@@ -1079,35 +1079,22 @@ fn proxy_text_view(
 
 /// Checks the one generated blank node alongside every fixed term in the fixture.
 fn assert_term_kind_text(text: &str) -> TestResult {
-    use rift_protocol::query::RdfTerm;
-    use std::collections::BTreeMap;
-
-    let row = text.lines().nth(2).ok_or("term-kind row missing")?;
-    let binding: BTreeMap<String, RdfTerm> = serde_json::from_str(
-        row.strip_prefix('\t')
-            .ok_or("term-kind row is not indented")?,
-    )?;
-    let Some(RdfTerm::BlankNode { value }) = binding.get("blank") else {
-        return Err("term-kind blank node missing".into());
-    };
+    let mut lines = text.lines();
+    assert_eq!(lines.next(), Some("?blank\t?iri\t?number\t?language"));
+    let row = lines.next().ok_or("term-kind row missing")?;
+    let (blank, rest) = row
+        .split_once('\t')
+        .ok_or("term-kind row needs four columns")?;
     assert!(
-        !value.is_empty(),
-        "the execution retains a blank-node identity"
+        blank
+            .strip_prefix("_:")
+            .is_some_and(|value| !value.is_empty())
     );
-    let expected: BTreeMap<String, RdfTerm> = serde_json::from_value(json!({
-        "blank":{"type":"blank_node","value":value},
-        "iri":{"type":"iri","value":"urn:fixture:term"},
-        "language":{"type":"language_literal","value":"hello","language":"en"},
-        "number":{"type":"literal","value":"1","datatype":"http://www.w3.org/2001/XMLSchema#integer"}
-    }))?;
-    assert_eq!(binding, expected);
     assert_eq!(
-        text,
-        format!(
-            "1 results · page 1/1\n\tblank iri number language\n\t{}\n",
-            serde_json::to_string(&expected)?
-        )
+        rest,
+        "<urn:fixture:term>\t\"1\"^^<http://www.w3.org/2001/XMLSchema#integer>\t\"hello\"@en"
     );
+    assert!(lines.next().is_none());
     Ok(())
 }
 
@@ -1405,7 +1392,7 @@ fn assert_paged_index_text(
     let (_, view) = proxy_text_view(text_of(result)?)?;
     let view = view.ok_or("paged index query retains its own view")?;
     let next = rift_search::sparql::continuation_query(answer, &view.id, 1)?;
-    let mut expected = String::from("1000 results · page 1/2\n\tindex\n");
+    let mut expected = String::from("?index\n");
     for (index, row) in bindings.iter().enumerate() {
         assert_eq!(row.len(), 1);
         assert_eq!(
@@ -1415,12 +1402,14 @@ fn assert_paged_index_text(
                 datatype: "http://www.w3.org/2001/XMLSchema#integer".to_owned(),
             })
         );
-        expected.push('\t');
-        expected.push_str(&serde_json::to_string(row)?);
-        expected.push('\n');
+        use std::fmt::Write as _;
+        writeln!(
+            expected,
+            "\"{index}\"^^<http://www.w3.org/2001/XMLSchema#integer>"
+        )?;
     }
-    expected.push_str("next_query ");
-    expected.push_str(&serde_json::to_string(&next)?);
+    expected.push_str("page 1/2\nnext query · ");
+    expected.push_str(&next);
     expected.push('\n');
     assert_eq!(body, expected);
     if let Some(structured) = &result.structured_content {

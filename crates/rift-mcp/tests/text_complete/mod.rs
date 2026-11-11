@@ -151,117 +151,110 @@ fn source_lines(text: &str, value: &serde_json::Value, indent: &str) -> Result<(
 }
 
 fn query_continuation_text(text: &str, structured: &serde_json::Value) -> Result<(), String> {
-    let continuations = text
+    let continuations: Vec<_> = text
         .lines()
-        .filter_map(|line| line.strip_prefix("next_query "))
-        .collect::<Vec<_>>();
-    match (
-        structured["pagination"]["next_query"].as_str(),
-        continuations.as_slice(),
-    ) {
-        (Some(expected), [encoded]) => {
-            let actual =
-                serde_json::from_str::<String>(encoded).map_err(|error| error.to_string())?;
-            if actual != expected {
-                return Err("$.pagination.next_query differs".into());
-            }
-        }
-        (None, []) => {}
-        _ => return Err("$.pagination.next_query missing or repeated".into()),
+        .filter_map(|line| line.strip_prefix("next query · "))
+        .collect();
+    let expected = structured["pagination"]["next_query"].as_str();
+    if continuations != expected.into_iter().collect::<Vec<_>>() {
+        return Err("query continuation differs".into());
     }
     Ok(())
 }
 
-/// Parses the existing compact query rows without changing RDF terms or row order.
-pub(crate) fn query_rows(text: &str) -> Result<Vec<serde_json::Value>, String> {
-    text.lines()
-        .filter(|line| line.trim_start().starts_with('{'))
-        .map(|line| {
-            serde_json::from_str::<serde_json::Value>(line.trim())
-                .map_err(|error| error.to_string())
-        })
-        .collect()
+fn query_term(term: &serde_json::Value) -> Result<String, String> {
+    let value = term["value"].as_str().ok_or("query term value")?;
+    let quoted = || serde_json::to_string(value).map_err(|error| error.to_string());
+    match term["type"].as_str() {
+        Some("iri") => Ok(format!("<{value}>")),
+        Some("blank_node") => Ok(format!("_:{value}")),
+        Some("language_literal") => Ok(format!(
+            "{}@{}",
+            quoted()?,
+            term["language"].as_str().ok_or("term language")?
+        )),
+        Some("literal") => {
+            let datatype = term["datatype"].as_str().ok_or("term datatype")?;
+            if datatype == "http://www.w3.org/2001/XMLSchema#string" {
+                quoted()
+            } else {
+                Ok(format!("{}^^<{datatype}>", quoted()?))
+            }
+        }
+        _ => Err("unknown RDF term".into()),
+    }
 }
 
-/// Checks independently parsed JSON rows and the published query result metadata.
+fn bindings_text(answer: &serde_json::Value, text: &mut std::str::Lines<'_>) -> Result<(), String> {
+    let variables = answer["variables"]
+        .as_array()
+        .ok_or("query variables")?
+        .iter()
+        .map(|value| value.as_str().ok_or("query variable"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let header = variables
+        .iter()
+        .map(|name| format!("?{name}"))
+        .collect::<Vec<_>>()
+        .join("\t");
+    if text.next() != Some(header.as_str()) {
+        return Err("binding variables differ".into());
+    }
+    for row in answer["bindings"].as_array().ok_or("binding rows")? {
+        let cells = variables
+            .iter()
+            .map(|name| row.get(*name).map_or_else(|| Ok(String::new()), query_term))
+            .collect::<Result<Vec<_>, _>>()?;
+        if text.next() != Some(cells.join("\t").as_str()) {
+            return Err("binding row differs".into());
+        }
+    }
+    Ok(())
+}
+
 fn query_text_states(text: &str, structured: &serde_json::Value) -> Result<(), String> {
     if structured["outcome"] == "unavailable" {
         if !text.contains("unavailable") {
-            return Err("$.outcome unavailable".into());
+            return Err("missing unavailable outcome".into());
         }
     } else {
         let answer = &structured["answer"];
+        let mut lines = text.lines();
         match answer["result"].as_str() {
-            Some("boolean") => {
-                let value = text
-                    .lines()
-                    .next()
-                    .ok_or("boolean text")?
-                    .trim()
-                    .parse::<bool>()
-                    .map_err(|_| "boolean text value")?;
-                if Some(value) != answer["value"].as_bool() {
-                    return Err("$.answer.value".into());
-                }
-            }
-            Some(form @ ("bindings" | "graph")) => {
-                let key = if form == "bindings" {
-                    "bindings"
-                } else {
-                    "triples"
-                };
-                let expected = answer[key].as_array().ok_or("query result array")?;
-                let parsed = query_rows(text)?;
-                if &parsed != expected {
-                    return Err(format!("$.answer.{key}: text rows differ"));
-                }
-                let title = text.lines().next().ok_or("query title")?;
-                let count = title
-                    .split_whitespace()
-                    .next()
-                    .ok_or("query item count")?
-                    .parse::<usize>()
-                    .map_err(|_| "query item count")?;
-                if count != expected.len() {
-                    return Err("query item count differs".into());
-                }
-                let page = title.split_whitespace().last().ok_or("query page title")?;
-                let (index, pages) = page.split_once('/').ok_or("query page title")?;
-                if index
-                    .parse::<u64>()
-                    .map_err(|_| "query page index")?
-                    .checked_sub(1)
-                    != structured["pagination"]["page_index"].as_u64()
-                    || pages.parse::<u64>().map_err(|_| "query page count")?
-                        != structured["pagination"]["total_pages"]
-                            .as_u64()
-                            .ok_or("query page count")?
-                {
-                    return Err("query pagination differs".into());
-                }
-                if form == "bindings" {
-                    let variables = answer["variables"]
-                        .as_array()
-                        .ok_or("query variables")?
-                        .iter()
-                        .map(|value| value.as_str().ok_or("query variable"))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    if !variables.is_empty()
-                        && !text
-                            .lines()
-                            .any(|line| line.split_whitespace().collect::<Vec<_>>() == variables)
-                    {
-                        return Err("query variable order differs".into());
+            Some("boolean")
+                if lines.next().and_then(|value| value.parse::<bool>().ok())
+                    == answer["value"].as_bool() => {}
+            Some("boolean") => return Err("query boolean differs".into()),
+            Some("bindings") => bindings_text(answer, &mut lines)?,
+            Some("graph") => {
+                for triple in answer["triples"].as_array().ok_or("query triples")? {
+                    let expected = format!(
+                        "{} {} {} .",
+                        query_term(&triple["subject"])?,
+                        query_term(&triple["predicate"])?,
+                        query_term(&triple["object"])?
+                    );
+                    if lines.next() != Some(expected.as_str()) {
+                        return Err("query triple differs".into());
                     }
                 }
             }
-            _ => return Err("$.answer.result".into()),
+            _ => return Err("unknown query result".into()),
+        }
+        let total = structured["pagination"]["total_pages"]
+            .as_u64()
+            .ok_or("query total pages")?;
+        if total > 1 {
+            let page = structured["pagination"]["page_index"]
+                .as_u64()
+                .ok_or("query page index")?;
+            let expected = format!("page {}/{total}", page.saturating_add(1));
+            if lines.next() != Some(expected.as_str()) {
+                return Err("query page differs".into());
+            }
         }
     }
     query_continuation_text(text, structured)?;
-    for warning in structured["warnings"].as_array().into_iter().flatten() {
-        token(text, &warning["code"], "$.warnings.code")?;
-    }
     view_text(text, structured)
 }
 

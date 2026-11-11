@@ -490,10 +490,9 @@ pub(crate) async fn captured_seed(
     )
     .await?;
     let rows = query::rows(&answer)?;
-    let mut selected = rows.iter().filter(|row| {
-        query::literal(row, "path").ok() == Some(path)
-            && query::literal(row, "name").ok() == Some(name)
-    });
+    let mut selected = rows
+        .iter()
+        .filter(|row| query::literal(row, "name").ok() == Some(name));
     let row = selected
         .next()
         .ok_or_else(|| format!("original declaration {name} at {path}: {answer}"))?;

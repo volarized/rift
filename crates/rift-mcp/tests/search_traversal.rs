@@ -12,6 +12,7 @@
 
 #[cfg(unix)]
 mod fake_engine;
+mod graph_query;
 
 #[cfg(unix)]
 #[path = "announced_work/mod.rs"]

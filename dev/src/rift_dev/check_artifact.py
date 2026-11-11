@@ -14,6 +14,7 @@ from rift_dev.query import (
     incoming_references_request,
     iri,
     literal,
+    project_source_unit,
 )
 from rift_dev.rift_test_client import (
     POLL_SECONDS,
@@ -86,11 +87,12 @@ async def symbol_read(client: Client, hit: JsonObject) -> JsonObject:
     declarations = array_value(answer.get("declarations"), "symbol declarations")
     require(len(declarations) == 1, f"expected one declaration: {answer}")
     declaration = object_value(declarations[0], "declaration")
-    for field in ("path",):
-        require(
-            declaration.get(field) == literal(hit, field),
-            f"symbol declaration changed {field}: {answer}",
-        )
+    path = declaration.get("path")
+    require(isinstance(path, str), f"local declaration has no path: {answer}")
+    require(
+        isinstance(path, str) and project_source_unit(path) == iri(hit, "unit"),
+        f"symbol declaration changed unit: {answer}",
+    )
     require(
         declaration.get("range")
         == {"start": int(literal(hit, "start")), "end": int(literal(hit, "end"))},

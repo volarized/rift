@@ -16,15 +16,29 @@ Read `rift://map` first for served languages, workspace layout, and language ser
 | Situation | Tool |
 | --- | --- |
 | The target is unknown. | `search` |
-| Every match of a regex in the project's text is needed. | `search` (with `pattern`) |
+| Every match of a regex in the project's text is needed. | `search` (with `:pattern` in `SERVICE :search`) |
 | The exact symbol identity is known. | `get_symbol` |
-| A package or runtime declaration is needed. | `search` (with `scope: "global"` or `"all"`; read the returned `id` with `get_symbol`) |
-| A package version the project does not use, or a package it lacks, is needed. | `search` (with `packages` and `scope: "global"` or `"all"`; read the returned `id` with `get_symbol`, naming the hit's release as `revision`) |
+| A package or runtime declaration is needed. | `search` (with `:scope "global"` or `"all"` in `SERVICE :search`; read the returned symbol IRI with `get_symbol`) |
+| A package version the project does not use, or a package it lacks, is needed. | `search` (with `:packages` and `:scope "global"` or `"all"` in `SERVICE :search`; read the returned IRI with `get_symbol`, naming the hit's release as `revision`) |
 | A declaration's source, or the syntax nodes of a symbol's declarations, is needed. | `nodes` (with `symbol`, a project, package, or runtime one; send `node_cursor` back for the rest of a long answer) |
 | The syntax structure at one position is needed. | `nodes` |
-| The declarations that reference a symbol, its impact (what changes when it does), or a path between two symbols is needed. | `search` (with a `traversal` block) |
-| The declarations two revisions, or a revision and the working tree, hold differently are needed. | `search` (with a `change` block) |
-| The commit that made a change, found by its message, is needed. | `search` (with `target: "commit"`) |
+| The declarations that reference a symbol, its impact (what changes when it does), or a path between two symbols is needed. | `search` (with SPARQL property paths) |
+| The declarations two revisions, or a revision and the working tree, hold differently are needed. | `search` (with `:change` in `SERVICE :search`) |
+| The commit that made a change, found by its message, is needed. | `search` (with `:target "commit"` in `SERVICE :search`) |
+
+## Search queries
+
+`search` takes required `query` text and optional `language`, default `sparql`. Replace `<symbol-id>` with an IRI returned by Rift.
+
+- Name: `SELECT ?s {?s a :Symbol; :name "load_config"}`
+- Usages: `SELECT ?u {<symbol-id> :usages ?u}`
+- Locations: `SELECT * {<symbol-id> :usages/:range [:unit ?u; :start ?s; :end ?e]}`
+- Distinct callers: `SELECT DISTINCT ?s {?s :references <symbol-id>}`
+- Third-level callees: `SELECT ?s {<symbol-id> :calls/:calls/:calls ?s}`
+- Regex: `SELECT ?p {SERVICE :search {?h :pattern "TODO|FIXME"; :target "file"; :path ?p}}`
+- Count: `SELECT (COUNT(?u) AS ?n) {<symbol-id> :usages ?u}`
+
+Follow `pagination.next_query` unchanged for transport pages. Read exact symbols and nodes with the selected `revision`. Missing required facts return a typed unavailable outcome.
 
 ## When a call refuses
 

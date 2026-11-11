@@ -28,7 +28,6 @@ from rift_dev.query import (
 from rift_dev.rift_test_client import (
     Client,
     Server,
-    ToolFailure,
     array_value,
     collector_line,
     gate_deadline,
@@ -68,7 +67,8 @@ async def check_embedded_references(client: Client, root: Path) -> None:
     answer = await incoming_references(client, seed)
     callers = bindings(answer)
     require(
-        [literal(row, "name") for row in callers] == ["caller"], f"callers: {answer}"
+        [iri(row, "caller").rsplit("/", 1)[-1] for row in callers] == ["caller"],
+        f"callers: {answer}",
     )
     answer = await client.call("search", usage_request(seed))
     original = (root / "service.py").read_bytes()
@@ -86,19 +86,14 @@ async def check_embedded_references(client: Client, root: Path) -> None:
 
 async def check_mixed_references_unavailable(client: Client) -> None:
     """Require complete relationship acquisition to refuse an unserved language."""
-    seed = symbol_id(await symbol_hit(client, "serve", "python"))
-    try:
-        answer = await incoming_references(client, seed)
-    except ToolFailure as failure:
-        require(
-            failure.code == "capability_unavailable"
-            and failure.retry == "operator_action",
-            f"mixed relationship acquisition returned a different refusal: {failure}",
-        )
-    else:
-        raise AssertionError(
-            f"unserved Rust relationships returned a complete answer: {answer}"
-        )
+    answer = await client.call(
+        "search", {"query": "SELECT ?caller ?target { ?caller :references ?target }"}
+    )
+    require(
+        answer.get("outcome") == "unavailable"
+        and answer.get("reason") == "insufficient_coverage",
+        f"unserved Rust relationships returned a complete answer: {answer}",
+    )
 
 
 async def check_python_references(

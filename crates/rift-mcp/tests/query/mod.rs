@@ -19,10 +19,9 @@ const HIT_FIELDS: &[&str] = &["path", "unit", "start", "end", "line"];
 pub(crate) fn declaration(name: &str, path: &str) -> QueryParams {
     let name = Literal::from(name);
     let unit = rift_protocol::identity::encode_source_unit_key(path);
-    let path = Literal::from(path);
     QueryParams {
         query: format!(
-            "SELECT ?symbol ?name ?kind ?language ?path ?source ?start ?end {{ ?symbol a :Symbol; :name {name}; :kind ?kind; :language ?language . ?node :of ?symbol; :index 0; :source ?source; :range [ :unit <rift://source/project/{unit}>; :start ?start; :end ?end ] . BIND({name} AS ?name) BIND({path} AS ?path) }}"
+            "SELECT ?symbol ?name ?kind ?language ?unit ?source ?start ?end {{ ?symbol a :Symbol; :name {name}; :name ?name; :kind ?kind; :language ?language . ?node :of ?symbol; :index 0; :source ?source; :range [ :unit <rift://source/project/{unit}>; :unit ?unit; :start ?start; :end ?end ] }}"
         ),
         language: QueryLanguage::Sparql,
     }

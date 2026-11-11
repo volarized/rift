@@ -67,7 +67,14 @@ impl Render for QueryResult {
         if let Some(next) = &self.pagination.next_query {
             out.raw_line(0, &format!("next query · {next}"))?;
         }
-        warning::section(out, &self.warnings)
+        warning::section(out, &self.warnings)?;
+        if let Some(view) = &self.view {
+            out.raw_line(
+                0,
+                &format!("view {} · expires {}", view.id.as_str(), view.expires_at),
+            )?;
+        }
+        Ok(())
     }
 }
 

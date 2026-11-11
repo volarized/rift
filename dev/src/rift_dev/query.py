@@ -68,12 +68,10 @@ def declaration_request(name: str) -> JsonObject:
     """Select a named symbol and its item node from the captured graph."""
     value = quoted(name)
     return {
-        "query": f"""SELECT ?symbol ?name ?language ?path ?source ?start ?end {{
-          ?symbol a :Symbol; :name {value}; :language ?language .
+        "query": f"""SELECT ?symbol ?name ?language ?unit ?source ?start ?end {{
+          ?symbol a :Symbol; :name {value}; :name ?name; :language ?language .
           ?node :of ?symbol; :index 0; :source ?source;
                 :range [ :unit ?unit; :start ?start; :end ?end ] .
-          BIND({value} AS ?name)
-          BIND(STRAFTER(STR(?unit), "rift://source/project/") AS ?path)
         }}"""
     }
 
