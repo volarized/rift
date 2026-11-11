@@ -470,11 +470,9 @@ impl TreeDatabase {
             AnswerRefusal::Invalid(format!("tree root is not UTF-8: {}", path.display()))
         })?;
         let system = HermeticSystem::new(&system_root);
-        let mut metadata =
-            ProjectMetadata::discover_with_uv(&system_root, &system, ty_project::UseUv::Off)
-                .map_err(|error| {
-                    AnswerRefusal::Invalid(format!("ty project discovery: {error}"))
-                })?;
+        let mut metadata = ProjectMetadata::discover(&system_root, &system)
+            .map_err(|error| AnswerRefusal::Invalid(format!("ty project discovery: {error}")))?
+            .with_use_uv(ty_project::UseUv::Off);
         if let Some(options) = environment.options(&system_root) {
             metadata.set_fallback_options(options);
         }
@@ -866,6 +864,7 @@ fn pulled_diagnostics(
     let mut items = Vec::new();
     for diagnostic in database.check_file(file) {
         let severity = match diagnostic.severity() {
+            ruff_db::diagnostic::Severity::Hint => 4,
             ruff_db::diagnostic::Severity::Info => 3,
             ruff_db::diagnostic::Severity::Warning => 2,
             ruff_db::diagnostic::Severity::Error | ruff_db::diagnostic::Severity::Fatal => 1,
@@ -1054,9 +1053,9 @@ mod tests {
         let system_root =
             SystemPathBuf::from_path_buf(root.to_path_buf()).expect("a UTF-8 temporary root");
         let system = ruff_db::system::OsSystem::new(&system_root);
-        let metadata =
-            ProjectMetadata::discover_with_uv(&system_root, &system, ty_project::UseUv::Off)
-                .expect("ty's discovery");
+        let metadata = ProjectMetadata::discover(&system_root, &system)
+            .expect("ty's discovery")
+            .with_use_uv(ty_project::UseUv::Off);
         let database = ProjectDatabase::fallible(metadata, system).expect("a default database");
         let app = system_path_to_file(&database, system_root.join("app.py")).expect("app.py");
         let findings: Vec<(String, String)> = database
