@@ -42,11 +42,7 @@ impl GlobalClient {
                 }
                 let mut owners = HashSet::new();
                 for position in &request.positions {
-                    if let Some(owner) =
-                        global_source_owner(position.unit.as_str(), request.view.as_ref())?
-                    {
-                        owners.insert(owner);
-                    }
+                    owners.insert(global_source_owner(position.unit.as_str())?);
                 }
                 let capabilities = self.get_capabilities().await?;
                 if !supports_feature(&capabilities, "declarations") {
@@ -110,21 +106,10 @@ impl GlobalClient {
     }
 }
 
-fn global_source_owner(
-    unit: &str,
-    view: Option<&rift_protocol::symbol_read::CapturedViewId>,
-) -> Result<Option<SymbolOwner>, RiftError> {
+fn global_source_owner(unit: &str) -> Result<SymbolOwner, RiftError> {
     let (owner, _) = parse_source_unit_identity(unit)?;
     match owner {
-        Some(owner @ (SymbolOwner::Package { .. } | SymbolOwner::Runtime { .. })) => {
-            Ok(Some(owner))
-        }
-        None if view.is_some()
-            && rift_protocol::read::SourceUnitId::parse(unit)
-                .is_ok_and(|unit| !unit.is_project()) =>
-        {
-            Ok(None)
-        }
+        Some(owner @ (SymbolOwner::Package { .. } | SymbolOwner::Runtime { .. })) => Ok(owner),
         _ => Err(failure::request_invalid(
             "global_source_owner",
             "unit",

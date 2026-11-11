@@ -3,13 +3,18 @@ use rift_analysis::{
     PackageImportRootOrigin, PackageSource,
 };
 use rift_core::{ContributionOrigin, ProjectPath, SourceKind, SourceLocation};
-use rift_protocol::index::PackagePublication;
-use rift_protocol::producer::{FactKind, ProducerFacts};
-use rift_protocol::read::{Language, PackageIdentity, SourceUnitId};
+use std::cell::Cell;
+
+use rift_error::RiftError;
+use rift_protocol::index::{PackagePublication, RelationshipCoverage};
+use rift_protocol::producer::{FactKind, FactProducer, ProducerFacts};
+use rift_protocol::read::{Language, PackageIdentity, RelationshipFacet, SourceUnitId};
 use rift_syntax::{ByteRange, NodeMatch, SyntaxLimits};
 use serde_json::{Value, json};
 
-use super::{PublicationNodes, accept_producer_facts};
+use super::{
+    ExtractionInput, FactExtractor, PublicationNodes, accept_extracted_facts, accept_producer_facts,
+};
 use crate::located_node::NodeAddress;
 
 const SOURCE: &str =
@@ -74,6 +79,7 @@ fn unit(publication: &PackagePublication) -> SourceUnitId {
 
 fn facts(publication: &PackagePublication, body: Value) -> ProducerFacts {
     let mut facts = json!({
+        "format": 1,
         "producer": {"name": "demo-indexer", "revision": "0.6.1"},
         "language": "python",
         "kinds": ["relationships", "occurrences"],
@@ -361,4 +367,224 @@ fn producer_facts_outside_their_coverage_or_address_are_refused() {
     .expect("first acceptance");
     let again = facts_with_kinds(&once, &["occurrences"]);
     assert!(refusal(once, again).contains("field kinds, violation duplicate"));
+}
+
+#[test]
+fn producer_facts_require_a_format() {
+    let mut wire = serde_json::to_value(call_facts(&click())).expect("serialize");
+    assert_eq!(wire["format"], json!(1));
+    wire.as_object_mut().expect("object").remove("format");
+    let refused = serde_json::from_value::<ProducerFacts>(wire).expect_err("no format");
+    assert!(refused.to_string().contains("format"), "{refused}");
+}
+
+#[test]
+fn accept_producer_facts_refuses_another_format() {
+    let publication = click();
+    let facts = facts(&publication, json!({"format": 2}));
+    let message = refusal(publication, facts);
+    assert!(
+        message.contains("field format, violation unsupported"),
+        "{message}"
+    );
+}
+
+#[test]
+fn accept_producer_facts_leaves_relationship_coverage_unchanged() {
+    let mut publication = click();
+    publication.coverage[0].relationships = vec![
+        RelationshipCoverage {
+            facet: RelationshipFacet::Calls,
+            complete: true,
+        },
+        RelationshipCoverage {
+            facet: RelationshipFacet::References,
+            complete: false,
+        },
+    ];
+    let before = serde_json::to_string(&publication.coverage[0].relationships).expect("before");
+    let facts = call_facts(&publication);
+    let accepted =
+        accept_producer_facts(publication, facts, SyntaxLimits::default()).expect("accepted");
+    let after = serde_json::to_string(&accepted.coverage[0].relationships).expect("after");
+    assert_eq!(after, before);
+}
+
+#[test]
+fn producer_extensions_reach_the_stored_relationship() {
+    let publication = click();
+    let before = publication.relationships.len();
+    let extension = json!({"dev.demo-indexer.precision": {
+        "version": 1,
+        "data": {"class": "compiler binding", "observation": 17},
+    }});
+    let facts = facts(
+        &publication,
+        json!({
+            "kinds": ["relationships"],
+            "relationships": [{
+                "from": SHOUT, "kind": "call", "facets": ["calls"], "to": ECHO,
+                "derivation": "resolution", "extensions": extension,
+            }],
+        }),
+    );
+    let accepted =
+        accept_producer_facts(publication, facts, SyntaxLimits::default()).expect("accepted");
+    let stored = &accepted.relationships[before];
+    assert_eq!(
+        serde_json::to_value(&stored.extensions).expect("extensions"),
+        extension
+    );
+    accepted.validate_facts().expect("facts agree");
+    let wire = serde_json::to_string(&accepted).expect("serialize");
+    let read: PackagePublication = serde_json::from_str(&wire).expect("deserialize");
+    assert_eq!(read.relationships[before].extensions, stored.extensions);
+}
+
+#[test]
+fn imported_relationships_do_not_depend_on_emission_order() {
+    let publication = click();
+    let forward = call_facts(&publication);
+    let mut reversed = forward.clone();
+    reversed.relationships.reverse();
+    let first = accept_producer_facts(publication.clone(), forward, SyntaxLimits::default())
+        .expect("forward");
+    let second = accept_producer_facts(publication.clone(), reversed, SyntaxLimits::default())
+        .expect("reversed");
+    let canonical = |accepted: &PackagePublication| {
+        rift_protocol::canonical::canonical_json(accepted).expect("canonical publication")
+    };
+    assert_eq!(canonical(&first), canonical(&second));
+    let built_in = publication.relationships.len();
+    assert_eq!(
+        first.relationships[..built_in],
+        publication.relationships[..],
+        "built-in relationships keep their order"
+    );
+}
+
+/// An extractor fake: it writes one occurrence for every `echo` its units name, and records
+/// how often it ran and how many units of its language and of the publication it saw.
+struct DemoExtractor {
+    producer: FactProducer,
+    language: Language,
+    written: Value,
+    runs: Cell<usize>,
+    seen: Cell<(usize, usize)>,
+}
+
+impl DemoExtractor {
+    fn new(written: Value) -> Self {
+        Self {
+            producer: accepted_producer(),
+            language: python(),
+            written,
+            runs: Cell::new(0),
+            seen: Cell::new((0, 0)),
+        }
+    }
+}
+
+impl FactExtractor for DemoExtractor {
+    fn producer(&self) -> &FactProducer {
+        &self.producer
+    }
+
+    fn language(&self) -> &Language {
+        &self.language
+    }
+
+    fn extract(&self, input: &ExtractionInput<'_>) -> Result<ProducerFacts, RiftError> {
+        self.runs.set(self.runs.get() + 1);
+        self.seen
+            .set((input.units().count(), input.publication().units.len()));
+        let occurrences = input
+            .units()
+            .flat_map(|unit| {
+                unit.source.match_indices("echo").map(move |(start, _)| {
+                    json!({
+                        "symbol": ECHO,
+                        "unit": unit.unit.0,
+                        "range": {"start": start, "end": start + 4},
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut wire = json!({
+            "format": 1,
+            "producer": self.producer,
+            "language": input.language().name,
+            "kinds": ["occurrences"],
+            "occurrences": occurrences,
+        });
+        let Value::Object(written) = &self.written else {
+            panic!("written fields must be an object: {}", self.written);
+        };
+        for (key, value) in written {
+            wire[key] = value.clone();
+        }
+        serde_json::from_value(wire).map_err(|_| super::invalid("extractor", "output"))
+    }
+}
+
+#[test]
+fn an_extractor_reads_its_language_units_and_its_facts_enter_the_publication() {
+    let publication = click();
+    let extractor = DemoExtractor::new(json!({}));
+    let accepted = accept_extracted_facts(publication.clone(), &extractor, SyntaxLimits::default())
+        .expect("extracted");
+    assert_eq!(extractor.runs.get(), 1);
+    let ranges = accepted
+        .occurrences
+        .iter()
+        .map(|occurrence| (occurrence.range.start, occurrence.range.end))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ranges,
+        [(4, 8), CALL],
+        "the notes unit is not python, so its `echo` is not read"
+    );
+    assert!(accepted.coverage[0].covers(FactKind::Occurrences, Some(&accepted_producer())));
+    assert_eq!(extractor.seen.get(), (1, publication.units.len()));
+}
+
+#[test]
+fn an_extractor_output_naming_another_producer_or_language_is_refused() {
+    for (written, expected) in [
+        (
+            json!({"producer": {"name": "other-indexer", "revision": "1"}}),
+            "field producer, violation mismatch",
+        ),
+        (
+            json!({"language": "javascript"}),
+            "field language, violation mismatch",
+        ),
+        (
+            json!({"format": "one"}),
+            "field extractor, violation output",
+        ),
+    ] {
+        let extractor = DemoExtractor::new(written);
+        let error = accept_extracted_facts(click(), &extractor, SyntaxLimits::default())
+            .expect_err("refused output");
+        assert!(error.to_string().contains(expected), "{expected}: {error}");
+    }
+}
+
+#[test]
+fn an_extractor_for_an_uncovered_language_never_runs() {
+    let mut extractor = DemoExtractor::new(json!({}));
+    extractor.language = Language {
+        name: "javascript".to_owned(),
+        dialect: None,
+    };
+    let error = accept_extracted_facts(click(), &extractor, SyntaxLimits::default())
+        .expect_err("uncovered language");
+    assert!(
+        error
+            .to_string()
+            .contains("field language, violation uncovered"),
+        "{error}"
+    );
+    assert_eq!(extractor.runs.get(), 0);
 }

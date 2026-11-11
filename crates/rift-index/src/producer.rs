@@ -3,19 +3,26 @@
 //! A producer addresses source the way its own tools do: by source unit and byte range.
 //! [`PublicationNodes`] resolves such a range to the node address every read uses, and
 //! [`accept_producer_facts`] adds the producer's relationships and occurrences to the
-//! publication under that producer's name.
+//! publication under that producer's name. [`FactExtractor`] is the interface an external
+//! extractor implements, and [`accept_extracted_facts`] runs one and imports its output.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use rift_error::{RiftError, errors};
 use rift_protocol::index::{PACKAGE_SYMBOLS_CEILING, PackageOccurrence, PackagePublication};
 use rift_protocol::producer::{
-    FactCoverage, FactKind, FactProducer, ProducerFacts, ProducerOccurrence, ProducerRelationship,
+    FactCoverage, FactKind, FactProducer, PRODUCER_FACTS_FORMAT_REVISION, ProducerFacts,
+    ProducerOccurrence, ProducerRelationship,
 };
-use rift_protocol::read::{Extensions, Relationship, SourceUnitId, SourceUnitSpan, SymbolId};
+use rift_protocol::read::{Relationship, SourceUnitId, SourceUnitSpan, SymbolId};
 use rift_syntax::{ByteRange, NodeMatch, SyntaxDocument, SyntaxLimits, SyntaxSource};
 
 use crate::located_node::{LocatedNode, NodeAddress};
+
+mod extractor;
+
+pub use extractor::{ExtractionInput, FactExtractor, accept_extracted_facts};
 
 /// Relationships and occurrences one [`accept_producer_facts`] call adds, together: the
 /// declaration ceiling a publication supports.
@@ -172,11 +179,19 @@ impl<'publication> PublicationNodes<'publication> {
 /// Every added relationship and occurrence names `facts.producer`, and the coverage entry of
 /// `facts.language` gains one entry per covered kind. A relationship that names only its
 /// `occurrence` starts at the symbol whose declaration encloses it; every range a fact names
-/// must resolve to a node of its unit. The publication is checked whole with
+/// must resolve to a node of its unit. The coverage entry's `relationships` stay as package
+/// analysis wrote them: an imported kind states who emitted its facts, never that they are
+/// complete.
+///
+/// The added relationships follow the built-in ones, sorted by `from`, `to`, `kind`,
+/// occurrence unit and range, `derivation`, `facets`, then `confidence`, so the order the
+/// producer emitted them in does not reach the publication's bytes. Occurrences are kept in
+/// unit, range, and symbol order. The publication is checked whole with
 /// [`PackagePublication::validate_facts`] before it is returned.
 ///
 /// # Errors
-/// Returns `producer_fact_invalid` for more than [`PRODUCER_FACTS_MAX`] facts, a language
+/// Returns `producer_fact_invalid` for a `format` other than
+/// [`PRODUCER_FACTS_FORMAT_REVISION`], more than [`PRODUCER_FACTS_MAX`] facts, a language
 /// the publication has no coverage for, a fact of a kind `facts.kinds` does not name, a kind
 /// already covered by this producer, a relationship naming neither `from` nor `occurrence`,
 /// or one naming only an `occurrence` outside every declaration; `producer_range_unresolved`
@@ -187,12 +202,16 @@ pub fn accept_producer_facts(
     limits: SyntaxLimits,
 ) -> Result<PackagePublication, RiftError> {
     let ProducerFacts {
+        format,
         producer,
         language,
         kinds,
         relationships,
         occurrences,
     } = facts;
+    if format != PRODUCER_FACTS_FORMAT_REVISION {
+        return Err(invalid("format", "unsupported"));
+    }
     let (coverage, kinds) = admitted_kinds(&publication, &producer, &language, kinds)?;
     admit_counts(&kinds, relationships.len(), occurrences.len())?;
     let (relationships, occurrences) = {
@@ -207,7 +226,9 @@ pub fn accept_producer_facts(
             .collect::<Result<Vec<_>, _>>()?;
         (relationships, occurrences)
     };
+    let built_in = publication.relationships.len();
     publication.relationships.extend(relationships);
+    publication.relationships[built_in..].sort_by(canonical_order);
     publication.occurrences.extend(occurrences);
     publication.occurrences.sort_by(|left, right| {
         (&left.unit, left.range.start, left.range.end, &left.symbol).cmp(&(
@@ -281,6 +302,7 @@ fn resolve_relationship(
         occurrence,
         derivation,
         confidence,
+        extensions,
     } = relationship;
     let enclosing = occurrence
         .as_ref()
@@ -307,7 +329,7 @@ fn resolve_relationship(
         derivation,
         confidence,
         producer: Some(producer.clone()),
-        extensions: Extensions::default(),
+        extensions,
     })
 }
 
@@ -329,6 +351,25 @@ fn resolve_occurrence(
         range: span.range,
         producer: Some(producer.clone()),
     })
+}
+
+/// The order of one producer's imported relationships. Two edges equal under it differ only
+/// in their extensions and keep the order the producer wrote them.
+fn canonical_order(left: &Relationship, right: &Relationship) -> Ordering {
+    fn span(edge: &Relationship) -> Option<(&SourceUnitId, u64, u64)> {
+        edge.occurrence
+            .as_ref()
+            .map(|span| (&span.unit, span.range.start, span.range.end))
+    }
+    (&left.from, &left.to, &left.kind)
+        .cmp(&(&right.from, &right.to, &right.kind))
+        .then_with(|| span(left).cmp(&span(right)))
+        .then_with(|| left.derivation.cmp(&right.derivation))
+        .then_with(|| left.facets.cmp(&right.facets))
+        .then_with(|| match (left.confidence, right.confidence) {
+            (Some(left), Some(right)) => left.total_cmp(&right),
+            (left, right) => left.is_some().cmp(&right.is_some()),
+        })
 }
 
 fn byte_range(span: &SourceUnitSpan) -> ByteRange {

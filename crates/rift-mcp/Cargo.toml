@@ -59,7 +59,7 @@ tower-service = "0.3.3"
 windows-spawn.workspace = true
 
 [dev-dependencies]
-ty_vendored = { git = "https://github.com/astral-sh/ruff", rev = "11aaa39f84c0c44bdfb4c9cc21e4038c6f74c00a" }
+ty_vendored = { git = "https://github.com/astral-sh/ruff", rev = "fde7c6debc8ab1507d1e2bd74e5d8d8c394acef1" }
 stats_alloc = "=0.1.10"
 rift-history = { workspace = true, features = ["fixtures"] }
 rift-tracing = { workspace = true, features = ["fixtures"] }

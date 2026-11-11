@@ -13,9 +13,12 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::read::{
-    ExactKind, Language, RelationshipDerivation, RelationshipFacet, SourceUnitId, SourceUnitSpan,
-    SymbolId, TextRange,
+    ExactKind, Extensions, Language, RelationshipDerivation, RelationshipFacet, SourceUnitId,
+    SourceUnitSpan, SymbolId, TextRange,
 };
+
+/// Format of the [`ProducerFacts`] input this build imports.
+pub const PRODUCER_FACTS_FORMAT_REVISION: u32 = 1;
 
 /// Longest producer name, in bytes.
 pub const PRODUCER_NAME_BYTES_MAX: usize = 64;
@@ -230,11 +233,12 @@ pub enum FactKind {
     Occurrences,
 }
 
-/// One fact kind a publication covers for one language, and the producer of those facts.
+/// One fact kind a publication carries for one language, and the producer of those facts.
 ///
-/// A covered kind with no facts means its producer found none. A kind no entry names was
-/// not produced, so its absence says nothing about the source. Two producers of one kind
-/// take two entries.
+/// An entry states that its producer emitted facts of this kind for this language. It makes
+/// no claim that the producer found every fact of the kind, for any producer: whether a
+/// language's relationships are complete is stated by the coverage entry's `relationships`
+/// alone. A kind no entry names was not produced. Two producers of one kind take two entries.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FactCoverage {
@@ -255,12 +259,14 @@ pub struct FactCoverage {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProducerFacts {
+    /// The input format the producer wrote. The importer accepts
+    /// [`PRODUCER_FACTS_FORMAT_REVISION`] alone.
+    pub format: u32,
     /// The producer that emitted every fact here.
     pub producer: FactProducer,
     /// The language whose source the producer read.
     pub language: Language,
-    /// The fact kinds the producer covered for `language`, including kinds it found no
-    /// fact of.
+    /// The fact kinds the producer emitted for `language`. A kind may carry no fact.
     pub kinds: Vec<FactKind>,
     /// Edges the producer found.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -292,6 +298,10 @@ pub struct ProducerRelationship {
     /// How likely a `heuristic` edge is to hold, from 0 to 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<f64>,
+    /// Edge facts the model has no field for, under reverse-domain keys. The importer
+    /// carries them to the stored edge unchanged.
+    #[serde(default, skip_serializing_if = "Extensions::is_empty")]
+    pub extensions: Extensions,
 }
 
 /// One place an external producer found a unit's source naming a symbol.

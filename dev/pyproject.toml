@@ -30,7 +30,7 @@ packages = ["src/rift_dev"]
 dev = [
     "ruff==0.17.2",
     "ty==0.0.91",
-    "types-pywin32==312.0.0.20261006",
+    "types-pywin32==312.0.0.20261024",
     "pre-commit==4.7.0",
     "tree-sitter==0.26.0",
     "tree-sitter-rust==0.24.2",

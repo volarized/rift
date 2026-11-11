@@ -37,7 +37,10 @@ pub use lexical::{
     LexicalStamp, PublishedIndex, RevisionScoped, is_connection_unavailable,
 };
 pub use located_node::{LocatedNode, NodeAddress, whole_range};
-pub use producer::{PRODUCER_FACTS_MAX, PublicationNodes, accept_producer_facts};
+pub use producer::{
+    ExtractionInput, FactExtractor, PRODUCER_FACTS_MAX, PublicationNodes, accept_extracted_facts,
+    accept_producer_facts,
+};
 pub use relationship::{RELATIONSHIP_EDGES_MAX, RelationshipEdge, RelationshipStore};
 pub use revision::RevisionPaths;
 pub use rift_analysis::documentation::{
