@@ -236,7 +236,7 @@ impl AcquiredAdjacency {
                 group
                     .relationships
                     .iter()
-                    .map(|record| record.relationship.to.clone()),
+                    .map(|record| endpoint(&record.relationship, step.direction).clone()),
             );
         }
         self.view.get_or_insert_with(|| page.view.clone());
@@ -348,6 +348,7 @@ impl RiftMcp {
             remote: None,
             local: None,
             neighbors: BTreeMap::new(),
+            local_reverse: None,
             use_installed: None,
         };
         let mut frontier = BTreeSet::from([selected.seed.clone()]);
@@ -363,7 +364,8 @@ impl RiftMcp {
                     continue;
                 }
                 if SymbolIdentity::parse(seed.as_str())?.owner().is_local()
-                    || walk.acquired.installed.contains_key(&seed)
+                    || (walk.step.direction == TraversalDirection::Outgoing
+                        && walk.acquired.installed.contains_key(&seed))
                 {
                     let mut reached = BTreeSet::new();
                     walk.local_step(&seed, &mut reached).await?;
@@ -416,28 +418,23 @@ struct AdjacencyWalk<'request> {
         rift_server::CalleeRoots,
     )>,
     neighbors: BTreeMap<(SymbolId, AdjacencyStep), Vec<SymbolId>>,
+    local_reverse: Option<BTreeMap<SymbolId, BTreeSet<SymbolId>>>,
     use_installed: Option<bool>,
 }
 
 impl AdjacencyWalk<'_> {
-    async fn local_step(
-        &mut self,
-        seed: &SymbolId,
-        frontier: &mut BTreeSet<SymbolId>,
-    ) -> Result<(), RiftError> {
+    async fn ensure_local(&mut self) -> Result<(), RiftError> {
         if self.resolved.stale.is_some() {
             return Err(coverage_failure());
         }
-        claim_request(&mut self.remaining)?;
-        let reads = &self.resolved.published.reads;
-        let direction = self.step.direction;
-        if self.local.is_none() {
-            let engines = self.server.engine_pool_for(&self.resolved.published).await;
-            let roots = if self.step.facet == RelationshipFacet::Calls
-                || self.selected.has_distinct_steps()
-            {
-                let reads = std::sync::Arc::clone(reads);
-                let engines = std::sync::Arc::clone(&engines);
+        if self.local.is_some() {
+            return Ok(());
+        }
+        let engines = self.server.engine_pool_for(&self.resolved.published).await;
+        let roots =
+            if self.step.facet == RelationshipFacet::Calls || self.selected.has_distinct_steps() {
+                let reads = Arc::clone(&self.resolved.published.reads);
+                let engines = Arc::clone(&engines);
                 self.server
                     .blocking
                     .run("graph callee package roots", move || {
@@ -447,8 +444,19 @@ impl AdjacencyWalk<'_> {
             } else {
                 rift_server::CalleeRoots::default()
             };
-            self.local = Some((engines, roots));
-        }
+        self.local = Some((engines, roots));
+        Ok(())
+    }
+
+    async fn local_step(
+        &mut self,
+        seed: &SymbolId,
+        frontier: &mut BTreeSet<SymbolId>,
+    ) -> Result<(), RiftError> {
+        self.ensure_local().await?;
+        claim_request(&mut self.remaining)?;
+        let reads = &self.resolved.published.reads;
+        let direction = self.step.direction;
         let (engines, roots) = self.local.as_ref().ok_or_else(coverage_failure)?;
         let deadline = self.deadline.walk_end(self.resolved.capture_elapsed);
         match (direction, self.step.facet) {
@@ -490,7 +498,8 @@ impl AdjacencyWalk<'_> {
                     ))
                     .await?
                 };
-                self.name_package_calls(&mut calls).await?;
+                self.name_package_calls(&mut calls, self.selected.symbol_details)
+                    .await?;
                 self.admit_local_calls(seed, calls, frontier)?;
             }
             _ => return Err(coverage_failure()),
@@ -532,6 +541,7 @@ impl AdjacencyWalk<'_> {
     async fn name_package_calls(
         &mut self,
         calls: &mut rift_server::GraphCalls,
+        lookup_details: bool,
     ) -> Result<(), RiftError> {
         if calls.packages.is_empty() {
             return Ok(());
@@ -558,6 +568,15 @@ impl AdjacencyWalk<'_> {
         if installed {
             return self.capture_installed_calls(calls).await;
         }
+        self.name_published_calls(calls, lookup_details).await
+    }
+
+    async fn name_published_calls(
+        &mut self,
+        calls: &mut rift_server::GraphCalls,
+        lookup_details: bool,
+    ) -> Result<(), RiftError> {
+        claim_request(&mut self.remaining)?;
         let callees: Vec<_> = calls
             .packages
             .iter()
@@ -576,7 +595,7 @@ impl AdjacencyWalk<'_> {
             {
                 return Err(coverage_failure());
             }
-            if self.selected.symbol_details
+            if lookup_details
                 && !self
                     .acquired
                     .named_package_symbols
@@ -688,16 +707,86 @@ impl AdjacencyWalk<'_> {
             .await
     }
 
-    async fn remote_steps(
-        &mut self,
-        remote_seeds: &[SymbolId],
-        frontier: &mut BTreeSet<SymbolId>,
-    ) -> Result<Option<SearchUnavailable>, RiftError> {
-        let selected = self.selected;
-        let step = self.step;
-        if step.direction != TraversalDirection::Outgoing || !self.configuration.enabled {
-            return Err(coverage_failure());
+    async fn acquire_local_reverse(&mut self) -> Result<(), RiftError> {
+        if self.local_reverse.is_some() {
+            return Ok(());
         }
+        self.ensure_local().await?;
+        let reads = &self.resolved.published.reads;
+        let capture = Arc::clone(reads);
+        let maximum = usize::try_from(self.remaining.requests_max).unwrap_or(usize::MAX);
+        let seeds = self
+            .server
+            .blocking
+            .run("local reverse caller seeds", move || {
+                capture
+                    .local_search_view_input(true)?
+                    .semantic_seeds(maximum)
+            })
+            .await?;
+        let published_declarations = self.remote.as_ref().is_some_and(|remote| {
+            remote
+                .capabilities
+                .supported_features
+                .iter()
+                .any(|feature| feature == "declarations")
+        });
+        let deadline = self.deadline.walk_end(self.resolved.capture_elapsed);
+        let mut callers = BTreeMap::<SymbolId, BTreeSet<SymbolId>>::new();
+        for seed in seeds {
+            claim_request(&mut self.remaining)?;
+            let (engines, roots) = self.local.as_ref().ok_or_else(coverage_failure)?;
+            let mut calls = Box::pin(rift_server::graph_calls(
+                reads,
+                engines,
+                roots,
+                &seed,
+                TraversalDirection::Outgoing,
+                deadline,
+            ))
+            .await?;
+            if !calls.packages.is_empty() {
+                if published_declarations {
+                    self.name_published_calls(&mut calls, false).await?;
+                } else {
+                    self.capture_installed_calls(&mut calls).await?;
+                }
+            }
+            charge_records(&mut self.remaining, calls.local.len())?;
+            for (target, occurrences) in calls.local {
+                charge_records(&mut self.remaining, occurrences.len())?;
+                let owner = SymbolIdentity::parse(target.as_str())?;
+                if !owner.owner().is_local() {
+                    callers.entry(target).or_default().insert(seed.clone());
+                }
+            }
+        }
+        self.local_reverse = Some(callers);
+        Ok(())
+    }
+
+    fn admit_local_reverse(
+        &mut self,
+        seeds: &[SymbolId],
+        frontier: &mut BTreeSet<SymbolId>,
+    ) -> Result<(), RiftError> {
+        let captured = self.local_reverse.as_ref().ok_or_else(coverage_failure)?;
+        for seed in seeds {
+            if let Some(callers) = captured.get(seed) {
+                for caller in callers {
+                    self.acquired.local_edges.push((
+                        caller.clone(),
+                        SymbolRelation::Calls,
+                        seed.clone(),
+                    ));
+                    frontier.insert(caller.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn ensure_remote(&mut self) -> Result<(), RiftError> {
         if self.remote.is_none() {
             let reads = &self.resolved.published.reads;
             let mut domain = exact_domain(reads.dependency_context())?;
@@ -713,7 +802,25 @@ impl AdjacencyWalk<'_> {
                 capabilities,
             });
         }
+        Ok(())
+    }
+
+    async fn remote_steps(
+        &mut self,
+        remote_seeds: &[SymbolId],
+        frontier: &mut BTreeSet<SymbolId>,
+    ) -> Result<Option<SearchUnavailable>, RiftError> {
+        let selected = self.selected;
+        let step = self.step;
+        let incoming = step.direction == TraversalDirection::Incoming;
+        if !self.configuration.enabled || (incoming && step.facet != RelationshipFacet::Calls) {
+            return Err(coverage_failure());
+        }
+        self.ensure_remote().await?;
         let remote = self.remote.as_ref().ok_or_else(coverage_failure)?;
+        if incoming && !remote.domain.complete {
+            return Err(coverage_failure());
+        }
         let bounds = remote.client.relationship_bounds(
             &remote.capabilities,
             step.direction,
@@ -721,6 +828,7 @@ impl AdjacencyWalk<'_> {
         )?;
         let seeds_max = usize::try_from(bounds.max_seeds).unwrap_or(usize::MAX);
         for seeds in remote_seeds.chunks(seeds_max) {
+            let remote = self.remote.as_ref().ok_or_else(coverage_failure)?;
             for seed in seeds {
                 if !self
                     .acquired
@@ -769,18 +877,32 @@ impl AdjacencyWalk<'_> {
                     SymbolUnavailableReason::ViewContext,
                 )));
             }
+            self.acquired
+                .admit_remote(page, step, &mut self.remaining, frontier)?;
+            if incoming {
+                Box::pin(self.acquire_local_reverse()).await?;
+                self.admit_local_reverse(seeds, frontier)?;
+            }
             if selected.has_distinct_steps() {
+                let (page, _) = self.acquired.pages.last().ok_or_else(coverage_failure)?;
                 for group in &page.groups {
+                    let local = self
+                        .local_reverse
+                        .as_ref()
+                        .and_then(|callers| callers.get(&group.seed))
+                        .into_iter()
+                        .flatten()
+                        .filter(|_| incoming);
                     let reached = group
                         .relationships
                         .iter()
-                        .map(|record| record.relationship.to.clone())
+                        .map(|record| endpoint(&record.relationship, step.direction))
+                        .chain(local)
+                        .cloned()
                         .collect();
                     self.neighbors.insert((group.seed.clone(), step), reached);
                 }
             }
-            self.acquired
-                .admit_remote(page, step, &mut self.remaining, frontier)?;
         }
         Ok(None)
     }
@@ -791,6 +913,16 @@ fn relation(facet: RelationshipFacet) -> Result<SymbolRelation, RiftError> {
         RelationshipFacet::Calls => Ok(SymbolRelation::Calls),
         RelationshipFacet::References => Ok(SymbolRelation::References),
         _ => Err(coverage_failure()),
+    }
+}
+
+fn endpoint(
+    relationship: &rift_protocol::read::Relationship,
+    direction: TraversalDirection,
+) -> &SymbolId {
+    match direction {
+        TraversalDirection::Outgoing => &relationship.to,
+        TraversalDirection::Incoming => &relationship.from,
     }
 }
 
@@ -813,19 +945,24 @@ struct ExactDomain {
     packages: Vec<PackageIdentity>,
     runtimes: Vec<RuntimeIdentity>,
     revisions: BTreeMap<SymbolOwner, RevisionIri>,
+    complete: bool,
 }
 
 fn exact_domain(context: &rift_dependency::DependencyContext) -> Result<ExactDomain, RiftError> {
     let mut entries = BTreeMap::<SymbolOwner, Option<(String, Option<PackageIdentity>)>>::new();
+    let mut complete = !context.is_degraded();
     for entry in context.entries() {
         if entry.availability != rift_protocol::dependencies::PackageAvailability::Canonical {
+            complete = false;
             continue;
         }
         let Some(version) = &entry.version else {
+            complete = false;
             continue;
         };
         let (owner, package) = if entry.manager == rift_dependency::STANDARD_LIBRARY_MANAGER {
             let Some(library) = rift_dependency::StandardLibrary::from_name(&entry.name) else {
+                complete = false;
                 continue;
             };
             let owner = SymbolOwner::Runtime {
@@ -834,6 +971,7 @@ fn exact_domain(context: &rift_dependency::DependencyContext) -> Result<ExactDom
             (owner, None)
         } else {
             let Some(registry) = &entry.registry else {
+                complete = false;
                 continue;
             };
             let package = PackageIdentity {
@@ -862,6 +1000,7 @@ fn exact_domain(context: &rift_dependency::DependencyContext) -> Result<ExactDom
     let mut domain = ExactDomain::default();
     for (owner, selection) in entries {
         let Some((version, package)) = selection else {
+            complete = false;
             continue;
         };
         let revision = Revision::release(&owner, &version)?;
@@ -877,6 +1016,7 @@ fn exact_domain(context: &rift_dependency::DependencyContext) -> Result<ExactDom
             .revisions
             .insert(owner, RevisionIri::parse(&revision.to_string())?);
     }
+    domain.complete = complete;
     Ok(domain)
 }
 
