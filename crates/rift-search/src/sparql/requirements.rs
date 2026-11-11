@@ -53,6 +53,9 @@ impl GraphQuery {
     /// An expression that may inspect other facts requires the full acquisition path.
     #[must_use]
     pub fn symbol_selection(&self) -> Option<SymbolSelection<'_>> {
+        if !self.reads_base() {
+            return None;
+        }
         if let Query::Describe(query) = self.query()
             && let QueryExpression::Extend {
                 inner,
@@ -67,10 +70,11 @@ impl GraphQuery {
         {
             return Some(SymbolSelection::Identified(target.as_str()));
         }
-        let QueryExpression::Bgp { patterns } = query_pattern(self.query())? else {
-            return None;
+        let selection = match query_pattern(self.query())? {
+            QueryExpression::Bgp { patterns } => symbol_patterns(patterns),
+            _ => None,
         };
-        symbol_patterns(patterns)
+        selection.or_else(|| self.symbol_only().then_some(SymbolSelection::All))
     }
 
     /// Proves that a graph pattern needs only the syntax nodes of selected declarations.
@@ -181,6 +185,10 @@ fn query_pattern(query: &Query) -> Option<&QueryExpression> {
     };
     loop {
         expression = match expression {
+            QueryExpression::Graph {
+                name: NamedNodePattern::NamedNode(name),
+                inner,
+            } if name.as_str() == super::LOCAL_GRAPH => inner,
             QueryExpression::Project { inner, .. }
             | QueryExpression::Distinct { inner }
             | QueryExpression::Reduced { inner }
@@ -446,7 +454,8 @@ fn uniform_path(path: &PropertyPathExpression) -> Option<(RelationshipFacet, boo
     results.pop()
 }
 
-fn symbol_patterns(patterns: &[TriplePattern]) -> Option<SymbolSelection<'_>> {
+pub(super) fn symbol_patterns(patterns: &[TriplePattern]) -> Option<SymbolSelection<'_>> {
+    let mut identity = None;
     let mut name = None;
     let single_subject = patterns.first().is_some_and(|first| {
         patterns
@@ -454,6 +463,14 @@ fn symbol_patterns(patterns: &[TriplePattern]) -> Option<SymbolSelection<'_>> {
             .all(|pattern| pattern.subject == first.subject)
     });
     for pattern in patterns {
+        if let TermPattern::NamedNode(subject) = &pattern.subject
+            && let Ok(parsed) = rift_protocol::identity::SymbolIdentity::parse(subject.as_str())
+        {
+            if !parsed.owner().is_local() {
+                return None;
+            }
+            identity = Some(subject.as_str());
+        }
         let NamedNodePattern::NamedNode(predicate) = &pattern.predicate else {
             return None;
         };
@@ -471,6 +488,9 @@ fn symbol_patterns(patterns: &[TriplePattern]) -> Option<SymbolSelection<'_>> {
             _ if is_symbol_class(pattern) => {}
             _ => return None,
         }
+    }
+    if let Some(identity) = identity.filter(|_| single_subject) {
+        return Some(SymbolSelection::Identified(identity));
     }
     Some(match name.filter(|_| single_subject) {
         Some(name) => SymbolSelection::Named(name),

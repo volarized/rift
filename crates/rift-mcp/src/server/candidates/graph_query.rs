@@ -69,7 +69,7 @@ impl RiftMcp {
         if let Some(selection) = query.page_selection() {
             return self.replay_graph_query(selection).await.map(Json);
         }
-        let graph = match self.prepare_graph(&query, limits, deadline).await? {
+        let graph = match Box::pin(self.prepare_graph(&query, limits, deadline)).await? {
             Ok(graph) => graph,
             Err(unavailable) => return Ok(Json(QueryReadResult::Unavailable(unavailable))),
         };
@@ -133,7 +133,7 @@ impl RiftMcp {
         let mut acquired = if let Some(selected) = &selected {
             let result = tokio::time::timeout_at(
                 deadline.at(),
-                self.acquire_adjacency(&resolved, selected, limits, deadline),
+                Box::pin(self.acquire_adjacency(&resolved, selected, limits, deadline)),
             )
             .await
             .map_err(|_| read_failure(deadline_failure(deadline.budget())))?;
@@ -159,10 +159,12 @@ impl RiftMcp {
         };
         let mut retrieved = Vec::new();
         for selection in query.retrieval_requests() {
-            let result =
-                tokio::time::timeout_at(deadline.at(), self.query_retrieval(selection, limits))
-                    .await
-                    .map_err(|_| read_failure(deadline_failure(deadline.budget())))??;
+            let result = tokio::time::timeout_at(
+                deadline.at(),
+                Box::pin(self.query_retrieval(selection, limits)),
+            )
+            .await
+            .map_err(|_| read_failure(deadline_failure(deadline.budget())))??;
             match result {
                 Ok(result) => retrieved.push(*result),
                 Err(reason) => return Ok(Err(reason)),
@@ -255,6 +257,14 @@ impl AcquiredGraph {
         }
         for (selection, result) in query.retrieval_requests().iter().zip(&retrieved) {
             dataset.insert_retrieval(selection, result)?;
+        }
+        if query.names_local_graph() {
+            if selected.is_some() {
+                return Ok(query_unavailable(
+                    SymbolUnavailableReason::InsufficientCoverage,
+                ));
+            }
+            dataset.publish_local_graph()?;
         }
         let dataset = dataset.build();
         let answer: QueryAnswer = dataset.evaluate(query, cancellation)?.into();
@@ -655,6 +665,8 @@ fn query_unavailable(reason: SymbolUnavailableReason) -> QueryReadResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rift_protocol::query::QueryLanguage;
+    use serde_json::{Value, json};
 
     type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -674,7 +686,7 @@ mod tests {
         let QueryReadResult::Results(first) = server
             .graph_query(QueryParams {
                 query: "SELECT ?name { ?symbol a :Symbol; :name ?name; :kind 'function' } ORDER BY ?name".to_owned(),
-                language: Default::default(),
+                language: QueryLanguage::Sparql,
             })
             .await
             .map_err(|failure| format!("{failure:?}"))?
@@ -692,7 +704,7 @@ mod tests {
         let QueryReadResult::Results(next) = server
             .graph_query(QueryParams {
                 query: next_query,
-                language: Default::default(),
+                language: QueryLanguage::Sparql,
             })
             .await
             .map_err(|failure| format!("{failure:?}"))?
@@ -749,7 +761,7 @@ mod tests {
                 "SELECT ?start ?text {{ <{}> :usages ?usage . ?usage :range/:start ?start ; :source ?text }} ORDER BY ?start",
                 id.as_str()
             ),
-            language: Default::default(),
+            language: QueryLanguage::Sparql,
         };
         let result = server
             .graph_query(params)
@@ -772,7 +784,7 @@ mod tests {
                     "SELECT (COUNT(?usage) AS ?n) {{ <{}> :usages ?usage }}",
                     id.as_str()
                 ),
-                language: Default::default(),
+                language: QueryLanguage::Sparql,
             })
             .await
             .map_err(|failure| format!("{failure:?}"))?
@@ -786,7 +798,7 @@ mod tests {
 
         let evidence = server.graph_query(QueryParams {
             query: format!("SELECT ?source ?unit {{ ?node :of <{}> ; :index 0 ; :source ?source ; :range [ :unit ?unit ; :start ?start ; :end ?end ] }}", id.as_str()),
-            language: Default::default(),
+            language: QueryLanguage::Sparql,
         }).await.map_err(|failure| format!("{failure:?}"))?.0;
         assert!(
             matches!(evidence, QueryReadResult::Results(ref result)
@@ -798,31 +810,25 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn graph_query_walks_three_hops_across_exact_releases_in_one_captured_view() -> TestResult
-    {
+    const ROOT: &str = "rift://symbol/cargo/crates.io/demo/rust/root";
+    const A: &str = "rift://symbol/cargo/crates.io/demo/rust/a";
+    const B: &str = "rift://symbol/cargo/crates.io/dependency/rust/b";
+    const C: &str = "rift://symbol/cargo/crates.io/dependency/rust/c";
+    const VIEW: &str = "7acfa78d70b3a8211b44149026dbab4c5f28bbf93240d7817235d3722481069d";
+
+    fn json_response(value: &Value) -> impl axum::response::IntoResponse + use<> {
+        ([("content-type", "application/json")], value.to_string())
+    }
+
+    fn remote_graph_routes(
+        requests: Arc<tokio::sync::Mutex<Vec<Value>>>,
+        endpoint_expiry: String,
+    ) -> axum::Router {
         use axum::routing::{get, post};
-        use serde_json::{Value, json};
 
-        const ROOT: &str = "rift://symbol/cargo/crates.io/demo/rust/root";
-        const A: &str = "rift://symbol/cargo/crates.io/demo/rust/a";
-        const B: &str = "rift://symbol/cargo/crates.io/dependency/rust/b";
-        const C: &str = "rift://symbol/cargo/crates.io/dependency/rust/c";
-        const VIEW: &str = "7acfa78d70b3a8211b44149026dbab4c5f28bbf93240d7817235d3722481069d";
-
-        fn response(value: Value) -> impl axum::response::IntoResponse {
-            ([("content-type", "application/json")], value.to_string())
-        }
-
-        let expires = jiff::Timestamp::now()
-            .checked_add(jiff::Span::new().minutes(2))?
-            .to_string();
-        let endpoint_expiry = expires.clone();
-        let requests_seen = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
-        let requests = Arc::clone(&requests_seen);
-        let app = axum::Router::new()
+        axum::Router::new()
             .route("/rift/v1/capabilities", get(|| async {
-                response(json!({
+                json_response(&json!({
                     "supported_package_managers": ["cargo"],
                     "supported_features": ["resolutions", "search", "symbols", "relationships"],
                     "publication_format": "rift-package-index-v2",
@@ -855,7 +861,7 @@ mod tests {
                         ROOT => (A, 1_u64),
                         A => (B, 2),
                         B => (C, 3),
-                        _ => return response(json!({"outcome":"unavailable","reason":"insufficient_coverage"})),
+                        _ => return json_response(&json!({"outcome":"unavailable","reason":"insufficient_coverage"})),
                     };
                     let symbol = |id: &str| json!({
                         "symbol": {"id":id,"name":id.rsplit('/').next(),"language":"rust","kind":"function",
@@ -871,9 +877,19 @@ mod tests {
                         "view":{"id":VIEW,"expires_at":expires}
                     });
                     requests.lock().await.push(request);
-                    response(result)
+                    json_response(&result)
                 }
-            }));
+            }))
+    }
+
+    #[tokio::test]
+    async fn graph_query_walks_three_hops_across_exact_releases_in_one_captured_view() -> TestResult
+    {
+        let expires = jiff::Timestamp::now()
+            .checked_add(jiff::Span::new().minutes(2))?
+            .to_string();
+        let requests_seen = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let app = remote_graph_routes(Arc::clone(&requests_seen), expires.clone());
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
         let endpoint = listener.local_addr()?;
         let service = tokio::spawn(async move { axum::serve(listener, app).await });
@@ -908,7 +924,7 @@ mod tests {
         let result = server
             .graph_query(QueryParams {
                 query,
-                language: Default::default(),
+                language: QueryLanguage::Sparql,
             })
             .await
             .map_err(|failure| format!("{failure:?}"))?
@@ -949,6 +965,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn graph_query_selects_the_local_graph_and_its_complete_symbol_inventory() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        crate::server::hermetic_workspace(directory.path(), "")?;
+        std::fs::write(
+            directory.path().join("Cargo.toml"),
+            "[package]\nname='graph_fixture'\nversion='1.0.0'\n[lib]\npath='lib.rs'\n",
+        )?;
+        std::fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn alpha() {}\npub fn beta() {}\n",
+        )?;
+        let root = directory.path().canonicalize()?;
+        let server =
+            RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
+        let params = QueryParams {
+            query: "SELECT (COUNT(?symbol) AS ?n) FROM NAMED <urn:rift:graph:local> { GRAPH <urn:rift:graph:local> { ?symbol a :Symbol ; :name ?name FILTER(?name IN ('alpha', 'beta')) } }".to_owned(),
+            language: QueryLanguage::Sparql,
+        };
+        let result = server
+            .graph_query(params)
+            .await
+            .map_err(|failure| format!("{failure:?}"))?
+            .0;
+        assert!(
+            matches!(result, QueryReadResult::Results(ref result)
+            if matches!(&result.answer, QueryAnswer::Bindings { bindings, .. }
+                if matches!(&bindings[0]["n"], rift_protocol::query::RdfTerm::Literal { value, .. } if value == "2"))),
+            "{result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn graph_query_projects_regex_occurrences_from_the_original_producer() -> TestResult {
         let directory = tempfile::tempdir()?;
         crate::server::hermetic_workspace(directory.path(), "")?;
@@ -961,7 +1010,7 @@ mod tests {
             RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
         let params = QueryParams {
             query: "SELECT ?start ?path { SERVICE :search { ?hit :pattern 'signal'; :target 'file'; :path ?path; :start ?start; :matched_by/:value 'content' } } ORDER BY ?start".to_owned(),
-            language: Default::default(),
+            language: QueryLanguage::Sparql,
         };
         let result = server
             .graph_query(params)
@@ -997,7 +1046,7 @@ mod tests {
         let result = server
             .graph_query(QueryParams {
                 query: "ASK { ?a :calls ?b }".to_owned(),
-                language: Default::default(),
+                language: QueryLanguage::Sparql,
             })
             .await
             .map_err(|failure| format!("{failure:?}"))?
