@@ -22,7 +22,13 @@ pub(super) struct InstalledTarget {
     pub(super) revision: Revision,
     pub(super) unit: SourceUnitId,
     pub(super) source: Arc<str>,
-    declarations: Vec<rift_protocol::index::PackageSymbol>,
+    metadata: Option<String>,
+    declarations: Vec<InstalledDeclaration>,
+}
+
+struct InstalledDeclaration {
+    range: rift_protocol::read::TextRange,
+    kind: Option<String>,
 }
 
 impl InstalledTarget {
@@ -36,36 +42,42 @@ impl InstalledTarget {
             return Err(coverage_failure());
         };
         let bytes_max = accepted.providers.syntax.max_file.bytes();
-        let (file, source) = roots.capture_package_call(&callee, &[tree], bytes_max)?;
-        let import_root = file
-            .import_root()
-            .filter(|_| package.manager == "pypi")
-            .ok_or_else(coverage_failure)?;
+        let (file, source, metadata) = roots.capture_package_call(&callee, &[tree], bytes_max)?;
         let owner = SymbolOwner::Package {
             manager: package.manager.clone(),
             registry: package.registry.clone(),
             name: package.name.clone(),
         };
-        let provider = Language {
-            name: "python".to_owned(),
+        let path = file.path().as_str();
+        let extension = Path::new(path)
+            .extension()
+            .and_then(std::ffi::OsStr::to_str);
+        let (provider, import_root) =
+            match (package.manager.as_str(), file.import_root(), extension) {
+                ("pypi", Some(import_root), Some("py")) => {
+                    ("python", Some(python_import_root(import_root)?))
+                }
+                ("npm", None, Some("ts")) if !path.ends_with(".d.ts") => ("typescript", None),
+                _ => return Err(coverage_failure()),
+            };
+        let language = Language {
+            name: provider.to_owned(),
             dialect: None,
         };
-        let import = import_root.as_str();
-        let module = import
-            .strip_suffix(".pyi")
-            .or_else(|| import.strip_suffix(".py"))
-            .unwrap_or(import);
-        let imports = [PackageImportRoot::new(
-            None,
-            vec![module.replace('/', ".")],
-            PackageImportRootOrigin::Wheel,
-        )?];
         let origin =
             rift_core::ContributionOrigin::new(Some(file.origin().clone()), SourceKind::Authored)?;
         let files = [PackageSource::new(file.path(), &source)];
         let limits = ExactPackageLimits::from_configuration(accepted)?;
-        let input = ExactPackageInput::new(&owner, &provider, &origin, &files, limits)?
-            .with_import_roots(&imports)?;
+        let manifest = rift_core::ProjectPath::new("package.json")?;
+        let context = metadata
+            .as_deref()
+            .map(|text| [PackageSource::new(&manifest, text)]);
+        let input = ExactPackageInput::new(&owner, &language, &origin, &files, limits)?
+            .with_import_roots(import_root.as_slice())?
+            .with_framework_context(
+                context.as_ref().map_or(&[], |source| source.as_slice()),
+                &[],
+            )?;
         let analysis = PackageAnalyzer::analyze(input, 1)?;
         if !analysis.warnings().is_empty() {
             return Err(coverage_failure());
@@ -88,7 +100,10 @@ impl InstalledTarget {
             .declarations
             .iter()
             .filter(|item| item.symbol == selected.symbol)
-            .cloned()
+            .map(|item| InstalledDeclaration {
+                range: item.range.clone(),
+                kind: item.node_kind.clone(),
+            })
             .collect();
         Ok(Self {
             callee,
@@ -96,6 +111,7 @@ impl InstalledTarget {
             revision: publication.revision.clone(),
             unit: selected.unit.clone(),
             source: source.into(),
+            metadata,
             declarations,
         })
     }
@@ -104,13 +120,29 @@ impl InstalledTarget {
         self.symbol.id.as_ref().ok_or_else(coverage_failure)
     }
 
+    pub(super) fn retained_bytes(&self) -> usize {
+        self.source
+            .len()
+            .saturating_add(self.metadata.as_ref().map_or(0, String::len))
+    }
+
+    pub(super) fn same_capture(&self, other: &Self) -> bool {
+        self.unit == other.unit
+            && self.revision == other.revision
+            && self.source == other.source
+            && self.metadata == other.metadata
+    }
+
     pub(super) fn verify(&self, roots: &CalleeRoots, tree: &Path) -> Result<(), RiftError> {
-        let (file, current) = roots.capture_package_call(
+        let (file, current, metadata) = roots.capture_package_call(
             &self.callee,
             &[tree],
             u64::try_from(self.source.len()).map_err(|_| coverage_failure())?,
         )?;
-        if file.unit().to_string() != self.unit.as_str() || current != self.source.as_ref() {
+        if file.unit().to_string() != self.unit.as_str()
+            || current != self.source.as_ref()
+            || metadata != self.metadata
+        {
             return Err(coverage_failure());
         }
         Ok(())
@@ -135,7 +167,7 @@ impl InstalledTarget {
                 let range = &declaration.range;
                 let start = usize::try_from(range.start).map_err(|_| coverage_failure())?;
                 let end = usize::try_from(range.end).map_err(|_| coverage_failure())?;
-                let kind = declaration.node_kind.clone().ok_or_else(coverage_failure)?;
+                let kind = declaration.kind.clone().ok_or_else(coverage_failure)?;
                 let source = if include_source {
                     self.source
                         .get(start..end)
@@ -149,7 +181,7 @@ impl InstalledTarget {
                     &Node {
                         declaration: Some(u64::try_from(index).map_err(|_| coverage_failure())?),
                         index: 0,
-                        unit: declaration.unit.clone(),
+                        unit: self.unit.clone(),
                         language: self.symbol.language.clone(),
                         kind: rift_protocol::read::ExactKind(kind),
                         facets: Vec::new(),
@@ -165,4 +197,16 @@ impl InstalledTarget {
         }
         Ok(())
     }
+}
+
+fn python_import_root(
+    import_root: &rift_core::ProjectPath,
+) -> Result<PackageImportRoot, RiftError> {
+    let import = import_root.as_str();
+    let module = import.strip_suffix(".py").unwrap_or(import);
+    PackageImportRoot::new(
+        None,
+        vec![module.replace('/', ".")],
+        PackageImportRootOrigin::Wheel,
+    )
 }

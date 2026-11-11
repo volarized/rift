@@ -629,7 +629,7 @@ impl AdjacencyWalk<'_> {
                 for (callee, occurrences) in packages {
                     let target = InstalledTarget::capture(callee, &roots, &tree, &configuration)?;
                     retained = retained
-                        .checked_add(target.source.len())
+                        .checked_add(target.retained_bytes())
                         .filter(|size| *size <= maximum)
                         .ok_or_else(coverage_failure)?;
                     targets.push((target, occurrences));
@@ -652,10 +652,12 @@ impl AdjacencyWalk<'_> {
             self.remaining.bytes_max = self
                 .remaining
                 .bytes_max
-                .checked_sub(u64::try_from(target.source.len()).map_err(|_| coverage_failure())?)
+                .checked_sub(
+                    u64::try_from(target.retained_bytes()).map_err(|_| coverage_failure())?,
+                )
                 .ok_or_else(coverage_failure)?;
             if let Some(held) = self.acquired.installed.get(&identity)
-                && (held.unit != target.unit || held.source != target.source)
+                && !held.same_capture(&target)
             {
                 return Err(coverage_failure());
             }
