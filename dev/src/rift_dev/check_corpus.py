@@ -11,6 +11,7 @@ import tempfile
 import time
 import traceback
 from collections.abc import Callable
+from itertools import batched
 from pathlib import Path
 
 from rift_dev.corpus_assertions import (
@@ -969,8 +970,8 @@ class Corpus:
             selected=details,
         )
         identities: set[str] = set()
-        beyond = 0
-        for hit in selected:
+
+        async def verify(hit: JsonObject) -> int:
             identity = optional_iri(hit, "symbol")
             if identity is not None:
                 identity = string_value(identity, "symbol identity")
@@ -992,7 +993,7 @@ class Corpus:
                     client, identity, unit, end, content, path
                 )
                 require(path.read_bytes() == content, f"read changed {path}")
-                continue
+                return 0
             # Declarations can start with attached comments or attributes. Extraction
             # keeps their end equal to the item end, so its final byte is in the item.
             request: JsonObject = {
@@ -1016,8 +1017,21 @@ class Corpus:
                 answer, nodes, unit, end - 1
             )
             if not listed:
-                beyond += 1
                 require(path.read_bytes() == content, f"read changed {path}")
+                return 1
+            return 0
+
+        beyond = 0
+        if self.pin.name == "nextjs":
+            # Each read validates the full tree. Two independent reads can use the
+            # server's worker pool while the corpus leaves the checkout unchanged.
+            for pair in batched(selected, 2):
+                async with asyncio.TaskGroup() as group:
+                    reads = [group.create_task(verify(hit)) for hit in pair]
+                beyond += sum(read.result() for read in reads)
+        else:
+            for hit in selected:
+                beyond += await verify(hit)
         self.record(
             "identities",
             count=len(identities),
@@ -1261,10 +1275,10 @@ class Corpus:
         async def read(name: str, identity: str | None) -> tuple[str, int]:
             nonlocal overlaps
             before = len(sources)
-            # A tool's first read waits for the index this workspace is still building;
-            # every read after it answers from a published one.
+            # First reads and convergence can wait for a publication. Keep the shorter
+            # budget for steady reads while the writer is running.
             first = not timings[name]
-            budget = READ_SECONDS if first else STEADY_READ_SECONDS
+            budget = READ_SECONDS if first or converging else STEADY_READ_SECONDS
             started = time.monotonic()
             codes: list[str] = []
             revision: int | None = None
