@@ -1016,10 +1016,10 @@ class Corpus:
         async def read(name: str, identity: str | None) -> tuple[str, int]:
             nonlocal overlaps
             before = len(sources)
-            # A tool's first read waits for the index this workspace is still building;
-            # every read after it answers from a published one.
+            # First reads and convergence can wait for a publication. Keep the shorter
+            # budget for steady reads while the writer is running.
             first = not timings[name]
-            budget = READ_SECONDS if first else STEADY_READ_SECONDS
+            budget = READ_SECONDS if first or converging else STEADY_READ_SECONDS
             started = time.monotonic()
             codes: list[str] = []
             revision: int | None = None
