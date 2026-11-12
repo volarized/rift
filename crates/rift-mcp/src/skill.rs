@@ -121,7 +121,10 @@ const DECISION_TABLE: &[DecisionRow] = &[
     DecisionRow {
         situation: "A symbol's source, or the syntax nodes of its declarations, is needed.",
         tools: &["nodes"],
-        note: Some("with `symbol`; send `node_cursor` back for the rest of a long answer"),
+        note: Some(
+            "with `symbol`, a project, package, or runtime one; send `node_cursor` back for the \
+             rest of a long answer",
+        ),
     },
     DecisionRow {
         situation: "The syntax structure at one position is needed.",

@@ -8,8 +8,8 @@ use rift_core::ProjectPath as CoreProjectPath;
 use rift_error::{RiftError, errors};
 use rift_index::{IndexedFile, SymbolMatch, WorkspaceIndex, WorkspaceSymbolView, whole_range};
 use rift_protocol::read::{
-    Extensions, FILE_NODE_KIND, FileId, Language, NODES_SOURCE_BYTES_MAX, Node, NodesParams,
-    SymbolId,
+    Extensions, FILE_NODE_KIND, FileId, Language, NODES_SOURCE_BYTES_MAX, Node, NodeUnit,
+    NodesParams, SymbolId,
 };
 use rift_syntax::{ByteRange, NodeHolder, NodePlace, SyntaxDocument};
 use sha2::{Digest as _, Sha256};
@@ -492,7 +492,7 @@ impl UnitSource<'_> {
         Node {
             declaration: declaration.map(wire_count),
             index: wire_count(index),
-            unit: self.unit.clone(),
+            unit: NodeUnit::File(self.unit.clone()),
             language: self.language.clone(),
             kind: super::wire_kind(kind),
             facets,

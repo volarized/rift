@@ -6,7 +6,7 @@ use rift_protocol::error::{
 use rift_protocol::read::{
     CommitAuthor, DiagnosticContext, Digest, Documentation, DocumentationFormat, ExactKind,
     Extensions, FileId, GetSymbolHit, GetSymbolResult, Language, Node, NodeFacet, NodeRegion,
-    NodesResult, PackageIdentity, Pagination, ProjectPath, ReadWarning, RegionRole,
+    NodeUnit, NodesResult, PackageIdentity, Pagination, ProjectPath, ReadWarning, RegionRole,
     RelationshipFacet, RevisionId, Signature, SourceKind, SourceLocationKind, SourceUnitId, Symbol,
     SymbolFacet, SymbolHistory, SymbolId, SymbolOrigin, SymbolVersion, SymbolVersionKind,
     TextRange,
@@ -246,7 +246,7 @@ fn node(index: u64, kind: &str, start: u64, end: u64) -> Node {
     Node {
         declaration: None,
         index,
-        unit: FileId("rift://file/src/lib.rs".to_owned()),
+        unit: NodeUnit::File(FileId("rift://file/src/lib.rs".to_owned())),
         language: rust(),
         kind: ExactKind(kind.to_owned()),
         facets: Vec::new(),
@@ -3662,6 +3662,43 @@ fn outer_and_inner() -> NodesResult {
     nodes_result(vec![outer, inner], vec!["fn name() {}\n// tail", "name"])
 }
 
+/// A package symbol's nodes, which sit in a package source unit, write as a project symbol's
+/// do: the unit locates a node for a reader of the structured answer, and the text writes
+/// the same items and the item's source.
+#[test]
+fn a_package_symbol_answer_writes_like_a_project_symbol_answer() {
+    const PACKAGE_ID: &str = "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon";
+    let package_unit = rift_protocol::read::SourceUnitId(
+        "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs".to_owned(),
+    );
+    let mut item = node(0, "function_item", 26, 44);
+    item.declaration = Some(0);
+    let mut name = node(2, "identifier", 33, 39);
+    name.declaration = Some(0);
+    name.parent = Some(0);
+    let mut answer = nodes_result(vec![item, name], vec!["pub fn beacon() {}", "beacon"]);
+    answer.symbol = Some(SymbolId(PACKAGE_ID.to_owned()));
+    let project_text = rendered(&answer);
+    for node in &mut answer.nodes {
+        node.unit = NodeUnit::Source(package_unit.clone());
+    }
+    assert_eq!(rendered(&answer), project_text);
+    golden(
+        &answer,
+        &[
+            "2 nodes · rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon",
+            "\t[1] function_item",
+            "\t\t26..44",
+            "\t\tdeclaration 0 · index 0",
+            "\t[2] identifier",
+            "\t\t33..39",
+            "\t\tdeclaration 0 · index 2 · parent 0",
+            "",
+            "\t\tpub fn beacon() {}",
+        ],
+    );
+}
+
 #[test]
 fn a_symbol_answer_writes_each_declaration_source_then_its_cursor() {
     let mut first = node(0, "function_item", 0, 9);
@@ -4164,7 +4201,7 @@ fn identities_are_written_whole_and_hashes_are_cut() {
         "{get_symbol}"
     );
     let mut node_item = node(0, "function_item", 0, 1);
-    node_item.unit = FileId(file.to_owned());
+    node_item.unit = NodeUnit::File(FileId(file.to_owned()));
     let mut node_answer = nodes_result(vec![node_item], vec!["x"]);
     node_answer.symbol = Some(SymbolId(symbol_id.to_owned()));
     let nodes = rendered(&node_answer);

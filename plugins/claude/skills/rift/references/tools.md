@@ -22,18 +22,19 @@ Parameters:
 
 Lists syntax nodes with their source text: every node of one `symbol`, or, for one
 UTF-8 byte `position` in one file, every node of the symbol whose declaration holds
-it, or the file's unit nodes when no declaration holds it. The answer names `symbol`;
+it, or the file's unit nodes when no declaration holds it. A symbol read is the way to
+read a declaration's source, and a package or runtime symbol's nodes come from the
+global API, each in a source unit of that symbol's release. The answer names `symbol`;
 each node is addressed by its place: node `index` of declaration `declaration` of
 that symbol, or node `index` of its unit, from the file node at 0, with `parent` an
-index in the same declaration or unit. An edit renumbers the nodes after it. A symbol
-read is the way to read a declaration's source. An answer whose nodes cross its node
-count or source byte bound returns `node_cursor` for the rest. A file no syntax
-provider parses answers its file node alone. `rev` lists the nodes as of a
-version-control revision instead of the current tree. If discovery is incomplete or
-a targeted read spends the request's remaining time, the result has empty `nodes`
-and carries `local_index_preparing`. A selected source path can answer within that
-remaining time, with the same warning until the publication
-records the path: workspace byte and declaration bounds remain unchecked.
+index in the same declaration or unit. An edit renumbers the nodes after it. An answer
+whose nodes cross its node count or source byte bound returns `node_cursor` for the
+rest. A file no syntax provider parses answers its file node alone. `rev` lists the
+nodes as of a version-control revision instead of the current tree. If discovery is
+incomplete or a targeted read spends the request's remaining time, the result has
+empty `nodes` and carries `local_index_preparing`. A selected source path can answer
+within that remaining time, with the same warning until the publication records the
+path: workspace byte and declaration bounds remain unchecked.
 
 Parameters:
 

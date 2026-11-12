@@ -58,7 +58,7 @@ impl CandidateResponses {
 }
 
 impl RiftMcp {
-    pub(super) fn has_captured_context(&self, view: &CapturedViewId) -> bool {
+    pub(in crate::server) fn has_captured_context(&self, view: &CapturedViewId) -> bool {
         self.candidate_responses
             .bytes
             .lock()
@@ -201,6 +201,31 @@ impl RiftMcp {
         })
         .await
     }
+
+    /// Reads the nodes of a package or runtime symbol from the global API, which holds the
+    /// facts of that symbol's release.
+    pub(in crate::server) async fn global_nodes(
+        &self,
+        params: &rift_protocol::read::NodesParams,
+    ) -> Result<Json<rift_protocol::read::NodesResult>, super::ToolFailure> {
+        let deadline = self.request_deadline().await;
+        let resolved = self
+            .published_workspace(super::wire::ErrorPhase::Read, deadline)
+            .await?;
+        resolved
+            .published
+            .configuration
+            .accepted_for_tool(super::wire::ErrorPhase::Read)?;
+        let configuration = resolved.published.configuration.global_configuration();
+        within_deadline(
+            deadline,
+            "nodes",
+            self.global.symbol_nodes(&configuration, params),
+        )
+        .await
+        .map(Json)
+    }
+
     async fn global_symbol(
         &self,
         params: &GetSymbolParams,
@@ -223,20 +248,12 @@ impl RiftMcp {
             params.view.as_ref(),
             "get_symbol",
         )?;
-        let result = tokio::time::timeout_at(
-            deadline.at(),
+        let result = within_deadline(
+            deadline,
+            "get_symbol",
             self.global.exact_symbol(&configuration, params),
         )
-        .await
-        .map_err(|_| {
-            read_failure(
-                errors::server::read_unavailable()
-                    .operation("get_symbol")
-                    .detail("a request spent its whole readiness budget")
-                    .error(),
-            )
-        })?
-        .map_err(read_failure)?;
+        .await?;
         let view = match &result {
             GetSymbolResult::Found { view, .. } | GetSymbolResult::Missing { view, .. } => {
                 Some(view)
@@ -272,6 +289,26 @@ impl super::ReadAnswer for GetSymbolResult {
             | Self::Unavailable { warnings, .. } => warnings,
         }
     }
+}
+
+/// Awaits one global API read within the request's remaining time, refusing
+/// `read_unavailable` naming `operation` once that time is spent.
+async fn within_deadline<T>(
+    deadline: crate::server::RequestDeadline,
+    operation: &'static str,
+    read: impl Future<Output = Result<T, RiftError>>,
+) -> Result<T, super::ToolFailure> {
+    tokio::time::timeout_at(deadline.at(), read)
+        .await
+        .map_err(|_| {
+            read_failure(
+                errors::server::read_unavailable()
+                    .operation(operation)
+                    .detail("a request spent its whole readiness budget")
+                    .error(),
+            )
+        })?
+        .map_err(read_failure)
 }
 
 #[cfg(test)]

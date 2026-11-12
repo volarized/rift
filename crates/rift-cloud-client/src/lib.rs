@@ -3,6 +3,7 @@
 mod cache;
 pub mod contract;
 mod failure;
+mod nodes;
 mod pattern;
 mod response;
 pub mod search;

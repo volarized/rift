@@ -11,6 +11,7 @@ import tempfile
 import time
 import traceback
 from collections.abc import Callable
+from itertools import batched
 from pathlib import Path
 from typing import cast
 
@@ -776,8 +777,8 @@ class Corpus:
             selected=details,
         )
         identities: set[str] = set()
-        beyond = 0
-        for hit in selected:
+
+        async def verify(hit: JsonObject) -> int:
             symbol = object_value(
                 object_value(hit.get("hit"), "search hit").get("symbol"), "symbol"
             )
@@ -807,7 +808,7 @@ class Corpus:
                     client, identity, unit, end, content, path
                 )
                 require(path.read_bytes() == content, f"read changed {path}")
-                continue
+                return 0
             # Declarations can start with attached comments or attributes. Extraction
             # keeps their end equal to the item end, so its final byte is in the item.
             request: JsonObject = {
@@ -831,9 +832,8 @@ class Corpus:
                 answer, nodes, unit, end - 1
             )
             if not listed:
-                beyond += 1
                 require(path.read_bytes() == content, f"read changed {path}")
-                continue
+                return 1
             matching = [
                 node
                 for node in nodes
@@ -868,6 +868,19 @@ class Corpus:
                 f"raw declaration acquired an unproved identity at {path}:{start}-{end}",
             )
             require(path.read_bytes() == content, f"read changed {path}")
+            return 0
+
+        beyond = 0
+        if self.pin.name == "nextjs":
+            # Each read validates the full tree. Two independent reads can use the
+            # server's worker pool while the corpus leaves the checkout unchanged.
+            for pair in batched(selected, 2):
+                async with asyncio.TaskGroup() as group:
+                    reads = [group.create_task(verify(hit)) for hit in pair]
+                beyond += sum(read.result() for read in reads)
+        else:
+            for hit in selected:
+                beyond += await verify(hit)
         self.record(
             "identities",
             count=len(identities),

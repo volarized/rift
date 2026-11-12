@@ -289,6 +289,38 @@ fn the_pattern_max_length_is_the_search_pattern_bound() -> TestResult {
     Ok(())
 }
 
+/// The contract states the source bound a nodes page stops at and the cursor bound the
+/// client enforces, and a drift in either fails validation.
+#[test]
+fn the_nodes_page_bounds_are_the_ones_the_client_enforces() -> TestResult {
+    let mut document = contract()?;
+    document["paths"]["/v1/nodes"]["post"]["x-rift-page-source-bytes-max"] = json!(2_097_152);
+    assert_invalid(&document, "x-rift-page-source-bytes-max")?;
+
+    let mut document = contract()?;
+    document["components"]["schemas"]["NodesParams"]["properties"]["node_cursor"]["maxLength"] =
+        json!(8192);
+    assert_invalid(&document, "NodesParams/node_cursor/maxLength")?;
+
+    let mut document = contract()?;
+    document["paths"]["/v1/nodes"]["post"]["requestBody"]["content"]["application/json"]["schema"] =
+        json!({"$ref": "#/components/schemas/GetSymbolParams"});
+    assert_invalid(&document, "POST /v1/nodes request must use NodesParams")?;
+
+    let mut document = contract()?;
+    document["paths"]["/v1/nodes"]["post"]["responses"]["200"]["content"]["application/json"]["schema"] =
+        json!({"$ref": "#/components/schemas/GetSymbolResult"});
+    assert_invalid(
+        &document,
+        "POST /v1/nodes 200 response must use NodesResult",
+    )?;
+
+    let mut document = contract()?;
+    document["paths"]["/v1/nodes"]["post"]["parameters"] = json!([]);
+    assert_invalid(&document, "POST /v1/nodes must not declare query selectors")?;
+    Ok(())
+}
+
 /// An optional property accepting `null` fails validation, in a shared schema and in one the
 /// contract alone defines: the service omits an absent field.
 #[test]
@@ -325,7 +357,7 @@ fn every_contract_example_validates_against_its_schema() -> TestResult {
     let mut checked = 0_usize;
     validate_examples(&document, components, &mut checked)?;
     assert_eq!(
-        checked, 15,
+        checked, 17,
         "each request and success response carries an example"
     );
     Ok(())
@@ -337,7 +369,7 @@ fn every_contract_response_example_decodes_through_generated_types() -> TestResu
     let mut checked = 0_usize;
     decode_examples(&document, &mut checked)?;
     assert_eq!(
-        checked, 8,
+        checked, 9,
         "each success response carries a generated response type"
     );
     Ok(())
@@ -401,6 +433,15 @@ fn decode_generated_response_example(reference: &str, value: Value) -> TestResul
         "#/components/schemas/PackagePatternPage" => {
             serde_json::from_value::<PackagePatternPage>(value)?;
         }
+        "#/components/schemas/NodesResult" => {
+            let result = serde_json::from_value::<rift_protocol::read::NodesResult>(value)?;
+            assert!(
+                result
+                    .nodes
+                    .iter()
+                    .all(|node| matches!(node.unit, rift_protocol::read::NodeUnit::Source(_)))
+            );
+        }
         "#/components/schemas/FindDeclarationsResult" => {
             serde_json::from_value::<rift_protocol::source_read::FindDeclarationsResult>(value)?;
         }
@@ -408,6 +449,7 @@ fn decode_generated_response_example(reference: &str, value: Value) -> TestResul
         | "#/components/schemas/PackageSearchRequest"
         | "#/components/schemas/PackagePatternRequest"
         | "#/components/schemas/GetSymbolParams"
+        | "#/components/schemas/NodesParams"
         | "#/components/schemas/FindDeclarationsParams" => return Ok(false),
         other => return Err(format!("contract example names no generated type: {other}").into()),
     }

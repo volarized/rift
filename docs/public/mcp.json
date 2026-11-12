@@ -3554,7 +3554,7 @@
       }
     },
     {
-      "description": "Lists syntax nodes with their source text: every node of one `symbol`, or, for one\nUTF-8 byte `position` in one file, every node of the symbol whose declaration holds\nit, or the file's unit nodes when no declaration holds it. The answer names `symbol`;\neach node is addressed by its place: node `index` of declaration `declaration` of\nthat symbol, or node `index` of its unit, from the file node at 0, with `parent` an\nindex in the same declaration or unit. An edit renumbers the nodes after it. A symbol\nread is the way to read a declaration's source. An answer whose nodes cross its node\ncount or source byte bound returns `node_cursor` for the rest. A file no syntax\nprovider parses answers its file node alone. `rev` lists the nodes as of a\nversion-control revision instead of the current tree. If discovery is incomplete or\na targeted read spends the request's remaining time, the result has empty `nodes`\nand carries `local_index_preparing`. A selected source path can answer within that\nremaining time, with the same warning until the publication\nrecords the path: workspace byte and declaration bounds remain unchecked.",
+      "description": "Lists syntax nodes with their source text: every node of one `symbol`, or, for one\nUTF-8 byte `position` in one file, every node of the symbol whose declaration holds\nit, or the file's unit nodes when no declaration holds it. A symbol read is the way to\nread a declaration's source, and a package or runtime symbol's nodes come from the\nglobal API, each in a source unit of that symbol's release. The answer names `symbol`;\neach node is addressed by its place: node `index` of declaration `declaration` of\nthat symbol, or node `index` of its unit, from the file node at 0, with `parent` an\nindex in the same declaration or unit. An edit renumbers the nodes after it. An answer\nwhose nodes cross its node count or source byte bound returns `node_cursor` for the\nrest. A file no syntax provider parses answers its file node alone. `rev` lists the\nnodes as of a version-control revision instead of the current tree. If discovery is\nincomplete or a targeted read spends the request's remaining time, the result has\nempty `nodes` and carries `local_index_preparing`. A selected source path can answer\nwithin that remaining time, with the same warning until the publication records the\npath: workspace byte and declaration bounds remain unchecked.",
       "input_schema": {
         "$defs": {
           "CapturedViewId": {
@@ -3674,7 +3674,7 @@
           },
           "symbol": {
             "$ref": "#/$defs/SymbolId",
-            "description": "The symbol whose nodes the read lists: each declaration's item node, then the\ndescendants that belong to that declaration and not to a declaration nested in it,\noutermost first per declaration. The caller MUST omit `path` and `position` beside it."
+            "description": "The symbol whose nodes the read lists: each declaration's item node, then the\ndescendants that belong to that declaration and not to a declaration nested in it,\noutermost first per declaration. A package or runtime symbol's nodes come from the\nglobal API. The caller MUST omit `path` and `position` beside it."
           },
           "view": {
             "$ref": "#/$defs/CapturedViewId",
@@ -4091,8 +4091,8 @@
                 "type": "string"
               },
               "unit": {
-                "$ref": "#/$defs/FileId",
-                "description": "The file the node is written in."
+                "$ref": "#/$defs/NodeUnit",
+                "description": "The source unit the node is written in: a project file, or a package or runtime\nsource unit for a node of a package or runtime symbol."
               }
             },
             "required": [
@@ -4218,6 +4218,19 @@
               "range"
             ],
             "type": "object"
+          },
+          "NodeUnit": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/FileId",
+                "description": "A file of the project tree, as `rift://file/src/lib.rs`."
+              },
+              {
+                "$ref": "#/$defs/SourceUnitId",
+                "description": "A source unit of a package or runtime release, as\n`rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs`."
+              }
+            ],
+            "description": "The source unit a [`Node`] is written in: a file of the project tree the read targets, or\na source unit of the package or runtime release that owns the node's symbol."
           },
           "NotebookCell": {
             "additionalProperties": false,

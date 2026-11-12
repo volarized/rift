@@ -3721,6 +3721,345 @@ impl<'de> serde::Deserialize<'de> for SyntaxFramework {
         }
     }
 }
+/// Lists syntax nodes with their source: every node of one `symbol`, or the nodes of the
+/// innermost declaration holding one `position` in one file, or of that file's unit when no
+/// declaration holds it. Each node carries its kind, range, source text, and place, including
+/// expressions smaller than a declaration.
+#[serde_with::skip_serializing_none]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
+#[serde(deny_unknown_fields)]
+pub struct NodesParams {
+    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
+    pub symbol: Option<String>,
+    /// One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift
+    /// normalizes what it emits and what it accepts, and compares byte-for-byte. The empty path
+    /// names the root itself. Absolute paths, backslashes, control characters, empty segments,
+    /// and `.` or `..` segments are refused before the filesystem is touched. The limit is 1000
+    /// UTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal
+    /// fails the read that touches them with `content_unavailable`.
+    #[validate(
+        length(max = 1_000u64),
+        regex(path = "REGEX_DOCUMENTATION_LICENSE_FILE_PATH")
+    )]
+    pub path: Option<String>,
+    /// UTF-8 byte offset inside the declaration whose nodes the read lists - one position,
+    /// not a range; the nodes themselves carry the spans. The read lists the nodes of the
+    /// innermost declaration holding the node at the position, or of the file's unit when no
+    /// declaration holds it. A position inside a multi-byte character is valid; a position at
+    /// or past the file's byte length refuses.
+    #[validate(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
+    pub position: Option<u64>,
+    /// Continuation a preceding read returned, bound to the symbol or unit its answer listed
+    /// and the tree revision it read. The caller MUST send it with the selector of that read;
+    /// the server refuses it for another symbol or unit and once the tree has moved.
+    #[validate(length(min = 1u64, max = 4_096u64))]
+    pub node_cursor: Option<String>,
+    /// A service-issued key for one immutable view in one serving context.
+    #[validate(
+        length(min = 3u64, max = 4_096u64),
+        regex(path = "REGEX_PACKAGE_SEARCH_REQUEST_VIEW")
+    )]
+    pub view: Option<String>,
+    /// Identity of one revision in the workspace's version-control history, spelled the way the
+    /// version-control system spells it: a branch, tag, or commit id, optionally followed by
+    /// ancestry suffixes, such as `HEAD~2` for the second first-parent ancestor or `main^2` for
+    /// the second parent. Rift carries it opaquely and never orders two revisions by comparing
+    /// their identifiers.
+    #[validate(
+        length(min = 1u64, max = 128u64),
+        regex(path = "REGEX_COMMIT_HIT_REVISION")
+    )]
+    pub rev: Option<String>,
+}
+/// The nodes a read selected, each with its source text and its place inside its symbol or
+/// unit.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct NodesResult {
+    /// Continuation for the rest of an answer whose nodes crossed its node count or source
+    /// byte bound. Absent when the answer holds the last node.
+    pub node_cursor: Option<String>,
+    /// Nodes the read selected, in pre-order: per declaration, in the order a symbol read
+    /// lists them, or the unit's nodes from its file node on.
+    pub nodes: Vec<Node>,
+    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    pub symbol: Option<String>,
+    /// The immutable serving view and the expiry promised by its owner.
+    pub view: Option<CapturedView>,
+    /// Warnings attached to this result. Absent when there is nothing to warn about.
+    #[default(Some(Default::default()))]
+    pub warnings: Option<Vec<ReadWarning>>,
+}
+/// One node of a source unit's syntax tree, with its source text, addressed by its place inside
+/// a symbol. A node inside a declaration's item subtree is node `index` of declaration
+/// `declaration` of the symbol the read names; a node outside every declaration is node `index`
+/// of its `unit`. Indexes count in pre-order from 0 at the declaration's item node, or from 0 at
+/// the unit's file node, and skip the subtrees of nested declarations, whose nodes belong to the
+/// nested symbol. The address names a place at the read's revision: an edit renumbers the nodes
+/// after it.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct Node {
+    /// Ordinal of the declaration holding this node among the declarations of the symbol the
+    /// read names, from 0 in the order a symbol read lists them. Absent for a node outside
+    /// every declaration: the file node, an import, a top-level statement.
+    pub declaration: Option<u64>,
+    /// Pre-order position of this node inside its declaration's item subtree, or inside its
+    /// unit when `declaration` is absent. The item node and the unit's file node are 0.
+    pub index: u64,
+    /// The source unit a [`Node`] is written in: a file of the project tree the read targets, or
+    /// a source unit of the package or runtime release that owns the node's symbol.
+    pub unit: Box<NodeUnit>,
+    /// A language name and its optional dialect, joined by `:`. `sql` and `sql:postgresql` are two languages with two symbol spaces.
+    pub language: String,
+    /// A provider-local kind preserving the construct name used by that language implementation.
+    pub kind: String,
+    /// Portable structural classification, so a query can ask for bodies or imports without
+    /// knowing the grammar that produced them. Absent when empty.
+    #[default(Some(Default::default()))]
+    pub facets: Option<Vec<NodeFacet>>,
+    /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
+    /// from whatever its toolchain counts in at its own boundary, so two toolchains' column
+    /// numbers arrive here on the same scale. No JSON Schema keyword can tie one field to
+    /// another, so that `end` is never below `start` is asserted by the surface
+    /// validation tests instead.
+    pub range: TextRange,
+    /// The node's exact source text: the bytes `range` spans at the read's revision.
+    pub source: String,
+    /// The node's named parts, including its function body and documentation. Absent when empty.
+    #[default(Some(Default::default()))]
+    pub regions: Option<Vec<NodeRegion>>,
+    /// `index` of the node this one is nested inside, in the same declaration or unit. Absent
+    /// for node 0.
+    pub parent: Option<u64>,
+    /// Facts a provider carries that the model has no field for, under a reverse-domain key.
+    /// Keys and values use RFC 8785 canonical JSON. Consumers skip entries they do not
+    /// implement.
+    pub extensions: Option<serde_json::Value>,
+}
+/// Portable structural facets, so a filter can ask for bodies or imports without knowing the
+/// grammar that produced them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
+pub enum NodeFacet {
+    /// Introduces a name.
+    #[default]
+    Declaration,
+    /// Supplies the implementation behind a declared name.
+    Definition,
+    /// The implementation part of a declaration.
+    Body,
+    /// A delimited group of statements.
+    Block,
+    /// One executable step.
+    Statement,
+    /// Computes a value.
+    Expression,
+    /// Spells a type.
+    TypeExpression,
+    /// Brings an external name into scope.
+    Import,
+    /// Exposes a name outside its unit.
+    Export,
+    /// A declared input of a callable.
+    Parameter,
+    /// A value passed at a call site.
+    Argument,
+    /// A decorator or attribute qualifying a construct.
+    Annotation,
+    /// Commentary the language ignores.
+    Comment,
+    /// A name as written in the source.
+    Identifier,
+    /// A value written out directly.
+    Literal,
+    /// A destructuring or match pattern.
+    Pattern,
+    /// Produced by a tool rather than authored.
+    Generated,
+    /// Belongs to test code.
+    Test,
+}
+impl core::fmt::Display for NodeFacet {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Declaration => write!(f, "declaration"),
+            Self::Definition => write!(f, "definition"),
+            Self::Body => write!(f, "body"),
+            Self::Block => write!(f, "block"),
+            Self::Statement => write!(f, "statement"),
+            Self::Expression => write!(f, "expression"),
+            Self::TypeExpression => write!(f, "type_expression"),
+            Self::Import => write!(f, "import"),
+            Self::Export => write!(f, "export"),
+            Self::Parameter => write!(f, "parameter"),
+            Self::Argument => write!(f, "argument"),
+            Self::Annotation => write!(f, "annotation"),
+            Self::Comment => write!(f, "comment"),
+            Self::Identifier => write!(f, "identifier"),
+            Self::Literal => write!(f, "literal"),
+            Self::Pattern => write!(f, "pattern"),
+            Self::Generated => write!(f, "generated"),
+            Self::Test => write!(f, "test"),
+        }
+    }
+}
+impl<'de> serde::Deserialize<'de> for NodeFacet {
+    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_ascii_lowercase().as_str() {
+            "declaration" => Ok(NodeFacet::Declaration),
+            "definition" => Ok(NodeFacet::Definition),
+            "body" => Ok(NodeFacet::Body),
+            "block" => Ok(NodeFacet::Block),
+            "statement" => Ok(NodeFacet::Statement),
+            "expression" => Ok(NodeFacet::Expression),
+            "type_expression" => Ok(NodeFacet::TypeExpression),
+            "import" => Ok(NodeFacet::Import),
+            "export" => Ok(NodeFacet::Export),
+            "parameter" => Ok(NodeFacet::Parameter),
+            "argument" => Ok(NodeFacet::Argument),
+            "annotation" => Ok(NodeFacet::Annotation),
+            "comment" => Ok(NodeFacet::Comment),
+            "identifier" => Ok(NodeFacet::Identifier),
+            "literal" => Ok(NodeFacet::Literal),
+            "pattern" => Ok(NodeFacet::Pattern),
+            "generated" => Ok(NodeFacet::Generated),
+            "test" => Ok(NodeFacet::Test),
+            _ => {
+                Err(
+                    serde::de::Error::unknown_variant(
+                        &s,
+                        &[
+                            "declaration",
+                            "definition",
+                            "body",
+                            "block",
+                            "statement",
+                            "expression",
+                            "type_expression",
+                            "import",
+                            "export",
+                            "parameter",
+                            "argument",
+                            "annotation",
+                            "comment",
+                            "identifier",
+                            "literal",
+                            "pattern",
+                            "generated",
+                            "test",
+                        ],
+                    ),
+                )
+            }
+        }
+    }
+}
+/// One named part of a node, and the bytes it spans.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct NodeRegion {
+    /// One named part of a node. A language marks these out inside a declaration, so an
+    /// operation can address the body of a function without addressing its documentation.
+    pub role: RegionRole,
+    /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
+    /// from whatever its toolchain counts in at its own boundary, so two toolchains' column
+    /// numbers arrive here on the same scale. No JSON Schema keyword can tie one field to
+    /// another, so that `end` is never below `start` is asserted by the surface
+    /// validation tests instead.
+    pub range: TextRange,
+}
+/// The source unit a [`Node`] is written in: a file of the project tree the read targets, or
+/// a source unit of the package or runtime release that owns the node's symbol.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(untagged)]
+pub enum NodeUnit {
+    /// Identity of one file in the tree a request targets. The path after `rift://file/` is a
+    /// `ProjectPath` in canonical percent-encoding. The server re-validates the decoded path
+    /// wherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,
+    /// whatever schema its implementation generated from.
+    #[default]
+    File(FileId),
+    /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
+    SourceUnit(SourceUnitId),
+}
+/// One named part of a node. A language marks these out inside a declaration, so an
+/// operation can address the body of a function without addressing its documentation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
+pub enum RegionRole {
+    /// The stretch that best identifies the node when presented.
+    #[default]
+    Selection,
+    /// The name being declared.
+    Name,
+    /// The declaration up to where the body starts.
+    Header,
+    /// The implementation, without documentation or header.
+    Body,
+    /// The interior of the node without its delimiters.
+    Content,
+    /// The doc comment attached to the declaration.
+    Documentation,
+    /// The full extent including what surrounds the node proper.
+    Enclosing,
+}
+impl core::fmt::Display for RegionRole {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Selection => write!(f, "selection"),
+            Self::Name => write!(f, "name"),
+            Self::Header => write!(f, "header"),
+            Self::Body => write!(f, "body"),
+            Self::Content => write!(f, "content"),
+            Self::Documentation => write!(f, "documentation"),
+            Self::Enclosing => write!(f, "enclosing"),
+        }
+    }
+}
+impl<'de> serde::Deserialize<'de> for RegionRole {
+    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_ascii_lowercase().as_str() {
+            "selection" => Ok(RegionRole::Selection),
+            "name" => Ok(RegionRole::Name),
+            "header" => Ok(RegionRole::Header),
+            "body" => Ok(RegionRole::Body),
+            "content" => Ok(RegionRole::Content),
+            "documentation" => Ok(RegionRole::Documentation),
+            "enclosing" => Ok(RegionRole::Enclosing),
+            _ => {
+                Err(
+                    serde::de::Error::unknown_variant(
+                        &s,
+                        &[
+                            "selection",
+                            "name",
+                            "header",
+                            "body",
+                            "content",
+                            "documentation",
+                            "enclosing",
+                        ],
+                    ),
+                )
+            }
+        }
+    }
+}
 /// Returns supported package managers, features, publication revisions, and active bounds.
 #[derive(Debug, Clone, validator::Validate, oas3_gen_support::Default)]
 pub struct GetCapabilitiesRequest {}
@@ -4271,6 +4610,146 @@ pub enum GetSymbolResponse {
     GatewayTimeout(ProblemDetails),
     ///404: The valid identity is absent from the completely searched exact selection.
     NotFound(GetSymbolResult),
+    ///default: Unknown response
+    Unknown,
+}
+/// Lists the syntax nodes of one package or runtime symbol with their source text, in the exact release its identity names: each declaration's item node, then the descendants that belong to that declaration and not to a declaration nested in it, outermost first per declaration. Every node's `unit` is a source unit of that release. The request carries `symbol` and MAY carry `node_cursor` and `view`; the server refuses `path`, `position`, and `rev`. A page holds at most `page_limit_max` nodes and, beyond its first node, at most `x-rift-page-source-bytes-max` bytes of node source; `node_cursor` continues where the page stopped. A symbol the release does not declare answers 404.
+#[derive(Debug, Clone, validator::Validate, oas3_gen_support::Default)]
+pub struct NodesRequest {
+    /// The package or runtime symbol whose nodes the request lists.
+    #[validate(nested)]
+    pub body: NodesParams,
+}
+impl NodesRequest {
+    /// Parse the HTTP response into the response enum.
+    pub async fn parse_response(
+        req: reqwest::Response,
+    ) -> anyhow::Result<NodesResponse> {
+        let status = req.status();
+        if status == http::StatusCode::OK {
+            let data = oas3_gen_support::Diagnostics::<
+                NodesResult,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(NodesResponse::Ok(data));
+        }
+        if status == http::StatusCode::BAD_REQUEST {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(NodesResponse::BadRequest(data));
+        }
+        if status == http::StatusCode::UNAUTHORIZED {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(NodesResponse::Unauthorized(data));
+        }
+        if status == http::StatusCode::FORBIDDEN {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(NodesResponse::Forbidden(data));
+        }
+        if status == http::StatusCode::NOT_ACCEPTABLE {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(NodesResponse::NotAcceptable(data));
+        }
+        if status == http::StatusCode::PAYLOAD_TOO_LARGE {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(NodesResponse::ContentTooLarge(data));
+        }
+        if status == http::StatusCode::UNSUPPORTED_MEDIA_TYPE {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(NodesResponse::UnsupportedMediaType(data));
+        }
+        if status == http::StatusCode::TOO_MANY_REQUESTS {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(NodesResponse::TooManyRequests(data));
+        }
+        if status == http::StatusCode::INTERNAL_SERVER_ERROR {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(NodesResponse::InternalServerError(data));
+        }
+        if status == http::StatusCode::BAD_GATEWAY {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(NodesResponse::BadGateway(data));
+        }
+        if status == http::StatusCode::SERVICE_UNAVAILABLE {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(NodesResponse::ServiceUnavailable(data));
+        }
+        if status == http::StatusCode::GATEWAY_TIMEOUT {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(NodesResponse::GatewayTimeout(data));
+        }
+        if status == http::StatusCode::NOT_FOUND {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(NodesResponse::NotFound(data));
+        }
+        let _ = req.bytes().await?;
+        return Ok(NodesResponse::Unknown);
+    }
+}
+/// Response types for nodes
+#[derive(Debug, Clone)]
+pub enum NodesResponse {
+    ///200: The symbol's nodes with their source text.
+    Ok(NodesResult),
+    ///400: Request JSON, query parameters, or field relationships are invalid.
+    BadRequest(ProblemDetails),
+    ///401: Authentication is required or credentials are invalid.
+    Unauthorized(ProblemDetails),
+    ///403: Credentials do not permit this operation.
+    Forbidden(ProblemDetails),
+    ///406: The server cannot produce an accepted media type.
+    NotAcceptable(ProblemDetails),
+    ///413: The request body exceeds the request body bound.
+    ContentTooLarge(ProblemDetails),
+    ///415: The request media type is unsupported.
+    UnsupportedMediaType(ProblemDetails),
+    ///429: The request rate limit is exhausted.
+    TooManyRequests(ProblemDetails),
+    ///500: The server encountered an unexpected failure.
+    InternalServerError(ProblemDetails),
+    ///502: The server received an invalid upstream response.
+    BadGateway(ProblemDetails),
+    ///503: Typed selection unavailability or service failure.
+    ServiceUnavailable(ProblemDetails),
+    ///504: The upstream request timed out.
+    GatewayTimeout(ProblemDetails),
+    ///404: The release the symbol names declares no such symbol.
+    NotFound(ProblemDetails),
     ///default: Unknown response
     Unknown,
 }

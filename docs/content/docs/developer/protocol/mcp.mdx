@@ -807,11 +807,17 @@ A `symbol` read answers every node of the symbol: per declaration, in the order
 [`get_symbol`](#tool-get_symbol) lists its declarations, the item node, which spans the
 declaration without its attached documentation, then each node of its item subtree in
 pre-order that no declaration nested in it holds. The answer names the symbol in `symbol`, and
-the item node's `source` is the declaration's source. A symbol with no declaration in the index refuses
-`resource_not_found`. The server serves the symbols of the workspace and its accepted extra
-projects; a package or runtime symbol refuses `capability_unavailable`.
+the item node's `source` is the declaration's source. A symbol with no declaration in the index
+refuses `resource_not_found`.
 
-One answer holds at most `results_max` nodes and 1 MiB of node source, and at least one node.
+The server reads the nodes of a package or runtime symbol from the global API, in the exact
+release the identity names. Each node's `unit` is then a source unit of that release, such as
+`rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs`, and a symbol the release does not declare
+refuses `resource_not_found`. The server **MUST** refuse `rev` beside such a symbol with
+`invalid_request`, since the global API serves released source alone.
+
+One answer holds at most `results_max` nodes, or the global API's `page_limit_max` for a package
+or runtime symbol, and 1 MiB of node source, and at least one node.
 When nodes remain, the answer carries `node_cursor`; the caller **MUST** send it back with the
 same selector to read the next page. A cursor binds the answer's symbol or unit and the tree
 revision the read served, so the server refuses it with `invalid_request` for another symbol or
