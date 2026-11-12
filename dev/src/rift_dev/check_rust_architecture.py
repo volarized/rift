@@ -39,6 +39,8 @@ EXPECTED_EDGES = {
     "rift-cloud-client -> rift-protocol",
     "rift-cloud-client -> rift-ranking",
     "rift-cloud-client -> rift-tracing",
+    "rift-collect -> rift-core",
+    "rift-collect -> rift-lsp",
     "rift-core -> rift-protocol",
     "rift-core -> rift-error",
     "rift-error -> rift-error-macros",
@@ -799,11 +801,10 @@ def main() -> int:
         for target in package["targets"]
         if "bin" in target["kind"]
     )
-    # rift is the only released binary, and rift-schema-export is the
-    # repo-internal generator that writes the served tool surface into
-    # docs/public. Engine behavior is proven against real language servers, so
-    # the workspace ships no test engine of its own.
+    # rift is the released binary. rift-collect runs local semantic collection,
+    # and rift-schema-export writes the served tool surface into docs/public.
     expected_binaries = [
+        "rift-collect:rift-collect",
         "rift-schema-export:rift-schema-export",
         "rift:rift",
     ]

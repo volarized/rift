@@ -32,9 +32,16 @@ const HEADER_SEPARATOR: char = ':';
 /// plus one fed chunk, because every complete frame is drained on the feed
 /// that completes it and an overlong header or body is refused instead of
 /// buffered.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Framing {
     buffer: Vec<u8>,
+    message_bytes_max: usize,
+}
+
+impl Default for Framing {
+    fn default() -> Self {
+        Self::with_message_limit(MESSAGE_BYTES_MAX)
+    }
 }
 
 impl Framing {
@@ -42,6 +49,15 @@ impl Framing {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An empty codec with a smaller limit on announced message bodies.
+    #[must_use]
+    pub fn with_message_limit(message_bytes_max: usize) -> Self {
+        Self {
+            buffer: Vec::new(),
+            message_bytes_max: message_bytes_max.min(MESSAGE_BYTES_MAX),
+        }
     }
 
     /// Wraps one outgoing JSON payload in its `Content-Length` header.
@@ -93,11 +109,11 @@ impl Framing {
             return errors::lsp::framing_header_too_long().fail();
         }
         let body_bytes = content_length(&self.buffer[..terminator])?;
-        if body_bytes > MESSAGE_BYTES_MAX {
+        if body_bytes > self.message_bytes_max {
             return errors::lsp::framing_message_too_long()
                 .announced_bytes(body_bytes)
                 .field("framing.message_bytes_max")
-                .limit(MESSAGE_BYTES_MAX)
+                .limit(self.message_bytes_max)
                 .required(body_bytes)
                 .fail();
         }
@@ -143,6 +159,19 @@ mod tests {
 
     fn fed(codec: &mut Framing, bytes: &[u8]) -> Vec<Vec<u8>> {
         codec.feed(bytes).expect("feed must succeed")
+    }
+
+    #[test]
+    fn custom_body_limit_refuses_the_header_without_waiting_for_the_body() {
+        let mut codec = Framing::with_message_limit(2);
+        assert_eq!(
+            fed(&mut codec, b"Content-Length: 2\r\n\r\n{}"),
+            [b"{}".to_vec()]
+        );
+        let error = codec
+            .feed(b"Content-Length: 3\r\n\r\n")
+            .expect_err("announced body crosses custom limit");
+        assert_eq!(error.slug(), errors::lsp::framing_message_too_long::SLUG);
     }
 
     #[test]
