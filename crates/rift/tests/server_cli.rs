@@ -1579,6 +1579,44 @@ fn stop_after_large_workspace_binds_ends_the_process() -> TestResult {
 /// close below: `[search] busy_timeout` at its upper bound, longer than the whole stop.
 const HELD_INDEX_BUSY_TIMEOUT: &str = "30s";
 
+/// Takes the index write lock and returns it once the worker starts its blocked write.
+fn hold_index_write(root: &Path, stderr: &StderrWatch) -> TestResult<rusqlite::Connection> {
+    let holder = rusqlite::Connection::open(root.join(".rift").join("index"))?;
+    wait_for_initial_trigram_index(&holder)?;
+
+    // Another process takes the index database's write lock, then a source change makes
+    // the server write: its `BEGIN IMMEDIATE` waits inside SQLite's busy handler.
+    holder.execute_batch("BEGIN IMMEDIATE")?;
+    let previous_commits = stderr
+        .snapshot()
+        .matches("lexical commit committing")
+        .count();
+    fs::write(
+        root.join("lib.rs"),
+        "pub fn beacon() {}\npub fn held() {}\n",
+    )?;
+    // The lane can still be canceled after its start record. Once the index worker
+    // starts the transaction itself, it must finish that command before it can stop.
+    wait_for(
+        START_POLL_ATTEMPT_COUNT,
+        "the index worker to start the held lexical transaction",
+        || {
+            let records = stderr.snapshot();
+            let (start, _) = records
+                .match_indices("lexical commit committing")
+                .nth(previous_commits)?;
+            records[start..]
+                .lines()
+                .any(|line| {
+                    line.contains("database=index")
+                        && line.ends_with("SQLite worker beginning immediate transaction")
+                })
+                .then_some(())
+        },
+    )?;
+    Ok(holder)
+}
+
 /// A server whose index write waits on a lock another process holds is stopped: the
 /// write keeps its SQLite worker, so the worker's stop outlasts its bound; the close runs no
 /// checkpoint. The stop still exits 0, ends the `SQLite worker shutdown` stage `timeout`
@@ -1602,38 +1640,33 @@ fn a_stop_whose_index_close_outlasts_its_bound_ends_timeout_and_retires_the_docu
         .args(["server", "start", "--foreground"])
         .current_dir(root)
         .envs(SERVER_LOG_VARIABLES)
+        .env(
+            "RUST_LOG",
+            format!("{STARTUP_TRACE_FILTER},rift_index::database_thread=debug"),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()?;
     let stderr = StderrWatch::spawn(&mut child, FOREGROUND_LABEL)?;
     wait_for_foreground_server(root, &mut child, &stderr)?;
-    wait_for(START_POLL_ATTEMPT_COUNT, "the first lexical commit", || {
-        stderr
-            .snapshot()
-            .contains("lexical commit settled")
-            .then_some(())
-    })?;
-
-    let holder = rusqlite::Connection::open(root.join(".rift").join("index"))?;
-    wait_for_initial_trigram_index(&holder)?;
-
-    // Another process takes the index database's write lock, then a source change makes
-    // the server write: its `BEGIN IMMEDIATE` waits inside SQLite's busy handler.
-    holder.execute_batch("BEGIN IMMEDIATE")?;
-    fs::write(
-        root.join("lib.rs"),
-        "pub fn beacon() {}\npub fn held() {}\n",
+    wait_for(
+        START_POLL_ATTEMPT_COUNT,
+        "the initial lexical and trigram commits",
+        || {
+            let records = stderr.snapshot();
+            let (_, after_commit) = records.split_once("lexical commit settled")?;
+            after_commit
+                .lines()
+                .any(|line| {
+                    line.contains("the trigram index took a batch of file rows")
+                        && line.contains("pending=0")
+                })
+                .then_some(())
+        },
     )?;
-    wait_for(START_POLL_ATTEMPT_COUNT, "the held lexical commit", || {
-        (stderr
-            .snapshot()
-            .matches("lexical commit committing")
-            .count()
-            >= 2)
-            .then_some(())
-    })?;
 
+    let holder = hold_index_write(root, &stderr)?;
     stop_foreground_server(root, &mut child, &stderr)?;
     let status = wait_for(
         GONE_POLL_ATTEMPT_COUNT,
