@@ -1637,11 +1637,9 @@ class Corpus:
                             )
                             break
                         require(
-                            any(
-                                warning.get("code") == "local_index_preparing"
-                                for warning in warnings(answer)
-                            ),
-                            f"source.files overflow returned a complete read: {answer}",
+                            answer.get("outcome") == "unavailable"
+                            and answer.get("reason") == "index_preparing",
+                            f"source.files overflow returned an unexpected answer: {answer}",
                         )
                         await asyncio.sleep(POLL_SECONDS)
                     await observed(
