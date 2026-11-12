@@ -92,6 +92,29 @@ def retrieval_request(
     columns: Sequence[str] = ("symbol", "name", "path", "unit", "start", "end"),
 ) -> JsonObject:
     """Invoke existing retrieval through standard SERVICE syntax and explicit projection."""
+    projection = " ".join(f"?{column}" for column in columns)
+    return {
+        "query": f"SELECT {projection} {{ {_retrieval_service(parameters, columns)} }} ORDER BY ?index"
+    }
+
+
+def retrieval_batch_request(
+    requests: Sequence[Mapping[str, Json]], columns: Sequence[str]
+) -> JsonObject:
+    """Group independent retrievals while retaining each input's hit order."""
+    if not 2 <= len(requests) <= 6:
+        raise ValueError("a retrieval batch needs two to six inputs")
+    projection = " ".join(f"?{column}" for column in columns)
+    branches = " UNION ".join(
+        f"{{ {_retrieval_service(parameters, columns)} BIND({slot} AS ?slot) }}"
+        for slot, parameters in enumerate(requests)
+    )
+    return {
+        "query": f"SELECT ?slot {projection} {{ {branches} }} ORDER BY ?slot ?index"
+    }
+
+
+def _retrieval_service(parameters: Mapping[str, Json], columns: Sequence[str]) -> str:
     unknown = set(parameters) - _INPUT_FIELDS
     if unknown:
         raise ValueError(f"unknown retrieval inputs: {sorted(unknown)}")
@@ -130,11 +153,7 @@ def retrieval_request(
             "size",
         }:
             clauses.append(f"OPTIONAL {{ ?hit :{column} ?{column} }}")
-    projection = " ".join(f"?{column}" for column in columns)
-    body = " ".join(clauses)
-    return {
-        "query": f"SELECT {projection} {{ SERVICE :search {{ {body} }} }} ORDER BY ?index"
-    }
+    return "SERVICE :search { " + " ".join(clauses) + " }"
 
 
 def usage_request(symbol: str) -> JsonObject:

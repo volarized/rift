@@ -780,7 +780,7 @@ jobs:
           - repository: nextjs
             case: workspace
             test: test_nextjs_corpus
-            minutes: 13
+            minutes: 14
           - repository: nextjs
             case: churn
             test: test_nextjs_churn

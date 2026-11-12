@@ -10,7 +10,7 @@ import sys
 import tempfile
 import time
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Sequence
 from itertools import batched
 from pathlib import Path
 
@@ -65,6 +65,7 @@ from rift_dev.query import (
     iri,
     literal,
     optional_iri,
+    retrieval_batch_request,
     retrieval_request,
 )
 from rift_dev.rift_test_client import (
@@ -129,15 +130,19 @@ STEADY_READ_SECONDS = READINESS_SECONDS * 2 / 3
 # 0.53 seconds with the server's answer already sent at 58.47 seconds. The bound is twice
 # the longest passing interval, 59.12 seconds, rounded up. Callers are the `workspace`
 # case of `bun`, `nextjs`, and `fastapi` (the `shallow` read only for `fastapi`) and the
-# `nextjs` `churn` case, with work budgets of 510, 690, and 210 seconds (the pinned
-# 540, 720, and 240 less CLEANUP_RESERVE_SECONDS). The bound stands inside the smallest,
-# `fastapi` at 210. Reads of one case run in sequence, so a case where every read ran
-# to this bound would reach its work budget first and fail there, naming the action.
+# `nextjs` `churn` case, with work budgets of 510, 750, 690, and 210 seconds for
+# Bun workspace, Next.js workspace, Next.js churn, and FastAPI, respectively.
+# The bound stands inside the smallest, `fastapi` at 210. A case where every read
+# ran to this bound would reach its work budget first and fail there, naming the action.
 LOCAL_PREPARATION_SECONDS = 120.0
 # Seconds a case keeps inside its own deadline for the served tree's removal,
 # the report write, and the process exit. Nextest allows the same grace after
 # it ends a corpus case, so the two bounds agree on what cleanup costs.
 CLEANUP_RESERVE_SECONDS = 30.0
+# The workspace case measures the full declaration sample and two further cold
+# starts. Retained Linux timings put its batched reads at up to 688 seconds of work.
+# Keep one minute of runner variation inside the matching Nextest override.
+NEXTJS_WORKSPACE_ALLOWANCE_SECONDS = 60
 SEED = 34
 POLL_SECONDS = 0.1
 OBSERVATION_SECONDS = 60.0
@@ -160,6 +165,8 @@ REQUIRED_LANGUAGES = {
     "nextjs": {"typescript"},
     "fastapi": {"python"},
 }
+CORPUS_COLUMNS = ("symbol", "name", "kind", "language", "path", "unit", "start", "end")
+PATH_HIT_LIMIT = 1000
 
 
 def catalog_paths(workspace: JsonObject) -> dict[str, list[str]]:
@@ -188,7 +195,7 @@ def catalog_paths(workspace: JsonObject) -> dict[str, list[str]]:
 
 def corpus_request(parameters: JsonObject) -> JsonObject:
     """Project corpus facts through the served SPARQL retrieval service."""
-    columns = ["symbol", "name", "kind", "language", "path", "unit", "start", "end"]
+    columns = list(CORPUS_COLUMNS)
     if parameters.get("target") == "file":
         columns.extend(("target", "size"))
     for include in array_value(parameters.get("include", []), "retrieval include"):
@@ -196,6 +203,74 @@ def corpus_request(parameters: JsonObject) -> JsonObject:
         if field in {"source", "score"}:
             columns.append(field)
     return retrieval_request(parameters, columns)
+
+
+def sample_path_request(path: str, query: str = "test") -> JsonObject:
+    return {
+        "query": query,
+        "target": "symbol",
+        "paths": {"include": [path]},
+        "limit": PATH_HIT_LIMIT,
+        "order": "identity",
+    }
+
+
+async def read_sample_paths(
+    client: Client, paths: Sequence[str]
+) -> list[list[JsonObject]]:
+    """Read independently ranked exact paths through one retained graph query."""
+    request = retrieval_batch_request(
+        [sample_path_request(path) for path in paths], CORPUS_COLUMNS
+    )
+    answer = await settled_local(client, "search", request)
+    warnings(answer)
+    rows = bindings(answer)
+    view = answer.get("view")
+    pagination = object_value(answer.get("pagination"), "sample pagination")
+    count = number(pagination.get("total_pages"), "sample page count")
+    require(
+        0 <= count <= len(paths) * PATH_HIT_LIMIT, "sample page count exceeds hit bound"
+    )
+    grouped: list[list[JsonObject]] = [[] for _ in paths]
+    previous = -1
+    for page in range(max(count, 1)):
+        if page:
+            next_query = string_value(
+                pagination.get("next_query"), "sample continuation"
+            )
+            answer = await client.call("search", {"query": next_query})
+            warnings(answer)
+            rows = bindings(answer)
+            require(
+                view is not None and answer.get("view") == view, "sample view changed"
+            )
+            pagination = object_value(answer.get("pagination"), "sample pagination")
+        require(
+            pagination.get("page_index") == page
+            and pagination.get("total_pages") == count,
+            "sample pagination changed",
+        )
+        require(count > 0 or not rows, "sample returned rows without pages")
+        for row in rows:
+            slot = int(literal(row, "slot"))
+            require(
+                0 <= slot < len(paths) and slot >= previous, "sample slot out of order"
+            )
+            require(
+                literal(row, "path") == paths[slot],
+                "literal sample path matched another file",
+            )
+            require(
+                len(grouped[slot]) < PATH_HIT_LIMIT, "sample slot exceeds hit bound"
+            )
+            grouped[slot].append(
+                {key: value for key, value in row.items() if key != "slot"}
+            )
+            previous = slot
+    require(
+        pagination.get("next_query") is None, "sample returned an unadvertised page"
+    )
+    return grouped
 
 
 CHURN_SEARCH_INPUTS: JsonObject = {
@@ -294,13 +369,16 @@ class Corpus:
     def work_seconds(self) -> float:
         """The wall clock this case's own actions get.
 
-        Nextest ends the case at the pinned deadline, so the actions stop before
+        Nextest ends the case at its configured deadline, so the actions stop before
         it: the reserve is the room the served tree's removal, the report write,
         and the process exit need inside that same deadline. A case that crosses
         this bound fails naming the action it was running, instead of being
         killed with no evidence of where it stood.
         """
-        return max(self.pin.seconds - CLEANUP_RESERVE_SECONDS, 1.0)
+        deadline = self.pin.seconds
+        if self.pin.name == "nextjs" and self.case == "workspace":
+            deadline += NEXTJS_WORKSPACE_ALLOWANCE_SECONDS
+        return max(deadline - CLEANUP_RESERVE_SECONDS, 1.0)
 
     async def run(self) -> None:
         """A timeout fails the suite after server cleanup writes its evidence.
@@ -563,8 +641,8 @@ class Corpus:
         """Collect complete exact-path results for the existing physical sample.
 
         The callback boundary covers a first catalog page with no sampled language
-        and final exhaustion of an optional language. These typed callback rows
-        test control flow; the owning corpus run checks actual declarations.
+        and final exhaustion of an optional language. It also checks continuation
+        of one batched query. The owning corpus run checks actual declarations.
 
         >>> from types import SimpleNamespace
         >>> from typing import cast
@@ -572,14 +650,14 @@ class Corpus:
         >>> def term(value, datatype="string"):
         ...     return {"type": "literal", "value": str(value), "datatype": "http://www.w3.org/2001/XMLSchema#" + datatype}
         >>> rows = [{**{key: term(value) for key, value in {"name": f"entry{index}", "kind": "function", "language": "typescript", "path": "src/test.ts"}.items()}, "start": term(index * 2, "integer"), "end": term(index * 2 + 1, "integer"), "symbol": {"type": "iri", "value": f"urn:fixture:sample:{index}"}} for index in range(SYMBOL_COUNT)]
-        >>> def answer(bindings):
-        ...     return {"answer": {"result": "bindings", "variables": list(rows[0]), "bindings": bindings}}
+        >>> def answer(bindings, index, **continuation):
+        ...     return {"answer": {"result": "bindings", "variables": ["slot", *rows[0]], "bindings": [{**row, "slot": term(0, "integer")} for row in bindings]}, "view": {"id": "retained"}, "pagination": {"page_index": index, "total_pages": 2, **continuation}}
         >>> languages = [{"language": language, "enabled": True, "syntax": True, "include": ["**"]} for language in ("rust", "typescript", "typescript:tsx", "markdown")]
         >>> common = {"configuration_revision": "0123abcd", "languages": languages}
         >>> first = {**common, "pagination": {"page_index": 0, "total_pages": 2}, "source": [{"path": f"docs/a{index:04}.md", "digest": "0123abcd", "language": "markdown"} for index in range(1000)]}
         >>> second = {**common, "pagination": {"page_index": 1, "total_pages": 2}, "source": [{"path": path, "digest": "0123abcd", "language": language} for path, language in [("src/test.ts", "typescript"), ("src/ztest.tsx", "typescript:tsx")]]}
         >>> admission = {"answer": {"result": "boolean", "value": True}}
-        >>> client = SimpleNamespace(resource=AsyncMock(side_effect=[first, second]), call=AsyncMock(side_effect=[admission, answer(rows), answer([])]))
+        >>> client = SimpleNamespace(resource=AsyncMock(side_effect=[first, second]), call=AsyncMock(side_effect=[admission, answer(rows[:100], 0, next_query="retained next page"), answer(rows[100:], 1)]))
         >>> sample = Corpus(cast(Pin, SimpleNamespace(name="nextjs")), Path("rift"), Path("report"))
         >>> selected = asyncio.run(sample.symbol_candidates(cast(Client, client)))
         >>> len(selected), client.call.await_count, client.resource.await_count
@@ -588,6 +666,10 @@ class Corpus:
         True
         >>> client.call.await_args_list[0].args[1] == {"query": "ASK {}"}
         True
+        >>> client.call.await_args_list[1].args[1]["query"].count("SERVICE :search")
+        2
+        >>> client.call.await_args_list[2].args[1] == {"query": "retained next page"}
+        True
         """
         languages = SAMPLE_LANGUAGES[self.pin.name]
 
@@ -595,15 +677,7 @@ class Corpus:
             answer = await settled_local(
                 client,
                 "search",
-                corpus_request(
-                    {
-                        "query": query,
-                        "target": "symbol",
-                        "paths": {"include": [path]},
-                        "limit": 1000,
-                        "order": "identity",
-                    }
-                ),
+                corpus_request(sample_path_request(path, query)),
             )
             warnings(answer)
             found = bindings(answer)
@@ -675,41 +749,82 @@ class Corpus:
             )
             for language in languages
         }
-        exhausted: set[str] = set()
-        seen: set[str] = set()
-        while True:
+
+        def rounds() -> Iterator[tuple[list[tuple[str, str]], frozenset[str]]]:
+            exhausted: set[str] = set()
+            seen: set[str] = set()
+            while len(exhausted) < len(languages):
+                paths: list[tuple[str, str]] = []
+                for language in languages:
+                    if language in exhausted:
+                        continue
+                    path = next(pending[language], None)
+                    if path is None:
+                        exhausted.add(language)
+                    elif path not in seen:
+                        seen.add(path)
+                        paths.append((language, path))
+                yield paths, frozenset(exhausted)
+
+        def enough(exhausted: frozenset[str]) -> bool:
             counts = language_counts(pool)
-            enough = len(declaration_pool(pool)) >= minimum
-            if minimum == SYMBOL_COUNT:
-                enough = (
-                    enough
-                    and REQUIRED_LANGUAGES[self.pin.name].issubset(counts)
-                    and bool(symbol_pool(pool))
-                    and set(languages).issubset(represented | exhausted)
-                )
-            if enough:
-                return pool
-            progress = False
-            for language in languages:
-                if language in exhausted:
-                    continue
-                path = next(pending[language], None)
-                if path is None:
-                    exhausted.add(language)
-                    progress = True
-                    continue
-                progress = True
-                if path in seen:
-                    continue
-                seen.add(path)
-                added = await read(path)
-                pool.extend(added)
-                if added:
-                    represented.add(language)
-            require(
-                progress,
-                f"source catalog has fewer than {minimum} sampled declarations",
+            return len(declaration_pool(pool)) >= minimum and (
+                minimum != SYMBOL_COUNT
+                or REQUIRED_LANGUAGES[self.pin.name].issubset(counts)
+                and bool(symbol_pool(pool))
+                and set(languages).issubset(represented | exhausted)
             )
+
+        if enough(frozenset()):
+            return pool
+        grouped = minimum == SYMBOL_COUNT and self.pin.name in {"nextjs", "bun"}
+        parallel = grouped and self.pin.name == "nextjs"
+        batches = batched(rounds(), 2 if grouped else 1)
+
+        async def read_batch(
+            batch: Sequence[tuple[list[tuple[str, str]], frozenset[str]]],
+        ) -> list[list[JsonObject]]:
+            paths = [path for paths, _ in batch for _, path in paths]
+            if grouped and len(paths) > 1:
+                return await read_sample_paths(client, paths)
+            return [await read(path) for path in paths]
+
+        # The original language rounds decide the sample, even when the next query
+        # starts early. A speculative read's result cannot add paths to that sample.
+        batch = next(batches, ())
+        pending_read = (
+            asyncio.create_task(read_batch(batch)) if parallel and batch else None
+        )
+        try:
+            while batch:
+                current_read = pending_read
+                following = next(batches, ())
+                pending_read = (
+                    asyncio.create_task(read_batch(following))
+                    if parallel and following
+                    else None
+                )
+                result = iter(
+                    await current_read
+                    if current_read is not None
+                    else await read_batch(batch)
+                )
+                for paths, exhausted in batch:
+                    for language, _ in paths:
+                        added = next(result)
+                        pool.extend(added)
+                        if added:
+                            represented.add(language)
+                    if enough(exhausted):
+                        return pool
+                batch = following
+        finally:
+            if pending_read is not None:
+                pending_read.cancel()
+                await asyncio.gather(pending_read, return_exceptions=True)
+        raise AssertionError(
+            f"source catalog has fewer than {minimum} sampled declarations"
+        )
 
     async def baseline(self) -> None:
         with self.server() as server:
@@ -1017,7 +1132,7 @@ class Corpus:
             return 0
 
         beyond = 0
-        if self.pin.name == "nextjs":
+        if self.pin.name in {"nextjs", "bun"}:
             # Each read validates the full tree. Two independent reads can use the
             # server's worker pool while the corpus leaves the checkout unchanged.
             for pair in batched(selected, 2):
