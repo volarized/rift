@@ -13,7 +13,7 @@ from pathlib import Path
 from urllib.parse import unquote
 
 from rift_dev.log_records import Line, closes_span, lines, parse_line
-from rift_dev.query import bindings, iri, literal
+from rift_dev.query import bindings, iri, literal, project_source_unit
 from rift_dev.rift_test_client import (
     Json,
     JsonObject,
@@ -640,9 +640,15 @@ def churn_answer(
         require(len(rows) == 1, f"{tool} lost probe declaration")
         hit = object_value(rows[0], "probe hit")
         found = iri(hit, "symbol")
-        require(
-            literal(hit, "path") == probe_path, f"{tool} returned another probe path"
-        )
+        if identity is None:
+            require(
+                literal(hit, "path") == probe_path, "search returned another probe path"
+            )
+        else:
+            require(
+                iri(hit, "unit") == project_source_unit(probe_path),
+                "search returned another probe unit",
+            )
         excerpt = literal(hit, "source")
     require(identity is None or found == identity, f"{tool} changed probe identity")
     source = string_value(excerpt, "probe source")

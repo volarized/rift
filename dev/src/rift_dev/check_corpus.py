@@ -1322,6 +1322,12 @@ class Corpus:
         task: asyncio.Task[None] | None = None
         try:
             identity, _revision = await read("search", None)
+            # Read the known declaration from one published snapshot while edits continue.
+            requests["search"] = {
+                "query": f"SELECT (<{identity}> AS ?symbol) ?unit ?source ?start ?end "
+                f"{{ ?node :of <{identity}>; :index 0; :source ?source; "
+                ":range [ :unit ?unit; :start ?start; :end ?end ] }"
+            }
             requests["symbol_nodes"] = {"symbol": identity}
             task = asyncio.create_task(writer())
             reads = 0
