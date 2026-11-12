@@ -3006,7 +3006,10 @@ impl RiftMcp {
             operation = "search.store",
             async move {
                 rift_tracing::debug!("search store read started");
-                self.store_answer(index, tree_revision, &parsed).await
+                self.store_answer(tree_revision, || {
+                    self.read_store(index, tree_revision, &parsed)
+                })
+                .await
             }
         )
         .await;
@@ -3194,32 +3197,49 @@ impl RiftMcp {
             .map_err(StoreReadFailure::from)
     }
 
-    /// The store's answer for `tree_revision` and the lexical lane's state after one read.
-    /// A `Committing` lane leaves the store answer unmatched, so [`ranking_of`] returns
-    /// identifier matching with `lexical_ranking_unavailable`. A later request can read
-    /// the full-text tier after the write lands. Without a lane, the revision counts as
-    /// settled because nothing could commit it.
+    /// Reads the store for `tree_revision` and classifies an unmatched answer using the
+    /// lexical lane. A read that saw no stamp during a commit keeps the in-progress report
+    /// if the write lands before the lane is observed again. Without a lane, the revision
+    /// counts as settled because nothing could commit it.
     ///
     /// # Cancel safety
     ///
     /// Dropping the future drops the store read; nothing is written.
-    async fn store_answer(
+    async fn store_answer<Read>(
         &self,
-        index: &SearchIndex,
         tree_revision: &str,
-        query: &ParsedQuery,
-    ) -> Result<(RevisionScoped<PhasedRanking>, LexicalCommitReport), StoreReadFailure> {
+        read: impl FnOnce() -> Read,
+    ) -> Result<(RevisionScoped<PhasedRanking>, LexicalCommitReport), StoreReadFailure>
+    where
+        Read: std::future::Future<Output = Result<RevisionScoped<PhasedRanking>, StoreReadFailure>>,
+    {
+        let lane = self.lexical.as_ref();
+        let before = lane.map_or_else(LexicalCommitReport::settled, |lane| {
+            lane.commit_report(tree_revision)
+        });
         let searched = rift_tracing::traced!(
             component = "search",
             operation = "search.read_store",
             attempt = 1_u8,
-            async move { self.read_store(index, tree_revision, query).await }
+            async move { read().await }
         )
         .await?;
-        let Some(lane) = self.lexical.as_ref() else {
-            return Ok((searched, LexicalCommitReport::settled()));
+        let Some(lane) = lane.filter(|_| !matches!(searched, RevisionScoped::Matched(_))) else {
+            return Ok((searched, before));
         };
-        let commit = lane.commit_report(tree_revision);
+        let after = lane.commit_report(tree_revision);
+        let commit = if matches!(
+            (&searched, &before.state, &after.state),
+            (
+                RevisionScoped::NoRevision,
+                LexicalCommitState::Committing,
+                LexicalCommitState::Settled
+            )
+        ) {
+            before
+        } else {
+            after
+        };
         Ok((searched, commit))
     }
 
@@ -9884,6 +9904,47 @@ done
             "a landed commit clears the warning: {:?}",
             ranked.warnings
         );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_without_a_stamp_keeps_the_commit_it_overlapped() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let (server, double) = server_over_gated_store(directory.path(), "").await?;
+        let published = current_publication(&server).await;
+        let revision = published.reads.tree_revision();
+        let lane = server.lexical.as_ref().ok_or("lexical lane")?;
+        let index = server.search_index.as_ref().ok_or("search index")?;
+        let query = super::ParsedQuery::parse("beacon")?;
+        assert_eq!(lane.commit_state(revision), LexicalCommitState::Committing);
+
+        let (searched, commit) = server
+            .store_answer(revision, || async {
+                let searched = server.read_store(index, revision, &query).await?;
+                assert!(matches!(searched, RevisionScoped::NoRevision));
+                let landed = lane.landed();
+                double.release_one();
+                tokio::time::timeout(UNWAITED_READ_MAX, landed)
+                    .await
+                    .expect("released lexical write must land");
+                assert_eq!(lane.commit_state(revision), LexicalCommitState::Settled);
+                Ok(searched)
+            })
+            .await
+            .map_err(|error| format!("store read: {error:?}"))?;
+        assert!(matches!(searched, RevisionScoped::NoRevision));
+        assert_eq!(commit.state, LexicalCommitState::Committing);
+
+        let ranked = run_search(&server, "beacon").await?;
+        assert!(store_ranked(&ranked) && ranked.warnings.is_empty());
+
+        let (_, settled) = server
+            .store_answer(revision, || {
+                std::future::ready(Ok(RevisionScoped::NoRevision))
+            })
+            .await
+            .map_err(|error| format!("store read: {error:?}"))?;
+        assert_eq!(settled.state, LexicalCommitState::Settled);
         Ok(())
     }
 
