@@ -144,8 +144,8 @@ pub struct PackageCoverage {
     pub applicability_complete: bool,
     /// Coverage of each relationship facet, independent of identity lookup.
     pub relationships: Vec<RelationshipCoverage>,
-    /// The fact kinds produced for this language, each with its producer. A kind no entry
-    /// names was not produced.
+    /// The fact kinds produced for this language, each with its producer. An entry makes no
+    /// completeness claim, and a kind no entry names was not produced.
     pub facts: Vec<FactCoverage>,
 }
 

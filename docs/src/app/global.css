@@ -66,6 +66,8 @@
  */
 
 :root {
+  --font-inter: "Inter", Arial, sans-serif;
+  --font-geist-mono: "Geist Mono", "Courier New", monospace;
   --background: oklch(0.985 0.0022 106.4);
   --foreground: oklch(0.165 0.0046 285.7);
   --card: oklch(0.985 0.0022 106.4);
