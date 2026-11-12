@@ -717,6 +717,9 @@ This search requests `demo` 1.1.0. The fixture serves collected release 1.0.0, r
 identity; declaration source addresses remain separate. `get_symbol` accepts neither
 name discovery nor `scope`, `packages`, `limit`, or `page_index`.
 
+Every declaration of one qualified path binds to that one identity, so `declarations` lists
+repeated definitions, overloads, and `cfg` variants of one symbol together.
+
 <ReadExample name="local-symbol" />
 
 `outcome` distinguishes `found`, `missing`, and `unavailable`. `found` contains one

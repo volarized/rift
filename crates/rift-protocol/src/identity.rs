@@ -1,7 +1,5 @@
 //! Canonical ownership and logical paths for symbol identities.
 
-use std::num::NonZeroU32;
-
 use rift_error::{RiftError, errors};
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
@@ -28,7 +26,7 @@ const LOCAL_SCOPE_PREFIX: &str = "local";
 const REGISTRATION_SEPARATOR: char = '@';
 
 /// The canonical owner and logical path format this codec accepts.
-pub const SYMBOL_IDENTITY_FORMAT_REVISION: u32 = 1;
+pub const SYMBOL_IDENTITY_FORMAT_REVISION: u32 = 2;
 
 /// Prefix shared by canonical symbol addresses.
 pub const SYMBOL_URI_PREFIX: &str = "rift://symbol/";
@@ -40,8 +38,7 @@ pub const SYMBOL_ID_PATTERN: &str = concat!(
     r"|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)",
     r"[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/",
     r"(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+",
-    r"(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*",
-    r"(?:~[1-9][0-9]*\?rev=[0-9a-f]{64})?$"
+    r"(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$"
 );
 
 /// Structural physical source pattern. The codec also validates decoded paths and spelling.
@@ -67,16 +64,10 @@ pub const RELEASED_SOURCE_UNIT_ID_PATTERN: &str = concat!(
     r"(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
 );
 
-/// Revision query selecting an occurrence's immutable source.
-const REVISION_QUERY_PREFIX: &str = "?rev=";
-
-/// Number separator for a revision-bound occurrence.
-const OCCURRENCE_SEPARATOR: char = '~';
-
 /// Encoded width of a complete SHA-256 revision.
 const REVISION_HEX_BYTES: usize = 64;
 
-/// RFC 3986 path characters, excluding hierarchy and occurrence delimiters.
+/// RFC 3986 path characters, excluding the hierarchy delimiter and `~`.
 const COMPONENT_ESCAPE_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'.')
     .remove(b'_')
@@ -200,47 +191,12 @@ fn source_digest_is_valid(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-/// Occurrence number bound to one complete immutable source digest.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct SymbolOccurrence {
-    number: NonZeroU32,
-    revision: SourceDigest,
-}
-
-impl SymbolOccurrence {
-    /// Validates an occurrence number and complete SHA-256 revision spelling.
-    ///
-    /// # Errors
-    /// Returns a violation for zero numbers or noncanonical revisions.
-    pub fn new(number: u32, revision: String) -> Result<Self, RiftError> {
-        let number = NonZeroU32::new(number).ok_or(SymbolIdentityViolation::Occurrence)?;
-        if !source_digest_is_valid(&revision) {
-            return Err(SymbolIdentityViolation::Revision.into());
-        }
-        let revision = SourceDigest(revision);
-        Ok(Self { number, revision })
-    }
-
-    /// Returns the positive occurrence number.
-    #[must_use]
-    pub fn number(&self) -> u32 {
-        self.number.get()
-    }
-
-    /// Returns the complete immutable source revision.
-    #[must_use]
-    pub fn revision(&self) -> &str {
-        self.revision.as_str()
-    }
-}
-
 /// Validated owner, language and logical hierarchy of one symbol.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SymbolIdentity {
     owner: SymbolOwner,
     language: Language,
     qualified_path: Vec<String>,
-    occurrence: Option<SymbolOccurrence>,
 }
 
 impl schemars::JsonSchema for SymbolIdentity {
@@ -254,7 +210,7 @@ impl schemars::JsonSchema for SymbolIdentity {
             "minLength": 1,
             "maxLength": SYMBOL_ID_BYTES_MAX,
             "pattern": SYMBOL_ID_PATTERN,
-            "not": {"pattern": "/\\.{1,2}(?:/|~|$)"},
+            "not": {"pattern": "/\\.{1,2}(?:/|$)"},
             "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
             "examples": [
                 "rift://symbol/local/rust/app/parser/parse",
@@ -286,8 +242,6 @@ pub(crate) enum SymbolIdentityViolation {
     Encoding,
     /// Rendering the parsed identity changes its spelling.
     Noncanonical,
-    /// An occurrence number is absent, zero, or invalid.
-    Occurrence,
     /// A revision is absent or is not a complete lowercase SHA-256 digest.
     Revision,
 }
@@ -302,7 +256,6 @@ impl From<SymbolIdentityViolation> for RiftError {
             SymbolIdentityViolation::QualifiedPath => "QualifiedPath",
             SymbolIdentityViolation::Encoding => "Encoding",
             SymbolIdentityViolation::Noncanonical => "Noncanonical",
-            SymbolIdentityViolation::Occurrence => "Occurrence",
             SymbolIdentityViolation::Revision => "Revision",
         };
         errors::core::symbol_identity_invalid()
@@ -325,20 +278,9 @@ impl SymbolIdentity {
             owner,
             language,
             qualified_path,
-            occurrence: None,
         };
         identity.validate()?;
         Ok(identity)
-    }
-
-    /// Binds this identity to an occurrence in one immutable source revision.
-    ///
-    /// # Errors
-    /// Returns a length violation if the complete encoded identity exceeds its limit.
-    pub fn with_occurrence(mut self, occurrence: SymbolOccurrence) -> Result<Self, RiftError> {
-        self.occurrence = Some(occurrence);
-        self.validate_length()?;
-        Ok(self)
     }
 
     /// Parses a canonical symbol address without performing lookup or I/O.
@@ -354,8 +296,7 @@ impl SymbolIdentity {
         let remainder = value
             .strip_prefix(SYMBOL_URI_PREFIX)
             .ok_or(SymbolIdentityViolation::Structure)?;
-        let (address, occurrence) = parse_occurrence(remainder)?;
-        let mut segments = address.split('/');
+        let mut segments = remainder.split('/');
         let scope = next_segment(&mut segments)?;
         let owner = parse_owner(scope, &mut segments)?;
         let language = Language::from_identity_segment(next_segment(&mut segments)?)
@@ -363,8 +304,7 @@ impl SymbolIdentity {
         let qualified_path = segments
             .map(decode_component)
             .collect::<Result<Vec<_>, _>>()?;
-        let mut identity = Self::new(owner, language, qualified_path)?;
-        identity.occurrence = occurrence;
+        let identity = Self::new(owner, language, qualified_path)?;
         if identity.wire_identity() != value {
             return Err(SymbolIdentityViolation::Noncanonical.into());
         }
@@ -389,12 +329,6 @@ impl SymbolIdentity {
         &self.qualified_path
     }
 
-    /// Returns the revision-bound occurrence when this identity requires one.
-    #[must_use]
-    pub fn occurrence(&self) -> Option<&SymbolOccurrence> {
-        self.occurrence.as_ref()
-    }
-
     /// Serializes the validated identity with readable hierarchy and canonical escaping.
     #[must_use]
     pub fn wire_identity(&self) -> String {
@@ -406,14 +340,7 @@ impl SymbolIdentity {
             .map(|part| encode_component(part))
             .collect::<Vec<_>>()
             .join("/");
-        let mut value = format!("{SYMBOL_URI_PREFIX}{owner}/{language}/{path}");
-        if let Some(occurrence) = &self.occurrence {
-            value.push(OCCURRENCE_SEPARATOR);
-            value.push_str(&occurrence.number().to_string());
-            value.push_str(REVISION_QUERY_PREFIX);
-            value.push_str(occurrence.revision());
-        }
-        value
+        format!("{SYMBOL_URI_PREFIX}{owner}/{language}/{path}")
     }
 
     fn validate(&self) -> Result<(), RiftError> {
@@ -601,22 +528,6 @@ impl<'de> Deserialize<'de> for SymbolIdentity {
         let value = String::deserialize(deserializer)?;
         Self::parse(&value).map_err(serde::de::Error::custom)
     }
-}
-
-fn parse_occurrence(value: &str) -> Result<(&str, Option<SymbolOccurrence>), RiftError> {
-    let Some((address, revision)) = value.split_once(REVISION_QUERY_PREFIX) else {
-        return Ok((value, None));
-    };
-    let (address, number) = address
-        .rsplit_once(OCCURRENCE_SEPARATOR)
-        .ok_or(SymbolIdentityViolation::Occurrence)?;
-    let number = number
-        .parse::<u32>()
-        .map_err(|_| RiftError::from(SymbolIdentityViolation::Occurrence))?;
-    Ok((
-        address,
-        Some(SymbolOccurrence::new(number, revision.to_owned())?),
-    ))
 }
 
 fn parse_owner<'a>(

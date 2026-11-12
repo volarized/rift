@@ -367,13 +367,11 @@ fn explicit_library_name_and_path_replace_physical_layout() {
 }
 
 #[test]
-fn duplicate_occurrence_retains_full_immutable_source_digest() {
+fn repeated_declarations_share_one_identity() {
     let source = "pub fn repeat() {}\npub fn repeat() {}";
     let found = anchors(&[("Cargo.toml", MANIFEST)], "src/lib.rs", source);
-    let expected = format!(
-        "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/crate_root/repeat~2?rev={}",
-        crate::documentation::content_digest(source.as_bytes()).0
-    );
+    let expected = "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/crate_root/repeat";
+    assert_eq!(found["repeat~1"].as_str(), expected);
     assert_eq!(found["repeat~2"].as_str(), expected);
 }
 

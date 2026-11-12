@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use rift_core::{FileDigest, ProjectPath, SymbolId};
-use rift_protocol::identity::{SymbolIdentity, SymbolOccurrence, SymbolOwner};
+use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
 use rift_protocol::index::python_identifier_is_valid;
 use rift_syntax::SyntaxFacts;
 use serde::Deserialize;
@@ -73,7 +73,7 @@ pub(super) fn prepare(
         );
         anchors.insert(
             path.clone(),
-            file_anchors(input, file.syntax, &namespace, file.source, &admitted),
+            file_anchors(input, file.syntax, &namespace, &admitted),
         );
         for (child, local, child_scope) in children {
             let mut child_namespace = namespace.clone();
@@ -287,10 +287,8 @@ fn file_anchors(
     input: &NamespaceInput<'_>,
     syntax: &SyntaxFacts,
     namespace: &[String],
-    source: &str,
     admitted: &std::collections::BTreeSet<rift_syntax::ByteRange>,
 ) -> BTreeMap<String, SymbolId> {
-    let revision = crate::documentation::content_digest(source.as_bytes()).0;
     let supported = |symbol: &rift_syntax::SyntaxSymbol| {
         let Some(invocations) = syntax.macro_invocations() else {
             return true;
@@ -318,19 +316,10 @@ fn file_anchors(
             Some(container) => format!("{container}::{}", symbol.name),
             None => symbol.name.clone(),
         };
-        let occurrence = if symbol.qualified_name == base {
-            None
-        } else if let Some(number) = symbol.qualified_name.strip_prefix(&format!("{base}~")) {
-            if counts.get(&base).copied().unwrap_or_default() < 2 {
-                continue;
-            }
-            match number.parse::<u32>() {
-                Ok(number) => Some(number),
-                Err(_) => continue,
-            }
-        } else {
+        let repeated = counts.get(&base).copied().unwrap_or_default() > 1;
+        if symbol.qualified_name != base && !repeated {
             continue;
-        };
+        }
         let Some(names) = base
             .split("::")
             .map(source_identifier)
@@ -340,22 +329,13 @@ fn file_anchors(
         };
         let mut qualified_path = namespace.to_vec();
         qualified_path.extend(names);
-        let Ok(mut identity) = SymbolIdentity::new(
+        let Ok(identity) = SymbolIdentity::new(
             input.owner().clone(),
             syntax.language().clone(),
             qualified_path,
         ) else {
             continue;
         };
-        if let Some(number) = occurrence {
-            let Ok(occurrence) = SymbolOccurrence::new(number, revision.clone()) else {
-                continue;
-            };
-            let Ok(qualified) = identity.with_occurrence(occurrence) else {
-                continue;
-            };
-            identity = qualified;
-        }
         if let Ok(identity) = SymbolId::new(identity.wire_identity()) {
             anchors.insert(symbol.qualified_name.clone(), identity);
         }

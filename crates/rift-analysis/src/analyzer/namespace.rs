@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rift_core::SymbolId;
-use rift_protocol::identity::{SymbolIdentity, SymbolOccurrence};
+use rift_protocol::identity::SymbolIdentity;
 use rift_protocol::index::python_identifier_is_valid;
 use rift_syntax::SyntaxFacts;
 
@@ -188,94 +188,39 @@ fn identity_anchors_with_roots(
     let Some(module) = python_module(path, roots) else {
         return BTreeMap::new();
     };
-    let mut revision = None::<String>;
-    let mut occurrences = BTreeMap::<String, usize>::new();
-    let mut declarations = BTreeMap::<String, Vec<&rift_syntax::SyntaxSymbol>>::new();
+    let mut declarations = BTreeMap::<String, usize>::new();
     for symbol in syntax.symbols() {
         if let Some(name) = python_declaration_name(symbol) {
-            *occurrences.entry(name.clone()).or_default() += 1;
-            declarations.entry(name).or_default().push(symbol);
+            *declarations.entry(name).or_default() += 1;
         }
     }
-    let overloads = declarations
-        .iter()
-        .filter_map(|(name, symbols)| {
-            let mut ordinary = 0_usize;
-            let mut overloaded = 0_usize;
-            for symbol in symbols {
-                if symbol.kind != "function" {
-                    return None;
-                }
-                match symbol.python_overload.as_ref() {
-                    Some(rift_syntax::PythonOverload::Overload { .. }) if ordinary == 0 => {
-                        overloaded += 1;
-                    }
-                    Some(rift_syntax::PythonOverload::Ordinary) if ordinary == 0 => ordinary += 1,
-                    _ => return None,
-                }
-            }
-            (overloaded > 0).then(|| name.clone())
-        })
-        .collect::<BTreeSet<_>>();
     let mut anchors = BTreeMap::new();
     for symbol in syntax.symbols() {
         let Some(name) = python_declaration_name(symbol) else {
             continue;
         };
-        let occurrence = if symbol.qualified_name == name || overloads.contains(&name) {
-            None
-        } else {
-            if occurrences.get(&name).copied().unwrap_or_default() < 2 {
-                continue;
-            }
-            let Some(number) = symbol
-                .qualified_name
-                .strip_prefix(&name)
-                .and_then(|suffix| suffix.strip_prefix('~'))
-                .and_then(|number| number.parse::<u32>().ok())
-            else {
-                continue;
-            };
-            Some(number)
-        };
+        let repeated = declarations.get(&name).copied().unwrap_or_default() > 1;
+        if symbol.qualified_name != name && !repeated {
+            continue;
+        }
         let names = name.split('.').collect::<Vec<_>>();
         if !names.iter().all(|name| python_identifier_is_valid(name)) {
             continue;
         }
         let mut qualified_path = module.clone();
         qualified_path.extend(names.into_iter().map(str::to_owned));
-        let Ok(mut identity) = SymbolIdentity::new(
+        let Ok(identity) = SymbolIdentity::new(
             input.owner().clone(),
             syntax.language().clone(),
             qualified_path,
         ) else {
             continue;
         };
-        if let Some(number) = occurrence {
-            let revision = revision.get_or_insert_with(|| occurrence_revision(digest));
-            let Ok(occurrence) = SymbolOccurrence::new(number, revision.clone()) else {
-                continue;
-            };
-            let Ok(qualified) = identity.with_occurrence(occurrence) else {
-                continue;
-            };
-            identity = qualified;
-        }
         if let Ok(identity) = SymbolId::new(identity.wire_identity()) {
             anchors.insert(symbol.qualified_name.clone(), identity);
         }
     }
     anchors
-}
-
-fn occurrence_revision(digest: rift_core::FileDigest) -> String {
-    use std::fmt::Write as _;
-
-    let mut revision = String::with_capacity(digest.as_bytes().len() * 2);
-    for byte in digest.as_bytes() {
-        write!(&mut revision, "{byte:02x}").expect("String accepts formatted bytes");
-    }
-    revision
 }
 
 fn python_declaration_name(symbol: &rift_syntax::SyntaxSymbol) -> Option<String> {

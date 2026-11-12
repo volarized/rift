@@ -99,10 +99,7 @@ where
         let field = named_member(&steps[..shape.followed()]);
         let canonical = tool == "get_symbol" && field.as_deref() == Some("id");
         let accepted = if canonical {
-            Some(
-                "rift://symbol/<owner>/<language>/<qualified_path>; an occurrence uses ~2?rev=<revision>"
-                    .to_owned(),
-            )
+            Some("rift://symbol/<owner>/<language>/<qualified_path>".to_owned())
         } else {
             (!shape.accepted().is_empty()).then(|| shape.accepted().join(", "))
         };

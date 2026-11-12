@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use rift_core::{FileDigest, ProjectPath, SymbolId};
-use rift_protocol::identity::{SymbolIdentity, SymbolOccurrence, SymbolOwner};
+use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
 use rift_protocol::read::SymbolFacet;
 use rift_syntax::{ByteRange, LogicalDeclaration, SyntaxExportKind, SyntaxFacts, SyntaxSymbol};
 use serde::{Deserialize, Deserializer, de};
@@ -711,18 +711,14 @@ fn declaration_anchors_with_public(
     module: Option<&str>,
     public: &BTreeSet<String>,
 ) -> BTreeMap<String, SymbolId> {
-    let mut groups: BTreeMap<String, Vec<&SyntaxSymbol>> = BTreeMap::new();
+    let mut groups: BTreeMap<String, usize> = BTreeMap::new();
     for symbol in syntax.symbols().iter().filter(|symbol| {
         symbol.node_kind != Some("assignment_expression")
             || symbol.facets.contains(&SymbolFacet::Public)
             || public.contains(&symbol.qualified_name)
     }) {
-        groups
-            .entry(defining_name(symbol))
-            .or_default()
-            .push(symbol);
+        *groups.entry(defining_name(symbol)).or_default() += 1;
     }
-    let revision = crate::documentation::content_digest(source.as_bytes()).0;
     let mut paths: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut anchors = BTreeMap::new();
     for symbol in syntax.symbols().iter().filter(|symbol| {
@@ -742,41 +738,20 @@ fn declaration_anchors_with_public(
             path.push(symbol.name.clone());
         }
         let base = defining_name(symbol);
-        let group = &groups[&base];
-        let overload = syntax.language().name == "typescript" && is_function_overload(group);
-        let occurrence = if symbol.qualified_name == base || overload {
-            None
-        } else {
-            let Some(number) = symbol
-                .qualified_name
-                .strip_prefix(&format!("{base}~"))
-                .and_then(|number| number.parse::<u32>().ok())
-            else {
-                continue;
-            };
-            if group.len() < 2 {
-                continue;
-            }
-            Some(number)
-        };
-        let Ok(mut identity) = SymbolIdentity::new(
+        let repeated = groups[&base] > 1;
+        if symbol.qualified_name != base && !repeated {
+            continue;
+        }
+        let Ok(identity) = SymbolIdentity::new(
             input.owner().clone(),
             syntax.language().clone(),
             path.clone(),
         ) else {
             continue;
         };
-        if let Some(number) = occurrence {
-            let Ok(qualified) = SymbolOccurrence::new(number, revision.clone())
-                .and_then(|occurrence| identity.clone().with_occurrence(occurrence))
-            else {
-                continue;
-            };
-            identity = qualified;
-        }
         if let Ok(identity) = SymbolId::new(identity.wire_identity()) {
             paths.insert(symbol.qualified_name.clone(), path.clone());
-            if overload {
+            if repeated {
                 paths.insert(base, path);
             }
             anchors.insert(symbol.qualified_name.clone(), identity);
@@ -815,16 +790,6 @@ fn container_path(
         Some(container) => paths.get(container).cloned(),
         None => module.map(|module| vec![module.to_owned()]),
     }
-}
-
-fn is_function_overload(group: &[&SyntaxSymbol]) -> bool {
-    group.len() > 1
-        && group.iter().all(|symbol| symbol.kind == "function")
-        && group
-            .iter()
-            .filter(|symbol| symbol.body_range.is_some())
-            .count()
-            <= 1
 }
 
 #[cfg(test)]
