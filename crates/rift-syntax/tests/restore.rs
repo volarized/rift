@@ -276,7 +276,7 @@ fn complete_facts_restore_for_every_shipped_language() {
 }
 
 #[test]
-fn duplicate_suffixes_parser_errors_and_omissions_are_preserved() {
+fn declaration_ordinals_parser_errors_and_omissions_are_preserved() {
     let cases = ["pub fn open() {}\npub fn open() {}\n", "pub fn open( {\n"];
     for text in cases {
         let document = parsed(ShippedLanguage::Rust, text);
@@ -294,6 +294,65 @@ fn duplicate_suffixes_parser_errors_and_omissions_are_preserved() {
     let restored = SyntaxFacts::from_parts(&text, SyntaxLimits::default(), parts(document.facts()))
         .expect("omissions");
     assert_eq!(&restored, document.facts());
+}
+
+#[test]
+fn declaration_ordinals_out_of_source_order_are_refused() {
+    let text = "pub fn open() {}\npub fn open() {}\n";
+    let document = parsed(ShippedLanguage::Rust, text);
+    let original = parts(document.facts());
+    for ordinals in [[0, 0], [1, 0], [0, 2]] {
+        let mut numbered = original.clone();
+        for (symbol, ordinal) in numbered.symbols.iter_mut().zip(ordinals) {
+            symbol.declaration_ordinal = ordinal;
+        }
+        assert_eq!(
+            SyntaxFacts::from_parts(text, SyntaxLimits::default(), numbered)
+                .map_err(|error| error.slug()),
+            Err(errors::syntax::facts_name_invalid::SLUG),
+            "{ordinals:?}"
+        );
+    }
+}
+
+#[test]
+fn a_repeated_container_resolves_to_the_declaration_enclosing_each_child() {
+    let text = "{\"servers\": {\"host\": 1}, \"servers\": {\"host\": 2}}";
+    let document = parsed(ShippedLanguage::Json, text);
+    let keys = document
+        .symbols()
+        .iter()
+        .map(|symbol| (symbol.qualified_name.as_str(), symbol.declaration_ordinal))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        keys,
+        [
+            ("servers", 0),
+            ("servers > host", 0),
+            ("servers", 1),
+            ("servers > host", 1)
+        ]
+    );
+    let restored = SyntaxFacts::from_parts(text, SyntaxLimits::default(), parts(document.facts()))
+        .expect("each child sits inside its own container");
+    assert_eq!(&restored, document.facts());
+    let mut shrunk = parts(document.facts());
+    let second = text.rfind("\"servers\"").expect("the second key") as u64;
+    let key = ByteRange {
+        start: second,
+        end: second + "\"servers\"".len() as u64,
+    };
+    let container = &mut shrunk.symbols[2];
+    container.range = key;
+    container.item_range = key;
+    container.body_range = None;
+    container.documentation_ranges.clear();
+    assert_eq!(
+        SyntaxFacts::from_parts(text, SyntaxLimits::default(), shrunk)
+            .map_err(|error| error.slug()),
+        Err(errors::syntax::facts_reference_invalid::SLUG),
+        "a child its container's latest earlier declaration does not enclose is refused"
+    );
 }
 
 #[test]
@@ -1874,9 +1933,14 @@ fn literal_macro_functions_exclude_nested_body_functions_and_keep_duplicate_name
         .map(|symbol| symbol.qualified_name.as_str())
         .collect::<Vec<_>>();
     assert!(names.contains(&"plain"));
-    assert!(names.contains(&"same~1"));
-    assert!(names.contains(&"same~2"));
-    assert!(names.contains(&"same~3"));
+    let ordinals = document
+        .facts()
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.qualified_name == "same")
+        .map(|symbol| symbol.declaration_ordinal)
+        .collect::<Vec<_>>();
+    assert_eq!(ordinals, [0, 1, 2]);
     let duplicate_ranges = document
         .facts()
         .symbols()

@@ -330,7 +330,6 @@ struct SectionDraft {
     title_range: TextRange,
     level: u32,
     name: String,
-    key: Vec<(u32, String)>,
 }
 
 #[derive(Default)]
@@ -348,7 +347,6 @@ fn collect_section_facts(
     let mut adornment_levels = HashMap::<char, u32>::new();
     let mut section_stack = Vec::<(u32, String)>::new();
     let mut sections = Vec::new();
-    let mut duplicate_counts = HashMap::<Vec<(u32, String)>, usize>::new();
     let mut section_title_ranges = HashMap::<usize, TextRange>::new();
     for entry in entries
         .iter()
@@ -379,9 +377,6 @@ fn collect_section_facts(
             .unwrap_or_default()
             .trim()
             .to_owned();
-        let mut key = section_stack.clone();
-        key.push((level, name.clone()));
-        *duplicate_counts.entry(key.clone()).or_default() += 1;
         section_stack.push((level, name.clone()));
         sections.push(SectionDraft {
             node_id: node.id(),
@@ -389,13 +384,11 @@ fn collect_section_facts(
             title_range: byte_range(title)?,
             level,
             name,
-            key,
         });
         section_title_ranges.insert(node.id(), byte_range(title)?);
     }
 
     let mut section_stack = Vec::<(u32, RstHeading)>::new();
-    let mut duplicate_ordinals = HashMap::<Vec<(u32, String)>, u32>::new();
     let mut section_paths = HashMap::<usize, Vec<RstHeading>>::new();
     let mut section_events = Vec::with_capacity(sections.len());
     for section in sections {
@@ -405,18 +398,11 @@ fn collect_section_facts(
         {
             section_stack.pop();
         }
-        let name = if duplicate_counts.get(&section.key).copied().unwrap_or(0) > 1 {
-            let ordinal = duplicate_ordinals.entry(section.key.clone()).or_default();
-            *ordinal += 1;
-            format!("{}~{}", section.name, ordinal)
-        } else {
-            section.name.clone()
-        };
         section_stack.push((
             section.level,
             RstHeading {
                 level: section.level,
-                name,
+                name: section.name.clone(),
             },
         ));
         let path = section_stack
@@ -899,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn first_seen_adornment_order_sets_heading_path_and_duplicate_names() {
+    fn first_seen_adornment_order_sets_heading_path_and_repeated_names() {
         let text = "Top\n===\n\nIntro.\n\nChild\n-----\n\nDetails.\n\nTop\n===\n\nAgain.\n";
         let facts = extract(text);
         let headings = facts
@@ -911,8 +897,12 @@ mod tests {
         assert_eq!(headings.len(), 3);
         assert_eq!(headings[0].0[0].level, 1);
         assert_eq!(headings[1].0[1].level, 2);
-        assert_eq!(headings[0].0[0].name, "Top~1");
-        assert_eq!(headings[2].0[0].name, "Top~2");
+        assert_eq!(headings[0].0[0].name, "Top");
+        assert_eq!(headings[2].0[0].name, "Top");
+        assert_ne!(
+            headings[0].1, headings[2].1,
+            "each section keeps its own range"
+        );
         assert_eq!(
             &text[usize::try_from(headings[1].1.start).expect("range start")
                 ..usize::try_from(headings[1].1.end).expect("range end")],

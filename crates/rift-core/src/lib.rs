@@ -23,7 +23,7 @@ pub use identity::{
     CompositionId, CompositionRevision, IndexRevision, ModelId, ModelRevision,
     ParsedSymbolIdentity, ProviderId, ProviderRevision, ProviderSymbolId, SourceResolverId,
     SourceRevision, SourceUnitId, SymbolId, SymbolIdentityError, TreeRevision, WorkspaceId,
-    encode_path, parse_symbol_identity, symbol_identity,
+    declaration_address, encode_path, parse_symbol_identity, symbol_identity,
 };
 pub use limits::{BudgetExhausted, LoopBudget};
 pub use name::is_canonical_ascii_name;

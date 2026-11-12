@@ -15,8 +15,8 @@ use crate::{
 
 /// Every field needed to reconstruct normalized per-file facts.
 ///
-/// Qualified names already carry the provider's duplicate suffixes. Checked construction
-/// preserves them, attached documentation, parser errors, and omission counts unchanged.
+/// Declarations carry the provider's declaration ordinals. Checked construction preserves
+/// them, attached documentation, parser errors, and omission counts unchanged.
 #[derive(Debug, Clone)]
 pub struct SyntaxFactsParts {
     /// Recorded provider or framework origin, retained through checked construction.
@@ -327,7 +327,6 @@ pub(crate) fn validate_symbols(
     }
     ordered(parts.symbols.iter().map(|symbol| symbol.range))?;
     ordered(parts.left_out_symbols.iter().map(|symbol| symbol.range))?;
-    let mut positions = BTreeMap::new();
     for symbol in &parts.symbols {
         if !rift_core::is_portable_name(&symbol.name)
             || !rift_core::is_portable_name(&symbol.qualified_name)
@@ -342,16 +341,27 @@ pub(crate) fn validate_symbols(
         .chain(&parts.left_out_symbols)
         .collect::<Vec<_>>();
     symbols.sort_by_key(|symbol| symbol.range.start);
-    for (position, symbol) in symbols.iter().enumerate() {
-        if positions
-            .insert(symbol.qualified_name.as_str(), position)
-            .is_some()
-        {
-            return errors::syntax::facts_name_invalid().fail();
-        }
-    }
+    let positions = declaration_positions(&symbols)?;
     validate_left_out_symbols(source, limits, &names, parts)?;
     validate_symbol_parents(&symbols, limits, &positions)
+}
+
+/// Every qualified name's declarations as positions in `symbols`, in source order.
+///
+/// A name's declarations must carry ordinals 0, 1, 2 and on in source order: the key
+/// `(qualified_name, declaration_ordinal)` names exactly one declaration of the file.
+fn declaration_positions<'facts>(
+    symbols: &[&'facts SyntaxSymbol],
+) -> Result<BTreeMap<&'facts str, Vec<usize>>, RiftError> {
+    let mut positions: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (position, symbol) in symbols.iter().enumerate() {
+        let declared = positions.entry(symbol.qualified_name.as_str()).or_default();
+        if symbol.declaration_ordinal != declared.len() {
+            return errors::syntax::facts_name_invalid().fail();
+        }
+        declared.push(position);
+    }
+    Ok(positions)
 }
 
 fn retained_name(value: &str, limits: SyntaxLimits) -> Result<(), RiftError> {
@@ -560,10 +570,16 @@ fn validate_module_path(
     Ok(())
 }
 
+/// Checks every resolved container precedes and encloses its declaration, within the
+/// depth bound.
+///
+/// A container names a qualified name; its declaration is the latest earlier one spelling
+/// that name. A qualified name never nests inside a declaration of itself, so an earlier
+/// declaration of the name enclosing the child is always the latest one.
 fn validate_symbol_parents(
     symbols: &[&SyntaxSymbol],
     limits: SyntaxLimits,
-    positions: &BTreeMap<&str, usize>,
+    positions: &BTreeMap<&str, Vec<usize>>,
 ) -> Result<(), RiftError> {
     let mut depths = vec![0_usize; symbols.len()];
     for (position, symbol) in symbols.iter().enumerate() {
@@ -571,18 +587,21 @@ fn validate_symbol_parents(
             None => 1,
             Some(container) => {
                 retained_name(container, limits)?;
-                // Duplicate suffixing changes qualified names but retains authored containers.
-                match positions.get(container).copied() {
+                match positions.get(container) {
                     None => {
                         if container.chars().any(char::is_control) {
                             return errors::syntax::facts_name_invalid().fail();
                         }
                         1
                     }
-                    Some(parent) => {
-                        if parent >= position || !contains(symbols[parent].range, symbol.range) {
-                            return Err(errors::syntax::facts_reference_invalid().error());
-                        }
+                    Some(declared) => {
+                        let parent = declared
+                            .iter()
+                            .rev()
+                            .copied()
+                            .find(|parent| *parent < position)
+                            .filter(|parent| contains(symbols[*parent].range, symbol.range))
+                            .ok_or_else(|| errors::syntax::facts_reference_invalid().error())?;
                         depths[parent]
                             .checked_add(1)
                             .ok_or_else(|| errors::syntax::facts_depth_exceeded().error())?
@@ -742,11 +761,11 @@ impl SyntaxFacts {
     /// Validates and restores normalized facts for exact source bytes and syntax bounds.
     ///
     /// Each collection is bounded by `limits.syntax_nodes_max()`. Validation checks UTF-8
-    /// ranges, source order, provider names, unique declaration names, and parent references.
+    /// ranges, source order, provider names, declaration ordinals, and parent references.
     /// Decoded text fits the source byte bound. Signatures retain the source header and
     /// language emitted by the syntax walk; semantic fields must remain empty.
     /// Resolved parents must precede their children, which rejects cycles in one bounded pass.
-    /// Authored containers absent after duplicate suffixing remain accepted.
+    /// Authored containers no declaration spells remain accepted.
     ///
     /// # Errors
     ///
@@ -802,12 +821,13 @@ fn validate_export_bindings(
     }
     count(bindings.len(), limits)?;
     ordered(bindings.iter().map(|binding| binding.range))?;
-    let containers = parts
-        .symbols
-        .iter()
-        .chain(&parts.left_out_symbols)
-        .map(|symbol| (symbol.qualified_name.as_str(), symbol.range))
-        .collect::<BTreeMap<_, _>>();
+    let mut containers: BTreeMap<&str, Vec<ByteRange>> = BTreeMap::new();
+    for symbol in parts.symbols.iter().chain(&parts.left_out_symbols) {
+        containers
+            .entry(symbol.qualified_name.as_str())
+            .or_default()
+            .push(symbol.range);
+    }
     let mut previous = None;
     for binding in bindings {
         range(source, binding.range)?;
@@ -830,7 +850,7 @@ fn validate_export_bindings(
             retained_name(container, limits)?;
             if !containers
                 .get(container.as_str())
-                .is_some_and(|range| contains(*range, binding.range))
+                .is_some_and(|ranges| ranges.iter().any(|range| contains(*range, binding.range)))
             {
                 return errors::syntax::facts_reference_invalid().fail();
             }

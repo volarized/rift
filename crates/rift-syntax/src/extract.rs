@@ -403,6 +403,7 @@ fn qualified_symbol(
         .into_iter()
         .collect();
     Ok(SyntaxSymbol {
+        declaration_ordinal: 0,
         qualified_name: qualify(
             rules.qualification_separator(),
             qualification,

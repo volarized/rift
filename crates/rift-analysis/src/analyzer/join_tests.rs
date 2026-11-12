@@ -133,16 +133,22 @@ fn symbol_at<'publication>(
     path: &str,
     qualified_name: &str,
 ) -> Option<&'publication PackageSymbol> {
+    declaration_at(analysis, path, (qualified_name, 0))
+}
+
+/// The binding of the declaration `(qualified_name, declaration_ordinal)` at `path`.
+fn declaration_at<'publication>(
+    analysis: &'publication super::PackageAnalysis,
+    path: &str,
+    (qualified_name, ordinal): (&str, usize),
+) -> Option<&'publication PackageSymbol> {
     let held = analysis
         .files()
         .iter()
         .find(|held| held.file().path().as_str() == path)?;
-    let syntax = held
-        .file()
-        .syntax()
-        .symbols()
-        .iter()
-        .find(|symbol| symbol.qualified_name == qualified_name)?;
+    let syntax = held.file().syntax().symbols().iter().find(|symbol| {
+        symbol.qualified_name == qualified_name && symbol.declaration_ordinal == ordinal
+    })?;
     let unit = analysis
         .publication()
         .units
@@ -263,12 +269,12 @@ fn test_a_python_stub_joins_its_module_into_one_symbol_per_name() {
     );
 
     let joined = symbol_at(&publication, "mod.py", "f").expect("f answers at the module");
-    let stub_signatures: Vec<&str> = ["f~1", "f~2"]
+    let stub_signatures: Vec<&str> = [("f", 0), ("f", 1)]
         .into_iter()
         .flat_map(|form| {
             binding_signature_displays(
                 &publication,
-                symbol_at(&publication, "mod.pyi", form).expect("retained stub form"),
+                declaration_at(&publication, "mod.pyi", form).expect("retained stub form"),
             )
         })
         .collect();
@@ -299,8 +305,9 @@ fn test_a_python_stub_joins_its_module_into_one_symbol_per_name() {
         .find(|document| document.identity == joined.symbol.0)
         .expect("the joined symbol ranks under one document");
     assert_eq!(document.signature.as_deref(), Some("def f(x: int) -> int:"));
-    for form in ["f~1", "f~2"] {
-        let binding = symbol_at(&publication, "mod.pyi", form).expect("each stub form is retained");
+    for form in [("f", 0), ("f", 1)] {
+        let binding =
+            declaration_at(&publication, "mod.pyi", form).expect("each stub form is retained");
         assert_eq!(binding.symbol, joined.symbol);
     }
     assert_eq!(
@@ -324,8 +331,8 @@ fn test_a_python_stub_joins_its_module_into_one_symbol_per_name() {
     assert_unique_identities(&publication);
 }
 
-/// When the module repeats the overload forms before its implementation, the last form is
-/// the one the module binds, so it answers for the stub's forms.
+/// When the module repeats the overload forms before its implementation, every form is a
+/// declaration of the one symbol, and the implementation form answers with its own source.
 #[test]
 fn test_a_module_repeating_its_overloads_answers_at_the_implementation_form() {
     let overloads = "from typing import overload\n\n@overload\ndef f(x: int) -> int: ...\n@overload\ndef f(x: str) -> str: ...\n";
@@ -335,19 +342,19 @@ fn test_a_module_repeating_its_overloads_answers_at_the_implementation_form() {
         vec![("mod.pyi", overloads), ("mod.py", module.as_str())],
     );
 
-    let joined = symbol_at(&publication, "mod.py", "f~3").expect("the implementation form");
+    let joined = declaration_at(&publication, "mod.py", ("f", 2)).expect("the implementation form");
     assert!(joined.public);
     assert!(joined.source.starts_with("def f(x):"));
     assert_eq!(
         binding_signature_displays(&publication, joined),
         ["def f(x):"]
     );
-    let stub_signatures: Vec<&str> = ["f~1", "f~2"]
+    let stub_signatures: Vec<&str> = [("f", 0), ("f", 1)]
         .into_iter()
         .flat_map(|form| {
             binding_signature_displays(
                 &publication,
-                symbol_at(&publication, "mod.pyi", form).expect("retained stub form"),
+                declaration_at(&publication, "mod.pyi", form).expect("retained stub form"),
             )
         })
         .collect();
@@ -355,17 +362,17 @@ fn test_a_module_repeating_its_overloads_answers_at_the_implementation_form() {
         stub_signatures,
         ["def f(x: int) -> int:", "def f(x: str) -> str:"]
     );
-    for form in ["f~1", "f~2"] {
+    for form in [("f", 0), ("f", 1)] {
         assert_eq!(
-            symbol_at(&publication, "mod.pyi", form)
+            declaration_at(&publication, "mod.pyi", form)
                 .expect("a retained stub form")
                 .symbol,
             joined.symbol,
-            "{form}"
+            "{form:?}"
         );
         assert!(
-            symbol_at(&publication, "mod.py", form).is_some_and(|symbol| !symbol.public),
-            "{form}"
+            declaration_at(&publication, "mod.py", form).is_some_and(|symbol| symbol.public),
+            "every declaration of the public symbol is public: {form:?}"
         );
     }
 }
@@ -661,8 +668,8 @@ fn test_a_joined_declaration_records_its_stub_forms_and_ranges() {
     assert_eq!(
         identities,
         [
-            rift_core::symbol_identity("python", stub_file.placement.identity_path(), "f~1"),
-            rift_core::symbol_identity("python", stub_file.placement.identity_path(), "f~2"),
+            rift_core::declaration_address("python", stub_file.placement.identity_path(), "f", 0),
+            rift_core::declaration_address("python", stub_file.placement.identity_path(), "f", 1),
         ]
     );
     assert!(forms.iter().all(|form| form.path().0 == "mod.pyi"));
@@ -677,7 +684,7 @@ fn test_a_joined_declaration_records_its_stub_forms_and_ranges() {
     );
     assert!(module.stub_forms("missing").is_empty());
     assert!(
-        stub_file.stub_forms("f~1").is_empty(),
+        stub_file.stub_forms("f").is_empty(),
         "a stub records no forms"
     );
 }

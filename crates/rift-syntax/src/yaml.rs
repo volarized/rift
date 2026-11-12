@@ -592,8 +592,8 @@ mod tests {
             qualified_names(&document),
             [
                 ("servers", None),
-                ("servers > host~1", Some("servers")),
-                ("servers > host~2", Some("servers")),
+                ("servers > host", Some("servers")),
+                ("servers > host", Some("servers")),
                 ("plain", None),
             ]
         );
@@ -639,18 +639,23 @@ mod tests {
         );
     }
 
-    /// Repeated keys take distinct qualified names with distinct spans:
-    /// neither keeps the bare key path, each takes a `~N` suffix, the same
-    /// policy every provider applies.
+    /// Repeated keys share one qualified name and keep distinct spans, numbered apart
+    /// in source order, the same policy every provider applies.
     #[test]
-    fn test_repeated_keys_take_distinct_qualified_names_with_distinct_spans() {
+    fn test_repeated_keys_share_one_qualified_name_numbered_apart() {
         let document = analyze("port: 1\nport: 2\n");
         let names = document
             .symbols()
             .iter()
             .map(|symbol| symbol.qualified_name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(names, ["port~1", "port~2"]);
+        assert_eq!(names, ["port", "port"]);
+        let ordinals = document
+            .symbols()
+            .iter()
+            .map(|symbol| symbol.declaration_ordinal)
+            .collect::<Vec<_>>();
+        assert_eq!(ordinals, [0, 1]);
         assert_ne!(
             document.symbols()[0].range,
             document.symbols()[1].range,
@@ -659,10 +664,11 @@ mod tests {
     }
 
     /// A sequence of mappings - the shape `.github/dependabot.yml` writes
-    /// its `updates` under - gives each item's repeated key its own
-    /// qualified name, so the file mints one identity per declaration.
+    /// its `updates` under - gives each item's repeated key one qualified name,
+    /// numbered apart per item, so the file holds one symbol with one declaration
+    /// per item.
     #[test]
-    fn test_a_sequence_of_mappings_names_each_repeated_key_apart() {
+    fn test_a_sequence_of_mappings_numbers_each_repeated_key_apart() {
         let text = "updates:\n  - package-ecosystem: bun\n  \
                     - package-ecosystem: cargo\n  \
                     - package-ecosystem: github-actions\n";
@@ -676,11 +682,17 @@ mod tests {
             names,
             [
                 "updates",
-                "updates > package-ecosystem~1",
-                "updates > package-ecosystem~2",
-                "updates > package-ecosystem~3"
+                "updates > package-ecosystem",
+                "updates > package-ecosystem",
+                "updates > package-ecosystem"
             ]
         );
+        let ordinals = document
+            .symbols()
+            .iter()
+            .map(|symbol| symbol.declaration_ordinal)
+            .collect::<Vec<_>>();
+        assert_eq!(ordinals, [0, 0, 1, 2]);
     }
 
     #[test]

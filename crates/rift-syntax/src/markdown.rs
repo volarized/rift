@@ -805,21 +805,23 @@ mod tests {
         assert!(!document.has_errors());
     }
 
-    /// Repeated headings take distinct qualified names and keep their own
-    /// spans: none keeps the bare heading path, each takes a `~N` suffix,
-    /// the same policy every provider applies.
+    /// Repeated headings share one qualified name and keep their own spans,
+    /// numbered apart in source order, the same policy every provider applies.
     #[test]
-    fn test_repeated_headings_take_distinct_qualified_names_with_distinct_spans() {
+    fn test_repeated_headings_share_one_qualified_name_numbered_apart() {
         let document = analyze("# Notes\n\n## Sub\n\n# Notes\n\n## Sub\n");
         let names = document
             .symbols()
             .iter()
             .map(|symbol| symbol.qualified_name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(
-            names,
-            ["Notes~1", "Notes > Sub~1", "Notes~2", "Notes > Sub~2"]
-        );
+        assert_eq!(names, ["Notes", "Notes > Sub", "Notes", "Notes > Sub"]);
+        let ordinals = document
+            .symbols()
+            .iter()
+            .map(|symbol| symbol.declaration_ordinal)
+            .collect::<Vec<_>>();
+        assert_eq!(ordinals, [0, 0, 1, 1]);
         assert_ne!(
             document.symbols()[0].range,
             document.symbols()[2].range,

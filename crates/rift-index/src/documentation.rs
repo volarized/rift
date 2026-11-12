@@ -69,11 +69,8 @@ pub(crate) fn declarations(
     for file in files.values() {
         let language = file.syntax().language();
         for symbol in file.syntax().symbols() {
-            let identity = rift_core::symbol_identity(
-                &language.identity_segment(),
-                file.path().as_str(),
-                &symbol.qualified_name,
-            );
+            let identity =
+                symbol.provider_address(&language.identity_segment(), file.path().as_str());
             if let Some(canonical) =
                 crate::workspace::ReadableSymbol::assembled_by(semantics, &identity)
                     .and_then(|readable| readable.identity().cloned())

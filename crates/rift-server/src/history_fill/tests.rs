@@ -340,6 +340,43 @@ fn an_analyzed_commit_classifies_each_changed_declaration_and_pairs_pure_renames
     Ok(())
 }
 
+/// Two declarations of one function are one symbol: editing the second records one
+/// change under the shared qualified name, and adding a third changes its signature.
+#[test]
+fn a_commit_records_one_change_for_every_declaration_of_a_name() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path();
+    init(root);
+    let declaration = |body: &str| format!("#[cfg(unix)]\npub fn tick() {{ {body} }}\n");
+    write(root, "src/lib.rs", &(declaration("1") + &declaration("2")))?;
+    commit_all(root, "introduce tick twice");
+    write(root, "src/lib.rs", &(declaration("1") + &declaration("3")))?;
+    commit_all(root, "edit the second tick");
+    write(
+        root,
+        "src/lib.rs",
+        &(declaration("1") + &declaration("3") + &declaration("4")),
+    )?;
+    commit_all(root, "add a third tick");
+    let analysis = analysis(root, &everything(10))?;
+    let plan = analysis.plan(&HashMap::new())?;
+    let change = |index: usize| -> TestResult<Vec<DeclarationChange>> {
+        Ok(analysis
+            .analyze(&plan.pending()[index], &|| false)?
+            .ok_or("nothing cancels the analysis")?
+            .into_record()
+            .declarations)
+    };
+    let tick = |change| DeclarationChange {
+        path: "src/lib.rs".to_owned(),
+        qualified_name: "tick".to_owned(),
+        change,
+    };
+    assert_eq!(change(0)?, [tick(SymbolVersionKind::SignatureChanged)]);
+    assert_eq!(change(1)?, [tick(SymbolVersionKind::BodyChanged)]);
+    Ok(())
+}
+
 #[test]
 fn an_analysis_asked_to_stop_answers_nothing() -> TestResult {
     let directory = three_commits()?;

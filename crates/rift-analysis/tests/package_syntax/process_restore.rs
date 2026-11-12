@@ -49,6 +49,7 @@ impl CapturedModulePath {
 struct CapturedSymbol {
     name: String,
     qualified_name: String,
+    declaration_ordinal: usize,
     container: Option<String>,
     kind: String,
     node_kind: Option<String>,
@@ -79,6 +80,7 @@ impl CapturedSymbol {
         Self {
             name: symbol.name.clone(),
             qualified_name: symbol.qualified_name.clone(),
+            declaration_ordinal: symbol.declaration_ordinal,
             container: symbol.container.clone(),
             kind: symbol.kind.to_owned(),
             node_kind: symbol.node_kind.map(str::to_owned),
@@ -104,6 +106,7 @@ impl CapturedSymbol {
         SyntaxSymbol {
             name: self.name,
             qualified_name: self.qualified_name,
+            declaration_ordinal: self.declaration_ordinal,
             container: self.container,
             kind: names
                 .symbol_kind(&self.kind)

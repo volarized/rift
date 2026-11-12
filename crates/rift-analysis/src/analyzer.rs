@@ -114,9 +114,10 @@ impl AnalyzedFile {
         self.public_names.contains(qualified_name)
     }
 
-    /// The stub declarations the declaration spelled by `qualified_name` answers for, in the
-    /// stub's source order: each one's identity, stub path, and range. Empty unless this
-    /// file is an implementation whose declaration joined its stub.
+    /// The stub declarations the symbol spelled by `qualified_name` answers for, in the
+    /// stub's source order: each one's identity, stub path, and range. Every declaration
+    /// of the symbol in this file answers for the same forms. Empty unless this file is an
+    /// implementation whose declaration joined its stub.
     #[must_use]
     pub fn stub_forms(&self, qualified_name: &str) -> &[StubForm] {
         self.role.stub_forms(qualified_name)

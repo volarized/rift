@@ -88,7 +88,11 @@ fn python_repeated_declarations_share_one_identity() {
     let ordinary = anchors(text, text, false);
     let captured = anchors(text, text, true);
     assert_eq!(ordinary, captured);
-    assert_eq!(ordinary.len(), 2);
+    assert_eq!(
+        ordinary.len(),
+        1,
+        "both declarations spell one qualified name"
+    );
     let identities = captured.values().collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
         identities

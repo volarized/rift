@@ -69,6 +69,34 @@ pub fn symbol_identity(language_segment: &str, path: &str, qualified_name: &str)
     )
 }
 
+/// Marks the declaration ordinal in a provider-local declaration address.
+///
+/// `symbol_identity` escapes `#` inside every segment, so the marker never meets a byte
+/// of the language, path, or qualified name.
+const DECLARATION_ORDINAL_MARKER: char = '#';
+
+/// Mints the provider-local address of one declaration: the `symbol_identity` of its
+/// qualified name, followed by `#<ordinal>` for every declaration after the first one
+/// spelling that name in the file.
+///
+/// Several declarations of one qualified name are one logical symbol; the ordinal - the
+/// declaration's position among them, counted from 0 in source order - keeps their
+/// provider keys apart. The address is a provider key, never a public identity, and
+/// nothing reads the ordinal back out of it.
+#[must_use]
+pub fn declaration_address(
+    language_segment: &str,
+    path: &str,
+    qualified_name: &str,
+    ordinal: usize,
+) -> String {
+    let address = symbol_identity(language_segment, path, qualified_name);
+    if ordinal == 0 {
+        return address;
+    }
+    format!("{address}{DECLARATION_ORDINAL_MARKER}{ordinal}")
+}
+
 /// Parsed parts of a canonical wire symbol identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedSymbolIdentity {
@@ -629,7 +657,8 @@ mod tests {
     use super::{
         CompositionId, CompositionRevision, IndexRevision, ModelId, ModelRevision, ProviderId,
         ProviderRevision, ProviderSymbolId, SourceResolverId, SourceRevision, SourceUnitId,
-        SymbolId, TreeRevision, WorkspaceId, encode_path, parse_symbol_identity, symbol_identity,
+        SymbolId, TreeRevision, WorkspaceId, declaration_address, encode_path,
+        parse_symbol_identity, symbol_identity,
     };
     use crate::constants::{
         SOURCE_RESOLVER_ID_BYTES_MAX, SOURCE_UNIT_ID_BYTES_MAX, SOURCE_UNIT_URI_PREFIX,
@@ -757,6 +786,20 @@ mod tests {
                 "qualified-name slashes must stay separate from path separators: {name}"
             );
         }
+    }
+
+    #[test]
+    fn declaration_address_keeps_the_first_declaration_on_its_name_address() {
+        let first = declaration_address("json", "names space.json", "a#1", 0);
+        assert_eq!(first, symbol_identity("json", "names space.json", "a#1"));
+        assert_eq!(first, "rift://symbol/json/names%20space.json/a%231");
+        let second = declaration_address("json", "names space.json", "a", 1);
+        assert_eq!(second, "rift://symbol/json/names%20space.json/a#1");
+        assert_ne!(
+            first, second,
+            "an escaped name never meets the ordinal marker"
+        );
+        assert!(ProviderSymbolId::for_symbol(&second).is_ok());
     }
 
     /// Pins a shipped rust `SymbolId` byte-for-byte: generalizing the minting

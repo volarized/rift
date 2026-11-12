@@ -1650,9 +1650,11 @@ pub(crate) fn resolve_symbol<'a>(
 ) -> Option<(&'a IndexedFile, &'a SyntaxSymbol)> {
     let file = index.file(path)?;
     let language = file.syntax().language().identity_segment();
-    let symbol = file.syntax().symbols().iter().find(|symbol| {
-        rift_core::symbol_identity(&language, path.as_str(), &symbol.qualified_name) == identity
-    })?;
+    let symbol = file
+        .syntax()
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.provider_address(&language, path.as_str()) == identity)?;
     Some((file, symbol))
 }
 
@@ -4298,8 +4300,7 @@ impl Tower {
         let file = service.index().file(&path).ok_or("fixture file missing")?;
         let mut names = Vec::new();
         for symbol in file.syntax().symbols() {
-            let identity =
-                rift_core::symbol_identity("json", path.as_str(), &symbol.qualified_name);
+            let identity = symbol.provider_address("json", path.as_str());
             let (resolved_file, resolved_symbol) =
                 super::resolve_symbol(service.index(), &path, &identity)
                     .ok_or("minted identity must resolve")?;
@@ -4320,13 +4321,7 @@ impl Tower {
         }
         assert_eq!(
             names,
-            [
-                "js/bun",
-                "js%2Fbun",
-                "café/test",
-                "duplicate~1",
-                "duplicate~2"
-            ]
+            ["js/bun", "js%2Fbun", "café/test", "duplicate", "duplicate"]
         );
         for refused in [
             "not a symbol address",
