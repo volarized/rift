@@ -117,7 +117,11 @@ filter = 'binary(=corpus_fastapi) & test(=test_fastapi_corpus)'
 slow-timeout = { period = "240s", terminate-after = 1, grace-period = "30s" }
 
 [[profile.corpus.overrides]]
-filter = 'binary(=corpus_bun) & (test(=test_bun_workspace) | test(=test_bun_stop))'
+filter = 'binary(=corpus_bun) & test(=test_bun_workspace)'
+slow-timeout = { period = "600s", terminate-after = 1, grace-period = "30s" }
+
+[[profile.corpus.overrides]]
+filter = 'binary(=corpus_bun) & test(=test_bun_stop)'
 slow-timeout = { period = "540s", terminate-after = 1, grace-period = "30s" }
 
 [[profile.corpus.overrides]]

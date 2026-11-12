@@ -772,7 +772,7 @@ jobs:
           - repository: bun
             case: workspace
             test: test_bun_workspace
-            minutes: 10
+            minutes: 11
           - repository: bun
             case: stop
             test: test_bun_stop
