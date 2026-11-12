@@ -415,12 +415,28 @@ Use `include` to select optional projections:
 | Include | Adds |
 | --- | --- |
 | `documentation` | Bounded documentation referring to the exact declaration |
-| `history` | The logical symbol's version-control timeline |
+| `history` | The logical symbol's history edges: the commits that touched it and the symbols changed beside it |
 
 The options combine; an omitted or empty `include` adds neither. A declaration's source comes
-from [`nodes`](#tool-nodes) with the symbol's `id`. `history` lists the revisions that changed the symbol, newest first, with each
-commit's author. The local server fills its history store in the background; an incomplete
-timeline answers `complete: false` until the store holds the selected revision.
+from [`nodes`](#tool-nodes) with the symbol's `id`.
+
+`history` answers edges from the symbol. The commit edges come first, newest first, each naming
+its commit as a `rift://revision/git/<commit>` revision with the commit's author and the path the
+declaration lived at:
+
+- `introduced_in` - the commit brought the symbol into existence
+- `changed_in` - the commit changed the declaration in place; `change` says whether the
+  signature, the body, or the decorators changed
+- `renamed_from` - the commit moved the declaration unchanged; `from` is the path it came from
+- `removed_in` - the commit deleted the declaration
+
+The `co_changes` edges follow, most shared commits first: each names a symbol the listed commits
+changed beside this one and how many of them did. A commit that changed more than 256
+declarations, such as a sweeping rename, counts toward no co-change edge, and one history answers
+at most 32 of them; `co_changes_truncated` counts what either bound left out.
+
+The local server fills its history store in the background; an incomplete history answers
+`complete: false` until the store holds the selected revision.
 
 Pass a preceding `view` to retain its immutable selection. Expiry refuses the read instead
 of selecting latest implicitly. `declaration_limit` bounds returned declarations; a returned

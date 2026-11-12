@@ -3,7 +3,11 @@
 use rift_protocol::documentation::{
     DocumentationContext, DocumentationHit, DocumentationReferenceHit,
 };
-use rift_protocol::read::{GetSymbolHit, ProjectPath, ReadWarning, SymbolHistory, SymbolVersion};
+use rift_protocol::read::{
+    CoChangeTruncation, GetSymbolHit, HistoryCommit, HistoryEdge, ProjectPath, ReadWarning,
+    SymbolHistory,
+};
+use rift_protocol::revision::{Revision, RevisionPoint};
 
 use super::facts::{
     Facts, author_of, block_of, cut_hash, date_of, describe, location, spaced_name,
@@ -16,6 +20,8 @@ use crate::output::text::TextError;
 const ENTRY_INDENT: usize = 1;
 /// Levels that indent the lines under an entry.
 const DETAIL_INDENT: usize = 2;
+/// The member a history edge's wire object names its edge kind under.
+const EDGE_TAG: &str = "edge";
 
 /// Writes one `get_symbol` hit: the declaration, its place, then each requested section.
 pub(super) fn hit(lines: &mut Lines<'_>, hit: &GetSymbolHit) -> Result<(), TextError> {
@@ -113,7 +119,7 @@ fn reference_entry(
     }
 }
 
-/// Writes the timeline: one entry per version, newest first.
+/// Writes the history: one entry per edge, commit edges newest first, then co-changes.
 fn history_section(
     lines: &mut Lines<'_>,
     history: &SymbolHistory,
@@ -121,8 +127,9 @@ fn history_section(
 ) -> Result<(), TextError> {
     let SymbolHistory {
         symbol: _,
-        versions,
+        edges,
         complete,
+        co_changes_truncated,
     } = history;
     lines.blank()?;
     lines.line(
@@ -133,36 +140,91 @@ fn history_section(
             "history (incomplete):"
         },
     )?;
-    for version in versions {
-        version_entry(lines, version, own_path)?;
+    for edge in edges {
+        edge_entry(lines, edge, own_path)?;
+    }
+    if let Some(CoChangeTruncation {
+        commits_past_bound,
+        symbols_past_bound,
+    }) = co_changes_truncated
+    {
+        lines.line(
+            ENTRY_INDENT,
+            &format!(
+                "co-changes truncated: {commits_past_bound} commits past bound, \
+                 {symbols_past_bound} symbols past bound"
+            ),
+        )?;
     }
     Ok(())
 }
 
-/// Writes one version: date, revision, kind, author, and its path when the symbol moved.
-fn version_entry(
+/// Writes one edge. A commit edge reads date, commit, edge, the change or the path the
+/// declaration came from, author, its path when the declaration lived elsewhere, and the
+/// commit summary below; a co-change reads the other symbol and the shared commit count.
+fn edge_entry(
     lines: &mut Lines<'_>,
-    version: &SymbolVersion,
+    edge: &HistoryEdge,
     own_path: Option<&ProjectPath>,
 ) -> Result<(), TextError> {
-    let SymbolVersion {
+    let mut facts = Facts::default();
+    let mut detail = Facts::default();
+    let commit = match edge {
+        HistoryEdge::IntroducedIn { commit } | HistoryEdge::RemovedIn { commit } => commit,
+        HistoryEdge::ChangedIn { commit, change } => {
+            detail.push(&spaced_name(change)?);
+            commit
+        }
+        HistoryEdge::RenamedFrom { commit, from } => {
+            detail.push_value(&from.0);
+            commit
+        }
+        HistoryEdge::CoChanges { symbol, commits } => {
+            facts.push(&edge_name(edge)?);
+            facts.push_value(symbol.as_str());
+            facts.push(&format!("{commits} commits"));
+            return lines.line(ENTRY_INDENT, facts.as_str());
+        }
+    };
+    let HistoryCommit {
         revision,
         path,
-        kind,
         timestamp,
         summary,
         author,
-    } = version;
-    let mut facts = Facts::default();
+    } = commit;
     facts.push_value(date_of(timestamp));
-    facts.push_value(cut_hash(&revision.0));
-    facts.push(&spaced_name(kind)?);
+    facts.push_value(cut_hash(commit_spelling(revision)));
+    facts.push(&edge_name(edge)?);
+    facts.extend(&detail);
     facts.push_value(&author_of(author));
     if Some(path) != own_path {
         facts.push_value(&path.0);
     }
     lines.line(ENTRY_INDENT, facts.as_str())?;
     lines.line(DETAIL_INDENT, summary.as_deref().unwrap_or_default())
+}
+
+/// The wire tag of `edge` with underscores written as spaces, such as `introduced in`.
+fn edge_name(edge: &HistoryEdge) -> Result<String, TextError> {
+    serde_json::to_value(edge)
+        .ok()
+        .and_then(|value| {
+            value
+                .get(EDGE_TAG)?
+                .as_str()
+                .map(|name| name.replace('_', " "))
+        })
+        .ok_or(TextError::Unsupported("history edge without a wire tag"))
+}
+
+/// The commit id a history commit names; empty for a revision of another form, which a
+/// history never answers.
+fn commit_spelling(revision: &Revision) -> &str {
+    match revision.point() {
+        RevisionPoint::Commit(id) => id,
+        RevisionPoint::Reference(_) | RevisionPoint::Release(..) | RevisionPoint::Tree(_) => "",
+    }
 }
 
 pub(super) fn canonical(

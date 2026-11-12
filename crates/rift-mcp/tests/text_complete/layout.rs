@@ -798,7 +798,7 @@ fn symbol_hit(item: &Item<'_>, hit: &Value, at: &str) -> Result<(), String> {
     source_states(item, hit.get("source"), at)
 }
 
-/// Checks the history label, which says whether it is complete, and every version.
+/// Checks the history label, which says whether it is complete, and every edge.
 fn history_states(item: &Item<'_>, history: &Value, at: &str) -> Result<(), String> {
     let complete = history
         .get("complete")
@@ -823,29 +823,36 @@ fn history_states(item: &Item<'_>, history: &Value, at: &str) -> Result<(), Stri
         .filter(|line| !line.starts_with(indent(2).as_str()))
         .copied()
         .collect();
-    let versions = history.get("versions").and_then(Value::as_array);
-    for (index, version) in versions.into_iter().flatten().enumerate() {
-        version_states(
+    let edges = history.get("edges").and_then(Value::as_array);
+    for (index, edge) in edges.into_iter().flatten().enumerate() {
+        edge_states(
             entries.get(index).copied(),
-            version,
-            &format!("{at}.versions[{index}]"),
+            edge,
+            &format!("{at}.edges[{index}]"),
         )?;
     }
     Ok(())
 }
 
-/// Checks that an entry states the cut revision and the kind of a version.
-fn version_states(entry: Option<&str>, version: &Value, at: &str) -> Result<(), String> {
+/// Checks that an entry states the edge, and the cut commit and change of a commit edge or
+/// the other symbol of a co-change.
+fn edge_states(entry: Option<&str>, edge: &Value, at: &str) -> Result<(), String> {
     let entry = entry.ok_or_else(|| format!("{at}: no entry line under the history label"))?;
     let facts: Vec<&str> = entry.trim_start().split(SEPARATOR).collect();
-    let revision = text_at(version, "/revision").unwrap_or_default();
-    let kind = text_at(version, "/kind")
-        .unwrap_or_default()
-        .replace('_', " ");
-    for (name, wanted) in [("revision", cut_hash(revision)), ("kind", kind.as_str())] {
-        require(facts.contains(&wanted), &format!("{at}.{name}"), || {
-            format!("no `{wanted}` fact on the entry `{entry}`")
-        })?;
+    let spaced = |pointer: &str| text_at(edge, pointer).map(|text| text.replace('_', " "));
+    let mut wanted = vec![("edge", spaced("/edge").unwrap_or_default())];
+    if let Some(revision) = text_at(edge, "/commit/revision") {
+        let commit = revision.rsplit('/').next().unwrap_or_default();
+        wanted.push(("commit.revision", cut_hash(commit).to_owned()));
+    }
+    wanted.extend(spaced("/change").map(|change| ("change", change)));
+    wanted.extend(text_at(edge, "/symbol").map(|symbol| ("symbol", symbol.to_owned())));
+    for (name, wanted) in wanted {
+        require(
+            facts.contains(&wanted.as_str()),
+            &format!("{at}.{name}"),
+            || format!("no `{wanted}` fact on the entry `{entry}`"),
+        )?;
     }
     Ok(())
 }
@@ -1168,21 +1175,31 @@ mod tests {
                 "history": {
                     "symbol": "rift://symbol/rust/src/a.rs/a",
                     "complete": false,
-                    "versions": [
+                    "edges": [
                         {
-                            "revision": "1f2080e5aa",
-                            "path": "src/a.rs",
-                            "kind": "signature_changed",
-                            "timestamp": "2026-08-21T10:00:00+00:00",
-                            "summary": "Return an error",
-                            "author": { "name": "Alice", "email": "alice@example.com" }
+                            "edge": "changed_in",
+                            "change": "signature_changed",
+                            "commit": {
+                                "revision": "rift://revision/git/1f2080e5aa00000000000000000000000000000a",
+                                "path": "src/a.rs",
+                                "timestamp": "2026-08-21T10:00:00+00:00",
+                                "summary": "Return an error",
+                                "author": { "name": "Alice", "email": "alice@example.com" }
+                            }
                         },
                         {
-                            "revision": "HEAD~2",
-                            "path": "src/a.rs",
-                            "kind": "introduced",
-                            "timestamp": "2026-08-17T09:41:05+00:00",
-                            "author": { "name": "Alice", "email": "alice@example.com" }
+                            "edge": "introduced_in",
+                            "commit": {
+                                "revision": "rift://revision/git/2b00000000000000000000000000000000000000",
+                                "path": "src/a.rs",
+                                "timestamp": "2026-08-17T09:41:05+00:00",
+                                "author": { "name": "Alice", "email": "alice@example.com" }
+                            }
+                        },
+                        {
+                            "edge": "co_changes",
+                            "symbol": "rift://symbol/rust/src/b.rs/b",
+                            "commits": 2
                         }
                     ]
                 }
@@ -1199,9 +1216,10 @@ mod tests {
 \trift://symbol/rust/src/a.rs/a
 
 \thistory (incomplete):
-\t\t2026-08-21 · 1f2080e5 · signature changed · Alice <alice@example.com>
+\t\t2026-08-21 · 1f2080e5 · changed in · signature changed · Alice <alice@example.com>
 \t\t\tReturn an error
-\t\t2026-08-17 · HEAD~2 · introduced · Alice <alice@example.com>
+\t\t2026-08-17 · 2b000000 · introduced in · Alice <alice@example.com>
+\t\tco changes · rift://symbol/rust/src/b.rs/b · 2 commits
 
 \tpub fn a() {}
 ";
@@ -2215,23 +2233,30 @@ mod tests {
     }
 
     #[test]
-    fn a_history_version_without_its_entry_is_refused() -> Result<(), String> {
+    fn a_history_edge_without_its_entry_is_refused() -> Result<(), String> {
         let text = edited(SYMBOL_TEXT, " · signature changed", " · signature_changed")?;
         let failure = refused(Tool::GetSymbol, &text, &symbol_answer())?;
         assert!(
-            failure.contains("$.hits[0].history.versions[0].kind"),
+            failure.contains("$.hits[0].history.edges[0].change"),
             "{failure}"
         );
         let text = edited(SYMBOL_TEXT, "1f2080e5", "1f2080e")?;
         let failure = refused(Tool::GetSymbol, &text, &symbol_answer())?;
-        assert!(failure.contains("versions[0].revision"), "{failure}");
+        assert!(failure.contains("edges[0].commit.revision"), "{failure}");
         let text = edited(
             SYMBOL_TEXT,
-            "\t\t2026-08-17 · HEAD~2 · introduced · Alice <alice@example.com>\n",
+            " · 2b000000 · introduced in",
+            " · 2b000000 · introduced",
+        )?;
+        let failure = refused(Tool::GetSymbol, &text, &symbol_answer())?;
+        assert!(failure.contains("edges[1].edge"), "{failure}");
+        let text = edited(
+            SYMBOL_TEXT,
+            "\t\tco changes · rift://symbol/rust/src/b.rs/b · 2 commits\n",
             "",
         )?;
         let failure = refused(Tool::GetSymbol, &text, &symbol_answer())?;
-        assert!(failure.contains("versions[1]"), "{failure}");
+        assert!(failure.contains("edges[2]"), "{failure}");
         Ok(())
     }
 

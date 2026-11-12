@@ -95,8 +95,9 @@ fn canonical_text_states(text: &str, structured: &serde_json::Value) -> Result<(
             if !text.contains(label) {
                 return Err("$.history.complete".to_owned());
             }
-            for version in history["versions"].as_array().ok_or("$.history.versions")? {
-                token(text, &version["kind"], "$.history.versions.kind")?;
+            for edge in history["edges"].as_array().ok_or("$.history.edges")? {
+                let spaced = edge["edge"].as_str().map(|name| name.replace('_', " "));
+                token(text, &serde_json::json!(spaced), "$.history.edges.edge")?;
             }
         }
         if let Some(cursor) = structured.get("declaration_cursor") {

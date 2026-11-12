@@ -18,6 +18,7 @@ use rusqlite::{
     CachedStatement, Connection, OptionalExtension as _, Transaction, TransactionBehavior, params,
 };
 
+use crate::edges::DeclarationKey;
 use crate::record::CommitRecord;
 
 /// How long one connection waits for another's write lock before `SQLite`
@@ -939,6 +940,43 @@ impl StoreReads {
                 .map_err(|source| {
                     errors::history_store::database()
                         .operation("read moved declaration")
+                        .detail(source)
+                        .error()
+                })
+        })
+    }
+
+    /// The declarations `commit` changed, in path and qualified-name order, at most
+    /// `limit` of them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RiftError`] when `SQLite` refuses the read.
+    pub fn changed_declarations(
+        &self,
+        commit: &StoredCommit,
+        limit: usize,
+    ) -> Result<Vec<DeclarationKey>, RiftError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        timed(QUERY_OPERATION, || {
+            self.connection
+                .prepare_cached(
+                    "SELECT path, qualified_name FROM changed_declarations WHERE commit_row = ?1 \
+                     ORDER BY path, qualified_name LIMIT ?2",
+                )
+                .and_then(|mut statement| {
+                    statement
+                        .query_map(params![commit.row, limit], |row| {
+                            Ok(DeclarationKey {
+                                path: row.get(0)?,
+                                qualified_name: row.get(1)?,
+                            })
+                        })?
+                        .collect()
+                })
+                .map_err(|source| {
+                    errors::history_store::database()
+                        .operation("read changed declarations")
                         .detail(source)
                         .error()
                 })

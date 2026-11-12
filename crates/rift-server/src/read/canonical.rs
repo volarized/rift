@@ -651,7 +651,8 @@ impl ReadService {
                     self.index.limits().syntax(),
                     self.stored_history.get(),
                 )?;
-                let history = timelines.symbol_timeline(&bindings, request.id.clone())?;
+                let history =
+                    timelines.symbol_timeline(&self.index, &bindings, request.id.clone())?;
                 let bytes = serde_json::to_vec(&history)
                     .map_err(|error| material_error("capture symbol history", &error))?;
                 Some((request.id.as_str().to_owned(), Arc::<[u8]>::from(bytes)))

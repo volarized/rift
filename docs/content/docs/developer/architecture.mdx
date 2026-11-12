@@ -391,8 +391,8 @@ recent history answers soon, writing bounded batches at the share of one core `c
 When `HEAD` moves, the task analyzes only the commits the store lacks and deletes the ones
 outside every worktree's newest `max_revisions` commits.
 
-No request waits for the task. A symbol timeline and a
-[commit search](/docs/mcp#search-commits) answer from what the store holds: a timeline whose
+No request waits for the task. A symbol history and a
+[commit search](/docs/mcp#search-commits) answer from what the store holds: a history whose
 served revision the store has not analyzed yet answers `complete: false`, and a commit search
 answered before the fill lands carries a `history_store_filling` warning naming how far it has got.
 
@@ -767,4 +767,5 @@ A Symbol carries `id` when the index established one identity for the declaratio
 the providers could not settle answers without an `id`, and a retained provider disagreement
 lands as a `symbol_disagreement` entry in the result's `warnings`.
 
-Asking for history attaches the symbol's committed timeline to the same answer.
+Asking for history attaches the symbol's history edges to the same answer: the commits that
+introduced, changed, renamed, or removed it, and the symbols those commits changed beside it.
