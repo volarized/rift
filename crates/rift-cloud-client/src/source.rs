@@ -4,10 +4,7 @@ use std::collections::HashSet;
 
 use rift_protocol::{
     identity::{SymbolIdentity, SymbolOwner, parse_source_unit_identity},
-    source_read::{
-        DeclarationPositionResult, FindDeclarationsParams, FindDeclarationsResult, GetSourceParams,
-        GetSourceResult,
-    },
+    source_read::{DeclarationPositionResult, FindDeclarationsParams, FindDeclarationsResult},
 };
 
 use crate::{
@@ -16,69 +13,6 @@ use crate::{
 };
 
 impl GlobalClient {
-    /// Reads one physical source unit from its exact release or admitted captured view.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RiftError`] when the request or answer breaks the contract, or the endpoint
-    /// is unavailable.
-    pub async fn get_source(
-        &self,
-        request: &GetSourceParams,
-    ) -> Result<GetSourceResult, RiftError> {
-        rift_tracing::traced!(component = "global", operation = "get_source", async {
-            if !self.inner.enabled {
-                return Err(failure::configuration_invalid(
-                    "enabled",
-                    "global client disabled",
-                ));
-            }
-            if !request.is_valid() {
-                return Err(failure::request_invalid(
-                    "get_source",
-                    "unit",
-                    "field failed validation",
-                ));
-            }
-            global_source_owner(request.unit.as_str(), request.view.as_ref())?;
-            let capabilities = self.get_capabilities().await?;
-            let body = serialize_body(request, self.inner.config.max_request)?;
-            validate_body_for_capabilities(&body, &capabilities, self.inner.config.max_request)?;
-            let raw = self
-                .request(
-                    contract::Endpoint::Source,
-                    Some(body),
-                    None,
-                    active_response_body_bytes_max(&capabilities, self.inner.config.max_response),
-                )
-                .await;
-            let raw = self.observed(raw).await?;
-            let parsed = self.observed(response::exact_source(raw)).await?;
-            let bounded_source = match &parsed.value {
-                GetSourceResult::Found { source, .. } => {
-                    source.text.len()
-                        <= smaller_bound(
-                            capabilities.bounds.source_bytes_max,
-                            self.inner.config.max_source,
-                        )
-                }
-                _ => true,
-            };
-            if !bounded_source || !parsed.value.is_valid_for(request) {
-                return self
-                    .observed(Err(failure::response_invalid(
-                        "get_source",
-                        "body",
-                        "field failed validation",
-                        Some(parsed.meta.status),
-                    )))
-                    .await;
-            }
-            Ok(parsed.value)
-        })
-        .await
-    }
-
     /// Names declarations holding source positions in one immutable selection.
     ///
     /// # Errors

@@ -40,14 +40,13 @@ const ERROR_STATUSES: [StatusCode; 10] = [
     StatusCode::SERVICE_UNAVAILABLE,
 ];
 
-const ENDPOINTS: [Endpoint; 7] = [
+const ENDPOINTS: [Endpoint; 6] = [
     Endpoint::Capabilities,
     Endpoint::Resolutions,
     Endpoint::Search,
     Endpoint::Symbols,
     Endpoint::Patterns,
     Endpoint::Declarations,
-    Endpoint::Source,
 ];
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -58,7 +57,6 @@ pub(crate) enum Endpoint {
     Symbols,
     Patterns,
     Declarations,
-    Source,
 }
 
 impl Endpoint {
@@ -70,7 +68,6 @@ impl Endpoint {
             Self::Symbols => "/v1/symbols",
             Self::Patterns => "/v1/patterns",
             Self::Declarations => "/v1/declarations",
-            Self::Source => "/v1/source",
         }
     }
 
@@ -81,8 +78,7 @@ impl Endpoint {
             | Self::Search
             | Self::Symbols
             | Self::Patterns
-            | Self::Declarations
-            | Self::Source => Method::POST,
+            | Self::Declarations => Method::POST,
         }
     }
 
@@ -94,7 +90,6 @@ impl Endpoint {
             Self::Symbols => "get_symbol",
             Self::Patterns => "searchPackagePatterns",
             Self::Declarations => "findDeclarations",
-            Self::Source => "getSource",
         }
     }
 
@@ -102,7 +97,7 @@ impl Endpoint {
         let mut statuses = ERROR_STATUSES.into_iter().collect::<BTreeSet<_>>();
         statuses.insert(StatusCode::OK);
         statuses.insert(StatusCode::GATEWAY_TIMEOUT);
-        if matches!(self, Self::Source | Self::Symbols) {
+        if self == Self::Symbols {
             statuses.insert(StatusCode::NOT_FOUND);
         }
         if self == Self::Capabilities {
@@ -337,9 +332,7 @@ fn validate_response_media(
             }
             continue;
         }
-        if matches!(endpoint, Endpoint::Source | Endpoint::Symbols)
-            && *status == StatusCode::SERVICE_UNAVAILABLE
-        {
+        if endpoint == Endpoint::Symbols && *status == StatusCode::SERVICE_UNAVAILABLE {
             if response.content.len() != 2
                 || !response.content.contains_key("application/json")
                 || !response.content.contains_key("application/problem+json")
@@ -351,8 +344,7 @@ fn validate_response_media(
             continue;
         }
         let expected = if *status == StatusCode::OK
-            || (matches!(endpoint, Endpoint::Source | Endpoint::Symbols)
-                && *status == StatusCode::NOT_FOUND)
+            || (endpoint == Endpoint::Symbols && *status == StatusCode::NOT_FOUND)
         {
             "application/json"
         } else {
@@ -785,8 +777,6 @@ fn validate_shared_schemas(document: &Value) -> Result<(), String> {
     let _ = generator.subschema_for::<rift_protocol::read::SearchTraversal>();
     let _ = generator.subschema_for::<rift_protocol::symbol_read::GetSymbolParams>();
     let _ = generator.subschema_for::<rift_protocol::symbol_read::GetSymbolResult>();
-    let _ = generator.subschema_for::<rift_protocol::source_read::GetSourceParams>();
-    let _ = generator.subschema_for::<rift_protocol::source_read::GetSourceResult>();
     let _ = generator.subschema_for::<rift_protocol::source_read::FindDeclarationsParams>();
     let _ = generator.subschema_for::<rift_protocol::source_read::FindDeclarationsResult>();
 

@@ -1,84 +1,15 @@
-//! Exact source reads and declaration positions in an immutable selection.
+//! Declaration positions in an immutable selection.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::read::{
-    ExactKind, ReadWarning, RevisionId, SourceExcerpt, SourceUnitId, SymbolId, TextRange,
-};
+use crate::read::{ExactKind, ReadWarning, RevisionId, SourceUnitId, SymbolId};
 use crate::symbol_read::{CapturedView, CapturedViewId, SymbolUnavailableReason};
 
 /// Most positions submitted to one declaration-position read.
 pub const SOURCE_POSITIONS_MAX: usize = 1000;
 /// Largest line or character offset accepted by the declaration-position surface.
 pub const SOURCE_POSITION_MAX: u64 = 2_147_483_647;
-
-/// Reads a source unit or a byte range without requiring a semantic symbol.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-#[schemars(extend("rift:since" = "v0.0.67"))]
-#[schemars(extend("examples" = [
-    {"unit": "rift://source/project/src/lib.rs"}
-]))]
-pub struct GetSourceParams {
-    /// Canonical source unit, retaining its physical package or runtime owner.
-    pub unit: SourceUnitId,
-    /// Requested half-open UTF-8 byte range. Omitted requests the whole unit.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub range: Option<TextRange>,
-    /// A preceding immutable selection. Expiry never selects latest implicitly.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub view: Option<CapturedViewId>,
-    /// A local Git revision. Refused for released sources and beside `view`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rev: Option<RevisionId>,
-}
-
-/// Source bytes, definite absence, or explicit selection unavailability.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
-#[schemars(extend("examples" = [{
-    "outcome": "unavailable",
-    "unit": "rift://source/project/src/lib.rs",
-    "reason": "insufficient_coverage"
-}]))]
-pub enum GetSourceResult {
-    /// The selected unit exists, including when its requested range is empty.
-    Found {
-        /// Returned bytes and their exact source unit and range.
-        source: SourceExcerpt,
-        /// Whether the complete requested range or unit was returned.
-        source_complete: bool,
-        /// Immutable selection supplying these bytes.
-        view: CapturedView,
-        /// Projection cuts and other typed read warnings.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        warnings: Vec<ReadWarning>,
-    },
-    /// The unit is absent from completely searched captured coverage.
-    Missing {
-        /// Requested canonical source unit.
-        unit: SourceUnitId,
-        /// Complete immutable selection searched.
-        view: CapturedView,
-        /// Other typed read warnings.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        warnings: Vec<ReadWarning>,
-    },
-    /// The exact selection cannot establish presence or absence.
-    Unavailable {
-        /// Requested canonical source unit.
-        unit: SourceUnitId,
-        /// Selected view, when one could be captured.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        view: Option<CapturedView>,
-        /// Typed cause of unavailability.
-        reason: SymbolUnavailableReason,
-        /// Details and partial-read warnings.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        warnings: Vec<ReadWarning>,
-    },
-}
 
 /// How a language engine counts characters within a source line.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -171,16 +102,6 @@ pub struct FindDeclarationsResult {
     pub warnings: Vec<ReadWarning>,
 }
 
-impl GetSourceParams {
-    /// Checks source spelling, byte bounds, and mutually exclusive selectors.
-    #[must_use]
-    pub fn is_valid(&self) -> bool {
-        selectors_valid(self.view.as_ref(), self.rev.as_ref())
-            && source_valid(&self.unit, self.rev.as_ref())
-            && self.range.as_ref().is_none_or(range_valid)
-    }
-}
-
 impl SourcePosition {
     /// Checks canonical source spelling and negotiated coordinate bounds.
     #[must_use]
@@ -204,48 +125,6 @@ impl FindDeclarationsParams {
                     && source_valid(&position.unit, self.rev.as_ref())
                     && seen.insert((position.unit.as_str(), position.line, position.character))
             })
-    }
-}
-
-impl GetSourceResult {
-    /// Checks response identity, captured view, and returned byte ranges.
-    /// Complete coverage and view expiry are established by the serving boundary.
-    #[must_use]
-    pub fn is_valid_for(&self, request: &GetSourceParams) -> bool {
-        if !request.is_valid() {
-            return false;
-        }
-        match self {
-            Self::Found {
-                source,
-                source_complete,
-                view,
-                ..
-            } => {
-                let range = &source.span.range;
-                source.span.unit == request.unit
-                    && view_matches(view, request.view.as_ref())
-                    && range_valid(range)
-                    && u64::try_from(source.text.len()).ok() == range.end.checked_sub(range.start)
-                    && request.range.as_ref().map_or_else(
-                        || range.start == 0,
-                        |requested| {
-                            range.start == requested.start
-                                && range.end <= requested.end
-                                && (!source_complete || range.end == requested.end)
-                        },
-                    )
-            }
-            Self::Missing { unit, view, .. } => {
-                *unit == request.unit && view_matches(view, request.view.as_ref())
-            }
-            Self::Unavailable { unit, view, .. } => {
-                *unit == request.unit
-                    && view
-                        .as_ref()
-                        .is_none_or(|view| view_matches(view, request.view.as_ref()))
-            }
-        }
     }
 }
 
@@ -306,10 +185,6 @@ fn selectors_valid(view: Option<&CapturedViewId>, rev: Option<&RevisionId>) -> b
 
 fn source_valid(unit: &SourceUnitId, rev: Option<&RevisionId>) -> bool {
     SourceUnitId::parse(unit.as_str()).is_ok() && (rev.is_none() || unit.is_project())
-}
-
-fn range_valid(range: &TextRange) -> bool {
-    range.start <= range.end && range.end <= 9_007_199_254_740_991
 }
 
 fn view_matches(view: &CapturedView, requested: Option<&CapturedViewId>) -> bool {
