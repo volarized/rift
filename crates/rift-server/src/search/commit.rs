@@ -97,6 +97,12 @@ impl ReadService {
         let parsed = parsed_query(query)?;
         let stored = self.commit_store()?;
         let reads = stored.connect()?;
+        // The filler records progress after writing its batch. Read progress first
+        // so a completed batch cannot hide the warning on older search results.
+        let mut warnings: Vec<ReadWarning> = stored
+            .filling(&reads, self.index().root())?
+            .into_iter()
+            .collect();
         let results_max = self.index().results_max();
         let matched = rift_tracing::traced!(component = "search", operation = "search.commits", {
             matched_commits(&reads, &parsed, results_max)
@@ -106,10 +112,6 @@ impl ReadService {
         for id in &ids {
             results.extend(commit_hit(&reads, id)?);
         }
-        let mut warnings: Vec<ReadWarning> = stored
-            .filling(&reads, self.index().root())?
-            .into_iter()
-            .collect();
         if parsed.is_narrowed() {
             warnings.push(query_narrowing_warning());
         }

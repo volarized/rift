@@ -37,6 +37,10 @@ static REGEX_DOCUMENTATION_LICENSE_FILE_PATH: std::sync::LazyLock<regex::Regex> 
         )
         .expect("invalid regex")
 });
+static REGEX_FACT_PRODUCER_NAME: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
+regex::Regex::new("^[a-z][a-z0-9._-]*$").expect("invalid regex"));
+static REGEX_FACT_PRODUCER_REVISION: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
+regex::Regex::new("^[A-Za-z0-9][A-Za-z0-9._+-]*$").expect("invalid regex"));
 static REGEX_GET_SYMBOL_PARAMS_REVISION: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
 {
     regex::Regex::new(
@@ -2579,6 +2583,10 @@ pub struct Relationship {
     /// derivation.
     #[validate(range(min = 0.0, max = 1.0))]
     pub confidence: Option<f64>,
+    /// The external program that produced a fact, and its revision. A fact without one was
+    /// produced by Rift's built-in analyzer.
+    #[validate(nested)]
+    pub producer: Option<FactProducer>,
     /// Facts a provider carries that the model has no field for, under a reverse-domain key.
     /// Keys and values use RFC 8785 canonical JSON. Consumers skip entries they do not
     /// implement.
@@ -4026,6 +4034,36 @@ impl<'de> serde::Deserialize<'de> for RegionRole {
         }
     }
 }
+/// The external program that produced a fact, and its revision. A fact without one was
+/// produced by Rift's built-in analyzer.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
+#[serde(deny_unknown_fields)]
+pub struct FactProducer {
+    /// Name of one external producer: a lowercase ASCII letter, then lowercase letters, digits, `.`, `_`, or `-`.
+    #[validate(
+        length(min = 1u64, max = 64u64),
+        regex(path = "REGEX_FACT_PRODUCER_NAME")
+    )]
+    pub name: String,
+    /// Revision of one external producer: an ASCII letter or digit, then letters, digits, `.`, `_`, `+`, or `-`.
+    #[validate(
+        length(min = 1u64, max = 128u64),
+        regex(path = "REGEX_FACT_PRODUCER_REVISION")
+    )]
+    pub revision: String,
+}
+/// Name of one external producer: a lowercase ASCII letter, then lowercase letters, digits, `.`, `_`, or `-`.
+pub type ProducerName = String;
+/// Revision of one external producer: an ASCII letter or digit, then letters, digits, `.`, `_`, `+`, or `-`.
+pub type ProducerRevision = String;
 /// Returns supported package managers, features, publication revisions, and active bounds.
 #[derive(Debug, Clone, validator::Validate, oas3_gen_support::Default)]
 pub struct GetCapabilitiesRequest {}

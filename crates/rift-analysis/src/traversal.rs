@@ -155,6 +155,7 @@ mod tests {
     fn hop(from: &SymbolId, to: &SymbolId) -> GraphHop {
         GraphHop {
             relationship: Relationship {
+                producer: None,
                 from: WireSymbolId(from.as_str().to_owned()),
                 to: WireSymbolId(to.as_str().to_owned()),
                 kind: ExactKind("calls".to_owned()),

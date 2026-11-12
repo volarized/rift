@@ -2033,6 +2033,27 @@ fn a_heuristic_hop_starts_with_probably_whatever_its_confidence_and_direction() 
     );
 }
 
+#[test]
+fn a_hop_an_external_producer_emitted_names_that_producer_after_its_relationship() {
+    let mut hop = edge("incoming", (RUN, LOAD_CONFIG), &["calls"], "resolution");
+    hop.relationship.producer = Some(
+        serde_json::from_value(serde_json::json!({"name": "demo-indexer", "revision": "0.6.1"}))
+            .expect("producer"),
+    );
+    golden(
+        &only_page(vec![walked_hit(RUN, "fn run()", 20, vec![hop])]),
+        &[
+            "1 result",
+            "\tat rift://symbol/local/rust/app/config/load_config",
+            "",
+            "\t\t↳ called · demo-indexer 0.6.1",
+            "\t\t\tby fn run()",
+            "\t\t\tin src/app.rs:20",
+            "\t\t\tat rift://symbol/local/rust/app/app/run",
+        ],
+    );
+}
+
 /// Each facet with the words an incoming hop writes for it.
 const INCOMING_WORDS: [(&str, &str); 29] = [
     ("contains", "contained by"),

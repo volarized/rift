@@ -41,6 +41,7 @@ use rift_protocol::index::{
     PackageCoverage, PackageDocument, PackageDocumentKind, PackagePublication, PackageSourceUnit,
     PackageSymbol,
 };
+use rift_protocol::producer::{FactCoverage, FactKind};
 use rift_protocol::read::{
     Digest, Language, ProjectPath, SourceLocationKind, SourceUnitId, Symbol, SymbolFacet, SymbolId,
     SymbolOrigin, TextRange,
@@ -583,6 +584,7 @@ fn publish(
     );
     Ok((
         PackagePublication {
+            occurrences: Vec::new(),
             format_revision: PACKAGE_PUBLICATION_FORMAT_REVISION,
             identity_format: rift_protocol::identity::SYMBOL_IDENTITY_FORMAT_REVISION,
             analyzer_revision: analyzer_revision(),
@@ -682,6 +684,10 @@ fn publication_coverage(
                     && held.file.syntax().left_out_declaration_count() == 0;
             }
             PackageCoverage {
+                facts: vec![FactCoverage {
+                    kind: FactKind::Relationships,
+                    producer: None,
+                }],
                 inventory_complete,
                 identity_complete: !records.symbols_truncated
                     && !records.identity_incomplete
@@ -1620,6 +1626,7 @@ impl Records {
             }
             let facet = relationship_facet(edge.kind());
             self.relationships.push(rift_protocol::read::Relationship {
+                producer: None,
                 from: SymbolId::parse(from.as_str()).map_err(|_| {
                     errors::analysis::package_provider_failed()
                         .package(package_label(owner))

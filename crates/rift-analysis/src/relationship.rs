@@ -55,6 +55,7 @@ impl RelationshipEdge {
     #[must_use]
     pub fn to_protocol(&self) -> rift_protocol::read::Relationship {
         rift_protocol::read::Relationship {
+            producer: None,
             from: rift_protocol::read::SymbolId(self.from.as_str().to_owned()),
             to: rift_protocol::read::SymbolId(self.to.as_str().to_owned()),
             kind: rift_protocol::read::ExactKind(self.facet.as_ref().to_owned()),

@@ -39,6 +39,8 @@ const IN: &str = "in ";
 const AT: &str = "at ";
 /// Word before the first facet of a heuristic relationship.
 const HEURISTIC: &str = "probably ";
+/// Text between a relationship and the external producer that emitted it.
+const PRODUCER: &str = " · ";
 /// Matched field that the tree states, so the facts line leaves it out.
 const STATED_FIELD: &str = "relationship";
 /// Each relationship facet, read from the target back to the source.
@@ -177,11 +179,18 @@ fn hops_of(hit: &Value, at: &str) -> Result<Vec<Hop>, String> {
                 phrase.truncate(phrase.len() - BY_ENDING.len());
             }
         }
+        let produced = match (
+            text_at(hop, "/relationship/producer/name"),
+            text_at(hop, "/relationship/producer/revision"),
+        ) {
+            (Some(name), Some(revision)) => format!("{PRODUCER}{name} {revision}"),
+            _ => String::new(),
+        };
         let (start, reached) = if outgoing { (from, to) } else { (to, from) };
         hops.push(Hop {
             start,
             reached,
-            head: format!("{BRANCH} {guess}{}", phrases.join(", ")),
+            head: format!("{BRANCH} {guess}{}{produced}", phrases.join(", ")),
             by,
         });
     }

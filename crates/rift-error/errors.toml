@@ -1011,6 +1011,16 @@ message = "source path pattern is invalid"
 action = "correct the source path pattern and retry"
 fields = { pattern = { type = "string", optional = true }, source = { type = "error", role = "source" } }
 
+[error.analysis.producer_fact_invalid]
+message = "producer fact does not match the publication: field {field}, violation {violation}"
+action = "correct the reported field of the producer facts and retry"
+fields = { field = { type = "string" }, violation = { type = "string" } }
+
+[error.analysis.producer_range_unresolved]
+message = "producer fact range resolves to no node of its source unit: unit {unit}"
+action = "name a byte range inside a source unit the publication carries and retry"
+fields = { unit = { type = "string" }, start = { type = "unsigned" }, end = { type = "unsigned" } }
+
 [error.analysis.package_input_identity_invalid]
 message = "package identity cannot form a source unit"
 action = "correct package identity and retry"
