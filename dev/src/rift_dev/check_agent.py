@@ -118,7 +118,7 @@ async def check_resources(client: Client) -> None:
 
 
 async def declaration_node(client: Client, name: str) -> str:
-    """Prove nodes retains the captured declaration and original source."""
+    """Prove get_symbol and nodes answer the searched declaration at one revision."""
     search = await client.call(
         "search",
         {"query": name, "target": "symbol", "include": ["source"], "limit": 1000},
@@ -134,18 +134,8 @@ async def declaration_node(client: Client, name: str) -> str:
             matches.append(row)
     require(len(matches) == 1, f"expected one {name} declaration: {search}")
     hit = matches[0]
-    selected_view = hit.get("view")
-    if selected_view is None:
-        selected_view = search.get("view")
-    captured = object_value(selected_view, "search.view")
     identity = symbol_id(hit)
-    answer = await client.call(
-        "get_symbol",
-        {
-            "id": identity,
-            "view": string_value(captured.get("id"), "view.id"),
-        },
-    )
+    answer = await client.call("get_symbol", {"id": identity})
     require(answer.get("outcome") == "found", f"symbol was not found: {answer}")
     require(
         object_value(answer.get("symbol"), "symbol").get("id") == identity,
@@ -169,17 +159,19 @@ async def declaration_node(client: Client, name: str) -> str:
         type(start) is int and type(end) is int and 0 <= start < end,
         f"declaration range is invalid: {span}",
     )
-    view = object_value(answer.get("view"), "symbol.view")
-    require(view == captured, f"symbol changed captured view: {answer}")
+    revision = string_value(answer.get("revision"), "symbol.revision")
     listing = await client.call(
         "nodes",
         {
             "path": string_value(declaration.get("path"), "declaration.path"),
             "position": cast(int, end) - 1,
-            "view": string_value(view.get("id"), "view.id"),
+            "revision": revision,
         },
     )
-    require(listing.get("view") == view, f"nodes changed captured view: {listing}")
+    require(
+        listing.get("revision") == revision,
+        f"nodes answered another revision: {listing}",
+    )
     nodes = [
         object_value(entry, "node")
         for entry in array_value(listing.get("nodes"), "nodes.nodes")

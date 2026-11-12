@@ -86,8 +86,8 @@ between symbols, resolved types, diagnostics, and history. A family no provider 
 refuses with `capability_unavailable`. Signatures and documentation travel on the symbol itself,
 covered under the `types` family.
 
-A search result carries the answer, `pagination`, and `warnings`. Exact symbol and source
-reads carry an `outcome` and immutable `view`; a symbol read can carry a `declaration_cursor`. A condition the caller must
+A search result carries the answer, `pagination`, and `warnings`. An exact symbol read carries
+an `outcome` and the `revision` it was read at, and can carry a `declaration_cursor`. A condition the caller must
 weigh - an index that lags the tree - arrives as a typed entry in `warnings`; the
 [Reads](/docs/developer/protocol/mcp#reads) section in the MCP reference states the paging and warning
 contract.

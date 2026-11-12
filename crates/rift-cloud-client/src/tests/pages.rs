@@ -198,52 +198,27 @@ async fn test_fixture_search_page_assembly_records_refusals() {
     assert_eq!(server.state.requests.load(Ordering::SeqCst), 2);
 }
 
-/// Declaration continuation keeps the exact issued view and never sends an implicit page.
+/// Declaration continuation sends the issued cursor and never sends an implicit page.
 #[tokio::test]
-async fn test_exact_declaration_cursor_keeps_view_and_bounds() {
-    use rift_protocol::symbol_read::CapturedViewId;
+async fn test_exact_declaration_cursor_keeps_its_bounds() {
     let mut request = symbol_request();
-    request.view = Some(CapturedViewId::parse(&"a".repeat(64)).expect("view"));
     request.declaration_cursor = Some("next".to_owned());
     request.declaration_limit = 1;
     let (server, client) = operation_client(OperationFixture::Valid).await;
-    let result = client
-        .get_symbol(&request)
-        .await
-        .expect("same-view continuation");
+    let result = client.get_symbol(&request).await.expect("continuation");
     assert!(
-        matches!(result, GetSymbolResult::Found { ref view, ref declarations, .. } if Some(&view.id) == request.view.as_ref() && declarations.len() == 1)
+        matches!(result, GetSymbolResult::Found { ref declarations, .. } if declarations.len() == 1)
     );
     assert_eq!(server.state.requests.load(Ordering::SeqCst), 2);
     let requests = server.state.request_log.lock().await;
     let body: serde_json::Value =
         serde_json::from_slice(&requests.last().expect("request").body).expect("body");
     assert_eq!(body["declaration_cursor"], "next");
-    assert_eq!(body["view"], "a".repeat(64));
     assert_eq!(body["declaration_limit"], 1);
+    assert!(body.get("view").is_none());
     drop(requests);
-    let mut foreign = symbol_result_json("demo", "first");
-    foreign["view"]["id"] = serde_json::json!("b".repeat(64));
-    assert_registered_field(
-        &canonical_symbol_response(foreign, &request, SOURCE_BYTES_MAX)
-            .await
-            .expect_err("foreign view"),
-        "rift.client.response_invalid",
-        "body",
-    );
-    request.view = None;
-    let (server, client) = operation_client(OperationFixture::Valid).await;
-    assert_registered_field(
-        &client
-            .get_symbol(&request)
-            .await
-            .expect_err("unbound continuation"),
-        "rift.client.request_invalid",
-        "declaration_cursor",
-    );
-    assert_eq!(server.state.requests.load(Ordering::SeqCst), 0);
-    request.view = Some(CapturedViewId::parse(&"a".repeat(64)).expect("view"));
     request.declaration_cursor = Some("x".repeat(CURSOR_BYTES_MAX + 1));
+    let (server, client) = operation_client(OperationFixture::Valid).await;
     assert_registered_field(
         &client
             .get_symbol(&request)

@@ -4,8 +4,8 @@ Generated from the served tool surface.
 
 ## get_symbol
 
-Reads one logical symbol by its canonical `id`. The caller may select a preceding
-immutable `view`; continuations retain that selection and its original expiry.
+Reads one logical symbol by its canonical `id` at one `revision`; the answer names the
+revision it read, and `declaration_cursor` continues its declarations at that revision.
 A complete exact miss returns `symbol_not_found` and up to three alternatives.
 An unavailable selection returns its typed cause. A found symbol carries its facts and
 each declaration's location; `nodes` with `symbol` reads a declaration's source. Use
@@ -16,9 +16,8 @@ Parameters:
 - `id` (required) - Canonical identity.
 - `include` - Requested projections.
 - `revision` - The revision to read.
-- `view` - A view returned by a preceding read.
 - `declaration_limit` - Most declarations returned in this read.
-- `declaration_cursor` - Continuation bound to this exact symbol, projections and serving view.
+- `declaration_cursor` - Continuation a preceding read returned, bound to this symbol and the revision it read.
 
 ## nodes
 
@@ -45,7 +44,6 @@ Parameters:
 - `path` - Project-relative file to inspect.
 - `position` - UTF-8 byte offset inside the declaration whose nodes the read lists - one position, not a range; the nodes themselves carry the spans.
 - `node_cursor` - Continuation a preceding read returned, bound to the symbol or unit its answer listed and the tree revision it read.
-- `view` - Captured view selected by discovery.
 - `revision` - The revision to read: a git revision reads that commit, a tree revision the served working tree, and a release revision selects the release of a package or runtime `symbol`'s owner.
 
 ## search

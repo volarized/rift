@@ -208,8 +208,8 @@ served package in one answer:
 
 <ReadExample name="all-search" />
 
-Use `query` to combine registered projects under `all`. The returned page includes each hit's
-own `view`; pass that view with the hit's `id` when reading its symbol.
+Use `query` to combine registered projects under `all`. A hit's `id` names its owner, so
+reading its symbol with that `id` reaches the project or package that holds it.
 
 For example, a project using Tokio can search its dependency declarations for `spawn_blocking`:
 
@@ -399,8 +399,8 @@ crate and declaration, rather than the physical file:
 
 <ReadExample name="local-symbol" />
 
-The result carries `outcome: "found"`, one `symbol`, an immutable `view` with an expiry,
-and `declarations` in deterministic source order. Each declaration keeps its own origin,
+The result carries `outcome: "found"`, one `symbol`, the `revision` it was read at, and
+`declarations` in deterministic source order. Each declaration keeps its own origin,
 source address, byte range, and indices into the symbol's signatures, types, and documentation.
 Every declaration of one qualified path, such as two `cfg` variants of one Rust function, is a binding of that one logical symbol. A source-less object can
 be found with no declarations. These runtime reads distinguish a declaration with no
@@ -438,9 +438,9 @@ at most 32 of them; `co_changes_truncated` counts what either bound left out.
 The local server fills its history store in the background; an incomplete history answers
 `complete: false` until the store holds the selected revision.
 
-Pass a preceding `view` to retain its immutable selection. Expiry refuses the read instead
-of selecting latest implicitly. `declaration_limit` bounds returned declarations; a returned
-`declaration_cursor` continues the same symbol, projections, and view. It is not hit paging.
+`declaration_limit` bounds returned declarations; a returned `declaration_cursor` continues
+the same symbol at the revision the answer names. Once the index serves another tree, the
+cursor refuses and the read starts again without it. It is not hit paging.
 
 <span id="get_symbol-scope" />
 
@@ -463,7 +463,7 @@ and returns the served identity:
 <ReadExample name="requested-served" />
 
 Several declaration bindings share one identity. `declaration_limit` and its returned cursor
-continue those bindings in the same view:
+continue those bindings at the same revision:
 
 <ReadExample name="multi-declaration-full" />
 
@@ -471,8 +471,7 @@ continue those bindings in the same view:
 
 <ReadExample name="multi-declaration-next" />
 
-`revision` is refused beside `view`. For a package or runtime symbol it can only name the release
-the symbol's identity carries. Released source units remain physical addresses separate from
+For a package or runtime symbol, `revision` can only name a release of the symbol's owner. Released source units remain physical addresses separate from
 logical symbol identities.
 
 A valid absent identity returns MCP `isError: true` and `outcome: "missing"` with
@@ -557,7 +556,7 @@ the local index. See [Index](/docs/developer/architecture#index) for local updat
 Search keeps responses small with `limit` and names another page with `page_index`.
 Its returned `pagination` states the served page and page count. An exact `get_symbol`
 read bounds declaration bindings with `declaration_limit` and continues with
-`declaration_cursor` in the same immutable `view`.
+`declaration_cursor` at the revision the answer names.
 
 Warnings explain when an answer is incomplete or a capability could not contribute.
 For example, `stale_index` reports an index behind the captured project state or a rebuild failure;

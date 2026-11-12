@@ -119,9 +119,11 @@ fn validate_request(request: &GetSymbolParams) -> Result<(), RiftError> {
             "field failed validation",
         ));
     }
-    if request.declaration_cursor.as_ref().is_some_and(|cursor| {
-        cursor.is_empty() || cursor.len() > CURSOR_BYTES_MAX || request.view.is_none()
-    }) {
+    if request
+        .declaration_cursor
+        .as_ref()
+        .is_some_and(|cursor| cursor.is_empty() || cursor.len() > CURSOR_BYTES_MAX)
+    {
         return Err(failure::request_invalid(
             "validate_request",
             "declaration_cursor",
@@ -154,15 +156,13 @@ fn valid_result(
     match result {
         GetSymbolResult::Found {
             symbol,
-            view,
             declarations,
             history,
             documentation,
             ..
         } => {
-            request.view.as_ref().is_none_or(|id| id == &view.id)
-                && u64::try_from(declarations.len())
-                    .is_ok_and(|length| length <= request.declaration_limit)
+            u64::try_from(declarations.len())
+                .is_ok_and(|length| length <= request.declaration_limit)
                 && (valid_origin(&symbol.origin, owner, version)
                     || (declarations.is_empty()
                         && symbol.origin.source_kind == SourceKind::Synthetic
@@ -186,12 +186,7 @@ fn valid_result(
                         )
                 })
         }
-        GetSymbolResult::Missing { view, .. } => {
-            request.view.as_ref().is_none_or(|id| id == &view.id)
-        }
-        GetSymbolResult::Unavailable { view, .. } => view
-            .as_ref()
-            .is_none_or(|view| request.view.as_ref().is_none_or(|id| id == &view.id)),
+        GetSymbolResult::Missing { .. } | GetSymbolResult::Unavailable { .. } => true,
     }
 }
 

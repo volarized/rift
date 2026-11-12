@@ -19,7 +19,6 @@ use super::RiftProxy;
 mod read;
 #[cfg(test)]
 pub(in crate::proxy) use read::dispatch_read_request;
-mod reservation;
 
 #[derive(Debug)]
 pub(super) enum CandidateAnswer {
@@ -38,7 +37,6 @@ pub(super) struct CapturedCandidates {
 #[derive(Debug)]
 pub(super) struct CandidateViews {
     rows: Mutex<Vec<SavedCandidateBytes>>,
-    reservation_serial: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Debug)]
@@ -46,7 +44,6 @@ struct SavedCandidateBytes {
     key: [u8; 32],
     expires: SystemTime,
     bytes: Vec<u8>,
-    reservation: Option<u64>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -67,14 +64,12 @@ use crate::global::candidates::SavedCandidateBackend;
 )]
 enum SavedCandidateRead {
     Search(Box<SavedCandidateSearch>),
-    Symbol(Box<SavedCandidateBackend>),
 }
 
 impl Default for CandidateViews {
     fn default() -> Self {
         Self {
             rows: Mutex::new(Vec::with_capacity(256)),
-            reservation_serial: std::sync::atomic::AtomicU64::new(1),
         }
     }
 }
@@ -125,7 +120,6 @@ impl CandidateViews {
             key,
             expires,
             bytes,
-            reservation: None,
         });
         Ok(view)
     }
@@ -142,9 +136,6 @@ impl CandidateViews {
         let mut selected = None;
         let mut expired = false;
         for row in rows.iter() {
-            if row.reservation.is_some() {
-                continue;
-            }
             for accepted in saved_backends(&row.bytes)?
                 .into_iter()
                 .filter(|accepted| accepted.view.id == *id)
@@ -194,14 +185,8 @@ impl CandidateViews {
                 rift_protocol::symbol_read::SymbolUnavailableReason::ViewExpired,
             ));
         }
-        if row.reservation.is_some() {
-            return Ok(Err(SymbolUnavailableReason::ViewContext));
-        }
-        let saved: SavedCandidateRead = serde_json::from_slice(&row.bytes)
+        let SavedCandidateRead::Search(saved) = serde_json::from_slice(&row.bytes)
             .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
-        let SavedCandidateRead::Search(saved) = saved else {
-            return Ok(Err(SymbolUnavailableReason::ViewContext));
-        };
         if saved.view.id != *id || saved.params != normalized_params(params) {
             return Ok(Err(
                 rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext,
@@ -215,7 +200,6 @@ fn saved_backends(bytes: &[u8]) -> Result<Vec<SavedCandidateBackend>, RiftError>
     let saved: SavedCandidateRead = serde_json::from_slice(bytes)
         .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
     Ok(match saved {
-        SavedCandidateRead::Symbol(backend) => vec![*backend],
         SavedCandidateRead::Search(saved) => saved
             .captured
             .pools
@@ -225,8 +209,6 @@ fn saved_backends(bytes: &[u8]) -> Result<Vec<SavedCandidateBackend>, RiftError>
                 backend: pool.backend,
                 root: pool.root,
                 view: pool.view,
-                project: None,
-                upstream_view: None,
             })
             .collect(),
     })

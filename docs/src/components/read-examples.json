@@ -11,7 +11,7 @@
         "include": ["src/**"]
       }
     },
-    "text": "4 results\n\t[1] pub fn beacon()\n\t\tsrc/lib.rs:1 \u00b7 name, signature, content \u00b7 view 185188270e125504187d800959068773e250aceb8f3276a1e6cbdb75f28c9a91 \u00b7 expires 2026-10-12T16:01:30.984578+00:00\n\t\trift://symbol/local@sdk/rust/docs_sdk/beacon\n\n\t\tpub fn beacon() {}\n\t[2] pub fn beacon()\n\t\tsrc/lib.rs:2 \u00b7 name, signature \u00b7 view cf05414816a1388a288c97ef62ee4c068d7f8d7f1500678ed8cb9354c1db8c6f \u00b7 expires 2026-10-12T16:01:30.980861+00:00\n\t\trift://symbol/local/rust/docs_global_app/beacon\n\n\t\tpub fn beacon() {}\n\t[3] function beacon\n\t\trift://source/cargo/crates.io/demo/src/lib.rs:2 \u00b7 name \u00b7 view aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z \u00b7 dependency rift://revision/cargo/crates.io/demo@1.0.0\n\t\trift://symbol/cargo/crates.io/demo/rust/demo/beacon\n\n\t\tpub fn beacon() {}\n\t[4] pub fn local_beacon()\n\t\tsrc/lib.rs:1 \u00b7 name, signature \u00b7 view cf05414816a1388a288c97ef62ee4c068d7f8d7f1500678ed8cb9354c1db8c6f \u00b7 expires 2026-10-12T16:01:30.980861+00:00\n\t\trift://symbol/local/rust/docs_global_app/local_beacon\n\n\t\tpub fn local_beacon() {}\n3 warnings\n\tpackage_requirement_absent \u00b7 entry typescript >=0 (npm)\n\tpackage_requirement_absent \u00b7 entry node >=0 (stdlib)\n\tpackage_requirement_absent \u00b7 entry rust >=0 (stdlib)\nview cf05414816a1388a288c97ef62ee4c068d7f8d7f1500678ed8cb9354c1db8c6f \u00b7 expires 2026-10-12T16:01:30.980861+00:00\n",
+    "text": "4 results\n\t[1] pub fn beacon()\n\t\tsrc/lib.rs:1 \u00b7 name, signature, content\n\t\trift://symbol/local@sdk/rust/docs_sdk/beacon\n\n\t\tpub fn beacon() {}\n\t[2] pub fn beacon()\n\t\tsrc/lib.rs:2 \u00b7 name, signature\n\t\trift://symbol/local/rust/docs_global_app/beacon\n\n\t\tpub fn beacon() {}\n\t[3] function beacon\n\t\trift://source/cargo/crates.io/demo/src/lib.rs:2 \u00b7 name\n\t\trift://symbol/cargo/crates.io/demo/rust/demo/beacon\n\n\t\tpub fn beacon() {}\n\t[4] pub fn local_beacon()\n\t\tsrc/lib.rs:1 \u00b7 name, signature\n\t\trift://symbol/local/rust/docs_global_app/local_beacon\n\n\t\tpub fn local_beacon() {}\n3 warnings\n\tpackage_requirement_absent \u00b7 entry typescript >=0 (npm)\n\tpackage_requirement_absent \u00b7 entry node >=0 (stdlib)\n\tpackage_requirement_absent \u00b7 entry rust >=0 (stdlib)\nview cf05414816a1388a288c97ef62ee4c068d7f8d7f1500678ed8cb9354c1db8c6f \u00b7 expires 2026-10-12T16:01:30.980861+00:00\n",
     "json": {
       "view": {
         "id": "cf05414816a1388a288c97ef62ee4c068d7f8d7f1500678ed8cb9354c1db8c6f",
@@ -19,10 +19,6 @@
       },
       "results": [
         {
-          "view": {
-            "id": "185188270e125504187d800959068773e250aceb8f3276a1e6cbdb75f28c9a91",
-            "expires_at": "2026-10-12T16:01:30.984578+00:00"
-          },
           "hit": {
             "target": "symbol",
             "symbol": {
@@ -50,10 +46,6 @@
           "path": "src/lib.rs"
         },
         {
-          "view": {
-            "id": "cf05414816a1388a288c97ef62ee4c068d7f8d7f1500678ed8cb9354c1db8c6f",
-            "expires_at": "2026-10-12T16:01:30.980861+00:00"
-          },
           "hit": {
             "target": "symbol",
             "symbol": {
@@ -81,10 +73,6 @@
           "path": "src/lib.rs"
         },
         {
-          "view": {
-            "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "expires_at": "2099-10-10T10:05:00Z"
-          },
           "hit": {
             "target": "symbol",
             "symbol": {
@@ -114,10 +102,6 @@
           "unit": "rift://source/cargo/crates.io/demo/src/lib.rs"
         },
         {
-          "view": {
-            "id": "cf05414816a1388a288c97ef62ee4c068d7f8d7f1500678ed8cb9354c1db8c6f",
-            "expires_at": "2026-10-12T16:01:30.980861+00:00"
-          },
           "hit": {
             "target": "symbol",
             "symbol": {
@@ -189,7 +173,7 @@
       "include": ["source"],
       "limit": 10
     },
-    "text": "6 results\n\t[1] pub fn load_config() -> u32\n\t\tsrc/lib.rs:1 \u00b7 name, signature, documentation, content \u00b7 view 577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272 \u00b7 expires 2026-10-12T15:50:28.704474+00:00\n\t\trift://symbol/local@sdk/rust/docs_sdk/load_config\n\t\tLoads configuration.\n\n\t\t/// Loads configuration.\n\t\tpub fn load_config() -> u32 { 42 }\n\t[2] heading Configuration\n\t\tREADME.md:5 \u00b7 content \u00b7 view 577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272 \u00b7 expires 2026-10-12T15:50:28.704474+00:00\n\t\t43..81\n\n\t\t## Configuration\n\n\t\tCall `load_config`.\n\n\t[3] heading Example project\n\t\tREADME.md:1 \u00b7 content \u00b7 view 577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272 \u00b7 expires 2026-10-12T15:50:28.704474+00:00\n\t\t0..81\n\n\t\t# Example project\n\n\t\tProject documentation.\n\n\t\t## Configuration\n\n\t\tCall `load_config`.\n\n\t[4] member name\n\t\tCargo.toml:2 \u00b7 content \u00b7 view 577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272 \u00b7 expires 2026-10-12T15:50:28.704474+00:00\n\t\t10..27\n\n\t\tname = \"docs_sdk\"\n\t[5] member version\n\t\tCargo.toml:3 \u00b7 content \u00b7 view 577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272 \u00b7 expires 2026-10-12T15:50:28.704474+00:00\n\t\t28..45\n\n\t\tversion = \"0.1.0\"\n\t[6] table package\n\t\tCargo.toml:1 \u00b7 content \u00b7 view 577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272 \u00b7 expires 2026-10-12T15:50:28.704474+00:00\n\t\t0..63\n\n\t\t[package]\n\t\tname = \"docs_sdk\"\n\t\tversion = \"0.1.0\"\n\t\tedition = \"2021\"\n\nview 577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272 \u00b7 expires 2026-10-12T15:50:28.704474+00:00\n",
+    "text": "6 results\n\t[1] pub fn load_config() -> u32\n\t\tsrc/lib.rs:1 \u00b7 name, signature, documentation, content\n\t\trift://symbol/local@sdk/rust/docs_sdk/load_config\n\t\tLoads configuration.\n\n\t\t/// Loads configuration.\n\t\tpub fn load_config() -> u32 { 42 }\n\t[2] heading Configuration\n\t\tREADME.md:5 \u00b7 content\n\t\t43..81\n\n\t\t## Configuration\n\n\t\tCall `load_config`.\n\n\t[3] heading Example project\n\t\tREADME.md:1 \u00b7 content\n\t\t0..81\n\n\t\t# Example project\n\n\t\tProject documentation.\n\n\t\t## Configuration\n\n\t\tCall `load_config`.\n\n\t[4] member name\n\t\tCargo.toml:2 \u00b7 content\n\t\t10..27\n\n\t\tname = \"docs_sdk\"\n\t[5] member version\n\t\tCargo.toml:3 \u00b7 content\n\t\t28..45\n\n\t\tversion = \"0.1.0\"\n\t[6] table package\n\t\tCargo.toml:1 \u00b7 content\n\t\t0..63\n\n\t\t[package]\n\t\tname = \"docs_sdk\"\n\t\tversion = \"0.1.0\"\n\t\tedition = \"2021\"\n\nview 577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272 \u00b7 expires 2026-10-12T15:50:28.704474+00:00\n",
     "json": {
       "view": {
         "id": "577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272",
@@ -197,10 +181,6 @@
       },
       "results": [
         {
-          "view": {
-            "id": "577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272",
-            "expires_at": "2026-10-12T15:50:28.704474+00:00"
-          },
           "hit": {
             "target": "symbol",
             "symbol": {
@@ -234,10 +214,6 @@
           "path": "src/lib.rs"
         },
         {
-          "view": {
-            "id": "577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272",
-            "expires_at": "2026-10-12T15:50:28.704474+00:00"
-          },
           "hit": {
             "target": "symbol",
             "symbol": {
@@ -256,10 +232,6 @@
           "path": "README.md"
         },
         {
-          "view": {
-            "id": "577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272",
-            "expires_at": "2026-10-12T15:50:28.704474+00:00"
-          },
           "hit": {
             "target": "symbol",
             "symbol": {
@@ -278,10 +250,6 @@
           "path": "README.md"
         },
         {
-          "view": {
-            "id": "577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272",
-            "expires_at": "2026-10-12T15:50:28.704474+00:00"
-          },
           "hit": {
             "target": "symbol",
             "symbol": {
@@ -300,10 +268,6 @@
           "path": "Cargo.toml"
         },
         {
-          "view": {
-            "id": "577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272",
-            "expires_at": "2026-10-12T15:50:28.704474+00:00"
-          },
           "hit": {
             "target": "symbol",
             "symbol": {
@@ -322,10 +286,6 @@
           "path": "Cargo.toml"
         },
         {
-          "view": {
-            "id": "577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272",
-            "expires_at": "2026-10-12T15:50:28.704474+00:00"
-          },
           "hit": {
             "target": "symbol",
             "symbol": {
@@ -355,7 +315,7 @@
     "arguments": {
       "id": "rift://symbol/local/rust/example_project/config/load_config"
     },
-    "text": "\tpub fn load_config(path: &Path) -> Result<Config, ConfigError>\n\trift://symbol/local/rust/example_project/config/load_config\n\n\tLoads the workspace configuration from `rift.toml`.\n\n\tdeclarations:\n\t\tsrc/config.rs:11\n\t\t218..355\nrevision rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11\nview e736fecc6db89146c2b8d8a2cd4ec9b8acdd395d7c948ee0517eb364a5ccf2f3 \u00b7 expires 2026-10-12T15:50:28.711117+00:00\n",
+    "text": "\tpub fn load_config(path: &Path) -> Result<Config, ConfigError>\n\trift://symbol/local/rust/example_project/config/load_config\n\n\tLoads the workspace configuration from `rift.toml`.\n\n\tdeclarations:\n\t\tsrc/config.rs:11\n\t\t218..355\nrevision rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -377,10 +337,6 @@
             "text": "Loads the workspace configuration from `rift.toml`."
           }
         ]
-      },
-      "view": {
-        "id": "e736fecc6db89146c2b8d8a2cd4ec9b8acdd395d7c948ee0517eb364a5ccf2f3",
-        "expires_at": "2026-10-12T15:50:28.711117+00:00"
       },
       "revision": "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11",
       "declarations": [
@@ -407,7 +363,7 @@
     "arguments": {
       "id": "rift://symbol/local@sdk/rust/docs_sdk/load_config"
     },
-    "text": "\tpub fn load_config() -> u32\n\trift://symbol/local@sdk/rust/docs_sdk/load_config\n\n\tLoads configuration.\n\n\tdeclarations:\n\t\tsrc/lib.rs:2\n\t\t25..59\nrevision rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11\nview e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd \u00b7 expires 2026-10-12T16:17:02.916991+00:00\n",
+    "text": "\tpub fn load_config() -> u32\n\trift://symbol/local@sdk/rust/docs_sdk/load_config\n\n\tLoads configuration.\n\n\tdeclarations:\n\t\tsrc/lib.rs:2\n\t\t25..59\nrevision rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -429,10 +385,6 @@
             "text": "Loads configuration."
           }
         ]
-      },
-      "view": {
-        "id": "e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd",
-        "expires_at": "2026-10-12T16:17:02.916991+00:00"
       },
       "revision": "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11",
       "declarations": [
@@ -459,14 +411,10 @@
     "arguments": {
       "id": "rift://symbol/local/rust/example_project/config/load_configs"
     },
-    "text": "\tunavailable \u00b7 InsufficientCoverage\n\trift://symbol/local/rust/example_project/config/load_configs\nview 52889776a11e04e3e6d9e9cc23476830656e159470c991b595ff493600732298 \u00b7 expires 2026-10-12T15:50:28.794765+00:00\n",
+    "text": "\tunavailable \u00b7 InsufficientCoverage\n\trift://symbol/local/rust/example_project/config/load_configs\n",
     "json": {
       "outcome": "unavailable",
       "id": "rift://symbol/local/rust/example_project/config/load_configs",
-      "view": {
-        "id": "52889776a11e04e3e6d9e9cc23476830656e159470c991b595ff493600732298",
-        "expires_at": "2026-10-12T15:50:28.794765+00:00"
-      },
       "reason": "insufficient_coverage"
     }
   },
@@ -1219,7 +1167,7 @@
       "include": ["source"],
       "limit": 5
     },
-    "text": "5 results \u00b7 page 1/4\n\t[1] pub fn load_config(path: &Path) -> Result<Config, ConfigError>\n\t\tsrc/config.rs:10 \u00b7 name, signature, documentation, content \u00b7 view c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68 \u00b7 expires 2026-10-12T15:50:28.932788+00:00\n\t\trift://symbol/local/rust/example_project/config/load_config\n\t\tLoads the workspace configuration from `rift.toml`.\n\n\t\t/// Loads the workspace configuration from `rift.toml`.\n\t\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n\t\t    let text = std::fs::read_to_string(path)?;\n\t\t    parse_config(&text)\n\t\t}\n\t[2] Example project\n\t\tREADME.md:3 \u00b7 content \u00b7 view c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68 \u00b7 expires 2026-10-12T15:50:28.932788+00:00\n\t\tA Rust project that reads workspace configuration from `rift.toml`.\n\n\t[3] Example project > Example project > Configuration\n\t\tREADME.md:12 \u00b7 content \u00b7 view c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68 \u00b7 expires 2026-10-12T15:50:28.932788+00:00\n\t\t## Configuration\n\n\t[4] private module config\n\t\tsrc/main.rs:1 \u00b7 content \u00b7 view c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68 \u00b7 expires 2026-10-12T15:50:28.932788+00:00\n\t\t0..11\n\n\t\tmod config;\n\t[5] pub module config\n\t\tsrc/lib.rs:1 \u00b7 content \u00b7 view c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68 \u00b7 expires 2026-10-12T15:50:28.932788+00:00\n\t\trift://symbol/local/rust/example_project/config\n\n\t\tpub mod config;\nview c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68 \u00b7 expires 2026-10-12T15:50:28.932788+00:00\n",
+    "text": "5 results \u00b7 page 1/4\n\t[1] pub fn load_config(path: &Path) -> Result<Config, ConfigError>\n\t\tsrc/config.rs:10 \u00b7 name, signature, documentation, content\n\t\trift://symbol/local/rust/example_project/config/load_config\n\t\tLoads the workspace configuration from `rift.toml`.\n\n\t\t/// Loads the workspace configuration from `rift.toml`.\n\t\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n\t\t    let text = std::fs::read_to_string(path)?;\n\t\t    parse_config(&text)\n\t\t}\n\t[2] Example project\n\t\tREADME.md:3 \u00b7 content\n\t\tA Rust project that reads workspace configuration from `rift.toml`.\n\n\t[3] Example project > Example project > Configuration\n\t\tREADME.md:12 \u00b7 content\n\t\t## Configuration\n\n\t[4] private module config\n\t\tsrc/main.rs:1 \u00b7 content\n\t\t0..11\n\n\t\tmod config;\n\t[5] pub module config\n\t\tsrc/lib.rs:1 \u00b7 content\n\t\trift://symbol/local/rust/example_project/config\n\n\t\tpub mod config;\nview c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68 \u00b7 expires 2026-10-12T15:50:28.932788+00:00\n",
     "json": {
       "view": {
         "id": "c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68",
@@ -1227,10 +1175,6 @@
       },
       "results": [
         {
-          "view": {
-            "id": "c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68",
-            "expires_at": "2026-10-12T15:50:28.932788+00:00"
-          },
           "hit": {
             "target": "symbol",
             "symbol": {
@@ -1264,10 +1208,6 @@
           "path": "src/config.rs"
         },
         {
-          "view": {
-            "id": "c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68",
-            "expires_at": "2026-10-12T15:50:28.932788+00:00"
-          },
           "hit": {
             "target": "documentation",
             "documentation": {
@@ -1333,10 +1273,6 @@
           "path": "README.md"
         },
         {
-          "view": {
-            "id": "c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68",
-            "expires_at": "2026-10-12T15:50:28.932788+00:00"
-          },
           "hit": {
             "target": "documentation",
             "documentation": {
@@ -1406,10 +1342,6 @@
           "path": "README.md"
         },
         {
-          "view": {
-            "id": "c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68",
-            "expires_at": "2026-10-12T15:50:28.932788+00:00"
-          },
           "hit": {
             "target": "symbol",
             "symbol": {
@@ -1430,10 +1362,6 @@
           "path": "src/main.rs"
         },
         {
-          "view": {
-            "id": "c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68",
-            "expires_at": "2026-10-12T15:50:28.932788+00:00"
-          },
           "hit": {
             "target": "symbol",
             "symbol": {
@@ -1469,7 +1397,7 @@
       "include": ["source"],
       "limit": 5
     },
-    "text": "5 results \u00b7 page 1/4\n\t[1] pub fn load_config(path: &Path) -> Result<Config, ConfigError>\n\t\tsrc/config.rs:10 \u00b7 documentation, content \u00b7 view 9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f \u00b7 expires 2026-10-12T15:50:28.954251+00:00\n\t\trift://symbol/local/rust/example_project/config/load_config\n\t\tLoads the workspace configuration from `rift.toml`.\n\n\t\t/// Loads the workspace configuration from `rift.toml`.\n\t\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n\t\t    let text = std::fs::read_to_string(path)?;\n\t\t    parse_config(&text)\n\t\t}\n\t[2] heading Example project\n\t\tREADME.md:1 \u00b7 content \u00b7 view 9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f \u00b7 expires 2026-10-12T15:50:28.954251+00:00\n\t\t0..398\n\n\t\t# Example project\n\n\t\tA Rust project that reads workspace configuration from `rift.toml`.\n\n\t\t- `src/main.rs` starts the application.\n\t\t- `src/config.rs` loads the workspace configuration.\n\t\t- `src/error.rs` defines the error type returned by the loader.\n\n\t\tRift reads the project structure, source, and documentation to help\n\t\tan agent find the code relevant to its task.\n\n\t\t## Configuration\n\n\t\tCall `load_config`.\n\n\t[3] heading Configuration\n\t\tREADME.md:12 \u00b7 content \u00b7 view 9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f \u00b7 expires 2026-10-12T15:50:28.954251+00:00\n\t\t360..398\n\n\t\t## Configuration\n\n\t\tCall `load_config`.\n\n\t[4] pub struct Config\n\t\tsrc/config.rs:5 \u00b7 content \u00b7 view 9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f \u00b7 expires 2026-10-12T15:50:28.954251+00:00\n\t\trift://symbol/local/rust/example_project/config/Config\n\t\tWorkspace configuration read from `rift.toml`.\n\n\t\t/// Workspace configuration read from `rift.toml`.\n\t\tpub struct Config {\n\t\t    pub root: std::path::PathBuf,\n\t\t}\n\t[5] private async fn main() -> Result<(), ConfigError>\n\t\tsrc/main.rs:9 \u00b7 content \u00b7 view 9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f \u00b7 expires 2026-10-12T15:50:28.954251+00:00\n\t\t96..343\n\n\t\t#[tokio::main]\n\t\tasync fn main() -> Result<(), ConfigError> {\n\t\t    let config = tokio::task::spawn_blocking(|| {\n\t\t        load_config(Path::new(\"rift.toml\"))\n\t\t    })\n\t\t    .await??;\n\n\t\t    println!(\"Workspace root: {}\", config.root.display());\n\t\t    Ok(())\n\t\t}\nview 9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f \u00b7 expires 2026-10-12T15:50:28.954251+00:00\n",
+    "text": "5 results \u00b7 page 1/4\n\t[1] pub fn load_config(path: &Path) -> Result<Config, ConfigError>\n\t\tsrc/config.rs:10 \u00b7 documentation, content\n\t\trift://symbol/local/rust/example_project/config/load_config\n\t\tLoads the workspace configuration from `rift.toml`.\n\n\t\t/// Loads the workspace configuration from `rift.toml`.\n\t\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n\t\t    let text = std::fs::read_to_string(path)?;\n\t\t    parse_config(&text)\n\t\t}\n\t[2] heading Example project\n\t\tREADME.md:1 \u00b7 content\n\t\t0..398\n\n\t\t# Example project\n\n\t\tA Rust project that reads workspace configuration from `rift.toml`.\n\n\t\t- `src/main.rs` starts the application.\n\t\t- `src/config.rs` loads the workspace configuration.\n\t\t- `src/error.rs` defines the error type returned by the loader.\n\n\t\tRift reads the project structure, source, and documentation to help\n\t\tan agent find the code relevant to its task.\n\n\t\t## Configuration\n\n\t\tCall `load_config`.\n\n\t[3] heading Configuration\n\t\tREADME.md:12 \u00b7 content\n\t\t360..398\n\n\t\t## Configuration\n\n\t\tCall `load_config`.\n\n\t[4] pub struct Config\n\t\tsrc/config.rs:5 \u00b7 content\n\t\trift://symbol/local/rust/example_project/config/Config\n\t\tWorkspace configuration read from `rift.toml`.\n\n\t\t/// Workspace configuration read from `rift.toml`.\n\t\tpub struct Config {\n\t\t    pub root: std::path::PathBuf,\n\t\t}\n\t[5] private async fn main() -> Result<(), ConfigError>\n\t\tsrc/main.rs:9 \u00b7 content\n\t\t96..343\n\n\t\t#[tokio::main]\n\t\tasync fn main() -> Result<(), ConfigError> {\n\t\t    let config = tokio::task::spawn_blocking(|| {\n\t\t        load_config(Path::new(\"rift.toml\"))\n\t\t    })\n\t\t    .await??;\n\n\t\t    println!(\"Workspace root: {}\", config.root.display());\n\t\t    Ok(())\n\t\t}\nview 9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f \u00b7 expires 2026-10-12T15:50:28.954251+00:00\n",
     "json": {
       "view": {
         "id": "9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f",
@@ -1477,10 +1405,6 @@
       },
       "results": [
         {
-          "view": {
-            "id": "9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f",
-            "expires_at": "2026-10-12T15:50:28.954251+00:00"
-          },
           "hit": {
             "target": "symbol",
             "symbol": {
@@ -1514,10 +1438,6 @@
           "path": "src/config.rs"
         },
         {
-          "view": {
-            "id": "9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f",
-            "expires_at": "2026-10-12T15:50:28.954251+00:00"
-          },
           "hit": {
             "target": "symbol",
             "symbol": {
@@ -1536,10 +1456,6 @@
           "path": "README.md"
         },
         {
-          "view": {
-            "id": "9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f",
-            "expires_at": "2026-10-12T15:50:28.954251+00:00"
-          },
           "hit": {
             "target": "symbol",
             "symbol": {
@@ -1558,10 +1474,6 @@
           "path": "README.md"
         },
         {
-          "view": {
-            "id": "9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f",
-            "expires_at": "2026-10-12T15:50:28.954251+00:00"
-          },
           "hit": {
             "target": "symbol",
             "symbol": {
@@ -1589,10 +1501,6 @@
           "path": "src/config.rs"
         },
         {
-          "view": {
-            "id": "9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f",
-            "expires_at": "2026-10-12T15:50:28.954251+00:00"
-          },
           "hit": {
             "target": "symbol",
             "symbol": {
@@ -1669,7 +1577,7 @@
       "target": "symbol",
       "include": ["source"]
     },
-    "text": "1 result\n\tfunction beacon\n\trift://source/cargo/crates.io/demo/src/lib.rs:2 \u00b7 name \u00b7 view aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z \u00b7 dependency rift://revision/cargo/crates.io/demo@1.0.0\n\trift://symbol/cargo/crates.io/demo/rust/demo/beacon\n\n\tpub fn beacon() {}\n3 warnings\n\tpackage_requirement_absent \u00b7 entry typescript >=0 (npm)\n\tpackage_requirement_absent \u00b7 entry node >=0 (stdlib)\n\tpackage_requirement_absent \u00b7 entry rust >=0 (stdlib)\nview aabd1ca9d9cf576674866bdabbe164721917b5640b11be8ede7f2d403ee6e405 \u00b7 expires 2026-10-12T16:01:30.993123+00:00\n",
+    "text": "1 result\n\tfunction beacon\n\trift://source/cargo/crates.io/demo/src/lib.rs:2 \u00b7 name\n\trift://symbol/cargo/crates.io/demo/rust/demo/beacon\n\n\tpub fn beacon() {}\n3 warnings\n\tpackage_requirement_absent \u00b7 entry typescript >=0 (npm)\n\tpackage_requirement_absent \u00b7 entry node >=0 (stdlib)\n\tpackage_requirement_absent \u00b7 entry rust >=0 (stdlib)\nview aabd1ca9d9cf576674866bdabbe164721917b5640b11be8ede7f2d403ee6e405 \u00b7 expires 2026-10-12T16:01:30.993123+00:00\n",
     "json": {
       "view": {
         "id": "aabd1ca9d9cf576674866bdabbe164721917b5640b11be8ede7f2d403ee6e405",
@@ -1677,10 +1585,6 @@
       },
       "results": [
         {
-          "view": {
-            "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "expires_at": "2099-10-10T10:05:00Z"
-          },
           "hit": {
             "target": "symbol",
             "symbol": {
@@ -1761,7 +1665,7 @@
       "target": "symbol",
       "include": ["source"]
     },
-    "text": "1 result\n\tfunction beacon\n\trift://source/cargo/crates.io/demo/src/lib.rs:2 \u00b7 name \u00b7 view aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z \u00b7 dependency rift://revision/cargo/crates.io/demo@1.0.0\n\trift://symbol/cargo/crates.io/demo/rust/demo/beacon\n\n\tpub fn beacon() {}\n4 warnings\n\tpackage_requirement_absent \u00b7 entry typescript >=0 (npm)\n\tpackage_requirement_absent \u00b7 entry node >=0 (stdlib)\n\tpackage_requirement_absent \u00b7 entry rust >=0 (stdlib)\n\tpackage_substituted \u00b7 entry demo@1.1.0 (cargo) \u00b7 package demo@1.0.0 (cargo)\nview 1296f4f78cde6a430d2acafc95b5a618ff90a19e0aefa7470440e6933df26058 \u00b7 expires 2026-10-12T16:01:30.999711+00:00\n",
+    "text": "1 result\n\tfunction beacon\n\trift://source/cargo/crates.io/demo/src/lib.rs:2 \u00b7 name\n\trift://symbol/cargo/crates.io/demo/rust/demo/beacon\n\n\tpub fn beacon() {}\n4 warnings\n\tpackage_requirement_absent \u00b7 entry typescript >=0 (npm)\n\tpackage_requirement_absent \u00b7 entry node >=0 (stdlib)\n\tpackage_requirement_absent \u00b7 entry rust >=0 (stdlib)\n\tpackage_substituted \u00b7 entry demo@1.1.0 (cargo) \u00b7 package demo@1.0.0 (cargo)\nview 1296f4f78cde6a430d2acafc95b5a618ff90a19e0aefa7470440e6933df26058 \u00b7 expires 2026-10-12T16:01:30.999711+00:00\n",
     "json": {
       "view": {
         "id": "1296f4f78cde6a430d2acafc95b5a618ff90a19e0aefa7470440e6933df26058",
@@ -1769,10 +1673,6 @@
       },
       "results": [
         {
-          "view": {
-            "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "expires_at": "2099-10-10T10:05:00Z"
-          },
           "hit": {
             "target": "symbol",
             "symbol": {
@@ -1859,7 +1759,7 @@
       "id": "rift://symbol/cargo/crates.io/demo/rust/demo/beacon",
       "include": ["documentation"]
     },
-    "text": "\tfunction beacon\n\trift://symbol/cargo/crates.io/demo/rust/demo/beacon\n\tdependency rift://revision/cargo/crates.io/demo@1.0.0\n\n\tdocumentation:\n\t\trift://source/cargo/crates.io/demo/README.md:1\n\t\t\tguide\n\n\tdeclarations:\n\t\trift://source/cargo/crates.io/demo/src/lib.rs:2\n\t\t26..44\nrevision rift://revision/cargo/crates.io/demo@1.0.0\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction beacon\n\trift://symbol/cargo/crates.io/demo/rust/demo/beacon\n\tdependency rift://revision/cargo/crates.io/demo@1.0.0\n\n\tdocumentation:\n\t\trift://source/cargo/crates.io/demo/README.md:1\n\t\t\tguide\n\n\tdeclarations:\n\t\trift://source/cargo/crates.io/demo/src/lib.rs:2\n\t\t26..44\nrevision rift://revision/cargo/crates.io/demo@1.0.0\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -1877,10 +1777,6 @@
           },
           "source_kind": "authored"
         }
-      },
-      "view": {
-        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "expires_at": "2099-10-10T10:05:00Z"
       },
       "revision": "rift://revision/cargo/crates.io/demo@1.0.0",
       "declarations": [
@@ -1976,7 +1872,7 @@
     "arguments": {
       "id": "rift://symbol/stdlib/node/javascript/fs/readFile"
     },
-    "text": "\tfunction readFile\n\trift://symbol/stdlib/node/javascript/fs/readFile\n\tstdlib rift://revision/stdlib/node@26.11.1\nrevision rift://revision/stdlib/node@26.11.1\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction readFile\n\trift://symbol/stdlib/node/javascript/fs/readFile\n\tstdlib rift://revision/stdlib/node@26.11.1\nrevision rift://revision/stdlib/node@26.11.1\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -1993,10 +1889,6 @@
           "source_kind": "authored"
         }
       },
-      "view": {
-        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "expires_at": "2099-10-10T10:05:00Z"
-      },
       "revision": "rift://revision/stdlib/node@26.11.1",
       "declarations": []
     }
@@ -2006,7 +1898,7 @@
     "arguments": {
       "id": "rift://symbol/stdlib/cpython/python/builtins/len"
     },
-    "text": "\tfunction len\n\trift://symbol/stdlib/cpython/python/builtins/len\n\tsynthetic\nrevision rift://revision/stdlib/cpython@3.12.9\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction len\n\trift://symbol/stdlib/cpython/python/builtins/len\n\tsynthetic\nrevision rift://revision/stdlib/cpython@3.12.9\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -2018,10 +1910,6 @@
           "source_kind": "synthetic"
         }
       },
-      "view": {
-        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "expires_at": "2099-10-10T10:05:00Z"
-      },
       "revision": "rift://revision/stdlib/cpython@3.12.9",
       "declarations": []
     }
@@ -2031,7 +1919,7 @@
     "arguments": {
       "id": "rift://symbol/npm/npmjs.org/prettier/typescript/prettier/format"
     },
-    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier/typescript/prettier/format\n\tdependency rift://revision/npm/npmjs.org/prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier/index.d.ts:1\n\t\t0..46\n\t\trift://source/npm/npmjs.org/prettier/index.d.ts:2\n\t\t47..93\nrevision rift://revision/npm/npmjs.org/prettier@3.8.5\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier/typescript/prettier/format\n\tdependency rift://revision/npm/npmjs.org/prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier/index.d.ts:1\n\t\t0..46\n\t\trift://source/npm/npmjs.org/prettier/index.d.ts:2\n\t\t47..93\nrevision rift://revision/npm/npmjs.org/prettier@3.8.5\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -2049,10 +1937,6 @@
           },
           "source_kind": "authored"
         }
-      },
-      "view": {
-        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "expires_at": "2099-10-10T10:05:00Z"
       },
       "revision": "rift://revision/npm/npmjs.org/prettier@3.8.5",
       "declarations": [
@@ -2107,7 +1991,7 @@
       "id": "rift://symbol/npm/npmjs.org/prettier/typescript/prettier/format",
       "declaration_limit": 1
     },
-    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier/typescript/prettier/format\n\tdependency rift://revision/npm/npmjs.org/prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier/index.d.ts:1\n\t\t0..46\n\tdeclaration_cursor fixture-next\nrevision rift://revision/npm/npmjs.org/prettier@3.8.5\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier/typescript/prettier/format\n\tdependency rift://revision/npm/npmjs.org/prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier/index.d.ts:1\n\t\t0..46\n\tdeclaration_cursor fixture-next\nrevision rift://revision/npm/npmjs.org/prettier@3.8.5\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -2125,10 +2009,6 @@
           },
           "source_kind": "authored"
         }
-      },
-      "view": {
-        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "expires_at": "2099-10-10T10:05:00Z"
       },
       "revision": "rift://revision/npm/npmjs.org/prettier@3.8.5",
       "declarations": [
@@ -2162,10 +2042,9 @@
     "arguments": {
       "id": "rift://symbol/npm/npmjs.org/prettier/typescript/prettier/format",
       "declaration_limit": 1,
-      "declaration_cursor": "fixture-next",
-      "view": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      "declaration_cursor": "fixture-next"
     },
-    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier/typescript/prettier/format\n\tdependency rift://revision/npm/npmjs.org/prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier/index.d.ts:2\n\t\t47..93\nrevision rift://revision/npm/npmjs.org/prettier@3.8.5\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier/typescript/prettier/format\n\tdependency rift://revision/npm/npmjs.org/prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier/index.d.ts:2\n\t\t47..93\nrevision rift://revision/npm/npmjs.org/prettier@3.8.5\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -2183,10 +2062,6 @@
           },
           "source_kind": "authored"
         }
-      },
-      "view": {
-        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "expires_at": "2099-10-10T10:05:00Z"
       },
       "revision": "rift://revision/npm/npmjs.org/prettier@3.8.5",
       "declarations": [
@@ -2222,7 +2097,7 @@
       "target": "symbol",
       "include": ["source"]
     },
-    "text": "2 results\n\t[1] function format(value: string): string\n\t\toverload.d.ts:1 \u00b7 name, signature \u00b7 view 2114a0691a72144a74f0c4652bdf5ce8f96c135c91f315f307e76000c834c1af \u00b7 expires 2026-10-12T16:01:31.145575+00:00\n\t\t0..46\n\n\t\texport function format(value: string): string;\n\t[2] function format(value: number): string\n\t\toverload.d.ts:2 \u00b7 name, signature \u00b7 view 2114a0691a72144a74f0c4652bdf5ce8f96c135c91f315f307e76000c834c1af \u00b7 expires 2026-10-12T16:01:31.145575+00:00\n\t\t47..93\n\n\t\texport function format(value: number): string;\nview 2114a0691a72144a74f0c4652bdf5ce8f96c135c91f315f307e76000c834c1af \u00b7 expires 2026-10-12T16:01:31.145575+00:00\n",
+    "text": "2 results\n\t[1] function format(value: string): string\n\t\toverload.d.ts:1 \u00b7 name, signature\n\t\t0..46\n\n\t\texport function format(value: string): string;\n\t[2] function format(value: number): string\n\t\toverload.d.ts:2 \u00b7 name, signature\n\t\t47..93\n\n\t\texport function format(value: number): string;\nview 2114a0691a72144a74f0c4652bdf5ce8f96c135c91f315f307e76000c834c1af \u00b7 expires 2026-10-12T16:01:31.145575+00:00\n",
     "json": {
       "view": {
         "id": "2114a0691a72144a74f0c4652bdf5ce8f96c135c91f315f307e76000c834c1af",
@@ -2230,10 +2105,6 @@
       },
       "results": [
         {
-          "view": {
-            "id": "2114a0691a72144a74f0c4652bdf5ce8f96c135c91f315f307e76000c834c1af",
-            "expires_at": "2026-10-12T16:01:31.145575+00:00"
-          },
           "hit": {
             "target": "symbol",
             "symbol": {
@@ -2259,10 +2130,6 @@
           "path": "overload.d.ts"
         },
         {
-          "view": {
-            "id": "2114a0691a72144a74f0c4652bdf5ce8f96c135c91f315f307e76000c834c1af",
-            "expires_at": "2026-10-12T16:01:31.145575+00:00"
-          },
           "hit": {
             "target": "symbol",
             "symbol": {

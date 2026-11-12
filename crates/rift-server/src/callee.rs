@@ -360,8 +360,6 @@ pub struct CalleeDeclaration {
     pub origin: rift_core::SourceLocation,
     /// The release of the declaration's own owner that `id` answers in.
     pub revision: rift_protocol::revision::Revision,
-    /// Immutable global selection that established this declaration.
-    pub view: rift_protocol::symbol_read::CapturedView,
 }
 
 impl PackageCallee {
@@ -411,7 +409,6 @@ impl PackageCallee {
             kind,
             origin: _,
             revision,
-            view: _,
         } = declaration;
         let parsed = rift_protocol::identity::SymbolIdentity::parse(id.as_str()).ok()?;
         let language = parsed.language().clone();
@@ -966,20 +963,11 @@ mod tests {
                 package: package.clone(),
             },
             revision: package.release().expect("fixture package release"),
-            view: captured_view(),
         }
     }
 
     fn release(value: &str) -> rift_protocol::revision::Revision {
         rift_protocol::revision::Revision::parse(value).expect("fixture release")
-    }
-
-    fn captured_view() -> rift_protocol::symbol_read::CapturedView {
-        rift_protocol::symbol_read::CapturedView {
-            id: rift_protocol::symbol_read::CapturedViewId::parse("claims.package")
-                .expect("fixture captured view"),
-            expires_at: "2099-10-10T10:05:00Z".to_owned(),
-        }
     }
 
     #[test]
@@ -1034,7 +1022,6 @@ mod tests {
                 kind: ExactKind("class".to_owned()),
                 origin: python.clone(),
                 revision: release("rift://revision/stdlib/cpython@3.12.9"),
-                view: captured_view(),
             })
             .ok_or("the id names a language")?;
         let wire = serde_json::to_value(&symbol)?;
@@ -1067,7 +1054,6 @@ mod tests {
                 kind: ExactKind("function".to_owned()),
                 origin: physical.clone(),
                 revision: release("rift://revision/stdlib/python@3.14.3"),
-                view: captured_view(),
             })
             .ok_or("canonical runtime identity")?;
         assert_eq!(symbol.id.as_ref().map(|id| id.0.as_str()), Some(runtime_id));
@@ -1095,7 +1081,6 @@ mod tests {
                 kind: ExactKind("function".to_owned()),
                 origin: runtime.clone(),
                 revision: package.release()?,
-                view: captured_view(),
             })
             .ok_or("canonical package identity")?;
         assert_eq!(inverse.origin.package, Some(package.clone()));
@@ -1110,7 +1095,6 @@ mod tests {
                 kind: ExactKind("function".to_owned()),
                 origin: runtime.clone(),
                 revision: release("rift://revision/stdlib/python@3.14.3"),
-                view: captured_view(),
             })
             .is_none()
         );
@@ -1120,7 +1104,6 @@ mod tests {
                 kind: ExactKind("function".to_owned()),
                 origin: runtime,
                 revision: package.release()?,
-                view: captured_view(),
             })
             .is_none(),
             "an answered release of another owner names no origin"
@@ -1153,7 +1136,6 @@ mod tests {
                 kind: ExactKind("function".to_owned()),
                 origin: rust.clone(),
                 revision: release("rift://revision/stdlib/rustc@1.98.1"),
-                view: captured_view(),
             })
             .ok_or("the id names a language")?;
         let wire = serde_json::to_value(symbol)?;

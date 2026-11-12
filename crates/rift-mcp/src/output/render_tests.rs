@@ -147,7 +147,6 @@ fn documentation_text(text: &str) -> Documentation {
 
 fn search_hit(target: SearchHitTarget) -> SearchHit {
     SearchHit {
-        view: None,
         hit: target,
         score: None,
         matched_by: Vec::new(),
@@ -359,7 +358,6 @@ fn nodes_result(mut nodes: Vec<Node>, source: Vec<&str>) -> NodesResult {
     }
     NodesResult {
         symbol: None,
-        view: None,
         nodes,
         node_cursor: None,
         revision: tree_revision(),
@@ -4532,32 +4530,11 @@ fn output_allocation_cost() {
 }
 
 #[test]
-fn nodes_captured_view_renders_original_key_and_expiry() {
-    let mut answer = nodes_result(Vec::new(), Vec::new());
-    answer.view = Some(rift_protocol::symbol_read::CapturedView {
-        id: rift_protocol::symbol_read::CapturedViewId::parse("claims.nodes")
-            .expect("issued fixture key"),
-        expires_at: "2030-01-01T00:15:00Z".to_owned(),
-    });
-    let text = rendered(&answer);
-    assert!(
-        text.contains("view claims.nodes · expires 2030-01-01T00:15:00Z"),
-        "{text}"
-    );
-    answer.view = None;
-    assert!(!rendered(&answer).contains("view "));
-}
-
-#[test]
 fn canonical_symbol_render_keeps_source_less_object_without_physical_bindings() {
-    use rift_protocol::symbol_read::{CapturedView, CapturedViewId, GetSymbolResult};
+    use rift_protocol::symbol_read::GetSymbolResult;
     let id = SymbolId::parse("rift://symbol/local/rust/app/a/A").expect("modeled local identity");
     let answer = GetSymbolResult::Found {
         symbol: Box::new(symbol(Some(id.as_str()), "A")),
-        view: CapturedView {
-            id: CapturedViewId::parse("claims.signature").expect("view"),
-            expires_at: "2030-01-01T00:10:00+00:00".to_owned(),
-        },
         revision: tree_revision(),
         declarations: Vec::new(),
         declaration_cursor: None,
@@ -4567,7 +4544,7 @@ fn canonical_symbol_render_keeps_source_less_object_without_physical_bindings() 
     };
     let text = rendered(&answer);
     assert!(text.contains(id.as_str()));
-    assert!(text.contains("view claims.signature"));
+    assert!(!text.contains("view "));
     assert!(text.contains(&format!("revision {}", tree_revision())));
     assert!(!text.contains("declarations:"));
     assert!(!text.contains("a.rs:1"));
@@ -4575,9 +4552,7 @@ fn canonical_symbol_render_keeps_source_less_object_without_physical_bindings() 
 
 #[test]
 fn canonical_symbol_render_keeps_binding_location_and_declaration_continuation() {
-    use rift_protocol::symbol_read::{
-        CapturedView, CapturedViewId, GetSymbolResult, SymbolDeclaration,
-    };
+    use rift_protocol::symbol_read::{GetSymbolResult, SymbolDeclaration};
     let logical = symbol(Some("rift://symbol/local/rust/app/a/A"), "A");
     let source = "// original\nstruct A;\n";
     let answer = GetSymbolResult::Found {
@@ -4592,10 +4567,6 @@ fn canonical_symbol_render_keeps_binding_location_and_declaration_continuation()
             documentation_indices: Vec::new(),
         }],
         symbol: Box::new(logical),
-        view: CapturedView {
-            id: CapturedViewId::parse("claims.signature").expect("view"),
-            expires_at: "2030-01-01T00:10:00+00:00".to_owned(),
-        },
         revision: tree_revision(),
         declaration_cursor: Some("opaque-continuation".to_owned()),
         history: None,
@@ -4610,36 +4581,28 @@ fn canonical_symbol_render_keeps_binding_location_and_declaration_continuation()
 
 #[test]
 fn canonical_read_render_keeps_missing_and_unavailable_distinct() {
-    use rift_protocol::symbol_read::{
-        CapturedView, CapturedViewId, GetSymbolResult, SymbolNotFound, SymbolUnavailableReason,
-    };
+    use rift_protocol::symbol_read::{GetSymbolResult, SymbolNotFound, SymbolUnavailableReason};
     let id = SymbolId::parse("rift://symbol/local/rust/app/a/A").expect("modeled local identity");
-    let view = CapturedView {
-        id: CapturedViewId::parse("claims.signature").expect("view"),
-        expires_at: "2030-01-01T00:10:00+00:00".to_owned(),
-    };
     let missing = GetSymbolResult::Missing {
         symbol_not_found: SymbolNotFound {
             id: id.clone(),
             alternatives: Vec::new(),
             detail: None,
         },
-        view: view.clone(),
         revision: tree_revision(),
         warnings: Vec::new(),
     };
     let unavailable = GetSymbolResult::Unavailable {
         id,
-        view: Some(view),
         revision: None,
-        reason: SymbolUnavailableReason::ViewExpired,
+        reason: SymbolUnavailableReason::IndexPreparing,
         warnings: Vec::new(),
     };
     let missing = rendered(&missing);
     assert!(missing.contains("symbol_not_found"));
     assert!(missing.contains("revision rift://revision/tree/"));
     let text = rendered(&unavailable);
-    assert!(text.contains("unavailable · ViewExpired"));
+    assert!(text.contains("unavailable · IndexPreparing"));
     assert!(!text.contains("symbol_not_found"));
     assert!(!text.contains("revision "));
 }

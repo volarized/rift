@@ -504,7 +504,6 @@ pub(crate) fn package_traversal_hit(
 ) -> SearchHit {
     let distance = u64::try_from(path.len()).unwrap_or(u64::MAX);
     SearchHit {
-        view: Some(declaration.view.clone()),
         hit: SearchHitTarget::Symbol {
             symbol: Box::new(declaration.symbol.clone()),
         },

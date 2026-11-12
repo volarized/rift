@@ -12,13 +12,6 @@ use rift_protocol::read::{
     SymbolId,
 };
 use rift_syntax::{ByteRange, NodeHolder, NodePlace, SyntaxDocument};
-use sha2::{Digest as _, Sha256};
-
-/// The separator between a node cursor's offset and the tag binding it to one read.
-const CURSOR_SEPARATOR: char = '.';
-
-/// Characters of the tag that binds a node cursor to its symbol or unit and tree revision.
-const CURSOR_TAG_CHARS: usize = 16;
 
 /// The address of each declaration of one file, by its position in the file's symbols: the
 /// symbol it binds and its ordinal among that symbol's declarations.
@@ -92,39 +85,9 @@ fn invalid(field: &'static str, violation: &str) -> RiftError {
         .error()
 }
 
-/// The tag binding a cursor to the answer `key` names, a symbol or a unit identity, and the
-/// tree `revision` names: the first `CURSOR_TAG_CHARS` lowercase hex characters of their
-/// SHA-256.
-fn cursor_tag(key: &str, revision: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(key.as_bytes());
-    hasher.update([0]);
-    hasher.update(revision.as_bytes());
-    let mut tag = data_encoding::HEXLOWER.encode(&hasher.finalize());
-    tag.truncate(CURSOR_TAG_CHARS);
-    tag
-}
-
-/// The cursor that resumes the answer `key` names over `revision` at `offset`.
-fn cursor(offset: usize, key: &str, revision: &str) -> String {
-    format!("{offset}{CURSOR_SEPARATOR}{}", cursor_tag(key, revision))
-}
-
 /// The offset `cursor` resumes at, refused when it was minted for another answer or tree.
 pub(crate) fn cursor_offset(cursor: &str, key: &str, revision: &str) -> Result<usize, RiftError> {
-    let (offset, tag) = cursor
-        .split_once(CURSOR_SEPARATOR)
-        .ok_or_else(|| invalid("node_cursor", "send the cursor a nodes read returned"))?;
-    if tag != cursor_tag(key, revision) {
-        return Err(invalid(
-            "node_cursor",
-            "the cursor belongs to another symbol, unit, or tree revision; restart the read \
-             without it",
-        ));
-    }
-    offset
-        .parse()
-        .map_err(|_| invalid("node_cursor", "send the cursor a nodes read returned"))
+    super::cursor::offset(cursor, "node_cursor", key, revision)
 }
 
 /// One page of an answer's nodes, and the cursor resuming it when nodes remain.
@@ -325,7 +288,7 @@ impl<'key> PageBuilder<'key> {
             || self.source_bytes.saturating_add(bytes) > self.bounds.source_bytes_max;
         if crosses && !self.nodes.is_empty() {
             let resume = self.offset.saturating_add(self.nodes.len());
-            return Some(cursor(resume, self.key, self.revision));
+            return Some(super::cursor::mint(resume, self.key, self.revision));
         }
         self.source_bytes = self.source_bytes.saturating_add(bytes);
         self.nodes.push(node());

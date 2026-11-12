@@ -35,10 +35,6 @@ fn request() -> GetSymbolParams {
     serde_json::from_value(json!({"id": ID})).expect("request")
 }
 
-fn view() -> Value {
-    json!({"id": "a".repeat(64), "expires_at": "2026-10-10T01:00:00Z"})
-}
-
 fn found(declarations: Vec<Value>) -> GetSymbolResult {
     serde_json::from_value(json!({
         "outcome": "found",
@@ -47,7 +43,6 @@ fn found(declarations: Vec<Value>) -> GetSymbolResult {
                 "manager": "cargo", "registry": "crates.io", "name": "tokio", "version": "1.50.0"
             }
         }},
-        "view": view(),
         "revision": RELEASE,
         "declarations": Value::Array(declarations),
     }))
@@ -78,7 +73,7 @@ fn source_less_found_and_typed_absence_remain_distinct() {
         serde_json::from_value(intrinsic).expect("synthetic source-less symbol");
     assert!(valid_result(&request, &intrinsic, 100));
     let missing = serde_json::from_value(json!({
-        "outcome": "missing", "view": view(), "revision": RELEASE,
+        "outcome": "missing", "revision": RELEASE,
         "symbol_not_found": {"id": ID, "alternatives": [{
             "id": OTHER_ID, "name": "Beacon", "match_context": ["version"]
         }]}
@@ -114,9 +109,6 @@ fn exact_answer_rejects_a_different_release_or_captured_view() {
         !valid_result(&request, &stale, 100),
         "the symbol's origin names the answered release"
     );
-    request.view =
-        Some(rift_protocol::symbol_read::CapturedViewId::parse(&"b".repeat(64)).expect("view"));
-    assert!(!valid_result(&request, &found(Vec::new()), 100));
 }
 
 #[test]
@@ -136,7 +128,7 @@ fn exact_answer_enforces_projection_and_declaration_bounds() {
 }
 
 #[test]
-fn request_rejects_local_owners_revision_and_unbound_continuation() {
+fn request_rejects_local_owners_revision_and_malformed_continuation() {
     let local: GetSymbolParams = serde_json::from_value(json!({
         "id": "rift://symbol/local/rust/Beacon"
     }))
@@ -144,8 +136,10 @@ fn request_rejects_local_owners_revision_and_unbound_continuation() {
     assert_request_field(&validate_request(&local).expect_err("local owner"), "id");
     let mut request = request();
     request.declaration_cursor = Some("next".to_owned());
+    assert!(validate_request(&request).is_ok(), "a cursor stands alone");
+    request.declaration_cursor = Some(String::new());
     assert_request_field(
-        &validate_request(&request).expect_err("unbound cursor"),
+        &validate_request(&request).expect_err("empty cursor"),
         "declaration_cursor",
     );
     request.declaration_cursor = None;
@@ -207,7 +201,7 @@ fn exact_response_requires_status_to_match_outcome() {
         (200, serde_json::to_value(found(Vec::new())).expect("found")),
         (
             404,
-            json!({"outcome":"missing","symbol_not_found":{"id":ID,"alternatives":[]},"view":view(),"revision":RELEASE}),
+            json!({"outcome":"missing","symbol_not_found":{"id":ID,"alternatives":[]},"revision":RELEASE}),
         ),
         (
             503,

@@ -337,7 +337,6 @@ impl<'a> FileMatches<'a> {
             None => text_file_hit_target(file),
         };
         SearchHit {
-            view: None,
             hit,
             score: None,
             matched_by: vec![MatchedField::Content],

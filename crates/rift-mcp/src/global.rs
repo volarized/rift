@@ -542,14 +542,12 @@ pub(crate) async fn callee_declarations(
                 id,
                 kind,
                 revision,
-                view,
+                ..
             } = result
             else {
                 continue;
             };
-            if !captured_callee_source(client, callees, &position, &id, &view, &mut verified)
-                .await?
-            {
+            if !captured_callee_source(client, callees, &position, &id, &mut verified).await? {
                 continue;
             }
             let key = CalleePosition {
@@ -562,7 +560,7 @@ pub(crate) async fn callee_declarations(
                 line: position.line,
                 character: position.character,
             };
-            named.insert((encoding.clone(), key), (id, kind, revision, view));
+            named.insert((encoding.clone(), key), (id, kind, revision));
         }
         if selected.is_none() {
             break;
@@ -578,7 +576,6 @@ async fn captured_callee_source(
     callees: &[PackageCallee],
     position: &rift_protocol::source_read::SourcePosition,
     id: &SymbolId,
-    view: &rift_protocol::symbol_read::CapturedView,
     verified: &mut HashMap<String, bool>,
 ) -> Result<bool, RiftError> {
     for callee in callees {
@@ -611,12 +608,12 @@ async fn captured_callee_source(
             return Ok(*matched);
         }
         let request = rift_protocol::read::NodesParams {
-            view: Some(view.id.clone()),
+            revision: Some(release.clone()),
             ..rift_protocol::read::NodesParams::of(id.clone())
         };
         let answer = client.nodes(&request).await?;
-        let matched = answer.revision == release
-            && declared_nodes_match(&answer, id, &position.unit, view, held);
+        let matched =
+            answer.revision == release && declared_nodes_match(&answer, id, &position.unit, held);
         verified.insert(verified_key, matched);
         return Ok(matched);
     }
@@ -624,13 +621,11 @@ async fn captured_callee_source(
 }
 
 /// Whether the first page of `answer` lists the nodes of `id` with an item node in `unit`, and
-/// every such item node's source equals `held` at the node's byte range, in the captured
-/// `view`.
+/// every such item node's source equals `held` at the node's byte range.
 fn declared_nodes_match(
     answer: &rift_protocol::read::NodesResult,
     id: &SymbolId,
     unit: &rift_protocol::read::SourceUnitId,
-    view: &rift_protocol::symbol_read::CapturedView,
     held: &str,
 ) -> bool {
     let mut declared = answer
@@ -638,8 +633,7 @@ fn declared_nodes_match(
         .iter()
         .filter(|node| node.index == 0 && &node.unit == unit)
         .peekable();
-    answer.view.as_ref() == Some(view)
-        && answer.symbol.as_ref() == Some(id)
+    answer.symbol.as_ref() == Some(id)
         && declared.peek().is_some()
         && declared.all(|node| node_matches(node, held))
 }
@@ -992,12 +986,7 @@ pub(crate) struct CalleeDeclarations {
     /// encoding and key.
     named: HashMap<
         (PackageDeclarationRequestPositionEncoding, CalleePosition),
-        (
-            SymbolId,
-            ExactKind,
-            rift_protocol::revision::Revision,
-            rift_protocol::symbol_read::CapturedView,
-        ),
+        (SymbolId, ExactKind, rift_protocol::revision::Revision),
     >,
 }
 
@@ -1017,13 +1006,12 @@ impl CalleeDeclarations {
     pub(crate) fn declaration(&self, callee: &PackageCallee) -> Option<CalleeDeclaration> {
         let origin = callee_origin(callee)?;
         let key = (wire_encoding(callee), callee_position(callee, &origin)?);
-        let (id, kind, revision, view) = self.named.get(&key)?;
+        let (id, kind, revision) = self.named.get(&key)?;
         Some(CalleeDeclaration {
             id: id.clone(),
             kind: kind.clone(),
             origin,
             revision: revision.clone(),
-            view: view.clone(),
         })
     }
 }
@@ -3132,7 +3120,6 @@ mod tests {
 mod captured_runtime_tests {
     use super::declared_nodes_match;
     use rift_protocol::read::{NodesResult, SymbolId};
-    use rift_protocol::symbol_read::CapturedView;
 
     const ID: &str = "rift://symbol/stdlib/cpython/python/builtins/len";
     const UNIT: &str = "rift://source/stdlib/cpython/builtins.pyi";
@@ -3152,13 +3139,9 @@ mod captured_runtime_tests {
         node
     }
 
-    fn answer(
-        view: &CapturedView,
-        symbol: Option<&str>,
-        nodes: &[serde_json::Value],
-    ) -> NodesResult {
+    fn answer(symbol: Option<&str>, nodes: &[serde_json::Value]) -> NodesResult {
         let revision = "rift://revision/stdlib/cpython@3.12.3";
-        let mut answer = serde_json::json!({"nodes": nodes, "view": view, "revision": revision});
+        let mut answer = serde_json::json!({"nodes": nodes, "revision": revision});
         if let Some(symbol) = symbol {
             answer["symbol"] = serde_json::json!(symbol);
         }
@@ -3166,29 +3149,22 @@ mod captured_runtime_tests {
     }
 
     #[test]
-    fn runtime_stub_nodes_require_exact_bytes_unit_and_view() {
-        let view: CapturedView = serde_json::from_value(serde_json::json!({
-            "id": "claims.signature", "expires_at": "2099-01-01T00:00:00Z"
-        }))
-        .expect("captured view");
+    fn runtime_stub_nodes_require_exact_bytes_and_unit() {
         let id = SymbolId::parse(ID).expect("runtime symbol");
         let unit = serde_json::from_value(serde_json::json!(UNIT)).expect("runtime source unit");
         let matching = answer(
-            &view,
             Some(ID),
             &[node(0, UNIT, 6, DECLARED), node(1, UNIT, 10, "obj")],
         );
-        assert!(declared_nodes_match(&matching, &id, &unit, &view, STUB));
+        assert!(declared_nodes_match(&matching, &id, &unit, STUB));
         assert!(!declared_nodes_match(
             &matching,
             &id,
             &unit,
-            &view,
             "x = 1\ndef len(arg): ...\n"
         ));
-        assert!(!declared_nodes_match(&matching, &id, &unit, &view, "short"));
+        assert!(!declared_nodes_match(&matching, &id, &unit, "short"));
         let other_unit = answer(
-            &view,
             Some(ID),
             &[node(
                 0,
@@ -3197,21 +3173,10 @@ mod captured_runtime_tests {
                 DECLARED,
             )],
         );
-        assert!(!declared_nodes_match(&other_unit, &id, &unit, &view, STUB));
-        let shifted = answer(&view, Some(ID), &[node(0, UNIT, 5, DECLARED)]);
-        assert!(!declared_nodes_match(&shifted, &id, &unit, &view, STUB));
-        let unnamed = answer(&view, None, &[node(0, UNIT, 6, DECLARED)]);
-        assert!(!declared_nodes_match(&unnamed, &id, &unit, &view, STUB));
-        let mut other_view = view.clone();
-        other_view.id = serde_json::from_value(serde_json::json!("a_B-9.z_Y-0")).expect("view id");
-        let elsewhere = answer(&other_view, Some(ID), &[node(0, UNIT, 6, DECLARED)]);
-        assert!(!declared_nodes_match(&elsewhere, &id, &unit, &view, STUB));
-        let unviewed: NodesResult = serde_json::from_value(serde_json::json!({
-            "symbol": ID,
-            "nodes": [node(0, UNIT, 6, DECLARED)],
-            "revision": "rift://revision/stdlib/cpython@3.12.3"
-        }))
-        .expect("nodes answer");
-        assert!(!declared_nodes_match(&unviewed, &id, &unit, &view, STUB));
+        assert!(!declared_nodes_match(&other_unit, &id, &unit, STUB));
+        let shifted = answer(Some(ID), &[node(0, UNIT, 5, DECLARED)]);
+        assert!(!declared_nodes_match(&shifted, &id, &unit, STUB));
+        let unnamed = answer(None, &[node(0, UNIT, 6, DECLARED)]);
+        assert!(!declared_nodes_match(&unnamed, &id, &unit, STUB));
     }
 }

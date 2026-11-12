@@ -130,17 +130,15 @@ pub struct GetSymbolParams {
     /// revision reads the served working tree, and a release revision selects the release
     /// of a package or runtime `id`'s owner. Omitted reads the served working tree, or for
     /// a package the version the workspace's dependencies pin, else the newest collected
-    /// release. The server refuses it beside `view` and once the index no longer serves it.
+    /// release. The server refuses a tree revision once the index serves another tree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<Revision>,
-    /// A view returned by a preceding read. Expiry never selects latest implicitly.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub view: Option<CapturedViewId>,
     /// Most declarations returned in this read. Omitted uses the existing five-item bound.
     #[serde(default = "default_declaration_limit")]
     #[schemars(range(min = 1_u64, max = PAGE_LIMIT_MAX))]
     pub declaration_limit: u64,
-    /// Continuation bound to this exact symbol, projections and serving view.
+    /// Continuation a preceding read returned, bound to this symbol and the revision it read.
+    /// The server refuses it for another symbol and once that revision is no longer served.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1, max = 4096))]
     pub declaration_cursor: Option<String>,
@@ -288,14 +286,12 @@ pub enum GetSymbolResult {
     Found {
         /// One logical symbol. Its established `id` is required by read validation.
         symbol: Box<Symbol>,
-        /// The immutable context used for this result and its continuations.
-        view: CapturedView,
         /// The revision this answer was read at: a commit, a release, or a working tree.
         revision: Revision,
         /// Declaration bindings in deterministic source order.
         #[schemars(length(max = PAGE_LIMIT_MAX))]
         declarations: Vec<SymbolDeclaration>,
-        /// Continuation for remaining declarations in this exact view.
+        /// Continuation for the remaining declarations at `revision`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[schemars(length(min = 1, max = 4096))]
         declaration_cursor: Option<String>,
@@ -313,8 +309,6 @@ pub enum GetSymbolResult {
     Missing {
         /// Definite exact miss and its actual structural candidates.
         symbol_not_found: SymbolNotFound,
-        /// The exact immutable selection searched.
-        view: CapturedView,
         /// The revision this answer was read at: a commit, a release, or a working tree.
         revision: Revision,
         /// Warnings, including incomplete candidate work.
@@ -327,9 +321,6 @@ pub enum GetSymbolResult {
         #[serde(deserialize_with = "deserialize_symbol_id")]
         #[schemars(with = "crate::identity::SymbolIdentity")]
         id: SymbolId,
-        /// The selected view, when one could be captured.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        view: Option<CapturedView>,
         /// The revision the read selected, when it established one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         revision: Option<Revision>,

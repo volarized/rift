@@ -217,7 +217,7 @@ async fn assert_workspace_symbol(client: &Client, case: &SourceCase, name: &str)
     let start = usize::try_from(hit["range"]["start"].as_u64().ok_or("range start")?)?;
     let end = usize::try_from(hit["range"]["end"].as_u64().ok_or("range end")?)?;
     assert_eq!(hit["source"], Value::from(&case.text[start..end]));
-    assert_workspace_symbol_node(client, case, name, hit, start, end).await?;
+    assert_workspace_symbol_node(client, case, name, start, end).await?;
     let search = search_after_population(
         client,
         &json!({
@@ -244,7 +244,6 @@ async fn assert_workspace_symbol_node(
     client: &Client,
     case: &SourceCase,
     name: &str,
-    hit: &Value,
     start: usize,
     end: usize,
 ) -> TestResult {
@@ -252,16 +251,11 @@ async fn assert_workspace_symbol_node(
     let positions = source.match_indices(name).collect::<Vec<_>>();
     assert_eq!(positions.len(), 1, "{name} has one original name span");
     let position = u64::try_from(start.checked_add(positions[0].0).ok_or("name offset")?)?;
-    let view = hit["view"]["id"].as_str().ok_or("captured search view")?;
     let output = call_retrying_acceptance(
         client,
-        tool_request(
-            "nodes",
-            &json!({"path":case.path, "position":position, "view":view}),
-        ),
+        tool_request("nodes", &json!({"path":case.path, "position":position})),
     )
     .await?;
-    assert_eq!(output["view"], hit["view"], "original captured view");
     let nodes = output["nodes"].as_array().ok_or("nodes array")?;
     let start = u64::try_from(start)?;
     let end = u64::try_from(end)?;

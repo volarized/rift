@@ -1758,19 +1758,12 @@ async fn read_dependency_hit(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     hit: &Value,
 ) -> TestResult {
-    let selected = &hit["view"];
     let symbol = call_retrying_acceptance(
         client,
-        tool_request(
-            "get_symbol",
-            &json!({
-                "id":hit["hit"]["symbol"]["id"], "view":selected["id"]
-            }),
-        ),
+        tool_request("get_symbol", &json!({"id":hit["hit"]["symbol"]["id"]})),
     )
     .await?;
     assert_eq!(symbol["outcome"], "found", "{symbol}");
-    assert_eq!(symbol["view"], *selected, "{symbol}");
     assert_eq!(symbol["declarations"][0]["unit"], hit["unit"], "{symbol}");
     assert_eq!(symbol["declarations"][0]["range"]["start"], 0, "{symbol}");
     assert!(
@@ -1778,25 +1771,6 @@ async fn read_dependency_hit(
         "{symbol}"
     );
     Ok(())
-}
-
-async fn held_dependency_graph(
-    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
-    mut request: Value,
-    original: &Value,
-    endpoint: &str,
-) -> TestResult {
-    request["view"] = original["view"]["id"].clone();
-    let held = client.call_tool(tool_request("search", &request)).await?;
-    assert_ne!(held.is_error, Some(true), "{held:?}");
-    let body = held.structured_content.ok_or("held traversal result")?;
-    assert_eq!(&body, original, "captured graph and hit views stay fixed");
-    let greet = callee_hit(&body, "greet")?;
-    let meta = held.meta.ok_or("held dependency backend")?;
-    assert_eq!(meta.get("backend"), Some(&json!("global")));
-    assert_eq!(meta.get("root"), Some(&json!(endpoint)));
-    assert_eq!(meta.get("view"), Some(&greet["view"]));
-    read_dependency_hit(client, &greet).await
 }
 
 /// A standard library callee's position goes to the global API as `stdlib/python` at the
@@ -1880,7 +1854,7 @@ async fn search_traversal_outgoing_names_a_standard_library_callee_by_its_global
         1,
         "one stub nodes read: {stub_requests:?}"
     );
-    assert!(stub_requests[0]["view"].is_string());
+    assert!(stub_requests[0]["revision"].is_string());
 
     client.cancel().await?;
     Ok(())
@@ -1943,7 +1917,6 @@ async fn search_traversal_outgoing_names_a_dependency_callee_and_counts_one_answ
         "traversal": { "seed": captured_seed(&client, "hello", "app.py").await?, "direction": "outgoing" }
     });
     let hello = call_retrying_acceptance(&client, tool_request("search", &request)).await?;
-    held_dependency_graph(&client, request, &hello, &fixture.endpoint).await?;
     assert_eq!(symbol_names(&hello), ["greet"], "{hello}");
     let greet = callee_hit(&hello, "greet")?;
     read_dependency_hit(&client, &greet).await?;

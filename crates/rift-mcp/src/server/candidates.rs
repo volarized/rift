@@ -1,8 +1,6 @@
 mod symbol;
-mod traversal;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
-use symbol::SavedRead;
 
 use rift_error::{RiftError, errors};
 use rift_protocol::read::{ReadWarning, SearchParams};
@@ -18,63 +16,6 @@ use super::{ReadAnswer, RiftMcp, ToolFailure, wire};
 
 const BYTES_MAX: usize = crate::global::candidates::CANDIDATE_BYTES_MAX;
 const SLOTS_MAX: usize = 256;
-
-pub(in crate::server) fn write_captured_context(
-    result: &mut Result<CallToolResponse, rmcp::ErrorData>,
-    captured: Option<&Mutex<Option<crate::global::candidates::SavedCandidateBackend>>>,
-) {
-    if let Ok(CallToolResponse::Complete(response)) = result
-        && let Some(captured) = captured
-        && let Some(selected) = captured
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-    {
-        let meta = response
-            .meta
-            .get_or_insert_with(rmcp::model::MetaObject::new);
-        meta.insert("backend".to_owned(), serde_json::json!(selected.backend));
-        meta.insert("root".to_owned(), serde_json::json!(selected.root));
-        meta.insert("owner".to_owned(), serde_json::json!(selected.owner));
-        meta.insert("view".to_owned(), serde_json::json!(selected.view));
-    }
-}
-
-fn global_context(
-    context: Option<&Mutex<Option<crate::global::candidates::SavedCandidateBackend>>>,
-    endpoint: &str,
-    view: Option<&rift_protocol::symbol_read::CapturedViewId>,
-    operation: &str,
-) -> Result<(), ToolFailure> {
-    let Some(context) = context else {
-        return Ok(());
-    };
-    let context = context
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(selected) = context.as_ref() else {
-        return Ok(());
-    };
-    if selected.backend != "global"
-        || selected.root != endpoint
-        || selected.owner.is_some()
-        || view != Some(&selected.view.id)
-    {
-        return Err(captured_read_refusal(
-            operation,
-            &selected.view.id,
-            rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext,
-        ));
-    }
-    if crate::proxy::captured_expiry(&selected.view).map_err(read_failure)? <= SystemTime::now() {
-        return Err(captured_read_refusal(
-            operation,
-            &selected.view.id,
-            rift_protocol::symbol_read::SymbolUnavailableReason::ViewExpired,
-        ));
-    }
-    Ok(())
-}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -187,10 +128,8 @@ impl RiftMcp {
                 },
             )
         };
-        if params.traversal.is_some() {
-            return self.captured_traversal(params, None).await.map(Some);
-        }
-        if params.pattern.is_some()
+        if params.traversal.is_some()
+            || params.pattern.is_some()
             || params.change.is_some()
             || params.revision.is_some()
             || params.target == rift_protocol::read::SearchParamsTarget::Commit
@@ -214,14 +153,8 @@ impl RiftMcp {
                         None,
                     )));
                 };
-                let saved: SavedRead =
+                let saved: SavedResponse =
                     serde_json::from_slice(&row.bytes).map_err(transport_failure)?;
-                let SavedRead::Search(saved) = saved else {
-                    return Ok(Some(unavailable(
-                        SymbolUnavailableReason::ViewContext,
-                        None,
-                    )));
-                };
                 if row.expires <= SystemTime::now() {
                     return Ok(Some(unavailable(
                         SymbolUnavailableReason::ViewExpired,
@@ -516,39 +449,9 @@ impl RiftMcp {
     ) -> Result<(), RiftError> {
         let id = response.view.id.as_str().to_owned();
         let expires = crate::proxy::captured_expiry(&response.view)?;
-        let encoded = crate::proxy::encode_bounded(
-            &SavedRead::Search(Box::new(SavedResponse { params, response })),
-            BYTES_MAX,
-        )
-        .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
+        let encoded = crate::proxy::encode_bounded(&SavedResponse { params, response }, BYTES_MAX)
+            .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
         self.candidate_responses.save_bytes(id, expires, encoded)
-    }
-
-    pub(super) fn captured_nodes(
-        &self,
-        params: &rift_protocol::read::NodesParams,
-        view: &rift_protocol::symbol_read::CapturedViewId,
-    ) -> Result<rift_protocol::read::NodesResult, ToolFailure> {
-        let context = self.captured_context(view, "nodes")?;
-        let owner = context.owner;
-        let root = std::path::Path::new(&context.root);
-        let views = self.local_views.get().ok_or_else(|| {
-            captured_node_refusal(
-                view,
-                rift_protocol::symbol_read::SymbolUnavailableReason::ViewExpired,
-            )
-        })?;
-        let (nodes, selected) = views
-            .nodes(params, view, root, &owner)
-            .map_err(read_failure)?
-            .map_err(|reason| captured_node_refusal(view, reason))?;
-        if nodes.view.as_ref() != Some(&selected) || selected.id != *view {
-            return Err(captured_node_refusal(
-                view,
-                rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext,
-            ));
-        }
-        Ok(nodes)
     }
 
     fn saved_candidates(
@@ -565,13 +468,8 @@ impl RiftMcp {
             .iter()
             .find(|row| row.id == view.id.as_str())
             .ok_or_else(|| unavailable("captured candidates are unavailable"))?;
-        let SavedRead::Search(saved) =
-            serde_json::from_slice(&bytes.bytes).map_err(transport_failure)?
-        else {
-            return Err(unavailable(
-                "captured candidate request context does not match",
-            ));
-        };
+        let saved: SavedResponse =
+            serde_json::from_slice(&bytes.bytes).map_err(transport_failure)?;
         if crate::proxy::normalized_params(&saved.params) != crate::proxy::normalized_params(params)
             || &saved.response.view != view
         {
@@ -600,75 +498,6 @@ fn unavailable(detail: &str) -> ToolFailure {
     )
 }
 
-fn captured_read_refusal(
-    operation: &str,
-    view: &rift_protocol::symbol_read::CapturedViewId,
-    reason: rift_protocol::symbol_read::SymbolUnavailableReason,
-) -> ToolFailure {
-    use rift_protocol::symbol_read::SymbolUnavailableReason;
-    let error = match reason {
-        SymbolUnavailableReason::ViewExpired => errors::server::search_view_expired()
-            .operation(operation)
-            .view(view.as_str())
-            .error(),
-        SymbolUnavailableReason::ViewContext => errors::server::search_view_context()
-            .operation(operation)
-            .view(view.as_str())
-            .error(),
-        _ => errors::server::search_coverage_unavailable()
-            .operation(operation)
-            .view(view.as_str())
-            .error(),
-    };
-    read_failure(error)
-}
-
-fn captured_node_refusal(
-    view: &rift_protocol::symbol_read::CapturedViewId,
-    reason: rift_protocol::symbol_read::SymbolUnavailableReason,
-) -> ToolFailure {
-    captured_read_refusal("nodes", view, reason)
-}
-
-#[cfg(test)]
-mod captured_node_error_tests {
-    use super::captured_node_refusal;
-    use super::wire;
-    use crate::{failure::WireFailure, output::ToolFailure};
-    use rift_protocol::symbol_read::{CapturedViewId, SymbolUnavailableReason};
-
-    #[test]
-    fn nodes_view_refusals_keep_registered_code_and_safe_guidance() {
-        let view = CapturedViewId::parse("claims.nodes").expect("issued fixture key");
-        for (reason, slug, guidance) in [
-            (
-                SymbolUnavailableReason::ViewExpired,
-                "rift.server.search_view_expired",
-                "capture a new view",
-            ),
-            (
-                SymbolUnavailableReason::ViewContext,
-                "rift.server.search_view_context",
-                "matching workspace",
-            ),
-        ] {
-            let ToolFailure::Registered(error, phase) = captured_node_refusal(&view, reason) else {
-                panic!("captured refusal must retain its registered error");
-            };
-            assert_eq!(error.registered().slug().as_str(), slug);
-            let wire = error.wire_error(phase);
-            assert_eq!(wire.code, wire::ErrorCode::InvalidRequest);
-            assert_eq!(wire.retry, wire::RetryDirective::Never);
-            assert!(wire.message.contains(view.as_str()));
-            assert!(wire.message.contains(guidance));
-            assert!(
-                wire.causes.is_empty(),
-                "expected refusal has no invented source"
-            );
-        }
-    }
-}
-
 #[cfg(test)]
 mod captured_search_startup_tests {
     use super::{RiftMcp, SearchCandidateRequest, SearchCandidateResult, SearchParams};
@@ -691,10 +520,7 @@ mod captured_search_startup_tests {
             "query": "beacon", "scope": "local", "include": ["source"]
         }))?;
         let initial = server
-            .search(
-                super::super::Parameters(params.clone()),
-                rmcp::model::Extensions::default(),
-            )
+            .search(super::super::Parameters(params.clone()))
             .await
             .map_err(|failure| format!("{failure:?}"))?
             .0;
@@ -706,19 +532,10 @@ mod captured_search_startup_tests {
             .view
             .clone()
             .ok_or("initial search must issue a view")?;
-        assert!(
-            initial
-                .results
-                .iter()
-                .all(|hit| hit.view.as_ref() == Some(&view))
-        );
         std::fs::write(directory.path().join("lib.rs"), "pub fn replacement() {}\n")?;
         params.view = Some(view.id.clone());
         let later = server
-            .search(
-                super::super::Parameters(params.clone()),
-                rmcp::model::Extensions::default(),
-            )
+            .search(super::super::Parameters(params.clone()))
             .await
             .map_err(|failure| format!("{failure:?}"))?
             .0;
@@ -728,10 +545,7 @@ mod captured_search_startup_tests {
         assert_eq!(later, initial);
         params.page_index = 1;
         let page = server
-            .search(
-                super::super::Parameters(params.clone()),
-                rmcp::model::Extensions::default(),
-            )
+            .search(super::super::Parameters(params.clone()))
             .await
             .map_err(|failure| format!("{failure:?}"))?
             .0;
@@ -743,10 +557,7 @@ mod captured_search_startup_tests {
         params.query = Some("replacement".to_owned());
         assert!(matches!(
             server
-                .search(
-                    super::super::Parameters(params),
-                    rmcp::model::Extensions::default()
-                )
+                .search(super::super::Parameters(params))
                 .await
                 .map_err(|failure| format!("{failure:?}"))?
                 .0,
@@ -991,10 +802,7 @@ mod tests {
         }))?;
         let failure = assembled
             .server
-            .search(
-                super::super::Parameters(params),
-                rmcp::model::Extensions::default(),
-            )
+            .search(super::super::Parameters(params))
             .await
             .err()
             .expect("preparing publication must refuse the malformed query");
@@ -1050,10 +858,7 @@ mod tests {
                 }))?;
                 let direct = assembled
                     .server
-                    .search(
-                        super::super::Parameters(params),
-                        rmcp::model::Extensions::default(),
-                    )
+                    .search(super::super::Parameters(params))
                     .await
                     .map_err(|failure| format!("{failure:?}"))?
                     .0;

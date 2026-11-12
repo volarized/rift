@@ -293,27 +293,6 @@ async fn a_page_over_the_advertised_node_bound_refuses() {
     assert_registered_field(&error, "rift.client.response_invalid", "body");
 }
 
-/// A request naming a view accepts only the answer carrying that view.
-#[tokio::test]
-async fn an_answer_for_another_view_refuses() {
-    let view =
-        rift_protocol::symbol_read::CapturedViewId::parse(&"a".repeat(64)).expect("view fixture");
-    let request = NodesParams {
-        view: Some(view),
-        ..nodes_request()
-    };
-    let mut answer = nodes_response_json();
-    answer["view"] = json!({"id": "b".repeat(64), "expires_at": "2026-10-10T10:05:00Z"});
-    let (_server, client) =
-        operation_client(OperationFixture::Nodes(answer.clone(), StatusCode::OK)).await;
-    let error = client.nodes(&request).await.expect_err("another view");
-    assert_registered_field(&error, "rift.client.response_invalid", "body");
-    answer["view"]["id"] = json!("a".repeat(64));
-    let (_server, client) = operation_client(OperationFixture::Nodes(answer, StatusCode::OK)).await;
-    let answered = client.nodes(&request).await.expect("the requested view");
-    assert!(answered.view.is_some());
-}
-
 /// A request naming one release refuses an answer read at another release of the package.
 #[tokio::test]
 async fn an_answer_at_another_release_than_the_requested_one_refuses() {

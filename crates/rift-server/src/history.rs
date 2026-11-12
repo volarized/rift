@@ -262,28 +262,6 @@ impl SymbolTimelines {
         syntax: SyntaxLimits,
         store: Option<&StoredHistory>,
     ) -> Result<Self, RiftError> {
-        Self::open_with_capture(root, revision, history, syntax, store, false)
-    }
-
-    /// Captures one bounded timeline before its read connection closes.
-    pub(crate) fn open_captured(
-        root: &Path,
-        revision: Option<&RevisionId>,
-        history: &HistoryConfiguration,
-        syntax: SyntaxLimits,
-        store: Option<&StoredHistory>,
-    ) -> Result<Self, RiftError> {
-        Self::open_with_capture(root, revision, history, syntax, store, true)
-    }
-
-    fn open_with_capture(
-        root: &Path,
-        revision: Option<&RevisionId>,
-        history: &HistoryConfiguration,
-        syntax: SyntaxLimits,
-        store: Option<&StoredHistory>,
-        retained: bool,
-    ) -> Result<Self, RiftError> {
         if !history.enabled {
             return errors::server::read_unsupported()
                 .capability("symbol history (providers.history disabled)")
@@ -314,7 +292,6 @@ impl SymbolTimelines {
                 &start,
                 revision.is_some(),
                 revisions_max,
-                retained,
             )?),
             None => TimelineSource::Walk(Box::new(WalkedTimelines {
                 repository,
@@ -485,12 +462,8 @@ impl StoredTimelines {
         served: &ResolvedRevision,
         revision_read: bool,
         revisions_max: usize,
-        retained: bool,
     ) -> Result<Self, RiftError> {
         let reads = stored.connect()?;
-        if retained {
-            reads.begin_snapshot()?;
-        }
         let start = match (stored.strategy, revision_read) {
             (HistoryStrategy::Selective, false) => reads.chain_head()?,
             _ => Some(served.commit_id()),
@@ -1651,21 +1624,15 @@ mod tests {
             id: timeline_identity(&service, matched)?,
             include: vec![rift_protocol::read::GetSymbolInclude::History],
             revision: None,
-            view: None,
             declaration_limit: 2,
             declaration_cursor: None,
         };
-        let views = crate::read::LocalSymbolViews::new(1 << 20, [7; 32]);
-        let view = views
-            .capture(service.local_symbol_view_input(&request, true)?)?
-            .ok_or("captured history admission")?;
-        request.view = Some(view.id);
         let GetSymbolResult::Found {
             history: Some(history),
             ..
-        } = views.resolve(&request, service.index().root(), service.index().owner())?
+        } = service.exact_symbol(&request, true)?
         else {
-            return Err("captured history missing".into());
+            return Err("the read carries the symbol's history".into());
         };
         assert_eq!(
             edge_rows(&history),
@@ -1673,21 +1640,19 @@ mod tests {
         );
         assert!(history.complete);
         request.id = rift_protocol::read::SymbolId("rift://symbol/local/rust/beacon/absent".into());
-        request.view = None;
         assert!(
-            service.local_symbol_view_input(&request, true).is_ok(),
-            "a symbol no declaration binds captures no timeline"
+            matches!(
+                service.exact_symbol(&request, true)?,
+                GetSymbolResult::Missing { .. }
+            ),
+            "a symbol no declaration binds reads no timeline"
         );
         Ok(())
     }
 
     #[test]
-    fn retained_local_history_survives_trim_and_refuses_uncaptured_symbols() -> TestResult {
-        use std::collections::BTreeSet;
-
-        use rift_protocol::symbol_read::{
-            GetSymbolParams, GetSymbolResult, SymbolUnavailableReason,
-        };
+    fn a_stored_history_answers_commit_and_co_change_edges() -> TestResult {
+        use rift_protocol::symbol_read::{GetSymbolParams, GetSymbolResult};
 
         let (directory, service) = shared_path_fixture()?;
         let folder = tempfile::tempdir()?;
@@ -1696,54 +1661,22 @@ mod tests {
         let (stored, _) = stored(&store, HistoryStrategy::Everything);
         service.attach_history_store(&stored);
         let matched = service.index().symbols("beacon_one", 1)?[0];
-        let mut request = GetSymbolParams {
+        let request = GetSymbolParams {
             id: timeline_identity(&service, matched)?,
             include: vec![rift_protocol::read::GetSymbolInclude::History],
             revision: None,
-            view: None,
             declaration_limit: 1,
             declaration_cursor: None,
         };
-        let views = crate::read::LocalSymbolViews::new(1 << 20, [7; 32]);
-        let view = views
-            .capture(service.local_symbol_view_input(&request, true)?)?
-            .ok_or("captured history admission")?;
-        request.view = Some(view.id);
         let GetSymbolResult::Found {
-            history: Some(original),
+            history: Some(history),
             ..
-        } = views.resolve(&request, service.index().root(), service.index().owner())?
+        } = service.exact_symbol(&request, true)?
         else {
-            return Err("captured history missing".into());
+            return Err("the read carries the stored history".into());
         };
-        assert_eq!(
-            original.edges.len(),
-            3,
-            "two commit edges and one co-change"
-        );
-        assert!(original.complete);
-        store
-            .filler()?
-            .ok_or("filler lock")?
-            .trim(&BTreeSet::new())?;
-        assert!(store.reader().connect()?.held()?.is_empty());
-        let GetSymbolResult::Found {
-            history: Some(retained),
-            ..
-        } = views.resolve(&request, service.index().root(), service.index().owner())?
-        else {
-            return Err("retained history missing".into());
-        };
-        assert_eq!(retained, original);
-        let other = service.index().symbols("beacon_two", 1)?[0];
-        request.id = timeline_identity(&service, other)?;
-        assert!(matches!(
-            views.resolve(&request, service.index().root(), service.index().owner())?,
-            GetSymbolResult::Unavailable {
-                reason: SymbolUnavailableReason::InsufficientCoverage,
-                ..
-            }
-        ));
+        assert_eq!(history.edges.len(), 3, "two commit edges and one co-change");
+        assert!(history.complete);
         Ok(())
     }
 

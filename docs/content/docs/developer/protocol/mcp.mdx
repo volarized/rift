@@ -437,12 +437,8 @@ A package folder inside the workspace, such as `node_modules` or `.venv`, maps a
 The server then asks the global API which declaration holds each such callee's position, in one
 request per walk, and the walk does not continue from a package callee.
 
-Each dependency hit carries its own immutable `view` for subsequent `get_symbol` reads.
-The caller **MUST** use that hit's view rather than the top-level search
-view, which retains the project graph and paging selection. Each hit's view expires no later
-than either the project or cloud selection. The proxy retains the originating project and
-global endpoint for those reads and refuses a changed context instead of selecting another
-publication.
+A dependency hit's `id` names its package or runtime owner, so a subsequent `get_symbol` read
+of it goes to the global API.
 
 The server captures source and configuration before and after the engine request. If either
 changes, the server captures the current publication, refreshes the search ranking, and repeats
@@ -668,7 +664,7 @@ logical owner in the canonical identity, preserving physical declaration locatio
 <ReadExample name="all-search" />
 
 The caller **MUST** use `query` to combine profile and registered project results under `all`.
-The server returns one combined page; each hit retains its captured view for exact reads.
+The server returns one combined page; each hit's `id` routes an exact read to its owner.
 
 Local search runs the indexed declarations and lines, `paths.force_include`, ranked tier,
 and traversal. Global search runs the global query and pattern lanes. Under `order: "path"`,
@@ -748,9 +744,9 @@ bounds retain the definite miss and report incomplete alternative work.
 server refuses any other entry, `source` included, as an invalid request. A declaration's
 source is read by [`nodes`](#tool-nodes) with `symbol`.
 
-`view` retains a preceding immutable selection. Its expiry refuses the read; it never selects
-latest implicitly. `declaration_limit` defaults to 5 and accepts 1 through 10000.
-`declaration_cursor` continues the exact symbol, projections, and serving view. Each binding
+`declaration_limit` defaults to 5 and accepts 1 through 10000. `declaration_cursor` continues
+the declarations of the same symbol at the revision the answer names; the server refuses it for
+another symbol and once that revision is no longer served. Each binding
 retains `origin`, exactly one of `path` and `unit`, `range`, `line`, and
 indices into the symbol's signatures, types, and documentation.
 
@@ -808,8 +804,8 @@ owner differs.
 <ReadExample name="requested-served" />
 
 `revision` selects the [revision](#revision-reads) to read, and the answer carries the revision
-it was read at. It is refused beside `view`, and for a package or runtime identity it names a
-release of that identity's owner. Unknown named local projects, expired views, and incomplete coverage are explicit
+it was read at. For a package or runtime identity it names a release of that identity's owner.
+Unknown named local projects and incomplete coverage are explicit
 selection failures. A malformed identity is refused before lookup:
 
 <ReadExample name="malformed-symbol" />
@@ -899,8 +895,9 @@ at answers under its own path.
 `search` pages by `page_index` under `limit`, at most 10,000. Its `pagination` carries
 the served page and true page count, including an empty page past the last page.
 `get_symbol` bounds declaration bindings with `declaration_limit` and continues with
-`declaration_cursor`. Search and exact reads return an immutable `view` with an expiry;
-later reads can retain that selection. Expiry never selects latest implicitly.
+`declaration_cursor`, bound to the revision the answer names. A search answer can carry an
+immutable `view` with an expiry; later searches can retain that selection. Expiry never selects
+latest implicitly.
 
 Every read result also carries `warnings`. A `stale_index` warning reports an answer computed
 from an index that lags the tree the read captured, and names the two tree revision digests that
