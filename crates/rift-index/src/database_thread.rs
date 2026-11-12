@@ -1056,7 +1056,17 @@ impl DatabaseWorker {
         let result;
         let took = rift_tracing::measure_elapsed!("db.client.operation", {
             result = match self.connections.get_mut(&id) {
-                Some(owned) => owned.connection.exec(&schema, operation).await,
+                Some(owned) => {
+                    if OperationRole::of(&operation) == OperationRole::BeginImmediate {
+                        rift_tracing::debug!(
+                            component = "storage",
+                            operation = "database.transaction.begin",
+                            database = self.name.label(),
+                            "SQLite worker beginning immediate transaction"
+                        );
+                    }
+                    owned.connection.exec(&schema, operation).await
+                }
                 None => Err(worker_error("SQLite connection is closed")),
             };
         })
