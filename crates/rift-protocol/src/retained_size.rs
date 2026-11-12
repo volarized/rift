@@ -208,7 +208,6 @@ heap_fields!(
     origin,
     path,
     unit,
-    source,
     signature_indices,
     type_indices,
     documentation_indices

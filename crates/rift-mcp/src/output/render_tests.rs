@@ -329,14 +329,13 @@ fn graph_hop() -> GraphHop {
     hop("outgoing", "resolution", None)
 }
 
-fn symbol_hit_with_source(source: Option<&str>) -> GetSymbolHit {
+fn symbol_hit() -> GetSymbolHit {
     GetSymbolHit {
         symbol: symbol(Some("rift://symbol/local/rust/app/a/A"), "A"),
         path: Some(project_path("a.rs")),
         unit: None,
         range: range(0, 9),
         line: 1,
-        source: source.map(str::to_owned),
         history: None,
         documentation: None,
     }
@@ -3029,7 +3028,7 @@ fn an_empty_get_symbol_answer_writes_the_header_alone() {
 
 /// The authored `get_symbol` example, which the owner's example matches.
 #[test]
-fn the_owner_get_symbol_example_with_documentation_history_and_source() {
+fn the_owner_get_symbol_example_with_documentation_and_history() {
     golden(
         &example::<GetSymbolResult>(0),
         &[
@@ -3045,57 +3044,26 @@ fn the_owner_get_symbol_example_with_documentation_history_and_source() {
             "\t\t\tReturn ConfigError from load_config",
             "\t\t2026-08-17 · 82590265 · introduced · Alice <alice@example.com>",
             "\t\t\tAdd workspace configuration loading",
-            "",
-            "\t/// Loads the workspace configuration from `rift.toml`.",
-            "\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {",
-            "\t    let text = std::fs::read_to_string(path)?;",
-            "\t    parse_config(&text)",
-            "\t}",
         ],
     );
 }
 
 #[test]
-fn a_hit_without_source_ends_after_its_last_section_and_an_empty_source_adds_an_empty_line() {
+fn a_hit_ends_after_its_last_section() {
     golden(
-        &symbol_result(vec![symbol_hit_with_source(None)], pagination(0, 1)),
+        &symbol_result(vec![symbol_hit()], pagination(0, 1)),
         &[
             "1 result",
             "\tstruct A",
             "\ta.rs:1",
             "\trift://symbol/local/rust/app/a/A",
-        ],
-    );
-    golden(
-        &symbol_result(vec![symbol_hit_with_source(Some(""))], pagination(0, 1)),
-        &[
-            "1 result",
-            "\tstruct A",
-            "\ta.rs:1",
-            "\trift://symbol/local/rust/app/a/A",
-            "",
-            "",
-        ],
-    );
-    golden(
-        &symbol_result(
-            vec![symbol_hit_with_source(Some("struct A;"))],
-            pagination(0, 1),
-        ),
-        &[
-            "1 result",
-            "\tstruct A",
-            "\ta.rs:1",
-            "\trift://symbol/local/rust/app/a/A",
-            "",
-            "\tstruct A;",
         ],
     );
 }
 
 #[test]
 fn page_and_warnings_of_a_get_symbol_answer_follow_the_shared_header() {
-    let mut answer = symbol_result(vec![symbol_hit_with_source(None)], pagination(1, 4));
+    let mut answer = symbol_result(vec![symbol_hit()], pagination(1, 4));
     answer.warnings = vec![ReadWarning::GlobalAccessDisabled];
     golden(
         &answer,
@@ -3112,9 +3080,9 @@ fn page_and_warnings_of_a_get_symbol_answer_follow_the_shared_header() {
 
 #[test]
 fn a_symbol_without_an_identity_shows_its_range_and_a_dependency_hit_its_unit() {
-    let mut anonymous = symbol_hit_with_source(None);
+    let mut anonymous = symbol_hit();
     anonymous.symbol.id = None;
-    let mut dependency = symbol_hit_with_source(None);
+    let mut dependency = symbol_hit();
     dependency.path = None;
     dependency.unit = Some(source_unit(
         "rift://source/cargo/crates.io/serde@1.0.0/lib.rs",
@@ -3136,7 +3104,7 @@ fn a_symbol_without_an_identity_shows_its_range_and_a_dependency_hit_its_unit() 
 
 #[test]
 fn exceptional_facts_of_a_get_symbol_hit_share_one_line_without_score_and_distance() {
-    let mut hit = symbol_hit_with_source(None);
+    let mut hit = symbol_hit();
     hit.symbol.origin = origin(
         Some(SourceLocationKind::Dependency),
         Some(package("serde", "1.0.0")),
@@ -3159,7 +3127,7 @@ fn exceptional_facts_of_a_get_symbol_hit_share_one_line_without_score_and_distan
 
 #[test]
 fn every_documentation_text_follows_in_order_and_blank_texts_are_skipped() {
-    let mut hit = symbol_hit_with_source(None);
+    let mut hit = symbol_hit();
     hit.symbol.documentation = vec![
         documentation_text("First line.\nSecond line."),
         documentation_text(" \n"),
@@ -3218,7 +3186,7 @@ fn the_documentation_context_lists_each_reference_with_its_excerpt() {
         reference(&readme, None),
         reference(&readme, Some("")),
     ]);
-    let mut hit = symbol_hit_with_source(Some("struct A;"));
+    let mut hit = symbol_hit();
     hit.documentation = Some(context(&references, false));
     golden(
         &symbol_result(vec![hit], pagination(0, 1)),
@@ -3235,17 +3203,15 @@ fn the_documentation_context_lists_each_reference_with_its_excerpt() {
             "\t\t\tThen run it.",
             "\t\tREADME.md:3",
             "\t\tREADME.md:3",
-            "",
-            "\tstruct A;",
         ],
     );
 }
 
 #[test]
 fn a_truncated_or_empty_documentation_context_keeps_its_label() {
-    let mut truncated = symbol_hit_with_source(None);
+    let mut truncated = symbol_hit();
     truncated.documentation = Some(context(&json!([]), true));
-    let mut empty = symbol_hit_with_source(None);
+    let mut empty = symbol_hit();
     empty.documentation = Some(context(&json!([]), false));
     golden(
         &symbol_result(vec![truncated, empty], pagination(0, 1)),
@@ -3279,7 +3245,7 @@ fn documentation_context_warnings_follow_the_references_as_documentation_warning
         serde_json::from_value(warning.clone()).expect("documentation warning deserializes"),
         serde_json::from_value(truncated).expect("documentation warning deserializes"),
     ];
-    let mut hit = symbol_hit_with_source(None);
+    let mut hit = symbol_hit();
     hit.documentation = Some(context);
     golden(
         &symbol_result(vec![hit], pagination(0, 1)),
@@ -3314,7 +3280,7 @@ fn an_empty_documentation_context_with_a_warning_writes_the_label_and_the_warnin
             "stage": "source", "kind": "source_unavailable", "count": 2}))
         .expect("documentation warning deserializes"),
     ];
-    let mut hit = symbol_hit_with_source(None);
+    let mut hit = symbol_hit();
     hit.documentation = Some(context);
     golden(
         &symbol_result(vec![hit], pagination(0, 1)),
@@ -3333,7 +3299,7 @@ fn an_empty_documentation_context_with_a_warning_writes_the_label_and_the_warnin
 #[test]
 fn a_get_symbol_value_holding_a_delimiter_is_quoted_and_others_stay_bare() {
     let guide = documentation_hit_at("docs/guide.md", 2, &["Step 1: Install", "a · b"], None);
-    let mut hit = symbol_hit_with_source(None);
+    let mut hit = symbol_hit();
     hit.documentation = Some(context(&json!([reference(&guide, None)]), false));
     let mut moved = version("aaaaaaaa11", "src/a · b.rs", SymbolVersionKind::Moved, None);
     moved.author = CommitAuthor {
@@ -3483,7 +3449,7 @@ fn history(versions: Vec<SymbolVersion>, complete: bool) -> SymbolHistory {
 
 #[test]
 fn history_lists_versions_and_marks_an_incomplete_timeline() {
-    let mut complete = symbol_hit_with_source(None);
+    let mut complete = symbol_hit();
     complete.history = Some(history(
         vec![
             version(
@@ -3496,7 +3462,7 @@ fn history_lists_versions_and_marks_an_incomplete_timeline() {
         ],
         true,
     ));
-    let mut incomplete = symbol_hit_with_source(None);
+    let mut incomplete = symbol_hit();
     incomplete.history = Some(history(Vec::new(), false));
     golden(
         &symbol_result(vec![complete, incomplete], pagination(0, 1)),
@@ -3521,7 +3487,7 @@ fn history_lists_versions_and_marks_an_incomplete_timeline() {
 
 #[test]
 fn a_version_names_its_path_only_when_it_differs_from_the_hit() {
-    let mut hit = symbol_hit_with_source(None);
+    let mut hit = symbol_hit();
     hit.history = Some(history(
         vec![
             version("aaaaaaaa11", "b/a.rs", SymbolVersionKind::Moved, None),
@@ -3529,7 +3495,7 @@ fn a_version_names_its_path_only_when_it_differs_from_the_hit() {
         ],
         true,
     ));
-    let mut dependency = symbol_hit_with_source(None);
+    let mut dependency = symbol_hit();
     dependency.path = None;
     dependency.unit = Some(source_unit(
         "rift://source/cargo/crates.io/serde@1.0.0/lib.rs",
@@ -3560,9 +3526,9 @@ fn a_version_names_its_path_only_when_it_differs_from_the_hit() {
 }
 
 #[test]
-fn sections_come_in_order_documentation_text_context_history_source() {
+fn sections_come_in_order_documentation_text_context_history() {
     let guide = documentation_hit_at("docs/guide.md", 2, &["Guide"], None);
-    let mut hit = symbol_hit_with_source(Some("struct A;\n"));
+    let mut hit = symbol_hit();
     hit.symbol.documentation = vec![documentation_text("Text.")];
     hit.documentation = Some(context(&json!([reference(&guide, None)]), false));
     hit.history = Some(history(
@@ -3591,18 +3557,15 @@ fn sections_come_in_order_documentation_text_context_history_source() {
             "",
             "\thistory:",
             "\t\t2026-08-21 · 1f2080e4 · introduced · Alice <alice@example.com>",
-            "",
-            "\tstruct A;",
-            "",
         ])
     );
 }
 
 #[test]
 fn several_get_symbol_hits_have_markers_and_indent() {
-    let mut first = symbol_hit_with_source(Some("struct A {\n\n    x: u8,\n}"));
+    let mut first = symbol_hit();
     first.symbol.documentation = vec![documentation_text("Doc.")];
-    let mut second = symbol_hit_with_source(Some("struct B;"));
+    let mut second = symbol_hit();
     second.symbol = signed_symbol(Some("rift://symbol/local/rust/app/b/B"), "B", "struct B;");
     second.path = Some(project_path("b.rs"));
     golden(
@@ -3614,24 +3577,16 @@ fn several_get_symbol_hits_have_markers_and_indent() {
             "\t\trift://symbol/local/rust/app/a/A",
             "",
             "\t\tDoc.",
-            "",
-            "\t\tstruct A {",
-            "",
-            "\t\t    x: u8,",
-            "\t\t}",
             "\t[2] struct B;",
             "\t\tb.rs:1",
             "\t\trift://symbol/local/rust/app/b/B",
-            "",
-            "\t\tstruct B;",
         ],
     );
 }
 
 #[test]
-fn control_characters_in_get_symbol_facts_are_escaped_and_source_keeps_its_bytes() {
-    let source = "fn a() {\n\t\"q\"\r\n}\n\n";
-    let mut hit = symbol_hit_with_source(Some(source));
+fn control_characters_in_get_symbol_facts_are_escaped() {
+    let mut hit = symbol_hit();
     hit.symbol = signed_symbol(Some(A_ID), "A", "fn a()\n\u{1b}");
     hit.history = Some(history(
         vec![version(
@@ -3645,12 +3600,6 @@ fn control_characters_in_get_symbol_facts_are_escaped_and_source_keeps_its_bytes
     let output = rendered(&symbol_result(vec![hit], pagination(0, 1)));
     assert!(output.contains("\n\tfn a()\\n\\u{1b}\n"), "{output}");
     assert!(output.contains("\n\t\t\ta\\tb\n"), "{output}");
-    let written = output
-        .split_once("\n\n\tfn a() {")
-        .map(|(_, rest)| format!("\tfn a() {{{rest}"))
-        .and_then(|rest| rest.strip_suffix('\n').map(str::to_owned))
-        .expect("source closes the single hit");
-    assert_eq!(unindented(&written), source);
 }
 
 // Nodes answers.
@@ -4193,7 +4142,7 @@ fn identities_are_written_whole_and_hashes_are_cut() {
         "{search}"
     );
     assert!(search.lines().any(|line| line == entry(unit)), "{search}");
-    let mut symbols = symbol_hit_with_source(None);
+    let mut symbols = symbol_hit();
     symbols.symbol.id = Some(SymbolId(symbol_id.to_owned()));
     let get_symbol = rendered(&symbol_result(vec![symbols], pagination(0, 1)));
     assert!(
@@ -4506,7 +4455,7 @@ fn canonical_symbol_render_keeps_source_less_object_without_physical_bindings() 
 }
 
 #[test]
-fn canonical_symbol_render_keeps_binding_bytes_and_declaration_continuation() {
+fn canonical_symbol_render_keeps_binding_location_and_declaration_continuation() {
     use rift_protocol::symbol_read::{
         CapturedView, CapturedViewId, GetSymbolResult, SymbolDeclaration,
     };
@@ -4519,8 +4468,6 @@ fn canonical_symbol_render_keeps_binding_bytes_and_declaration_continuation() {
             unit: None,
             range: range(0, source.len() as u64),
             line: 1,
-            source: Some(source.to_owned()),
-            source_complete: true,
             signature_indices: Vec::new(),
             type_indices: Vec::new(),
             documentation_indices: Vec::new(),
@@ -4537,7 +4484,7 @@ fn canonical_symbol_render_keeps_binding_bytes_and_declaration_continuation() {
     };
     let text = rendered(&answer);
     assert!(text.contains("a.rs:1"));
-    assert!(text.contains("// original\n\t\tstruct A;\n"));
+    assert!(text.contains(&format!("0..{}", source.len())));
     assert!(text.contains("declaration_cursor opaque-continuation"));
 }
 

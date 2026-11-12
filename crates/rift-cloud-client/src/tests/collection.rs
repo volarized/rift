@@ -212,17 +212,12 @@ async fn test_collection_config_and_environment_deliver_source_past_default_boun
     assert_eq!(config.max_response, 4 << 20);
     assert_eq!(config.max_source, 2 << 20);
     let client = GlobalClient::new(config).expect("environment client");
-    let mut symbols = symbol_request();
-    symbols.include = vec![GetSymbolInclude::Source];
-    let result = client
-        .get_symbol(&symbols)
+    let nodes = client
+        .nodes(&super::nodes::nodes_request())
         .await
-        .expect("configured symbol source");
-    let GetSymbolResult::Found { declarations, .. } = result else {
-        panic!("found symbol")
-    };
+        .expect("configured node source");
     assert_eq!(
-        declarations[0].source.as_ref().map(String::len),
+        nodes.nodes.first().map(|node| node.source.len()),
         Some(source_bytes)
     );
     let mut patterns = pattern::pattern_request();

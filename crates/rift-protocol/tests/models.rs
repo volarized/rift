@@ -114,29 +114,20 @@ fn error_data_deserializes_with_diagnostics_and_causes_absent() -> TestResult {
 #[test]
 fn get_symbol_params_fill_documented_defaults() -> TestResult {
     let params: GetSymbolParams = serde_json::from_value(json!({ "name": "ReadService" }))?;
-    assert_eq!(params.include, vec![GetSymbolInclude::Source]);
+    assert_eq!(params.include, Vec::<GetSymbolInclude>::new());
     assert_eq!(params.limit, 5);
     Ok(())
 }
 
-/// An explicit empty `include` list decodes to no entries, distinct from the omitted
-/// field's `["source"]` default.
-#[test]
-fn get_symbol_params_include_explicit_empty_list_carries_no_entries() -> TestResult {
-    let params: GetSymbolParams =
-        serde_json::from_value(json!({ "name": "ReadService", "include": [] }))?;
-    assert_eq!(params.include, Vec::<GetSymbolInclude>::new());
-    Ok(())
-}
-
-/// `include: ["source", "history"]` decodes to both entries.
+/// `include: ["history", "documentation"]` decodes to both entries.
 #[test]
 fn get_symbol_params_include_explicit_both_carries_both_entries() -> TestResult {
-    let params: GetSymbolParams =
-        serde_json::from_value(json!({ "name": "ReadService", "include": ["source", "history"] }))?;
+    let params: GetSymbolParams = serde_json::from_value(
+        json!({ "name": "ReadService", "include": ["history", "documentation"] }),
+    )?;
     assert_eq!(
         params.include,
-        vec![GetSymbolInclude::Source, GetSymbolInclude::History]
+        vec![GetSymbolInclude::History, GetSymbolInclude::Documentation]
     );
     Ok(())
 }

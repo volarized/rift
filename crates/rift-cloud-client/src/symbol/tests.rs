@@ -48,16 +48,14 @@ fn found(declarations: Vec<Value>) -> GetSymbolResult {
     .expect("result")
 }
 
-fn declaration(source: &str) -> Value {
+fn declaration(end: usize) -> Value {
     json!({
         "origin": {"location": "dependency", "source_kind": "authored", "package": {
             "manager": "cargo", "registry": "crates.io", "name": "tokio", "version": "1.50.0"
         }},
         "unit": "rift://source/cargo/crates.io/tokio@1.50.0/src/lib.rs",
-        "range": {"start": 0, "end": source.len()},
+        "range": {"start": 0, "end": end},
         "line": 1,
-        "source": source,
-        "source_complete": true,
         "signature_indices": [],
         "type_indices": [],
         "documentation_indices": [],
@@ -102,22 +100,18 @@ fn exact_answer_rejects_a_different_release_or_captured_view() {
 }
 
 #[test]
-fn exact_answer_enforces_projection_and_source_bounds() {
+fn exact_answer_enforces_projection_and_declaration_bounds() {
     let mut request = request();
-    let mut invalid_binding = declaration("pub struct Beacon;");
+    let mut invalid_binding = declaration(18);
     invalid_binding["signature_indices"] = json!([0]);
     assert!(!valid_result(&request, &found(vec![invalid_binding]), 100));
-    let result = found(vec![declaration("pub struct Beacon;")]);
+    let result = found(vec![declaration(18)]);
     assert!(valid_result(&request, &result, 100));
-    assert!(!valid_result(&request, &result, 5));
-    request.include.clear();
-    assert!(!valid_result(&request, &result, 100));
-    request.include.push(GetSymbolInclude::Source);
+    let mut foreign = declaration(18);
+    foreign["unit"] = json!("rift://source/cargo/crates.io/tokio@1.49.0/src/lib.rs");
+    assert!(!valid_result(&request, &found(vec![foreign]), 100));
     request.declaration_limit = 1;
-    let result = found(vec![
-        declaration("pub struct Beacon;"),
-        declaration("struct Beacon;"),
-    ]);
+    let result = found(vec![declaration(18), declaration(14)]);
     assert!(!valid_result(&request, &result, 100));
 }
 
@@ -250,8 +244,7 @@ fn exact_response_keeps_service_problem_separate_from_unavailable() {
 
 fn documented_result() -> Value {
     let content = json!({"source": {"kind": "package", "unit": "rift://source/cargo/crates.io/tokio@1.50.0/README.md"}});
-    let mut result =
-        serde_json::to_value(found(vec![declaration("pub struct Beacon;")])).expect("found");
+    let mut result = serde_json::to_value(found(vec![declaration(18)])).expect("found");
     result["documentation"] = json!({
         "documentation_revision": "0123abcd", "truncated": false,
         "references": [{

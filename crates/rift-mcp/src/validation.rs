@@ -12630,7 +12630,7 @@ pub(crate) mod tests {
                 let params = serde_json::from_value(serde_json::json!({
                     "name": name,
                     "scope": "local",
-                    "include": ["source", "documentation"],
+                    "include": ["documentation"],
                     "limit": 64,
                     "page_index": page_index,
                 }))?;

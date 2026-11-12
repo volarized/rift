@@ -1764,8 +1764,7 @@ async fn read_dependency_hit(
         tool_request(
             "get_symbol",
             &json!({
-                "id":hit["hit"]["symbol"]["id"], "view":selected["id"],
-                "include":["source"]
+                "id":hit["hit"]["symbol"]["id"], "view":selected["id"]
             }),
         ),
     )
@@ -1773,10 +1772,9 @@ async fn read_dependency_hit(
     assert_eq!(symbol["outcome"], "found", "{symbol}");
     assert_eq!(symbol["view"], *selected, "{symbol}");
     assert_eq!(symbol["declarations"][0]["unit"], hit["unit"], "{symbol}");
+    assert_eq!(symbol["declarations"][0]["range"]["start"], 0, "{symbol}");
     assert!(
-        symbol["declarations"][0]["source"]
-            .as_str()
-            .is_some_and(|source| source.starts_with("def greet(")),
+        symbol["declarations"][0].get("source").is_none(),
         "{symbol}"
     );
     Ok(())
@@ -1873,16 +1871,15 @@ async fn search_traversal_outgoing_names_a_standard_library_callee_by_its_global
         .requests()
         .await
         .into_iter()
-        .filter(|request| request.uri.ends_with("/symbols"))
+        .filter(|request| request.uri.ends_with("/nodes"))
         .filter_map(|request| request.body)
-        .filter(|body| body["id"] == json!(runtime_id))
+        .filter(|body| body["symbol"] == json!(runtime_id))
         .collect();
     assert_eq!(
         stub_requests.len(),
         1,
-        "one stub declaration read: {stub_requests:?}"
+        "one stub nodes read: {stub_requests:?}"
     );
-    assert_eq!(stub_requests[0]["include"], json!(["source"]));
     assert!(stub_requests[0]["view"].is_string());
 
     client.cancel().await?;

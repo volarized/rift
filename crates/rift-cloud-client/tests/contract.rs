@@ -223,11 +223,6 @@ fn bound_and_shared_schema_changes_fail_validation() -> TestResult {
     )?;
 
     let mut document = contract()?;
-    document["components"]["schemas"]["SymbolDeclaration"]["properties"]["source"]["maxLength"] =
-        json!(67_108_863);
-    assert_invalid(&document, "SymbolDeclaration/properties/source/maxLength")?;
-
-    let mut document = contract()?;
     document["components"]["parameters"]["Cursor"]["schema"]["maxLength"] = json!(4095);
     assert_invalid(&document, "Cursor/schema/maxLength")?;
 
@@ -544,7 +539,6 @@ fn collection_schema_ceilings_do_not_revert_to_runtime_defaults() -> TestResult 
     }
     for component in [
         "PackageSearchHit",
-        "SymbolDeclaration",
         "PackagePatternDeclaration",
         "PackagePatternHit",
     ] {

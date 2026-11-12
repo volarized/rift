@@ -120,9 +120,7 @@ async fn symbol_read(
         .view
         .as_ref()
         .ok_or_else(|| format!("symbol view absent: {hit:?}"))?;
-    let arguments = json!({
-        "id":id, "view":view.id, "include":["source"],
-    });
+    let arguments = json!({"id":id, "view":view.id});
     let answer = proxied_call(client, "get_symbol", &arguments).await?;
     let result: GetSymbolResult = serde_json::from_value(answer.clone())
         .map_err(|error| format!("invalid symbol result: {error}; {answer}"))?;
@@ -138,12 +136,16 @@ async fn symbol_read(
     assert_eq!(symbol.id.as_ref(), Some(id), "{answer}");
     assert_eq!(&selected, view, "{answer}");
     assert_eq!(declarations.len(), 1, "{answer}");
-    assert_eq!(declarations[0].source, hit.source, "{answer}");
     assert_eq!(
         declarations[0].path.as_ref().map(|path| path.0.as_str()),
         Some("lib.rs"),
         "{answer}"
     );
+    let nodes = proxied_call(client, "nodes", &json!({"symbol":id, "view":view.id})).await?;
+    let item = &nodes["nodes"][0];
+    assert_eq!(nodes["symbol"].as_str(), Some(id.as_str()), "{nodes}");
+    assert_eq!(item["index"].as_u64(), Some(0), "{nodes}");
+    assert_eq!(item["source"].as_str(), hit.source.as_deref(), "{nodes}");
     Ok(answer)
 }
 
@@ -342,12 +344,7 @@ async fn require_profile_pattern(
     assert!(patterned.view.is_none());
     assert!(patterned.results[0].view.is_none());
     let id = symbol_id(&patterned.results[0])?;
-    let found = proxied_call(
-        client,
-        "get_symbol",
-        &json!({"id":id, "include":["source"]}),
-    )
-    .await?;
+    let found = proxied_call(client, "get_symbol", &json!({"id":id})).await?;
     let found: GetSymbolResult = serde_json::from_value(found)?;
     let GetSymbolResult::Found {
         symbol,
@@ -359,7 +356,15 @@ async fn require_profile_pattern(
     };
     assert_eq!(symbol.id.as_ref(), Some(id));
     assert_eq!(declarations.len(), 1);
-    assert_eq!(declarations[0].source, patterned.results[0].source);
+    let nodes = proxied_call(client, "nodes", &json!({"symbol":id})).await?;
+    let item = &nodes["nodes"][0];
+    assert_eq!(nodes["symbol"].as_str(), Some(id.as_str()), "{nodes}");
+    assert_eq!(item["index"].as_u64(), Some(0), "{nodes}");
+    assert_eq!(
+        item["source"].as_str(),
+        patterned.results[0].source.as_deref(),
+        "{nodes}"
+    );
     Ok(())
 }
 

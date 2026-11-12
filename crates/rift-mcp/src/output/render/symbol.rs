@@ -25,7 +25,6 @@ pub(super) fn hit(lines: &mut Lines<'_>, hit: &GetSymbolHit) -> Result<(), TextE
         unit,
         range,
         line,
-        source,
         history,
         documentation,
     } = hit;
@@ -46,13 +45,7 @@ pub(super) fn hit(lines: &mut Lines<'_>, hit: &GetSymbolHit) -> Result<(), TextE
     if let Some(history) = history {
         history_section(lines, history, path.as_ref())?;
     }
-    match source {
-        Some(source) => {
-            lines.blank()?;
-            lines.verbatim(0, source)
-        }
-        None => Ok(()),
-    }
+    Ok(())
 }
 
 /// Writes one documentation text after a blank line. Whitespace-only text writes nothing.
@@ -280,12 +273,6 @@ fn declarations_section(
             1,
             &format!("{}..{}", declaration.range.start, declaration.range.end),
         )?;
-        if let Some(source) = &declaration.source {
-            if !declaration.source_complete {
-                lines.line(1, "source (incomplete):")?;
-            }
-            lines.verbatim(1, source)?;
-        }
     }
     Ok(())
 }

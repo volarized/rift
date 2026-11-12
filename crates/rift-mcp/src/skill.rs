@@ -119,7 +119,8 @@ const DECISION_TABLE: &[DecisionRow] = &[
         ),
     },
     DecisionRow {
-        situation: "A symbol's source, or the syntax nodes of its declarations, is needed.",
+        situation: "A declaration's source, or the syntax nodes of a symbol's declarations, is \
+                    needed.",
         tools: &["nodes"],
         note: Some(
             "with `symbol`, a project, package, or runtime one; send `node_cursor` back for the \

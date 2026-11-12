@@ -189,6 +189,36 @@ async fn symbol_history_without_a_repository_names_the_remedy() -> TestResult {
     Ok(())
 }
 
+/// `get_symbol` serves no declaration source: `include: ["source"]` names no projection,
+/// so the served schema refuses it like any unknown value, naming the accepted ones.
+#[tokio::test]
+async fn symbol_source_include_is_refused_as_an_unknown_value() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+    fs::write(
+        directory.path().join("rift.toml"),
+        hermetic_search::HERMETIC_TABLES,
+    )?;
+    let failure =
+        failing_observed_symbol_error(directory.path(), json!({ "include": ["source"] })).await?;
+    assert_eq!(failure.code, ErrorCode::InvalidRequest);
+    assert_eq!(failure.retry, RetryDirective::Never);
+    let message = &failure.message;
+    assert!(
+        message.contains("accepted documentation, history") && message.contains("include"),
+        "the refusal must name the accepted values and the field: {message}"
+    );
+    assert!(
+        failure
+            .text
+            .lines()
+            .any(|line| line.trim() == "rift.mcp.parameter_invalid"),
+        "the refusal must retain its registered identity: {}",
+        failure.text
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn symbol_history_with_history_disabled_is_refused() -> TestResult {
     let directory = tempfile::tempdir()?;

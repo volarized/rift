@@ -1162,8 +1162,8 @@ mod tests {
             assert_eq!(answer["outcome"], "found");
             assert_eq!(answer["declarations"][0]["path"], "lib.rs");
             assert_eq!(
-                answer["declarations"][0]["source"],
-                format!("pub fn {name}() {{}}")
+                answer["declarations"][0]["range"]["end"],
+                format!("pub fn {name}() {{}}").len()
             );
         }
         let expired_roots = u32::try_from(roots.len() - 1)?;

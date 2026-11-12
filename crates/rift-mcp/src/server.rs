@@ -2307,7 +2307,9 @@ impl RiftMcp {
     /// Reads one logical symbol by its canonical `id`. The caller may select a preceding
     /// immutable `view`; continuations retain that selection and its original expiry.
     /// A complete exact miss returns `symbol_not_found` and up to three alternatives.
-    /// An unavailable selection returns its typed cause. Use `search` for discovery.
+    /// An unavailable selection returns its typed cause. A found symbol carries its facts and
+    /// each declaration's location; `nodes` with `symbol` reads a declaration's source. Use
+    /// `search` for discovery.
     #[tool]
     async fn get_symbol(
         &self,
@@ -7187,7 +7189,10 @@ done
             .ok_or("declaration array")?;
         assert_eq!(declarations.len(), 1);
         assert_eq!(declarations[0]["path"], "lib.rs");
-        assert_eq!(declarations[0]["source"], "pub fn beacon() {}");
+        assert_eq!(
+            declarations[0]["range"],
+            json!({"start": 0, "end": "pub fn beacon() {}".len()})
+        );
         assert!(structured.get("declaration_cursor").is_none());
         assert!(structured["view"]["id"].as_str().is_some());
 
@@ -8307,12 +8312,12 @@ done
         }
     }
 
-    /// One complete `get_symbol` for `beacon` with its source and history.
+    /// One complete `get_symbol` for `beacon` with its history.
     async fn beacon_history(server: &RiftMcp) -> TestResult<rift_protocol::read::SymbolHistory> {
         let published = current_publication(server).await;
         let id = captured_traversal_seed(&published.reads, "beacon")?;
         let params = serde_json::from_value(json!({
-            "id": id, "include": ["source", "history"]
+            "id": id, "include": ["history"]
         }))?;
         let answer = tokio::time::timeout(
             UNWAITED_READ_MAX,
@@ -8353,7 +8358,10 @@ done
             declaration.path.as_ref().map(|path| path.0.as_str()),
             Some("lib.rs")
         );
-        assert_eq!(declaration.source.as_deref(), Some("pub fn beacon() {}"));
+        assert_eq!(
+            (declaration.range.start, declaration.range.end),
+            (0, "pub fn beacon() {}".len() as u64)
+        );
         Ok(history.ok_or("the symbol carries its history")?)
     }
 
@@ -10733,7 +10741,18 @@ done
             declarations[0].path.as_ref().map(|path| path.0.as_str()),
             Some("src/blob.rs")
         );
-        assert!(declarations[0].source_complete);
+        let nodes = server
+            .nodes(Parameters(rift_protocol::read::NodesParams::of(id.clone())))
+            .await?
+            .0;
+        assert_eq!(nodes.symbol.as_ref(), Some(&id), "{nodes:?}");
+        assert!(
+            nodes
+                .nodes
+                .first()
+                .is_some_and(|node| node.index == 0 && node.source.contains("BLOB")),
+            "{nodes:?}"
+        );
         assert!(search_symbols(&server, "HUGE").await?.results.is_empty());
         Ok(())
     }

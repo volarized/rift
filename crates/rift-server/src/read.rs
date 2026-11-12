@@ -1333,7 +1333,6 @@ impl ReadService {
         }
         let absent = public_candidates.is_empty() && object_warnings.is_empty();
         let (window, pagination) = page(public_candidates, params.page_index, limit);
-        let include_source = params.include.contains(&GetSymbolInclude::Source);
         let include_history = params.include.contains(&GetSymbolInclude::History);
         let include_documentation = params.include.contains(&GetSymbolInclude::Documentation);
         let mut documentation_bytes_left =
@@ -1347,7 +1346,7 @@ impl ReadService {
         let mut disagreements = Vec::new();
         for (matched, assembled) in window {
             let (mut hit, disagreement) =
-                Self::project_hit(matched, assembled, include_source, timelines.as_mut())?;
+                Self::project_hit(matched, assembled, timelines.as_mut())?;
             disagreements.extend(disagreement);
             if include_documentation && let Some(symbol) = &hit.symbol.id {
                 hit.documentation = Some(rift_index::documentation_context_with_budget(
@@ -1434,7 +1433,6 @@ impl ReadService {
     fn project_hit(
         matched: SymbolMatch<'_>,
         assembled: (Symbol, Option<ReadWarning>),
-        include_source: bool,
         timelines: Option<&mut SymbolTimelines>,
     ) -> Result<(GetSymbolHit, Option<ReadWarning>), RiftError> {
         let (symbol, disagreement) = assembled;
@@ -1453,7 +1451,6 @@ impl ReadService {
             unit,
             range: text_range(matched.symbol.range),
             line: line::line_number_at(matched.file.source(), matched.symbol.range.start),
-            source: include_source.then(|| excerpt(matched.file, matched.symbol.range)),
             history,
             documentation: None,
         };
@@ -2097,7 +2094,7 @@ pub(crate) mod tests {
     };
     use rift_protocol::configuration::{LanguageConfiguration, WorkspaceConfiguration};
     use rift_protocol::read::{
-        GetSymbolInclude, GetSymbolParams, Language, NodeFacet, NodesParams, NodesResult,
+        GetSymbolInclude, GetSymbolParams, Language, Node, NodeFacet, NodesParams, NodesResult,
         PAGE_LIMIT_MAX, Pagination, ProjectPath, ReadWarning, RevisionId, SOURCE_WARNINGS_MAX,
         SearchScope, SymbolId,
     };
@@ -2484,6 +2481,34 @@ pub(crate) mod tests {
                 .any(|(key, value)| key == "maximum" && value == "1")
         );
         Ok(())
+    }
+
+    /// The bytes a `get_symbol` hit's `range` spans in the file its `path` names below `root`.
+    fn declared_text(root: &Path, hit: &serde_json::Value) -> TestResult<String> {
+        let path = hit["path"].as_str().ok_or("hit path")?;
+        let start = usize::try_from(hit["range"]["start"].as_u64().ok_or("range start")?)?;
+        let end = usize::try_from(hit["range"]["end"].as_u64().ok_or("range end")?)?;
+        let source = fs::read_to_string(root.join(path))?;
+        Ok(source
+            .get(start..end)
+            .ok_or("range inside the file")?
+            .to_owned())
+    }
+
+    /// The item node `service` lists for the symbol a `get_symbol` hit names.
+    fn item_node(service: &ReadService, hit: &serde_json::Value) -> TestResult<Node> {
+        let id = SymbolId(
+            hit["symbol"]["id"]
+                .as_str()
+                .ok_or("hit identity")?
+                .to_owned(),
+        );
+        service
+            .nodes(&NodesParams::of(id))?
+            .nodes
+            .into_iter()
+            .find(|node| node.index == 0)
+            .ok_or_else(|| "the symbol's item node".into())
     }
 
     fn fixture() -> TestResult<(TempDir, ReadService)> {
@@ -3149,35 +3174,19 @@ pub fn compute() -> i32 {
     }
 
     #[test]
-    fn get_symbol_span_is_set_whether_or_not_the_body_was_requested() -> TestResult {
-        let (_directory, service) = fixture()?;
-        let with_body: GetSymbolParams =
-            serde_json::from_value(json!({ "name": "signal", "include": ["source"] }))?;
-        let without_body: GetSymbolParams =
-            serde_json::from_value(json!({ "name": "signal", "include": [] }))?;
-        let with_body_value = serde_json::to_value(service.get_symbol(&with_body)?)?;
-        let without_body_value = serde_json::to_value(service.get_symbol(&without_body)?)?;
+    fn get_symbol_hit_names_the_declaration_range_and_carries_no_source() -> TestResult {
+        let (directory, service) = fixture()?;
+        let params: GetSymbolParams = serde_json::from_value(json!({ "name": "signal" }))?;
+        let value = serde_json::to_value(service.get_symbol(&params)?)?;
+        let hit = &value["hits"][0];
         assert!(
-            without_body_value["hits"][0].get("source").is_none(),
-            "include: [] must carry no source excerpt"
+            hit.get("source").is_none() && hit.get("node").is_none(),
+            "a hit carries no source and no node identity: {hit:#}"
         );
-        assert_eq!(
-            with_body_value["hits"][0]["path"], without_body_value["hits"][0]["path"],
-            "the path must not depend on include"
-        );
-        assert_eq!(
-            with_body_value["hits"][0]["range"], without_body_value["hits"][0]["range"],
-            "the range must not depend on include"
-        );
-        assert_eq!(without_body_value["hits"][0]["path"], json!("src/lib.rs"));
+        assert_eq!(hit["path"], json!("src/lib.rs"));
         assert!(
-            without_body_value["hits"][0]["range"]["start"]
-                .as_u64()
-                .is_some_and(|start| start
-                    < without_body_value["hits"][0]["range"]["end"]
-                        .as_u64()
-                        .unwrap_or_default()),
-            "the range must name a real byte range: {without_body_value:#}"
+            declared_text(directory.path(), hit)?.contains("fn signal"),
+            "the range must name the declaration's bytes: {value:#}"
         );
         Ok(())
     }
@@ -3233,7 +3242,7 @@ pub fn compute() -> i32 {
 
     #[test]
     fn symbol_read_returns_normalized_identity_and_omits_the_common_origin() -> TestResult {
-        let (_directory, service) = fixture()?;
+        let (directory, service) = fixture()?;
         let params: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon"}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         let symbol = &value["hits"][0]["symbol"];
@@ -3254,7 +3263,10 @@ pub fn compute() -> i32 {
             symbol.get("origin").is_none(),
             "a project-authored symbol with no package must omit origin entirely: {symbol}"
         );
-        assert_eq!(value["hits"][0]["source"], "pub struct Beacon;");
+        assert_eq!(
+            declared_text(directory.path(), &value["hits"][0])?,
+            "pub struct Beacon;"
+        );
         assert!(
             value.get("warnings").is_none(),
             "a single-provider fixture with no disagreement raises no warning: {value}"
@@ -3302,8 +3314,7 @@ pub fn compute() -> i32 {
     #[test]
     fn symbol_and_node_wire_shape_is_unchanged() -> TestResult {
         let (_directory, service) = fixture()?;
-        let params: GetSymbolParams =
-            serde_json::from_value(json!({"name": "signal", "include": ["source"]}))?;
+        let params: GetSymbolParams = serde_json::from_value(json!({"name": "signal"}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
 
         let symbol = &value["hits"][0]["symbol"];
@@ -3316,9 +3327,11 @@ pub fn compute() -> i32 {
             json!(local_identity("rust", &["beacon", "Beacon"]))
         );
 
-        assert!(
-            value["hits"][0].get("node").is_none(),
-            "a declaration carries no node identity"
+        let item = item_node(&service, &value["hits"][0])?;
+        assert_eq!(
+            (item.declaration, item.index),
+            (Some(0), 0),
+            "the declaration's item node is node 0 of its declaration"
         );
 
         let top_level: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon"}))?;
@@ -3517,10 +3530,9 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
-    /// `include: ["source", "history"]` carries both: the hit's node identity, source
-    /// excerpt, and timeline all ride the same answer.
+    /// `include: ["history"]` carries the timeline and nothing of the declaration's source.
     #[test]
-    fn get_symbol_include_both_carries_source_and_history_together() -> TestResult {
+    fn get_symbol_include_history_carries_history_without_source() -> TestResult {
         let directory = timeline_fixture()?;
         let service = ReadService::build(
             directory.path(),
@@ -3530,44 +3542,34 @@ pub fn compute() -> i32 {
             HistoryConfiguration::default(),
         )?;
         let params: GetSymbolParams =
-            serde_json::from_value(json!({"name": "beacon", "include": ["source", "history"]}))?;
+            serde_json::from_value(json!({"name": "beacon", "include": ["history"]}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         let hit = &value["hits"][0];
-        assert!(
-            !hit["source"].is_null(),
-            "include: [\"source\"] must carry source: {hit:#}"
-        );
         assert!(
             !hit["history"].is_null(),
             "include: [\"history\"] must carry history: {hit:#}"
         );
+        assert!(
+            hit.get("source").is_none() && hit.get("node").is_none(),
+            "a hit carries no source and no node identity: {hit:#}"
+        );
         Ok(())
     }
 
-    /// An omitted `include` serves exactly what `["source"]` serves; `[]` serves neither.
+    /// An omitted `include` serves exactly what `[]` serves: neither history nor source.
     #[test]
-    fn get_symbol_include_omitted_matches_source_and_empty_serves_neither() -> TestResult {
+    fn get_symbol_include_omitted_matches_empty() -> TestResult {
         let (_directory, service) = fixture()?;
         let omitted: GetSymbolParams = serde_json::from_value(json!({"name": "beacon"}))?;
-        let explicit: GetSymbolParams =
-            serde_json::from_value(json!({"name": "beacon", "include": ["source"]}))?;
         let empty: GetSymbolParams =
             serde_json::from_value(json!({"name": "beacon", "include": []}))?;
         let omitted = serde_json::to_value(service.get_symbol(&omitted)?)?;
-        let explicit = serde_json::to_value(service.get_symbol(&explicit)?)?;
         let empty = serde_json::to_value(service.get_symbol(&empty)?)?;
-        assert_eq!(
-            omitted, explicit,
-            "an omitted include answers as include: [\"source\"]"
-        );
+        assert_eq!(omitted, empty, "an omitted include answers as include: []");
         let hit = &empty["hits"][0];
         assert!(
-            hit.get("source").is_none() && hit.get("node").is_none(),
-            "an explicit empty include serves neither source nor node: {hit:#}"
-        );
-        assert!(
-            !omitted["hits"][0]["source"].is_null(),
-            "the omitted form serves source: {omitted:#}"
+            hit.get("source").is_none() && hit.get("history").is_none(),
+            "an empty include serves neither source nor history: {hit:#}"
         );
         Ok(())
     }
@@ -3879,17 +3881,18 @@ pub fn compute() -> i32 {
              pub fn finish() {{}}\n"
         );
         let (_directory, service) = project_fixture(&source)?;
-        let request = serde_json::from_value(json!({"name": retained, "include": ["source"]}))?;
+        let request = serde_json::from_value(json!({"name": retained}))?;
         let result = service.get_symbol(&request)?;
         assert_eq!(result.hits.len(), 1);
         let hit = &result.hits[0];
         assert_eq!(hit.symbol.name, retained);
         assert!(hit.symbol.id.is_none());
         assert_eq!(hit.path, Some(ProjectPath("src/lib.rs".to_owned())));
+        let declared = usize::try_from(hit.range.start)?..usize::try_from(hit.range.end)?;
         assert!(
-            hit.source
-                .as_ref()
-                .is_some_and(|source| source.contains(&retained))
+            source
+                .get(declared)
+                .is_some_and(|declared| declared.contains(&retained))
         );
         assert!(!hit.symbol.signatures.is_empty());
         assert!(!hit.symbol.documentation.is_empty());
@@ -4364,6 +4367,24 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
+    /// A declaration's item node spans the declaration without the attached documentation
+    /// and attributes the declaration's own range covers.
+    #[test]
+    fn a_documented_declaration_names_its_item_node() -> TestResult {
+        let (directory, service) = documented_fixture()?;
+        let params: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon"}))?;
+        let value = serde_json::to_value(service.get_symbol(&params)?)?;
+        let hit = &value["hits"][0];
+        let item = item_node(&service, hit)?;
+        assert_eq!((item.declaration, item.index), (Some(0), 0));
+        assert_eq!(item.source, "pub struct Beacon;");
+        assert_eq!(
+            declared_text(directory.path(), hit)?,
+            DOCUMENTED_SOURCE.trim_end()
+        );
+        Ok(())
+    }
+
     #[test]
     fn nodes_backlink_documented_item_to_its_symbol() -> TestResult {
         let (_directory, service) = documented_fixture()?;
@@ -4479,7 +4500,7 @@ pub fn compute() -> i32 {
 
     #[test]
     fn get_symbol_finds_a_typescript_interface_beside_other_languages() -> TestResult {
-        let (_directory, service) = multi_language_fixture()?;
+        let (directory, service) = multi_language_fixture()?;
         let params: GetSymbolParams = serde_json::from_value(json!({"name": "Route"}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         let symbol = &value["hits"][0]["symbol"];
@@ -4491,8 +4512,9 @@ pub fn compute() -> i32 {
             json!(local_identity("typescript", &["beacon", "Route"]))
         );
         assert_eq!(
-            value["hits"][0]["source"], "export interface Route {\n  path: string;\n}",
-            "the source starts at the `export` statement carrying the declaration"
+            declared_text(directory.path(), &value["hits"][0])?,
+            "export interface Route {\n  path: string;\n}",
+            "the range starts at the `export` statement carrying the declaration"
         );
         Ok(())
     }
@@ -4637,11 +4659,11 @@ pub fn compute() -> i32 {
     }
 
     /// A markdown heading answers `get_symbol` like any declaration: the
-    /// provider's kind word, empty facets, physical path and node,
-    /// and the whole section as the source excerpt.
+    /// provider's kind word, empty facets, physical path, and a range over
+    /// the whole section.
     #[test]
     fn get_symbol_finds_a_markdown_heading_beside_other_languages() -> TestResult {
-        let (_directory, service) = multi_language_fixture()?;
+        let (directory, service) = multi_language_fixture()?;
         let params: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon Guide"}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         let symbol = &value["hits"][0]["symbol"];
@@ -4656,9 +4678,8 @@ pub fn compute() -> i32 {
             "structural facts have no established identity"
         );
         assert_eq!(value["hits"][0]["path"], json!("src/guide.md"));
-        assert!(value["hits"][0]["range"]["end"].as_u64().is_some());
         assert_eq!(
-            value["hits"][0]["source"],
+            declared_text(directory.path(), &value["hits"][0])?,
             "# Beacon Guide\n\nHow the beacon works.\n"
         );
         Ok(())
@@ -4710,7 +4731,7 @@ pub fn compute() -> i32 {
         let history = HistoryConfiguration::default();
         let service =
             ReadService::build(directory.path(), limits, &visibility, &inclusion, history)?;
-        let request = json!({"name": "Install", "include": ["history", "source"]});
+        let request = json!({"name": "Install", "include": ["history"]});
         let params: GetSymbolParams = serde_json::from_value(request)?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         let hit = &value["hits"][0];
@@ -4720,7 +4741,6 @@ pub fn compute() -> i32 {
             "unresolved structural facts have no symbol timeline"
         );
         assert_eq!(hit["path"], json!("docs.md"));
-        assert!(hit["source"].as_str().is_some());
         structural_changes(directory.path(), "docs.md", "Install")?;
         let repository = rift_history::Repository::open(directory.path())?;
         let start = repository.resolve("HEAD")?;
@@ -4735,11 +4755,11 @@ pub fn compute() -> i32 {
     }
 
     /// A JSON member answers `get_symbol` like any declaration: the
-    /// provider's kind word, empty facets, physical path and node, and the
-    /// whole pair as the source excerpt.
+    /// provider's kind word, empty facets, physical path, and a range over
+    /// the whole pair.
     #[test]
     fn get_symbol_finds_a_json_member_beside_other_languages() -> TestResult {
-        let (_directory, service) = multi_language_fixture()?;
+        let (directory, service) = multi_language_fixture()?;
         let params: GetSymbolParams = serde_json::from_value(json!({"name": "beacon settings"}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         let symbol = &value["hits"][0]["symbol"];
@@ -4754,9 +4774,8 @@ pub fn compute() -> i32 {
             "structural facts have no established identity"
         );
         assert_eq!(value["hits"][0]["path"], json!("settings.json"));
-        assert!(value["hits"][0]["range"]["end"].as_u64().is_some());
         assert_eq!(
-            value["hits"][0]["source"],
+            declared_text(directory.path(), &value["hits"][0])?,
             "\"beacon settings\": {\"port\": 8080}"
         );
 
@@ -4788,11 +4807,11 @@ pub fn compute() -> i32 {
     }
 
     /// A YAML mapping entry answers `get_symbol` like any declaration: the
-    /// composed wire kind, empty facets, physical path and node, and the
-    /// whole pair as the source excerpt.
+    /// composed wire kind, empty facets, physical path, and a range over the
+    /// whole pair.
     #[test]
     fn get_symbol_finds_a_yaml_entry_beside_other_languages() -> TestResult {
-        let (_directory, service) = multi_language_fixture()?;
+        let (directory, service) = multi_language_fixture()?;
         let params: GetSymbolParams = serde_json::from_value(json!({"name": "beacon pipeline"}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         let symbol = &value["hits"][0]["symbol"];
@@ -4807,10 +4826,10 @@ pub fn compute() -> i32 {
             "structural facts have no established identity"
         );
         assert_eq!(value["hits"][0]["path"], json!("pipeline.yaml"));
-        assert!(value["hits"][0]["range"]["end"].as_u64().is_some());
         assert_eq!(
-            value["hits"][0]["source"], "beacon pipeline:\n  retries: 3\n",
-            "the excerpt serves whole lines, so the pair's last line ends it"
+            declared_text(directory.path(), &value["hits"][0])?,
+            "beacon pipeline:\n  retries: 3\n",
+            "the range covers whole lines, so the pair's last line ends it"
         );
         Ok(())
     }
@@ -4887,7 +4906,7 @@ pub fn compute() -> i32 {
         let history = HistoryConfiguration::default();
         let service =
             ReadService::build(directory.path(), limits, &visibility, &inclusion, history)?;
-        let request = json!({"name": "server", "include": ["history", "source"]});
+        let request = json!({"name": "server", "include": ["history"]});
         let params: GetSymbolParams = serde_json::from_value(request)?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         let hit = &value["hits"][0];
@@ -4897,7 +4916,6 @@ pub fn compute() -> i32 {
             "unresolved structural facts have no symbol timeline"
         );
         assert_eq!(hit["path"], json!("settings.json"));
-        assert!(hit["source"].as_str().is_some());
         structural_changes(directory.path(), "settings.json", "server")?;
         let repository = rift_history::Repository::open(directory.path())?;
         let start = repository.resolve("HEAD")?;
@@ -4928,7 +4946,7 @@ pub fn compute() -> i32 {
         let history = HistoryConfiguration::default();
         let service =
             ReadService::build(directory.path(), limits, &visibility, &inclusion, history)?;
-        let request = json!({"name": "retries", "include": ["history", "source"]});
+        let request = json!({"name": "retries", "include": ["history"]});
         let params: GetSymbolParams = serde_json::from_value(request)?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         let hit = &value["hits"][0];
@@ -4938,7 +4956,6 @@ pub fn compute() -> i32 {
             "unresolved structural facts have no symbol timeline"
         );
         assert_eq!(hit["path"], json!("deploy.yml"));
-        assert!(hit["source"].as_str().is_some());
         structural_changes(directory.path(), "deploy.yml", "retries")?;
         let repository = rift_history::Repository::open(directory.path())?;
         let start = repository.resolve("HEAD")?;
@@ -5055,7 +5072,8 @@ pub fn compute() -> i32 {
         let params: GetSymbolParams = serde_json::from_value(json!({"name": "beacon"}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         assert_eq!(
-            value["hits"][0]["source"], "pub fn beacon() {}",
+            item_node(&service, &value["hits"][0])?.source,
+            "pub fn beacon() {}",
             "the committed body answers, not the drifted working tree"
         );
         assert!(
@@ -5088,7 +5106,8 @@ pub fn compute() -> i32 {
             );
             let value = serde_json::to_value(service.get_symbol(&params)?)?;
             assert_eq!(
-                value["hits"][0]["source"], "pub fn beacon() {}",
+                item_node(&service, &value["hits"][0])?.source,
+                "pub fn beacon() {}",
                 "{spelling}"
             );
         }
