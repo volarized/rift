@@ -1679,7 +1679,7 @@
       "post": {
         "operationId": "findDeclarations",
         "summary": "Find declarations holding source positions.",
-        "description": "Finds declarations holding source positions in one immutable selection. Answers each position once, retaining request order and one shared captured view. A position in a type stub may name a declaration with a proved runtime or package owner. Complete captured coverage with no declaration returns missing; unavailable coverage returns unavailable. The server MUST NOT answer from another version, and MUST NOT move a position past its line or the text, or one inside a character, to a neighboring one.",
+        "description": "Finds declarations holding source positions at the releases the positions name. Answers each position once, retaining request order. A position in a type stub may name a declaration with a proved runtime or package owner. Complete facts of a position's release with no declaration there return missing; unavailable coverage returns unavailable. The server MUST NOT answer from another version, and MUST NOT move a position past its line or the text, or one inside a character, to a neighboring one.",
         "security": [
           {},
           {
@@ -1687,7 +1687,7 @@
           }
         ],
         "requestBody": {
-          "description": "Source positions to answer in one captured selection.",
+          "description": "Source positions to answer, each at the release it names.",
           "required": true,
           "content": {
             "application/json": {
@@ -1721,7 +1721,7 @@
         },
         "responses": {
           "200": {
-            "description": "Ordered outcomes for every submitted position in one captured view.",
+            "description": "Ordered outcomes for every submitted position.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1742,11 +1742,7 @@
                           },
                           "id": "rift://symbol/cargo/crates.io/beacon/rust/beacon/serve",
                           "kind": "function",
-                          "revision": "rift://revision/cargo/crates.io/beacon@1.0.0",
-                          "view": {
-                            "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                            "expires_at": "2026-10-10T10:05:00Z"
-                          }
+                          "revision": "rift://revision/cargo/crates.io/beacon@1.0.0"
                         },
                         {
                           "outcome": "missing",
@@ -1755,10 +1751,6 @@
                             "revision": "rift://revision/cargo/crates.io/beacon@1.0.0",
                             "line": 0,
                             "character": 2
-                          },
-                          "view": {
-                            "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                            "expires_at": "2026-10-10T10:05:00Z"
                           }
                         }
                       ]
@@ -4937,10 +4929,6 @@
                 "$ref": "#/components/schemas/Revision",
                 "description": "The release of the declaration's owner that `id` answers in. It differs from\nthe position's release when a proved stub mapping names a runtime declaration."
               },
-              "view": {
-                "$ref": "#/components/schemas/CapturedView",
-                "description": "Immutable selection supplying this declaration."
-              },
               "outcome": {
                 "type": "string",
                 "const": "found"
@@ -4951,8 +4939,7 @@
               "position",
               "id",
               "kind",
-              "revision",
-              "view"
+              "revision"
             ],
             "description": "An established declaration holds this exact position."
           },
@@ -4964,10 +4951,6 @@
                 "$ref": "#/components/schemas/SourcePosition",
                 "description": "Submitted position, unchanged."
               },
-              "view": {
-                "$ref": "#/components/schemas/CapturedView",
-                "description": "Complete immutable selection searched."
-              },
               "outcome": {
                 "type": "string",
                 "const": "missing"
@@ -4975,10 +4958,9 @@
             },
             "required": [
               "outcome",
-              "position",
-              "view"
+              "position"
             ],
-            "description": "Complete captured coverage contains no declaration at this position."
+            "description": "The complete facts of the position's release hold no declaration at this position."
           },
           {
             "type": "object",
@@ -4987,10 +4969,6 @@
               "position": {
                 "$ref": "#/components/schemas/SourcePosition",
                 "description": "Submitted position, unchanged."
-              },
-              "view": {
-                "description": "Selected view, when one could be captured.",
-                "$ref": "#/components/schemas/CapturedView"
               },
               "reason": {
                 "$ref": "#/components/schemas/SymbolUnavailableReason",
@@ -5033,17 +5011,13 @@
             "minItems": 1,
             "maxItems": 1000,
             "uniqueItems": true
-          },
-          "view": {
-            "description": "A preceding immutable selection shared by the whole batch.",
-            "$ref": "#/components/schemas/CapturedViewId"
           }
         },
         "required": [
           "position_encoding",
           "positions"
         ],
-        "description": "Finds declarations holding positions in one immutable selection."
+        "description": "Finds the declarations holding source positions at the releases the positions name."
       },
       "FindDeclarationsResult": {
         "type": "object",
@@ -5068,7 +5042,7 @@
         "required": [
           "results"
         ],
-        "description": "One answer per submitted position, retaining one shared captured selection."
+        "description": "One answer per submitted position, in request order."
       },
       "GetSymbolInclude": {
         "description": "One optional `get_symbol` hit field the caller may opt into through `include`.",

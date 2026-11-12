@@ -15,18 +15,10 @@ fn revision(value: &str) -> Revision {
     Revision::parse(value).expect("release fixture")
 }
 
-fn view(value: &str) -> CapturedView {
-    CapturedView {
-        id: CapturedViewId::parse(value).expect("captured view fixture"),
-        expires_at: "2026-10-10T03:00:00Z".to_owned(),
-    }
-}
-
 fn request() -> FindDeclarationsParams {
     FindDeclarationsParams {
         position_encoding: PositionEncoding::Utf8,
         positions: vec![position(PACKAGE, PACKAGE_RELEASE)],
-        view: None,
     }
 }
 
@@ -44,7 +36,6 @@ fn position_selectors_accept_released_units_and_refuse_legacy_owners() {
     let mut request = request();
     assert!(request.is_valid());
     request.positions = vec![position(RUNTIME, RUNTIME_RELEASE)];
-    request.view = Some(view("payload.signature").id);
     assert!(request.is_valid());
     for (unit, release) in [
         (PROJECT, PACKAGE_RELEASE),
@@ -83,7 +74,6 @@ fn position_bounds_match_schema_and_batch_order() {
     let mut request = FindDeclarationsParams {
         position_encoding: PositionEncoding::Utf16,
         positions: vec![position(PACKAGE, PACKAGE_RELEASE)],
-        view: None,
     };
     request.positions[0].line = SOURCE_POSITION_MAX;
     request.positions[0].character = SOURCE_POSITION_MAX;
@@ -113,7 +103,7 @@ fn position_bounds_match_schema_and_batch_order() {
 }
 
 #[test]
-fn position_results_share_view_without_conflating_physical_and_logical_owner() {
+fn position_results_keep_order_without_conflating_physical_and_logical_owner() {
     let request = FindDeclarationsParams {
         position_encoding: PositionEncoding::Utf8,
         positions: vec![
@@ -123,7 +113,6 @@ fn position_results_share_view_without_conflating_physical_and_logical_owner() {
             ),
             position(PACKAGE, PACKAGE_RELEASE),
         ],
-        view: None,
     };
     let mut result = FindDeclarationsResult {
         results: vec![
@@ -133,11 +122,9 @@ fn position_results_share_view_without_conflating_physical_and_logical_owner() {
                     .expect("runtime symbol"),
                 kind: ExactKind("class".to_owned()),
                 revision: revision(RUNTIME_RELEASE),
-                view: view("payload.signature"),
             },
             DeclarationPositionResult::Missing {
                 position: request.positions[1].clone(),
-                view: view("payload.signature"),
             },
         ],
         warnings: Vec::new(),
@@ -171,11 +158,10 @@ fn position_results_share_view_without_conflating_physical_and_logical_owner() {
     result.results.swap(0, 1);
     assert!(!result.is_valid_for(&request));
     result.results.swap(0, 1);
-    let DeclarationPositionResult::Missing { view: selected, .. } = &mut result.results[1] else {
-        panic!("missing fixture")
-    };
-    *selected = view("foreign.signature");
-    assert!(!result.is_valid_for(&request));
-    let legacy = json!({"outcome":"found","position":{"unit":PACKAGE,"revision":PACKAGE_RELEASE,"line":0,"character":0},"id":"rift://symbol/rust/src/lib.rs/beacon","kind":"function","view":view("payload.signature")});
+    let legacy = json!({"outcome":"found","position":{"unit":PACKAGE,"revision":PACKAGE_RELEASE,"line":0,"character":0},"id":"rift://symbol/rust/src/lib.rs/beacon","kind":"function","revision":PACKAGE_RELEASE});
     assert!(serde_json::from_value::<DeclarationPositionResult>(legacy).is_err());
+    let viewed = json!({"outcome":"missing","position":{"unit":PACKAGE,"revision":PACKAGE_RELEASE,"line":0,"character":0},"view":{"id":"payload.signature","expires_at":"2026-10-10T03:00:00Z"}});
+    assert!(serde_json::from_value::<DeclarationPositionResult>(viewed).is_err());
+    let request_view = json!({"position_encoding":"utf-8","positions":[{"unit":PACKAGE,"revision":PACKAGE_RELEASE,"line":0,"character":0}],"view":"payload.signature"});
+    assert!(serde_json::from_value::<FindDeclarationsParams>(request_view).is_err());
 }

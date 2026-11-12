@@ -25,7 +25,6 @@ pub(super) fn declaration_request() -> FindDeclarationsParams {
     FindDeclarationsParams {
         position_encoding: PositionEncoding::Utf16,
         positions: vec![position(3), position(0)],
-        view: None,
     }
 }
 
@@ -33,15 +32,11 @@ fn position_json(line: u64) -> Value {
     serde_json::to_value(position(line)).expect("position JSON")
 }
 
-fn view_json() -> Value {
-    json!({"id":"a".repeat(64),"expires_at":"2026-10-10T10:05:00Z"})
-}
-
-/// One declaration and one definite absence in the same captured selection.
+/// One declaration and one definite absence, in request order.
 pub(super) fn declaration_response_json() -> Value {
     json!({"results":[
-        {"outcome":"found","position":position_json(3),"id":DECLARATION,"kind":"function","revision":RELEASE,"view":view_json()},
-        {"outcome":"missing","position":position_json(0),"view":view_json()}
+        {"outcome":"found","position":position_json(3),"id":DECLARATION,"kind":"function","revision":RELEASE},
+        {"outcome":"missing","position":position_json(0)}
     ]})
 }
 
@@ -57,11 +52,11 @@ async fn test_fixture_declarations_answer_each_position_once() {
         .await
         .unwrap_or_else(|error| panic!("declarations: {error:?}"));
     assert!(matches!(&answer.results[..], [
-        DeclarationPositionResult::Found { position, id, kind, revision, view },
-        DeclarationPositionResult::Missing { position: missing, view: missing_view }
+        DeclarationPositionResult::Found { position, id, kind, revision },
+        DeclarationPositionResult::Missing { position: missing }
     ] if position.line == 3 && id.as_str() == DECLARATION && kind.0 == "function"
         && revision.to_string() == RELEASE
-        && missing.line == 0 && view == missing_view));
+        && missing.line == 0));
     assert_eq!(
         server.state.last_path.lock().await.as_deref(),
         Some("/rift/rest/v1/declarations")
@@ -220,7 +215,7 @@ async fn test_declaration_requests_stay_within_the_advertised_package_bound() {
 fn test_declaration_responses_account_for_every_position() {
     let request = declaration_request();
     assert!(decoded(declaration_response_json()).is_valid_for(&request));
-    for change in ["missing", "duplicate", "extra", "reordered", "foreign_view"] {
+    for change in ["missing", "duplicate", "extra", "reordered"] {
         let mut value = declaration_response_json();
         match change {
             "missing" => {
@@ -228,12 +223,12 @@ fn test_declaration_responses_account_for_every_position() {
             }
             "duplicate" => value["results"][1]["position"] = position_json(3),
             "extra" => {
-                value["results"].as_array_mut().expect("results").push(
-                    json!({"outcome":"missing","position":position_json(7),"view":view_json()}),
-                );
+                value["results"]
+                    .as_array_mut()
+                    .expect("results")
+                    .push(json!({"outcome":"missing","position":position_json(7)}));
             }
             "reordered" => value["results"].as_array_mut().expect("results").swap(0, 1),
-            "foreign_view" => value["results"][1]["view"]["id"] = json!("b".repeat(64)),
             _ => unreachable!(),
         }
         assert!(!decoded(value).is_valid_for(&request), "{change}");
