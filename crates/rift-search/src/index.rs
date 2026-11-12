@@ -861,10 +861,27 @@ impl SearchIndex {
         phase: QueryPhase,
         limit: u32,
     ) -> Result<RevisionScoped<StoreRanking>, RiftError> {
+        self.rank_with_path(tree_revision, query, phase, limit, None)
+            .await
+    }
+
+    /// Ranks the lexical store within an exact project path when supplied.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::rank`].
+    pub async fn rank_with_path(
+        &self,
+        tree_revision: &str,
+        query: &ParsedQuery,
+        phase: QueryPhase,
+        limit: u32,
+        path: Option<&ProjectPath>,
+    ) -> Result<RevisionScoped<StoreRanking>, RiftError> {
         let scan = self.vector_scan(tree_revision);
         let lexical = match self
             .lexical
-            .search(tree_revision, query, phase, limit)
+            .search_with_path(tree_revision, query, phase, limit, path)
             .await?
         {
             RevisionScoped::Matched(ranking) => ranking,

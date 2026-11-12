@@ -1652,6 +1652,31 @@ fn lexical_truncated(matches_max: u32) -> ReadWarning {
     }
 }
 
+/// Proves the path matcher can select at most one physical path for lexical ranking.
+fn exact_lexical_path(params: &SearchParams) -> Option<rift_core::ProjectPath> {
+    let paths = params.paths.as_ref()?;
+    let [include] = paths.include.as_slice() else {
+        return None;
+    };
+    let path = include.0.as_str();
+    if params.scope != SearchScope::Local
+        || !paths.force_include.is_empty()
+        || path.is_empty()
+        || !path
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_' | b'.' | b'-'))
+    {
+        return None;
+    }
+    // A slash anchors the whole path in the glob matcher. A basename can also
+    // be used when the exclusion removes all nested paths.
+    if !path.contains('/') && !matches!(paths.exclude.as_slice(), [exclude] if exclude.0 == "*/**")
+    {
+        return None;
+    }
+    rift_core::ProjectPath::new(path).ok()
+}
+
 /// The warnings one search index's readiness adds to an answer, for a workspace of `files`
 /// files.
 ///
@@ -3001,13 +3026,14 @@ impl RiftMcp {
             return Ok(Some(SearchRanking::default()));
         };
         let tree_revision = published.reads.tree_revision();
+        let path = exact_lexical_path(params);
         let stored = rift_tracing::traced!(
             component = "search",
             operation = "search.store",
             async move {
                 rift_tracing::debug!("search store read started");
                 self.store_answer(tree_revision, || {
-                    self.read_store(index, tree_revision, &parsed)
+                    self.read_store(index, tree_revision, &parsed, path.as_ref())
                 })
                 .await
             }
@@ -3109,9 +3135,10 @@ impl RiftMcp {
         index: &SearchIndex,
         tree_revision: &str,
         query: &ParsedQuery,
+        path: Option<&rift_core::ProjectPath>,
     ) -> Result<RevisionScoped<PhasedRanking>, StoreReadFailure> {
         let precise = self
-            .run_phase(index, tree_revision, query, QueryPhase::Precise)
+            .run_phase(index, tree_revision, query, QueryPhase::Precise, path)
             .await?;
         let RevisionScoped::Matched(precise) = precise else {
             return Ok(match precise {
@@ -3125,12 +3152,19 @@ impl RiftMcp {
         let filled = precise.inputs().iter().any(|input| {
             input.order().len() >= usize::try_from(self.fetch_limit()).unwrap_or(usize::MAX)
         });
+        let mut lexical_truncated_at = precise.lexical_truncated_at();
         let broad = if query.has_broad_phase() && !filled {
             match self
-                .run_phase(index, tree_revision, query, QueryPhase::Broad)
+                .run_phase(index, tree_revision, query, QueryPhase::Broad, path)
                 .await?
             {
-                RevisionScoped::Matched(broad) => broad.into_inputs(),
+                RevisionScoped::Matched(broad) => {
+                    if path.is_some() {
+                        lexical_truncated_at =
+                            lexical_truncated_at.or(broad.lexical_truncated_at());
+                    }
+                    broad.into_inputs()
+                }
                 _ => Vec::new(),
             }
         } else {
@@ -3138,7 +3172,7 @@ impl RiftMcp {
         };
         let file_rows = self.file_rows(index, tree_revision, query).await?;
         Ok(RevisionScoped::Matched(PhasedRanking {
-            lexical_truncated_at: precise.lexical_truncated_at(),
+            lexical_truncated_at,
             readiness: precise.readiness(),
             precise: precise.into_inputs(),
             broad,
@@ -3181,6 +3215,7 @@ impl RiftMcp {
         tree_revision: &str,
         query: &ParsedQuery,
         phase: QueryPhase,
+        path: Option<&rift_core::ProjectPath>,
     ) -> Result<RevisionScoped<StoreRanking>, StoreReadFailure> {
         rift_tracing::debug!(
             component = "search",
@@ -3192,7 +3227,7 @@ impl RiftMcp {
             "ranking the full-text store for one query phase"
         );
         index
-            .rank(tree_revision, query, phase, self.fetch_limit())
+            .rank_with_path(tree_revision, query, phase, self.fetch_limit(), path)
             .await
             .map_err(StoreReadFailure::from)
     }
@@ -9920,7 +9955,7 @@ done
 
         let (searched, commit) = server
             .store_answer(revision, || async {
-                let searched = server.read_store(index, revision, &query).await?;
+                let searched = server.read_store(index, revision, &query, None).await?;
                 assert!(matches!(searched, RevisionScoped::NoRevision));
                 let landed = lane.landed();
                 double.release_one();
@@ -11878,6 +11913,80 @@ done
             "a ranking under the bound is not cut: {:?}",
             whole.warnings
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn literal_search_paths_bound_lexical_matches_before_graph_evaluation() -> TestResult {
+        use rift_protocol::query::{QueryLanguage, QueryParams};
+
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        fs::create_dir(root.join("src"))?;
+        for (path, source) in [
+            ("src/focus.rs", "pub fn beacon_focus() {}\n"),
+            ("witness.rs", "pub fn beacon_root() {}\n"),
+            ("src/witness.rs", "pub fn beacon_nested() {}\n"),
+            (
+                "src/crowded.rs",
+                "pub fn beacon_one() {}\npub fn beacon_two() {}\npub fn beacon_three() {}\n",
+            ),
+        ] {
+            fs::write(root.join(path), source)?;
+        }
+        super::hermetic_workspace(root, "[search.lexical]\nmax_matches = 2\n")?;
+        let server = RiftMcp::build_settled(root, WorkspaceIndexLimits::default()).await?;
+        search_after_population(&server, "beacon").await?;
+
+        let query = |terms: &str, selector: &str| {
+            server.search_query(Parameters(QueryParams {
+                language: QueryLanguage::Sparql,
+                query: format!(
+                    "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> \
+                     SELECT ?path {{ SERVICE :search {{ ?hit :query '{terms}'; :target 'symbol'; {selector} :path ?path }} }}"
+                ),
+            }))
+        };
+        for (selector, path) in [
+            (
+                r#":paths '{"include":["src/focus.rs"]}'^^rdf:JSON;"#,
+                "src/focus.rs",
+            ),
+            (
+                r#":paths '{"include":["witness.rs"],"exclude":["*/**"]}'^^rdf:JSON;"#,
+                "witness.rs",
+            ),
+        ] {
+            let answer = serde_json::to_value(query("beacon", selector).await?.0)?;
+            let rows = answer["answer"]["bindings"]
+                .as_array()
+                .ok_or_else(|| format!("complete bindings expected: {answer}"))?;
+            assert_eq!(rows.len(), 1, "{answer}");
+            assert_eq!(rows[0]["path"]["value"], path, "{answer}");
+        }
+        let crowded = r#":paths '{"include":["src/crowded.rs"]}'^^rdf:JSON;"#;
+        for (terms, selector) in [
+            ("beacon", ""),
+            (
+                "beacon",
+                r#":paths '{"include":["witness.rs"]}'^^rdf:JSON;"#,
+            ),
+            ("beacon", crowded),
+            ("beacon lantern", crowded),
+        ] {
+            let answer = serde_json::to_value(query(terms, selector).await?.0)?;
+            assert_eq!(answer["outcome"], "unavailable", "{answer}");
+            assert_eq!(answer["reason"], "insufficient_coverage", "{answer}");
+            assert!(
+                answer["warnings"]
+                    .as_array()
+                    .is_some_and(|warnings| warnings.contains(&json!({
+                        "code": "lexical_ranking_truncated",
+                        "matches_max": 2
+                    }))),
+                "{answer}"
+            );
+        }
         Ok(())
     }
 
