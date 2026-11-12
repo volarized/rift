@@ -676,8 +676,8 @@ fn is_language_word(word: &str) -> bool {
 /// One node of a file's concrete syntax tree, addressed by its place inside a symbol. A node
 /// inside a declaration's item subtree is node `index` of declaration `declaration` of
 /// `symbol`; a node outside every declaration is node `index` of its `unit`. Indexes count in
-/// pre-order from 0 at the declaration's item node, or at the unit's root node, and skip the
-/// subtrees of nested declarations, whose nodes belong to the nested symbol. The address
+/// pre-order from 0 at the declaration's item node, or from 0 at the unit's file node, and
+/// skip the subtrees of nested declarations, whose nodes belong to the nested symbol. The address
 /// names a place at the read's revision: an edit renumbers the nodes after it.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -693,7 +693,7 @@ pub struct Node {
     #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
     pub declaration: Option<u64>,
     /// Pre-order position of this node inside its declaration's item subtree, or inside its
-    /// unit when `declaration` is absent. The item node and the unit's root node are 0.
+    /// unit when `declaration` is absent. The item node and the unit's file node are 0.
     #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
     pub index: u64,
     /// The file the node is written in.
@@ -769,6 +769,25 @@ pub enum NodeFacet {
     Test,
 }
 
+/// The kind of the node that spans one whole source unit. Every source unit has one, the
+/// outermost node of its tree, whether or not a syntax provider parses the unit.
+pub const FILE_NODE_KIND: &str = "file";
+
+/// The language of a source unit no syntax provider parses. Its only node is its file node.
+pub const TEXT_LANGUAGE_NAME: &str = "text";
+
+impl Language {
+    /// The language of a source unit no syntax provider parses: [`TEXT_LANGUAGE_NAME`], with
+    /// no dialect.
+    #[must_use]
+    pub fn text() -> Self {
+        Self {
+            name: TEXT_LANGUAGE_NAME.to_owned(),
+            dialect: None,
+        }
+    }
+}
+
 /// One named part of a node, and the bytes it spans.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -820,14 +839,15 @@ pub struct NodesParams {
     {
         "nodes": [
             {
-                "index": 0,
+                "index": 1,
                 "unit": "rift://file/src/config.rs",
                 "language": "rust",
                 "kind": "source_file",
                 "range": {
                     "start": 0,
                     "end": 356
-                }
+                },
+                "parent": 0
             },
             {
                 "symbol": "rift://symbol/local/rust/app/config/load_config",

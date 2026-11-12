@@ -2660,8 +2660,8 @@ pub fn compute() -> i32 {
         );
         assert_eq!(value["nodes"][0]["language"], "rust");
         assert_eq!(
-            value["nodes"][0]["index"], 0,
-            "the outermost node is the unit's root"
+            value["nodes"][0]["index"], 1,
+            "the outermost listed node is the unit's root, after its file node"
         );
         assert!(
             value.get("warnings").is_none(),
@@ -4365,8 +4365,8 @@ pub fn compute() -> i32 {
         let root = nodes.first().ok_or("a root covers the position")?;
         assert_eq!(
             (&root.symbol, root.declaration, root.index, root.parent),
-            (&None, None, 0, None),
-            "the file's root is node 0 of the unit"
+            (&None, None, 1, Some(0)),
+            "the file's root follows the unit's file node"
         );
         let lamp = rift_protocol::read::SymbolId(local_identity("rust", &["beacon", "lamp"]));
         let light =

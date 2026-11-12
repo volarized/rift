@@ -45,8 +45,8 @@ use rift_ranking::{
     identifier_terms,
 };
 use rift_syntax::{
-    NodePlace, SyntaxDocument, SyntaxLimits, SyntaxNode, SyntaxProvider, SyntaxSource,
-    SyntaxSymbol, registry,
+    ByteRange, NodeMatch, NodePlace, SyntaxDocument, SyntaxLimits, SyntaxNode, SyntaxProvider,
+    SyntaxSource, SyntaxSymbol, registry,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -58,6 +58,7 @@ use crate::documentation::NotebookFiles;
 use crate::language::{ClassifiedPath, WorkspaceLanguagePolicy};
 use crate::relationship::RelationshipStore;
 use crate::semantic::{BuiltSemantics, WorkspaceSemantics};
+use crate::{LocatedNode, NodeAddress};
 use rift_analysis::{DocumentationSelection, ForceIncludeReach, PathMatcher, PathVerdict};
 
 #[derive(Debug)]
@@ -4397,6 +4398,48 @@ impl WorkspaceIndex {
         Ok(Some(syntax))
     }
 
+    /// Resolves the node at one location: the innermost node spanning `range` exactly, or
+    /// under [`NodeMatch::Enclosing`] the innermost one containing it, addressed by its place
+    /// inside its symbol or unit.
+    ///
+    /// A held file without a syntax provider answers its file node, which spans the whole
+    /// file, alone. `None` when the index holds no file at `path` or no node matches.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RiftError`] when the held file no longer parses under this index's provider
+    /// and bounds, or the canonical declaration directory cannot be built.
+    pub fn node_at(
+        &self,
+        path: &ProjectPath,
+        range: ByteRange,
+        matching: NodeMatch,
+    ) -> Result<Option<LocatedNode>, RiftError> {
+        if let Some(document) = self.syntax(path)? {
+            let source = self.file(path).map_or("", IndexedFile::source);
+            let declarations = (0..document.symbols().len())
+                .map(|position| self.declaration_address(path, position))
+                .collect::<Result<Vec<_>, _>>()?;
+            let places = document
+                .node_places(|position, _| declarations.get(position).is_some_and(Option::is_some));
+            let located = document.node_at(range, matching).and_then(|node| {
+                let position = document
+                    .nodes()
+                    .iter()
+                    .position(|candidate| std::ptr::eq(candidate, node))?;
+                Some(LocatedNode {
+                    address: node_address(places[position], &declarations),
+                    kind: node.kind,
+                    range: node.range,
+                })
+            });
+            return Ok(located.or_else(|| LocatedNode::file(source, range, matching)));
+        }
+        Ok(self
+            .text_file(path)
+            .and_then(|file| LocatedNode::file(file.content(), range, matching)))
+    }
+
     /// Walks the workspace on demand for `.rs` files matching `force_include`'s globs that are
     /// not already indexed, ignoring `[source]` policy and `.gitignore` - only the hard floor
     /// (`.git`, `.rift`, `target`, symlinks) stays unreachable. Each match is parsed with the
@@ -6766,6 +6809,24 @@ pub fn relative_path(path: &Path) -> Result<ProjectPath, RiftError> {
 /// package hit's class under the same rule this index orders by.
 fn symbol_rank(symbol: &SyntaxSymbol, matcher: &IdentifierMatcher<'_>) -> Option<IdentifierMatch> {
     matcher.matches(&symbol.name, &symbol.qualified_name)
+}
+
+/// The address `place` names, given the address of each declaration of its file.
+fn node_address(place: NodePlace, declarations: &[Option<(SymbolId, usize)>]) -> NodeAddress {
+    let held = match place.holder {
+        rift_syntax::NodeHolder::Declaration(position) => {
+            declarations.get(position).and_then(Option::as_ref)
+        }
+        rift_syntax::NodeHolder::Unit => None,
+    };
+    match held {
+        Some((symbol, declaration)) => NodeAddress::Declaration {
+            symbol: symbol.clone(),
+            declaration: *declaration,
+            index: place.index,
+        },
+        None => NodeAddress::Unit { index: place.index },
+    }
 }
 
 /// One declaration's ranking identity: the same `SymbolId` a read answers with, so a

@@ -7176,8 +7176,8 @@ done
         );
         assert_eq!(
             listed[0]["index"],
-            json!(0),
-            "the outermost node is the unit's root"
+            json!(1),
+            "the outermost listed node is the unit's root, after its file node"
         );
         let item = listed
             .iter()

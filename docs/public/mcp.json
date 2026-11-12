@@ -3966,7 +3966,7 @@
           },
           "Node": {
             "additionalProperties": false,
-            "description": "One node of a file's concrete syntax tree, addressed by its place inside a symbol. A node\ninside a declaration's item subtree is node `index` of declaration `declaration` of\n`symbol`; a node outside every declaration is node `index` of its `unit`. Indexes count in\npre-order from 0 at the declaration's item node, or at the unit's root node, and skip the\nsubtrees of nested declarations, whose nodes belong to the nested symbol. The address\nnames a place at the read's revision: an edit renumbers the nodes after it.",
+            "description": "One node of a file's concrete syntax tree, addressed by its place inside a symbol. A node\ninside a declaration's item subtree is node `index` of declaration `declaration` of\n`symbol`; a node outside every declaration is node `index` of its `unit`. Indexes count in\npre-order from 0 at the declaration's item node, or from 0 at the unit's file node, and\nskip the subtrees of nested declarations, whose nodes belong to the nested symbol. The address\nnames a place at the read's revision: an edit renumbers the nodes after it.",
             "properties": {
               "declaration": {
                 "description": "Ordinal of the declaration holding this node among the declarations of `symbol`, from\n0 in the order a symbol read lists them. Present exactly when `symbol` is.",
@@ -3989,7 +3989,7 @@
                 "type": "array"
               },
               "index": {
-                "description": "Pre-order position of this node inside its declaration's item subtree, or inside its\nunit when `declaration` is absent. The item node and the unit's root node are 0.",
+                "description": "Pre-order position of this node inside its declaration's item subtree, or inside its\nunit when `declaration` is absent. The item node and the unit's file node are 0.",
                 "format": "uint64",
                 "maximum": 9007199254740991,
                 "minimum": 0,
@@ -5721,9 +5721,10 @@
           {
             "nodes": [
               {
-                "index": 0,
+                "index": 1,
                 "kind": "source_file",
                 "language": "rust",
+                "parent": 0,
                 "range": {
                   "end": 356,
                   "start": 0

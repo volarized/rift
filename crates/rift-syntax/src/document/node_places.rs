@@ -6,6 +6,8 @@ use super::{SyntaxDocument, SyntaxSymbol};
 
 /// What holds one syntax node: a declaration, named by its position in
 /// [`SyntaxDocument::symbols`], or the unit when no declaration's item subtree holds the node.
+/// The unit's file node, which spans the whole unit outside the node table, is node 0 of the
+/// unit.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum NodeHolder {
     /// The declaration at this position of the document's symbols.
@@ -20,10 +22,12 @@ pub enum NodeHolder {
 pub struct NodePlace {
     /// The declaration or unit that holds the node.
     pub holder: NodeHolder,
-    /// Pre-order position inside the holder: 0 for a declaration's item node and for the
-    /// unit's root, counting no node of a nested declaration's item subtree.
+    /// Pre-order position inside the holder: 0 for a declaration's item node, 1 for the
+    /// unit's root after its file node at 0, counting no node of a nested declaration's item
+    /// subtree.
     pub index: usize,
-    /// `index` of the node's parent inside the same holder. `None` for index 0.
+    /// `index` of the node's parent inside the same holder: the file node for the unit's
+    /// root, `None` for a declaration's item node.
     pub parent: Option<usize>,
 }
 
@@ -34,9 +38,9 @@ impl SyntaxDocument {
     /// spans its `item_range` and, when the provider names one, has its `node_kind`. A node
     /// belongs to the nearest declaration whose item node encloses it, so a nested
     /// declaration's subtree counts toward the nested declaration alone; a node no item node
-    /// encloses belongs to the unit. `holds` selects the declarations that hold nodes at all,
-    /// so a declaration without an established identity leaves its nodes to the enclosing
-    /// holder. Two declarations naming one item node give it to the first.
+    /// encloses belongs to the unit, whose nodes count from 1 after the file node. `holds`
+    /// selects the declarations that hold nodes at all, so a declaration without an
+    /// established identity leaves its nodes to the enclosing holder. Two declarations naming one item node give it to the first.
     #[must_use]
     pub fn node_places(&self, holds: impl Fn(usize, &SyntaxSymbol) -> bool) -> Vec<NodePlace> {
         let nodes = self.nodes();
@@ -76,12 +80,16 @@ impl SyntaxDocument {
                 || enclosing.map_or(NodeHolder::Unit, |parent| parent.holder),
                 |declaration| NodeHolder::Declaration(*declaration),
             );
-            let count = counts.entry(holder).or_default();
+            let count = counts
+                .entry(holder)
+                .or_insert(usize::from(holder == NodeHolder::Unit));
             let index = *count;
             *count += 1;
-            let parent = enclosing
-                .filter(|parent| index != 0 && parent.holder == holder)
-                .map(|parent| parent.index);
+            let parent = match enclosing {
+                Some(parent) if parent.holder == holder && index != 0 => Some(parent.index),
+                None if holder == NodeHolder::Unit => Some(0),
+                _ => None,
+            };
             places.push(NodePlace {
                 holder,
                 index,
@@ -124,7 +132,7 @@ mod tests {
 
     /// Each declaration numbers its own item subtree from its item node at 0, a nested
     /// declaration's subtree counts toward the nested declaration alone, and the unit numbers
-    /// what no declaration holds from its root at 0.
+    /// what no declaration holds from its root at 1, after its file node at 0.
     #[test]
     fn every_node_is_numbered_inside_the_declaration_or_unit_that_holds_it() {
         let document = document(NESTED);
@@ -135,7 +143,7 @@ mod tests {
             holder_of(&document, "light"),
             holder_of(&document, "dim"),
         );
-        for holder in [NodeHolder::Unit, lamp, light, dim] {
+        for (holder, first) in [(NodeHolder::Unit, 1), (lamp, 0), (light, 0), (dim, 0)] {
             let indexes: Vec<usize> = places
                 .iter()
                 .filter(|place| place.holder == holder)
@@ -143,8 +151,8 @@ mod tests {
                 .collect();
             assert_eq!(
                 indexes,
-                (0..indexes.len()).collect::<Vec<_>>(),
-                "{holder:?} counts its own nodes in pre-order from 0"
+                (first..first + indexes.len()).collect::<Vec<_>>(),
+                "{holder:?} counts its own nodes in pre-order from {first}"
             );
         }
         let node_of = |kind: &str, text: &str| {
@@ -159,9 +167,10 @@ mod tests {
             places[0],
             NodePlace {
                 holder: NodeHolder::Unit,
-                index: 0,
-                parent: None
-            }
+                index: 1,
+                parent: Some(0)
+            },
+            "the root follows the file node"
         );
         let light_item = places[node_of("function_item", "pub fn light")];
         assert_eq!((light_item.holder, light_item.index), (light, 0));

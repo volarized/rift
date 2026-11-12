@@ -816,7 +816,8 @@ file's source. A declaration's source is read through the `source` member of its
 A node carries no identity. The server **MUST** address each node by its place: a node inside a
 declaration's item subtree carries `symbol`, the `declaration` ordinal among that symbol's
 declarations, and its pre-order `index` from the item node at 0; a node outside every declaration
-carries its `index` in the `unit` alone, from the file's root at 0. Nodes of a nested declaration
+carries its `index` in the `unit` alone, from the unit's file node at 0, so the file's root is
+1. Nodes of a nested declaration
 count toward the nested symbol. `parent` names the `index` of the enclosing node in the same
 declaration or unit, and is absent for node 0. An address names a place at the read's revision,
 so an edit renumbers the nodes after it.
