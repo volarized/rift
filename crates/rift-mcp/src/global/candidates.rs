@@ -192,6 +192,7 @@ pub(crate) fn merge_candidate_pools(
     let (results, pagination) = super::page_window(hits, params.page_index, limit);
     Ok(SearchResult {
         view: None,
+        revision: None,
         results,
         pagination,
         warnings,

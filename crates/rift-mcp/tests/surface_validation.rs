@@ -433,7 +433,7 @@ async fn absent_request(
     )?;
     let mut request = json!({"id":missing.wire_identity(),"include":[]});
     if let Some(revision) = revision {
-        request["rev"] = json!(revision);
+        request["revision"] = json!(format!("rift://revision/git/{revision}"));
     }
     Ok(request)
 }
@@ -638,7 +638,7 @@ async fn get_symbol_miss_reports_unavailable_alternatives_at_the_work_bound() ->
         let requested = rift_protocol::identity::SymbolIdentity::parse(
             request["id"].as_str().ok_or("requested id")?,
         )?;
-        let exhausted = request.get("rev").is_none() && requested.language().name == "rust";
+        let exhausted = request.get("revision").is_none() && requested.language().name == "rust";
         assert_eq!(warning.get("detail").is_some(), exhausted, "{answer:#}");
         if exhausted {
             assert_eq!(warning["alternatives"], json!([]));
@@ -1093,12 +1093,12 @@ fn traversal_refusal_corpus(target: &str, seed: &str) -> Vec<(Value, InputSchema
     let outgoing = json!({ "seed": seed, "direction": "outgoing" });
     vec![
         (
-            json!({ "rev": "main", "traversal": { "seed": target } }),
+            json!({ "revision": "rift://revision/git/main", "traversal": { "seed": target } }),
             InputSchema::Admits,
             ErrorCode::CapabilityUnavailable,
         ),
         (
-            json!({ "rev": "main", "traversal": outgoing }),
+            json!({ "revision": "rift://revision/git/main", "traversal": outgoing }),
             InputSchema::Admits,
             ErrorCode::CapabilityUnavailable,
         ),
@@ -1319,7 +1319,7 @@ async fn packages_beside_the_local_scope_or_rev_refuse_naming_packages() -> Test
         ("get_symbol", json!({ "id": id, "packages": packages })),
         (
             "get_symbol",
-            json!({ "id": id, "scope": "all", "rev": "main", "packages": packages }),
+            json!({ "id": id, "scope": "all", "revision": "rift://revision/git/main", "packages": packages }),
         ),
         (
             "search",
@@ -1327,7 +1327,7 @@ async fn packages_beside_the_local_scope_or_rev_refuse_naming_packages() -> Test
         ),
         (
             "search",
-            json!({ "query": "helper_beacon", "scope": "global", "rev": "main", "packages": packages }),
+            json!({ "query": "helper_beacon", "scope": "global", "revision": "rift://revision/git/main", "packages": packages }),
         ),
     ];
     for (name, request) in requests {
@@ -1360,7 +1360,7 @@ async fn packages_beside_the_local_scope_or_rev_refuse_naming_packages() -> Test
                 failure.message
             );
         } else {
-            let field = if request.get("rev").is_some() {
+            let field = if request.get("revision").is_some() {
                 "field scope"
             } else {
                 "field packages"
@@ -1391,7 +1391,7 @@ async fn search_pattern_refusals_carry_their_codes() -> TestResult {
             ErrorCode::InvalidRequest,
         ),
         (
-            json!({ "pattern": "beacon", "rev": "main" }),
+            json!({ "pattern": "beacon", "revision": "rift://revision/git/main" }),
             ErrorCode::InvalidRequest,
         ),
         (json!({ "pattern": "beacon(" }), ErrorCode::InvalidRequest),
@@ -1475,6 +1475,65 @@ async fn a_commit_search_hit_validates_against_the_served_output_schema() -> Tes
 
 /// A revision spelling past the advertised form - a reflog selector, or an ancestry suffix
 /// followed by a path - refuses `invalid_request` naming the field that carried it.
+/// Every read reports the revision it answered at: a git reference answers at the commit
+/// it resolves to, a reported tree revision pins a later read, and a tree the index no
+/// longer serves refuses `resource_not_found` naming the tree it serves.
+#[tokio::test]
+async fn reads_report_their_revision_and_a_moved_tree_refuses() -> TestResult {
+    let (_directory, client, server_task) = served_fixture().await?;
+    let id = workspace_client::captured_seed(&client, "beacon_one", "lib.rs").await?;
+    let current = structured_answer(&client, "get_symbol", &json!({ "id": id })).await?;
+    let tree = current["revision"]
+        .as_str()
+        .ok_or("tree revision")?
+        .to_owned();
+    assert!(tree.starts_with("rift://revision/tree/"), "{current:#}");
+    let pinned = json!({ "symbol": id, "revision": tree });
+    let nodes = structured_answer(&client, "nodes", &pinned).await?;
+    assert_eq!(nodes["revision"], json!(tree), "{nodes:#}");
+    let at_main = json!({ "id": id, "revision": "rift://revision/git/main" });
+    let committed = structured_answer(&client, "get_symbol", &at_main).await?;
+    let commit = committed["revision"].as_str().ok_or("commit revision")?;
+    let commit_id = commit
+        .strip_prefix("rift://revision/git/")
+        .unwrap_or_default();
+    assert!(
+        commit_id.len() == 40 && commit_id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "a reference answers at the commit it resolves to: {committed:#}"
+    );
+    let moved =
+        json!({ "symbol": id, "revision": format!("rift://revision/tree/{}", "0".repeat(64)) });
+    let refused = workspace_client::failed_call(
+        client.call_tool(tools_call_request("nodes", &moved)?).await,
+    )?;
+    assert_eq!(
+        refused.code,
+        ErrorCode::ResourceNotFound,
+        "{}",
+        refused.text
+    );
+    assert!(refused.message.contains(&tree), "{}", refused.message);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+async fn structured_answer(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    tool: &'static str,
+    arguments: &Value,
+) -> TestResult<Value> {
+    let result = client
+        .call_tool(tools_call_request(tool, arguments)?)
+        .await?;
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "{tool} {arguments}: {result:?}"
+    );
+    Ok(result.structured_content.ok_or("structured answer")?)
+}
+
 #[tokio::test]
 async fn a_revision_spelling_past_the_advertised_form_refuses_naming_the_field() -> TestResult {
     let (_directory, client, server_task) = served_fixture().await?;
@@ -1482,8 +1541,8 @@ async fn a_revision_spelling_past_the_advertised_form_refuses_naming_the_field()
     let refused = [
         (
             "get_symbol",
-            json!({ "id": id, "rev": "HEAD@{1}" }),
-            "field rev",
+            json!({ "id": id, "revision": "rift://revision/git/HEAD@{1}" }),
+            "field revision",
         ),
         (
             "search",
@@ -1529,7 +1588,10 @@ async fn search_commit_refusals_name_the_field() -> TestResult {
             "traversal",
         ),
         (json!({ "change": { "base": "baseline" } }), "change"),
-        (json!({ "rev": "main" }), "rev"),
+        (
+            json!({ "revision": "rift://revision/git/main" }),
+            "revision",
+        ),
         (json!({ "packages": packages, "scope": "all" }), "packages"),
         (json!({ "paths": { "include": ["lib.rs"] } }), "paths"),
         (json!({ "scope": "global" }), "scope"),

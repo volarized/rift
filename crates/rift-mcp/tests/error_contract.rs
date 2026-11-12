@@ -52,11 +52,17 @@ async fn served_tool_failures_are_completed_error_results() -> TestResult {
             "get_symbol",
             json!({ "name": "beacon", "include": ["history"] }),
         ),
-        ("get_symbol", json!({ "name": "beacon", "rev": "main" })),
-        ("search", json!({ "query": "beacon", "rev": "main" })),
+        (
+            "get_symbol",
+            json!({ "name": "beacon", "revision": "rift://revision/git/main" }),
+        ),
+        (
+            "search",
+            json!({ "query": "beacon", "revision": "rift://revision/git/main" }),
+        ),
         (
             "nodes",
-            json!({ "path": "lib.rs", "position": 0, "rev": "HEAD~1" }),
+            json!({ "path": "lib.rs", "position": 0, "revision": "rift://revision/git/HEAD~1" }),
         ),
     ];
     for (tool, request) in failing_requests {
@@ -158,12 +164,16 @@ async fn revision_read_without_a_repository_names_the_remedy() -> TestResult {
         directory.path().join("rift.toml"),
         hermetic_search::HERMETIC_TABLES,
     )?;
-    let failure = failing_observed_symbol_error(directory.path(), json!({ "rev": "main" })).await?;
+    let failure = failing_observed_symbol_error(
+        directory.path(),
+        json!({ "revision": "rift://revision/git/main" }),
+    )
+    .await?;
     assert_eq!(failure.code, ErrorCode::CapabilityUnavailable);
     assert_eq!(failure.retry, RetryDirective::OperatorAction);
     let message = &failure.message;
     assert!(
-        message.contains("requires a git repository - run `git init`, or omit `rev`"),
+        message.contains("requires a git repository - run `git init`, or omit `revision`"),
         "the refusal must name the remedy: {message}"
     );
     Ok(())
@@ -252,7 +262,11 @@ async fn revision_read_with_history_disabled_is_refused() -> TestResult {
             hermetic_search::HERMETIC_TABLES
         ),
     )?;
-    let failure = failing_observed_symbol_error(directory.path(), json!({ "rev": "main" })).await?;
+    let failure = failing_observed_symbol_error(
+        directory.path(),
+        json!({ "revision": "rift://revision/git/main" }),
+    )
+    .await?;
     assert_eq!(failure.code, ErrorCode::CapabilityUnavailable);
     let message = &failure.message;
     assert!(

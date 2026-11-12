@@ -92,7 +92,7 @@ __rift_error_definition!(
     unversioned,
     slug = "rift.history.unversioned",
     message = "workspace has no git repository: {workspace}",
-    action = "run `git init`, or omit `rev` to read current tree",
+    action = "run `git init`, or omit `revision` to read current tree",
     fields = {
         requires: required(string),
         workspace: required(path),

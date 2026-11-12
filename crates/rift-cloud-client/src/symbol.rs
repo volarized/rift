@@ -104,10 +104,14 @@ fn validate_request(request: &GetSymbolParams) -> Result<(), RiftError> {
             "field failed validation",
         ));
     }
-    if request.rev.is_some() {
+    if request
+        .revision
+        .as_ref()
+        .is_some_and(|revision| !revision.answers_for(identity.owner()))
+    {
         return Err(failure::request_invalid(
             "validate_request",
-            "rev",
+            "revision",
             "field failed validation",
         ));
     }

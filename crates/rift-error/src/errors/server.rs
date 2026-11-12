@@ -53,6 +53,17 @@ __rift_error_definition!(
 );
 
 __rift_error_definition!(
+    read_revision_unserved,
+    slug = "rift.server.read_revision_unserved",
+    message = "the index does not serve the requested revision {revision}; it serves {served}",
+    action = "resend the read without `revision`, or with the revision the latest answer reported",
+    fields = {
+        revision: required(string),
+        served: required(string),
+    },
+);
+
+__rift_error_definition!(
     read_source_unavailable,
     slug = "rift.server.read_source_unavailable",
     message = "claimed source path is not available in the index: {path}",

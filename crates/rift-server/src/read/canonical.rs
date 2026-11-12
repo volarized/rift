@@ -100,7 +100,7 @@ struct LocalSymbolMaterial {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CapturedMetadata {
-    revision: Option<rift_protocol::read::RevisionId>,
+    revision: rift_protocol::revision::Revision,
     warnings: Vec<rift_protocol::read::ReadWarning>,
 }
 
@@ -128,7 +128,7 @@ impl Continuation {
             && self.include == request.include
             && self.limit == request.declaration_limit
             && request.view.as_ref().is_none_or(|view| view == &self.view)
-            && request.rev.is_none()
+            && request.revision.is_none()
     }
 
     fn retained_bytes(&self) -> usize {
@@ -456,11 +456,12 @@ impl LocalSymbolViews {
     ) -> Result<GetSymbolResult, RiftError> {
         let identity = SymbolIdentity::parse(request.id.as_str())?;
         super::accepted_limit(request.declaration_limit)?;
-        if request.rev.is_some() && (request.view.is_some() || request.declaration_cursor.is_some())
+        if request.revision.is_some()
+            && (request.view.is_some() || request.declaration_cursor.is_some())
         {
             return Err(invalid(
-                "rev",
-                "rev cannot accompany a captured view or continuation",
+                "revision",
+                "revision cannot accompany a captured view or continuation",
             ));
         }
         let (held, offset) = {
@@ -571,6 +572,7 @@ fn unavailable(
     GetSymbolResult::Unavailable {
         id: request.id.clone(),
         view,
+        revision: None,
         reason,
         warnings: Vec::new(),
     }
@@ -617,7 +619,7 @@ impl ReadService {
     ) -> Result<(Arc<rift_index::WorkspaceSymbolView>, Vec<u8>), RiftError> {
         let index = self.index.symbol_view()?;
         let metadata = serde_json::to_vec(&CapturedMetadata {
-            revision: self.revision.clone(),
+            revision: self.served_revision()?,
             warnings: self.warnings(),
         })
         .map_err(|error| material_error("capture read metadata", &error))?;
@@ -680,9 +682,9 @@ impl LocalSymbolMaterial {
         let metadata: CapturedMetadata = serde_json::from_slice(&self.metadata)
             .map_err(|error| material_error("decode captured metadata", &error))?;
         if request
-            .rev
+            .revision
             .as_ref()
-            .is_some_and(|revision| Some(revision) != metadata.revision.as_ref())
+            .is_some_and(|revision| revision != &metadata.revision)
         {
             return Ok((
                 unavailable(
@@ -713,6 +715,7 @@ impl LocalSymbolMaterial {
                         detail,
                     },
                     view: view.clone(),
+                    revision: metadata.revision,
                     warnings: metadata.warnings,
                 },
                 None,
@@ -757,6 +760,7 @@ impl LocalSymbolMaterial {
             GetSymbolResult::Found {
                 symbol: Box::new(symbol),
                 view: view.clone(),
+                revision: metadata.revision,
                 declarations,
                 declaration_cursor: None,
                 history,

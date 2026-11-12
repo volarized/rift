@@ -55,7 +55,7 @@ fn request(id: SymbolId, view: CapturedViewId) -> GetSymbolParams {
     GetSymbolParams {
         id,
         include: vec![GetSymbolInclude::Documentation],
-        rev: None,
+        revision: None,
         view: Some(view),
         declaration_limit: 1,
         declaration_cursor: None,
@@ -76,7 +76,7 @@ fn captured_input(reads: &ReadService) -> LocalSymbolViewInput {
                 id: SymbolId::parse("rift://symbol/local/javascript/beacon/open")
                     .expect("fixture identity"),
                 include: Vec::new(),
-                rev: None,
+                revision: None,
                 view: None,
                 declaration_limit: 1,
                 declaration_cursor: None,
@@ -694,6 +694,43 @@ fn captured_nodes_keep_canonical_binding_and_file_source_after_live_source_chang
     );
 }
 
+/// A captured view already names the revision it holds, so a request naming one beside the
+/// view, or beside a continuation, refuses naming `revision`.
+#[test]
+fn a_revision_beside_a_captured_view_refuses_naming_the_field() {
+    let (_directory, reads, id) = fixture(true);
+    let store = LocalSymbolViews::new(1 << 20, [15; 32]);
+    let view = capture(&store, &reads, SystemTime::now());
+    let revision = reads.served_revision().expect("served revision");
+    let mut symbol = request(id, view.id.clone());
+    symbol.revision = Some(revision.clone());
+    let nodes = rift_protocol::read::NodesParams {
+        view: Some(view.id.clone()),
+        revision: Some(revision),
+        ..rift_protocol::read::NodesParams::at(
+            rift_protocol::read::ProjectPath("index.js".to_owned()),
+            0,
+        )
+    };
+    let refusals = [
+        store
+            .resolve(&symbol, reads.index.root(), reads.index.owner())
+            .expect_err("a revision beside a view"),
+        store
+            .nodes(&nodes, &view.id, reads.index.root(), reads.index.owner())
+            .expect_err("a revision beside a view"),
+    ];
+    for refused in refusals {
+        assert_eq!(refused.slug(), errors::server::read_invalid::SLUG);
+        assert!(
+            refused
+                .context()
+                .any(|(field, value)| field == "field" && value == "revision"),
+            "{refused}"
+        );
+    }
+}
+
 #[test]
 fn captured_nodes_refuse_foreign_selection_and_invalid_positions() {
     let (_directory, reads, _) = fixture(true);
@@ -1279,7 +1316,7 @@ fn distinct_text_generations() -> (tempfile::TempDir, Vec<rift_index::WorkspaceI
 
 fn text_generation_input(index: &rift_index::WorkspaceIndex) -> LocalSymbolViewInput {
     let metadata = serde_json::to_vec(&CapturedMetadata {
-        revision: None,
+        revision: rift_protocol::revision::Revision::tree(&"0".repeat(64)).expect("tree revision"),
         warnings: Vec::new(),
     })
     .expect("captured metadata");

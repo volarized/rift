@@ -52,8 +52,8 @@ use rift_syntax::{ByteRange, SyntaxSymbol};
 use crate::engine_read::EngineReferences;
 use crate::read::file_id;
 use crate::read::{
-    CURRENT_TREE_ALONE, ReadService, RiftError, accepted_limit, excerpt, page, project_path,
-    results_truncation_warning, source_warnings, text_range, validate_common,
+    CURRENT_TREE_ALONE, ReadService, RiftError, accepted_limit, excerpt, is_git_revision, page,
+    project_path, results_truncation_warning, source_warnings, text_range,
     validate_requested_packages, wire_symbol,
 };
 use crate::traversal::{
@@ -251,7 +251,7 @@ impl ReadService {
         store: &StoreAnswer,
         references: &EngineReferences,
     ) -> Result<SearchResult, RiftError> {
-        self.validate_dependency_scope(&params.scope, params.rev.as_ref())?;
+        self.validate_dependency_scope(&params.scope, is_git_revision(params.revision.as_ref()))?;
         if params.target == SearchParamsTarget::Commit {
             return self.search_commits(params);
         }
@@ -270,6 +270,7 @@ impl ReadService {
                 .capability("force_include at a revision")
                 .fail();
         }
+        self.accept_revision(params.revision.as_ref())?;
         let ((results, pagination), warnings) = self.ordered_search_hits(
             params,
             store,
@@ -282,10 +283,18 @@ impl ReadService {
         )?;
         Ok(SearchResult {
             view: None,
+            revision: Some(self.served_revision()?),
             results,
             pagination,
             warnings,
         })
+    }
+
+    /// Refuses a search `revision` this service does not serve, and a scope reaching
+    /// packages beside a git one.
+    pub(crate) fn accept_search_revision(&self, params: &SearchParams) -> Result<(), RiftError> {
+        self.validate_dependency_scope(&params.scope, is_git_revision(params.revision.as_ref()))?;
+        self.accept_revision(params.revision.as_ref())
     }
 
     /// Returns the ordered traversal search results before applying a page window.
@@ -299,7 +308,7 @@ impl ReadService {
         store: &StoreAnswer,
         references: &EngineReferences,
     ) -> Result<(Vec<SearchHit>, Vec<ReadWarning>), RiftError> {
-        self.validate_dependency_scope(&params.scope, params.rev.as_ref())?;
+        self.accept_search_revision(params)?;
         let pattern = self.validated_pattern(params, store, references)?;
         if params.traversal.is_none()
             || pattern.is_some()
@@ -489,7 +498,7 @@ impl ReadService {
 
     pub(crate) fn validate_engine_search(&self, params: &SearchParams) -> Result<(), RiftError> {
         validate_search(params)?;
-        self.validate_dependency_scope(&params.scope, params.rev.as_ref())?;
+        self.accept_search_revision(params)?;
         accepted_query(params)?;
         search_page_limit(params)?;
         path_matcher(self.index().root(), params.paths.as_ref())?;
@@ -914,8 +923,8 @@ pub fn search_page_limit(params: &SearchParams) -> Result<usize, RiftError> {
 }
 
 pub(crate) fn validate_search(params: &SearchParams) -> Result<(), RiftError> {
-    validate_common(params.rev.is_some())?;
-    validate_requested_packages(&params.scope, params.rev.is_some(), &params.packages)?;
+    let git = is_git_revision(params.revision.as_ref());
+    validate_requested_packages(&params.scope, git, &params.packages)?;
     if let Some(selector) = params.paths.as_ref() {
         validate_path_selector(selector)?;
     }
@@ -931,7 +940,7 @@ pub(crate) fn validate_search(params: &SearchParams) -> Result<(), RiftError> {
     if let Some(traversal) = params.traversal.as_ref() {
         validate_traversal(traversal)?;
         validate_traversal_seed(params, traversal)?;
-        if params.rev.is_some() {
+        if git {
             return errors::server::read_unsupported()
                 .capability("traversal at a revision")
                 .fail();
@@ -982,14 +991,14 @@ fn validate_traversal_seed(
 /// a revision spelling that breaks the charset [`RevisionId`] advertises. A working-tree
 /// `head` names no revision, so it has no spelling to check.
 ///
-/// The `change` block names both sides of the comparison itself, so `rev` has nothing left
-/// to address, and `query` selects a result set of its own. A `scope` past `local`
+/// The `change` block names both sides of the comparison itself, so `revision` has nothing
+/// left to address, and `query` selects a result set of its own. A `scope` past `local`
 /// follows the rule every revision-addressed read applies, since package facts are
 /// served for the current tree alone. A `traversal` is refused beside a comparison by
 /// [`validate_traversal_seed`], since no lane serves the walk from a comparison's changed
 /// declarations.
 fn validate_change(change: &SearchChange, params: &SearchParams) -> Result<(), RiftError> {
-    if params.rev.is_some() {
+    if params.revision.is_some() {
         return errors::server::read_invalid()
             .field("change")
             .violation("change names its own revisions")
@@ -4021,8 +4030,9 @@ impl Tower {
         let visibility = SourceVisibility::default();
         let history = HistoryConfiguration::default();
         let service = ReadService::at_revision(root, &revision, limits, &visibility, history)?;
-        let committed: SearchParams =
-            serde_json::from_value(json!({"query": "committed_probe", "rev": "HEAD"}))?;
+        let committed: SearchParams = serde_json::from_value(
+            json!({"query": "committed_probe", "revision": "rift://revision/git/HEAD"}),
+        )?;
         let answer = service.search(&committed, &StoreAnswer::identifier_only())?;
         let value = serde_json::to_value(answer)?;
         assert!(
@@ -4037,8 +4047,9 @@ impl Tower {
             })
         });
         assert!(names_deep, "{value:#}");
-        let refused: SearchParams =
-            serde_json::from_value(json!({"query": "deep_probe", "rev": "HEAD"}))?;
+        let refused: SearchParams = serde_json::from_value(
+            json!({"query": "deep_probe", "revision": "rift://revision/git/HEAD"}),
+        )?;
         let refused_answer = service.search(&refused, &StoreAnswer::identifier_only())?;
         let refused_value = serde_json::to_value(refused_answer)?;
         assert_eq!(
@@ -5077,7 +5088,7 @@ impl Tower {
                 "the local scope reads the project alone",
             ),
             (
-                json!({"query": "beacon", "scope": "all", "rev": "main", "packages": packages}),
+                json!({"query": "beacon", "scope": "all", "revision": "rift://revision/git/main", "packages": packages}),
                 "scope",
                 "package facts are served for the current tree alone",
             ),
@@ -5113,8 +5124,9 @@ impl Tower {
     fn search_rev_with_a_global_scope_refuses_naming_scope() -> TestResult {
         let (_directory, service) = beacon_fixture()?;
         for scope in ["global", "all"] {
-            let params: SearchParams =
-                serde_json::from_value(json!({"query": "beacon", "scope": scope, "rev": "main"}))?;
+            let params: SearchParams = serde_json::from_value(
+                json!({"query": "beacon", "scope": scope, "revision": "rift://revision/git/main"}),
+            )?;
 
             let error = service
                 .search(&params, &StoreAnswer::identifier_only())

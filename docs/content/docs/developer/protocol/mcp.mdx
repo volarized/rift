@@ -313,7 +313,7 @@ A file past `pattern_matches_per_file` is cut there, and the answer carries a
 `pattern_matches_truncated` warning naming it, while every other file answers in full.
 `results_truncated` still reports the result bound alone.
 
-The server refuses `pattern` beside `query`, `traversal`, `change`, or `rev` with
+The server refuses `pattern` beside `query`, `traversal`, `change`, or a git `revision` with
 `invalid_request`: the trigram index holds the current tree alone, and the other fields select
 another result set or tree. A `scope` past `local` reaches the package files through the global
 index, as [package scope](#search-scope) describes. `target: "documentation"` refuses
@@ -379,8 +379,8 @@ A walk whose seed no engine answers for refuses `capability_unavailable` naming
 `relationship traversal (no language engine serves the seed)`: nothing this workspace holds
 resolves a reference to that declaration, and a resend changes nothing. A `facets` list naming
 no facet a lane populates draws the same refusal, such as `references` alone on an outgoing walk.
-An engine session serves the current tree, so `traversal` combines with neither `rev` nor
-`change`, and refuses `capability_unavailable` for each, whatever its `direction`.
+An engine session serves the current tree, so `traversal` combines with neither a git `revision`
+nor `change`, and refuses `capability_unavailable` for each, whatever its `direction`.
 
 An outgoing walk from a seed the ready engine prepares no call hierarchy item at refuses
 `capability_unavailable` naming the seed's kind, such as a `struct` under rust-analyzer. The
@@ -473,8 +473,7 @@ process key in `processes`.
 ### Change [#search-change]
 
 `change` answers the declarations two sides hold differently. `base` names the committed revision
-compared from, spelled the way a [revision read](#revision-reads) spells `rev`, such as `main` or
-`HEAD~1`. `head` names the side
+compared from, spelled the way git spells it, such as `main` or `HEAD~1`. `head` names the side
 compared to: a revision spelled the same way, or the working tree, spelled
 `{"kind": "working_tree"}`. An omitted `head` is `HEAD`.
 
@@ -532,7 +531,7 @@ and its `results_truncated` warning. A changed file either revision cannot read 
 per-file byte bound, bytes that are not UTF-8, or a syntax tree the provider refuses -
 contributes no declaration, and the changed paths beside it still answer.
 
-The server refuses `change` beside `rev` with `invalid_request`, since `change` names its own
+The server refuses `change` beside `revision` with `invalid_request`, since `change` names its own
 revisions, and beside `query` with `invalid_request`, since the two select different result
 sets. A `traversal` beside it refuses `capability_unavailable`, since no lane serves the walk from
 a comparison's changed declarations. A `scope` past `local`
@@ -647,7 +646,7 @@ and `message_truncated` says so; `paths` lists at most 32 paths in path order, a
 
 </ExampleTabs>
 
-The server refuses `target: "commit"` beside `pattern`, `traversal`, `change`, `rev`, `packages`,
+The server refuses `target: "commit"` beside `pattern`, `traversal`, `change`, a git `revision`, `packages`,
 and `paths`, and with a `scope` past `local`, each with `invalid_request` naming the field: each of
 them selects declarations, file text, or another tree, and the global index holds no project
 history. A missing or empty `query` refuses `invalid_request` naming `query`.
@@ -686,7 +685,7 @@ addressed by `unit`, with the file's `size`, and each declaration holding a matc
 hit at its first match, both tagged `matched_by: ["content"]`. `global` answers released source
 matches; `all` includes project matches too, retaining each matched owner.
 
-The server refuses `rev` together with a scope beyond `local` as `invalid_request`, since
+The server refuses a git `revision` together with a scope beyond `local` as `invalid_request`, since
 package facts are served for the current tree alone, and refuses `traversal` together with
 `global` the same way, since a walk runs over the project alone; `all` still walks the
 project graph. Package warnings under [Reads](#reads) ride a `search` answer whose
@@ -795,8 +794,9 @@ The declaration's `unit` keeps the physical defining owner even when the logical
 
 <ReadExample name="requested-served" />
 
-`rev` selects a local Git revision. It is refused beside `view` and for package or runtime
-identities. Unknown named local projects, expired views, and incomplete coverage are explicit
+`revision` selects the [revision](#revision-reads) to read, and the answer carries the revision
+it was read at. It is refused beside `view`, and for a package or runtime identity it names that
+identity's release alone. Unknown named local projects, expired views, and incomplete coverage are explicit
 selection failures. A malformed identity is refused before lookup:
 
 <ReadExample name="malformed-symbol" />
@@ -818,8 +818,9 @@ refuses `resource_not_found`.
 The server reads the nodes of a package or runtime symbol from the global API, in the exact
 release the identity names. Each node's `unit` is then a source unit of that release, such as
 `rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs`, and a symbol the release does not declare
-refuses `resource_not_found`. The server **MUST** refuse `rev` beside such a symbol with
-`invalid_request`, since the global API serves released source alone.
+refuses `resource_not_found`. The server **MUST** refuse a `revision` beside such a symbol other
+than the release its identity names with `invalid_request`, since the global API serves that
+release alone, and the answer carries that release as its `revision`.
 
 One answer holds at most `results_max` nodes, or the global API's `page_limit_max` for a package
 or runtime symbol, and 1 MiB of node source, and at least one node.
@@ -1026,7 +1027,8 @@ answers for. The global warning naming why the global API did not answer rides b
 outside that bound. The `source_unavailable` bound above is separate, so an answer can carry
 eight of each.
 
-Every read carries an optional `rev`, and reads the workspace tree when it is absent.
+Every read carries an optional `revision`, and reads the working tree the index serves when it is
+absent.
 
 ### Result content [#result-content]
 
@@ -1223,30 +1225,51 @@ These examples retain compact text and canonical JSON from the same answers:
 
 ### Revision-addressed reads [#revision-reads]
 
-Every read also accepts `rev` - a branch, tag, or commit id, spelled the way git spells it:
-`main`, `v0.0.6`, `dd0a482`. The server resolves the revision in place from the workspace's
-git objects, with no checkout, and indexes that commit's tree under the same
-[`[source]`](/docs/developer/configuration#source) policy and bounds as the working-tree scan. A revision
-read answers from committed bytes, so uncommitted working-tree changes never appear in it.
+Every read accepts `revision`, a [`Revision`](/docs/developer/protocol/reference) IRI
+that names one point on the history axis:
 
-This `get_symbol` request reads a declaration as it stands on `main`, whatever the working tree
-currently holds:
+- `rift://revision/git/<commit>` - a complete lowercase git commit id
+- `rift://revision/git/<reference>` - a branch, tag, or `HEAD`, optionally followed by `~N`
+  ancestry suffixes, which the server resolves to a commit
+- `rift://revision/<manager>/<registry>/<name>@<version>` - a package release, such as
+  `rift://revision/cargo/crates.io/serde@1.0.228`
+- `rift://revision/stdlib/<runtime>@<version>` - a runtime release, such as
+  `rift://revision/stdlib/cpython@3.12.9`
+- `rift://revision/tree/<digest>` - the working tree the index serves, by its complete SHA-256
+  digest
 
-```json
-{ "id": "rift://symbol/local/rust/example_project/config/load_config", "rev": "main" }
-```
+Every `get_symbol` and `nodes` answer carries the `revision` it was read at. A `search` answer
+carries the revision of the one project tree it read, and omits it when it merged several trees,
+read packages alone, or answered from a captured view. An answer names a commit, a release, or a
+tree, never a reference, so a caller **MAY** send the reported revision back to pin a later read
+to the same point.
 
-A name may carry git's ancestry suffixes: `~N` walks `N` first parents and `^N` picks the `N`th
-parent, each count defaulting to 1, so `HEAD~1` and `HEAD^` name the commit below `HEAD`. The server
-resolves the spelling through git's revision syntax, and a spelling that carries anything else -
-a reflog selector such as `HEAD@{1}`, or a path after a suffix - refuses `invalid_request` naming
-the field. This request reads the declaration one commit back:
+A git revision reads committed bytes. The server resolves it in place from the workspace's git
+objects, with no checkout, and indexes that commit's tree under the same
+[`[source]`](/docs/developer/configuration#source) policy and bounds as the working-tree scan,
+so uncommitted working-tree changes never appear in it. This `get_symbol` request reads a
+declaration as it stands on `main`, whatever the working tree currently holds:
 
 **Request:**
 
 ```json
-{ "id": "rift://symbol/local/rust/example_project/config/load_config", "rev": "HEAD~1" }
+{
+  "id": "rift://symbol/local/rust/example_project/config/load_config",
+  "revision": "rift://revision/git/main"
+}
 ```
+
+The answer reports the commit `main` resolved to, such as
+`rift://revision/git/1f2080e49da12fee4431e6872630509355cd62d1`. `~N` walks `N` first parents,
+defaulting to 1, so `rift://revision/git/HEAD~1` names the commit below `HEAD`. A reference that
+carries anything else - a second-parent selector such as `^2`, or a reflog selector such as
+`HEAD@{1}` - refuses `invalid_request` naming `revision`.
+
+A tree revision reads the working tree the index serves. The server **MUST** refuse a tree
+revision naming any other tree with `resource_not_found`
+(`rift.server.read_revision_unserved`), naming the requested and the served revision, since the
+index retains no earlier tree. A release revision **MUST** name the release a package or runtime
+identity carries; beside a project identity the server refuses it the same way.
 
 A revision search refuses `force_include`: reaching index-excluded files is a walk of the
 working tree, which a revision does not have.
@@ -1262,7 +1285,7 @@ A workspace with no git repository refuses a revision read and names the remedy:
 ```text
 1 error
 	capability_unavailable · retry operator_action
-		no configured provider serves this request: workspace /Users/alice/projects/charming-aurora, requires a git repository - run `git init`, or omit `rev` to read the current tree; adjust the request to a served capability, or configure a provider that serves it
+		no configured provider serves this request: workspace /Users/alice/projects/charming-aurora, requires a git repository - run `git init`, or omit `revision` to read the current tree; adjust the request to a served capability, or configure a provider that serves it
 ```
 
 </Tab>
@@ -1274,7 +1297,7 @@ A workspace with no git repository refuses a revision read and names the remedy:
 ```json
 {
   "code": "capability_unavailable",
-  "message": "no configured provider serves this request: workspace /Users/alice/projects/charming-aurora, requires a git repository - run `git init`, or omit `rev` to read the current tree; adjust the request to a served capability, or configure a provider that serves it",
+  "message": "no configured provider serves this request: workspace /Users/alice/projects/charming-aurora, requires a git repository - run `git init`, or omit `revision` to read the current tree; adjust the request to a served capability, or configure a provider that serves it",
   "retry": "operator_action",
   "phase": "read"
 }
@@ -1322,7 +1345,7 @@ This search reads Tokio 1.47.1 beside the project, in place of the version the w
 ```
 
 The server refuses `packages` as `invalid_request` naming the field beside the `local` scope, the
-default, since a project read consults no package, and beside `rev`, since package facts are
+default, since a project read consults no package, and beside a git `revision`, since package facts are
 served for the current tree alone. A list past 64 entries, and an entry whose `manager`, `name`,
 or `version` is empty or longer than its schema allows, refuse the same way before anything
 reaches the global API.

@@ -149,6 +149,9 @@ fn view_text(text: &str, structured: &serde_json::Value) -> Result<(), String> {
         token(text, &view["id"], "$.view.id")?;
         token(text, &view["expires_at"], "$.view.expires_at")?;
     }
+    if let Some(revision) = structured.get("revision") {
+        token(text, revision, "$.revision")?;
+    }
     for warning in structured["warnings"].as_array().into_iter().flatten() {
         token(text, &warning["code"], "$.warnings.code")?;
     }

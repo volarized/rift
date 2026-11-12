@@ -105,7 +105,7 @@ pub(crate) async fn prepared_corpus(
                 .to_owned();
             let mut discovery =
                 json!({"query": name, "target": "symbol", "include": ["source"], "limit": 1000});
-            for field in ["scope", "packages", "rev"] {
+            for field in ["scope", "packages", "revision"] {
                 if let Some(value) = request.get(field) {
                     discovery[field] = value.clone();
                 }
@@ -427,16 +427,22 @@ fn lexical_search_corpus() -> Vec<(&'static str, Value)> {
 /// fixture's committed baseline.
 fn revision_read_corpus() -> Vec<(&'static str, Value)> {
     vec![
-        ("get_symbol", json!({ "name": "beacon_one", "rev": "main" })),
+        (
+            "get_symbol",
+            json!({ "name": "beacon_one", "revision": "rift://revision/git/main" }),
+        ),
         // An ancestry suffix names the fixture's baseline, one commit below `HEAD`.
         (
             "get_symbol",
-            json!({ "name": "beacon_one", "rev": "HEAD^" }),
+            json!({ "name": "beacon_one", "revision": "rift://revision/git/HEAD~1" }),
         ),
-        ("search", json!({ "query": "beacon", "rev": "main" })),
+        (
+            "search",
+            json!({ "query": "beacon", "revision": "rift://revision/git/main" }),
+        ),
         (
             "nodes",
-            json!({ "path": "lib.rs", "position": 0, "rev": "main" }),
+            json!({ "path": "lib.rs", "position": 0, "revision": "rift://revision/git/main" }),
         ),
     ]
 }

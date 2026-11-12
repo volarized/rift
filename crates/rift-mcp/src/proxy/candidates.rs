@@ -327,7 +327,7 @@ impl RiftProxy {
         if params.pattern.is_some()
             || params.traversal.is_some()
             || params.change.is_some()
-            || params.rev.is_some()
+            || params.revision.is_some()
             || params.target == rift_protocol::read::SearchParamsTarget::Commit
         {
             if params.view.is_some() {

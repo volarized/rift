@@ -378,7 +378,10 @@ fn a_commit_search_refuses_every_field_beside_query() -> TestResult {
             "traversal",
         ),
         (json!({"change": {"base": "HEAD~1"}}), "change"),
-        (json!({"rev": "HEAD~1"}), "rev"),
+        (
+            json!({"revision": "rift://revision/git/HEAD~1"}),
+            "revision",
+        ),
         (
             json!({"packages": [{"manager": "cargo", "name": "tokio", "version": "1.47.1"}]}),
             "packages",

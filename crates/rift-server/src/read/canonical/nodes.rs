@@ -24,8 +24,11 @@ impl LocalSymbolViews {
         root: &Path,
         owner: &SymbolOwner,
     ) -> Result<Result<(NodesResult, CapturedView), SymbolUnavailableReason>, RiftError> {
-        if request.rev.is_some() {
-            return Err(invalid("rev", "rev cannot accompany a captured view"));
+        if request.revision.is_some() {
+            return Err(invalid(
+                "revision",
+                "revision cannot accompany a captured view",
+            ));
         }
         if request
             .view
@@ -70,6 +73,7 @@ impl LocalSymbolMaterial {
             symbol: page.symbol,
             nodes: page.nodes,
             node_cursor: page.node_cursor,
+            revision: metadata.revision,
             view: None,
             warnings: metadata.warnings,
         }))

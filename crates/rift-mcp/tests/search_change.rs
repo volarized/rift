@@ -269,7 +269,7 @@ async fn search_change_refuses_the_requests_it_cannot_answer() -> TestResult {
 
     let refusals = [
         (
-            json!({"change": {"base": "baseline"}, "rev": "main"}),
+            json!({"change": {"base": "baseline"}, "revision": "rift://revision/git/main"}),
             ErrorCode::InvalidRequest,
         ),
         (

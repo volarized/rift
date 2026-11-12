@@ -43,8 +43,8 @@ pub(super) fn commit_conflict(params: &SearchParams) -> Option<RiftError> {
             "a comparison answers declarations, and a commit search answers commits",
         ),
         (
-            "rev",
-            params.rev.is_some(),
+            "revision",
+            crate::read::is_git_revision(params.revision.as_ref()),
             "a commit search reads the history store, which holds every analyzed revision",
         ),
         (
@@ -91,6 +91,7 @@ impl ReadService {
         if let Some(conflict) = commit_conflict(params) {
             return conflict.fail();
         }
+        self.accept_revision(params.revision.as_ref())?;
         let query = required_query(params)?;
         let limit = search_page_limit(params)?;
         let parsed = parsed_query(query)?;
@@ -117,6 +118,7 @@ impl ReadService {
         }
         Ok(SearchResult {
             view: None,
+            revision: Some(self.served_revision()?),
             results,
             pagination,
             warnings,

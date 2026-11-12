@@ -24,7 +24,6 @@ pub(super) fn declaration_request() -> FindDeclarationsParams {
         position_encoding: PositionEncoding::Utf16,
         positions: vec![position(3), position(0)],
         view: None,
-        rev: None,
     }
 }
 

@@ -26,6 +26,7 @@ use rift_protocol::read::{
     Digest, GetSymbolResult, Language, NodesParams, NodesResult, Pagination, ProjectPath,
     ReadWarning, SearchParams, SearchResult, SearchScope, TraversalDirection,
 };
+use rift_protocol::revision::Revision;
 use rift_protocol::workspace::{
     WORKSPACE_SOURCE_UNITS_MAX, WorkspaceLanguageSummary, WorkspaceLspSummary,
     WorkspaceResourcePage, WorkspaceSourceUnit,
@@ -887,14 +888,20 @@ impl ResolvedWorkspace {
     }
 }
 
-fn nodes_preparing_answer(resolved: &ResolvedWorkspace) -> NodesResult {
-    NodesResult {
+fn nodes_preparing_answer(resolved: &ResolvedWorkspace) -> Result<NodesResult, ToolFailure> {
+    let revision = resolved
+        .published
+        .reads
+        .served_revision()
+        .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))?;
+    Ok(NodesResult {
         symbol: None,
         view: None,
         nodes: Vec::new(),
         node_cursor: None,
+        revision,
         warnings: nodes_preparing_warnings(resolved),
-    }
+    })
 }
 
 /// Whether `symbol` belongs to a package or a runtime release, whose nodes the global API
@@ -2338,7 +2345,7 @@ impl RiftMcp {
     /// answers each match and each declaration holding one, in place of `query` and
     /// `traversal`. `change` answers the declarations a committed revision and another
     /// revision, or the working tree, hold differently, in place of `query` and `traversal`.
-    /// `rev` searches a version-control revision instead of the current tree, and never
+    /// A git `revision` searches that commit instead of the served working tree, and never
     /// combines with `pattern`, `traversal`, or `change`. `scope` reaches past the project
     /// tree: `global` answers collected package and runtime facts selected by the project's
     /// dependency context. Explicit `packages` replaces versions of named packages or adds
@@ -2385,7 +2392,7 @@ impl RiftMcp {
         if let Some(change) = params.change.clone() {
             return self.change_search(params, change).await;
         }
-        let Some(rev) = params.rev.clone() else {
+        let Some(git) = params.revision.as_ref().and_then(Revision::git_revision) else {
             return rift_tracing::traced!(
                 component = "search",
                 operation = "search.request",
@@ -2395,7 +2402,7 @@ impl RiftMcp {
         };
         // The search index only ever holds the current tree, so a revision-addressed
         // search never consults it.
-        self.read_at(Some(rev), move |reads| {
+        self.read_at(Some(git), move |reads| {
             reads.search(&params, &StoreAnswer::identifier_only())
         })
         .await
@@ -2628,7 +2635,7 @@ impl RiftMcp {
         let read_context = ReadContext::accepted(
             &resolved.published.reads,
             &params.scope,
-            params.rev.as_ref(),
+            params.revision.as_ref(),
             &params.packages,
         )
         .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))?;
@@ -2680,7 +2687,7 @@ impl RiftMcp {
         let read_context = ReadContext::accepted(
             &resolved.published.reads,
             &params.scope,
-            params.rev.as_ref(),
+            params.revision.as_ref(),
             &params.packages,
         )
         .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))?;
@@ -3241,10 +3248,11 @@ impl RiftMcp {
     /// that symbol, or node `index` of its unit, from the file node at 0, with `parent` an
     /// index in the same declaration or unit. An edit renumbers the nodes after it. An answer
     /// whose nodes cross its node count or source byte bound returns `node_cursor` for the
-    /// rest. A file no syntax provider parses answers its file node alone. `rev` lists the
-    /// nodes as of a version-control revision instead of the current tree. If discovery is
-    /// incomplete or a targeted read spends the request's remaining time, the result has
-    /// empty `nodes` and carries `local_index_preparing`. A selected source path can answer
+    /// rest. A file no syntax provider parses answers its file node alone. `revision` lists
+    /// the nodes at a git commit or pins the served working tree, and the answer names the
+    /// revision it was read at. If discovery is incomplete or a targeted read spends the
+    /// request's remaining time, the result has empty `nodes` and carries
+    /// `local_index_preparing`. A selected source path can answer
     /// within that remaining time, with the same warning until the publication records the
     /// path: workspace byte and declaration bounds remain unchecked.
     #[tool]
@@ -3265,9 +3273,9 @@ impl RiftMcp {
         if let Some(view) = &params.view {
             return self.captured_nodes(&params, view).map(Json);
         }
-        let rev = params.rev.clone();
-        if rev.is_some() {
-            return self.read_at(rev, move |reads| reads.nodes(&params)).await;
+        let git = params.revision.as_ref().and_then(Revision::git_revision);
+        if git.is_some() {
+            return self.read_at(git, move |reads| reads.nodes(&params)).await;
         }
         let deadline = self.request_deadline().await;
         let resolved = self
@@ -3288,7 +3296,7 @@ impl RiftMcp {
                     .tool_failure(wire::ErrorPhase::Read)
             })?;
         if preparation.is_some_and(|preparation| preparation.total.is_none()) {
-            return Ok(Json(nodes_preparing_answer(&resolved)));
+            return nodes_preparing_answer(&resolved).map(Json);
         }
         // A complete batch clears `preparation`; retained selected paths therefore carry
         // the warning used by a deadline answer.
@@ -3312,15 +3320,15 @@ impl RiftMcp {
     }
 
     /// Runs one read against the tree the request names - the current
-    /// snapshot, or a snapshot built at the request's version-control
-    /// revision - behind the acceptance gate every request passes.
+    /// snapshot, or a snapshot built at the commit `git` resolves to - behind
+    /// the acceptance gate every request passes.
     ///
     /// A revision snapshot is built per request from the workspace's git
     /// objects, under the same `[source]` policy and bounds as the current
     /// one; `[providers.history] enabled = false` refuses it.
     async fn read_at<Answer>(
         &self,
-        rev: Option<rift_protocol::read::RevisionId>,
+        git: Option<rift_protocol::read::RevisionId>,
         operation: impl FnOnce(&ReadService) -> Result<Answer, RiftError> + Send + 'static,
     ) -> Result<Json<Answer>, ToolFailure>
     where
@@ -3330,7 +3338,7 @@ impl RiftMcp {
         let resolved = self
             .published_workspace(wire::ErrorPhase::Read, deadline)
             .await?;
-        let Some(rev) = rev else {
+        let Some(git) = git else {
             return self.current_tree_read(&resolved, true, operation).await;
         };
         let RevisionRead {
@@ -3346,7 +3354,7 @@ impl RiftMcp {
             .run("revision workspace read", move || {
                 let reads = ReadService::at_revision_with_languages(
                     &root,
-                    &rev,
+                    &git,
                     limits,
                     &visibility,
                     &text_inclusion,
@@ -3470,7 +3478,7 @@ impl RiftMcp {
             Ok(Err(error)) => error.mcp().tool_failure(wire::ErrorPhase::Read).fail(),
             Err(_) => {
                 timed_cancellation.cancel();
-                Ok(Json(nodes_preparing_answer(resolved)))
+                nodes_preparing_answer(resolved).map(Json)
             }
         }
     }
@@ -5597,6 +5605,8 @@ done
         expected.warnings.extend(super::nodes_preparing_warnings(
             &super::ResolvedWorkspace::current(published, Duration::ZERO),
         ));
+        // The targeted parse answers at its own partial tree; every other field matches.
+        expected.revision = retried.revision.clone();
         assert_eq!(retried, expected);
         tokio::time::timeout(Duration::from_secs(3), client.cancel()).await??;
         tokio::time::timeout(Duration::from_secs(3), serving).await??;
@@ -11687,12 +11697,20 @@ done
                 .any(|warning| matches!(warning, ReadWarning::LexicalRankingUnavailable { .. })),
             "a current-tree search must report the absent index: {current:#?}"
         );
-        let params: SearchParams =
-            serde_json::from_value(json!({"query": "beacon", "rev": "main"}))?;
+        let params: SearchParams = serde_json::from_value(
+            json!({"query": "beacon", "revision": "rift://revision/git/main"}),
+        )?;
         let answer = server.answered_search(Parameters(params)).await?.0;
         assert!(
             !answer.results.is_empty(),
             "a revision search must still answer: {answer:#?}"
+        );
+        let reported = answer.revision.as_ref().map(ToString::to_string);
+        assert!(
+            reported.as_deref().is_some_and(|revision| {
+                revision.starts_with("rift://revision/git/") && revision.len() == 60
+            }),
+            "a revision search reports the commit main resolved to: {reported:?}"
         );
         assert_eq!(
             answer.warnings,

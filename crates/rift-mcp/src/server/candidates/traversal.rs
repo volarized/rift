@@ -97,6 +97,7 @@ impl RiftMcp {
         }
         let result = SearchResult {
             view: Some(saved.view),
+            revision: None,
             results,
             pagination,
             warnings: saved.warnings,

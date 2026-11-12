@@ -5,6 +5,7 @@ use crate::read::{GetSymbolInclude, Symbol, SymbolId};
 
 const ID: &str = "rift://symbol/local/rust/app/parser/parse";
 const VIEW: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const COMMIT_REVISION: &str = "rift://revision/git/1f2080e49da12fee4431e6872630509355cd62d1";
 
 fn symbol() -> Value {
     json!({
@@ -38,7 +39,7 @@ fn exact_requests_validate_identity_and_reject_removed_fields() {
     assert!(request.include.is_empty());
     assert_eq!(request.declaration_limit, 5);
     assert_eq!(request.declaration_cursor, None);
-    assert_eq!(request.rev, None);
+    assert_eq!(request.revision, None);
     assert_eq!(request.view, None);
     let empty: GetSymbolParams =
         serde_json::from_value(json!({"id": ID, "include": []})).expect("valid fixture");
@@ -216,6 +217,7 @@ fn source_less_success_stays_distinct_from_missing_and_unavailable() {
         "outcome": "found",
         "symbol": symbol(),
         "view": {"id": VIEW, "expires_at": "2026-10-10T12:00:00Z"},
+        "revision": COMMIT_REVISION,
         "declarations": []
     });
     let result: GetSymbolResult = serde_json::from_value(found.clone()).expect("valid fixture");
@@ -227,6 +229,21 @@ fn source_less_success_stays_distinct_from_missing_and_unavailable() {
         let result: GetSymbolResult = serde_json::from_value(value).expect("valid fixture");
         assert!(!result.is_valid_for(&requested));
     }
+    let mut released = found.clone();
+    released["revision"] = json!("rift://revision/cargo/crates.io/app@1.0.0");
+    assert!(
+        !serde_json::from_value::<GetSymbolResult>(released)
+            .expect("valid fixture")
+            .is_valid_for(&requested),
+        "a project answer never reports a release revision"
+    );
+    let unparsed = SymbolId("rift://symbol/local".to_owned());
+    assert!(
+        !serde_json::from_value::<GetSymbolResult>(found.clone())
+            .expect("valid fixture")
+            .is_valid_for(&unparsed),
+        "an unparsed request identity"
+    );
     let mut wrong_language = found;
     wrong_language["symbol"]["language"] = json!("typescript");
     assert!(
@@ -242,7 +259,8 @@ fn source_less_success_stays_distinct_from_missing_and_unavailable() {
             "name": "read",
             "match_context": ["module", "name"]
         }]},
-        "view": {"id": VIEW, "expires_at": "2026-10-10T12:00:00Z"}
+        "view": {"id": VIEW, "expires_at": "2026-10-10T12:00:00Z"},
+        "revision": COMMIT_REVISION
     });
     let result: GetSymbolResult = serde_json::from_value(missing.clone()).expect("valid fixture");
     assert!(result.is_valid_for(&requested));

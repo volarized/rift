@@ -1141,7 +1141,7 @@ async fn validated_proxy_text(
         held_request
             .as_object_mut()
             .ok_or("tool arguments must be an object")?
-            .remove("rev");
+            .remove("revision");
         let held = proxied_result(client, name, &held_request).await?;
         assert_ne!(held.is_error, Some(true), "{name}: {held:?}");
         assert_eq!(

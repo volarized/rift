@@ -192,7 +192,7 @@ impl RiftMcp {
         }
         if params.pattern.is_some()
             || params.change.is_some()
-            || params.rev.is_some()
+            || params.revision.is_some()
             || params.target == rift_protocol::read::SearchParamsTarget::Commit
         {
             return Ok(params
@@ -483,7 +483,7 @@ impl RiftMcp {
         let context = crate::global::ReadContext::accepted(
             &resolved.published.reads,
             &params.scope,
-            params.rev.as_ref(),
+            params.revision.as_ref(),
             &params.packages,
         )
         .map_err(read_failure)?;

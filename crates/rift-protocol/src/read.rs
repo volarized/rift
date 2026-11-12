@@ -402,15 +402,16 @@ pub struct GetSymbolParams {
     pub language: Option<Language>,
     /// Which declarations the lookup searches: the project tree, the dependency
     /// packages, or both. Omitted, `local`. The server refuses a scope beyond `local`
-    /// together with `rev`, since package facts are served for the current tree alone.
+    /// together with a git `revision`, since package facts are served for the current tree
+    /// alone.
     #[serde(default)]
     pub scope: SearchScope,
     /// Packages this lookup reads beside the ones the workspace's manifests and
     /// lockfiles name, at most 64. An entry naming a package the workspace depends on
     /// replaces that package's versions for this read, and an entry naming another
     /// package adds it. The server refuses `packages` beside the `local` scope, since a
-    /// project read consults no package, and beside `rev`, since package facts are
-    /// served for the current tree alone.
+    /// project read consults no package, and beside a git `revision`, since package facts
+    /// are served for the current tree alone.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 64))]
     pub packages: Vec<RequestedPackage>,
@@ -429,11 +430,12 @@ pub struct GetSymbolParams {
     /// `page_index` and the true `total_pages`.
     #[serde(default = "default_get_symbol_params_page_index")]
     pub page_index: u64,
-    /// The version-control revision to read - a branch, tag, or commit id as the
-    /// workspace's version control spells it. Omitted reads the current tree. The server
-    /// refuses a revision read when the workspace has no version-control repository.
+    /// The revision to read: a git revision reads that commit, a tree revision the served
+    /// working tree. Omitted reads the served working tree. The server refuses a git
+    /// revision when the workspace has no version-control repository, and a tree revision
+    /// once the index serves another tree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rev: Option<RevisionId>,
+    pub revision: Option<crate::revision::Revision>,
 }
 
 fn default_get_symbol_params_limit() -> u64 {
@@ -871,14 +873,16 @@ pub struct NodesParams {
     #[schemars(length(min = 1, max = 4096))]
     pub node_cursor: Option<String>,
     /// Captured view selected by discovery. The server reads nodes from that view and
-    /// refuses an expired or foreign view. The caller MUST omit `rev` beside `view`.
+    /// refuses an expired or foreign view. The caller MUST omit `revision` beside `view`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<crate::symbol_read::CapturedViewId>,
-    /// The version-control revision to read - a branch, tag, or commit id as the
-    /// workspace's version control spells it. Omitted reads the current tree. The server
-    /// refuses a revision read when the workspace has no version-control repository.
+    /// The revision to read: a git revision reads that commit, a tree revision the served
+    /// working tree, and a release revision names the release a package or runtime
+    /// `symbol` carries. Omitted reads the served working tree. The server refuses a git
+    /// revision when the workspace has no version-control repository, and a tree revision
+    /// once the index serves another tree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rev: Option<RevisionId>,
+    pub revision: Option<crate::revision::Revision>,
 }
 
 impl NodesParams {
@@ -1079,7 +1083,8 @@ pub const NODES_SOURCE_BYTES_MAX: u64 = 1_048_576;
                 "source": "PathBuf",
                 "parent": 7
             }
-        ]
+        ],
+        "revision": "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11"
     }
 ]))]
 pub struct NodesResult {
@@ -1095,6 +1100,8 @@ pub struct NodesResult {
     /// byte bound. Absent when the answer holds the last node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_cursor: Option<String>,
+    /// The revision this answer was read at: a commit, a release, or a working tree.
+    pub revision: crate::revision::Revision,
     /// Captured view used for this read, with its original expiry. Absent when the
     /// request did not select a captured view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4278,6 +4285,7 @@ mod captured_nodes_tests {
             symbol: None,
             nodes: Vec::new(),
             node_cursor: None,
+            revision: crate::revision::Revision::tree(&"0".repeat(64)).expect("tree revision"),
             warnings: Vec::new(),
             view: Some(view.clone()),
         };
@@ -4294,11 +4302,13 @@ mod captured_nodes_tests {
         ] {
             assert!(serde_json::from_value::<NodesParams>(wire).is_err());
         }
-        let legacy: NodesResult =
-            serde_json::from_value(json!({"nodes":[]})).expect("legacy result");
-        assert!(legacy.view.is_none());
+        let tree = format!("rift://revision/tree/{}", "0".repeat(64));
+        let latest: NodesResult =
+            serde_json::from_value(json!({"nodes":[], "revision": tree})).expect("latest result");
+        assert!(latest.view.is_none());
+        assert!(serde_json::from_value::<NodesResult>(json!({"nodes":[]})).is_err());
         assert!(
-            serde_json::to_value(legacy)
+            serde_json::to_value(latest)
                 .expect("result")
                 .get("view")
                 .is_none()

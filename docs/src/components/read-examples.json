@@ -355,7 +355,7 @@
     "arguments": {
       "id": "rift://symbol/local/rust/example_project/config/load_config"
     },
-    "text": "\tpub fn load_config(path: &Path) -> Result<Config, ConfigError>\n\trift://symbol/local/rust/example_project/config/load_config\n\n\tLoads the workspace configuration from `rift.toml`.\n\n\tdeclarations:\n\t\tsrc/config.rs:11\n\t\t218..355\nview e736fecc6db89146c2b8d8a2cd4ec9b8acdd395d7c948ee0517eb364a5ccf2f3 \u00b7 expires 2026-10-12T15:50:28.711117+00:00\n",
+    "text": "\tpub fn load_config(path: &Path) -> Result<Config, ConfigError>\n\trift://symbol/local/rust/example_project/config/load_config\n\n\tLoads the workspace configuration from `rift.toml`.\n\n\tdeclarations:\n\t\tsrc/config.rs:11\n\t\t218..355\nrevision rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11\nview e736fecc6db89146c2b8d8a2cd4ec9b8acdd395d7c948ee0517eb364a5ccf2f3 \u00b7 expires 2026-10-12T15:50:28.711117+00:00\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -382,6 +382,7 @@
         "id": "e736fecc6db89146c2b8d8a2cd4ec9b8acdd395d7c948ee0517eb364a5ccf2f3",
         "expires_at": "2026-10-12T15:50:28.711117+00:00"
       },
+      "revision": "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11",
       "declarations": [
         {
           "origin": {
@@ -406,7 +407,7 @@
     "arguments": {
       "id": "rift://symbol/local@sdk/rust/docs_sdk/load_config"
     },
-    "text": "\tpub fn load_config() -> u32\n\trift://symbol/local@sdk/rust/docs_sdk/load_config\n\n\tLoads configuration.\n\n\tdeclarations:\n\t\tsrc/lib.rs:2\n\t\t25..59\nview e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd \u00b7 expires 2026-10-12T16:17:02.916991+00:00\n",
+    "text": "\tpub fn load_config() -> u32\n\trift://symbol/local@sdk/rust/docs_sdk/load_config\n\n\tLoads configuration.\n\n\tdeclarations:\n\t\tsrc/lib.rs:2\n\t\t25..59\nrevision rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11\nview e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd \u00b7 expires 2026-10-12T16:17:02.916991+00:00\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -433,6 +434,7 @@
         "id": "e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd",
         "expires_at": "2026-10-12T16:17:02.916991+00:00"
       },
+      "revision": "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11",
       "declarations": [
         {
           "origin": {
@@ -483,8 +485,9 @@
       "include": ["source"],
       "limit": 10
     },
-    "text": "7 results\n\t[1] heading Configuration\n\t\tREADME.md:12 \u00b7 content\n\t\t360..398\n\n\t\t## Configuration\n\n\t\tCall `load_config`.\n\n\t[2] README.md:14 \u00b7 content\n\t\tCall `load_config`.\n\t[3] pub fn load_config(path: &Path) -> Result<Config, ConfigError>\n\t\tsrc/config.rs:10 \u00b7 content\n\t\trift://symbol/local/rust/example_project/config/load_config\n\t\tLoads the workspace configuration from `rift.toml`.\n\n\t\t/// Loads the workspace configuration from `rift.toml`.\n\t\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n\t\t    let text = std::fs::read_to_string(path)?;\n\t\t    parse_config(&text)\n\t\t}\n\t[4] src/config.rs:11 \u00b7 content\n\t\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n\t[5] src/main.rs:6 \u00b7 content\n\t\tuse config::load_config;\n\t[6] private async fn main() -> Result<(), ConfigError>\n\t\tsrc/main.rs:9 \u00b7 content\n\t\t96..343\n\n\t\t#[tokio::main]\n\t\tasync fn main() -> Result<(), ConfigError> {\n\t\t    let config = tokio::task::spawn_blocking(|| {\n\t\t        load_config(Path::new(\"rift.toml\"))\n\t\t    })\n\t\t    .await??;\n\n\t\t    println!(\"Workspace root: {}\", config.root.display());\n\t\t    Ok(())\n\t\t}\n\t[7] src/main.rs:12 \u00b7 content\n\t\t        load_config(Path::new(\"rift.toml\"))\n",
+    "text": "7 results\n\t[1] heading Configuration\n\t\tREADME.md:12 \u00b7 content\n\t\t360..398\n\n\t\t## Configuration\n\n\t\tCall `load_config`.\n\n\t[2] README.md:14 \u00b7 content\n\t\tCall `load_config`.\n\t[3] pub fn load_config(path: &Path) -> Result<Config, ConfigError>\n\t\tsrc/config.rs:10 \u00b7 content\n\t\trift://symbol/local/rust/example_project/config/load_config\n\t\tLoads the workspace configuration from `rift.toml`.\n\n\t\t/// Loads the workspace configuration from `rift.toml`.\n\t\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n\t\t    let text = std::fs::read_to_string(path)?;\n\t\t    parse_config(&text)\n\t\t}\n\t[4] src/config.rs:11 \u00b7 content\n\t\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n\t[5] src/main.rs:6 \u00b7 content\n\t\tuse config::load_config;\n\t[6] private async fn main() -> Result<(), ConfigError>\n\t\tsrc/main.rs:9 \u00b7 content\n\t\t96..343\n\n\t\t#[tokio::main]\n\t\tasync fn main() -> Result<(), ConfigError> {\n\t\t    let config = tokio::task::spawn_blocking(|| {\n\t\t        load_config(Path::new(\"rift.toml\"))\n\t\t    })\n\t\t    .await??;\n\n\t\t    println!(\"Workspace root: {}\", config.root.display());\n\t\t    Ok(())\n\t\t}\n\t[7] src/main.rs:12 \u00b7 content\n\t\t        load_config(Path::new(\"rift.toml\"))\nrevision rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11\n",
     "json": {
+      "revision": "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11",
       "results": [
         {
           "hit": {
@@ -636,7 +639,7 @@
       "path": "src/config.rs",
       "position": 338
     },
-    "text": "30 nodes \u00b7 rift://symbol/local/rust/example_project/config/load_config\n\t[1] function_item \u00b7 4 lines\n\t\t218..355\n\t\tdeclaration 0 \u00b7 index 0\n\t[2] visibility_modifier\n\t\t218..221\n\t\tdeclaration 0 \u00b7 index 1 \u00b7 parent 0\n\t[3] identifier\n\t\t225..236\n\t\tdeclaration 0 \u00b7 index 2 \u00b7 parent 0\n\t[4] parameters\n\t\t236..249\n\t\tdeclaration 0 \u00b7 index 3 \u00b7 parent 0\n\t[5] parameter\n\t\t237..248\n\t\tdeclaration 0 \u00b7 index 4 \u00b7 parent 3\n\t[6] identifier\n\t\t237..241\n\t\tdeclaration 0 \u00b7 index 5 \u00b7 parent 4\n\t[7] reference_type\n\t\t243..248\n\t\tdeclaration 0 \u00b7 index 6 \u00b7 parent 4\n\t[8] type_identifier\n\t\t244..248\n\t\tdeclaration 0 \u00b7 index 7 \u00b7 parent 6\n\t[9] generic_type\n\t\t253..280\n\t\tdeclaration 0 \u00b7 index 8 \u00b7 parent 0\n\t[10] type_identifier\n\t\t253..259\n\t\tdeclaration 0 \u00b7 index 9 \u00b7 parent 8\n\t[11] type_arguments\n\t\t259..280\n\t\tdeclaration 0 \u00b7 index 10 \u00b7 parent 8\n\t[12] type_identifier\n\t\t260..266\n\t\tdeclaration 0 \u00b7 index 11 \u00b7 parent 10\n\t[13] type_identifier\n\t\t268..279\n\t\tdeclaration 0 \u00b7 index 12 \u00b7 parent 10\n\t[14] block \u00b7 4 lines\n\t\t281..355\n\t\tdeclaration 0 \u00b7 index 13 \u00b7 parent 0\n\t[15] let_declaration\n\t\t287..329\n\t\tdeclaration 0 \u00b7 index 14 \u00b7 parent 13\n\t[16] identifier\n\t\t291..295\n\t\tdeclaration 0 \u00b7 index 15 \u00b7 parent 14\n\t[17] try_expression\n\t\t298..328\n\t\tdeclaration 0 \u00b7 index 16 \u00b7 parent 14\n\t[18] call_expression\n\t\t298..327\n\t\tdeclaration 0 \u00b7 index 17 \u00b7 parent 16\n\t[19] scoped_identifier\n\t\t298..321\n\t\tdeclaration 0 \u00b7 index 18 \u00b7 parent 17\n\t[20] scoped_identifier\n\t\t298..305\n\t\tdeclaration 0 \u00b7 index 19 \u00b7 parent 18\n\t[21] identifier\n\t\t298..301\n\t\tdeclaration 0 \u00b7 index 20 \u00b7 parent 19\n\t[22] identifier\n\t\t303..305\n\t\tdeclaration 0 \u00b7 index 21 \u00b7 parent 19\n\t[23] identifier\n\t\t307..321\n\t\tdeclaration 0 \u00b7 index 22 \u00b7 parent 18\n\t[24] arguments\n\t\t321..327\n\t\tdeclaration 0 \u00b7 index 23 \u00b7 parent 17\n\t[25] identifier\n\t\t322..326\n\t\tdeclaration 0 \u00b7 index 24 \u00b7 parent 23\n\t[26] call_expression\n\t\t334..353\n\t\tdeclaration 0 \u00b7 index 25 \u00b7 parent 13\n\t[27] identifier\n\t\t334..346\n\t\tdeclaration 0 \u00b7 index 26 \u00b7 parent 25\n\t[28] arguments\n\t\t346..353\n\t\tdeclaration 0 \u00b7 index 27 \u00b7 parent 25\n\t[29] reference_expression\n\t\t347..352\n\t\tdeclaration 0 \u00b7 index 28 \u00b7 parent 27\n\t[30] identifier\n\t\t348..352\n\t\tdeclaration 0 \u00b7 index 29 \u00b7 parent 28\n\n\t\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n\t\t    let text = std::fs::read_to_string(path)?;\n\t\t    parse_config(&text)\n\t\t}\n",
+    "text": "30 nodes \u00b7 rift://symbol/local/rust/example_project/config/load_config\n\t[1] function_item \u00b7 4 lines\n\t\t218..355\n\t\tdeclaration 0 \u00b7 index 0\n\t[2] visibility_modifier\n\t\t218..221\n\t\tdeclaration 0 \u00b7 index 1 \u00b7 parent 0\n\t[3] identifier\n\t\t225..236\n\t\tdeclaration 0 \u00b7 index 2 \u00b7 parent 0\n\t[4] parameters\n\t\t236..249\n\t\tdeclaration 0 \u00b7 index 3 \u00b7 parent 0\n\t[5] parameter\n\t\t237..248\n\t\tdeclaration 0 \u00b7 index 4 \u00b7 parent 3\n\t[6] identifier\n\t\t237..241\n\t\tdeclaration 0 \u00b7 index 5 \u00b7 parent 4\n\t[7] reference_type\n\t\t243..248\n\t\tdeclaration 0 \u00b7 index 6 \u00b7 parent 4\n\t[8] type_identifier\n\t\t244..248\n\t\tdeclaration 0 \u00b7 index 7 \u00b7 parent 6\n\t[9] generic_type\n\t\t253..280\n\t\tdeclaration 0 \u00b7 index 8 \u00b7 parent 0\n\t[10] type_identifier\n\t\t253..259\n\t\tdeclaration 0 \u00b7 index 9 \u00b7 parent 8\n\t[11] type_arguments\n\t\t259..280\n\t\tdeclaration 0 \u00b7 index 10 \u00b7 parent 8\n\t[12] type_identifier\n\t\t260..266\n\t\tdeclaration 0 \u00b7 index 11 \u00b7 parent 10\n\t[13] type_identifier\n\t\t268..279\n\t\tdeclaration 0 \u00b7 index 12 \u00b7 parent 10\n\t[14] block \u00b7 4 lines\n\t\t281..355\n\t\tdeclaration 0 \u00b7 index 13 \u00b7 parent 0\n\t[15] let_declaration\n\t\t287..329\n\t\tdeclaration 0 \u00b7 index 14 \u00b7 parent 13\n\t[16] identifier\n\t\t291..295\n\t\tdeclaration 0 \u00b7 index 15 \u00b7 parent 14\n\t[17] try_expression\n\t\t298..328\n\t\tdeclaration 0 \u00b7 index 16 \u00b7 parent 14\n\t[18] call_expression\n\t\t298..327\n\t\tdeclaration 0 \u00b7 index 17 \u00b7 parent 16\n\t[19] scoped_identifier\n\t\t298..321\n\t\tdeclaration 0 \u00b7 index 18 \u00b7 parent 17\n\t[20] scoped_identifier\n\t\t298..305\n\t\tdeclaration 0 \u00b7 index 19 \u00b7 parent 18\n\t[21] identifier\n\t\t298..301\n\t\tdeclaration 0 \u00b7 index 20 \u00b7 parent 19\n\t[22] identifier\n\t\t303..305\n\t\tdeclaration 0 \u00b7 index 21 \u00b7 parent 19\n\t[23] identifier\n\t\t307..321\n\t\tdeclaration 0 \u00b7 index 22 \u00b7 parent 18\n\t[24] arguments\n\t\t321..327\n\t\tdeclaration 0 \u00b7 index 23 \u00b7 parent 17\n\t[25] identifier\n\t\t322..326\n\t\tdeclaration 0 \u00b7 index 24 \u00b7 parent 23\n\t[26] call_expression\n\t\t334..353\n\t\tdeclaration 0 \u00b7 index 25 \u00b7 parent 13\n\t[27] identifier\n\t\t334..346\n\t\tdeclaration 0 \u00b7 index 26 \u00b7 parent 25\n\t[28] arguments\n\t\t346..353\n\t\tdeclaration 0 \u00b7 index 27 \u00b7 parent 25\n\t[29] reference_expression\n\t\t347..352\n\t\tdeclaration 0 \u00b7 index 28 \u00b7 parent 27\n\t[30] identifier\n\t\t348..352\n\t\tdeclaration 0 \u00b7 index 29 \u00b7 parent 28\n\n\t\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n\t\t    let text = std::fs::read_to_string(path)?;\n\t\t    parse_config(&text)\n\t\t}\nrevision rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11\n",
     "json": {
       "symbol": "rift://symbol/local/rust/example_project/config/load_config",
       "nodes": [
@@ -1035,7 +1038,8 @@
           "source": "text",
           "parent": 28
         }
-      ]
+      ],
+      "revision": "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11"
     }
   },
   "symbol-nodes": {
@@ -1043,7 +1047,7 @@
     "arguments": {
       "symbol": "rift://symbol/local/rust/example_project/config/Config"
     },
-    "text": "12 nodes \u00b7 rift://symbol/local/rust/example_project/config/Config\n\t[1] struct_item \u00b7 3 lines\n\t\t105..160\n\t\tdeclaration 0 \u00b7 index 0\n\t[2] visibility_modifier\n\t\t105..108\n\t\tdeclaration 0 \u00b7 index 1 \u00b7 parent 0\n\t[3] type_identifier\n\t\t116..122\n\t\tdeclaration 0 \u00b7 index 2 \u00b7 parent 0\n\t[4] field_declaration_list \u00b7 3 lines\n\t\t123..160\n\t\tdeclaration 0 \u00b7 index 3 \u00b7 parent 0\n\t[5] field_declaration\n\t\t129..157\n\t\tdeclaration 0 \u00b7 index 4 \u00b7 parent 3\n\t[6] visibility_modifier\n\t\t129..132\n\t\tdeclaration 0 \u00b7 index 5 \u00b7 parent 4\n\t[7] field_identifier\n\t\t133..137\n\t\tdeclaration 0 \u00b7 index 6 \u00b7 parent 4\n\t[8] scoped_type_identifier\n\t\t139..157\n\t\tdeclaration 0 \u00b7 index 7 \u00b7 parent 4\n\t[9] scoped_identifier\n\t\t139..148\n\t\tdeclaration 0 \u00b7 index 8 \u00b7 parent 7\n\t[10] identifier\n\t\t139..142\n\t\tdeclaration 0 \u00b7 index 9 \u00b7 parent 8\n\t[11] identifier\n\t\t144..148\n\t\tdeclaration 0 \u00b7 index 10 \u00b7 parent 8\n\t[12] type_identifier\n\t\t150..157\n\t\tdeclaration 0 \u00b7 index 11 \u00b7 parent 7\n\n\t\tpub struct Config {\n\t\t    pub root: std::path::PathBuf,\n\t\t}\n",
+    "text": "12 nodes \u00b7 rift://symbol/local/rust/example_project/config/Config\n\t[1] struct_item \u00b7 3 lines\n\t\t105..160\n\t\tdeclaration 0 \u00b7 index 0\n\t[2] visibility_modifier\n\t\t105..108\n\t\tdeclaration 0 \u00b7 index 1 \u00b7 parent 0\n\t[3] type_identifier\n\t\t116..122\n\t\tdeclaration 0 \u00b7 index 2 \u00b7 parent 0\n\t[4] field_declaration_list \u00b7 3 lines\n\t\t123..160\n\t\tdeclaration 0 \u00b7 index 3 \u00b7 parent 0\n\t[5] field_declaration\n\t\t129..157\n\t\tdeclaration 0 \u00b7 index 4 \u00b7 parent 3\n\t[6] visibility_modifier\n\t\t129..132\n\t\tdeclaration 0 \u00b7 index 5 \u00b7 parent 4\n\t[7] field_identifier\n\t\t133..137\n\t\tdeclaration 0 \u00b7 index 6 \u00b7 parent 4\n\t[8] scoped_type_identifier\n\t\t139..157\n\t\tdeclaration 0 \u00b7 index 7 \u00b7 parent 4\n\t[9] scoped_identifier\n\t\t139..148\n\t\tdeclaration 0 \u00b7 index 8 \u00b7 parent 7\n\t[10] identifier\n\t\t139..142\n\t\tdeclaration 0 \u00b7 index 9 \u00b7 parent 8\n\t[11] identifier\n\t\t144..148\n\t\tdeclaration 0 \u00b7 index 10 \u00b7 parent 8\n\t[12] type_identifier\n\t\t150..157\n\t\tdeclaration 0 \u00b7 index 11 \u00b7 parent 7\n\n\t\tpub struct Config {\n\t\t    pub root: std::path::PathBuf,\n\t\t}\nrevision rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11\n",
     "json": {
       "symbol": "rift://symbol/local/rust/example_project/config/Config",
       "nodes": [
@@ -1204,7 +1208,8 @@
           "source": "PathBuf",
           "parent": 7
         }
-      ]
+      ],
+      "revision": "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11"
     }
   },
   "local-search": {
@@ -1854,7 +1859,7 @@
       "id": "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon",
       "include": ["documentation"]
     },
-    "text": "\tfunction beacon\n\trift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon\n\tdependency demo@1.0.0\n\n\tdocumentation:\n\t\trift://source/cargo/crates.io/demo@1.0.0/README.md:1\n\t\t\tguide\n\n\tdeclarations:\n\t\trift://source/cargo/crates.io/demo@1.0.0/src/lib.rs:2\n\t\t26..44\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction beacon\n\trift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon\n\tdependency demo@1.0.0\n\n\tdocumentation:\n\t\trift://source/cargo/crates.io/demo@1.0.0/README.md:1\n\t\t\tguide\n\n\tdeclarations:\n\t\trift://source/cargo/crates.io/demo@1.0.0/src/lib.rs:2\n\t\t26..44\nrevision rift://revision/cargo/crates.io/demo@1.0.0\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -1877,6 +1882,7 @@
         "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "expires_at": "2099-10-10T10:05:00Z"
       },
+      "revision": "rift://revision/cargo/crates.io/demo@1.0.0",
       "declarations": [
         {
           "origin": {
@@ -1970,7 +1976,7 @@
     "arguments": {
       "id": "rift://symbol/stdlib/node@26.11.1/javascript/fs/readFile"
     },
-    "text": "\tfunction readFile\n\trift://symbol/stdlib/node@26.11.1/javascript/fs/readFile\n\tstdlib node@26.11.1\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction readFile\n\trift://symbol/stdlib/node@26.11.1/javascript/fs/readFile\n\tstdlib node@26.11.1\nrevision rift://revision/stdlib/node@26.11.1\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -1991,6 +1997,7 @@
         "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "expires_at": "2099-10-10T10:05:00Z"
       },
+      "revision": "rift://revision/stdlib/node@26.11.1",
       "declarations": []
     }
   },
@@ -1999,7 +2006,7 @@
     "arguments": {
       "id": "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
     },
-    "text": "\tfunction len\n\trift://symbol/stdlib/cpython@3.12.9/python/builtins/len\n\tsynthetic\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction len\n\trift://symbol/stdlib/cpython@3.12.9/python/builtins/len\n\tsynthetic\nrevision rift://revision/stdlib/cpython@3.12.9\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -2015,6 +2022,7 @@
         "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "expires_at": "2099-10-10T10:05:00Z"
       },
+      "revision": "rift://revision/stdlib/cpython@3.12.9",
       "declarations": []
     }
   },
@@ -2023,7 +2031,7 @@
     "arguments": {
       "id": "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format"
     },
-    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format\n\tdependency prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:1\n\t\t0..46\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:2\n\t\t47..93\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format\n\tdependency prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:1\n\t\t0..46\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:2\n\t\t47..93\nrevision rift://revision/npm/npmjs.org/prettier@3.8.5\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -2046,6 +2054,7 @@
         "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "expires_at": "2099-10-10T10:05:00Z"
       },
+      "revision": "rift://revision/npm/npmjs.org/prettier@3.8.5",
       "declarations": [
         {
           "origin": {
@@ -2098,7 +2107,7 @@
       "id": "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format",
       "declaration_limit": 1
     },
-    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format\n\tdependency prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:1\n\t\t0..46\n\tdeclaration_cursor fixture-next\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format\n\tdependency prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:1\n\t\t0..46\n\tdeclaration_cursor fixture-next\nrevision rift://revision/npm/npmjs.org/prettier@3.8.5\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -2121,6 +2130,7 @@
         "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "expires_at": "2099-10-10T10:05:00Z"
       },
+      "revision": "rift://revision/npm/npmjs.org/prettier@3.8.5",
       "declarations": [
         {
           "origin": {
@@ -2155,7 +2165,7 @@
       "declaration_cursor": "fixture-next",
       "view": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     },
-    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format\n\tdependency prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:2\n\t\t47..93\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format\n\tdependency prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:2\n\t\t47..93\nrevision rift://revision/npm/npmjs.org/prettier@3.8.5\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -2178,6 +2188,7 @@
         "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "expires_at": "2099-10-10T10:05:00Z"
       },
+      "revision": "rift://revision/npm/npmjs.org/prettier@3.8.5",
       "declarations": [
         {
           "origin": {

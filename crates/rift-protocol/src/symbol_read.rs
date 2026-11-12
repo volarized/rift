@@ -6,9 +6,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
     documentation::DocumentationContext,
     read::{
-        GetSymbolInclude, PAGE_LIMIT_MAX, ProjectPath, ReadWarning, RevisionId, SourceUnitId,
-        Symbol, SymbolHistory, SymbolId, SymbolOrigin, TextRange,
+        GetSymbolInclude, PAGE_LIMIT_MAX, ProjectPath, ReadWarning, SourceUnitId, Symbol,
+        SymbolHistory, SymbolId, SymbolOrigin, TextRange,
     },
+    revision::Revision,
 };
 
 /// A service-issued key for one immutable view in one serving context.
@@ -125,9 +126,12 @@ pub struct GetSymbolParams {
     /// by `nodes` with `symbol`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<GetSymbolInclude>,
-    /// A local Git revision. Refused for a package or runtime owner and beside `view`.
+    /// The revision to read. A git revision reads that commit of a project, a tree
+    /// revision reads the served working tree, and a release revision names the release
+    /// a package or runtime `id` carries. Omitted reads the served working tree. The
+    /// server refuses it beside `view` and once the index no longer serves it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rev: Option<RevisionId>,
+    pub revision: Option<Revision>,
     /// A view returned by a preceding read. Expiry never selects latest implicitly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<CapturedViewId>,
@@ -285,6 +289,8 @@ pub enum GetSymbolResult {
         symbol: Box<Symbol>,
         /// The immutable context used for this result and its continuations.
         view: CapturedView,
+        /// The revision this answer was read at: a commit, a release, or a working tree.
+        revision: Revision,
         /// Declaration bindings in deterministic source order.
         #[schemars(length(max = PAGE_LIMIT_MAX))]
         declarations: Vec<SymbolDeclaration>,
@@ -308,6 +314,8 @@ pub enum GetSymbolResult {
         symbol_not_found: SymbolNotFound,
         /// The exact immutable selection searched.
         view: CapturedView,
+        /// The revision this answer was read at: a commit, a release, or a working tree.
+        revision: Revision,
         /// Warnings, including incomplete candidate work.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         warnings: Vec<ReadWarning>,
@@ -321,6 +329,9 @@ pub enum GetSymbolResult {
         /// The selected view, when one could be captured.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         view: Option<CapturedView>,
+        /// The revision the read selected, when it established one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        revision: Option<Revision>,
         /// The typed cause of unavailability.
         reason: SymbolUnavailableReason,
         /// Details and available partial-read warnings.
@@ -330,37 +341,55 @@ pub enum GetSymbolResult {
 }
 
 impl GetSymbolResult {
-    /// Checks exact identity and declaration associations at a serving boundary.
+    /// The revision this answer reports, absent only from an unavailable read that
+    /// established none.
+    #[must_use]
+    pub const fn revision(&self) -> Option<&Revision> {
+        match self {
+            Self::Found { revision, .. } | Self::Missing { revision, .. } => Some(revision),
+            Self::Unavailable { revision, .. } => revision.as_ref(),
+        }
+    }
+
+    /// Checks exact identity, revision, and declaration associations at a serving boundary.
     #[must_use]
     pub fn is_valid_for(&self, requested: &SymbolId) -> bool {
-        match self {
-            Self::Found {
-                symbol,
-                declarations,
-                ..
-            } => {
-                symbol.id.as_ref() == Some(requested)
-                    && crate::identity::SymbolIdentity::parse(requested.as_str())
-                        .is_ok_and(|identity| identity.language() == &symbol.language)
-                    && u64::try_from(declarations.len())
-                        .is_ok_and(|length| length <= PAGE_LIMIT_MAX)
-                    && declarations
-                        .iter()
-                        .all(|declaration| declaration.is_valid_for(symbol))
+        let Ok(identity) = crate::identity::SymbolIdentity::parse(requested.as_str()) else {
+            return false;
+        };
+        let answered = self
+            .revision()
+            .is_none_or(|revision| revision.answers_for(identity.owner()));
+        answered
+            && match self {
+                Self::Found {
+                    symbol,
+                    declarations,
+                    ..
+                } => {
+                    symbol.id.as_ref() == Some(requested)
+                        && identity.language() == &symbol.language
+                        && u64::try_from(declarations.len())
+                            .is_ok_and(|length| length <= PAGE_LIMIT_MAX)
+                        && declarations
+                            .iter()
+                            .all(|declaration| declaration.is_valid_for(symbol))
+                }
+                Self::Missing {
+                    symbol_not_found, ..
+                } => {
+                    symbol_not_found.id == *requested
+                        && SymbolId::parse(requested.as_str()).is_ok()
+                        && symbol_not_found.alternatives.len() <= 3
+                        && symbol_not_found
+                            .alternatives
+                            .iter()
+                            .all(|candidate| SymbolId::parse(candidate.id.as_str()).is_ok())
+                }
+                Self::Unavailable { id, .. } => {
+                    id == requested && SymbolId::parse(id.as_str()).is_ok()
+                }
             }
-            Self::Missing {
-                symbol_not_found, ..
-            } => {
-                symbol_not_found.id == *requested
-                    && SymbolId::parse(requested.as_str()).is_ok()
-                    && symbol_not_found.alternatives.len() <= 3
-                    && symbol_not_found
-                        .alternatives
-                        .iter()
-                        .all(|candidate| SymbolId::parse(candidate.id.as_str()).is_ok())
-            }
-            Self::Unavailable { id, .. } => id == requested && SymbolId::parse(id.as_str()).is_ok(),
-        }
     }
 }
 

@@ -15,7 +15,7 @@ Parameters:
 
 - `id` (required) - Canonical identity.
 - `include` - Requested projections.
-- `rev` - A local Git revision.
+- `revision` - The revision to read.
 - `view` - A view returned by a preceding read.
 - `declaration_limit` - Most declarations returned in this read.
 - `declaration_cursor` - Continuation bound to this exact symbol, projections and serving view.
@@ -31,10 +31,11 @@ each node is addressed by its place: node `index` of declaration `declaration` o
 that symbol, or node `index` of its unit, from the file node at 0, with `parent` an
 index in the same declaration or unit. An edit renumbers the nodes after it. An answer
 whose nodes cross its node count or source byte bound returns `node_cursor` for the
-rest. A file no syntax provider parses answers its file node alone. `rev` lists the
-nodes as of a version-control revision instead of the current tree. If discovery is
-incomplete or a targeted read spends the request's remaining time, the result has
-empty `nodes` and carries `local_index_preparing`. A selected source path can answer
+rest. A file no syntax provider parses answers its file node alone. `revision` lists
+the nodes at a git commit or pins the served working tree, and the answer names the
+revision it was read at. If discovery is incomplete or a targeted read spends the
+request's remaining time, the result has empty `nodes` and carries
+`local_index_preparing`. A selected source path can answer
 within that remaining time, with the same warning until the publication records the
 path: workspace byte and declaration bounds remain unchecked.
 
@@ -45,7 +46,7 @@ Parameters:
 - `position` - UTF-8 byte offset inside the declaration whose nodes the read lists - one position, not a range; the nodes themselves carry the spans.
 - `node_cursor` - Continuation a preceding read returned, bound to the symbol or unit its answer listed and the tree revision it read.
 - `view` - Captured view selected by discovery.
-- `rev` - The version-control revision to read - a branch, tag, or commit id as the workspace's version control spells it.
+- `revision` - The revision to read: a git revision reads that commit, a tree revision the served working tree, and a release revision names the release a package or runtime `symbol` carries.
 
 ## search
 
@@ -57,7 +58,7 @@ regex against the text of every indexed file, line by line as ripgrep reads it, 
 answers each match and each declaration holding one, in place of `query` and
 `traversal`. `change` answers the declarations a committed revision and another
 revision, or the working tree, hold differently, in place of `query` and `traversal`.
-`rev` searches a version-control revision instead of the current tree, and never
+A git `revision` searches that commit instead of the served working tree, and never
 combines with `pattern`, `traversal`, or `change`. `scope` reaches past the project
 tree: `global` answers collected package and runtime facts selected by the project's
 dependency context. Explicit `packages` replaces versions of named packages or adds
@@ -85,7 +86,7 @@ Parameters:
 - `include` - Extra payload to attach to every hit.
 - `limit` - Most hits to return in one page, at most 10,000; the server refuses a larger `limit` naming the field.
 - `page_index` - Zero-based page of the result set to serve, sized by `limit`.
-- `rev` - The version-control revision to search - a branch, tag, or commit id as the workspace's version control spells it.
+- `revision` - The revision to search: a git revision searches that commit, a tree revision the served working tree.
 - `traversal` - A bounded relationship walk from `seed`, standing alone or beside `query`.
 - `change` - A committed revision compared against another revision or the working tree, standing alone.
 

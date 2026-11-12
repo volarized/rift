@@ -8,7 +8,7 @@ use rift_protocol::read::{GetSymbolHit, ProjectPath, ReadWarning, SymbolHistory,
 use super::facts::{
     Facts, author_of, block_of, cut_hash, date_of, describe, location, spaced_name,
 };
-use super::layout::Lines;
+use super::layout::{self, Lines};
 use super::warning;
 use crate::output::text::TextError;
 
@@ -170,10 +170,11 @@ pub(super) fn canonical(
     result: &rift_protocol::symbol_read::GetSymbolResult,
 ) -> Result<(), TextError> {
     use rift_protocol::symbol_read::GetSymbolResult;
-    let (view, warnings) = match result {
+    let (view, revision, warnings) = match result {
         GetSymbolResult::Found {
             symbol,
             view,
+            revision,
             declarations,
             declaration_cursor,
             history,
@@ -206,11 +207,12 @@ pub(super) fn canonical(
             if let Some(cursor) = declaration_cursor {
                 lines.line(0, &format!("declaration_cursor {cursor}"))?;
             }
-            (Some(view), warnings)
+            (Some(view), Some(revision), warnings)
         }
         GetSymbolResult::Missing {
             symbol_not_found,
             view,
+            revision,
             warnings,
         } => {
             out.raw_line(0, "error: symbol_not_found")?;
@@ -229,20 +231,22 @@ pub(super) fn canonical(
             if let Some(detail) = &symbol_not_found.detail {
                 lines.verbatim(0, detail)?;
             }
-            (Some(view), warnings)
+            (Some(view), Some(revision), warnings)
         }
         GetSymbolResult::Unavailable {
             id,
             view,
+            revision,
             reason,
             warnings,
         } => {
             let mut lines = Lines::new(out, 0, 1);
             lines.head(&format!("unavailable · {reason:?}"))?;
             lines.line(0, id.as_str())?;
-            (view.as_ref(), warnings)
+            (view.as_ref(), revision.as_ref(), warnings)
         }
     };
+    layout::revision(out, revision)?;
     if let Some(view) = view {
         out.raw_line(
             0,

@@ -3,7 +3,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::read::{ExactKind, ReadWarning, RevisionId, SourceUnitId, SymbolId};
+use crate::read::{ExactKind, ReadWarning, SourceUnitId, SymbolId};
 use crate::symbol_read::{CapturedView, CapturedViewId, SymbolUnavailableReason};
 
 /// Most positions submitted to one declaration-position read.
@@ -49,9 +49,6 @@ pub struct FindDeclarationsParams {
     /// A preceding immutable selection shared by the whole batch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<CapturedViewId>,
-    /// A local Git revision. Refused for released sources and beside `view`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rev: Option<RevisionId>,
 }
 
 /// One submitted source position and its exact declaration outcome.
@@ -106,7 +103,7 @@ impl SourcePosition {
     /// Checks canonical source spelling and negotiated coordinate bounds.
     #[must_use]
     pub fn is_valid(&self) -> bool {
-        source_valid(&self.unit, None)
+        SourceUnitId::parse(self.unit.as_str()).is_ok()
             && self.line <= SOURCE_POSITION_MAX
             && self.character <= SOURCE_POSITION_MAX
     }
@@ -119,10 +116,8 @@ impl FindDeclarationsParams {
         let mut seen = std::collections::HashSet::new();
         !self.positions.is_empty()
             && self.positions.len() <= SOURCE_POSITIONS_MAX
-            && selectors_valid(self.view.as_ref(), self.rev.as_ref())
             && self.positions.iter().all(|position| {
                 position.is_valid()
-                    && source_valid(&position.unit, self.rev.as_ref())
                     && seen.insert((position.unit.as_str(), position.line, position.character))
             })
     }
@@ -177,14 +172,6 @@ impl FindDeclarationsResult {
                     }
             })
     }
-}
-
-fn selectors_valid(view: Option<&CapturedViewId>, rev: Option<&RevisionId>) -> bool {
-    !(view.is_some() && rev.is_some()) && rev.is_none_or(|rev| rev.violation().is_none())
-}
-
-fn source_valid(unit: &SourceUnitId, rev: Option<&RevisionId>) -> bool {
-    SourceUnitId::parse(unit.as_str()).is_ok() && (rev.is_none() || unit.is_project())
 }
 
 fn view_matches(view: &CapturedView, requested: Option<&CapturedViewId>) -> bool {
