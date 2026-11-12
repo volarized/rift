@@ -22,8 +22,9 @@ from mcp.client.stdio import stdio_client
 
 from rift_dev.check_artifact import incoming_references, symbol_hit, symbol_id
 from rift_dev.commands import DockerCommand, owned_environment
+from rift_dev.local_index_read import settled_local
 from rift_dev.log_records import parse_line
-from rift_dev.query import literal
+from rift_dev.query import bindings, literal, retrieval_request
 from rift_dev.rift_test_client import (
     LOG_BYTES_MAX,
     LOG_FILTER,
@@ -147,7 +148,25 @@ async def check_first_use(client: Client, name: str) -> None:
         f"cold workspace was not empty: {workspace}",
     )
     container_command(name, ["sh", "-c", 'printf %s "$1" > lib.rs', "sh", SOURCE])
-    hit = await symbol_hit(client, "beacon_cold")
+    # A bare Rust file has syntax before it has a canonical crate identity.
+    answer = await settled_local(
+        client,
+        "search",
+        retrieval_request(
+            {"pattern": r"\bbeacon_cold\b", "target": "symbol", "include": ["source"]},
+            ("name", "language", "source"),
+        ),
+        seconds=COLDSTART_SECONDS,
+        poll_seconds=POLL_SECONDS,
+        selection="current",
+    )
+    matches = [
+        row
+        for row in bindings(answer)
+        if literal(row, "name") == "beacon_cold" and literal(row, "language") == "rust"
+    ]
+    require(len(matches) == 1, f"expected one beacon_cold declaration: {answer}")
+    hit = matches[0]
     require(
         literal(hit, "source") == SOURCE.rstrip("\n"),
         f"late file was not indexed: {hit}",
