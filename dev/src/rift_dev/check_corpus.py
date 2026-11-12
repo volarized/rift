@@ -1106,7 +1106,7 @@ class Corpus:
                 "limit": 5,
             }
         )
-        answer = await client.call("search", request)
+        answer = await settled_local(client, "search", request)
         hits = bindings(answer)
         require(
             len(hits) == 1 and literal(hits[0], "source") == PROBE_SOURCE.rstrip("\n"),
@@ -1125,7 +1125,7 @@ class Corpus:
             "lexical_persistence", before=sizes, after=database_bytes(self.root)
         )
         path.unlink()
-        answer = await client.call("search", request)
+        answer = await settled_local(client, "search", request)
         require(not bindings(answer), f"removed source remained indexed: {answer}")
         await self.await_probe(False)
         require(
@@ -1194,8 +1194,9 @@ class Corpus:
             await client.call("nodes", {"path": path, "position": 0})
         except ToolFailure as error:
             require(
-                error.code == "temporarily_unavailable"
-                and "required Nodes facts" in str(error),
+                error.code == "resource_not_found"
+                and error.retry == "never"
+                and error.identity == "rift.server.read_not_found",
                 f"symlink nodes wrong refusal: {error}",
             )
         else:
