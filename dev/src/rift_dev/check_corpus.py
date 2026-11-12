@@ -1399,6 +1399,7 @@ class Corpus:
     async def shallow(self, root: Path) -> None:
         self.pin.checkout(root, depth=1)
         self.configure(root=root)
+        application = "fastapi/applications.py"
         with self.server(root) as server:
             async with server.connect() as client:
                 found = await settled_local(
@@ -1408,7 +1409,7 @@ class Corpus:
                         {
                             "query": "FastAPI",
                             "target": "symbol",
-                            "paths": {"include": ["fastapi/**/*.py"]},
+                            "paths": {"include": [application]},
                             "limit": 1000,
                         }
                     ),
@@ -1425,7 +1426,7 @@ class Corpus:
                             "shallow class lost its canonical Python identity",
                         )
                         require(
-                            literal(hit, "path").endswith(".py"),
+                            literal(hit, "path") == application,
                             "shallow class lost its original Python source path",
                         )
                         selected.append(hit)
