@@ -664,7 +664,7 @@ fn captured_nodes_keep_canonical_binding_and_file_source_after_live_source_chang
         .0
         .nodes
         .iter()
-        .find(|node| node.index == 0 && node.unit.as_str() == "rift://file/index.js")
+        .find(|node| node.index == 0 && node.unit.as_str() == "rift://source/project/index.js")
         .expect("the captured function's declaration in index.js holds nodes");
     assert!(
         reads

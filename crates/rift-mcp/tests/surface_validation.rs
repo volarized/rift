@@ -877,7 +877,7 @@ fn node_units(structured: &Value) -> Vec<String> {
                 for (key, member) in members {
                     match member {
                         Value::String(identity)
-                            if key == "unit" && identity.starts_with("rift://file/") =>
+                            if key == "unit" && identity.starts_with("rift://source/project/") =>
                         {
                             found.push(identity.clone());
                         }

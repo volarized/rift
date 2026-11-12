@@ -165,7 +165,7 @@ fn a_symbol_with_several_declarations_lists_each_outermost_first() -> TestResult
     for (item, binding) in items.iter().zip(&bindings) {
         assert_eq!(
             item.unit,
-            rift_protocol::read::NodeUnit::File(crate::read::file_id(binding.file.path())),
+            crate::read::file_id(binding.file.path()),
             "item nodes follow binding order"
         );
         assert_eq!(item.range.start, binding.symbol.item_range.start);
@@ -185,7 +185,7 @@ fn a_symbol_with_several_declarations_lists_each_outermost_first() -> TestResult
     for item in &items {
         let start = usize::try_from(item.range.start)?;
         let end = usize::try_from(item.range.end)?;
-        if item.unit.as_str() == "rift://file/index.d.ts" {
+        if item.unit.as_str() == "rift://source/project/index.d.ts" {
             assert_eq!(item.source, declarations[start..end]);
         }
     }
@@ -390,7 +390,11 @@ fn a_cursor_beside_a_position_continues_the_answer_it_came_with() -> TestResult 
     assert_eq!(rest.nodes, symbol_nodes(&service, &dim)?.nodes[1..]);
     let foreign = service
         .nodes(&NodesParams {
-            node_cursor: Some(super::cursor(1, "rift://file/src/lib.rs", &revision)),
+            node_cursor: Some(super::cursor(
+                1,
+                "rift://source/project/src/lib.rs",
+                &revision,
+            )),
             ..NodesParams::at(path, position)
         })
         .expect_err("a cursor minted for the unit refuses inside a declaration");

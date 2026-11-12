@@ -240,7 +240,7 @@ async fn a_raised_providers_syntax_bound_indexes_the_file_the_default_leaves_out
 
 /// Whether one search answer names `path` in a `source_unavailable` warning.
 fn names_unavailable(answer: &Value, path: &str) -> bool {
-    let unit = format!("rift://file/{path}");
+    let unit = format!("rift://source/project/{path}");
     answer["warnings"].as_array().is_some_and(|warnings| {
         warnings
             .iter()

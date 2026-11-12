@@ -2445,7 +2445,7 @@ mod tests {
                 {
                     "declaration": 0,
                     "index": 0,
-                    "unit": "rift://file/a.rs",
+                    "unit": "rift://source/project/a.rs",
                     "kind": "function_item",
                     "range": { "start": 0, "end": 9 },
                     "source": "fn a() {}"
@@ -2454,7 +2454,7 @@ mod tests {
                     "declaration": 0,
                     "index": 2,
                     "parent": 0,
-                    "unit": "rift://file/a.rs",
+                    "unit": "rift://source/project/a.rs",
                     "kind": "identifier",
                     "range": { "start": 3, "end": 4 },
                     "source": "a"
@@ -2462,7 +2462,7 @@ mod tests {
                 {
                     "declaration": 1,
                     "index": 0,
-                    "unit": "rift://file/b.rs",
+                    "unit": "rift://source/project/b.rs",
                     "kind": "function_item",
                     "range": { "start": 0, "end": 9 },
                     "source": "fn a() {}"

@@ -646,7 +646,7 @@
         {
           "declaration": 0,
           "index": 0,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "function_item",
           "facets": ["declaration", "definition"],
@@ -659,7 +659,7 @@
         {
           "declaration": 0,
           "index": 1,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "visibility_modifier",
           "range": {
@@ -672,7 +672,7 @@
         {
           "declaration": 0,
           "index": 2,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "identifier",
           "range": {
@@ -685,7 +685,7 @@
         {
           "declaration": 0,
           "index": 3,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "parameters",
           "range": {
@@ -698,7 +698,7 @@
         {
           "declaration": 0,
           "index": 4,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "parameter",
           "range": {
@@ -711,7 +711,7 @@
         {
           "declaration": 0,
           "index": 5,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "identifier",
           "range": {
@@ -724,7 +724,7 @@
         {
           "declaration": 0,
           "index": 6,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "reference_type",
           "range": {
@@ -737,7 +737,7 @@
         {
           "declaration": 0,
           "index": 7,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "type_identifier",
           "range": {
@@ -750,7 +750,7 @@
         {
           "declaration": 0,
           "index": 8,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "generic_type",
           "range": {
@@ -763,7 +763,7 @@
         {
           "declaration": 0,
           "index": 9,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "type_identifier",
           "range": {
@@ -776,7 +776,7 @@
         {
           "declaration": 0,
           "index": 10,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "type_arguments",
           "range": {
@@ -789,7 +789,7 @@
         {
           "declaration": 0,
           "index": 11,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "type_identifier",
           "range": {
@@ -802,7 +802,7 @@
         {
           "declaration": 0,
           "index": 12,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "type_identifier",
           "range": {
@@ -815,7 +815,7 @@
         {
           "declaration": 0,
           "index": 13,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "block",
           "range": {
@@ -828,7 +828,7 @@
         {
           "declaration": 0,
           "index": 14,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "let_declaration",
           "facets": ["declaration", "definition"],
@@ -842,7 +842,7 @@
         {
           "declaration": 0,
           "index": 15,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "identifier",
           "range": {
@@ -855,7 +855,7 @@
         {
           "declaration": 0,
           "index": 16,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "try_expression",
           "facets": ["expression"],
@@ -869,7 +869,7 @@
         {
           "declaration": 0,
           "index": 17,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "call_expression",
           "facets": ["expression"],
@@ -883,7 +883,7 @@
         {
           "declaration": 0,
           "index": 18,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "scoped_identifier",
           "range": {
@@ -896,7 +896,7 @@
         {
           "declaration": 0,
           "index": 19,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "scoped_identifier",
           "range": {
@@ -909,7 +909,7 @@
         {
           "declaration": 0,
           "index": 20,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "identifier",
           "range": {
@@ -922,7 +922,7 @@
         {
           "declaration": 0,
           "index": 21,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "identifier",
           "range": {
@@ -935,7 +935,7 @@
         {
           "declaration": 0,
           "index": 22,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "identifier",
           "range": {
@@ -948,7 +948,7 @@
         {
           "declaration": 0,
           "index": 23,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "arguments",
           "range": {
@@ -961,7 +961,7 @@
         {
           "declaration": 0,
           "index": 24,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "identifier",
           "range": {
@@ -974,7 +974,7 @@
         {
           "declaration": 0,
           "index": 25,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "call_expression",
           "facets": ["expression"],
@@ -988,7 +988,7 @@
         {
           "declaration": 0,
           "index": 26,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "identifier",
           "range": {
@@ -1001,7 +1001,7 @@
         {
           "declaration": 0,
           "index": 27,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "arguments",
           "range": {
@@ -1014,7 +1014,7 @@
         {
           "declaration": 0,
           "index": 28,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "reference_expression",
           "facets": ["expression"],
@@ -1028,7 +1028,7 @@
         {
           "declaration": 0,
           "index": 29,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "identifier",
           "range": {
@@ -1054,7 +1054,7 @@
         {
           "declaration": 0,
           "index": 0,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "struct_item",
           "facets": ["declaration", "definition"],
@@ -1067,7 +1067,7 @@
         {
           "declaration": 0,
           "index": 1,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "visibility_modifier",
           "range": {
@@ -1080,7 +1080,7 @@
         {
           "declaration": 0,
           "index": 2,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "type_identifier",
           "range": {
@@ -1093,7 +1093,7 @@
         {
           "declaration": 0,
           "index": 3,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "field_declaration_list",
           "range": {
@@ -1106,7 +1106,7 @@
         {
           "declaration": 0,
           "index": 4,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "field_declaration",
           "facets": ["declaration", "definition"],
@@ -1120,7 +1120,7 @@
         {
           "declaration": 0,
           "index": 5,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "visibility_modifier",
           "range": {
@@ -1133,7 +1133,7 @@
         {
           "declaration": 0,
           "index": 6,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "field_identifier",
           "range": {
@@ -1146,7 +1146,7 @@
         {
           "declaration": 0,
           "index": 7,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "scoped_type_identifier",
           "range": {
@@ -1159,7 +1159,7 @@
         {
           "declaration": 0,
           "index": 8,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "scoped_identifier",
           "range": {
@@ -1172,7 +1172,7 @@
         {
           "declaration": 0,
           "index": 9,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "identifier",
           "range": {
@@ -1185,7 +1185,7 @@
         {
           "declaration": 0,
           "index": 10,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "identifier",
           "range": {
@@ -1198,7 +1198,7 @@
         {
           "declaration": 0,
           "index": 11,
-          "unit": "rift://file/src/config.rs",
+          "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "type_identifier",
           "range": {

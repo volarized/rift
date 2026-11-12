@@ -257,61 +257,6 @@ impl Extensions {
     }
 }
 
-/// Identity of one file in the tree a request targets. The path after `rift://file/` is a
-/// `ProjectPath` in canonical percent-encoding. The server re-validates the decoded path
-/// wherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,
-/// whatever schema its implementation generated from.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(transparent)]
-#[schemars(transparent)]
-pub struct FileId(
-    #[schemars(example = &"rift://file/src/lib.rs")]
-    #[schemars(length(min = 13, max = 8192))]
-    #[schemars(regex(
-        pattern = concat!(r"^rift://file/", identity_path_character!(), r"{1,1000}$")
-    ))]
-    pub String,
-);
-
-/// The source unit a [`Node`] is written in: a file of the project tree the read targets, or
-/// a source unit of the package or runtime release that owns the node's symbol.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
-#[serde(untagged)]
-pub enum NodeUnit {
-    /// A file of the project tree, as `rift://file/src/lib.rs`.
-    File(FileId),
-    /// A source unit of a package or runtime, as `rift://source/cargo/crates.io/demo/src/lib.rs`.
-    Source(SourceUnitId),
-}
-
-impl NodeUnit {
-    /// The unit's canonical identity.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::File(file) => &file.0,
-            Self::Source(unit) => unit.as_str(),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for NodeUnit {
-    /// Selects the variant by the identity's scheme prefix: a `FileId` accepts any string,
-    /// so an untagged decode would never reach `Source`.
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = String::deserialize(deserializer)?;
-        if value.starts_with(FILE_ID_PREFIX) {
-            return Ok(Self::File(FileId(value)));
-        }
-        SourceUnitId::parse(&value)
-            .map(Self::Source)
-            .map_err(serde::de::Error::custom)
-    }
-}
-
-/// The scheme and kind prefix every [`FileId`] starts with.
-const FILE_ID_PREFIX: &str = "rift://file/";
-
 /// One declaration a `get_symbol` lookup found.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -724,9 +669,10 @@ pub struct Node {
     /// unit when `declaration` is absent. The item node and the unit's file node are 0.
     #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
     pub index: u64,
-    /// The source unit the node is written in: a project file, or a package or runtime
-    /// source unit for a node of a package or runtime symbol.
-    pub unit: NodeUnit,
+    /// The source unit the node is written in: a project file, as
+    /// `rift://source/project/src/lib.rs`, or a package or runtime source unit for a node of
+    /// a package or runtime symbol. It names no revision; the answer's `revision` does.
+    pub unit: SourceUnitId,
     /// The grammar that produced this node. It belongs to the identity because two
     /// providers can produce different trees over the same file bytes.
     pub language: Language,
@@ -923,7 +869,7 @@ pub const NODES_SOURCE_BYTES_MAX: u64 = 1_048_576;
             {
                 "declaration": 0,
                 "index": 0,
-                "unit": "rift://file/src/config.rs",
+                "unit": "rift://source/project/src/config.rs",
                 "language": "rust",
                 "kind": "struct_item",
                 "facets": [
@@ -939,7 +885,7 @@ pub const NODES_SOURCE_BYTES_MAX: u64 = 1_048_576;
             {
                 "declaration": 0,
                 "index": 1,
-                "unit": "rift://file/src/config.rs",
+                "unit": "rift://source/project/src/config.rs",
                 "language": "rust",
                 "kind": "visibility_modifier",
                 "range": {
@@ -952,7 +898,7 @@ pub const NODES_SOURCE_BYTES_MAX: u64 = 1_048_576;
             {
                 "declaration": 0,
                 "index": 2,
-                "unit": "rift://file/src/config.rs",
+                "unit": "rift://source/project/src/config.rs",
                 "language": "rust",
                 "kind": "type_identifier",
                 "range": {
@@ -965,7 +911,7 @@ pub const NODES_SOURCE_BYTES_MAX: u64 = 1_048_576;
             {
                 "declaration": 0,
                 "index": 3,
-                "unit": "rift://file/src/config.rs",
+                "unit": "rift://source/project/src/config.rs",
                 "language": "rust",
                 "kind": "field_declaration_list",
                 "range": {
@@ -978,7 +924,7 @@ pub const NODES_SOURCE_BYTES_MAX: u64 = 1_048_576;
             {
                 "declaration": 0,
                 "index": 4,
-                "unit": "rift://file/src/config.rs",
+                "unit": "rift://source/project/src/config.rs",
                 "language": "rust",
                 "kind": "field_declaration",
                 "facets": [
@@ -995,7 +941,7 @@ pub const NODES_SOURCE_BYTES_MAX: u64 = 1_048_576;
             {
                 "declaration": 0,
                 "index": 5,
-                "unit": "rift://file/src/config.rs",
+                "unit": "rift://source/project/src/config.rs",
                 "language": "rust",
                 "kind": "visibility_modifier",
                 "range": {
@@ -1008,7 +954,7 @@ pub const NODES_SOURCE_BYTES_MAX: u64 = 1_048_576;
             {
                 "declaration": 0,
                 "index": 6,
-                "unit": "rift://file/src/config.rs",
+                "unit": "rift://source/project/src/config.rs",
                 "language": "rust",
                 "kind": "field_identifier",
                 "range": {
@@ -1021,7 +967,7 @@ pub const NODES_SOURCE_BYTES_MAX: u64 = 1_048_576;
             {
                 "declaration": 0,
                 "index": 7,
-                "unit": "rift://file/src/config.rs",
+                "unit": "rift://source/project/src/config.rs",
                 "language": "rust",
                 "kind": "scoped_type_identifier",
                 "range": {
@@ -1034,7 +980,7 @@ pub const NODES_SOURCE_BYTES_MAX: u64 = 1_048_576;
             {
                 "declaration": 0,
                 "index": 8,
-                "unit": "rift://file/src/config.rs",
+                "unit": "rift://source/project/src/config.rs",
                 "language": "rust",
                 "kind": "scoped_identifier",
                 "range": {
@@ -1047,7 +993,7 @@ pub const NODES_SOURCE_BYTES_MAX: u64 = 1_048_576;
             {
                 "declaration": 0,
                 "index": 9,
-                "unit": "rift://file/src/config.rs",
+                "unit": "rift://source/project/src/config.rs",
                 "language": "rust",
                 "kind": "identifier",
                 "range": {
@@ -1060,7 +1006,7 @@ pub const NODES_SOURCE_BYTES_MAX: u64 = 1_048_576;
             {
                 "declaration": 0,
                 "index": 10,
-                "unit": "rift://file/src/config.rs",
+                "unit": "rift://source/project/src/config.rs",
                 "language": "rust",
                 "kind": "identifier",
                 "range": {
@@ -1073,7 +1019,7 @@ pub const NODES_SOURCE_BYTES_MAX: u64 = 1_048_576;
             {
                 "declaration": 0,
                 "index": 11,
-                "unit": "rift://file/src/config.rs",
+                "unit": "rift://source/project/src/config.rs",
                 "language": "rust",
                 "kind": "type_identifier",
                 "range": {
@@ -1401,7 +1347,7 @@ pub enum ReadWarning {
     /// framework-specific facts whose context is missing are left out.
     FrameworkContextUnresolved {
         /// The source whose framework context is unresolved.
-        unit: FileId,
+        unit: SourceUnitId,
         /// The framework whose context could not be established.
         framework: SyntaxFramework,
         /// The missing package version, configuration, or template source.
@@ -1543,7 +1489,7 @@ pub enum ReadWarning {
         matches_per_file: u64,
         /// The files cut at the bound.
         #[schemars(length(max = 8))]
-        files: Vec<FileId>,
+        files: Vec<SourceUnitId>,
     },
     /// The trigram index `pattern` selects its files through lacks rows of stored file
     /// text, and verifying those rows beside the selected ones would pass the `[search]`
@@ -1575,7 +1521,7 @@ pub enum ReadWarning {
         /// The file the warning names. Absent on the one warning that counts the files
         /// past `SOURCE_WARNINGS_MAX`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        unit: Option<FileId>,
+        unit: Option<SourceUnitId>,
         /// Why the warning was raised - prose for a reader; nothing keys on it.
         #[schemars(length(max = 4096))]
         detail: String,
@@ -1599,7 +1545,7 @@ pub enum ReadWarning {
     LargeFileUnparsed {
         /// The files held as text alone.
         #[schemars(length(max = 8))]
-        files: Vec<FileId>,
+        files: Vec<SourceUnitId>,
         /// Why the warning was raised - prose for a reader; nothing keys on it.
         #[schemars(length(max = 4096))]
         detail: String,
@@ -1612,7 +1558,7 @@ pub enum ReadWarning {
     LockfileExcluded {
         /// The selected lockfiles search leaves out.
         #[schemars(length(max = 8))]
-        files: Vec<FileId>,
+        files: Vec<SourceUnitId>,
         /// Why the warning was raised - prose for a reader; nothing keys on it.
         #[schemars(length(max = 4096))]
         detail: String,
@@ -2382,7 +2328,7 @@ pub enum SourceLocationKind {
 #[serde(deny_unknown_fields)]
 pub struct SourceSpan {
     /// Which file the offsets are into.
-    pub unit: FileId,
+    pub unit: SourceUnitId,
     /// The bytes, as offsets into that file.
     pub range: TextRange,
 }
@@ -2436,6 +2382,24 @@ impl SourceUnitId {
         Ok(Self(value.to_owned()))
     }
 
+    /// The source unit of one file of the project tree a read targets, as
+    /// `rift://source/project/src/lib.rs`: the path in the canonical source-unit encoding.
+    /// It validates nothing; every consumer that accepts a unit decodes it through
+    /// [`Self::parse`], which refuses a path no project file can have.
+    #[must_use]
+    pub fn project(path: &str) -> Self {
+        let key = crate::identity::encode_source_unit_key(path);
+        Self(format!("{PROJECT_SOURCE_UNIT_PREFIX}{key}"))
+    }
+
+    /// The project-relative path of a project source unit; absent for a package, runtime,
+    /// or custom resolver unit.
+    #[must_use]
+    pub fn project_path(&self) -> Option<String> {
+        let key = self.0.strip_prefix(PROJECT_SOURCE_UNIT_PREFIX)?;
+        crate::identity::decode_source_unit_key(key).ok()
+    }
+
     /// Returns the canonical physical source address.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -2456,6 +2420,10 @@ impl<'de> Deserialize<'de> for SourceUnitId {
         Ok(Self(value))
     }
 }
+
+/// The prefix of every project source unit: the `project` resolver of the tree a read
+/// targets.
+const PROJECT_SOURCE_UNIT_PREFIX: &str = "rift://source/project/";
 
 /// One byte range in a source-catalog unit.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -2915,42 +2883,42 @@ mod tests {
     use crate::dependencies::{PackageAvailability, PackageContextEntry, PackageSelector};
 
     use super::{
-        Digest, Duration, FileId, GLOBAL_WARNING_DETAIL_CHARS_MAX, GetSymbolParams,
-        GlobalFailureClass, GlobalPageWarningCode, LANGUAGE_IDENTITY_PATTERN, Language,
-        PAGE_INDEX_DEFAULT, PAGE_LIMIT_MAX, PackageIdentity, REVISION_ID_BYTES_MAX, ReadWarning,
-        RelationshipFacet, RevisionId, RevisionIdViolation, SOURCE_WARNINGS_MAX, SearchScope,
-        SourceUnitId, Symbol, SymbolId,
+        Digest, Duration, GLOBAL_WARNING_DETAIL_CHARS_MAX, GetSymbolParams, GlobalFailureClass,
+        GlobalPageWarningCode, LANGUAGE_IDENTITY_PATTERN, Language, PAGE_INDEX_DEFAULT,
+        PAGE_LIMIT_MAX, PackageIdentity, REVISION_ID_BYTES_MAX, ReadWarning, RelationshipFacet,
+        RevisionId, RevisionIdViolation, SOURCE_WARNINGS_MAX, SearchScope, SourceUnitId, Symbol,
+        SymbolId,
     };
     use schemars::schema_for;
     use serde_json::json;
     use strum::VariantArray;
 
-    /// A node's unit decodes by its scheme: a project file stays a `FileId`, a package source
-    /// unit decodes through the source unit codec, and a string neither form holds refuses.
+    /// A project file is a source unit of the `project` resolver: its path round-trips through
+    /// the source unit codec, and a path no project file can have refuses.
     #[test]
-    fn a_node_unit_decodes_a_project_file_and_a_package_source_unit_by_scheme() {
-        let file = "rift://file/src/lib.rs";
-        let package = "rift://source/cargo/crates.io/demo/src/lib.rs";
-        let decoded: super::NodeUnit = serde_json::from_value(json!(file)).expect("file unit");
-        assert_eq!(decoded, super::NodeUnit::File(FileId(file.to_owned())));
-        assert_eq!(decoded.as_str(), file);
-        let decoded: super::NodeUnit =
-            serde_json::from_value(json!(package)).expect("package unit");
-        assert!(matches!(&decoded, super::NodeUnit::Source(unit) if unit.as_str() == package));
-        assert_eq!(decoded.as_str(), package);
+    fn a_project_file_is_a_project_source_unit() {
+        let unit = SourceUnitId::project("packages/@scope/caf\u{e9} file.rs");
         assert_eq!(
-            serde_json::to_value(&decoded).expect("unit encodes"),
-            json!(package)
+            unit.as_str(),
+            "rift://source/project/packages/@scope/caf%C3%A9%20file.rs"
         );
-        for refused in [
-            "src/lib.rs",
-            "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs",
-        ] {
+        assert!(unit.is_project());
+        assert_eq!(
+            unit.project_path().as_deref(),
+            Some("packages/@scope/caf\u{e9} file.rs")
+        );
+        assert!(SourceUnitId::parse(unit.as_str()).is_ok_and(|parsed| parsed == unit));
+        let package = SourceUnitId::parse("rift://source/cargo/crates.io/demo/src/lib.rs")
+            .expect("package unit");
+        assert_eq!(package.project_path(), None);
+        for refused in ["", "/src/lib.rs", "src/../lib.rs", "src//lib.rs"] {
+            let spelled = SourceUnitId::project(refused);
             assert!(
-                serde_json::from_value::<super::NodeUnit>(json!(refused)).is_err(),
-                "{refused}"
+                SourceUnitId::parse(spelled.as_str()).is_err(),
+                "{refused:?}"
             );
         }
+        assert!(serde_json::from_value::<SourceUnitId>(json!("rift://file/src/lib.rs")).is_err());
     }
 
     #[test]
@@ -3669,10 +3637,6 @@ mod tests {
     fn every_identity_pattern_accepts_the_path_bytes_the_encoder_keeps() {
         let cases = [
             (
-                serde_json::to_value(schema_for!(FileId)).expect("file schema"),
-                "rift://file/packages/@scope/name/package.json",
-            ),
-            (
                 serde_json::to_value(schema_for!(SourceUnitId)).expect("source unit schema"),
                 "rift://source/project/packages/@scope/name/package.json",
             ),
@@ -3745,23 +3709,25 @@ mod tests {
             ),
             (
                 ReadWarning::SourceUnavailable {
-                    unit: Some(FileId("rift://file/src%2Finvalid.rs".to_owned())),
+                    unit: Some(SourceUnitId(
+                        "rift://source/project/src/invalid.rs".to_owned(),
+                    )),
                     detail: "src/invalid.rs is not UTF-8 and is absent from the index".to_owned(),
                 },
                 json!({
                     "code": "source_unavailable",
-                    "unit": "rift://file/src%2Finvalid.rs",
+                    "unit": "rift://source/project/src/invalid.rs",
                     "detail": "src/invalid.rs is not UTF-8 and is absent from the index",
                 }),
             ),
             (
                 ReadWarning::LockfileExcluded {
-                    files: vec![FileId("rift://file/Cargo.lock".to_owned())],
+                    files: vec![SourceUnitId("rift://source/project/Cargo.lock".to_owned())],
                     detail: "Cargo.lock is left out of search".to_owned(),
                 },
                 json!({
                     "code": "lockfile_excluded",
-                    "files": ["rift://file/Cargo.lock"],
+                    "files": ["rift://source/project/Cargo.lock"],
                     "detail": "Cargo.lock is left out of search",
                 }),
             ),
@@ -4004,12 +3970,12 @@ mod tests {
     fn the_pattern_matches_truncation_warning_round_trips_and_bounds_its_files() {
         let warning = ReadWarning::PatternMatchesTruncated {
             matches_per_file: 1_000,
-            files: vec![FileId("rift://file/src%2Fmany.rs".to_owned())],
+            files: vec![SourceUnitId("rift://source/project/src/many.rs".to_owned())],
         };
         let wire = json!({
             "code": "pattern_matches_truncated",
             "matches_per_file": 1_000,
-            "files": ["rift://file/src%2Fmany.rs"],
+            "files": ["rift://source/project/src/many.rs"],
         });
         assert_eq!(serde_json::to_value(&warning).expect("serialize"), wire);
         let parsed: ReadWarning = serde_json::from_value(wire).expect("deserialize");
@@ -4082,12 +4048,12 @@ mod tests {
             ),
             (
                 ReadWarning::LargeFileUnparsed {
-                    files: vec![FileId("rift://file/big.js".to_owned())],
+                    files: vec![SourceUnitId("rift://source/project/big.js".to_owned())],
                     detail: "big.js is past max_file".to_owned(),
                 },
                 json!({
                     "code": "large_file_unparsed",
-                    "files": ["rift://file/big.js"],
+                    "files": ["rift://source/project/big.js"],
                     "detail": "big.js is past max_file",
                 }),
             ),

@@ -5,11 +5,10 @@ use rift_protocol::error::{
 };
 use rift_protocol::read::{
     CommitAuthor, DiagnosticContext, Digest, Documentation, DocumentationFormat, ExactKind,
-    Extensions, FileId, GetSymbolHit, GetSymbolResult, Language, Node, NodeFacet, NodeRegion,
-    NodeUnit, NodesResult, PackageIdentity, Pagination, ProjectPath, ReadWarning, RegionRole,
-    RelationshipFacet, RevisionId, Signature, SourceKind, SourceLocationKind, SourceUnitId, Symbol,
-    SymbolFacet, SymbolHistory, SymbolId, SymbolOrigin, SymbolVersion, SymbolVersionKind,
-    TextRange,
+    Extensions, GetSymbolHit, GetSymbolResult, Language, Node, NodeFacet, NodeRegion, NodesResult,
+    PackageIdentity, Pagination, ProjectPath, ReadWarning, RegionRole, RelationshipFacet,
+    RevisionId, Signature, SourceKind, SourceLocationKind, SourceUnitId, Symbol, SymbolFacet,
+    SymbolHistory, SymbolId, SymbolOrigin, SymbolVersion, SymbolVersionKind, TextRange,
 };
 use rift_protocol::search::{
     CommitHit, GraphHop, MatchedField, SearchHit, SearchHitTarget, SearchResult, SymbolChange,
@@ -247,7 +246,7 @@ fn node(index: u64, kind: &str, start: u64, end: u64) -> Node {
     Node {
         declaration: None,
         index,
-        unit: NodeUnit::File(FileId("rift://file/src/lib.rs".to_owned())),
+        unit: SourceUnitId("rift://source/project/src/lib.rs".to_owned()),
         language: rust(),
         kind: ExactKind(kind.to_owned()),
         facets: Vec::new(),
@@ -603,8 +602,8 @@ fn warning_set() -> Vec<ReadWarning> {
         ReadWarning::PatternMatchesTruncated {
             matches_per_file: 5,
             files: vec![
-                FileId("rift://file/a.rs".to_owned()),
-                FileId("rift://file/b.rs".to_owned()),
+                SourceUnitId("rift://source/project/a.rs".to_owned()),
+                SourceUnitId("rift://source/project/b.rs".to_owned()),
             ],
         },
         stale_index(),
@@ -615,7 +614,7 @@ const WARNING_LINES: [&str; 5] = [
     "global_access_disabled",
     "results_truncated · results_max 100",
     "package_substituted · entry serde@1.0.0 (cargo) · package serde@1.0.1 (cargo)",
-    "pattern_matches_truncated · matches_per_file 5 · files rift://file/a.rs, rift://file/b.rs",
+    "pattern_matches_truncated · matches_per_file 5 · files rift://source/project/a.rs, rift://source/project/b.rs",
     "stale_index · index_tree_revision 3f9a1c2e · captured_tree_revision 3f9a1c2f: index lags the captured tree",
 ];
 
@@ -625,7 +624,7 @@ const WARNING_SECTION: [&str; 6] = [
     "\tglobal_access_disabled",
     "\tresults_truncated · results_max 100",
     "\tpackage_substituted · entry serde@1.0.0 (cargo) · package serde@1.0.1 (cargo)",
-    "\tpattern_matches_truncated · matches_per_file 5 · files rift://file/a.rs, rift://file/b.rs",
+    "\tpattern_matches_truncated · matches_per_file 5 · files rift://source/project/a.rs, rift://source/project/b.rs",
     "\tstale_index · index_tree_revision 3f9a1c2e · captured_tree_revision 3f9a1c2f: index lags the captured tree",
 ];
 
@@ -743,7 +742,7 @@ fn warning_line(wire: &serde_json::Value) -> String {
     reason = "one table pins the line of every warning variant"
 )]
 fn warning_cases() -> Vec<(serde_json::Value, &'static str)> {
-    let file = |name: &str| format!("rift://file/{name}");
+    let file = |name: &str| format!("rift://source/project/{name}");
     let entry = |name: &str, selector: (&str, &str), availability: &str| json!({"manager": "cargo", "name": name, selector.0: selector.1, "availability": availability});
     vec![
         (
@@ -822,8 +821,8 @@ fn warning_cases() -> Vec<(serde_json::Value, &'static str)> {
             "pattern_index_preparing · prepared 3 · total 9: rows are indexed in the background",
         ),
         (
-            json!({"code": "source_unavailable", "unit": file("src%2Finvalid.rs"), "detail": "not UTF-8"}),
-            "source_unavailable · unit rift://file/src%2Finvalid.rs: not UTF-8",
+            json!({"code": "source_unavailable", "unit": file("src/invalid.rs"), "detail": "not UTF-8"}),
+            "source_unavailable · unit rift://source/project/src/invalid.rs: not UTF-8",
         ),
         (
             json!({"code": "source_unavailable", "detail": "2 more files are left out"}),
@@ -835,11 +834,11 @@ fn warning_cases() -> Vec<(serde_json::Value, &'static str)> {
         ),
         (
             json!({"code": "large_file_unparsed", "files": [file("big.rs")], "detail": "past max_file"}),
-            "large_file_unparsed · files rift://file/big.rs: past max_file",
+            "large_file_unparsed · files rift://source/project/big.rs: past max_file",
         ),
         (
             json!({"code": "lockfile_excluded", "files": [file("Cargo.lock")], "detail": "left out of search"}),
-            "lockfile_excluded · files rift://file/Cargo.lock: left out of search",
+            "lockfile_excluded · files rift://source/project/Cargo.lock: left out of search",
         ),
         (
             json!({"code": "symbol_disagreement", "symbol": A_ID, "providers": ["history", "syntax"],
@@ -927,12 +926,12 @@ fn warning_cases() -> Vec<(serde_json::Value, &'static str)> {
         (
             json!({"code": "framework_context_unresolved", "unit": file("view.html"),
                 "framework": "tailwind", "detail": "dynamic class expression"}),
-            "framework_context_unresolved · unit rift://file/view.html · framework tailwind: dynamic class expression",
+            "framework_context_unresolved · unit rift://source/project/view.html · framework tailwind: dynamic class expression",
         ),
         (
             json!({"code": "framework_context_unresolved", "unit": file("component.ts"),
                 "framework": "angular", "detail": "dynamic template expression"}),
-            "framework_context_unresolved · unit rift://file/component.ts · framework angular: dynamic template expression",
+            "framework_context_unresolved · unit rift://source/project/component.ts · framework angular: dynamic template expression",
         ),
     ]
 }
@@ -986,7 +985,7 @@ fn a_warning_line_shows_one_line_per_payload_shape() {
         warning_line(&json!({"code": "global_access_disabled"})),
         warning_line(&json!({"code": "results_truncated", "results_max": 100})),
         warning_line(
-            &json!({"code": "lockfile_excluded", "files": ["rift://file/Cargo.lock"],
+            &json!({"code": "lockfile_excluded", "files": ["rift://source/project/Cargo.lock"],
             "detail": "left out of search"}),
         ),
         warning_line(&json!({"code": "package_absent",
@@ -999,7 +998,7 @@ fn a_warning_line_shows_one_line_per_payload_shape() {
         [
             "global_access_disabled",
             "results_truncated · results_max 100",
-            "lockfile_excluded · files rift://file/Cargo.lock: left out of search",
+            "lockfile_excluded · files rift://source/project/Cargo.lock: left out of search",
             "package_absent · package serde@1.0.0 (cargo)",
             "package_requirement_absent · entry left-pad ^1.3 (npm)",
         ]
@@ -3635,7 +3634,7 @@ fn a_package_symbol_answer_writes_like_a_project_symbol_answer() {
     answer.symbol = Some(SymbolId(PACKAGE_ID.to_owned()));
     let project_text = rendered(&answer);
     for node in &mut answer.nodes {
-        node.unit = NodeUnit::Source(package_unit.clone());
+        node.unit = package_unit.clone();
     }
     assert_eq!(rendered(&answer), project_text);
     golden(
@@ -4128,11 +4127,21 @@ fn diagnostics_follow_the_message_and_the_limit_one_compiler_style_line_each() {
         diagnostic(
             "error",
             Some("E0308"),
-            Some("rift://file/src/lib.rs"),
+            Some("rift://source/project/src/lib.rs"),
             (3, 9),
         ),
-        diagnostic("warning", None, Some("rift://file/src/a%20b.rs"), (7, 0)),
-        diagnostic("hint", None, Some("rift://file/src/lib.rs"), (0, 0)),
+        diagnostic(
+            "warning",
+            None,
+            Some("rift://source/project/src/a%20b.rs"),
+            (7, 0),
+        ),
+        diagnostic(
+            "hint",
+            None,
+            Some("rift://source/project/src/lib.rs"),
+            (0, 0),
+        ),
         diagnostic("info", Some("W1"), None, (0, 0)),
     ];
     golden(
@@ -4158,7 +4167,7 @@ fn diagnostics_follow_the_message_and_the_limit_one_compiler_style_line_each() {
 fn identities_are_written_whole_and_hashes_are_cut() {
     let symbol_id = "rift://symbol/local/rust/rift_server/read/ReadService/nodes";
     let unit = "rift://source/project/packages/@scope/name/package.json";
-    let file = "rift://file/src/dir%20name/lib.rs";
+    let file = "rift://source/project/src/dir%20name/lib.rs";
     let mut hit = search_hit(symbol_target(Some(symbol_id), "ReadService"));
     hit.unit = Some(source_unit(unit));
     let search = rendered(&only_page(vec![hit]));
@@ -4176,7 +4185,7 @@ fn identities_are_written_whole_and_hashes_are_cut() {
         "{get_symbol}"
     );
     let mut node_item = node(0, "function_item", 0, 1);
-    node_item.unit = NodeUnit::File(FileId(file.to_owned()));
+    node_item.unit = SourceUnitId(file.to_owned());
     let mut node_answer = nodes_result(vec![node_item], vec!["x"]);
     node_answer.symbol = Some(SymbolId(symbol_id.to_owned()));
     let nodes = rendered(&node_answer);

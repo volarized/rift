@@ -109,7 +109,7 @@ pub(super) fn section(out: &mut TextWriter, warnings: &[ReadWarning]) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use rift_protocol::read::{FileId, ReadWarning, SyntaxFramework};
+    use rift_protocol::read::{ReadWarning, SourceUnitId, SyntaxFramework};
 
     use super::section;
     use crate::output::text::{OUTPUT_TEXT_BYTES_MAX, TextWriter};
@@ -117,7 +117,7 @@ mod tests {
     #[test]
     fn equal_framework_issues_list_distinct_files_once() {
         let warning = |file: &str, detail: &str| ReadWarning::FrameworkContextUnresolved {
-            unit: FileId(format!("rift://file/{file}")),
+            unit: SourceUnitId(format!("rift://source/project/{file}")),
             framework: SyntaxFramework::Tailwind,
             detail: detail.to_owned(),
         };
@@ -136,9 +136,9 @@ mod tests {
             concat!(
                 "3 warnings\n",
                 "\tframework_context_unresolved · framework tailwind: missing version\n",
-                "\t\tfiles:\n\t\t\trift://file/a.ts\n\t\t\trift://file/b.ts\n",
+                "\t\tfiles:\n\t\t\trift://source/project/a.ts\n\t\t\trift://source/project/b.ts\n",
                 "\tframework_context_unresolved · framework tailwind: missing configuration\n",
-                "\t\tfiles:\n\t\t\trift://file/c.ts\n",
+                "\t\tfiles:\n\t\t\trift://source/project/c.ts\n",
                 "\tglobal_access_disabled\n",
             )
         );

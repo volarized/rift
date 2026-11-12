@@ -430,12 +430,7 @@ fn decode_generated_response_example(reference: &str, value: Value) -> TestResul
         }
         "#/components/schemas/NodesResult" => {
             let result = serde_json::from_value::<rift_protocol::read::NodesResult>(value)?;
-            assert!(
-                result
-                    .nodes
-                    .iter()
-                    .all(|node| matches!(node.unit, rift_protocol::read::NodeUnit::Source(_)))
-            );
+            assert!(result.nodes.iter().all(|node| !node.unit.is_project()));
         }
         "#/components/schemas/FindDeclarationsResult" => {
             serde_json::from_value::<rift_protocol::source_read::FindDeclarationsResult>(value)?;

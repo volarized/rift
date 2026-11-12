@@ -118,7 +118,7 @@ fn unresolved_angular_template_urls_keep_source_nodes_and_path_owned_warnings() 
                 unit,
                 framework: SyntaxFramework::Angular,
                 detail,
-            } if unit.0 == "rift://file/component.ts" && !detail.is_empty()
+            } if unit.0 == "rift://source/project/component.ts" && !detail.is_empty()
         )));
         let plain_nodes = service.nodes(&NodesParams::at(
             rift_protocol::read::ProjectPath("view.html".to_owned()),

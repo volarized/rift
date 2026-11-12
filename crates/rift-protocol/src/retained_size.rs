@@ -193,7 +193,6 @@ impl GetSize for crate::read::TextRange {
         (std::mem::size_of::<Self>().saturating_add(heap), tracker)
     }
 }
-heap_fields!(crate::read::FileId, 0);
 heap_fields!(
     crate::symbol_read::SymbolDeclaration,
     origin,

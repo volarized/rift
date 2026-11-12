@@ -695,8 +695,8 @@ fn a_file_past_the_matches_bound_is_cut_and_warned_apart_from_the_result_bound()
         result.warnings,
         [ReadWarning::PatternMatchesTruncated {
             matches_per_file: 20,
-            files: vec![rift_protocol::read::FileId(
-                "rift://file/many.txt".to_owned()
+            files: vec![rift_protocol::read::SourceUnitId(
+                "rift://source/project/many.txt".to_owned()
             )],
         }],
         "the cut is its own warning, never results_truncated"
@@ -876,8 +876,8 @@ fn split_verifies_unparsed_text_and_names_it_on_every_answer() -> TestResult {
     };
     assert_eq!(
         files,
-        &[rift_protocol::read::FileId(
-            "rift://file/huge.rs".to_owned()
+        &[rift_protocol::read::SourceUnitId(
+            "rift://source/project/huge.rs".to_owned()
         )]
     );
     assert!(detail.contains("max_file"), "{detail}");

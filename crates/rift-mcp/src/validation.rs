@@ -6631,7 +6631,7 @@ pub(crate) mod tests {
             answer.warnings.iter().any(|warning| matches!(
                 warning,
                 rift_protocol::read::ReadWarning::SourceUnavailable { unit: Some(unit), detail }
-                    if unit.0 == "rift://file/lib.rs"
+                    if unit.0 == "rift://source/project/lib.rs"
                         && detail.contains("lib.rs")
                         && detail.contains("byte limit of 60")
             )),

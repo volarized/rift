@@ -25,8 +25,9 @@ use super::facts::{FACT_SEPARATOR, wire_name};
 use super::layout;
 use crate::output::text::{TextError, TextWriter};
 
-/// Prefix that the file identity of a diagnostic span shares.
-const FILE_SCHEME: &str = "rift://file/";
+/// Prefix of the source unit of a project file a diagnostic span names; the text writes the
+/// project path after it.
+const PROJECT_UNIT_PREFIX: &str = "rift://source/project/";
 /// Noun counted by the title of a failure.
 const ERROR_NOUN: &str = "error";
 /// Depth of an entry head under the title.
@@ -143,7 +144,7 @@ fn diagnostic_line(context: &DiagnosticContext) -> Result<String, TextError> {
     } = diagnostic;
     let code = code.as_ref().map(|code| format!("[{code}]"));
     let place = span.as_ref().map(|span| {
-        let unit = span.unit.0.as_str();
+        let unit = span.unit.as_str();
         let positions: Vec<String> = [line, column]
             .into_iter()
             .flatten()
@@ -154,7 +155,10 @@ fn diagnostic_line(context: &DiagnosticContext) -> Result<String, TextError> {
         } else {
             format!(":{}", positions.join(":"))
         };
-        format!(" {}{at}", unit.strip_prefix(FILE_SCHEME).unwrap_or(unit))
+        format!(
+            " {}{at}",
+            unit.strip_prefix(PROJECT_UNIT_PREFIX).unwrap_or(unit)
+        )
     });
     Ok(format!(
         "{}{}{}: {message}",

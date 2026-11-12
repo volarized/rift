@@ -6182,7 +6182,7 @@ done
             result.warnings.iter().any(|warning| matches!(
                 warning,
                 ReadWarning::SourceUnavailable { unit: Some(unit), detail }
-                    if unit.0 == "rift://file/wide.rs"
+                    if unit.0 == "rift://source/project/wide.rs"
                         && detail.contains(expected_limit.as_str())
                         && detail.contains("field source.file_bytes")
                         && detail.contains(expected_observed.as_str())
@@ -6301,7 +6301,7 @@ done
             skipped.warnings.iter().any(|warning| matches!(
                 warning,
                 ReadWarning::SourceUnavailable { unit: Some(unit), detail }
-                    if unit.0 == "rift://file/lib.rs"
+                    if unit.0 == "rift://source/project/lib.rs"
                         && detail.contains(expected_limit.as_str())
                         && detail.contains("field source.file_bytes")
                         && detail.contains(expected_observed.as_str())
@@ -10661,8 +10661,8 @@ done
             .ok_or("the answer names the unparsed file")?;
         assert_eq!(
             unparsed,
-            [rift_protocol::read::FileId(
-                "rift://file/src/huge.rs".to_owned()
+            [rift_protocol::read::SourceUnitId(
+                "rift://source/project/src/huge.rs".to_owned()
             )]
         );
         assert!(

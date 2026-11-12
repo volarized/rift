@@ -105,7 +105,7 @@ async fn a_body_term_reaches_its_declaration_and_a_lockfile_answers_nothing() ->
         .ok_or("selecting an excluded lockfile warns")?;
     assert_eq!(
         warning["files"],
-        json!(["rift://file/Cargo.lock"]),
+        json!(["rift://source/project/Cargo.lock"]),
         "{warning:#}"
     );
 
