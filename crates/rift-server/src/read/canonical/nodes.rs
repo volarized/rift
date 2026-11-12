@@ -3,9 +3,12 @@ use std::time::SystemTime;
 
 use rift_error::RiftError;
 use rift_protocol::identity::SymbolOwner;
-use rift_protocol::read::{NodesParams, NodesResult};
+use rift_protocol::read::{Language, NodesParams, NodesResult};
 use rift_protocol::symbol_read::{CapturedView, CapturedViewId, SymbolUnavailableReason};
 
+use super::super::nodes::{
+    NodesPage, NodesSelector, PageBounds, UnitSource, position_page, symbol_page, unit_page,
+};
 use super::{CapturedMetadata, LocalSymbolMaterial, LocalSymbolViews, invalid, material_error};
 
 impl LocalSymbolViews {
@@ -47,44 +50,76 @@ impl LocalSymbolMaterial {
         &self,
         request: &NodesParams,
     ) -> Result<Result<NodesResult, SymbolUnavailableReason>, RiftError> {
-        let path = rift_core::ProjectPath::new(&request.path.0)?;
-        let Some(file) = self.index.file(&path) else {
-            return Ok(Err(SymbolUnavailableReason::InsufficientCoverage));
-        };
-        if request.position >= u64::try_from(file.source().len()).unwrap_or(u64::MAX) {
-            return Err(invalid(
-                "position",
-                "position must be inside captured source",
-            ));
-        }
-        let Some(document) = self.index.syntax(&path)? else {
-            return Ok(Err(SymbolUnavailableReason::InsufficientCoverage));
-        };
         let metadata: CapturedMetadata = serde_json::from_slice(&self.metadata)
             .map_err(|error| material_error("decode captured metadata", &error))?;
-        let declarations: Vec<_> = (0..document.symbols().len())
-            .map(|position| {
-                self.index
-                    .declaration_address(&path, position)
-                    .map(|(identity, ordinal)| (identity.clone(), ordinal))
-            })
-            .collect();
-        let (matched, places) =
-            super::super::covering_nodes(&document, &declarations, request.position);
-        let nodes = matched
-            .iter()
-            .zip(places)
-            .map(|(node, place)| super::super::wire_node(file, node, place, &declarations))
-            .collect();
-        let source = matched
-            .iter()
-            .map(|node| super::super::excerpt(file, node.range))
-            .collect();
-        Ok(Ok(NodesResult {
-            nodes,
-            source,
+        let view = request.view.as_ref().map_or("", CapturedViewId::as_str);
+        let bounds = PageBounds::served(self.index.results_max());
+        let index = self.index.as_ref();
+        let answer = match NodesSelector::of(request, view)? {
+            NodesSelector::Position {
+                path,
+                position,
+                cursor,
+            } => self.position_nodes(&path, position, cursor, view)?,
+            NodesSelector::Symbol { id, key, offset } => {
+                symbol_page(index, (id, &key), (offset, view), bounds)?
+                    .ok_or(SymbolUnavailableReason::InsufficientCoverage)
+            }
+        };
+        Ok(answer.map(|page| NodesResult {
+            symbol: page.symbol,
+            nodes: page.nodes,
+            node_cursor: page.node_cursor,
             view: None,
             warnings: metadata.warnings,
         }))
     }
+
+    /// The captured nodes of the declaration or unit holding `position`.
+    fn position_nodes(
+        &self,
+        path: &rift_core::ProjectPath,
+        position: u64,
+        cursor: Option<&str>,
+        view: &str,
+    ) -> Result<Result<NodesPage, SymbolUnavailableReason>, RiftError> {
+        let bounds = PageBounds::served(self.index.results_max());
+        if let Some(file) = self.index.file(path) {
+            inside(file.source(), position)?;
+            return Ok(position_page(
+                self.index.as_ref(),
+                (path, position),
+                (cursor, view),
+                bounds,
+            )?
+            .ok_or(SymbolUnavailableReason::InsufficientCoverage));
+        }
+        let Some(text) = self.index.source(path) else {
+            return Ok(Err(SymbolUnavailableReason::InsufficientCoverage));
+        };
+        inside(text, position)?;
+        let unit = super::super::file_id(path);
+        Ok(Ok(unit_page(
+            UnitSource {
+                unit: &unit,
+                language: &Language::text(),
+                source: text,
+            },
+            None,
+            cursor,
+            view,
+            bounds,
+        )?))
+    }
+}
+
+/// Refuses a `position` at or past the captured source's byte length.
+fn inside(source: &str, position: u64) -> Result<(), RiftError> {
+    if position >= u64::try_from(source.len()).unwrap_or(u64::MAX) {
+        return Err(invalid(
+            "position",
+            "position must be inside captured source",
+        ));
+    }
+    Ok(())
 }

@@ -19,8 +19,10 @@ The index skips symlinks. A linked file answers under its own path when the sour
 Each provider converts its toolchain's positions to byte offsets, so ranges from different
 providers use one scale.
 
-[`nodes`](/docs/mcp#tool-nodes) returns the syntax nodes covering one byte position,
-outermost first. Each node carries its grammar kind and byte range.
+[`nodes`](/docs/mcp#tool-nodes) returns the syntax nodes of one symbol, or of the declaration
+holding one byte position, in pre-order. Each node carries its grammar kind, byte range, and source
+text. Every source unit has a file node of kind `file` spanning all of it, the only node of a
+file no syntax provider parses.
 
 ## Source discovery
 

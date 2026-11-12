@@ -88,6 +88,16 @@ __rift_error_definition!(
 );
 
 __rift_error_definition!(
+    read_symbol_not_found,
+    slug = "rift.server.read_symbol_not_found",
+    message = "requested symbol has no declaration in the index: {id}",
+    action = "search first, then retry with an identity that answer returned",
+    fields = {
+        id: required(string),
+    },
+);
+
+__rift_error_definition!(
     read_task,
     slug = "rift.server.read_task",
     message = "workspace read task failed: {operation}",

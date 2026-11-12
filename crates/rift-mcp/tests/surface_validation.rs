@@ -1571,26 +1571,23 @@ fn tools_call_request(name: &'static str, value: &Value) -> TestResult<CallToolR
     Ok(CallToolRequestParams::new(name).with_arguments(arguments(value)?))
 }
 
-/// A visible path no syntax provider parses refuses `capability_unavailable`, naming
-/// the extension - `nodes` can never serve it whatever tree it is pointed at.
+/// A visible text file no syntax provider parses answers its file node alone, in the
+/// `text` language, with the whole file as its source.
 #[tokio::test]
-async fn nodes_on_an_unparsed_visible_path_names_the_extension() -> TestResult {
+async fn nodes_on_an_unparsed_visible_text_file_answer_its_file_node() -> TestResult {
     let (_directory, client, server_task) = served_fixture().await?;
 
-    let failure = workspace_client::failed_call(
-        client
-            .call_tool(
-                CallToolRequestParams::new("nodes")
-                    .with_arguments(arguments(&json!({ "path": "justfile", "position": 0 }))?),
-            )
-            .await,
-    )?;
-    assert_eq!(failure.code, ErrorCode::CapabilityUnavailable);
-    let message = &failure.message;
-    assert!(
-        message.contains("files with no extension"),
-        "the refusal must name what governs the missing provider: {message}"
-    );
+    let answer = client
+        .call_tool(
+            CallToolRequestParams::new("nodes")
+                .with_arguments(arguments(&json!({ "path": "justfile", "position": 0 }))?),
+        )
+        .await?;
+    let structured = answer.structured_content.ok_or("structured nodes answer")?;
+    assert_eq!(structured["nodes"][0]["kind"], "file");
+    assert_eq!(structured["nodes"][0]["language"], "text");
+    assert_eq!(structured["nodes"][0]["source"], "default:\n    echo hi\n");
+    assert_eq!(structured["nodes"].as_array().map(Vec::len), Some(1));
 
     client.cancel().await?;
     server_task.await?;

@@ -177,21 +177,25 @@ async def declaration_node(client: Client, name: str) -> str:
         },
     )
     require(listing.get("view") == view, f"nodes changed captured view: {listing}")
-    nodes = array_value(listing.get("nodes"), "nodes.nodes")
-    sources = array_value(listing.get("source"), "nodes.source")
-    require(len(nodes) == len(sources), f"nodes lost source excerpts: {listing}")
-    matches = [
-        (object_value(entry, "node"), excerpt)
-        for entry, excerpt in zip(nodes, sources, strict=True)
-        if object_value(entry, "node").get("symbol") == identity
-        and object_value(entry, "node").get("range") == span
+    nodes = [
+        object_value(entry, "node")
+        for entry in array_value(listing.get("nodes"), "nodes.nodes")
     ]
-    require(len(matches) == 1, f"nodes omitted the declaration: {listing}")
-    node, excerpt = matches[0]
-    require(excerpt == declaration.get("source"), f"nodes changed source: {listing}")
     require(
-        node.get("declaration") == 0 and node.get("index") == 0,
+        listing.get("symbol") == identity,
+        f"nodes did not answer the declaration's symbol: {listing}",
+    )
+    require(bool(nodes), f"nodes listed nothing: {listing}")
+    node = nodes[0]
+    require(
+        node.get("range") == span
+        and node.get("declaration") == 0
+        and node.get("index") == 0,
         f"the declaration's item node is not node 0 of its declaration: {listing}",
+    )
+    require(
+        node.get("source") == declaration.get("source"),
+        f"nodes changed source: {listing}",
     )
     return identity
 

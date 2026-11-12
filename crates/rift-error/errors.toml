@@ -1345,6 +1345,11 @@ message = "requested source path does not exist: {path}"
 action = "search or list first, then retry with a path that answer returned"
 fields = { path = { type = "string" } }
 
+[error.server.read_symbol_not_found]
+message = "requested symbol has no declaration in the index: {id}"
+action = "search first, then retry with an identity that answer returned"
+fields = { id = { type = "string" } }
+
 [error.server.read_source_unavailable]
 message = "claimed source path is not available in the index: {path}"
 action = "request the declaration without its body, or read a source-backed unit"

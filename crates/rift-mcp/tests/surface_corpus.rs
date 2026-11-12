@@ -68,6 +68,10 @@ pub(crate) fn corpus() -> Vec<(&'static str, Value)> {
         ),
         ("nodes", json!({ "path": "lib.rs", "position": 0 })),
         ("nodes", json!({ "path": "lib.rs", "position": 8 })),
+        // `symbol_name` resolves to the declaration's identity before the read.
+        ("nodes", json!({ "symbol_name": "beacon_one" })),
+        ("nodes", json!({ "path": "notes.txt", "position": 0 })),
+        ("nodes", json!({ "path": "justfile", "position": 0 })),
         (
             "nodes",
             json!({ "path": "packages/@scope/name/package.json", "position": 4 }),
@@ -112,6 +116,16 @@ pub(crate) async fn prepared_corpus(
                 object.remove(field);
             }
             object.insert("id".to_owned(), json!(id));
+        }
+        if *tool == "nodes"
+            && let Some(name) = request["symbol_name"].as_str().map(str::to_owned)
+        {
+            let discovery =
+                json!({"query": name, "target": "symbol", "include": ["source"], "limit": 1000});
+            let id = discovered_id(client, &discovery, &name, None).await?;
+            let object = request.as_object_mut().ok_or("corpus request object")?;
+            object.remove("symbol_name");
+            object.insert("symbol".to_owned(), json!(id));
         }
         for field in ["seed", "to"] {
             let selected = request["traversal"][field].as_str();

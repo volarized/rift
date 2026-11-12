@@ -1626,6 +1626,29 @@ pub fn require_search_selector(schema: &mut Schema) {
     );
 }
 
+/// A [`NodesParams`](crate::read::NodesParams) selects its nodes through exactly one of
+/// `symbol` or `path` with `position`, and `node_cursor` continues a `symbol` read alone.
+/// The server enforces each rule, so the schema states them for a validating caller.
+pub fn require_one_node_selector(schema: &mut Schema) {
+    use crate::read::NodesParams;
+    let symbol = property!(NodesParams, symbol);
+    let path = property!(NodesParams, path);
+    let position = property!(NodesParams, position);
+    append(
+        schema,
+        described(
+            "nodes selects a symbol, or a path with a position",
+            one_of(vec![
+                merged(vec![
+                    requires(&[symbol]),
+                    not(any_of(vec![requires(&[path]), requires(&[position])])),
+                ]),
+                merged(vec![requires(&[path, position]), not(requires(&[symbol]))]),
+            ]),
+        ),
+    );
+}
+
 /// A [`SearchTraversal`](crate::search::SearchTraversal) names the declaration its walk
 /// starts at through `seed`, and no walk rides beside `change`: the language engine lane
 /// that resolves references serves the current tree alone, and the walk from a

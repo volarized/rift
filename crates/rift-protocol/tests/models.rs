@@ -85,7 +85,6 @@ fn paginated_read_results_deserialize_with_warnings_absent() -> TestResult {
 
     let nodes: NodesResult = serde_json::from_value(json!({
         "nodes": [],
-        "source": []
     }))?;
     assert!(nodes.warnings.is_empty());
 

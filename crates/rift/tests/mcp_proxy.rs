@@ -348,11 +348,13 @@ async fn repository_workspace_reads(
         .await
         .map_err(|error| format!("nodes: {error:?}"))?;
     assert!(
-        nodes["source"]
+        nodes["nodes"]
             .as_array()
-            .ok_or("nodes carries source")?
+            .ok_or("nodes carries nodes")?
             .iter()
-            .any(|source| source.as_str().is_some_and(|source| source.contains(name))),
+            .any(|node| node["source"]
+                .as_str()
+                .is_some_and(|source| source.contains(name))),
         "{nodes}"
     );
     Ok(revision)

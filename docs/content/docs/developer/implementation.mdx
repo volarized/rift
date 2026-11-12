@@ -449,6 +449,11 @@ owns its map, source catalog, configuration, and preparation counts.
 local scope is complete, including an exact symbol read that already found a declaration. A `nodes` read can
 prepare its supplied path within the request budget without changing published progress.
 
+The index keeps each file's symbols but not its complete node table: a parse shares its nodes with
+the path-independent syntax facts, and the index releases them when it takes the facts. A `nodes`
+read parses the captured bytes again under the same provider and syntax bounds, once per file per
+answer, and resolves a location with an exact or enclosing match against that table.
+
 The [`rift://workspace`](/docs/developer/protocol/mcp#resource-workspace) resource projects only
 the requested page from published visible file digests. It performs no whole-tree capture per
 page; the completed catalog includes unclassified and disabled-language files as well as files
