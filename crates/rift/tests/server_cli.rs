@@ -1608,18 +1608,31 @@ fn a_stop_whose_index_close_outlasts_its_bound_ends_timeout_and_retires_the_docu
         .args(["server", "start", "--foreground"])
         .current_dir(root)
         .envs(SERVER_LOG_VARIABLES)
+        .env(
+            "RUST_LOG",
+            format!("{STARTUP_TRACE_FILTER},rift_index::database_thread=debug"),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()?;
     let stderr = StderrWatch::spawn(&mut child, FOREGROUND_LABEL)?;
     wait_for_foreground_server(root, &mut child, &stderr)?;
-    wait_for(START_POLL_ATTEMPT_COUNT, "the first lexical commit", || {
-        stderr
-            .snapshot()
-            .contains("lexical commit settled")
-            .then_some(())
-    })?;
+    wait_for(
+        START_POLL_ATTEMPT_COUNT,
+        "the initial lexical and trigram commits",
+        || {
+            let records = stderr.snapshot();
+            let (_, after_commit) = records.split_once("lexical commit settled")?;
+            after_commit
+                .lines()
+                .any(|line| {
+                    line.contains("the trigram index took a batch of file rows")
+                        && line.contains("pending=0")
+                })
+                .then_some(())
+        },
+    )?;
 
     let holder = rusqlite::Connection::open(root.join(".rift").join("index"))?;
     wait_for_initial_trigram_index(&holder)?;
@@ -1627,18 +1640,33 @@ fn a_stop_whose_index_close_outlasts_its_bound_ends_timeout_and_retires_the_docu
     // Another process takes the index database's write lock, then a source change makes
     // the server write: its `BEGIN IMMEDIATE` waits inside SQLite's busy handler.
     holder.execute_batch("BEGIN IMMEDIATE")?;
+    let previous_commits = stderr
+        .snapshot()
+        .matches("lexical commit committing")
+        .count();
     fs::write(
         root.join("lib.rs"),
         "pub fn beacon() {}\npub fn held() {}\n",
     )?;
-    wait_for(START_POLL_ATTEMPT_COUNT, "the held lexical commit", || {
-        (stderr
-            .snapshot()
-            .matches("lexical commit committing")
-            .count()
-            >= 2)
-            .then_some(())
-    })?;
+    // The lane can still be canceled after its start record. Once the index worker
+    // starts the transaction itself, it must finish that command before it can stop.
+    wait_for(
+        START_POLL_ATTEMPT_COUNT,
+        "the index worker to start the held lexical transaction",
+        || {
+            let records = stderr.snapshot();
+            let (start, _) = records
+                .match_indices("lexical commit committing")
+                .nth(previous_commits)?;
+            records[start..]
+                .lines()
+                .any(|line| {
+                    line.contains("database=index")
+                        && line.ends_with("SQLite worker beginning immediate transaction")
+                })
+                .then_some(())
+        },
+    )?;
 
     stop_foreground_server(root, &mut child, &stderr)?;
     let status = wait_for(
