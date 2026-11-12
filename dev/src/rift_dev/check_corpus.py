@@ -64,7 +64,6 @@ from rift_dev.query import (
     bindings,
     iri,
     literal,
-    name_request,
     optional_iri,
     retrieval_request,
 )
@@ -579,7 +578,7 @@ class Corpus:
         >>> common = {"configuration_revision": "0123abcd", "languages": languages}
         >>> first = {**common, "pagination": {"page_index": 0, "total_pages": 2}, "source": [{"path": f"docs/a{index:04}.md", "digest": "0123abcd", "language": "markdown"} for index in range(1000)]}
         >>> second = {**common, "pagination": {"page_index": 1, "total_pages": 2}, "source": [{"path": path, "digest": "0123abcd", "language": language} for path, language in [("src/test.ts", "typescript"), ("src/ztest.tsx", "typescript:tsx")]]}
-        >>> admission = {"answer": {"result": "bindings", "variables": ["symbol"], "bindings": [{"symbol": {"type": "iri", "value": "urn:fixture:startup"}}]}}
+        >>> admission = {"answer": {"result": "boolean", "value": True}}
         >>> client = SimpleNamespace(resource=AsyncMock(side_effect=[first, second]), call=AsyncMock(side_effect=[admission, answer(rows), answer([])]))
         >>> sample = Corpus(cast(Pin, SimpleNamespace(name="nextjs")), Path("rift"), Path("report"))
         >>> selected = asyncio.run(sample.symbol_candidates(cast(Client, client)))
@@ -587,10 +586,8 @@ class Corpus:
         (200, 3, 2)
         >>> all(literal(row, "path") == "src/test.ts" for row in selected)
         True
-        >>> client.call.await_args_list[0].args[1] == name_request("corpus_probe")
+        >>> client.call.await_args_list[0].args[1] == {"query": "ASK {}"}
         True
-        >>> "SERVICE" in client.call.await_args_list[0].args[1]["query"]
-        False
         """
         languages = SAMPLE_LANGUAGES[self.pin.name]
 
@@ -616,9 +613,7 @@ class Corpus:
             )
             return found
 
-        # The Domain query waits for index preparation without lexical ranking.
-        # Its identity rows are admission evidence, not declarations in the sample.
-        bindings(await settled_local(client, "search", name_request("corpus_probe")))
+        await await_index_ready(client)
         pool: list[JsonObject] = []
         represented: set[str] = set()
         workspace, groups = await self.source_catalog(client)
@@ -1233,11 +1228,7 @@ class Corpus:
                 async with server.connect() as client:
                     # Listener readiness precedes file preparation. Observe the existing
                     # startup budget before measuring reads against external writes.
-                    bindings(
-                        await settled_local(
-                            client, "search", name_request("corpus_probe")
-                        )
-                    )
+                    await await_index_ready(client)
                     await self.churn(client, probe.relative_to(self.root).as_posix())
                     no_failed_builds(await logged(server, "index"))
                 self.stop(server)
@@ -1575,11 +1566,14 @@ class Corpus:
                     answer.get("outcome") == "unavailable",
                     "incomplete lexical ranking reported a complete answer",
                 )
-                captured = await client.call("search", name_request("TEST"))
-                canonical = {iri(row, "symbol") for row in bindings(captured)}
                 anchor = "rift://symbol/local/rust/bun_bundler/defines/TEST"
+                captured = await client.call(
+                    "search",
+                    {"query": f"SELECT ?name {{ <{anchor}> a :Symbol; :name ?name }}"},
+                )
                 require(
-                    anchor in canonical, "Bun lost its established Rust TEST identity"
+                    [literal(row, "name") for row in bindings(captured)] == ["TEST"],
+                    "Bun lost its established Rust TEST identity",
                 )
                 exact = await client.call("get_symbol", {"id": anchor})
                 require(
@@ -1693,6 +1687,16 @@ async def settled_local(client: Client, name: str, request: JsonObject) -> JsonO
         seconds=LOCAL_PREPARATION_SECONDS,
         poll_seconds=POLL_SECONDS,
         selection="current",
+    )
+
+
+async def await_index_ready(client: Client) -> None:
+    """Wait for a published graph without requiring whole-workspace symbol coverage."""
+    answer = await settled_local(client, "search", {"query": "ASK {}"})
+    result = object_value(answer.get("answer"), "startup graph answer")
+    require(
+        result.get("result") == "boolean" and result.get("value") is True,
+        f"startup graph query did not return true: {answer}",
     )
 
 
