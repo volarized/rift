@@ -13,6 +13,8 @@
 mod engine_fixture;
 #[expect(dead_code, reason = "shared end-to-end helper, used by sibling suites")]
 mod harness;
+#[path = "../../rift-mcp/tests/query/mod.rs"]
+mod query;
 #[expect(dead_code, reason = "shared end-to-end helper, used by sibling suites")]
 mod rust_engine;
 #[allow(
@@ -558,12 +560,22 @@ fn search_request_with_timeout(
     query: &str,
     timeout: Option<Duration>,
 ) -> TestResult<String> {
+    let request = lexical_query(query)?;
     tool_request_with_timeout(
         port,
         token,
         "search",
-        &serde_json::json!({"query": query}),
+        &serde_json::to_value(request)?,
         timeout,
+    )
+}
+
+fn lexical_query(query: &str) -> TestResult<rift_protocol::query::QueryParams> {
+    let selected = serde_json::from_value(serde_json::json!({"query": query}))?;
+    query::projected_retrieval(
+        &selected,
+        "?matched_by ?target",
+        "?hit :matched_by/:value ?matched_by; :hit/:target ?target .",
     )
 }
 
@@ -604,7 +616,7 @@ fn symbol_request(port: u16, token: &str, name: &str) -> TestResult<String> {
         port,
         token,
         "tools/call",
-        &serde_json::json!({"name": "search", "arguments": {"query": name, "target": "symbol"}}),
+        &serde_json::json!({"name": "search", "arguments": query::declaration(name, "lib.rs")}),
     )
 }
 
@@ -647,27 +659,26 @@ fn answer_body(answer: &str) -> TestResult<serde_json::Value> {
     Ok(serde_json::from_str(body)?)
 }
 
-fn lexical_content_hit(answer: &str, path: &str) -> TestResult<serde_json::Value> {
+fn lexical_content_hit(
+    answer: &str,
+    path: &str,
+) -> TestResult<(serde_json::Value, serde_json::Value)> {
     let body = answer
         .split_once("\r\n\r\n")
         .ok_or("the MCP response must contain an HTTP body")?
         .1;
     let response: serde_json::Value = serde_json::from_str(body)?;
-    let results = response["result"]["structuredContent"]["results"]
-        .as_array()
-        .ok_or("the search response must contain structured results")?;
-    results
+    let answer = &response["result"]["structuredContent"];
+    let rows = query::rows(answer)?;
+    let row = rows
         .iter()
-        .find(|hit| {
-            hit["path"] == path
-                && hit["matched_by"]
-                    .as_array()
-                    .is_some_and(|fields| fields.iter().any(|field| field == "content"))
+        .find(|row| {
+            query::literal(row, "path").is_ok_and(|value| value == path)
+                && query::literal(row, "matched_by").is_ok_and(|value| value == "content")
         })
         .cloned()
-        .ok_or_else(|| {
-            format!("search must return {path} through lexical content: {answer}").into()
-        })
+        .ok_or_else(|| format!("search must return {path} through lexical content: {answer}"))?;
+    Ok((row, answer.clone()))
 }
 
 fn wait_for_lexical_content_hit(
@@ -675,12 +686,13 @@ fn wait_for_lexical_content_hit(
     token: &str,
     query: &str,
     path: &str,
-) -> TestResult<serde_json::Value> {
+) -> TestResult<(serde_json::Value, serde_json::Value)> {
     let deadline =
         std::time::Instant::now() + POLL_INTERVAL.saturating_mul(START_POLL_ATTEMPT_COUNT);
+    let arguments = serde_json::to_value(lexical_query(query)?)?;
     let mut last_response = String::from("no response received");
     for _ in 0..START_POLL_ATTEMPT_COUNT {
-        match search_request_with_timeout(port, token, query, Some(CONNECT_TIMEOUT)) {
+        match tool_request_with_timeout(port, token, "search", &arguments, Some(CONNECT_TIMEOUT)) {
             Ok(answer) => match lexical_content_hit(&answer, path) {
                 Ok(hit) => return Ok(hit),
                 Err(error) => last_response = error.to_string(),
@@ -997,7 +1009,7 @@ fn a_stopped_server_reopens_its_database_for_search() -> TestResult {
         "amber canoe velvet",
         "notes.md",
     )?;
-    let first = lexical_hit(first)?;
+    let first = lexical_hit_with_validated_view("first", serving.port, &serving.token, first)?;
 
     stop_foreground_server(root, &mut child, &stderr)?;
     wait_until_port_refuses(serving.port)?;
@@ -1010,7 +1022,8 @@ fn a_stopped_server_reopens_its_database_for_search() -> TestResult {
         "amber canoe velvet",
         "notes.md",
     )?;
-    let second = lexical_hit(second)?;
+    let second =
+        lexical_hit_with_validated_view("reopened", reopened.port, &reopened.token, second)?;
     assert_eq!(second, first, "reopen must preserve the lexical search hit");
 
     stop_foreground_server(root, &mut child, &stderr)?;
@@ -1019,13 +1032,36 @@ fn a_stopped_server_reopens_its_database_for_search() -> TestResult {
     Ok(())
 }
 
-fn lexical_hit(hit: serde_json::Value) -> TestResult<rift_protocol::search::SearchHit> {
-    let hit: rift_protocol::search::SearchHit = serde_json::from_value(hit)?;
-    assert_eq!(
-        serde_json::to_value(&hit.path)?,
-        serde_json::json!("notes.md")
-    );
-    Ok(hit)
+fn lexical_hit_with_validated_view(
+    phase: &str,
+    port: u16,
+    token: &str,
+    hit: (serde_json::Value, serde_json::Value),
+) -> TestResult<rift_protocol::read::SourceUnitSpan> {
+    let (row, original) = hit;
+    let retained = query::retained_page(&original, 0)?;
+    let replay = tool_request_with_timeout(
+        port,
+        token,
+        "search",
+        &serde_json::json!({"query":retained}),
+        Some(CONNECT_TIMEOUT),
+    )?;
+    let replay = answer_body(&replay)?;
+    let replay = &replay["result"]["structuredContent"];
+    assert_eq!(replay["view"], original["view"], "{phase}: {replay}");
+    assert_eq!(replay["answer"], original["answer"], "{phase}: {replay}");
+    assert_eq!(query::literal(&row, "path")?, "notes.md");
+    assert_eq!(query::literal(&row, "target")?, "documentation");
+    assert_eq!(query::literal(&row, "matched_by")?, "content");
+    let span = rift_protocol::read::SourceUnitSpan {
+        unit: rift_protocol::read::SourceUnitId::parse("rift://source/project/notes.md")?,
+        range: rift_protocol::read::TextRange {
+            start: query::literal(&row, "start")?.parse()?,
+            end: query::literal(&row, "end")?.parse()?,
+        },
+    };
+    Ok(span)
 }
 
 #[test]

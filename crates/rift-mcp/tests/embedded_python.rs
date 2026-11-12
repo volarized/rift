@@ -34,7 +34,7 @@ async fn incoming_references_resolve_cross_file_callers_without_writes() -> Test
     let answer = call_retrying_acceptance(
         &client,
         tool_request(
-            "search",
+            "search_retrieval",
             &json!({"target":"symbol", "traversal":{
                 "seed":seed, "direction":"incoming", "facets":["references"]
             }}),

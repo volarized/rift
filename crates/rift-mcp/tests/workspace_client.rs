@@ -278,33 +278,46 @@ pub(crate) async fn search_after_population(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     arguments: &Value,
 ) -> TestResult<Value> {
-    const SEARCH_TIER_ATTEMPTS_MAX: usize = 60;
-    const SEARCH_TIER_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+    populated_answer(client, "search_retrieval", arguments).await
+}
 
-    let query = arguments["query"].as_str().unwrap_or("<missing query>");
-    let mut answer = call_retrying_acceptance(client, tool_request("search", arguments)).await?;
-    for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
-        let population_pending =
-            answer["warnings"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|warning| {
-                    matches!(
-                        warning["code"].as_str(),
-                        Some("lexical_ranking_unavailable" | "stale_index")
-                    )
-                });
-        if !population_pending {
+/// Calls the public SPARQL route once its required local population is ready.
+pub(crate) async fn query_after_population(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    arguments: &rift_protocol::query::QueryParams,
+) -> TestResult<Value> {
+    populated_answer(client, "search", &serde_json::to_value(arguments)?).await
+}
+
+async fn populated_answer(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    tool: &'static str,
+    arguments: &Value,
+) -> TestResult<Value> {
+    const ATTEMPTS: usize = 60;
+    const DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+    let mut answer = call_retrying_acceptance(client, tool_request(tool, arguments)).await?;
+    for _attempt in 0..ATTEMPTS {
+        let pending = answer["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|warning| {
+                matches!(
+                    warning["code"].as_str(),
+                    Some("lexical_ranking_unavailable" | "stale_index" | "pattern_index_preparing")
+                )
+            });
+        if !pending {
             return Ok(answer);
         }
-        tokio::time::sleep(SEARCH_TIER_POLL).await;
-        answer = call_retrying_acceptance(client, tool_request("search", arguments)).await?;
+        tokio::time::sleep(DELAY).await;
+        answer = call_retrying_acceptance(client, tool_request(tool, arguments)).await?;
     }
-    Err(format!(
-        "the population lane never stamped the served tree for query {query}; the last answer was {answer:#}"
+    Err(
+        format!("{tool} population did not settle: request {arguments}; last answer {answer}")
+            .into(),
     )
-    .into())
 }
 
 /// The path from the process working directory to `target`, as one `..`
@@ -343,26 +356,29 @@ pub(crate) async fn call_retrying_acceptance(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     params: CallToolRequestParams,
 ) -> TestResult<Value> {
-    let mut refused = None;
-    for _attempt in 0..ACCEPTANCE_ATTEMPTS_MAX {
-        let result = client.call_tool(params.clone()).await?;
-        if result.is_error != Some(true) {
-            return result
-                .structured_content
-                .ok_or_else(|| "the tool must return structured content".into());
+    Box::pin(async move {
+        let mut refused = None;
+        for _attempt in 0..ACCEPTANCE_ATTEMPTS_MAX {
+            let result = client.call_tool(params.clone()).await?;
+            if result.is_error != Some(true) {
+                return result
+                    .structured_content
+                    .ok_or_else(|| "the tool must return structured content".into());
+            }
+            let failure = tool_failure(&result)?;
+            if failure.retry != RetryDirective::SameRequest {
+                return Err(format!("the tool failed: {}", failure.text).into());
+            }
+            refused = Some(failure.text);
         }
-        let failure = tool_failure(&result)?;
-        if failure.retry != RetryDirective::SameRequest {
-            return Err(format!("the tool failed: {}", failure.text).into());
-        }
-        refused = Some(failure.text);
-    }
-    Err(format!(
-        "the server kept refusing a retryable request through {ACCEPTANCE_ATTEMPTS_MAX} \
+        Err(format!(
+            "the server kept refusing a retryable request through {ACCEPTANCE_ATTEMPTS_MAX} \
          attempts; the last refusal: {}",
-        refused.unwrap_or_default()
-    )
-    .into())
+            refused.unwrap_or_default()
+        )
+        .into())
+    })
+    .await
 }
 
 /// The facts of one failed tool call, read from its error text.
@@ -458,28 +474,25 @@ fn failure_head(line: &str) -> TestResult<(ErrorCode, RetryDirective)> {
     ))
 }
 
+#[path = "query/mod.rs"]
+pub(crate) mod query;
+
 /// Selects one original declaration before a canonical read or engine walk.
 pub(crate) async fn captured_seed(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     name: &str,
     path: &str,
 ) -> TestResult<String> {
+    let request = query::declaration(name, path);
     let answer = call_retrying_acceptance(
         client,
-        tool_request(
-            "search",
-            &serde_json::json!({
-                "query": name, "target": "symbol", "include": ["source"], "limit": 1000
-            }),
-        ),
+        tool_request("search", &serde_json::to_value(request)?),
     )
     .await?;
-    let rows = answer["results"]
-        .as_array()
-        .ok_or("search carries original declarations")?;
+    let rows = query::rows(&answer)?;
     let mut selected = rows
         .iter()
-        .filter(|row| row["path"] == path && row["hit"]["symbol"]["name"] == name);
+        .filter(|row| query::literal(row, "name").ok() == Some(name));
     let row = selected
         .next()
         .ok_or_else(|| format!("original declaration {name} at {path}: {answer}"))?;
@@ -488,30 +501,26 @@ pub(crate) async fn captured_seed(
         "one original declaration {name} at {path}: {answer}"
     );
     assert!(
-        row["hit"]["symbol"]["kind"]
-            .as_str()
-            .is_some_and(|kind| !kind.is_empty()),
+        !query::literal(row, "kind")?.is_empty(),
         "original kind: {row}"
     );
     assert!(
-        row["source"]
-            .as_str()
-            .is_some_and(|source| !source.is_empty()),
+        !query::literal(row, "source")?.is_empty(),
         "original source: {row}"
     );
-    let start = row["range"]["start"]
-        .as_u64()
-        .ok_or("original range start")?;
-    let end = row["range"]["end"].as_u64().ok_or("original range end")?;
+    let start = query::literal(row, "start")?.parse::<u64>()?;
+    let end = query::literal(row, "end")?.parse::<u64>()?;
     assert!(start < end, "original byte range: {row}");
-    let identity = row["hit"]["symbol"]["id"]
-        .as_str()
-        .ok_or("original declaration has canonical identity")?;
+    let identity = query::iri(row, "symbol")?;
     let parsed = rift_protocol::identity::SymbolIdentity::parse(identity)?;
     assert_eq!(
         parsed.owner(),
         &rift_protocol::identity::SymbolOwner::Local,
         "original owner: {row}"
+    );
+    assert!(
+        answer["view"]["id"].is_string(),
+        "captured query selection: {answer}"
     );
     Ok(identity.to_owned())
 }

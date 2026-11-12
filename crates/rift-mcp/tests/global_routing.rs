@@ -72,7 +72,12 @@ async fn call_tool(
     name: &'static str,
     args: Value,
 ) -> TestResult<Value> {
-    let result = client.call_tool(tool_request(name, &args)).await?;
+    let producer = if name == "search" {
+        "search_retrieval"
+    } else {
+        name
+    };
+    let result = client.call_tool(tool_request(producer, &args)).await?;
     result
         .structured_content
         .ok_or_else(|| format!("{name} must return structured content").into())
@@ -316,7 +321,8 @@ async fn await_local_caller(
     let incoming = json!({
         "traversal": { "seed": "rift://symbol/local/rust/walk/beacon", "direction": "incoming" }
     });
-    let answer = call_retrying_acceptance(client, tool_request("search", &incoming)).await?;
+    let answer =
+        call_retrying_acceptance(client, tool_request("search_retrieval", &incoming)).await?;
     let results = answer["results"]
         .as_array()
         .ok_or("the local caller walk returns results")?;
@@ -406,7 +412,7 @@ async fn outgoing_walk_past_a_held_global_answer(hold: Hold) -> TestResult {
         "traversal": { "seed": "rift://symbol/local/rust/walk/caller", "direction": "outgoing" }
     });
     let started = tokio::time::Instant::now();
-    let answer = call_retrying_acceptance(&client, tool_request("search", &walk)).await?;
+    let answer = call_retrying_acceptance(&client, tool_request("search_retrieval", &walk)).await?;
     let elapsed = started.elapsed();
     assert!(
         elapsed < CALLEE_HOLD,
@@ -504,7 +510,7 @@ async fn unversioned_python_runtime_positions_remain_unasked() -> TestResult {
     let walk = json!({
         "traversal": {"seed": "rift://symbol/local/python/app/counted", "direction": "outgoing"}
     });
-    let answer = call_retrying_acceptance(&client, tool_request("search", &walk)).await?;
+    let answer = call_retrying_acceptance(&client, tool_request("search_retrieval", &walk)).await?;
     assert_eq!(
         answer["warnings"][0]["code"], "callees_dropped",
         "{answer:#}"
@@ -1248,7 +1254,7 @@ async fn a_refused_package_scoped_pattern_makes_no_global_request() -> TestResul
     let failure = failed_call(
         client
             .call_tool(tool_request(
-                "search",
+                "search_retrieval",
                 &json!({"pattern": "beacon(", "scope": "global"}),
             ))
             .await,
@@ -1519,7 +1525,7 @@ async fn a_revision_search_with_a_global_scope_refuses_invalid_request() -> Test
     let failure = failed_call(
         client
             .call_tool(tool_request(
-                "search",
+                "search_retrieval",
                 &json!({"query": "local_beacon", "scope": "all", "revision": "rift://revision/git/main"}),
             ))
             .await,
@@ -1930,31 +1936,31 @@ async fn a_refused_package_scoped_read_makes_no_global_request() -> TestResult {
     let refused = [
         (
             "search",
-            json!({"query": "beacon", "pattern": "beacon", "scope": "all"}),
-            "pattern",
+            json!({"query": "SELECT ?hit { SERVICE :search { ?hit :query 'beacon'; :pattern 'beacon'; :scope 'all'; :index ?index } }"}),
+            "field pattern",
         ),
         (
             "search",
-            json!({"query": "beacon", "scope": "all", "limit": 0}),
-            "limit",
+            json!({"query": "SELECT ?hit { SERVICE :search { ?hit :query 'beacon'; :scope 'all'; :limit 0; :index ?index } }"}),
+            "field limit",
         ),
         (
             "search",
-            json!({"query": "beacon", "scope": "all", "traversal": {"depth": 1}}),
-            "seed",
+            json!({"query": "SELECT ?hit { SERVICE :search { ?hit :query 42; :scope 'all'; :index ?index } }"}),
+            "retrieval query and pattern must be string literals",
         ),
         (
             "search",
-            json!({"pattern": "beacon", "scope": "all", "limit": 0}),
-            "limit",
+            json!({"query": "SELECT ?hit { SERVICE :search { ?hit :pattern 'beacon'; :scope 'all'; :limit 0; :index ?index } }"}),
+            "field limit",
         ),
         (
             "get_symbol",
             json!({"id": id, "declaration_limit": 0}),
-            "limit",
+            "field limit",
         ),
     ];
-    for (tool, request, field) in refused {
+    for (tool, request, diagnostic) in refused {
         let failure = failed_call(client.call_tool(tool_request(tool, &request)).await)?;
         assert_eq!(
             failure.code,
@@ -1963,7 +1969,7 @@ async fn a_refused_package_scoped_read_makes_no_global_request() -> TestResult {
             failure.text
         );
         assert!(
-            failure.message.contains(&format!("field {field}")),
+            failure.message.contains(diagnostic),
             "{request}: {}",
             failure.message
         );

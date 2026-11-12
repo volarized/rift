@@ -50,6 +50,7 @@ pub struct TreeRoot {
 
 impl TreeRoot {
     /// Converts an absolute filesystem root into its forward-slash form.
+    /// Windows verbatim drive paths use the same `C:/` form as ordinary drive paths.
     ///
     /// # Errors
     ///
@@ -58,6 +59,10 @@ impl TreeRoot {
         let text = root
             .to_str()
             .ok_or_else(|| errors::lsp::uri_root_not_unicode().error())?;
+        let text = text
+            .strip_prefix(r"\\?\")
+            .filter(|path| matches!(path.as_bytes(), [drive, b':', b'\\', ..] if drive.is_ascii_alphabetic()))
+            .unwrap_or(text);
         Self::from_slash_form(text.replace('\\', "/"))
     }
 
@@ -83,6 +88,12 @@ impl TreeRoot {
             }
         }
         Ok(Self { slash_form })
+    }
+
+    /// The admitted filesystem root in platform path form.
+    #[must_use]
+    pub fn filesystem_path(&self) -> &Path {
+        Path::new(&self.slash_form)
     }
 
     /// The file URI addressing the root itself.
@@ -344,6 +355,8 @@ impl EngineRoots {
                 let unit = SourceUnitId::for_origin(&package.origin, &path)?;
                 Ok(EngineAddress::Package(Box::new(PackageFile {
                     origin: package.origin.clone(),
+                    root: package.root.clone(),
+                    import_root: package.within.clone(),
                     path,
                     unit,
                 })))
@@ -378,11 +391,25 @@ pub enum EngineAddress {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackageFile {
     origin: SourceLocation,
+    root: TreeRoot,
+    import_root: Option<ProjectPath>,
     path: ProjectPath,
     unit: SourceUnitId,
 }
 
 impl PackageFile {
+    /// The admitted filesystem root that holds this physical file.
+    #[must_use]
+    pub const fn root(&self) -> &TreeRoot {
+        &self.root
+    }
+
+    /// The import root established by installed package metadata, when present.
+    #[must_use]
+    pub const fn import_root(&self) -> Option<&ProjectPath> {
+        self.import_root.as_ref()
+    }
+
     /// The defining package or runtime origin that holds the file.
     #[must_use]
     pub const fn origin(&self) -> &SourceLocation {
@@ -497,6 +524,20 @@ mod tests {
                 "{spelling}"
             );
         }
+    }
+
+    #[test]
+    fn windows_verbatim_drive_roots_emit_hostless_file_uris() {
+        let tree = TreeRoot::new(Path::new(r"\\?\c:\work space\ws")).expect("verbatim root");
+        assert_eq!(tree, root("C:/work space/ws"));
+        assert_eq!(
+            tree.root_uri().expect("root URI").as_str(),
+            "file:///C:/work%20space/ws"
+        );
+        let document = path("src/lib.rs");
+        let uri = tree.document_uri(&document).expect("document URI");
+        assert_eq!(uri.as_str(), "file:///C:/work%20space/ws/src/lib.rs");
+        assert_eq!(tree.project_path(&uri).expect("project path"), document);
     }
 
     #[test]

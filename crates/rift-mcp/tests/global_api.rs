@@ -172,6 +172,8 @@ pub(crate) struct FixtureOptions {
     /// Whether the precise search page stops at the response body bound: it answers its
     /// declarations with a `result_truncated` warning and [`BODY_BOUND_CURSOR`].
     pub(crate) stopped_at_body_bound: bool,
+    /// Whether precise search answers carry the incomplete-query warning.
+    pub(crate) query_narrowed: bool,
     /// The features the capabilities leave out of `supported_features`. Without both
     /// documentation features they carry no `documentation_revision` either.
     pub(crate) withheld_features: &'static [&'static str],
@@ -189,6 +191,7 @@ impl Default for FixtureOptions {
             page_limit_max: PAGE_LIMIT_ADVERTISED,
             dependency_entries_max: DEPENDENCY_ENTRIES_ADVERTISED,
             stopped_at_body_bound: false,
+            query_narrowed: true,
             withheld_features: &[],
             python_collection: false,
             resolution_problem: None,
@@ -368,7 +371,12 @@ async fn global_handler(
     }
     if path.ends_with("/search") {
         state.hold_read().await;
-        let mut page = search_page(options.symbol, &body, options.stopped_at_body_bound);
+        let mut page = search_page(
+            options.symbol,
+            &body,
+            options.stopped_at_body_bound,
+            options.query_narrowed,
+        );
         bound_case_page(&mut page, options.symbol, limit);
         return state.response(page);
     }
@@ -821,7 +829,12 @@ fn greeting_symbol() -> Value {
 /// [`BROAD_BODY_MATCH_QUERY`]. That query answers every declaration as a body match in
 /// source order. [`BODY_MATCH_QUERY`] answers `beacon` as a body match. A page stopped
 /// at the response body bound adds `result_truncated` and [`BODY_BOUND_CURSOR`].
-fn search_page(fixture: SymbolFixture, request: &Value, stopped_at_body_bound: bool) -> Value {
+fn search_page(
+    fixture: SymbolFixture,
+    request: &Value,
+    stopped_at_body_bound: bool,
+    query_narrowed: bool,
+) -> Value {
     if request["query"] == BROAD_BODY_MATCH_QUERY {
         let items = if request["phase"] == "broad" {
             DECLARATIONS
@@ -857,14 +870,19 @@ fn search_page(fixture: SymbolFixture, request: &Value, stopped_at_body_bound: b
         "code": "query_narrowed",
         "detail": "query exceeded the active term bound"
     });
+    let mut warnings = Vec::new();
+    if query_narrowed {
+        warnings.push(narrowed);
+    }
     if !stopped_at_body_bound {
-        return page(&items, &json!([narrowed]));
+        return page(&items, &json!(warnings));
     }
     let truncated = json!({
         "code": "result_truncated",
         "detail": "the page stopped at response_body_bytes_max"
     });
-    let mut stopped = page(&items, &json!([narrowed, truncated]));
+    warnings.push(truncated);
+    let mut stopped = page(&items, &json!(warnings));
     stopped["next_cursor"] = json!(BODY_BOUND_CURSOR);
     stopped
 }

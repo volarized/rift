@@ -1,6 +1,6 @@
 use super::{CANDIDATE_BYTES_MAX, RiftProxy, invalid};
 use rift_error::{RiftError, errors};
-use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
+use rift_protocol::identity::SymbolIdentity;
 use rift_protocol::symbol_read::{GetSymbolParams, GetSymbolResult};
 use rmcp::handler::server::tool::IntoCallToolResult;
 use rmcp::model::{
@@ -15,11 +15,9 @@ impl RiftProxy {
         &self,
         request: &CallToolRequestParams,
     ) -> Result<Option<Result<CallToolResponse, rmcp::ErrorData>>, RiftError> {
-        let arguments = request.arguments.clone().unwrap_or_default();
         match request.name.as_ref() {
             "get_symbol" => self.symbol_read(request).await,
-            "search" if arguments.contains_key("traversal") => self.traversal_read(request).await,
-            "search" => self.project_search(request).await,
+            "search" => self.query_forward(request).await.map(Some),
             "nodes" => self.project_nodes(request).await,
             _ => Ok(None),
         }
@@ -61,66 +59,6 @@ impl RiftProxy {
         Ok(Some(response))
     }
 
-    async fn traversal_read(
-        &self,
-        request: &CallToolRequestParams,
-    ) -> Result<Option<Result<CallToolResponse, rmcp::ErrorData>>, RiftError> {
-        let arguments = request.arguments.clone().unwrap_or_default();
-        super::super::encode_bounded(&arguments, CANDIDATE_BYTES_MAX)
-            .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
-        let params: rift_protocol::read::SearchParams =
-            serde_json::from_value(arguments.clone().into()).map_err(|source| {
-                errors::mcp::parameter_invalid()
-                    .tool("search")
-                    .field("arguments")
-                    .accepted(source.to_string())
-                    .error()
-            })?;
-        let seed = params
-            .traversal
-            .as_ref()
-            .and_then(|traversal| traversal.seed.as_ref())
-            .ok_or_else(|| invalid("seed", "a traversal starts at seed"))?;
-        let owner = SymbolIdentity::parse(seed.as_str())?.owner().clone();
-        let key = super::super::identity::backend_key(&owner);
-        let name = key
-            .as_deref()
-            .unwrap_or(if matches!(owner, SymbolOwner::Local) {
-                "local"
-            } else {
-                "global"
-            });
-        self.project_read(request, name).await.map(Some)
-    }
-
-    async fn project_search(
-        &self,
-        request: &CallToolRequestParams,
-    ) -> Result<Option<Result<CallToolResponse, rmcp::ErrorData>>, RiftError> {
-        let arguments = request.arguments.clone().unwrap_or_default();
-        if !arguments.contains_key("pattern") && !arguments.contains_key("change") {
-            return Ok(None);
-        }
-        super::super::encode_bounded(&arguments, CANDIDATE_BYTES_MAX)
-            .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
-        let params: rift_protocol::read::SearchParams = serde_json::from_value(arguments.into())
-            .map_err(|source| {
-                errors::mcp::parameter_invalid()
-                    .tool("search")
-                    .field("arguments")
-                    .accepted(source.to_string())
-                    .error()
-            })?;
-        // Revision-addressed reads keep the server's existing scope refusal.
-        if params.revision.is_some() {
-            return Ok(None);
-        }
-        let Some(name) = super::super::identity::scope_key(&params.scope) else {
-            return Ok(None);
-        };
-        self.project_read(request, &name).await.map(Some)
-    }
-
     /// Reads the nodes of a symbol an accepted extra project or profile owns from that
     /// project's own server, which knows the symbol under its `local` owner.
     async fn project_nodes(
@@ -146,7 +84,7 @@ impl RiftProxy {
         name: &str,
     ) -> Result<Result<CallToolResponse, rmcp::ErrorData>, RiftError> {
         let backend = self.call_backend(request)?;
-        let upstream = dispatch_read_request(request, name)?;
+        let upstream = dispatch_nodes_request(request, name)?;
         let mut response = backend.forward_read(upstream).await?;
         if let Ok(CallToolResponse::Complete(result)) = &response
             && result.is_error != Some(true)
@@ -160,7 +98,7 @@ impl RiftProxy {
                 )
             })?;
             let meta = result.meta.clone();
-            response = qualified_read_response(request, value, name)?;
+            response = qualified_nodes_response(value, name)?;
             if let Ok(CallToolResponse::Complete(answered)) = &mut response {
                 answered.meta = meta;
             }
@@ -168,7 +106,7 @@ impl RiftProxy {
         Ok(response)
     }
 
-    async fn forward_read(
+    pub(in crate::proxy) async fn forward_read(
         &self,
         request: CallToolRequestParams,
     ) -> Result<Result<CallToolResponse, rmcp::ErrorData>, RiftError> {
@@ -187,47 +125,8 @@ impl RiftProxy {
     }
 }
 
-pub(in crate::proxy) fn dispatch_read_request(
-    request: &CallToolRequestParams,
-    backend: &str,
-) -> Result<CallToolRequestParams, RiftError> {
-    if request.name == "nodes" {
-        return dispatch_nodes_request(request, backend);
-    }
-    if request.name != "search" {
-        return Ok(request.clone());
-    }
-    let mut params: rift_protocol::read::SearchParams =
-        serde_json::from_value(request.arguments.clone().unwrap_or_default().into())
-            .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
-    if let Some(traversal) = &mut params.traversal {
-        if let Some(seed) = &mut traversal.seed {
-            *seed = super::super::identity::dispatch_id(seed, backend)?;
-        }
-        if let Some(target) = &mut traversal.to {
-            *target = super::super::identity::dispatch_id(target, backend)?;
-        }
-    }
-    if let Some(name) = super::super::identity::scope_key(&params.scope) {
-        if name != backend {
-            return Err(invalid("scope", "captured backend context does not match"));
-        }
-        params.scope = rift_protocol::read::SearchScope::Local;
-    }
-    let mut upstream = request.clone();
-    let value = serde_json::to_value(params)
-        .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
-    upstream.arguments = Some(
-        value
-            .as_object()
-            .cloned()
-            .ok_or_else(|| invalid("arguments", "search request is not an object"))?,
-    );
-    Ok(upstream)
-}
-
 /// `request` with its `symbol` dispatched to `backend`'s own `local` owner.
-fn dispatch_nodes_request(
+pub(in crate::proxy) fn dispatch_nodes_request(
     request: &CallToolRequestParams,
     backend: &str,
 ) -> Result<CallToolRequestParams, RiftError> {
@@ -256,28 +155,14 @@ fn dispatch_nodes_request(
     Ok(upstream)
 }
 
-fn qualified_read_response(
-    request: &CallToolRequestParams,
+fn qualified_nodes_response(
     value: serde_json::Value,
     backend: &str,
 ) -> Result<Result<CallToolResponse, rmcp::ErrorData>, RiftError> {
-    use rmcp::handler::server::tool::IntoCallToolResult;
-    match request.name.as_ref() {
-        "nodes" => {
-            let mut result: rift_protocol::read::NodesResult = serde_json::from_value(value)
-                .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
-            super::super::identity::qualify_nodes(&mut result, backend)?;
-            bounded_response(crate::output::Json(result).into_call_tool_result())
-        }
-        "search" => {
-            let mut result: rift_protocol::search_read::SearchReadResult =
-                serde_json::from_value(value)
-                    .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
-            super::super::identity::qualify_search(&mut result, backend)?;
-            bounded_response(crate::output::Json(result).into_call_tool_result())
-        }
-        _ => Err(invalid("view", "captured backend mapping is unavailable")),
-    }
+    let mut result: rift_protocol::read::NodesResult = serde_json::from_value(value)
+        .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
+    super::super::identity::qualify_nodes(&mut result, backend)?;
+    bounded_response(crate::output::Json(result).into_call_tool_result())
 }
 
 fn bounded_response(
@@ -346,38 +231,4 @@ fn validate_symbol(params: &GetSymbolParams, result: &GetSymbolResult) -> Result
         return Err(invalid("id", "the project answered another symbol"));
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn selected_search_dispatch_preserves_pattern_change_and_scope_boundary()
-    -> Result<(), Box<dyn std::error::Error>> {
-        for (scope, backend, foreign) in [
-            ("local@docs", "docs", ":docs"),
-            ("local:docs", ":docs", "docs"),
-        ] {
-            for selector in [
-                serde_json::json!({"pattern":"beacon", "target":"symbol"}),
-                serde_json::json!({"change":{"base":"HEAD","head":{"kind":"working_tree"}}}),
-            ] {
-                let mut arguments = selector.as_object().ok_or("selector object")?.clone();
-                arguments.insert("scope".to_owned(), serde_json::json!(scope));
-                let request = CallToolRequestParams::new("search").with_arguments(arguments);
-                let dispatched = dispatch_read_request(&request, backend)?;
-                let original: rift_protocol::read::SearchParams =
-                    serde_json::from_value(request.arguments.clone().ok_or("arguments")?.into())?;
-                let selected: rift_protocol::read::SearchParams = serde_json::from_value(
-                    dispatched.arguments.ok_or("dispatched arguments")?.into(),
-                )?;
-                assert_eq!(selected.scope, rift_protocol::read::SearchScope::Local);
-                assert_eq!(selected.pattern, original.pattern);
-                assert_eq!(selected.change, original.change);
-                assert!(dispatch_read_request(&request, foreign).is_err());
-            }
-        }
-        Ok(())
-    }
 }

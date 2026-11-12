@@ -83,8 +83,7 @@ async fn search_after_population(
 // `search.rs` unit tests (`search_matched_by_carries_both_members_once_the_lexical_lane_covers_text_files`
 // and the sans-I/O tests beside it) prove that half of the fix directly.
 
-/// File-target `search` returns a `.mdx` file and a `justfile` for text they hold, each
-/// as a flat file hit whose `matched_by` claims the `content` lane.
+/// Text-file retrieval keeps the original file target and content match through SELECT.
 #[tokio::test]
 async fn search_reaches_the_mdx_file_and_the_extensionless_justfile() -> TestResult {
     let directory = laid_out_workspace(
@@ -105,57 +104,58 @@ async fn search_reaches_the_mdx_file_and_the_extensionless_justfile() -> TestRes
     let _cleanup = StopOnDrop::new(root);
     let failure_window = FailureWindow::begin(root);
     let client = proxy_client(root).await?;
-    // Issue #511: full-text hits require local file preparation and lexical population.
     within("workspace preparation", await_workspace_ready(&client)).await??;
-
-    let mdx = search_after_population(
-        &client,
-        &json!({ "query": "agentic development toolkit", "target": "file", "limit": 50 }),
-    )
-    .await?;
-    let mdx_hits: Vec<&serde_json::Value> = mdx["results"]
-        .as_array()
-        .expect("results must be an array")
-        .iter()
-        .filter(|result| result["path"] == json!("docs/content/docs/index.mdx"))
-        .collect();
-    assert_eq!(mdx_hits.len(), 1, "the mdx file must surface once: {mdx:#}");
-    assert_eq!(
-        mdx_hits[0]["hit"]["target"],
-        json!("file"),
-        "a text-lane hit answers as a file target: {mdx:#}"
-    );
-    assert!(
-        mdx_hits[0]["matched_by"]
-            .as_array()
-            .is_some_and(|lanes| lanes.contains(&json!("content"))),
-        "a text-lane hit claims the content lane: {mdx:#}"
-    );
-
-    let just = search_after_population(
-        &client,
-        &json!({ "query": "cargo fmt --all --check", "limit": 50 }),
-    )
-    .await?;
-    let just_hits: Vec<&serde_json::Value> = just["results"]
-        .as_array()
-        .expect("results must be an array")
-        .iter()
-        .filter(|result| result["path"] == json!("justfile"))
-        .collect();
-    assert_eq!(
-        just_hits.len(),
-        1,
-        "the extensionless justfile must surface: {just:#}"
-    );
-    assert_eq!(just_hits[0]["hit"]["target"], json!("file"), "{just:#}");
-    assert!(
-        just_hits[0]["matched_by"]
-            .as_array()
-            .is_some_and(|lanes| lanes.contains(&json!("content"))),
-        "{just:#}"
-    );
-
+    for (query, path) in [
+        (
+            r#"SELECT ?path ?target ?matched_by {
+          SERVICE :search {
+            ?hit :query "agentic development toolkit"; :target "file";
+              :path ?path; :hit ?record; :matched_by ?lane .
+            ?record :target ?target . ?lane :value ?matched_by .
+            FILTER(?matched_by = "content")
+          }
+        } LIMIT 50"#,
+            "docs/content/docs/index.mdx",
+        ),
+        (
+            r#"SELECT ?path ?target ?matched_by {
+          SERVICE :search {
+            ?hit :query "cargo fmt --all --check"; :path ?path;
+              :hit ?record; :matched_by ?lane .
+            ?record :target ?target . ?lane :value ?matched_by .
+            FILTER(?matched_by = "content")
+          }
+        } LIMIT 50"#,
+            "justfile",
+        ),
+    ] {
+        let answer = search_after_population(&client, &json!({"query":query})).await?;
+        let rift_protocol::query::QueryAnswer::Bindings { bindings, .. } =
+            serde_json::from_value(answer["answer"].clone())?
+        else {
+            return Err("file retrieval must return SELECT bindings".into());
+        };
+        let hits = bindings
+            .iter()
+            .filter(|row| {
+                matches!(row.get("path"),
+            Some(rift_protocol::query::RdfTerm::Literal { value, .. }) if value == path)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            hits.len(),
+            1,
+            "one original content hit for {path}: {answer}"
+        );
+        assert!(
+            matches!(hits[0].get("target"), Some(rift_protocol::query::RdfTerm::Literal { value, .. }) if value == "file"),
+            "text retrieval keeps file target: {answer}"
+        );
+        assert!(
+            matches!(hits[0].get("matched_by"), Some(rift_protocol::query::RdfTerm::Literal { value, .. }) if value == "content"),
+            "text retrieval keeps content match: {answer}"
+        );
+    }
     client.cancel().await?;
     let stopped = run_rift(root, &["server", "stop"]).await?;
     require_success(&stopped, "stop after the text-lane search")?;

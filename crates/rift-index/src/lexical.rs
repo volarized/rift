@@ -1088,10 +1088,16 @@ async fn ranked_rows(
     transaction: &mut dyn Executor,
     expression: String,
     probe_limit: i64,
+    path: Option<&ProjectPath>,
 ) -> Result<Vec<LexicalMatch>, RiftError> {
-    let rows = toasty::sql::query(lexical_search_sql())
+    let statement = toasty::sql::query(lexical_search_sql(path.is_some()))
         .bind(expression)
-        .bind(probe_limit)
+        .bind(probe_limit);
+    let statement = match path {
+        Some(path) => statement.bind(path.as_str()),
+        None => statement,
+    };
+    let rows = statement
         .column_types(lexical_search_column_types())
         .exec(transaction)
         .await
@@ -1110,7 +1116,7 @@ async fn ranked_rows(
 /// so each candidate row costs one `bm25` evaluation for its rank and one per
 /// column of `SearchableField::ALL`; the `matches_max` bound keeps that
 /// bounded, and what it buys is a `matched_by` a reader can act on.
-fn lexical_search_sql() -> String {
+fn lexical_search_sql(exact_path: bool) -> String {
     let ranked = rank_weights();
     let mut isolated = String::new();
     for field in SearchableField::ALL {
@@ -1121,6 +1127,11 @@ fn lexical_search_sql() -> String {
             ", bm25(lexical_documents_fts, {weights}) AS {column}_hit"
         );
     }
+    let path_predicate = if exact_path {
+        " AND lexical_documents.path = ?3"
+    } else {
+        ""
+    };
     format!(
         "SELECT lexical_documents.identity, lexical_documents.path, \
          lexical_documents.kind, lexical_documents.byte_offset, \
@@ -1129,7 +1140,7 @@ fn lexical_search_sql() -> String {
          FROM lexical_documents_fts \
          JOIN lexical_documents \
          ON lexical_documents.id = lexical_documents_fts.rowid \
-         WHERE lexical_documents_fts MATCH ?1 \
+         WHERE lexical_documents_fts MATCH ?1{path_predicate} \
          ORDER BY rank, lexical_documents.identity LIMIT ?2"
     )
 }
@@ -1768,13 +1779,23 @@ impl LexicalSearchIndex {
         phase: QueryPhase,
         limit: u32,
     ) -> Result<RevisionScoped<LexicalRanking>, RiftError> {
-        // The statement carries no path predicate. A caller narrowing by path
-        // screens the ranked identities it reads back, because the request's
-        // glob selector and this statement would be two spellings of one
-        // predicate, in two languages, that can disagree. What the caller pays
-        // is a query whose matches all sit outside its selector: the bound cuts
-        // before the screen runs, the answer is short, and `results_truncated`
-        // says the bound cut it.
+        self.search_with_path(tree_revision, query, phase, limit, None)
+            .await
+    }
+
+    /// Applies an exact project path before bounding the lexical matches.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::search`].
+    pub async fn search_with_path(
+        &self,
+        tree_revision: &str,
+        query: &ParsedQuery,
+        phase: QueryPhase,
+        limit: u32,
+        path: Option<&ProjectPath>,
+    ) -> Result<RevisionScoped<LexicalRanking>, RiftError> {
         let expression = query.render(phase);
         let bound = limit.min(self.limits.matches_max());
         // One row past the bound tells whether the store holds a match the bound cuts.
@@ -1816,7 +1837,7 @@ impl LexicalSearchIndex {
                 let matches = rift_tracing::traced!(
                     component = "lexical",
                     operation = "lexical.query",
-                    async move { ranked_rows(query_reader, expression, probe_limit).await }
+                    async move { ranked_rows(query_reader, expression, probe_limit, path).await }
                 )
                 .await?;
                 Ok(RevisionScoped::Matched(LexicalRanking::from_probe(
@@ -2571,7 +2592,7 @@ mod tests {
 
     #[test]
     fn test_the_ranking_query_declares_one_type_per_selected_column() {
-        let sql = lexical_search_sql();
+        let sql = lexical_search_sql(false);
         let aliased = sql.matches(" AS ").count();
         assert_eq!(
             aliased,

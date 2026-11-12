@@ -120,7 +120,7 @@ async fn search(client: &RunningService<RoleClient, ()>, query: &str) -> TestRes
         .as_object()
         .cloned()
         .ok_or("search arguments are an object")?;
-    let request = CallToolRequestParams::new("search").with_arguments(arguments);
+    let request = CallToolRequestParams::new("search_retrieval").with_arguments(arguments);
     let result = client.peer().call_tool(request).await?;
     result
         .structured_content

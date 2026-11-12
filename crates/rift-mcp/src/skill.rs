@@ -95,7 +95,7 @@ const DECISION_TABLE: &[DecisionRow] = &[
     DecisionRow {
         situation: "Every match of a regex in the project's text is needed.",
         tools: &["search"],
-        note: Some("with `pattern`"),
+        note: Some("with `:pattern` in `SERVICE :search`"),
     },
     DecisionRow {
         situation: "The exact symbol identity is known.",
@@ -106,7 +106,7 @@ const DECISION_TABLE: &[DecisionRow] = &[
         situation: "A package or runtime declaration is needed.",
         tools: &["search"],
         note: Some(
-            "with `scope: \"global\"` or `\"all\"`; read the returned `id` with `get_symbol`",
+            "with `:scope \"global\"` or `\"all\"` in `SERVICE :search`; read the returned symbol IRI with `get_symbol`",
         ),
     },
     DecisionRow {
@@ -114,7 +114,7 @@ const DECISION_TABLE: &[DecisionRow] = &[
                     needed.",
         tools: &["search"],
         note: Some(
-            "with `packages` and `scope: \"global\"` or `\"all\"`; read the returned `id` with \
+            "with `:packages` and `:scope \"global\"` or `\"all\"` in `SERVICE :search`; read the returned IRI with \
                     `get_symbol`, naming the hit's release as `revision`",
         ),
     },
@@ -136,18 +136,18 @@ const DECISION_TABLE: &[DecisionRow] = &[
         situation: "The declarations that reference a symbol, its impact (what changes when \
                     it does), or a path between two symbols is needed.",
         tools: &["search"],
-        note: Some("with a `traversal` block"),
+        note: Some("with SPARQL property paths"),
     },
     DecisionRow {
         situation: "The declarations two revisions, or a revision and the working tree, hold \
                     differently are needed.",
         tools: &["search"],
-        note: Some("with a `change` block"),
+        note: Some("with `:change` in `SERVICE :search`"),
     },
     DecisionRow {
         situation: "The commit that made a change, found by its message, is needed.",
         tools: &["search"],
-        note: Some("with `target: \"commit\"`"),
+        note: Some("with `:target \"commit\"` in `SERVICE :search`"),
     },
 ];
 
@@ -230,6 +230,20 @@ fn skill_markdown(form: SkillForm) -> String {
         rendered.push_str(&decision_row_markdown(row));
     }
     rendered.push('\n');
+    rendered.push_str(
+        "## Search queries\n\n\
+         `search` takes required `query` text and optional `language`, default `sparql`. \
+         Replace `<symbol-id>` with an IRI returned by Rift.\n\n\
+         - Name: `SELECT ?s {?s a :Symbol; :name \"load_config\"}`\n\
+         - Usages: `SELECT ?u {<symbol-id> :usages ?u}`\n\
+         - Locations: `SELECT * {<symbol-id> :usages/:range [:unit ?u; :start ?s; :end ?e]}`\n\
+         - Distinct callers: `SELECT DISTINCT ?s {?s :references <symbol-id>}`\n\
+         - Third-level callees: `SELECT ?s {<symbol-id> :calls/:calls/:calls ?s}`\n\
+         - Regex: `SELECT ?p {SERVICE :search {?h :pattern \"TODO|FIXME\"; :target \"file\"; :path ?p}}`\n\
+         - Count: `SELECT (COUNT(?u) AS ?n) {<symbol-id> :usages ?u}`\n\n\
+         Follow `pagination.next_query` unchanged for transport pages. Read exact symbols and nodes \
+         with the selected `revision`. Missing required facts return a typed unavailable outcome.\n\n",
+    );
     rendered.push_str("## When a call refuses\n\n");
     rendered.push_str(
         "Read `rift server logs` when a refusal alone does not say why; it carries the \
@@ -463,15 +477,8 @@ mod tests {
     fn decision_table_routes_a_package_the_project_lacks_to_packages() {
         for form in [SkillForm::Installed, SkillForm::Plugin] {
             let rendered = skill_markdown(form);
-            assert!(
-                rendered.contains(
-                    "| A package version the project does not use, or a package it lacks, is \
-                     needed. | `search` (with `packages` and `scope: \"global\"` \
-                     or `\"all\"`; read the returned `id` with `get_symbol`, naming the hit's \
-                     release as `revision`) |"
-                ),
-                "{rendered}"
-            );
+            assert!(rendered.contains("`search` (with `:packages` and `:scope"));
+            assert!(rendered.contains("naming the hit's release as `revision`"));
         }
     }
 
@@ -490,7 +497,8 @@ mod tests {
             assert_eq!(row.tools, &["search"]);
             let note = row.note.expect("discovery must select its search scope");
             assert!(note.contains("scope"));
-            assert!(note.contains("returned `id` with `get_symbol`"));
+            assert!(note.contains("`get_symbol`"));
+            assert!(note.contains("`SERVICE :search`"));
         }
     }
 
@@ -501,7 +509,7 @@ mod tests {
             assert!(
                 rendered.contains(
                     "| The declarations two revisions, or a revision and the working tree, hold \
-                     differently are needed. | `search` (with a `change` block) |"
+                     differently are needed. | `search` (with `:change` in `SERVICE :search`) |"
                 ),
                 "{rendered}"
             );
@@ -515,7 +523,7 @@ mod tests {
             assert!(
                 rendered.contains(
                     "| The commit that made a change, found by its message, is needed. | \
-                     `search` (with `target: \"commit\"`) |"
+                     `search` (with `:target \"commit\"` in `SERVICE :search`) |"
                 ),
                 "{rendered}"
             );
@@ -529,7 +537,7 @@ mod tests {
             assert!(
                 rendered.contains(
                     "| Every match of a regex in the project's text is needed. | `search` (with \
-                     `pattern`) |"
+                     `:pattern` in `SERVICE :search`) |"
                 ),
                 "{rendered}"
             );

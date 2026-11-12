@@ -114,7 +114,7 @@ async fn search_change_answers_every_declaration_the_two_revisions_differ_in() -
     let structured = call_retrying_acceptance(
         &client,
         tool_request(
-            "search",
+            "search_retrieval",
             &json!({
                 "change": {"base": "baseline", "head": "HEAD"},
                 "include": ["source"]
@@ -183,7 +183,7 @@ async fn search_change_against_the_working_tree_answers_uncommitted_edits() -> T
     let structured = call_retrying_acceptance(
         &client,
         tool_request(
-            "search",
+            "search_retrieval",
             &json!({"change": {"base": "baseline", "head": {"kind": "working_tree"}}}),
         ),
     )
@@ -229,7 +229,7 @@ async fn search_change_with_base_alone_compares_against_head() -> TestResult {
 
     let structured = call_retrying_acceptance(
         &client,
-        tool_request("search", &json!({"change": {"base": "baseline"}})),
+        tool_request("search_retrieval", &json!({"change": {"base": "baseline"}})),
     )
     .await?;
 
@@ -248,7 +248,7 @@ async fn search_change_with_a_file_target_answers_an_empty_page() -> TestResult 
     let structured = call_retrying_acceptance(
         &client,
         tool_request(
-            "search",
+            "search_retrieval",
             &json!({"change": {"base": "baseline"}, "target": "file"}),
         ),
     )
@@ -294,7 +294,11 @@ async fn search_change_refuses_the_requests_it_cannot_answer() -> TestResult {
     ];
 
     for (arguments, code) in refusals {
-        let failure = failed_call(client.call_tool(tool_request("search", &arguments)).await)?;
+        let failure = failed_call(
+            client
+                .call_tool(tool_request("search_retrieval", &arguments))
+                .await,
+        )?;
         assert_eq!(
             failure.code, code,
             "arguments={arguments}, failure={failure:?}"
@@ -326,7 +330,7 @@ async fn search_change_refuses_a_workspace_with_history_disabled() -> TestResult
     let failure = failed_call(
         client
             .call_tool(tool_request(
-                "search",
+                "search_retrieval",
                 &json!({"change": {"base": "baseline"}}),
             ))
             .await,
@@ -364,7 +368,10 @@ async fn search_change_refuses_a_workspace_with_no_repository() -> TestResult {
 
     let failure = failed_call(
         client
-            .call_tool(tool_request("search", &json!({"change": {"base": "main"}})))
+            .call_tool(tool_request(
+                "search_retrieval",
+                &json!({"change": {"base": "main"}}),
+            ))
             .await,
     )?;
     assert_eq!(
@@ -411,7 +418,7 @@ async fn search_change_pairs_a_declaration_moved_between_paths() -> TestResult {
 
     let structured = call_retrying_acceptance(
         &client,
-        tool_request("search", &json!({"change": {"base": "baseline"}})),
+        tool_request("search_retrieval", &json!({"change": {"base": "baseline"}})),
     )
     .await?;
 

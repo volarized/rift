@@ -23,13 +23,14 @@ use lsp_types::notification::{
     Notification, Progress, PublishDiagnostics,
 };
 use lsp_types::request::{
-    CallHierarchyOutgoingCalls, CallHierarchyPrepare, DocumentDiagnosticRequest, Initialize,
-    References, RegisterCapability, Request, Shutdown, WorkDoneProgressCreate,
-    WorkspaceConfiguration, WorkspaceDiagnosticRefresh,
+    CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare,
+    DocumentDiagnosticRequest, Initialize, References, RegisterCapability, Request, Shutdown,
+    WorkDoneProgressCreate, WorkspaceConfiguration, WorkspaceDiagnosticRefresh,
 };
 use lsp_types::{
-    CallHierarchyItem, CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams,
-    CallHierarchyPrepareParams, ConfigurationParams, Diagnostic, DidChangeWatchedFilesParams,
+    CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
+    CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
+    ConfigurationParams, Diagnostic, DidChangeWatchedFilesParams,
     DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DocumentDiagnosticParams, DocumentDiagnosticReport,
     DocumentDiagnosticReportResult, FileChangeType, FileEvent, FileSystemWatcher, GlobPattern,
@@ -465,7 +466,7 @@ pub struct EngineSession {
     empty_answers: EmptyAnswers,
     watched_file_watchers: Vec<FileSystemWatcher>,
     document_version: i32,
-    open_documents: BTreeSet<ProjectPath>,
+    open_documents: BTreeSet<lsp_types::Uri>,
     open_documents_unrecorded: bool,
     frame_in_flight: bool,
     ended: bool,
@@ -782,28 +783,35 @@ impl EngineSession {
         text: String,
     ) -> Result<(), RiftError> {
         let uri = self.document_uri(path)?;
+        self.open_uri(uri, language_id, text).await
+    }
+
+    /// Opens admitted exact source by its original document URI.
+    ///
+    /// # Errors
+    /// Returns a session or notification exchange failure.
+    pub async fn open_uri(
+        &mut self,
+        uri: lsp_types::Uri,
+        language_id: &str,
+        text: String,
+    ) -> Result<(), RiftError> {
         self.document_version += 1;
         let params = DidOpenTextDocumentParams {
             text_document: TextDocumentItem {
-                uri,
+                uri: uri.clone(),
                 language_id: language_id.to_owned(),
                 version: self.document_version,
                 text,
             },
         };
         self.notify::<DidOpenTextDocument>(&params).await?;
-        self.record_open(path);
-        Ok(())
-    }
-
-    /// Records `path` as opened, or marks the record incomplete past
-    /// [`OPEN_DOCUMENTS_MAX`].
-    fn record_open(&mut self, path: &ProjectPath) {
-        if self.open_documents.len() >= OPEN_DOCUMENTS_MAX && !self.open_documents.contains(path) {
+        if self.open_documents.len() >= OPEN_DOCUMENTS_MAX && !self.open_documents.contains(&uri) {
             self.open_documents_unrecorded = true;
-            return;
+        } else {
+            self.open_documents.insert(uri);
         }
-        self.open_documents.insert(path.clone());
+        Ok(())
     }
 
     /// Closes one previously opened document.
@@ -820,13 +828,20 @@ impl EngineSession {
     /// ([`EngineSession::is_intact`]); the document stays recorded open until the
     /// frame is written, so [`EngineSession::close_open_documents`] closes it again.
     pub async fn close(&mut self, path: &ProjectPath) -> Result<(), RiftError> {
+        let uri = self.document_uri(path)?;
+        self.close_uri(&uri).await
+    }
+
+    /// Closes admitted exact source previously opened by its original URI.
+    ///
+    /// # Errors
+    /// Returns a session or notification exchange failure.
+    pub async fn close_uri(&mut self, uri: &lsp_types::Uri) -> Result<(), RiftError> {
         let params = DidCloseTextDocumentParams {
-            text_document: TextDocumentIdentifier {
-                uri: self.document_uri(path)?,
-            },
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
         };
         self.notify::<DidCloseTextDocument>(&params).await?;
-        self.open_documents.remove(path);
+        self.open_documents.remove(uri);
         Ok(())
     }
 
@@ -849,9 +864,9 @@ impl EngineSession {
     /// later call closes it; one dropped while a frame is being written leaves the
     /// session not intact ([`EngineSession::is_intact`]).
     pub async fn close_open_documents(&mut self) -> Result<(), RiftError> {
-        let open: Vec<ProjectPath> = self.open_documents.iter().cloned().collect();
-        for path in &open {
-            self.close(path).await?;
+        let open: Vec<_> = self.open_documents.iter().cloned().collect();
+        for uri in &open {
+            self.close_uri(uri).await?;
         }
         Ok(())
     }
@@ -913,16 +928,57 @@ impl EngineSession {
         path: &ProjectPath,
         position: Position,
     ) -> Result<Vec<CallHierarchyItem>, RiftError> {
+        let uri = self.document_uri(path)?;
+        self.prepare_call_hierarchy_uri(uri, position).await
+    }
+
+    /// Prepares a new item in this session at a position of admitted exact source.
+    ///
+    /// # Errors
+    /// Returns a capability or request exchange failure.
+    pub async fn prepare_call_hierarchy_uri(
+        &mut self,
+        uri: lsp_types::Uri,
+        position: Position,
+    ) -> Result<Vec<CallHierarchyItem>, RiftError> {
         require(
             self.capabilities.call_hierarchy,
             CallHierarchyPrepare::METHOD,
         )?;
         let params = CallHierarchyPrepareParams {
-            text_document_position_params: self.position_params(path, position)?,
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position,
+            },
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
-        let items = self.request::<CallHierarchyPrepare>(params).await?;
-        Ok(items.unwrap_or_default())
+        Ok(self
+            .request::<CallHierarchyPrepare>(params)
+            .await?
+            .unwrap_or_default())
+    }
+
+    /// The callers the engine names for one prepared item, with each caller's ranges.
+    ///
+    /// # Errors
+    /// Returns the same capability and exchange failures as the outgoing call read.
+    pub async fn incoming_calls(
+        &mut self,
+        item: CallHierarchyItem,
+    ) -> Result<Vec<CallHierarchyIncomingCall>, RiftError> {
+        require(
+            self.capabilities.call_hierarchy,
+            CallHierarchyIncomingCalls::METHOD,
+        )?;
+        let params = CallHierarchyIncomingCallsParams {
+            item,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        Ok(self
+            .request::<CallHierarchyIncomingCalls>(params)
+            .await?
+            .unwrap_or_default())
     }
 
     /// The calls one prepared item makes: each callee, and the ranges of its

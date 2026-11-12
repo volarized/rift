@@ -69,8 +69,8 @@ its situation:
 - [`get_symbol`](/docs/mcp#tool-get_symbol) reads one exact symbol identity returned by search.
 - [`nodes`](/docs/mcp#tool-nodes) answers a symbol's source, every syntax node of its
   declarations, or the nodes of the declaration at one position.
-- `search` with a `traversal` block answers a symbol's neighbors, its impact (who breaks when it
-  changes), or a path between two symbols.
+- `search` with SPARQL property paths follows references and calls. `:usages` selects
+  physical occurrences.
 
 The skill also points the agent at [`rift://map`](/docs/mcp#resource-map) as the first
 read in an unfamiliar repository, and at [`rift server logs`](/docs/developer/implementation#server-logs)
@@ -113,19 +113,27 @@ and [`rift://map`](/docs/mcp#resource-map) for orientation.
 
 <VersionBadge version="v0.0.46" />
 
-The suggested call carries the agent's own search:
+The hook puts the search in a SPARQL `query` that calls `SERVICE :search`.
 
-- a `Grep` call becomes a [`pattern`](/docs/mcp#search-pattern) search with the same regex. Its
-  `path`, `glob`, and `type` become `paths.include`, `-i` a `(?i)` prefix, and `head_limit` and
-  `offset` the page
-- a `Glob` call becomes a `pattern` search for `\A`, which matches once at the start of every
-  file, with `target: "file"`: the answer lists the indexed files its pattern selects
-- a `Bash` call running one plain `grep`, `rg`, or `find` command is read as the `Grep` or
-  `Glob` call it equals. grep's basic and extended syntax is translated into the regex syntax
-  `pattern` reads, so `grep -rn "cfg(test)" src/` from the workspace root suggests:
+- For `Grep`, the hook passes the same [regex](/docs/mcp#search-pattern) as `:pattern`. It
+  maps `path`, `glob`, and `type` to the `include` list in `:paths`, and adds `(?i)` for
+  `-i`. The hook maps `head_limit` to `:limit` and an `offset` at a page boundary to
+  `:page_index`.
+- For `Glob`, the hook selects `:target "file"` and passes the regex `\A` as `:pattern`.
+  The pattern matches once per indexed file selected by `:paths`, and the query returns
+  its path.
+- For a single `grep`, `rg`, or `find` command in `Bash`, the hook maps the command to the
+  equivalent `Grep` or `Glob` request. It translates basic and extended grep syntax into
+  the regex syntax Rift reads.
+
+For `grep -rn "cfg(test)" src/` at the workspace root, the hook suggests these `search`
+arguments.
 
 ```json
-{ "pattern": "cfg\\(test\\)", "paths": { "include": ["src/**"] } }
+{
+  "query": "SELECT ?path ?symbol ?line ?start ?end ?source { SERVICE :search { ?hit :pattern \"cfg\\\\(test\\\\)\"; :index ?index; :path ?path; :paths '{\"include\":[\"src/**\"]}'^^<http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON> . OPTIONAL { ?hit :symbol ?symbol } OPTIONAL { ?hit :line ?line } OPTIONAL { ?hit :start ?start; :end ?end } OPTIONAL { ?hit :source ?source } } } ORDER BY ?index",
+  "language": "sparql"
+}
 ```
 
 A call with a part `search` has no form for passes without a deny: context lines, `multiline`,

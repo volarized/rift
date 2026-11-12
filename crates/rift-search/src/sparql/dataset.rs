@@ -11,6 +11,8 @@ use sha2::{Digest as _, Sha256};
 use super::limits::GraphLimits;
 use super::vocabulary::{VocabularyClass, VocabularyProperty};
 
+mod retrieval;
+
 /// IRI prefix of a symbol identity.
 const SYMBOL_PREFIX: &str = "rift://symbol/";
 /// IRI prefix of a source unit identity.
@@ -118,6 +120,15 @@ pub enum HistoryEvent {
     Removed,
 }
 
+/// The address of a logical symbol in one captured publication.
+#[derive(Clone, Copy, Debug)]
+pub enum SymbolAddress<'a> {
+    /// An established canonical symbol address.
+    Established(&'a SymbolId),
+    /// The original contribution of a symbol without an established identity.
+    Unestablished(&'a rift_core::ContributionReference),
+}
+
 /// One fact a graph dataset holds. Every resource a fact names is typed with its class, so a
 /// query reaches it through `rdf:type` whichever fact introduced it.
 #[derive(Clone, Copy, Debug)]
@@ -130,6 +141,19 @@ pub enum GraphFact<'a> {
         kind: &'a str,
         /// The symbol's language.
         language: &'a Language,
+    },
+    /// The portable presentation of a captured logical symbol.
+    SymbolDetails {
+        /// The symbol's address in this selection.
+        address: SymbolAddress<'a>,
+        /// The symbol's name, as written in source.
+        name: &'a str,
+        /// The declaration kind.
+        kind: &'a str,
+        /// The symbol's language.
+        language: &'a Language,
+        /// The original selected revision.
+        revision: &'a RevisionIri,
     },
     /// A syntax node.
     Node(NodeFact<'a>),
@@ -148,6 +172,15 @@ pub enum GraphFact<'a> {
         symbol: &'a SymbolId,
         /// The node using it.
         node: NodeAddress<'a>,
+    },
+    /// One physical usage, preserving the identity the provider gave this occurrence.
+    Occurrence {
+        /// The original record key within the selected provider and revision.
+        key: &'a str,
+        /// Target, enclosing symbol and source span.
+        occurrence: &'a rift_protocol::relationship_read::QueryOccurrence,
+        /// Exact source bytes at this occurrence, when acquired.
+        source: Option<&'a str>,
     },
     /// A revision's effect on a symbol.
     History {
@@ -246,11 +279,17 @@ impl GraphDatasetBuilder {
     pub fn insert(&mut self, fact: GraphFact<'_>) -> Result<(), RiftError> {
         let mut written = TripleWriter::default();
         fact.write_triples(&mut written)?;
+        self.insert_triples(written.0, GraphNameRef::DefaultGraph)
+    }
+
+    fn insert_triples(
+        &mut self,
+        triples: Vec<Triple>,
+        graph: GraphNameRef<'_>,
+    ) -> Result<(), RiftError> {
         let mut added = Graph::new();
-        for triple in written.0 {
-            let held = self
-                .dataset
-                .contains(triple.as_ref().in_graph(GraphNameRef::DefaultGraph));
+        for triple in triples {
+            let held = self.dataset.contains(triple.as_ref().in_graph(graph));
             if !held {
                 added.insert(triple);
             }
@@ -262,10 +301,85 @@ impl GraphDatasetBuilder {
         self.admit(added.len(), literal_bytes)?;
         self.literal_bytes += literal_bytes;
         for triple in &added {
-            self.dataset
-                .insert(triple.in_graph(oxrdf::GraphName::DefaultGraph));
+            self.dataset.insert(triple.in_graph(graph));
         }
         Ok(())
+    }
+
+    /// Adds one node from the existing revision-pinned syntax read.
+    ///
+    /// # Errors
+    /// Returns a graph admission refusal for an invalid or oversized node.
+    pub fn insert_declared_node(
+        &mut self,
+        symbol: &SymbolId,
+        node: &rift_protocol::read::Node,
+        include_source: bool,
+    ) -> Result<(), RiftError> {
+        let Some(declaration) = node.declaration else {
+            return Ok(());
+        };
+        let address = |index| NodeAddress::Declaration {
+            symbol,
+            declaration,
+            index,
+        };
+        self.insert(GraphFact::Node(NodeFact {
+            address: address(node.index),
+            kind: &node.kind.0,
+            language: &node.language,
+            parent: node.parent.map(address),
+            location: Some(NodeLocation {
+                unit: &node.unit,
+                range: &node.range,
+            }),
+            source: include_source.then_some(node.source.as_str()),
+        }))
+    }
+
+    /// Adds the item extent and optional excerpt of a captured physical declaration.
+    ///
+    /// The record position distinguishes declarations within this captured publication.
+    ///
+    /// # Errors
+    /// Returns an identity or graph admission refusal.
+    pub fn insert_declaration_excerpt(
+        &mut self,
+        id: &SymbolId,
+        position: usize,
+        location: NodeLocation<'_>,
+        source: Option<&str>,
+    ) -> Result<(), RiftError> {
+        use VocabularyProperty as Property;
+
+        let mut out = TripleWriter::default();
+        let symbol = out.symbol(id)?;
+        let position = position.to_string();
+        let node = out.typed(
+            content_blank_node(&[symbol.as_str(), "captured-declaration", &position]),
+            VocabularyClass::Node,
+        );
+        out.link(&node, Property::Of, symbol);
+        out.link(&node, Property::Index, Literal::from(0_u64));
+        out.location(&node, location.unit, location.range)?;
+        if let Some(source) = source {
+            out.literal(&node, Property::Source, source);
+        }
+        self.insert_triples(out.0, GraphNameRef::DefaultGraph)
+    }
+
+    /// Publishes the default local facts under their named graph.
+    ///
+    /// # Errors
+    /// Refuses a named graph that exceeds the shared dataset bounds.
+    pub fn publish_local_graph(&mut self) -> Result<(), RiftError> {
+        let graph = NamedNode::new_unchecked(super::LOCAL_GRAPH);
+        let triples = self
+            .dataset
+            .quads_for_graph_name(GraphNameRef::DefaultGraph)
+            .map(|quad| Triple::new(quad.subject, quad.predicate, quad.object))
+            .collect();
+        self.insert_triples(triples, (&graph).into())
     }
 
     /// Accepts the dataset.
@@ -317,6 +431,32 @@ impl GraphFact<'_> {
                 out.literal(&symbol, Property::Kind, kind);
                 out.literal(&symbol, Property::Language, &language.identity_segment());
             }
+            Self::SymbolDetails {
+                address,
+                name,
+                kind,
+                language,
+                revision,
+            } => {
+                let subject: NamedOrBlankNode = match address {
+                    SymbolAddress::Established(symbol) => out.symbol(symbol)?.into(),
+                    SymbolAddress::Unestablished(reference) => out
+                        .typed(
+                            content_blank_node(&[
+                                "symbol",
+                                reference.provider().as_str(),
+                                reference.symbol().as_str(),
+                            ]),
+                            VocabularyClass::Symbol,
+                        )
+                        .into(),
+                };
+                out.literal(&subject, Property::Name, name);
+                out.literal(&subject, Property::Kind, kind);
+                out.literal(&subject, Property::Language, &language.identity_segment());
+                let revision = out.revision(revision);
+                out.link(&subject, Property::Revision, revision);
+            }
             Self::Node(node) => node.write_triples(out)?,
             Self::Relation {
                 source,
@@ -329,6 +469,27 @@ impl GraphFact<'_> {
             Self::Usage { symbol, node } => {
                 let (symbol, node) = (out.symbol(symbol)?, out.node(node)?);
                 out.link(&symbol, Property::Usages, node);
+            }
+            Self::Occurrence {
+                key,
+                occurrence,
+                source,
+            } => {
+                let target = out.symbol(&occurrence.target)?;
+                let usage = out.typed(
+                    content_blank_node(&["occurrence", key]),
+                    VocabularyClass::Occurrence,
+                );
+                out.link(&target, Property::Usages, usage.clone());
+                out.literal(&usage, Property::Kind, occurrence.facet.as_ref());
+                out.location(&usage, &occurrence.source.unit, &occurrence.source.range)?;
+                if let Some(source) = source {
+                    out.literal(&usage, Property::Source, source);
+                }
+                if let Some(enclosing) = &occurrence.enclosing {
+                    let enclosing = out.symbol(enclosing)?;
+                    out.link(&usage, Property::Of, enclosing);
+                }
             }
             Self::History {
                 symbol,
@@ -373,13 +534,7 @@ impl NodeFact<'_> {
             out.literal(&node, Property::Source, source);
         }
         if let Some(NodeLocation { unit, range }) = self.location {
-            let unit = out.unit(unit)?;
-            let (start, end) = (range.start.to_string(), range.end.to_string());
-            let location = content_blank_node(&[node.as_str(), unit.as_str(), &start, &end]);
-            out.link(&node, Property::Range, location.clone());
-            out.link(&location, Property::Unit, unit);
-            out.link(&location, Property::Start, Literal::from(range.start));
-            out.link(&location, Property::End, Literal::from(range.end));
+            out.location(&node, unit, range)?;
         }
         Ok(())
     }
@@ -459,6 +614,23 @@ impl TripleWriter {
         }
         self.link(&node, Property::Index, Literal::from(index));
         Ok(node)
+    }
+
+    fn location(
+        &mut self,
+        subject: &BlankNode,
+        unit: &SourceUnitId,
+        range: &TextRange,
+    ) -> Result<(), RiftError> {
+        use VocabularyProperty as Property;
+        let unit = self.unit(unit)?;
+        let (start, end) = (range.start.to_string(), range.end.to_string());
+        let location = content_blank_node(&[subject.as_str(), unit.as_str(), &start, &end]);
+        self.link(subject, Property::Range, location.clone());
+        self.link(&location, Property::Unit, unit);
+        self.link(&location, Property::Start, Literal::from(range.start));
+        self.link(&location, Property::End, Literal::from(range.end));
+        Ok(())
     }
 
     /// Types a revision `Revision`, and `Commit` when it is a git commit.

@@ -38,11 +38,16 @@
 
 mod admission;
 mod dataset;
+mod dispatch;
 mod evaluation;
 mod expression;
+mod inventory;
 mod limits;
+mod page;
 mod query;
 mod query_thread;
+mod requirements;
+mod retrieval;
 mod vocabulary;
 
 #[cfg(test)]
@@ -50,17 +55,26 @@ mod conformance_tests;
 #[cfg(test)]
 mod tests;
 
+/// The named graph of the accepted local publication.
+pub const LOCAL_GRAPH: &str = "urn:rift:graph:local";
+
 pub use dataset::{
     GraphDataset, GraphDatasetBuilder, GraphFact, HistoryEvent, NodeAddress, NodeFact,
-    NodeLocation, RevisionIri, SymbolRelation,
+    NodeLocation, RevisionIri, SymbolAddress, SymbolRelation,
 };
 pub use evaluation::{GraphAnswer, GraphTerm, QueryCancellation, SolutionTable};
+pub use inventory::{OccurrenceSelection, SemanticInventory};
 pub use limits::{
     ALGEBRA_DEPTH_MAX, ANSWER_BYTES_MAX, BRACKETS_MAX, COMPUTED_BYTES_MAX, EVALUATION_TIMEOUT,
     EXPRESSION_BYTES_MAX, GraphLimits, GraphLimitsBuilder, LITERAL_BYTES_MAX, OPERATORS_MAX,
     PATTERNS_MAX, QUERY_BYTES_MAX, SOLUTIONS_MAX, TRIPLES_MAX,
 };
+pub use page::{PageForm, PageSelection, continuation_query};
 pub use query::GraphQuery;
+pub use requirements::{
+    AdjacencySelection, AdjacencyStep, NodeSelection, ReachedNodes, SymbolSelection,
+};
+pub use retrieval::RetrievalSelection;
 pub use vocabulary::{
     PropertyDefinition, VOCABULARY_NAMESPACE, VocabularyClass, VocabularyProperty,
     VocabularyResource, VocabularyValue,

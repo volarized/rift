@@ -1652,6 +1652,31 @@ fn lexical_truncated(matches_max: u32) -> ReadWarning {
     }
 }
 
+/// Proves the path matcher can select at most one physical path for lexical ranking.
+fn exact_lexical_path(params: &SearchParams) -> Option<rift_core::ProjectPath> {
+    let paths = params.paths.as_ref()?;
+    let [include] = paths.include.as_slice() else {
+        return None;
+    };
+    let path = include.0.as_str();
+    if params.scope != SearchScope::Local
+        || !paths.force_include.is_empty()
+        || path.is_empty()
+        || !path
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_' | b'.' | b'-'))
+    {
+        return None;
+    }
+    // A slash anchors the whole path in the glob matcher. A basename can also
+    // be used when the exclusion removes all nested paths.
+    if !path.contains('/') && !matches!(paths.exclude.as_slice(), [exclude] if exclude.0 == "*/**")
+    {
+        return None;
+    }
+    rift_core::ProjectPath::new(path).ok()
+}
+
 /// The warnings one search index's readiness adds to an answer, for a workspace of `files`
 /// files.
 ///
@@ -2331,30 +2356,16 @@ impl RiftMcp {
         result
     }
 
-    /// Searches indexed declarations and source lines by lexical `query`, merged with
-    /// full-text matches from included `[search.text]` files and declaration bodies, and by a
-    /// bounded relationship `traversal` from one seed symbol: `incoming` reaches the
-    /// declarations referencing it, `outgoing` the declarations it calls. `pattern` matches a
-    /// regex against the text of every indexed file, line by line as ripgrep reads it, and
-    /// answers each match and each declaration holding one, in place of `query` and
-    /// `traversal`. `change` answers the declarations a committed revision and another
-    /// revision, or the working tree, hold differently, in place of `query` and `traversal`.
-    /// A git `revision` searches that commit instead of the served working tree, and never
-    /// combines with `pattern`, `traversal`, or `change`. `scope` reaches past the project
-    /// tree: `global` answers collected package and runtime facts selected by the project's
-    /// dependency context. Explicit `packages` replaces versions of named packages or adds
-    /// packages the context lacks. `local@name` selects an accepted extra project; `local:name` selects a root-defined profile;
-    /// `local@name:profile` selects a profile defined in that extra project's own `rift.toml`.
-    /// `all` merges the primary project, profiles, accepted extra projects with their profiles, and global results. `target: "commit"` matches
-    /// `query` alone against the messages of the commits the history store holds.
-    /// Use `get_symbol` with an exact canonical identity returned by search.
-    ///
-    /// For a current-tree search, the published workspace is resolved exactly once and
-    /// threaded through both the search index's revision check and the executed
-    /// `ReadService::search` call: a concurrent rebuild between two separate resolutions
-    /// could otherwise validate ranked units against one snapshot and merge them into
-    /// results computed from another.
-    #[tool]
+    /// Evaluate SPARQL over captured code facts. Use `SERVICE :search` for ranked text and
+    /// regex retrieval. Continue a paged answer with its `next_query`.
+    #[tool(name = "search")]
+    async fn search_query(
+        &self,
+        Parameters(params): Parameters<rift_protocol::query::QueryParams>,
+    ) -> Result<Json<rift_protocol::query::QueryReadResult>, ToolFailure> {
+        Box::pin(self.graph_query(params)).await
+    }
+
     async fn search(
         &self,
         Parameters(params): Parameters<SearchParams>,
@@ -2367,6 +2378,28 @@ impl RiftMcp {
                 Box::new(answer),
             ))
         })
+    }
+
+    async fn search_retrieval_call(
+        &self,
+        request: CallToolRequestParams,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let params: SearchParams =
+            match serde_json::from_value(request.arguments.unwrap_or_default().into()) {
+                Ok(params) => params,
+                Err(source) => {
+                    return errors::mcp::parameter_invalid()
+                        .tool("search")
+                        .field("arguments")
+                        .accepted(source.to_string())
+                        .mcp()
+                        .tool_failure(wire::ErrorPhase::Read)
+                        .into_call_tool_result();
+                }
+            };
+        self.search(Parameters(params))
+            .await
+            .into_call_tool_result()
     }
 
     async fn search_result(&self, params: SearchParams) -> Result<Json<SearchResult>, ToolFailure> {
@@ -2993,12 +3026,16 @@ impl RiftMcp {
             return Ok(Some(SearchRanking::default()));
         };
         let tree_revision = published.reads.tree_revision();
+        let path = exact_lexical_path(params);
         let stored = rift_tracing::traced!(
             component = "search",
             operation = "search.store",
             async move {
                 rift_tracing::debug!("search store read started");
-                self.store_answer(index, tree_revision, &parsed).await
+                self.store_answer(tree_revision, || {
+                    self.read_store(index, tree_revision, &parsed, path.as_ref())
+                })
+                .await
             }
         )
         .await;
@@ -3098,9 +3135,10 @@ impl RiftMcp {
         index: &SearchIndex,
         tree_revision: &str,
         query: &ParsedQuery,
+        path: Option<&rift_core::ProjectPath>,
     ) -> Result<RevisionScoped<PhasedRanking>, StoreReadFailure> {
         let precise = self
-            .run_phase(index, tree_revision, query, QueryPhase::Precise)
+            .run_phase(index, tree_revision, query, QueryPhase::Precise, path)
             .await?;
         let RevisionScoped::Matched(precise) = precise else {
             return Ok(match precise {
@@ -3114,12 +3152,19 @@ impl RiftMcp {
         let filled = precise.inputs().iter().any(|input| {
             input.order().len() >= usize::try_from(self.fetch_limit()).unwrap_or(usize::MAX)
         });
+        let mut lexical_truncated_at = precise.lexical_truncated_at();
         let broad = if query.has_broad_phase() && !filled {
             match self
-                .run_phase(index, tree_revision, query, QueryPhase::Broad)
+                .run_phase(index, tree_revision, query, QueryPhase::Broad, path)
                 .await?
             {
-                RevisionScoped::Matched(broad) => broad.into_inputs(),
+                RevisionScoped::Matched(broad) => {
+                    if path.is_some() {
+                        lexical_truncated_at =
+                            lexical_truncated_at.or(broad.lexical_truncated_at());
+                    }
+                    broad.into_inputs()
+                }
                 _ => Vec::new(),
             }
         } else {
@@ -3127,7 +3172,7 @@ impl RiftMcp {
         };
         let file_rows = self.file_rows(index, tree_revision, query).await?;
         Ok(RevisionScoped::Matched(PhasedRanking {
-            lexical_truncated_at: precise.lexical_truncated_at(),
+            lexical_truncated_at,
             readiness: precise.readiness(),
             precise: precise.into_inputs(),
             broad,
@@ -3170,6 +3215,7 @@ impl RiftMcp {
         tree_revision: &str,
         query: &ParsedQuery,
         phase: QueryPhase,
+        path: Option<&rift_core::ProjectPath>,
     ) -> Result<RevisionScoped<StoreRanking>, StoreReadFailure> {
         rift_tracing::debug!(
             component = "search",
@@ -3181,37 +3227,54 @@ impl RiftMcp {
             "ranking the full-text store for one query phase"
         );
         index
-            .rank(tree_revision, query, phase, self.fetch_limit())
+            .rank_with_path(tree_revision, query, phase, self.fetch_limit(), path)
             .await
             .map_err(StoreReadFailure::from)
     }
 
-    /// The store's answer for `tree_revision` and the lexical lane's state after one read.
-    /// A `Committing` lane leaves the store answer unmatched, so [`ranking_of`] returns
-    /// identifier matching with `lexical_ranking_unavailable`. A later request can read
-    /// the full-text tier after the write lands. Without a lane, the revision counts as
-    /// settled because nothing could commit it.
+    /// Reads the store for `tree_revision` and classifies an unmatched answer using the
+    /// lexical lane. A read that saw no stamp during a commit keeps the in-progress report
+    /// if the write lands before the lane is observed again. Without a lane, the revision
+    /// counts as settled because nothing could commit it.
     ///
     /// # Cancel safety
     ///
     /// Dropping the future drops the store read; nothing is written.
-    async fn store_answer(
+    async fn store_answer<Read>(
         &self,
-        index: &SearchIndex,
         tree_revision: &str,
-        query: &ParsedQuery,
-    ) -> Result<(RevisionScoped<PhasedRanking>, LexicalCommitReport), StoreReadFailure> {
+        read: impl FnOnce() -> Read,
+    ) -> Result<(RevisionScoped<PhasedRanking>, LexicalCommitReport), StoreReadFailure>
+    where
+        Read: std::future::Future<Output = Result<RevisionScoped<PhasedRanking>, StoreReadFailure>>,
+    {
+        let lane = self.lexical.as_ref();
+        let before = lane.map_or_else(LexicalCommitReport::settled, |lane| {
+            lane.commit_report(tree_revision)
+        });
         let searched = rift_tracing::traced!(
             component = "search",
             operation = "search.read_store",
             attempt = 1_u8,
-            async move { self.read_store(index, tree_revision, query).await }
+            async move { read().await }
         )
         .await?;
-        let Some(lane) = self.lexical.as_ref() else {
-            return Ok((searched, LexicalCommitReport::settled()));
+        let Some(lane) = lane.filter(|_| !matches!(searched, RevisionScoped::Matched(_))) else {
+            return Ok((searched, before));
         };
-        let commit = lane.commit_report(tree_revision);
+        let after = lane.commit_report(tree_revision);
+        let commit = if matches!(
+            (&searched, &before.state, &after.state),
+            (
+                RevisionScoped::NoRevision,
+                LexicalCommitState::Committing,
+                LexicalCommitState::Settled
+            )
+        ) {
+            before
+        } else {
+            after
+        };
         Ok((searched, commit))
     }
 
@@ -4224,6 +4287,8 @@ impl ServerHandler for RiftMcp {
                     }
                     let result = if request.name == "search_candidates" {
                         self.search_candidates_call(request, &operation).await
+                    } else if request.name == "search_retrieval" {
+                        Box::pin(self.search_retrieval_call(request)).await
                     } else {
                         let routed = ToolCallContext::new(self, request, context);
                         match self.tool_router.call(routed).await {
@@ -5194,7 +5259,7 @@ done
             service.waiting().await.expect("server stops")
         });
         let client = ().serve(client_transport).await?;
-        let request = CallToolRequestParams::new("search").with_arguments(arguments(
+        let request = CallToolRequestParams::new("search_retrieval").with_arguments(arguments(
             &json!({"pattern": "beacon", "target": "symbol", "scope": "local"}),
         )?);
         assert_answers_before_discovery(&client, &request).await?;
@@ -5336,9 +5401,10 @@ done
             service.waiting().await.expect("server stops")
         });
         let client = ().serve(client_transport).await?;
-        let request = CallToolRequestParams::new("search").with_arguments(arguments(&json!({
-            "pattern": "beacon", "target": "symbol", "scope": "local", "include": ["source"]
-        }))?);
+        let request =
+            CallToolRequestParams::new("search_retrieval").with_arguments(arguments(&json!({
+                "pattern": "beacon", "target": "symbol", "scope": "local", "include": ["source"]
+            }))?);
         let answer = client.call_tool(request.clone()).await?;
         let partial: SearchResult = serde_json::from_value(
             answer
@@ -7160,17 +7226,18 @@ done
 
         let search = client
             .call_tool(
-                CallToolRequestParams::new("search")
-                    .with_arguments(arguments(&json!({"query": "beacon"}))?),
+                CallToolRequestParams::new("search").with_arguments(arguments(&json!({
+                    "query": "SELECT ?symbol { ?symbol a :Symbol ; :name 'beacon' }"
+                }))?),
             )
             .await?;
-        assert!(
-            !search
-                .structured_content
-                .ok_or("search must return structured content")?["results"]
-                .as_array()
-                .ok_or("search results must be an array")?
-                .is_empty()
+        let structured = search
+            .structured_content
+            .ok_or("search must return structured content")?;
+        assert_eq!(structured["answer"]["result"], "bindings");
+        assert_eq!(
+            structured["answer"]["bindings"],
+            json!([{"symbol": {"type":"iri", "value":id}}])
         );
 
         let nodes = client
@@ -7261,7 +7328,7 @@ done
     /// is not identifier-shaped and none of its tokens splits into words, so that
     /// ranking extracts no candidate at all.
     #[tokio::test]
-    async fn client_search_matched_by_names_the_column_that_placed_each_hit() -> TestResult {
+    async fn retrieval_matched_by_names_the_column_that_placed_each_hit() -> TestResult {
         let directory = tempfile::tempdir()?;
         let lib_rs = "/// Converts a raw measurement into base units.\npub fn scale_value(value: f64) -> f64 {\n    value * 2.0\n}\n";
         fs::write(directory.path().join("lib.rs"), lib_rs)?;
@@ -7540,14 +7607,7 @@ done
     async fn client_rejects_empty_search_query_with_typed_wire_error() -> TestResult {
         let result = failing_call(&json!({"query": ""}), "search").await?;
         let text = assert_error_result(&result, "invalid_request")?;
-        assert_eq!(
-            text,
-            "1 error\n\tinvalid_request · retry never\n\
-             \t\tthe request does not match the documented form: field query, \
-             violation query is empty: subject query; \
-             correct the reported field and resend the request\n\
-             \t\trift.server.read_invalid\n"
-        );
+        assert!(text.contains("rift.search.query_syntax_invalid"), "{text}");
         Ok(())
     }
 
@@ -7581,69 +7641,46 @@ done
         Ok(())
     }
 
-    /// A member sent in the wrong shape is refused by the member's own name,
-    /// with an example of the value it takes.
-    ///
-    /// The refusal never names a Rust type: `PathSelector` is a name only this
-    /// repository holds, and a caller reading it has nothing to look up. The
-    /// example comes from the same schema the caller lists, so it can be sent
-    /// back verbatim.
+    /// A member sent in the wrong shape names its field and an accepted example.
     #[tokio::test]
     async fn a_member_in_the_wrong_shape_is_refused_by_name_with_an_example() -> TestResult {
-        let result = failing_call(
-            &json!({"query": "beacon", "paths": ["crates/rift-server/src/read.rs"]}),
-            "search",
-        )
-        .await?;
+        let result = failing_call(&json!({"query": ["ASK {}"]}), "search").await?;
         let text = assert_error_result(&result, "invalid_request")?;
+        assert!(text.contains("field query"), "{text}");
         assert!(
-            text.contains(
-                "tool arguments do not match the served schema: accepted exclude, force_include, \
-                 include, example {\"include\":[\"src/**\"],\"exclude\":[\"src/generated/**\"]}, \
-                 field paths, tool search; \
-                 correct the reported field and resend the request"
-            ),
+            text.contains("example ") && text.contains("SELECT"),
             "{text}"
         );
+        assert!(text.contains("tool search"), "{text}");
         Ok(())
     }
 
-    /// A member the tool does not serve is refused by naming the members it
-    /// does, and an example of the whole request.
+    /// A member the tool does not serve names the accepted fields and a complete example.
     #[tokio::test]
     async fn an_unserved_member_is_refused_by_naming_the_served_ones() -> TestResult {
         let result =
-            failing_call(&json!({"query": "beacon", "path": "src/lib.rs"}), "search").await?;
+            failing_call(&json!({"query": "ASK {}", "path": "src/lib.rs"}), "search").await?;
         let text = assert_error_result(&result, "invalid_request")?;
-        assert!(
-            text.contains("tool arguments do not match the served schema: accepted "),
-            "{text}"
-        );
+        assert!(text.contains("accepted language, query"), "{text}");
         assert!(text.contains("tool search"), "{text}");
-        assert!(text.contains("paths"), "{text}");
         assert!(text.contains("example {"), "{text}");
         assert!(
             !text.contains("unknown field") && !text.contains("struct"),
-            "a refusal never speaks serde's grammar: {text}"
+            "{text}"
         );
         Ok(())
     }
 
-    /// A closed set's member is refused by listing the values it takes.
+    /// A closed set's member names the values it takes.
     #[tokio::test]
     async fn a_value_outside_a_closed_set_is_refused_by_listing_the_set() -> TestResult {
-        let result = failing_call(&json!({"query": "beacon", "target": "nodes"}), "search").await?;
+        let result =
+            failing_call(&json!({"query": "ASK {}", "language": "cypher"}), "search").await?;
         let text = assert_error_result(&result, "invalid_request")?;
-        assert!(
-            text.contains("accepted all, commit, documentation, file, symbol"),
-            "{text}"
-        );
-        assert!(text.contains("field target"), "{text}");
+        assert!(text.contains("example \"sparql\""), "{text}");
+        assert!(text.contains("field language"), "{text}");
         assert!(text.contains("tool search"), "{text}");
-        assert!(
-            !text.contains("unknown variant"),
-            "a refusal never speaks serde's grammar: {text}"
-        );
+        assert!(!text.contains("unknown variant"), "{text}");
         Ok(())
     }
 
@@ -8387,32 +8424,16 @@ done
         Ok(())
     }
 
-    /// One commit search for `beacon`, validated against the output schema the router serves
-    /// for `search`.
+    /// One internal commit search for `beacon`.
     async fn beacon_commits(server: &RiftMcp) -> TestResult<SearchResult> {
         let params = serde_json::from_value(json!({"target": "commit", "query": "beacon"}))?;
-        let answer = tokio::time::timeout(
+        Ok(tokio::time::timeout(
             UNWAITED_READ_MAX,
             server.answered_search(Parameters(params)),
         )
         .await
         .map_err(|_| "a commit search waits on no fill")??
-        .0;
-        let output_schema = RiftMcp::tool_router()
-            .list_all()
-            .into_iter()
-            .find(|tool| tool.name == "search")
-            .and_then(|tool| tool.output_schema)
-            .ok_or("search serves an output schema")?;
-        let validator =
-            jsonschema::validator_for(&serde_json::Value::Object(output_schema.as_ref().clone()))?;
-        let wire = serde_json::to_value(&answer)?;
-        let errors: Vec<String> = validator
-            .iter_errors(&wire)
-            .map(|error| error.to_string())
-            .collect();
-        assert!(errors.is_empty(), "{errors:?}: {wire:#}");
-        Ok(answer)
+        .0)
     }
 
     /// While the history task is held before its first commit, a commit search answers
@@ -9861,26 +9882,6 @@ done
             "the index holds no row to verify: {:?}",
             held.results
         );
-        let tools = RiftMcp::tool_router().list_all();
-        let search = tools
-            .iter()
-            .find(|tool| tool.name == "search")
-            .ok_or("search is served")?;
-        let schema = serde_json::Value::Object(
-            search
-                .output_schema
-                .as_deref()
-                .ok_or("search declares an output schema")?
-                .clone(),
-        );
-        let validator = jsonschema::validator_for(&schema)?;
-        let instance = serde_json::to_value(&held)?;
-        let failures: Vec<String> = validator
-            .iter_errors(&instance)
-            .map(|failure| failure.to_string())
-            .collect();
-        assert!(failures.is_empty(), "{failures:#?}\n{instance:#}");
-
         double.release_trigrams();
         let mut settled = server.answered_search(Parameters(params.clone())).await?.0;
         for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
@@ -9938,6 +9939,47 @@ done
             "a landed commit clears the warning: {:?}",
             ranked.warnings
         );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_without_a_stamp_keeps_the_commit_it_overlapped() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let (server, double) = server_over_gated_store(directory.path(), "").await?;
+        let published = current_publication(&server).await;
+        let revision = published.reads.tree_revision();
+        let lane = server.lexical.as_ref().ok_or("lexical lane")?;
+        let index = server.search_index.as_ref().ok_or("search index")?;
+        let query = super::ParsedQuery::parse("beacon")?;
+        assert_eq!(lane.commit_state(revision), LexicalCommitState::Committing);
+
+        let (searched, commit) = server
+            .store_answer(revision, || async {
+                let searched = server.read_store(index, revision, &query, None).await?;
+                assert!(matches!(searched, RevisionScoped::NoRevision));
+                let landed = lane.landed();
+                double.release_one();
+                tokio::time::timeout(UNWAITED_READ_MAX, landed)
+                    .await
+                    .expect("released lexical write must land");
+                assert_eq!(lane.commit_state(revision), LexicalCommitState::Settled);
+                Ok(searched)
+            })
+            .await
+            .map_err(|error| format!("store read: {error:?}"))?;
+        assert!(matches!(searched, RevisionScoped::NoRevision));
+        assert_eq!(commit.state, LexicalCommitState::Committing);
+
+        let ranked = run_search(&server, "beacon").await?;
+        assert!(store_ranked(&ranked) && ranked.warnings.is_empty());
+
+        let (_, settled) = server
+            .store_answer(revision, || {
+                std::future::ready(Ok(RevisionScoped::NoRevision))
+            })
+            .await
+            .map_err(|error| format!("store read: {error:?}"))?;
+        assert_eq!(settled.state, LexicalCommitState::Settled);
         Ok(())
     }
 
@@ -11874,6 +11916,80 @@ done
         Ok(())
     }
 
+    #[tokio::test]
+    async fn literal_search_paths_bound_lexical_matches_before_graph_evaluation() -> TestResult {
+        use rift_protocol::query::{QueryLanguage, QueryParams};
+
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        fs::create_dir(root.join("src"))?;
+        for (path, source) in [
+            ("src/focus.rs", "pub fn beacon_focus() {}\n"),
+            ("witness.rs", "pub fn beacon_root() {}\n"),
+            ("src/witness.rs", "pub fn beacon_nested() {}\n"),
+            (
+                "src/crowded.rs",
+                "pub fn beacon_one() {}\npub fn beacon_two() {}\npub fn beacon_three() {}\n",
+            ),
+        ] {
+            fs::write(root.join(path), source)?;
+        }
+        super::hermetic_workspace(root, "[search.lexical]\nmax_matches = 2\n")?;
+        let server = RiftMcp::build_settled(root, WorkspaceIndexLimits::default()).await?;
+        search_after_population(&server, "beacon").await?;
+
+        let query = |terms: &str, selector: &str| {
+            server.search_query(Parameters(QueryParams {
+                language: QueryLanguage::Sparql,
+                query: format!(
+                    "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> \
+                     SELECT ?path {{ SERVICE :search {{ ?hit :query '{terms}'; :target 'symbol'; {selector} :path ?path }} }}"
+                ),
+            }))
+        };
+        for (selector, path) in [
+            (
+                r#":paths '{"include":["src/focus.rs"]}'^^rdf:JSON;"#,
+                "src/focus.rs",
+            ),
+            (
+                r#":paths '{"include":["witness.rs"],"exclude":["*/**"]}'^^rdf:JSON;"#,
+                "witness.rs",
+            ),
+        ] {
+            let answer = serde_json::to_value(query("beacon", selector).await?.0)?;
+            let rows = answer["answer"]["bindings"]
+                .as_array()
+                .ok_or_else(|| format!("complete bindings expected: {answer}"))?;
+            assert_eq!(rows.len(), 1, "{answer}");
+            assert_eq!(rows[0]["path"]["value"], path, "{answer}");
+        }
+        let crowded = r#":paths '{"include":["src/crowded.rs"]}'^^rdf:JSON;"#;
+        for (terms, selector) in [
+            ("beacon", ""),
+            (
+                "beacon",
+                r#":paths '{"include":["witness.rs"]}'^^rdf:JSON;"#,
+            ),
+            ("beacon", crowded),
+            ("beacon lantern", crowded),
+        ] {
+            let answer = serde_json::to_value(query(terms, selector).await?.0)?;
+            assert_eq!(answer["outcome"], "unavailable", "{answer}");
+            assert_eq!(answer["reason"], "insufficient_coverage", "{answer}");
+            assert!(
+                answer["warnings"]
+                    .as_array()
+                    .is_some_and(|warnings| warnings.contains(&json!({
+                        "code": "lexical_ranking_truncated",
+                        "matches_max": 2
+                    }))),
+                "{answer}"
+            );
+        }
+        Ok(())
+    }
+
     /// `fetch_limit` reads `results_max` whatever the requested `limit`, so `total_pages`
     /// reflects the same candidate pool whatever page size the caller asks for: a `limit: 1` request
     /// reports as many pages as the pool a `limit` wide enough to fit it all serves on one
@@ -11925,7 +12041,7 @@ done
         for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
             let answer = peer
                 .call_tool(
-                    CallToolRequestParams::new("search")
+                    CallToolRequestParams::new("search_retrieval")
                         .with_arguments(arguments(&json!({"query": query}))?),
                 )
                 .await?;

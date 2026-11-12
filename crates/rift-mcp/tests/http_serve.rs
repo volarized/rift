@@ -119,7 +119,7 @@ async fn beacon_lookup(client: &RunningService<RoleClient, ()>) -> TestResult<se
     let served = client
         .call_tool(
             CallToolRequestParams::new("search")
-                .with_arguments(arguments(&json!({"query": "beacon", "target": "symbol"}))?),
+                .with_arguments(arguments(&json!({"query": "SELECT ?symbol ?name { ?symbol a :Symbol; :name 'beacon' . BIND('beacon' AS ?name) }"}))?),
         )
         .await?;
     served
@@ -168,6 +168,7 @@ async fn serves_tools_and_stops_on_external_cancel() -> TestResult {
         .iter()
         .map(|tool| tool.name.as_ref())
         .collect();
+    assert_eq!(names.len(), 3, "the surface contains exactly three tools");
     for expected in ["get_symbol", "nodes", "search"] {
         assert!(
             names.contains(&expected),
@@ -177,7 +178,7 @@ async fn serves_tools_and_stops_on_external_cancel() -> TestResult {
 
     let lookup = beacon_lookup(&client).await?;
     assert_eq!(
-        lookup["results"][0]["hit"]["symbol"]["name"],
+        lookup["answer"]["bindings"][0]["name"]["value"],
         json!("beacon")
     );
 
@@ -189,13 +190,13 @@ async fn serves_tools_and_stops_on_external_cancel() -> TestResult {
     let lantern = client
         .call_tool(
             CallToolRequestParams::new("search")
-                .with_arguments(arguments(&json!({"query": "lantern", "target": "symbol"}))?),
+                .with_arguments(arguments(&json!({"query": "SELECT ?symbol ?name { ?symbol a :Symbol; :name 'lantern' . BIND('lantern' AS ?name) }"}))?),
         )
         .await?
         .structured_content
         .ok_or("search must return structured content")?;
     assert_eq!(
-        lantern["results"][0]["hit"]["symbol"]["name"],
+        lantern["answer"]["bindings"][0]["name"]["value"],
         json!("lantern")
     );
 
@@ -327,7 +328,7 @@ async fn invalid_configuration_still_serves_typed_refusals() -> TestResult {
         client
             .call_tool(
                 CallToolRequestParams::new("search")
-                    .with_arguments(arguments(&json!({"query": "beacon", "target": "symbol"}))?),
+                    .with_arguments(arguments(&json!({"query": "SELECT ?symbol ?name { ?symbol a :Symbol; :name 'beacon' . BIND('beacon' AS ?name) }"}))?),
             )
             .await,
     )?;
@@ -349,11 +350,11 @@ async fn two_concurrent_clients_are_both_served() -> TestResult {
 
     let (first_lookup, second_lookup) = tokio::join!(beacon_lookup(&first), beacon_lookup(&second));
     assert_eq!(
-        first_lookup?["results"][0]["hit"]["symbol"]["name"],
+        first_lookup?["answer"]["bindings"][0]["name"]["value"],
         json!("beacon")
     );
     assert_eq!(
-        second_lookup?["results"][0]["hit"]["symbol"]["name"],
+        second_lookup?["answer"]["bindings"][0]["name"]["value"],
         json!("beacon")
     );
 
@@ -426,7 +427,13 @@ async fn http_tools_list_preserves_object_output_unions() -> TestResult {
     let client = connected_client(&server).await?;
     let listing = client.list_tools(None).await?;
     let exported = schema::tool_listing();
-    assert_eq!(listing.tools.len(), 3);
+    let mut names = listing
+        .tools
+        .iter()
+        .map(|tool| tool.name.to_string())
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(names, ["get_symbol", "nodes", "search"]);
     for tool in &listing.tools {
         let output = tool
             .output_schema

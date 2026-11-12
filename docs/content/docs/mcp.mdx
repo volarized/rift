@@ -83,311 +83,149 @@ entry points and relationships, and when they are available. It also shows a map
 
 ## Search [#tool-search]
 
-Once the agent knows where to look, `search` finds code by a name, a phrase, or a description
-of its behavior. A search for configuration loading can start with:
-
-<ReadExample name="local-search" />
-
-Each result identifies what matched and where it was found. A declaration result includes its
-symbol name and identity, so the agent can use that `id` with [get_symbol](#tool-get_symbol)
-to read it in more detail. [Reading results](#reads) explains the text response.
-
-### Full-text search (FTS) [#search-fulltext]
-
-Full-text search matches words in declaration names, signatures, documentation, source code,
-and included text files. Rift also recognizes identifier words, so `loadConfig` can find
-`load_config`. A word that only appears in a function's body still finds that function: Rift
-looks it up in the file's text and answers the declaration holding it.
-
-Double quotes keep a phrase together. For example, the agent can look for this wording in
-indexed content:
+`search` evaluates SPARQL over the facts Rift holds. The request carries `query` and an
+optional `language`, whose default is `sparql`:
 
 ```json
-{ "query": "\"workspace configuration\"", "include": ["source"] }
+{ "query": "SELECT ?symbol ?name { ?symbol a :Symbol; :name ?name } ORDER BY ?name LIMIT 10" }
 ```
 
-Results include `matched_by`, which identifies the fields that matched. The agent can narrow
-the result kind with `target`: `symbol` for declarations, `documentation` for collected
-documentation, or `file` for file results; the default, `all`, allows every kind.
+The empty prefix names `urn:rift:vocabulary:`. `r:`, `rdf:`, `rdfs:`, and `xsd:` are also
+available. An explicit `PREFIX` declaration can name another namespace.
+
+`SELECT` returns typed bindings, `ASK` returns a boolean, and `CONSTRUCT` and `DESCRIBE`
+return triples. The selected variables are the answer's columns. An unbound variable is
+absent from its row; an IRI, blank node, literal with a datatype, and literal with a language
+remain distinct terms.
+
+### Names and declarations
+
+A name is a fact rather than a ranking request:
+
+```sparql
+SELECT ?symbol ?kind {
+  ?symbol a :Symbol; :name "load_config"; :kind ?kind
+}
+```
+
+A symbol's IRI is its canonical identity. A graph node relates to its symbol through `:of`
+and can carry a `:range` and `:source`. Pass the symbol IRI to `get_symbol` for its declarations,
+or to `nodes` for its syntax and source at a selected revision.
+
+### Full-text search [#search-fulltext]
+
+`SERVICE :search` exposes the existing full-text and identifier ranking:
+
+```sparql
+SELECT ?symbol ?name ?source {
+  SERVICE :search {
+    ?hit :query "load project settings"; :target "symbol";
+         :symbol ?symbol; :source ?source; :index ?index .
+    ?symbol :name ?name
+  }
+}
+ORDER BY ?index
+LIMIT 5
+```
+
+The service's `:query` is the ranked text. The outer request's `query` is SPARQL.
+Project `:source` or `:score` when needed. Use outer `ORDER BY`, `LIMIT`, and `OFFSET`
+to order and select the rows. The service's `:limit` and `:page_index` select a producer page
+before SPARQL evaluates filters, joins, and aggregates.
 
 ### Hybrid search [#search-hybrid]
 
-An agent can describe a behavior without knowing the words used in its implementation.
-Hybrid search combines identifier and full-text matches with vector ranking, which compares
-the query's meaning with indexed declarations.
-
-For example, the agent can ask where the project reads its settings:
-
-```json
-{ "query": "read project settings from disk", "target": "symbol", "limit": 5 }
-```
-
-This uses the same `query` argument as full-text search. When vector ranking is available,
-it contributes to the combined result order. The [search configuration](/docs/developer/configuration#search)
-controls ranking weights, embedding options, and included text files.
-
-<Accordions>
-<Accordion title="Ranking details">
-
-`include: ["score"]` exposes the ranking value for comparison within one answer.
-A result tagged `matched_by: ["ranked"]` can come from vector ranking without a literal text match.
-
-While vectors are being prepared, or when their model cannot load, results carry a warning.
-Identifier and full-text matching remain available independently of vector ranking.
-The [read reference](/docs/developer/protocol/mcp#reads) describes these warnings.
-
-</Accordion>
-</Accordions>
+The same service combines identifier matching, full-text matching, and available vector
+ranking. Existing [search configuration](/docs/developer/configuration#search) controls
+weights, model selection, and indexed text. A query requiring unavailable or incomplete
+ranking facts returns typed unavailability with warnings.
 
 ### Regex search [#search-pattern]
 
-Sometimes the agent needs every place a piece of code occurs, not the best matches for a phrase:
-every `TODO`, every call written as `spawn_blocking(`, every path into a crate. It then sends a
-regular expression as `pattern` instead of `query`. The syntax is the one ripgrep reads, so a pattern the
-agent would write for `Grep` or `rg` works unchanged:
+Use `:pattern` in the service to select every regex match:
 
-<ReadExample name="pattern-search" />
-
-In the example project, the pattern matches two lines of `src/main.rs`. Every match comes back as a file hit with its byte range and line; the text shows its path and
-line, with the source line below it. A match shows its own line only, so a statement that
-continues on later lines looks cut; `nodes` reads the rest. `target: "symbol"` answers
-each declaration holding a match instead. Matching runs line by line, and a `(?i)` prefix makes it
-case-insensitive. Rift reads only the files a trigram index says can match, then checks them
-with the pattern, so the answer holds every match the files carry.
-
-Rift fills the trigram index in the background once the project's text is stored, so a search
-right after startup or an edit doesn't wait for it. Files the index doesn't hold yet are checked
-too, and when they're too many for one search, the answer covers the files the index holds and
-carries a `pattern_index_preparing` warning until the index catches up.
-
-`pattern` doesn't combine with `query`, `traversal`, `change`, or a git `revision`. With `scope` set to
-`global` or `all`, it also searches the package files the global index holds. The
-[pattern reference](/docs/developer/protocol/mcp#search-pattern) describes the bounds a search
-runs under and the warning a file with too many matches carries.
-
-### More search options
-
-The agent can narrow the files it searches, look into dependencies, follow references,
-compare revisions, or search commit messages. These options use the same `search` tool:
-
-<Accordions>
-<Accordion title="Path filters" id="search-paths">
-
-The map can help the agent restrict a search to the relevant part of the repository.
-`paths.include` selects project-relative paths, and `paths.exclude` removes matches from that selection:
-
-```json
-{
-  "query": "load configuration",
-  "paths": { "include": ["src/**"], "exclude": ["src/generated/**"] },
-  "include": ["source"]
-}
-```
-
-Here, `paths.include` selects files, while the top-level `include` asks for source excerpts.
-If a needed file is excluded from the index, `paths.force_include` can request an on-demand
-search, subject to the [search limits](/docs/developer/protocol/mcp#search).
-
-</Accordion>
-<Accordion title="Dependencies" id="search-scope">
-
-Reading project code often leads to a library call. The agent can search public declarations
-in the project's dependencies by changing `scope`:
-
-| Scope | Searches |
-| --- | --- |
-| `local` | Primary project code, the default |
-| `local@name` | One extra project accepted by the connection |
-| `local:name` | One profile defined in the root `rift.toml` |
-| `local@name:profile` | One profile defined in the extra project's own `rift.toml` |
-| `global` | Collected package and runtime facts selected by the dependency context |
-| `all` | Primary project, profiles, accepted extra projects with their profiles, and global facts |
-
-An `all` search retains identities from the primary project, a named local project, and a
-served package in one answer:
-
-<ReadExample name="all-search" />
-
-Use `query` to combine registered projects under `all`. A hit's `id` names its owner, so
-reading its symbol with that `id` reaches the project or package that holds it.
-
-For example, a project using Tokio can search its dependency declarations for `spawn_blocking`:
-
-```json
-{ "query": "spawn_blocking", "scope": "global", "target": "symbol", "limit": 5 }
-```
-
-Rift uses the project's manifests and lockfiles to select packages, adds the standard library of
-each language the project uses, and asks the global index for their declarations. A package
-result identifies its package and version, and carries `unit` instead of a local `path`. When the
-global index holds no release at the version the project locks, the nearest collected release
-answers, and the result names both versions in a `package_substituted` warning.
-
-Sometimes the agent needs a version other than the one the project resolves, such as an upgrade
-target, or a package the project does not use yet. `packages` names package versions for one
-read: an entry naming a dependency replaces its version, and an entry naming another package adds
-it. This request searches Tokio 1.47.1 beside the project code:
-
-```json
-{
-  "query": "spawn_blocking",
-  "scope": "all",
-  "target": "symbol",
-  "limit": 10,
-  "packages": [{ "manager": "cargo", "name": "tokio", "version": "1.47.1" }]
-}
-```
-
-An entry without `version` reads the newest release the global index has collected. `packages`
-takes effect with `scope` set to `global` or `all` on the current tree, and the server refuses it
-beside the `local` scope or a git `revision`.
-
-A dependency no public registry serves, such as a path outside the project or a git repository,
-has no declarations in the global index, and the answer names it in a `package_unavailable`
-warning. See [package scope](/docs/developer/protocol/mcp#search-scope) for package results,
-nearest releases, and paging, [requested packages](/docs/developer/protocol/mcp#requested-packages)
-for the argument's constraints, and the [read reference](/docs/developer/protocol/mcp#reads) for
-the warnings a package read carries.
-
-</Accordion>
-<Accordion title="Relationship traversal" id="search-traversal">
-
-Before changing a declaration, the agent can ask which other declarations reference it.
-`traversal` starts from a symbol identity returned by `search` or `get_symbol` and follows
-incoming references:
-
-<ReadExample name="incoming-traversal" />
-
-The example refuses because no configured language engine serves the seed. With an engine,
-`depth: 1` reaches declarations that reference `load_config`; `depth: 2` also follows references
-to those declarations. Use the returned identity for `seed`, since names alone do not identify
-a logical symbol.
-
-Reading a declaration raises the opposite question: what does it rely on? `direction: "outgoing"`
-follows calls and each hop carries the `calls` facet:
-
-<ReadExample name="outgoing-traversal" />
-
-An engine-resolved callee in an installed package or runtime can carry a global identity. The
-walk stops at that global object; its physical source unit remains separate from the identity.
-
-Traversal works on current local code and needs a configured
-[language engine](/docs/developer/configuration#languages-and-lsp) that resolves references and
-calls. The [traversal reference](/docs/developer/protocol/mcp#search-traversal) describes result
-paths, coverage warnings, and unsupported requests.
-
-</Accordion>
-<Accordion title="Language-engine references" id="search-engine-references">
-
-During traversal, the configured language engine resolves reference locations, or the callees of
-an outgoing walk. Rift finds the smallest indexed declaration containing each location, so the
-result identifies the caller or the callee. A callee in an installed package or a standard library
-is named by the global index. These relationships belong to this read and do not become indexed
-relationships in the map.
-
-See [language-engine references](/docs/developer/protocol/mcp#search-engine-references) for
-validation, retries, and failure behavior.
-
-</Accordion>
-<Accordion title="Changes between revisions" id="search-change">
-
-When reviewing a branch, the agent can search for declarations that differ between committed
-revisions. This request compares `main` with `HEAD`:
-
-```json
-{ "change": { "base": "main", "head": "HEAD" }, "target": "symbol" }
-```
-
-Each result describes what changed and identifies the declaration on each side of the comparison.
-
-To check its own uncommitted edits, the agent names the working tree as `head`. The working-tree
-side is the current local index, so staged, unstaged, untracked, and deleted files all take part:
-
-```json
-{ "change": { "base": "HEAD", "head": { "kind": "working_tree" } }, "target": "symbol" }
-```
-
-`change` selects the result set on its own; see the
-[change reference](/docs/developer/protocol/mcp#search-change) for classifications and argument
-constraints.
-
-</Accordion>
-<Accordion title="Commit messages" id="search-commits">
-
-When the agent needs the commit that introduced a change, it can search commit messages.
-`target: "commit"` matches `query` against the messages of the commits the history store holds:
-
-<ExampleTabs items={["call", "text", "json"]}>
-
-<Tab value="call">
-
-```json
-{ "target": "commit", "query": "change path bound", "limit": 10 }
-```
-
-</Tab>
-
-<Tab value="text">
-
-**`search` result holding this hit, compact text:**
-
-```text
-1 result
-	9c1d4e7a · Alice <alice@example.com> · 2026-09-22 14:03 +02:00
-	Bound comparisons at 512 changed paths
-
-	A comparison that reaches the bound answers from the paths that fit and warns change_truncated.
-
-	2 paths:
-		crates/rift-protocol/src/search.rs
-		crates/rift-server/src/change.rs
-```
-
-</Tab>
-
-<Tab value="json">
-
-**Search hit:**
-
-```json
-{
-  "hit": {
-    "target": "commit",
-    "commit": {
-      "revision": "9c1d4e7a2b8f03d5e6a1c4b7d9e2f0a3b5c8d1e4",
-      "message": "Bound comparisons at 512 changed paths\n\nA comparison that reaches the bound answers from the paths that fit and warns change_truncated.\n",
-      "message_truncated": false,
-      "author": { "name": "Alice", "email": "alice@example.com" },
-      "timestamp": "2026-09-22T14:03:11+02:00",
-      "paths": ["crates/rift-protocol/src/search.rs", "crates/rift-server/src/change.rs"],
-      "paths_truncated": false
-    }
+```sparql
+SELECT ?path ?start ?end ?source {
+  SERVICE :search {
+    ?hit :pattern "tokio::[A-Za-z_]+"; :target "file";
+         :path ?path; :start ?start; :end ?end; :source ?source
   }
 }
+ORDER BY ?path ?start
 ```
 
-</Tab>
+Matching uses Rust regex syntax and the existing trigram index, then verifies the selected
+text. File results keep each physical match and its UTF-8 byte range. Producer bounds
+remain in effect; a truncated acquisition cannot establish a complete SPARQL answer.
 
-</ExampleTabs>
+### Paths and package scope [#search-scope]
 
-Each hit carries the commit's message, author, time, and the paths it changed. The text cuts the
-revision to its first 8 characters, which Rift accepts wherever a request takes a revision.
+A service can select `:scope "global"` for collected dependency facts, or `:scope "all"`
+for the accepted project and dependency contexts. `:paths`, `:packages`, and `:change`
+carry their existing structured values as `rdf:JSON` literals. `:rev` selects a supported
+committed revision. The [protocol reference](/docs/developer/protocol/mcp#search-scope)
+describes selection and refusal behavior.
 
-While the local server is still filling its history store, the answer carries a
-`history_store_filling` warning naming how many of the selected commits the store holds, and a
-later search answers the rest. A search that finds no commit yet reads:
+Global relationship queries read facts already collected for the selected package or runtime.
 
-```text
-0 results
-1 warning
-	history_store_filling · analyzed 40 · total 100: the history store holds 40 of the 100 commits its latest fill selects, so a commit it has not reached answers nothing; the fill runs in the background, and a later search answers the rest
+### References and calls [#search-traversal]
+
+A canonical symbol identity anchors a graph question. These requests use a returned
+identity in place of `<symbol-id>`:
+
+```sparql
+SELECT ?usage ?unit ?start ?end {
+  <symbol-id> :usages ?usage .
+  ?usage :range [ :unit ?unit; :start ?start; :end ?end ]
+}
 ```
 
-A commit search takes `query` alone; see the [commit search reference](/docs/developer/protocol/mcp#search-commits)
-for ordering, bounds, and refusals.
+Each usage is a physical occurrence. Repeated uses inside one declaration and uses at file
+scope remain separate rows. Its enclosing declaration, when available, is a separate fact.
 
-</Accordion>
-</Accordions>
+```sparql
+SELECT ?caller { ?caller :references <symbol-id> }
+SELECT ?callee { <symbol-id> :calls/:calls/:calls ?callee }
+SELECT ?caller { <symbol-id> ^:references+ ?caller }
+```
+
+Property paths express fixed depth, alternatives, and closure. SPARQL owns path and
+binding semantics; a fixed three-step path can reach a symbol also reachable in one step.
+Use `DISTINCT` when the question needs distinct endpoints.
+
+### Language-engine references [#search-engine-references]
+
+Local reference and call questions use the configured
+[language engine](/docs/developer/configuration#languages-and-lsp) when required facts
+are absent from the captured publication. Acquisition preserves physical locations and
+continues through admitted dependency sources. These facts belong to the request and do
+not enter global collection. Missing coverage refuses the query; it cannot produce a false
+`ASK`, zero count, or empty graph.
+
+### Changes and commits [#search-change]
+
+Revision comparisons use `SERVICE :search` with a `:change` JSON literal. Project the
+returned change record's kind and base and head paths. The comparison producer preserves
+its existing revision, history, and change bounds.
+
+### Commit messages [#search-commits]
+
+Use `:target "commit"` and `:query` inside the service. Commit records retain their message,
+author, timestamp, revision, and ordered paths. SPARQL chooses which fields to project.
+An incomplete history store cannot establish a complete answer.
+
+### Paging and retained results
+
+The response's `pagination.next_query` is the next request's SPARQL statement. Send it
+unchanged as `query` to read the next transport page of the original execution. A source
+edit does not replace its rows, blank nodes, or selected source bytes.
+
+The continuation names one retained page and expires with the original view. After expiry,
+run the original statement again to start a new execution. SPARQL `LIMIT` and `OFFSET`
+apply before the transport pages are formed.
+
+See the [protocol reference](/docs/developer/protocol/mcp#search) for result terms, bounds,
+required facts, and migration from the former selector fields.
 
 ## Symbols [#tool-get_symbol]
 
@@ -448,19 +286,15 @@ A named local identity selects an extra project accepted by the connection:
 
 <ReadExample name="named-symbol" />
 
-A package or runtime identity selects that exact owner and served version. `get_symbol`
-takes neither `scope` nor `packages`; use those fields on search to discover the identity.
-The global search first names the actual served owner; optional documentation remains
-bound to that exact symbol:
-
-<ReadExample name="global-search" />
+A package or runtime identity names an owner across releases. Discover it with
+`:scope "global"` and `:packages` inside `SERVICE :search`, then pass the identity and selected
+`revision` to `get_symbol`.
 
 <ReadExample name="global-symbol-documentation" />
 
-A requested release can differ from the served release. Search reports the substitution
-and returns the served identity:
-
-<ReadExample name="requested-served" />
+If the requested release has no complete coverage, `search` can return an unavailable
+answer with package warnings. Use the release named by the warning when that is the release
+you want to query.
 
 Several declaration bindings share one identity. `declaration_limit` and its returned cursor
 continue those bindings at the same revision:
@@ -505,7 +339,7 @@ after it are the parts inside it, down to each identifier. A symbol with several
 such as an overloaded function, lists each declaration's nodes in turn. A long answer ends with
 `node_cursor`, which the agent sends back to read the rest.
 
-A package or runtime symbol that `search` returned with `scope: "global"` lists its nodes the same
+A package or runtime symbol that `search` returned through `SERVICE :search` with `:scope "global"` lists its nodes the same
 way. Rift reads them from the global API at the release `revision` names, such as
 `rift://revision/cargo/crates.io/demo@1.0.0`, or at the version your project's dependencies pin when the
 request names none. Each node's `unit` names a source unit of the package, such as
@@ -553,35 +387,18 @@ the local index. See [Index](/docs/developer/architecture#index) for local updat
 
 ## Reading results [#reads]
 
-Search keeps responses small with `limit` and names another page with `page_index`.
-Its returned `pagination` states the served page and page count. An exact `get_symbol`
-read bounds declaration bindings with `declaration_limit` and continues with
-`declaration_cursor` at the revision the answer names.
+`search` projects the variables named in `SELECT`, returns a boolean for `ASK`, or returns
+RDF triples for a graph query. Follow `pagination.next_query` to read the next page of the
+same execution. An exact `get_symbol` read bounds declaration bindings with
+`declaration_limit` and continues with `declaration_cursor` at the reported revision.
 
-Warnings explain when an answer is incomplete or a capability could not contribute.
-For example, `stale_index` reports an index behind the captured project state or a rebuild failure;
-`results_truncated` means a narrower query or path selection can bring results within the bound.
-Large files and lockfiles carry their own: `large_file_unparsed` names a file too large to parse,
-whose text still answers, `large_file_skipped` counts files left out of text search, and
-`lockfile_excluded` names a lockfile the path selection reached but search leaves out.
-The [read reference](/docs/developer/protocol/mcp#reads) describes each warning.
+Warnings explain missing facts or preparation still in progress. A query that requires
+missing facts returns `outcome: "unavailable"`. A completed query can return an empty result
+when its required facts are available.
 
-The agent reads each answer as compact text. The text is a list of sections, and each section
-starts with a title that counts its entries, such as `2 results` or `1 warning`, with the entries
-indented under it. Warnings form their own section after the items:
-
-<ReadExample name="local-search" />
-
-A symbol hit shows its declaration, location and matched fields, canonical identity when
-established, and requested source. A warning names its `code`, payload facts, and optional
-detail. An exact read uses its outcome and declaration bindings instead of a hit count:
-
-<ReadExample name="local-symbol" />
-
-Compact text prints only what stands out, such as a requested `score`, a dependency origin, or a
-truncated history. `rift mcp` returns compact text by default. A program that needs every field as JSON starts
-`rift mcp --output=all`, which includes structured output and output schemas in the tool listing.
-The workspace resource then carries both compact text and JSON. The map always returns JSON.
+The proxy returns compact text by default. Start `rift mcp --output=all` for structured
+results and output schemas. The workspace resource then carries compact text and JSON.
+The map always returns JSON.
 
 The [result content reference](/docs/developer/protocol/mcp#result-content) defines the form.
 
@@ -589,9 +406,8 @@ The [result content reference](/docs/developer/protocol/mcp#result-content) defi
 <Accordion title="Earlier revisions" id="revision-reads">
 
 Every `get_symbol` and `nodes` answer names the revision it was read at, such as
-`rift://revision/tree/<digest>` for the working tree the index serves, and so does a `search`
-answer that read one project tree. The agent can read older
-project code by adding `revision` to the same tools. For example, this reads the function from
+`rift://revision/tree/<digest>` for the working tree the index serves. The agent can read older
+project code by adding `revision` to either tool. For example, this reads the function from
 `main` without changing the working tree:
 
 ```json

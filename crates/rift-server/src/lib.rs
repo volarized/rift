@@ -24,7 +24,10 @@ pub use configuration::{
     CONFIGURATION_FILE_BYTES_MAX, configuration_file, load_configuration, profile_roots,
 };
 pub use engine::{EnginePool, EngineSlot, LspProcessKey};
-pub use engine_read::{EngineReferences, resolve_engine_references, uses_engine_references};
+pub use engine_read::{
+    EngineReferences, GraphCalls, graph_calls, graph_references, installed_graph_calls,
+    resolve_engine_references, uses_engine_references,
+};
 pub use history::{FillCounts, FillProgress, StoredHistory};
 pub use history_fill::{
     AnalyzedCommit, FillPlan, HistoryAnalysis, PendingCommit, RELEASE_TAGS_MAX, UnversionedTag,

@@ -12,6 +12,7 @@
 
 #[cfg(unix)]
 mod fake_engine;
+mod graph_query;
 
 #[cfg(unix)]
 #[path = "announced_work/mod.rs"]
@@ -82,7 +83,7 @@ async fn search_traversal_neighbors_depth_one_reaches_the_direct_callers() -> Te
     let structured = call_retrying_acceptance(
         &client,
         tool_request(
-            "search",
+            "search_retrieval",
             &json!({ "traversal": { "seed": captured_seed(&client, "leaf", "graph.py").await? } }),
         ),
     )
@@ -121,7 +122,7 @@ async fn search_traversal_impact_incoming_depth_two_reaches_every_caller() -> Te
     let structured = call_retrying_acceptance(
         &client,
         tool_request(
-            "search",
+            "search_retrieval",
             &json!({
                 "traversal": {
                     "seed": captured_seed(&client, "leaf", "graph.py").await?,
@@ -162,7 +163,7 @@ async fn search_traversal_to_keeps_only_the_path_query_target() -> TestResult {
     let structured = call_retrying_acceptance(
         &client,
         tool_request(
-            "search",
+            "search_retrieval",
             &json!({
                 "traversal": {
                     "seed": captured_seed(&client, "leaf", "graph.py").await?,
@@ -198,7 +199,7 @@ async fn search_query_and_traversal_merge_carry_both_matched_by_entries_and_the_
     let structured = call_retrying_acceptance(
         &client,
         tool_request(
-            "search",
+            "search_retrieval",
             &json!({
                 "query": "branch_a",
                 "target": "symbol",
@@ -238,7 +239,7 @@ async fn search_traversal_over_an_unproduced_facet_serves_the_coverage_warning()
     let structured = call_retrying_acceptance(
         &client,
         tool_request(
-            "search",
+            "search_retrieval",
             &json!({
                 "traversal": {
                     "seed": captured_seed(&client, "leaf", "graph.py").await?,
@@ -294,7 +295,7 @@ async fn search_traversal_over_a_produced_facet_serves_no_coverage_warning() -> 
     let structured = call_retrying_acceptance(
         &client,
         tool_request(
-            "search",
+            "search_retrieval",
             &json!({
                 "traversal": {
                     "seed": captured_seed(&client, "leaf", "graph.py").await?,
@@ -506,7 +507,11 @@ async fn incoming_walks_past_the_readiness_timeout(
         Some(configuration),
     )
     .await?;
-    call_retrying_acceptance(&client, tool_request("search", &json!({"query": "beacon"}))).await?;
+    call_retrying_acceptance(
+        &client,
+        tool_request("search_retrieval", &json!({"query": "beacon"})),
+    )
+    .await?;
     let started_lines = || {
         std::fs::read_to_string(&log).map_or(0, |text| {
             text.lines().filter(|line| *line == "start").count()
@@ -517,7 +522,7 @@ async fn incoming_walks_past_the_readiness_timeout(
         let structured = call_retrying_acceptance(
             &client,
             tool_request(
-                "search",
+                "search_retrieval",
                 &json!({"traversal": {"seed": captured_seed(&client, "beacon", "lib.rs").await?}}),
             ),
         )
@@ -606,7 +611,7 @@ async fn search_traversal_tells_the_engine_of_files_changed_outside_the_walk() -
     let walk = || {
         call_retrying_acceptance(
             &client,
-            tool_request("search", &json!({"traversal": {"seed": seed}})),
+            tool_request("search_retrieval", &json!({"traversal": {"seed": seed}})),
         )
     };
     walk().await?;
@@ -709,7 +714,7 @@ async fn live_walk(
         let structured = call_retrying_acceptance(
             client,
             tool_request(
-                "search",
+                "search_retrieval",
                 &json!({"traversal": {"seed": seed, "direction": direction}}),
             ),
         )
@@ -736,7 +741,7 @@ async fn live_seed(
     let answer = call_retrying_acceptance(
         client,
         tool_request(
-            "search",
+            "search_retrieval",
             &json!({"query": name, "target": "symbol", "include": ["source"], "limit": 1000}),
         ),
     )
@@ -777,7 +782,11 @@ async fn live_rust_analyzer_walks_answer_a_rename_in_an_unopened_file() -> TestR
     let started = std::time::Instant::now();
     let (directory, client, _server_task) =
         served_workspace(LIVE_RUST_FILES, Some(LIVE_RUST_ENGINE.to_owned())).await?;
-    call_retrying_acceptance(&client, tool_request("search", &json!({"query": "beacon"}))).await?;
+    call_retrying_acceptance(
+        &client,
+        tool_request("search_retrieval", &json!({"query": "beacon"})),
+    )
+    .await?;
     let larger = live_seed(&client, "larger", "rust").await?;
     let beacon = live_seed(&client, "beacon", "rust").await?;
     let (cold, answer) =
@@ -932,7 +941,11 @@ async fn live_typescript_language_server_walks_both_directions() -> TestResult {
         install_captured_typescript_engine,
     )
     .await?;
-    call_retrying_acceptance(&client, tool_request("search", &json!({"query": "beacon"}))).await?;
+    call_retrying_acceptance(
+        &client,
+        tool_request("search_retrieval", &json!({"query": "beacon"})),
+    )
+    .await?;
     let larger = live_seed(&client, "larger", "typescript").await?;
     let beacon = live_seed(&client, "beacon", "typescript").await?;
     let (outgoing, answer) = live_walk(
@@ -1006,9 +1019,11 @@ async fn published_holds(
 ) -> TestResult {
     let mut searches = 0_u32;
     loop {
-        let structured =
-            call_retrying_acceptance(client, tool_request("search", &json!({"query": name})))
-                .await?;
+        let structured = call_retrying_acceptance(
+            client,
+            tool_request("search_retrieval", &json!({"query": name})),
+        )
+        .await?;
         searches += 1;
         if symbol_names(&structured).iter().any(|held| held == name) == present {
             return Ok(());
@@ -1058,7 +1073,7 @@ async fn search_traversal_outgoing_depth_one_reaches_the_direct_callees() -> Tes
     let structured = call_retrying_acceptance(
         &client,
         tool_request(
-            "search",
+            "search_retrieval",
             &json!({ "traversal": { "seed": captured_seed(&client, "root", "graph.py").await?, "direction": "outgoing" } }),
         ),
     )
@@ -1096,7 +1111,7 @@ async fn search_traversal_outgoing_depth_two_reaches_the_callees_of_the_callees(
     let structured = call_retrying_acceptance(
         &client,
         tool_request(
-            "search",
+            "search_retrieval",
             &json!({ "traversal": { "seed": captured_seed(&client, "root", "graph.py").await?, "direction": "outgoing", "depth": 2 } }),
         ),
     )
@@ -1122,7 +1137,7 @@ async fn search_traversal_outgoing_depth_two_reaches_the_callees_of_the_callees(
     let only_leaf = call_retrying_acceptance(
         &client,
         tool_request(
-            "search",
+            "search_retrieval",
             &json!({
                 "traversal": { "seed": captured_seed(&client, "root", "graph.py").await?, "direction": "outgoing", "depth": 2, "to": captured_seed(&client, "leaf", "graph.py").await? }
             }),
@@ -1202,7 +1217,7 @@ async fn search_traversal_outgoing_drops_a_standard_library_callee_and_walks_a_c
     let counted = call_retrying_acceptance(
         &client,
         tool_request(
-            "search",
+            "search_retrieval",
             &json!({
                 "traversal": {
                     "seed": captured_seed(&client, "counted", "extra.py").await?, "direction": "outgoing"
@@ -1227,7 +1242,7 @@ async fn search_traversal_outgoing_drops_a_standard_library_callee_and_walks_a_c
     let holder = call_retrying_acceptance(
         &client,
         tool_request(
-            "search",
+            "search_retrieval",
             &json!({
                 "traversal": {
                     "seed": captured_seed(&client, "Holder", "extra.py").await?, "direction": "outgoing"
@@ -1261,12 +1276,16 @@ async fn search_traversal_outgoing_from_a_seed_without_a_call_hierarchy_item_ref
         Some(configuration),
     )
     .await?;
-    call_retrying_acceptance(&client, tool_request("search", &json!({"query": "Beacon"}))).await?;
+    call_retrying_acceptance(
+        &client,
+        tool_request("search_retrieval", &json!({"query": "Beacon"})),
+    )
+    .await?;
 
     let failure = failed_call(
         client
             .call_tool(tool_request(
-                "search",
+                "search_retrieval",
                 &json!({
                     "traversal": { "seed": captured_seed(&client, "Beacon", "lib.rs").await?, "direction": "outgoing" }
                 }),
@@ -1333,7 +1352,7 @@ async fn search_traversal_over_an_engine_that_announces_nothing_warns_readiness_
         let structured = call_retrying_acceptance(
             &client,
             tool_request(
-                "search",
+                "search_retrieval",
                 &json!({"traversal": {"seed": seed, "direction": direction}}),
             ),
         )
@@ -1377,7 +1396,7 @@ async fn search_traversal_over_an_unmappable_engine_answer_warns_in_both_directi
         let structured = call_retrying_acceptance(
             &client,
             tool_request(
-                "search",
+                "search_retrieval",
                 &json!({"traversal": {"seed": seed, "direction": direction}}),
             ),
         )
@@ -1476,9 +1495,13 @@ async fn search_traversal_refused_at_the_request_deadline_keeps_the_engine() -> 
         Some(configuration),
     )
     .await?;
-    call_retrying_acceptance(&client, tool_request("search", &json!({"query": "beacon"}))).await?;
+    call_retrying_acceptance(
+        &client,
+        tool_request("search_retrieval", &json!({"query": "beacon"})),
+    )
+    .await?;
     let walk = tool_request(
-        "search",
+        "search_retrieval",
         &json!({"traversal": {"seed": captured_seed(&client, "beacon", "lib.rs").await?}}),
     );
 
@@ -1565,9 +1588,13 @@ async fn search_traversal_refused_while_the_engine_starts_keeps_the_start() -> T
         Some(configuration),
     )
     .await?;
-    call_retrying_acceptance(&client, tool_request("search", &json!({"query": "beacon"}))).await?;
+    call_retrying_acceptance(
+        &client,
+        tool_request("search_retrieval", &json!({"query": "beacon"})),
+    )
+    .await?;
     let walk = tool_request(
-        "search",
+        "search_retrieval",
         &json!({"traversal": {"seed": captured_seed(&client, "beacon", "lib.rs").await?}}),
     );
 
@@ -1642,7 +1669,11 @@ async fn search_traversal_outgoing_past_the_readiness_timeout_warns_and_keeps_th
         Some(configuration),
     )
     .await?;
-    call_retrying_acceptance(&client, tool_request("search", &json!({"query": "caller"}))).await?;
+    call_retrying_acceptance(
+        &client,
+        tool_request("search_retrieval", &json!({"query": "caller"})),
+    )
+    .await?;
     let started_lines = || std::fs::read_to_string(&starts).map_or(0, |text| text.lines().count());
     let mut starts_after = Vec::new();
     for _walk in 0..2 {
@@ -1650,7 +1681,7 @@ async fn search_traversal_outgoing_past_the_readiness_timeout_warns_and_keeps_th
         let structured = call_retrying_acceptance(
             &client,
             tool_request(
-                "search",
+                "search_retrieval",
                 &json!({"traversal": {
                     "seed": captured_seed(&client, "caller", "lib.rs").await?, "direction": "outgoing"
                 }}),
@@ -1691,12 +1722,16 @@ async fn search_traversal_outgoing_past_the_readiness_timeout_warns_and_keeps_th
 #[tokio::test]
 async fn a_global_search_with_traversal_refuses_invalid_request() -> TestResult {
     let (_directory, client, _server_task) = served_workspace(ENGINELESS_FILES, None).await?;
-    call_retrying_acceptance(&client, tool_request("search", &json!({"query": "beacon"}))).await?;
+    call_retrying_acceptance(
+        &client,
+        tool_request("search_retrieval", &json!({"query": "beacon"})),
+    )
+    .await?;
 
     let failure = failed_call(
         client
             .call_tool(tool_request(
-                "search",
+                "search_retrieval",
                 &json!({
                     "query": "beacon",
                     "scope": "global",
@@ -1791,7 +1826,7 @@ async fn search_traversal_outgoing_names_a_standard_library_callee_by_its_global
     let counted = call_retrying_acceptance(
         &client,
         tool_request(
-            "search",
+            "search_retrieval",
             &json!({
                 "traversal": {
                     "seed": captured_seed(&client, "counted", "extra.py").await?, "direction": "outgoing"
@@ -1916,7 +1951,8 @@ async fn search_traversal_outgoing_names_a_dependency_callee_and_counts_one_answ
     let request = json!({"include":["source"], "limit":1,
         "traversal": { "seed": captured_seed(&client, "hello", "app.py").await?, "direction": "outgoing" }
     });
-    let hello = call_retrying_acceptance(&client, tool_request("search", &request)).await?;
+    let hello =
+        call_retrying_acceptance(&client, tool_request("search_retrieval", &request)).await?;
     assert_eq!(symbol_names(&hello), ["greet"], "{hello}");
     let greet = callee_hit(&hello, "greet")?;
     read_dependency_hit(&client, &greet).await?;
@@ -2011,7 +2047,7 @@ async fn search_traversal_outgoing_names_a_callee_installed_after_the_first_walk
         "traversal": { "seed": captured_seed(&client, "hello", "app.py").await?, "direction": "outgoing" }
     });
 
-    let first = call_retrying_acceptance(&client, tool_request("search", &walk)).await?;
+    let first = call_retrying_acceptance(&client, tool_request("search_retrieval", &walk)).await?;
     assert!(
         symbol_names(&first).is_empty(),
         "nothing installed resolves: {first}"
@@ -2025,7 +2061,7 @@ async fn search_traversal_outgoing_names_a_callee_installed_after_the_first_walk
         std::fs::create_dir_all(file.parent().ok_or("an installed file has a folder")?)?;
         std::fs::write(file, content)?;
     }
-    let second = call_retrying_acceptance(&client, tool_request("search", &walk)).await?;
+    let second = call_retrying_acceptance(&client, tool_request("search_retrieval", &walk)).await?;
     assert_eq!(symbol_names(&second), ["greet"], "{second}");
     let greet = callee_hit(&second, "greet")?;
     assert_eq!(
@@ -2065,7 +2101,7 @@ async fn search_traversal_outgoing_over_an_unavailable_global_api_drops_package_
     let counted = call_retrying_acceptance(
         &client,
         tool_request(
-            "search",
+            "search_retrieval",
             &json!({
                 "traversal": {
                     "seed": captured_seed(&client, "counted", "extra.py").await?, "direction": "outgoing"
@@ -2114,7 +2150,7 @@ async fn search_traversal_outgoing_over_a_global_api_without_declarations_drops_
     let counted = call_retrying_acceptance(
         &client,
         tool_request(
-            "search",
+            "search_retrieval",
             &json!({
                 "traversal": {
                     "seed": captured_seed(&client, "counted", "extra.py").await?, "direction": "outgoing"
@@ -2190,7 +2226,7 @@ async fn search_traversal_outgoing_asks_a_utf16_engines_dependency_callee_in_utf
     let hello = call_retrying_acceptance(
         &client,
         tool_request(
-            "search",
+            "search_retrieval",
             &json!({
                 "traversal": { "seed": captured_seed(&client, "hello", "app.py").await?, "direction": "outgoing" }
             }),
@@ -2226,7 +2262,12 @@ async fn refusal_code(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     arguments: &Value,
 ) -> TestResult<ErrorCode> {
-    Ok(failed_call(client.call_tool(tool_request("search", arguments)).await)?.code)
+    Ok(failed_call(
+        client
+            .call_tool(tool_request("search_retrieval", arguments))
+            .await,
+    )?
+    .code)
 }
 
 fn results(structured: &Value) -> Vec<Value> {

@@ -146,6 +146,84 @@ impl CalleeRoots {
         }
         Ok(None)
     }
+    /// Captures a package call's admitted file and, for npm, its namespace manifest.
+    ///
+    /// # Errors
+    /// Refuses an unadmitted source, changed owner, unreadable bytes or a file over the bound.
+    pub fn capture_package_call(
+        &self,
+        callee: &PackageCallee,
+        trees: &[&Path],
+        bytes_max: u64,
+    ) -> Result<(rift_lsp::uri::PackageFile, String, Option<String>), RiftError> {
+        let unavailable = installed_source_unavailable;
+        let uri = callee.document().ok_or_else(unavailable)?;
+        let Some(EngineAddress::Package(file)) = self.address(trees, uri)? else {
+            return Err(unavailable());
+        };
+        let CalleePackage::Installed(package) = callee.package() else {
+            return Err(unavailable());
+        };
+        if file.origin()
+            != &(rift_core::SourceLocation::Dependency {
+                package: package.clone(),
+            })
+            || file.path() != callee.path()
+        {
+            return Err(unavailable());
+        }
+        let relative = file.root().project_path(uri)?;
+        let root = file
+            .root()
+            .filesystem_path()
+            .canonicalize()
+            .map_err(|_| unavailable())?;
+        let text = capture_admitted_text(&root, relative.as_str(), bytes_max)?;
+        let metadata = if package.manager == NPM_MANAGER {
+            Some(capture_admitted_text(
+                &root,
+                PACKAGE_MANIFEST_FILE_NAME,
+                PACKAGE_MANIFEST_BYTES_MAX,
+            )?)
+        } else {
+            None
+        };
+        Ok((*file, text, metadata))
+    }
+}
+
+fn installed_source_unavailable() -> RiftError {
+    rift_error::errors::server::search_coverage_unavailable()
+        .operation("installed dependency source")
+        .error()
+}
+
+fn capture_admitted_text(root: &Path, relative: &str, bytes_max: u64) -> Result<String, RiftError> {
+    let unavailable = installed_source_unavailable;
+    let original = root.join(relative);
+    let path = original.canonicalize().map_err(|_| unavailable())?;
+    if path == root || !path.starts_with(root) {
+        return Err(unavailable());
+    }
+    let observed = fs::metadata(&path).map_err(|_| unavailable())?;
+    if !observed.is_file() || observed.len() > bytes_max {
+        return Err(unavailable());
+    }
+    let mut bytes = Vec::new();
+    let source = fs::File::open(&path).map_err(|_| unavailable())?;
+    if !source.metadata().map_err(|_| unavailable())?.is_file() {
+        return Err(unavailable());
+    }
+    source
+        .take(bytes_max.checked_add(1).ok_or_else(unavailable)?)
+        .read_to_end(&mut bytes)
+        .map_err(|_| unavailable())?;
+    if u64::try_from(bytes.len()).map_or(true, |length| length > bytes_max)
+        || original.canonicalize().map_err(|_| unavailable())? != path
+    {
+        return Err(unavailable());
+    }
+    String::from_utf8(bytes).map_err(|_| unavailable())
 }
 
 /// The order source roots keep: root, then defining origin.
@@ -346,6 +424,7 @@ pub struct PackageCallee {
     encoding: PositionEncoding,
     name: String,
     captured_source: Option<Arc<str>>,
+    document: Option<Arc<Uri>>,
 }
 
 /// The declaration the global API named at one package callee's position.
@@ -363,6 +442,12 @@ pub struct CalleeDeclaration {
 }
 
 impl PackageCallee {
+    /// The original document addressed by this engine result, when observed.
+    #[must_use]
+    pub fn document(&self) -> Option<&Uri> {
+        self.document.as_deref()
+    }
+
     /// Complete embedded stub bytes held with the observed runtime owner.
     #[must_use]
     pub fn captured_source(&self) -> Option<&str> {
@@ -372,6 +457,14 @@ impl PackageCallee {
     #[must_use]
     pub const fn package(&self) -> &CalleePackage {
         &self.package
+    }
+
+    /// The observed declaration position converted against captured exact bytes.
+    ///
+    /// # Errors
+    /// Refuses a position outside the captured source.
+    pub fn byte_offset(&self, text: &str) -> Result<usize, RiftError> {
+        rift_lsp::position::LineIndex::new(text).byte_offset(self.encoding, self.position)
     }
 
     /// The callee's file, below the package's root, such as `src/lib.rs`.
@@ -510,6 +603,7 @@ pub(crate) fn callee_file(
             encoding: call.encoding,
             name: call.name.to_owned(),
             captured_source: None,
+            document: Some(Arc::new(call.uri.clone())),
         })
     };
     if let Some(stub) = call.uri.as_str().strip_prefix(VENDORED_STDLIB_PREFIX) {
@@ -952,7 +1046,49 @@ mod tests {
             encoding: PositionEncoding::Utf16,
             name: "greet".to_owned(),
             captured_source: None,
+            document: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_capture_refuses_a_manifest_outside_the_admitted_root() -> TestResult {
+        use std::fs;
+        use std::sync::Arc;
+
+        let directory = tempfile::tempdir()?;
+        let tree = directory.path().canonicalize()?;
+        let folder = tree.join("node_modules/greeting");
+        fs::create_dir_all(&folder)?;
+        let package = identity("npm", "greeting", "1.0.0");
+        let roots = CalleeRoots::from_packages(vec![PackageRoot::with_origin(
+            TreeRoot::new(&folder)?,
+            rift_core::SourceLocation::Dependency {
+                package: package.clone(),
+            },
+        )]);
+        let mut target = callee(CalleePackage::Installed(package), "index.ts");
+        target.document = Some(Arc::new(
+            TreeRoot::new(&tree)?
+                .document_uri(&ProjectPath::new("node_modules/greeting/index.ts")?)?,
+        ));
+        let source = "export function greet() {}";
+        let metadata = r#"{"name":"greeting","version":"1.0.0","main":"./index.ts"}"#;
+        fs::write(folder.join("index.ts"), source)?;
+        let manifest = folder.join("package.json");
+        fs::write(&manifest, metadata)?;
+        let (file, held, context) = roots.capture_package_call(&target, &[&tree], 1024)?;
+        assert_eq!(file.path().as_str(), "index.ts");
+        assert_eq!(held, source);
+        assert_eq!(context.as_deref(), Some(metadata));
+        assert!(roots.capture_package_call(&target, &[&tree], 4).is_err());
+
+        fs::remove_file(&manifest)?;
+        let outside = tree.join("other.json");
+        fs::write(&outside, metadata)?;
+        std::os::unix::fs::symlink(&outside, &manifest)?;
+        assert!(roots.capture_package_call(&target, &[&tree], 1024).is_err());
+        Ok(())
     }
 
     fn declaration(id: &str, kind: &str, package: &PackageIdentity) -> CalleeDeclaration {

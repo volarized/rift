@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use lsp_types::{CallHierarchyItem, Location, Position, Range, Uri};
+use lsp_types::{CallHierarchyOutgoingCall, Location, Position, Range, Uri};
 use rift_core::{ProjectPath, SymbolId as CoreSymbolId};
 use rift_error::errors;
 use rift_index::{IndexedFile, RelationshipStore};
@@ -14,8 +14,9 @@ use rift_lsp::uri::TreeRoot;
 use rift_protocol::read::{
     ExactKind, Extensions, GraphHop, HopDirection, Language, ReadWarning, Relationship,
     RelationshipDerivation, RelationshipFacet, SearchParams, SearchParamsTarget, SearchTraversal,
-    SourceUnitId, Symbol, SymbolId, TraversalDirection,
+    SourceUnitId, SourceUnitSpan, Symbol, SymbolId, TextRange, TraversalDirection,
 };
+use rift_protocol::relationship_read::QueryOccurrence;
 use rift_syntax::SyntaxSymbol;
 use tokio::time::Instant;
 
@@ -733,7 +734,14 @@ async fn resolve_symbol_callees(
     };
     let language = file.syntax().language().clone();
     let target = ReferenceTarget::new(slot.workspace_root(), reads.index().root(), file, symbol)?;
-    let answered = Box::pin(callees_on_engine(slot, &target, walk.deadline)).await;
+    let answered = Box::pin(calls_on_engine(
+        slot,
+        &target,
+        TraversalDirection::Outgoing,
+        false,
+        walk.deadline,
+    ))
+    .await;
     let (report, unconfirmed) = match answered {
         Ok(OutgoingAnswer::Ready(report)) => (report, None),
         Ok(OutgoingAnswer::Unconfirmed(report)) => (report, Some(slot.name().to_owned())),
@@ -774,22 +782,28 @@ async fn resolve_symbol_callees(
 /// One outgoing calls answer: each callee the engine named, or the count past the
 /// traversal bound.
 struct CalleeReport {
-    calls: Result<Vec<CallHierarchyItem>, usize>,
+    calls: Result<Vec<CallHierarchyOutgoingCall>, usize>,
     encoding: PositionEncoding,
 }
 
-async fn callees_on_engine(
+async fn calls_on_engine(
     slot: &EngineSlot,
     target: &ReferenceTarget,
+    direction: TraversalDirection,
+    exact_seed: bool,
     deadline: Instant,
 ) -> Result<OutgoingAnswer<CalleeReport>, RiftError> {
     let request_path = target.path.clone();
     let utf8 = target.utf8;
     let utf16 = target.utf16;
+    let uri = target.uri.clone();
+    let canonical_uri = target.canonical_uri.clone();
     slot.request_outgoing(
         target.opening(),
         move |session: &mut EngineSession| {
             let path = request_path.clone();
+            let uri = uri.clone();
+            let canonical_uri = canonical_uri.clone();
             Box::pin(async move {
                 let encoding = session.capabilities().position_encoding;
                 let position = match encoding {
@@ -802,8 +816,26 @@ async fn callees_on_engine(
                 }
                 let mut calls = Vec::new();
                 for item in items {
-                    let answered = session.outgoing_calls(item).await?;
-                    calls.extend(answered.into_iter().map(|call| call.to));
+                    if exact_seed
+                        && (!(item.uri == uri || item.uri == canonical_uri)
+                            || !(item.selection_range.start <= position
+                                && position < item.selection_range.end))
+                    {
+                        return Err(graph_call_coverage());
+                    }
+                    match direction {
+                        TraversalDirection::Outgoing => {
+                            calls.extend(session.outgoing_calls(item).await?);
+                        }
+                        TraversalDirection::Incoming => {
+                            calls.extend(session.incoming_calls(item).await?.into_iter().map(
+                                |call| CallHierarchyOutgoingCall {
+                                    to: call.from,
+                                    from_ranges: call.from_ranges,
+                                },
+                            ));
+                        }
+                    }
                     if calls.len() > TRAVERSAL_NODES_MAX {
                         return Ok(Some(CalleeReport {
                             calls: Err(calls.len()),
@@ -854,7 +886,8 @@ fn map_callees(
         held: Vec::new(),
         dropped: 0,
     };
-    for item in &calls {
+    for call in &calls {
+        let item = &call.to;
         let call = NamedCallee {
             uri: &item.uri,
             name: &item.name,
@@ -886,6 +919,242 @@ fn map_callees(
         }
     }
     Ok(mapped)
+}
+
+/// Calls the engine established for one selected local declaration.
+#[derive(Default)]
+pub struct GraphCalls {
+    /// Canonical neighbors in the current tree.
+    pub local: Vec<(SymbolId, Vec<SourceUnitSpan>)>,
+    /// Outgoing targets in admitted dependency sources, awaiting exact identity resolution.
+    pub packages: Vec<(PackageCallee, Vec<SourceUnitSpan>)>,
+}
+
+/// Reads every adjacent call and its physical call sites in the selected direction.
+///
+/// # Errors
+/// Refuses missing readiness, an unaddressed callee, or work outside the accepted bounds.
+pub async fn graph_calls(
+    reads: &ReadService,
+    engines: &EnginePool,
+    roots: &CalleeRoots,
+    seed: &SymbolId,
+    direction: TraversalDirection,
+    deadline: Instant,
+) -> Result<GraphCalls, RiftError> {
+    let unavailable = graph_call_coverage;
+    let identity = CoreSymbolId::new(seed.as_str().to_owned()).map_err(|_| unavailable())?;
+    let (declarations, count) = reads.index().symbols_by_identity_page(&identity, 0, 1)?;
+    let [declaration] = declarations.as_slice() else {
+        return Err(unavailable());
+    };
+    if count != 1 {
+        return Err(unavailable());
+    }
+    let file = declaration.file;
+    let slot = engines
+        .engine_for(file.syntax().language())
+        .ok_or_else(unavailable)?;
+    let request = ReferenceTarget::new(
+        slot.workspace_root(),
+        reads.index().root(),
+        file,
+        declaration.symbol,
+    )?;
+    let answered = Box::pin(calls_on_engine(slot, &request, direction, true, deadline))
+        .await
+        .map_err(|error| {
+            if graph_engine_method_missing(&error) {
+                unavailable()
+            } else {
+                error
+            }
+        })?;
+    let OutgoingAnswer::Ready(report) = answered else {
+        return Err(unavailable());
+    };
+    map_graph_calls(
+        reads,
+        roots,
+        &identity,
+        report,
+        &CallGraphSource {
+            trees: [slot.workspace_root(), reads.index().root()],
+            source: file.source(),
+            unit: crate::read::source_unit_id(file.path()),
+            direction,
+        },
+    )
+}
+
+struct CallGraphSource<'source> {
+    trees: [&'source std::path::Path; 2],
+    source: &'source str,
+    unit: SourceUnitId,
+    direction: TraversalDirection,
+}
+
+fn map_graph_calls(
+    reads: &ReadService,
+    roots: &CalleeRoots,
+    identity: &CoreSymbolId,
+    report: CalleeReport,
+    held: &CallGraphSource<'_>,
+) -> Result<GraphCalls, RiftError> {
+    let unavailable = graph_call_coverage;
+    let mut result = GraphCalls::default();
+    let mut locations = 0usize;
+    for call in report.calls.map_err(|_| unavailable())? {
+        let item = &call.to;
+        let at = NamedCallee {
+            uri: &item.uri,
+            name: &item.name,
+            position: item.selection_range.start,
+            encoding: report.encoding,
+        };
+        let neighbor = callee_file(roots, &held.trees, identity, at)?;
+        let (source, unit) = match (&neighbor, held.direction) {
+            (_, TraversalDirection::Outgoing) => (held.source, held.unit.clone()),
+            (CalleeFile::Project(path), TraversalDirection::Incoming) => {
+                let file = reads.index().file(path).ok_or_else(unavailable)?;
+                (file.source(), crate::read::source_unit_id(file.path()))
+            }
+            _ => return Err(unavailable()),
+        };
+        let index = LineIndex::new(source);
+        let mut occurrences = Vec::new();
+        for range in call.from_ranges {
+            locations = locations
+                .checked_add(1)
+                .filter(|count| *count <= TRAVERSAL_NODES_MAX)
+                .ok_or_else(unavailable)?;
+            let start = index.byte_offset(report.encoding, range.start)?;
+            let end = index.byte_offset(report.encoding, range.end)?;
+            if source.get(start..end).is_none() {
+                return Err(unavailable());
+            }
+            occurrences.push(SourceUnitSpan {
+                unit: unit.clone(),
+                range: TextRange {
+                    start: start as u64,
+                    end: end as u64,
+                },
+            });
+        }
+        match neighbor {
+            CalleeFile::Project(path) => {
+                let target = project_declaration(
+                    reads,
+                    &path,
+                    (item.selection_range, report.encoding),
+                    "graph calls",
+                )?
+                .ok_or_else(unavailable)?;
+                result.local.push((target, occurrences));
+            }
+            CalleeFile::Package(target) => result.packages.push((target, occurrences)),
+            CalleeFile::Unaddressed => return Err(unavailable()),
+        }
+    }
+    Ok(result)
+}
+
+fn graph_engine_method_missing(error: &RiftError) -> bool {
+    error.slug() == errors::lsp::engine_capability_absent::SLUG
+        || (error.slug() == errors::lsp::engine_refused_terminal::SLUG
+            && error.context().any(|(key, value)| {
+                key == "code"
+                    && value.parse::<i64>() == Ok(rift_lsp::correlation::METHOD_NOT_FOUND_CODE)
+            }))
+}
+
+fn graph_call_coverage() -> RiftError {
+    errors::server::search_coverage_unavailable()
+        .operation("graph calls")
+        .error()
+}
+
+/// Reprepares and reads a call target from the same admitted installed bytes.
+///
+/// # Errors
+/// Refuses missing readiness, a different prepared position or an unaddressed callee.
+pub async fn installed_graph_calls(
+    reads: &ReadService,
+    engines: &EnginePool,
+    roots: &CalleeRoots,
+    seed: &SymbolId,
+    target: (&PackageCallee, &Language, &SourceUnitId, &str),
+    deadline: Instant,
+) -> Result<GraphCalls, RiftError> {
+    let (callee, language, unit, text) = target;
+    let slot = engines
+        .engine_for(language)
+        .ok_or_else(graph_call_coverage)?;
+    let uri = callee.document().ok_or_else(graph_call_coverage)?.clone();
+    let offset = callee.byte_offset(text)?;
+    let index = LineIndex::new(text);
+    let utf8 = index.position(PositionEncoding::Utf8, offset)?;
+    let utf16 = index.position(PositionEncoding::Utf16, offset)?;
+    let source: std::sync::Arc<str> = text.into();
+    let open_uri = uri.clone();
+    let close_uri = uri.clone();
+    let language_id = language.name.clone();
+    let result = slot.request_outgoing(
+        move |session| {
+            let uri = open_uri.clone();
+            let source = std::sync::Arc::clone(&source);
+            let language_id = language_id.clone();
+            Box::pin(async move { session.open_uri(uri, &language_id, source.to_string()).await })
+        },
+        move |session| {
+            let uri = uri.clone();
+            Box::pin(async move {
+                let encoding = session.capabilities().position_encoding;
+                let position = match encoding {
+                    PositionEncoding::Utf8 => utf8,
+                    PositionEncoding::Utf16 => utf16,
+                };
+                let items = session.prepare_call_hierarchy_uri(uri.clone(), position).await?;
+                let [item] = items.as_slice() else {
+                    return Err(graph_call_coverage());
+                };
+                if item.uri != uri || !(item.selection_range.start <= position && position < item.selection_range.end) {
+                    return Err(graph_call_coverage());
+                }
+                let calls = session.outgoing_calls(item.clone()).await?;
+                if calls.len() > TRAVERSAL_NODES_MAX {
+                    return Err(graph_call_coverage());
+                }
+                Ok(Some(CalleeReport { calls: Ok(calls), encoding }))
+            })
+        },
+        move |session| {
+            let uri = close_uri.clone();
+            Box::pin(async move {
+                if let Err(error) = session.close_uri(&uri).await {
+                    rift_tracing::warn!(component = "engine", error = %error, "engine document close failed");
+                }
+            })
+        },
+        deadline,
+    ).await?;
+    let OutgoingAnswer::Ready(report) = result else {
+        return Err(graph_call_coverage());
+    };
+    let identity =
+        CoreSymbolId::new(seed.as_str().to_owned()).map_err(|_| graph_call_coverage())?;
+    map_graph_calls(
+        reads,
+        roots,
+        &identity,
+        report,
+        &CallGraphSource {
+            trees: [slot.workspace_root(), reads.index().root()],
+            source: text,
+            unit: unit.clone(),
+            direction: TraversalDirection::Outgoing,
+        },
+    )
 }
 
 async fn resolve_symbol_references(
@@ -1126,6 +1395,123 @@ async fn references_on_engine(
         deadline,
     )
     .await
+}
+
+/// Complete physical usages from configured engines for one local declaration.
+///
+/// # Errors
+/// Refuses missing readiness, an uncovered source location, or a response above the engine bound.
+pub async fn graph_references(
+    reads: &ReadService,
+    engines: &EnginePool,
+    target: &SymbolId,
+    require_caller: bool,
+    deadline: Instant,
+) -> Result<Vec<QueryOccurrence>, RiftError> {
+    let unavailable = graph_reference_coverage;
+    let identity = CoreSymbolId::new(target.as_str().to_owned()).map_err(|_| unavailable())?;
+    let (declarations, count) = reads.index().symbols_by_identity_page(&identity, 0, 1)?;
+    let [_] = declarations.as_slice() else {
+        return Err(unavailable());
+    };
+    let (declarations, total) = if count == 1 {
+        (declarations, count)
+    } else {
+        reads
+            .index()
+            .symbols_by_identity_page(&identity, 0, count.min(TRAVERSAL_NODES_MAX))?
+    };
+    if total == 0 || declarations.len() != total {
+        return Err(unavailable());
+    }
+    let excluded: BTreeSet<_> = declarations
+        .iter()
+        .map(|declaration| {
+            let range = declaration.symbol.name_range.ok_or_else(unavailable)?;
+            Ok((declaration.file.path().clone(), range.start, range.end))
+        })
+        .collect::<Result<_, RiftError>>()?;
+    let mut found = BTreeMap::new();
+    for declaration in declarations {
+        let file = declaration.file;
+        let slot = engines
+            .engine_for(file.syntax().language())
+            .ok_or_else(unavailable)?;
+        let request = ReferenceTarget::new(
+            slot.workspace_root(),
+            reads.index().root(),
+            file,
+            declaration.symbol,
+        )?;
+        let (report, unconfirmed) = Box::pin(references_on_engine(slot, &request, deadline))
+            .await
+            .map_err(|error| {
+                if graph_engine_method_missing(&error)
+                    || error.slug() == errors::lsp::engine_analyzing::SLUG
+                {
+                    unavailable()
+                } else {
+                    error
+                }
+            })?;
+        if unconfirmed || !report.full {
+            return Err(unavailable());
+        }
+        let root = TreeRoot::new(slot.workspace_root())?;
+        let canonical = TreeRoot::new(reads.index().root())?;
+        let mut positions = BTreeMap::new();
+        for location in report.locations.map_err(|_| unavailable())? {
+            let path = root
+                .project_path(&location.uri)
+                .or_else(|_| canonical.project_path(&location.uri))
+                .map_err(|_| unavailable())?;
+            let file = reads.index().file(&path).ok_or_else(unavailable)?;
+            let positions = positions
+                .entry(file.path())
+                .or_insert_with(|| LineIndex::new(file.source()));
+            let start = positions.byte_offset(report.encoding, location.range.start)?;
+            let end = positions.byte_offset(report.encoding, location.range.end)?;
+            if file.source().get(start..end).is_none() {
+                return Err(unavailable());
+            }
+            let key = (path, start as u64, end as u64);
+            if excluded.contains(&key) || found.contains_key(&key) {
+                continue;
+            }
+            if found.len() == TRAVERSAL_NODES_MAX {
+                return Err(unavailable());
+            }
+            let enclosing = if let Some(symbol) = file.enclosing_symbol(key.1, key.2) {
+                let id = symbol_id(reads.index(), crate::search::declared(file, symbol))?;
+                if require_caller && id.is_none() {
+                    return Err(unavailable());
+                }
+                id
+            } else {
+                None
+            };
+            let occurrence = QueryOccurrence {
+                target: target.clone(),
+                enclosing,
+                source: SourceUnitSpan {
+                    unit: crate::read::source_unit_id(file.path()),
+                    range: TextRange {
+                        start: key.1,
+                        end: key.2,
+                    },
+                },
+                facet: RelationshipFacet::References,
+            };
+            found.insert(key, occurrence);
+        }
+    }
+    Ok(found.into_values().collect())
+}
+
+fn graph_reference_coverage() -> RiftError {
+    errors::server::search_coverage_unavailable()
+        .operation("graph references")
+        .error()
 }
 
 fn map_references(
@@ -1370,16 +1756,19 @@ mod tests {
     }
 
     /// One call hierarchy item naming `name` at `location`.
-    fn item(location: Location, name: &str) -> lsp_types::CallHierarchyItem {
-        lsp_types::CallHierarchyItem {
-            name: name.to_owned(),
-            kind: lsp_types::SymbolKind::FUNCTION,
-            tags: None,
-            detail: None,
-            uri: location.uri,
-            range: location.range,
-            selection_range: location.range,
-            data: None,
+    fn item(location: Location, name: &str) -> lsp_types::CallHierarchyOutgoingCall {
+        lsp_types::CallHierarchyOutgoingCall {
+            to: lsp_types::CallHierarchyItem {
+                name: name.to_owned(),
+                kind: lsp_types::SymbolKind::FUNCTION,
+                tags: None,
+                detail: None,
+                uri: location.uri,
+                range: location.range,
+                selection_range: location.range,
+                data: None,
+            },
+            from_ranges: Vec::new(),
         }
     }
 

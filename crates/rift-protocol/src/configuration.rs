@@ -1550,6 +1550,8 @@ impl ExecutionConfiguration {
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_search_ranges)]
 pub struct SearchConfiguration {
+    /// Transport bounds for retained graph query answers.
+    pub query: crate::query::QueryConfiguration,
     /// Most results one local search or symbol lookup collects, 1 to 10000.
     /// An answer that reaches this bound warns `results_truncated`.
     #[schemars(range(min = 1, max = 10_000))]
@@ -1613,6 +1615,7 @@ pub struct SearchConfiguration {
 impl Default for SearchConfiguration {
     fn default() -> Self {
         Self {
+            query: crate::query::QueryConfiguration::default(),
             results: SEARCH_RESULTS_DEFAULT,
             symbol_alternatives_work: SEARCH_SYMBOL_ALTERNATIVES_WORK_DEFAULT,
             symbol_alternatives_lowercase_work: SEARCH_SYMBOL_ALTERNATIVES_LOWERCASE_WORK_DEFAULT,
@@ -1640,6 +1643,7 @@ impl SearchConfiguration {
             .violation()
             .or_else(|| self.ranking.violation())
             .or_else(|| self.vector.violation())
+            .or_else(|| self.query.violation())
             .or_else(|| self.text.violation())
             .or_else(|| {
                 first_out_of_range([

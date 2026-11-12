@@ -10,8 +10,10 @@ use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
 use spargebra::vocab::sparql;
 
 use super::expression::GROUP_CONCAT_PREFIX;
+use super::inventory::SemanticInventory;
 use super::limits::GraphLimits;
 use super::query::refused;
+use super::retrieval::{self, RetrievalSelection};
 
 /// The feature a join of patterns sharing no variable is refused as.
 const CARTESIAN_PRODUCT: &str = "a cartesian product of patterns sharing no variable";
@@ -20,6 +22,17 @@ const CARTESIAN_PRODUCT: &str = "a cartesian product of patterns sharing no vari
 enum Visit<'a> {
     Pattern(&'a mut QueryExpression),
     Expression(&'a mut Expression),
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct Admission {
+    pub(super) separators: Vec<String>,
+    pub(super) retrieval: Vec<RetrievalSelection>,
+    pub(super) reads_base: bool,
+    pub(super) symbol_only: bool,
+    pub(super) named_local: bool,
+    pub(super) embedded_patterns: usize,
+    pub(super) semantics: Option<SemanticInventory>,
 }
 
 /// Refuses what the graph does not serve, renames each `GROUP_CONCAT` to its bounded form,
@@ -32,10 +45,18 @@ enum Visit<'a> {
 /// The walk keeps an explicit stack, so algebra depth never deepens the call stack. Its work
 /// is one step per algebra element, bounded by the query byte bound the parser ran under,
 /// plus one in-scope variable scan of both sides of every join.
-pub(super) fn admit(query: &mut Query, limits: &GraphLimits) -> Result<Vec<String>, RiftError> {
-    if query.dataset().is_some() {
-        return refused("a FROM or FROM NAMED clause");
+pub(super) fn admit(query: &mut Query, limits: &GraphLimits) -> Result<Admission, RiftError> {
+    let named_local = query.dataset().is_some();
+    if let Some(dataset) = query.dataset()
+        && dataset
+            .default
+            .iter()
+            .chain(dataset.named.iter().flatten())
+            .any(|graph| graph.as_str() != super::LOCAL_GRAPH)
+    {
+        return refused("a FROM or FROM NAMED clause outside the selected local dataset");
     }
+    let describes = matches!(query, Query::Describe(_));
     let mut joined = Joined::default();
     let root = match query {
         Query::Select(select) => &mut select.expression,
@@ -46,32 +67,47 @@ pub(super) fn admit(query: &mut Query, limits: &GraphLimits) -> Result<Vec<Strin
         }
         Query::Describe(describe) => &mut describe.pattern,
     };
-    let mut separators = Vec::new();
+    let mut admission = Admission {
+        reads_base: describes,
+        symbol_only: !describes,
+        semantics: (!describes).then(SemanticInventory::default),
+        named_local,
+        ..Admission::default()
+    };
     let mut pending = Pending::from(Visit::Pattern(root));
     while let Some(visit) = pending.next(limits)? {
         match visit {
             Visit::Pattern(pattern) => {
                 joined.count(pattern);
-                admit_pattern(pattern, &mut separators, &mut pending)?;
+                admit_pattern(pattern, &mut admission, &mut pending)?;
             }
-            Visit::Expression(expression) => push_expression_children(expression, &mut pending),
+            Visit::Expression(expression) => {
+                admission.embedded_patterns +=
+                    usize::from(matches!(expression, Expression::Exists(_)));
+                push_expression_children(expression, &mut pending);
+            }
         }
     }
     joined.admit(limits)?;
-    Ok(separators)
+    if named_local && !admission.retrieval.is_empty() {
+        return refused("explicit FROM with a retrieval service");
+    }
+    Ok(admission)
 }
 
 /// The algebra elements still to inspect, each with its depth below the root.
 struct Pending<'a> {
-    stack: Vec<(Visit<'a>, usize)>,
+    stack: Vec<(Visit<'a>, usize, bool)>,
     depth: usize,
+    in_retrieval: bool,
 }
 
 impl<'a> From<Visit<'a>> for Pending<'a> {
     fn from(root: Visit<'a>) -> Self {
         Self {
-            stack: vec![(root, 0)],
+            stack: vec![(root, 0, false)],
             depth: 0,
+            in_retrieval: false,
         }
     }
 }
@@ -81,7 +117,7 @@ impl<'a> Pending<'a> {
     /// recurse: both recurse once per level, and the text bounds bound the depth only as far
     /// as the parser and this scan agree on what the text holds.
     fn next(&mut self, limits: &GraphLimits) -> Result<Option<Visit<'a>>, RiftError> {
-        let Some((visit, depth)) = self.stack.pop() else {
+        let Some((visit, depth, in_retrieval)) = self.stack.pop() else {
             return Ok(None);
         };
         if depth > limits.algebra_depth_max() {
@@ -92,19 +128,23 @@ impl<'a> Pending<'a> {
                 .fail();
         }
         self.depth = depth;
+        self.in_retrieval = in_retrieval;
         Ok(Some(visit))
     }
 
     /// Queues a child of the element last returned.
     fn push(&mut self, visit: Visit<'a>) {
-        self.stack.push((visit, self.depth + 1));
+        self.stack.push((visit, self.depth + 1, self.in_retrieval));
     }
 
     /// Queues children of the element last returned.
     fn extend(&mut self, visits: impl IntoIterator<Item = Visit<'a>>) {
         let depth = self.depth + 1;
-        self.stack
-            .extend(visits.into_iter().map(|visit| (visit, depth)));
+        self.stack.extend(
+            visits
+                .into_iter()
+                .map(|visit| (visit, depth, self.in_retrieval)),
+        );
     }
 }
 
@@ -162,11 +202,58 @@ impl Joined {
 /// Refuses one pattern the graph does not serve, then pushes what it holds.
 fn admit_pattern<'a>(
     pattern: &'a mut QueryExpression,
-    separators: &mut Vec<String>,
+    admission: &mut Admission,
     pending: &mut Pending<'a>,
 ) -> Result<(), RiftError> {
     match pattern {
-        QueryExpression::Service { name, .. } => return refused(&format!("SERVICE {name}")),
+        QueryExpression::Service { name, .. } if pending.in_retrieval => {
+            return refused(&format!("SERVICE {name}"));
+        }
+        QueryExpression::Service { .. } => {
+            let selected = retrieval::rewrite(pattern, admission.retrieval.len())?;
+            admission.retrieval.push(selected);
+            pending.in_retrieval = true;
+        }
+        QueryExpression::Graph { .. } if pending.in_retrieval => {
+            return refused("GRAPH inside a retrieval service");
+        }
+        QueryExpression::Graph { name, .. } if !pending.in_retrieval => {
+            admission.reads_base = true;
+            if matches!(name, NamedNodePattern::NamedNode(name) if name.as_str() == super::LOCAL_GRAPH)
+            {
+                admission.named_local = true;
+            } else {
+                admission.symbol_only = false;
+                admission.semantics = None;
+            }
+        }
+        QueryExpression::Path { path, .. } if !pending.in_retrieval => {
+            admission.reads_base = true;
+            admission.symbol_only = false;
+            admission.semantics = admission.semantics.and_then(|mut requirements| {
+                requirements.include_path(path)?;
+                Some(requirements)
+            });
+        }
+        QueryExpression::Bgp { patterns } if !pending.in_retrieval && !patterns.is_empty() => {
+            admission.reads_base = true;
+            admission.semantics = admission.semantics.and_then(|mut requirements| {
+                requirements.include_patterns(patterns)?;
+                Some(requirements)
+            });
+            admission.symbol_only &=
+                super::requirements::symbol_patterns(patterns).is_some_and(|selection| {
+                    if let super::SymbolSelection::Identified(id) = selection {
+                        rift_protocol::identity::SymbolIdentity::parse(id)
+                            .is_ok_and(|id| id.owner().is_local())
+                    } else {
+                        true
+                    }
+                });
+            if is_disconnected(patterns) {
+                return refused(CARTESIAN_PRODUCT);
+            }
+        }
         QueryExpression::Bgp { patterns } if is_disconnected(patterns) => {
             return refused(CARTESIAN_PRODUCT);
         }
@@ -177,7 +264,7 @@ fn admit_pattern<'a>(
         }
         QueryExpression::Group { aggregates, .. } => {
             for (_, aggregate) in aggregates {
-                bound_group_concat(aggregate, separators);
+                bound_group_concat(aggregate, &mut admission.separators);
             }
         }
         _ => {}

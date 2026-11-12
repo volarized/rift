@@ -99,6 +99,11 @@ mod keyword {
     pub(super) const ADDITIONAL_PROPERTIES: &str = "additionalProperties";
 }
 
+/// The search tool returns an object for each result form.
+pub fn require_query_result_object(schema: &mut Schema) {
+    schema.insert(keyword::TYPE.to_owned(), Value::String("object".to_owned()));
+}
+
 /// References and unions one schema walk follows before it answers with what
 /// it has reached. A model may refer to itself, and a caller reaches the walk
 /// by sending one value the schema refuses, so the walk is bounded.

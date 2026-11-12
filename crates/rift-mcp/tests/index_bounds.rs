@@ -87,7 +87,7 @@ async fn search_page(
     query: &str,
 ) -> TestResult<Value> {
     let answer = client
-        .call_tool(tool_request("search", &json!({"query": query})))
+        .call_tool(tool_request("search_retrieval", &json!({"query": query})))
         .await?;
     answer
         .structured_content
@@ -275,7 +275,7 @@ async fn a_force_included_file_the_contract_refuses_is_left_out_and_the_answer_w
 
     let forced = client
         .call_tool(tool_request(
-            "search",
+            "search_retrieval",
             &json!({"query": "beacon", "paths": {"force_include": ["src/wide.rs"]}}),
         ))
         .await?;
@@ -326,7 +326,7 @@ async fn a_workspace_past_workspace_size_refuses_to_build_naming_the_key() -> Te
 
     let (client, server_task) = served_root_unsettled(directory.path()).await?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-    let params = tool_request("search", &json!({"query": "beacon"}));
+    let params = tool_request("search_retrieval", &json!({"query": "beacon"}));
     let refusal = loop {
         let result = tokio::time::timeout_at(deadline, client.call_tool(params.clone())).await??;
         if result.is_error == Some(true) {
@@ -446,7 +446,7 @@ async fn a_force_include_past_its_file_bound_refuses_with_the_match_count_as_evi
 
     let refused = client
         .call_tool(tool_request(
-            "search",
+            "search_retrieval",
             &json!({ "query": "note", "paths": { "force_include": ["extra/**"] } }),
         ))
         .await;
@@ -480,7 +480,7 @@ async fn a_force_include_past_its_file_bound_refuses_when_the_index_fills_the_po
 
     let refused = client
         .call_tool(tool_request(
-            "search",
+            "search_retrieval",
             &json!({ "query": "note", "paths": { "force_include": ["extra/**"] } }),
         ))
         .await;

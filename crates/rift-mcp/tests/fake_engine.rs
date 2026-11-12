@@ -91,7 +91,7 @@ pub(crate) async fn scripted_calls_workspace(
     let served = served_workspace(SCRIPTED_CALLS_FILES, Some(configuration)).await?;
     call_retrying_acceptance(
         &served.1,
-        tool_request("search", &json!({"query": "caller"})),
+        tool_request("search_retrieval", &json!({"query": "caller"})),
     )
     .await?;
     Ok((engine, served))

@@ -6,7 +6,10 @@ import asyncio
 from pathlib import Path
 from typing import cast
 
+from dulwich.repo import Repo
+
 from rift_dev.check_artifact import (
+    CONFIGURATION,
     check_external_change,
     check_reads,
     incoming_references,
@@ -16,6 +19,13 @@ from rift_dev.check_artifact import (
 )
 from rift_dev.log_records import parse_line
 from rift_dev.nextest_run import retained_collector
+from rift_dev.query import (
+    bindings,
+    iri,
+    literal,
+    project_source_unit,
+    usage_request,
+)
 from rift_dev.rift_test_client import (
     Client,
     Server,
@@ -29,7 +39,7 @@ from rift_dev.rift_test_client import (
     string_value,
     verify_version,
 )
-from rift_dev.trace import TEST_CASE_KEY, resource_attribute
+from rift_dev.trace import TEST_CASE_KEY, Collector, resource_attribute
 
 AGENT_SECONDS = 300.0
 READ_TOOLS = {"search", "get_symbol", "nodes"}
@@ -53,40 +63,69 @@ retry = { attempts = 12, delay = "250ms", delay_limit = "2s" }
 
 
 async def check_embedded_references(client: Client, root: Path) -> None:
-    """Require the embedded engine to resolve a caller through a read request."""
+    """Compare language-engine references and usage locations with authored bytes."""
     seed = symbol_id(await symbol_hit(client, "serve", "python"))
-    caller = symbol_id(await symbol_hit(client, "caller", "python"))
     answer = await incoming_references(client, seed)
-    resolved = []
-    for value in array_value(answer.get("results"), "search.results"):
-        hit = object_value(value, "search hit")
-        symbol = object_value(
-            object_value(hit.get("hit"), "hit").get("symbol"), "symbol"
-        )
-        if symbol.get("id") == caller:
-            resolved.append(hit)
-    require(len(resolved) == 1, f"engine references omitted caller: {answer}")
-    hops = array_value(resolved[0].get("traversal_path"), "traversal_path")
-    require(len(hops) == 1, f"expected one reference step: {hops}")
-    hop = object_value(hops[0], "hop")
-    relationship = object_value(hop.get("relationship"), "relationship")
+    callers = bindings(answer)
     require(
-        relationship.get("from") == caller and relationship.get("to") == seed,
-        f"reference endpoints differ: {relationship}",
+        [iri(row, "caller").rsplit("/", 1)[-1] for row in callers] == ["caller"],
+        f"callers: {answer}",
+    )
+    answer = await client.call("search", usage_request(seed))
+    original = (root / "service.py").read_bytes()
+    call = original.rindex(b"serve")
+    ranges = [
+        (iri(row, "unit"), int(literal(row, "start")), int(literal(row, "end")))
+        for row in bindings(answer)
+    ]
+    require(
+        ranges == [("rift://source/project/service.py", call, call + len(b"serve"))],
+        f"usage differs from authored range: {answer}",
+    )
+    require(original == PYTHON_SOURCE.encode(), "reference read changed source bytes")
+
+
+async def check_mixed_references_unavailable(client: Client) -> None:
+    """Require complete relationship acquisition to refuse an unserved language."""
+    answer = await client.call(
+        "search", {"query": "SELECT ?caller ?target { ?caller :references ?target }"}
     )
     require(
-        relationship.get("derivation") == "resolution",
-        f"reference was not resolved by the engine: {relationship}",
+        answer.get("outcome") == "unavailable"
+        and answer.get("reason") == "insufficient_coverage",
+        f"unserved Rust relationships returned a complete answer: {answer}",
     )
-    require(
-        relationship.get("facets") == ["references"],
-        f"reference facets differ: {relationship}",
+
+
+async def check_python_references(
+    binary: Path, base: Path, telemetry: Collector
+) -> None:
+    """Read relationship metadata from a complete served Python workspace."""
+    root = base / "python"
+    root.mkdir()
+    with Repo.init(root):
+        pass
+    (root / "rift.toml").write_text(
+        CONFIGURATION + "[source]\ninclude=['service.py','pyproject.toml']\n" + PYTHON_CONFIGURATION,
+        encoding="utf-8",
+        newline="",
     )
-    require(hop.get("direction") == "incoming", f"reference direction differs: {hop}")
-    require(
-        (root / "service.py").read_bytes() == PYTHON_SOURCE.encode(),
-        "reference read changed source bytes",
-    )
+    (root / "service.py").write_text(PYTHON_SOURCE, encoding="utf-8", newline="")
+    (root / "pyproject.toml").write_text(PYTHON_METADATA, encoding="utf-8", newline="")
+    with Server(
+        binary,
+        root,
+        base / "python-server.log",
+        env={"OTEL_RESOURCE_ATTRIBUTES": resource_attribute(TEST_CASE_KEY, "agent")},
+        collector=telemetry,
+    ) as server:
+        try:
+            async with server.connect() as client:
+                await check_embedded_references(client, root)
+        except BaseException as error:
+            for note in server.evidence():
+                error.add_note(note)
+            raise
 
 
 async def check_resources(client: Client) -> None:
@@ -119,21 +158,7 @@ async def check_resources(client: Client) -> None:
 
 async def declaration_node(client: Client, name: str) -> str:
     """Prove get_symbol and nodes answer the searched declaration at one revision."""
-    search = await client.call(
-        "search",
-        {"query": name, "target": "symbol", "include": ["source"], "limit": 1000},
-    )
-    matches = []
-    for value in array_value(search.get("results"), "search.results"):
-        row = object_value(value, "hit")
-        target = object_value(row.get("hit"), "hit")
-        if target.get("target") != "symbol":
-            continue
-        symbol = object_value(target.get("symbol"), "symbol")
-        if symbol.get("name") == name and symbol.get("language") == "rust":
-            matches.append(row)
-    require(len(matches) == 1, f"expected one {name} declaration: {search}")
-    hit = matches[0]
+    hit = await symbol_hit(client, name)
     identity = symbol_id(hit)
     answer = await client.call("get_symbol", {"id": identity})
     require(answer.get("outcome") == "found", f"symbol was not found: {answer}")
@@ -144,11 +169,13 @@ async def declaration_node(client: Client, name: str) -> str:
     declarations = array_value(answer.get("declarations"), "symbol declarations")
     require(len(declarations) == 1, f"expected one declaration: {answer}")
     declaration = object_value(declarations[0], "declaration")
-    for field in ("path", "range"):
-        require(
-            declaration.get(field) == hit.get(field),
-            f"symbol declaration changed {field}: {answer}",
-        )
+    path = string_value(declaration.get("path"), "declaration.path")
+    require(project_source_unit(path) == iri(hit, "unit"), f"changed unit: {answer}")
+    require(
+        declaration.get("range")
+        == {"start": int(literal(hit, "start")), "end": int(literal(hit, "end"))},
+        f"changed range: {answer}",
+    )
     require(
         "source" not in declaration,
         f"symbol declaration carried source: {answer}",
@@ -163,7 +190,7 @@ async def declaration_node(client: Client, name: str) -> str:
     listing = await client.call(
         "nodes",
         {
-            "path": string_value(declaration.get("path"), "declaration.path"),
+            "path": path,
             "position": cast(int, end) - 1,
             "revision": revision,
         },
@@ -189,7 +216,7 @@ async def declaration_node(client: Client, name: str) -> str:
         f"the declaration's item node is not node 0 of its declaration: {listing}",
     )
     require(
-        node.get("source") == hit.get("source"),
+        node.get("source") == literal(hit, "source"),
         f"nodes changed source: {listing}",
     )
     return identity
@@ -234,7 +261,7 @@ async def check_agent(binary: Path, version: str | None = None) -> None:
                     await check_reads(client)
                     await check_resources(client)
                     await check_external_change(client, root)
-                    await check_embedded_references(client, root)
+                    await check_mixed_references_unavailable(client)
                     await declaration_node(client, "beacon_one")
                     client.require_complete(READ_TOOLS)
                 server.stop()
@@ -243,6 +270,7 @@ async def check_agent(binary: Path, version: str | None = None) -> None:
                     any(parse_line(line) is not None for line in logs.splitlines()),
                     "startup recorded no logs",
                 )
+                await check_python_references(binary, base, telemetry)
             except BaseException as error:
                 for note in server.evidence():
                     error.add_note(note)
@@ -250,5 +278,4 @@ async def check_agent(binary: Path, version: str | None = None) -> None:
                 raise
             finally:
                 retain_collector(base, telemetry)
-            print(collector_line(telemetry), flush=True)
             print(collector_line(telemetry), flush=True)
