@@ -4640,6 +4640,7 @@ dependencies = [
  "anyhow",
  "axum",
  "chrono",
+ "data-encoding",
  "http",
  "jsonschema",
  "oas3",

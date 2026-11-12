@@ -5,6 +5,7 @@ pub mod contract;
 mod failure;
 mod nodes;
 mod pattern;
+pub mod relationships;
 mod response;
 pub mod search;
 mod source;
@@ -25,7 +26,6 @@ use std::{
     time::Duration,
 };
 
-use percent_encoding::percent_decode_str;
 use reqwest::{
     Client as HttpClient, StatusCode, Url,
     header::{
@@ -71,12 +71,12 @@ pub use generated::{
     PackageSearchRequest, PackageSearchRequestPhase, PackageSearchRequestTarget, Parameter,
     PositionEncoding as PackageDeclarationRequestPositionEncoding, ProblemDetails,
     PublicationFormat, QueryTerm, RelationshipFacet, ResolvePackageContextRequest,
-    ResolvePackageContextResponse, ResolvedRequirement, SearchPackagePatternsRequest,
-    SearchPackagePatternsRequestQuery, SearchPackagePatternsResponse, SearchPackagesRequest,
-    SearchPackagesRequestQuery, SearchPackagesResponse, SearchTraversal, Signature, SignatureLink,
-    SourceKind, SourceLocationKind, SourceUnitId, Symbol, SymbolFacet, SymbolId, SymbolOrigin,
-    TextRange, TraversalDirection, TypeBinding, TypeBindingOrigin, TypeBindingRole, TypeExpression,
-    Warning, WarningCode,
+    ResolvePackageContextResponse, ResolvedRequirement, Search200Response,
+    SearchPackagePatternsRequest, SearchPackagePatternsRequestQuery, SearchPackagePatternsResponse,
+    SearchPackagesRequest, SearchPackagesRequestQuery, SearchPackagesResponse, SearchTraversal,
+    SearchUnavailable, Signature, SignatureLink, SourceKind, SourceLocationKind, SourceUnitId,
+    Symbol, SymbolFacet, SymbolId, SymbolOrigin, TextRange, TraversalDirection, TypeBinding,
+    TypeBindingOrigin, TypeBindingRole, TypeExpression, Warning, WarningCode,
 };
 pub mod domain;
 pub use domain::{PackagePatternMatch, PackageSearchCandidate};
@@ -196,6 +196,18 @@ pub struct Config {
     pub max_response: usize,
     /// Most UTF-8 bytes one source payload carries, also bounded by capabilities.
     pub max_source: usize,
+    /// Most original symbol records in one relationship page.
+    pub max_symbols: usize,
+    /// Most original source units in one relationship page.
+    pub max_sources: usize,
+    /// Most subjects in one relationship request.
+    pub max_seeds: usize,
+    /// Most selected facets in one relationship request.
+    pub max_facets: usize,
+    /// Most relationship projections in one relationship group.
+    pub max_relationships: usize,
+    /// Most occurrence projections in one relationship group.
+    pub max_occurrences: usize,
     /// Local ceiling for capability cache lifetime.
     pub capabilities_ttl: Duration,
     /// Local ceiling for package resolution cache lifetime.
@@ -218,6 +230,14 @@ impl Default for Config {
             max_request: REQUEST_BODY_BYTES_MAX,
             max_response: RESPONSE_BODY_BYTES_MAX,
             max_source: SOURCE_BYTES_MAX,
+            max_symbols: usize::from(rift_protocol::configuration::GLOBAL_SYMBOLS_DEFAULT),
+            max_sources: usize::from(rift_protocol::configuration::GLOBAL_SOURCES_DEFAULT),
+            max_seeds: usize::from(rift_protocol::configuration::GLOBAL_SEEDS_DEFAULT),
+            max_facets: usize::from(rift_protocol::configuration::GLOBAL_FACETS_DEFAULT),
+            max_relationships: usize::from(
+                rift_protocol::configuration::GLOBAL_RELATIONSHIPS_DEFAULT,
+            ),
+            max_occurrences: usize::from(rift_protocol::configuration::GLOBAL_OCCURRENCES_DEFAULT),
             capabilities_ttl: Duration::from_mins(15),
             resolution_ttl: Duration::from_mins(15),
             failure_ttl: Duration::from_secs(30),
@@ -254,6 +274,32 @@ impl TryFrom<&rift_protocol::configuration::GlobalConfiguration> for Config {
             })?,
             max_source: usize::try_from(value.max_source.bytes()).map_err(|source| {
                 failure::configuration_source("max_source", "outside configured bounds", source)
+            })?,
+            max_symbols: usize::try_from(value.max_symbols).map_err(|source| {
+                failure::configuration_source("max_symbols", "outside configured bounds", source)
+            })?,
+            max_sources: usize::try_from(value.max_sources).map_err(|source| {
+                failure::configuration_source("max_sources", "outside configured bounds", source)
+            })?,
+            max_seeds: usize::try_from(value.max_seeds).map_err(|source| {
+                failure::configuration_source("max_seeds", "outside configured bounds", source)
+            })?,
+            max_facets: usize::try_from(value.max_facets).map_err(|source| {
+                failure::configuration_source("max_facets", "outside configured bounds", source)
+            })?,
+            max_relationships: usize::try_from(value.max_relationships).map_err(|source| {
+                failure::configuration_source(
+                    "max_relationships",
+                    "outside configured bounds",
+                    source,
+                )
+            })?,
+            max_occurrences: usize::try_from(value.max_occurrences).map_err(|source| {
+                failure::configuration_source(
+                    "max_occurrences",
+                    "outside configured bounds",
+                    source,
+                )
             })?,
             capabilities_ttl: Duration::from_millis(value.capabilities_ttl.milliseconds()),
             resolution_ttl: Duration::from_millis(value.resolution_ttl.milliseconds()),
@@ -953,7 +999,10 @@ impl GlobalClient {
                 let exact_outcome = operation == contract::Endpoint::Symbols
                     && response.status == StatusCode::SERVICE_UNAVAILABLE
                     && is_media(&response.meta, "application/json");
-                if !exact_outcome && should_retry(response.status, attempt, attempts) {
+                if !exact_outcome
+                    && !terminal_search_outcome(operation, &response)
+                    && should_retry(response.status, attempt, attempts)
+                {
                     rift_tracing::debug!(
                         operation = operation.operation_id(),
                         attempt,
@@ -1001,7 +1050,8 @@ impl GlobalClient {
             .inner
             .http
             .request(method, url)
-            .header(ACCEPT, "application/json, application/problem+json");
+            .header(ACCEPT, "application/json, application/problem+json")
+            .header("rift-api-version", "2");
         if self.inner.config.telemetry.disabled().await {
             request = request.header(reqwest::header::DNT, "1");
         }
@@ -2074,7 +2124,7 @@ fn validate_search_page(
                         None,
                     ));
                 }
-                let qualified_name = validate_hit_common(
+                validate_canonical_hit(
                     &hit.package,
                     &hit.symbol,
                     HitLocation {
@@ -2086,7 +2136,7 @@ fn validate_search_page(
                     selection,
                     smaller_bound(capabilities.bounds.source_bytes_max, source_bytes_max),
                 )?;
-                validate_search_match_class(request, hit, &qualified_name)?;
+                validate_search_match_class(request, hit)?;
             }
             PackageSearchItem::Documentation(hit) => validate_search_documentation_hit(
                 request,
@@ -2328,17 +2378,6 @@ struct HitLocation<'a> {
     source: Option<&'a str>,
 }
 
-fn validate_hit_common(
-    package: &PackageIdentity,
-    symbol: &Symbol,
-    location: HitLocation<'_>,
-    packages: Option<&HashSet<(String, String, String, String)>>,
-    source_bytes_max: usize,
-) -> Result<String, RiftError> {
-    let source_path = validate_hit_fields(package, symbol, location, packages, source_bytes_max)?;
-    validate_symbol_identity(symbol, package, &source_path)
-}
-
 fn validate_canonical_hit(
     package: &PackageIdentity,
     symbol: &Symbol,
@@ -2382,10 +2421,10 @@ fn validate_hit_fields(
     location: HitLocation<'_>,
     packages: Option<&HashSet<(String, String, String, String)>>,
     source_bytes_max: usize,
-) -> Result<String, RiftError> {
+) -> Result<(), RiftError> {
     validate_package_identity(package).map_err(|source| {
         failure::response_source(
-            "validate_hit_common",
+            "validate_hit_fields",
             "package",
             "field failed validation",
             None,
@@ -2394,7 +2433,7 @@ fn validate_hit_fields(
     })?;
     if packages.is_some_and(|packages| !packages.contains(&package_key(package))) {
         return Err(failure::response_invalid(
-            "validate_hit_common",
+            "validate_hit_fields",
             "package",
             "field failed validation",
             None,
@@ -2402,7 +2441,7 @@ fn validate_hit_fields(
     }
     if location.line < 1 || location.range.end < location.range.start {
         return Err(failure::response_invalid(
-            "validate_hit_common",
+            "validate_hit_fields",
             "location",
             "field failed validation",
             None,
@@ -2413,16 +2452,16 @@ fn validate_hit_fields(
         .is_some_and(|value| value.len() > source_bytes_max)
     {
         return Err(failure::response_invalid(
-            "validate_hit_common",
+            "validate_hit_fields",
             "source",
             "field failed validation",
             None,
         ));
     }
-    let source_path = package_source_path(package, location.unit)?;
+    package_source_path(package, location.unit)?;
     let Some(origin) = symbol.origin.as_ref() else {
         return Err(failure::response_invalid(
-            "validate_hit_common",
+            "validate_hit_fields",
             "origin",
             "field failed validation",
             None,
@@ -2432,13 +2471,13 @@ fn validate_hit_fields(
         || origin.package.as_ref() != Some(package)
     {
         return Err(failure::response_invalid(
-            "validate_hit_common",
+            "validate_hit_fields",
             "origin",
             "field failed validation",
             None,
         ));
     }
-    Ok(source_path)
+    Ok(())
 }
 
 /// The package-relative path of `unit`, after its exact defining registry owner is validated.
@@ -2475,86 +2514,19 @@ fn package_source_path(package: &PackageIdentity, unit: &str) -> Result<String, 
     Ok(unit.key().as_str().to_owned())
 }
 
-/// Checks that a package hit's symbol identity is the one its unit mints, and returns its
-/// qualified name.
-///
-/// Package analysis mints a package declaration's identity over its package and path,
-/// `<manager>/<name>/<path>`, as `rift://symbol/rust/cargo/beacon/src/lib.rs/serve` for the
-/// path `src/lib.rs`; the identity names no release. No producer mints the spelling over the
-/// package-relative path alone, `rift://symbol/rust/src/lib.rs/serve`, for a package
-/// declaration: it names a project file, and the client refuses it.
-fn validate_symbol_identity(
-    symbol: &Symbol,
-    package: &PackageIdentity,
-    source_path: &str,
-) -> Result<String, RiftError> {
-    let id = symbol.id.as_deref().ok_or(failure::response_invalid(
-        "validate_symbol_identity",
-        "symbol_identity",
-        "field failed validation",
-        None,
-    ))?;
-    if id.len() > 8_192 || rift_core::SymbolId::new(id).is_err() {
-        return Err(failure::response_invalid(
-            "validate_symbol_identity",
-            "symbol_identity",
-            "field failed validation",
-            None,
-        ));
-    }
-    let address = id
-        .strip_prefix("rift://symbol/")
-        .ok_or(failure::response_invalid(
-            "validate_symbol_identity",
-            "symbol_identity",
-            "field failed validation",
-            None,
-        ))?;
-    let (language, remainder) = address.split_once('/').ok_or(failure::response_invalid(
-        "validate_symbol_identity",
-        "symbol_identity",
-        "field failed validation",
-        None,
-    ))?;
-    if language != symbol.language
-        || rift_protocol::read::Language::from_identity_segment(language).is_err()
+fn validate_ranked_qualified_name(name: &str) -> Result<(), RiftError> {
+    if name.is_empty()
+        || name.len() > rift_protocol::identity::SYMBOL_ID_BYTES_MAX
+        || name.chars().any(char::is_control)
     {
         return Err(failure::response_invalid(
-            "validate_symbol_identity",
-            "symbol_identity",
+            "validate_search_page",
+            "qualified_name",
             "field failed validation",
             None,
         ));
     }
-    let (_, encoded_qualified_name) =
-        remainder.rsplit_once('/').ok_or(failure::response_invalid(
-            "validate_symbol_identity",
-            "symbol_identity",
-            "field failed validation",
-            None,
-        ))?;
-    let qualified_name = percent_decode_str(encoded_qualified_name)
-        .decode_utf8()
-        .map_err(|source| {
-            failure::response_source(
-                "validate_symbol_identity",
-                "symbol_identity",
-                "field failed validation",
-                None,
-                source,
-            )
-        })?;
-    let unit_path = format!("{}/{}/{source_path}", package.manager, package.name);
-    let minted = rift_core::symbol_identity(language, &unit_path, &qualified_name) == id;
-    if qualified_name.is_empty() || !minted {
-        return Err(failure::response_invalid(
-            "validate_symbol_identity",
-            "symbol_identity",
-            "field failed validation",
-            None,
-        ));
-    }
-    Ok(qualified_name.into_owned())
+    Ok(())
 }
 
 /// Checks a search hit's class against the request's identifiers. A hit reporting `unknown`,
@@ -2563,8 +2535,8 @@ fn validate_symbol_identity(
 fn validate_search_match_class(
     request: &PackageSearchRequest,
     hit: &PackageSearchHit,
-    qualified_name: &str,
 ) -> Result<(), RiftError> {
+    validate_ranked_qualified_name(&hit.qualified_name)?;
     let claimed = search_match_class(&hit.match_class)?;
     let expected = request
         .identifiers
@@ -2572,7 +2544,7 @@ fn validate_search_match_class(
         .unwrap_or_default()
         .iter()
         .filter_map(|candidate| {
-            rift_ranking::identifier_match(candidate, &hit.symbol.name, qualified_name)
+            rift_ranking::identifier_match(candidate, &hit.symbol.name, &hit.qualified_name)
         })
         .min()
         .map(rift_ranking::IdentifierMatch::class);
@@ -2812,6 +2784,18 @@ fn search_hit_identity(hit: &PackageSearchItem) -> Result<String, RiftError> {
 }
 
 fn validate_config(config: &Config) -> Result<(), RiftError> {
+    for (field, value) in [
+        ("max_symbols", config.max_symbols),
+        ("max_sources", config.max_sources),
+        ("max_seeds", config.max_seeds),
+        ("max_facets", config.max_facets),
+        ("max_relationships", config.max_relationships),
+        ("max_occurrences", config.max_occurrences),
+    ] {
+        if value == 0 {
+            return Err(failure::configuration_invalid(field, "must be positive"));
+        }
+    }
     for (field, value, maximum) in [
         (
             "max_request",
@@ -3031,6 +3015,23 @@ fn is_media(meta: &ResponseMeta, expected: &str) -> bool {
         .and_then(|value| value.split(';').next())
         .is_some_and(|value| value.trim().eq_ignore_ascii_case(expected))
 }
+fn terminal_search_outcome(operation: contract::Endpoint, response: &RawResponse) -> bool {
+    if operation != contract::Endpoint::Search || response.status != StatusCode::SERVICE_UNAVAILABLE
+    {
+        return false;
+    }
+    if is_media(&response.meta, "application/json") {
+        return serde_json::from_slice::<rift_protocol::search_read::SearchUnavailable>(
+            &response.body,
+        )
+        .is_ok();
+    }
+    is_media(&response.meta, "application/problem+json")
+        && serde_json::from_slice::<ProblemDetails>(&response.body).is_ok_and(|problem| {
+            failure::unsupported_operation(operation.operation_id(), &response.meta, Some(&problem))
+        })
+}
+
 fn should_retry(status: StatusCode, attempt: u32, attempts: u32) -> bool {
     attempt < attempts
         && (status == StatusCode::TOO_MANY_REQUESTS

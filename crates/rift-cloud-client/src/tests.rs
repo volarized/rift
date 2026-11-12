@@ -48,6 +48,7 @@ mod cache;
 mod collection;
 mod declaration;
 mod documentation;
+mod exact_runtime;
 mod nodes;
 mod pages;
 mod pattern;
@@ -84,6 +85,20 @@ enum FixtureMode {
 
 #[derive(Clone)]
 enum OperationFixture {
+    RelationshipRefusal {
+        value: serde_json::Value,
+        problem: bool,
+    },
+    Relationships {
+        pages: Vec<serde_json::Value>,
+        advertised: bool,
+    },
+    RelationshipBounds {
+        pages: Vec<serde_json::Value>,
+        bounds: rift_protocol::relationship_read::RelationshipBounds,
+        page_limit_min: i64,
+        page_limit_max: i64,
+    },
     Valid,
     ExactSymbol(serde_json::Value),
     SourceDeclarations(serde_json::Value, StatusCode),
@@ -149,6 +164,7 @@ struct FixtureState {
 
 #[derive(Debug, Eq, PartialEq)]
 struct CapturedRequest {
+    api_version: Option<String>,
     method: Method,
     path: String,
     query: Option<String>,
@@ -238,6 +254,11 @@ async fn fixture_handler(
     *state.last_path.lock().await = Some(path.clone());
     *state.last_query.lock().await = query.clone();
     state.request_log.lock().await.push(CapturedRequest {
+        api_version: parts
+            .headers
+            .get("rift-api-version")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
         method: parts.method,
         path: path.clone(),
         query: query.clone(),
@@ -453,6 +474,25 @@ const PATTERN_PAGE_LIMIT_ADVERTISED: i64 = 200;
 
 fn operation_capabilities_response(mode: &OperationFixture) -> Response {
     capabilities_response_with(|value| match mode {
+        OperationFixture::Relationships {
+            advertised: true, ..
+        }
+        | OperationFixture::RelationshipBounds { .. }
+        | OperationFixture::RelationshipRefusal { .. } => {
+            value["supported_features"] =
+                serde_json::json!(["resolutions", "search", "symbols", "relationships"]);
+            value["relationship_capabilities"] = operation_relationship_capabilities(mode);
+            if let OperationFixture::RelationshipBounds {
+                page_limit_min,
+                page_limit_max,
+                ..
+            } = mode
+            {
+                value["bounds"]["page_limit_min"] = serde_json::json!(page_limit_min);
+                value["bounds"]["page_limit_max"] = serde_json::json!(page_limit_max);
+                value["bounds"]["page_limit_default"] = serde_json::json!(page_limit_max);
+            }
+        }
         OperationFixture::Documentation { .. } | OperationFixture::DocumentationBounds { .. } => {
             value["supported_features"] = serde_json::json!([
                 "resolutions",
@@ -535,6 +575,25 @@ fn operation_capabilities_response(mode: &OperationFixture) -> Response {
     })
 }
 
+fn operation_relationship_capabilities(mode: &OperationFixture) -> serde_json::Value {
+    let mut operations = serde_json::json!([
+        {"direction":"outgoing","facets":["calls"],"bounds":{
+            "max_seeds":64,"max_facets":16,"max_relationships":1000,
+            "max_occurrences":1000,"max_symbols":10000,"max_sources":10000
+        }},
+        {"direction":"incoming","facets":["references"],"bounds":{
+            "max_seeds":64,"max_facets":16,"max_relationships":1000,
+            "max_occurrences":1000,"max_symbols":10000,"max_sources":10000
+        }}
+    ]);
+    if let OperationFixture::RelationshipBounds { bounds, .. } = mode {
+        for operation in operations.as_array_mut().expect("fixture operations") {
+            operation["bounds"] = serde_json::to_value(bounds).expect("fixture count bounds");
+        }
+    }
+    operations
+}
+
 fn operation_resolution_response(mode: &OperationFixture, request_body: &[u8]) -> Response {
     if matches!(mode, OperationFixture::EchoResolution) {
         let request: serde_json::Value =
@@ -594,6 +653,29 @@ fn operation_search_response(
     query: Option<&str>,
     request_number: usize,
 ) -> Response {
+    if let OperationFixture::RelationshipRefusal { value, problem } = mode {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(
+                header::CONTENT_TYPE,
+                if *problem {
+                    "application/problem+json"
+                } else {
+                    "application/json"
+                },
+            )],
+            Body::from(value.to_string()),
+        )
+            .into_response();
+    }
+    if let OperationFixture::Relationships { pages, .. }
+    | OperationFixture::RelationshipBounds { pages, .. } = mode
+    {
+        let index = query_cursor(query)
+            .and_then(|cursor| cursor.parse::<usize>().ok())
+            .unwrap_or(0);
+        return json_response(pages.get(index).unwrap_or(&serde_json::Value::Null), None);
+    }
     if matches!(mode, OperationFixture::PartialFailure) && request_number > 1 {
         return problem_response(StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -753,7 +835,7 @@ fn package_json(name: &str) -> serde_json::Value {
 
 fn symbol_json(package: &str, suffix: &str) -> serde_json::Value {
     serde_json::json!({
-        "id":format!("rift://symbol/rust/cargo/{package}/src/{suffix}.rs/demo"),
+        "id":format!("rift://symbol/cargo/crates.io/{package}/rust/{package}/{suffix}/demo"),
         "kind":"function",
         "language":"rust",
         "name":"demo",
@@ -763,7 +845,7 @@ fn symbol_json(package: &str, suffix: &str) -> serde_json::Value {
 
 fn search_hit_json(package: &str, suffix: &str) -> serde_json::Value {
     serde_json::json!({
-        "package":package_json(package), "symbol":symbol_json(package, suffix),
+        "package":package_json(package), "symbol":symbol_json(package, suffix), "qualified_name":"demo",
         "unit":format!("rift://source/cargo/crates.io/{package}/src/{suffix}.rs"), "range":{"start":0,"end":4}, "line":1,
         "contributing_fields":["qualified_name"], "match_class":"qualified_exact"
     })
@@ -2702,14 +2784,14 @@ fn test_search_match_class_uses_original_spelling_before_class() {
     request.query = Some("module::searchhit SearchHit".to_owned());
     let mut value = search_hit_json("demo", "first");
     value["symbol"]["name"] = serde_json::json!("SearchHit");
+    value["qualified_name"] = serde_json::json!("Module::SearchHit");
     value["match_class"] = serde_json::json!("name_exact");
     let hit: PackageSearchHit = serde_json::from_value(value).expect("search hit fixture");
     request.identifiers = Some(vec!["module::searchhit".to_owned(), "SearchHit".to_owned()]);
-    assert!((super::validate_search_match_class(&request, &hit, "Module::SearchHit")).is_ok());
+    assert!((super::validate_search_match_class(&request, &hit)).is_ok());
     request.identifiers = Some(Vec::new());
     assert_registered_field(
-        &(super::validate_search_match_class(&request, &hit, "Module::SearchHit"))
-            .expect_err("registered refusal"),
+        &(super::validate_search_match_class(&request, &hit)).expect_err("registered refusal"),
         "rift.client.response_invalid",
         "match_class",
     );
@@ -2784,10 +2866,7 @@ async fn test_symbol_lookup_refuses_discovery_match_class() {
     );
 }
 
-/// Package analysis mints a package declaration's identity over its package and path, so
-/// a hit carries `rift://symbol/rust/cargo/demo/src/first.rs/demo` beside the unit
-/// `rift://source/cargo/crates.io/demo/src/first.rs`. The package-relative spelling names a
-/// project file, and no producer mints it for a package declaration, so it is refused.
+/// A flat ranked declaration keeps its canonical owner independently of its source path.
 #[tokio::test]
 async fn test_hits_accept_the_symbol_identity_package_analysis_mints() {
     let hit = |id: &str| {
@@ -2795,15 +2874,15 @@ async fn test_hits_accept_the_symbol_identity_package_analysis_mints() {
         value["symbol"]["id"] = serde_json::json!(id);
         serde_json::from_value::<PackageSearchHit>(value).expect("search hit fixture")
     };
-    let minted = rift_core::symbol_identity("rust", "cargo/demo/src/first.rs", "demo");
-    let candidate = PackageSearchCandidate::try_from(&hit(&minted));
+    let minted = "rift://symbol/cargo/crates.io/demo/rust/demo/surface/demo";
+    let candidate = PackageSearchCandidate::try_from(&hit(minted));
     assert!(candidate.is_ok(), "{minted}: {candidate:?}");
     let refused = [
-        "rift://symbol/rust/src/first.rs/demo",
-        "rift://symbol/rust/cargo/other/src/first.rs/demo",
-        "rift://symbol/rust/npm/demo/src/first.rs/demo",
-        "rift://symbol/rust/cargo/demo/src/second.rs/demo",
-        "rift://symbol/rust/cargo/demo/demo",
+        "rift://symbol/local/rust/demo/demo",
+        "rift://symbol/cargo/crates.io/other/rust/demo/demo",
+        "rift://symbol/npm/npmjs.org/demo/typescript/demo/demo",
+        "rift://symbol/cargo/crates.io/demo/python/demo/demo",
+        "rift://symbol/rust/cargo/demo/src/first.rs/demo",
     ];
     for id in refused {
         let error = PackageSearchCandidate::try_from(&hit(id)).expect_err("identity refusal");
@@ -3077,3 +3156,6 @@ fn generated_exact_symbol_shapes_keep_shared_requests_and_typed_outcomes() {
         .is_err()
     );
 }
+
+#[path = "relationships/tests.rs"]
+mod relationships;

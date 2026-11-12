@@ -1,8 +1,11 @@
+use rift_core::SourceUnitId;
 use rift_error::RiftError;
 
 use rift_protocol::{
     identity::{SymbolIdentity, SymbolOwner},
-    read::{GetSymbolInclude, PAGE_LIMIT_MAX, SourceKind, SourceLocationKind, SymbolOrigin},
+    read::{
+        GetSymbolInclude, Language, PAGE_LIMIT_MAX, SourceKind, SourceLocationKind, SymbolOrigin,
+    },
     symbol_read::{GetSymbolParams, GetSymbolResult},
 };
 
@@ -171,9 +174,17 @@ fn valid_result(
                         && symbol.origin.runtime.is_none()))
                 && declarations.iter().all(|declaration| {
                     declaration.unit.as_ref().is_some_and(|unit| {
-                        rift_core::SourceUnitId::parse(&unit.0)
-                            .is_ok_and(|unit| unit.source_owner() == Some(owner))
-                    }) && valid_origin(&declaration.origin, owner, version)
+                        SourceUnitId::parse(unit.as_str()).is_ok_and(|unit| {
+                            (unit.source_owner() == Some(owner)
+                                && valid_origin(&declaration.origin, owner, version))
+                                || (typeshed_stdlib_unit(&unit, owner, identity.language())
+                                    && declaration.origin.location
+                                        == Some(SourceLocationKind::External)
+                                    && declaration.origin.source_kind == SourceKind::Authored
+                                    && declaration.origin.package.is_none()
+                                    && declaration.origin.runtime.is_none())
+                        })
+                    })
                 })
                 && (history.is_none() || request.include.contains(&GetSymbolInclude::History))
                 && documentation.as_ref().is_none_or(|context| {
@@ -190,8 +201,41 @@ fn valid_result(
     }
 }
 
+/// A pinned Typeshed standard-library stub that can declare a Python runtime symbol.
+pub(crate) fn typeshed_stdlib_unit(
+    unit: &SourceUnitId,
+    owner: &SymbolOwner,
+    language: &Language,
+) -> bool {
+    if !matches!(owner, SymbolOwner::Runtime { runtime } if runtime == "cpython")
+        || language.name != "python"
+        || language.dialect.is_some()
+        || unit.resolver().as_str() != "external"
+    {
+        return false;
+    }
+    let Some((commit, stub)) = unit.key().as_str().split_once('/') else {
+        return false;
+    };
+    commit.strip_prefix("typeshed-").is_some_and(|pin| {
+        pin.len() == 40
+            && pin
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    }) && stub.strip_prefix("stdlib/").is_some_and(|path| {
+        path.rsplit('/')
+            .next()
+            .and_then(|file| file.strip_suffix(".pyi"))
+            .is_some_and(|name| !name.is_empty())
+    })
+}
+
 /// Whether `origin` names `owner` at the answered release `version`.
-fn valid_origin(origin: &SymbolOrigin, owner: &SymbolOwner, version: Option<&str>) -> bool {
+pub(crate) fn valid_origin(
+    origin: &SymbolOrigin,
+    owner: &SymbolOwner,
+    version: Option<&str>,
+) -> bool {
     if origin.source_kind == SourceKind::Synthetic {
         return false;
     }

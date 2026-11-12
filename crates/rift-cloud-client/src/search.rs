@@ -164,7 +164,8 @@ mod tests {
                 "name": "parse", "kind": "function"},
             "unit": "rift://source/cargo/crates.io/demo/src/lib.rs",
             "range": {"start": 0, "end": 4}, "line": 1,
-            "contributing_fields": ["qualified_name"], "match_class": "qualified_exact"
+            "contributing_fields": ["qualified_name"], "match_class": "qualified_exact",
+            "qualified_name": "demo"
         });
         let legacy: crate::generated::PackageSearchHit =
             serde_json::from_value(value.clone()).expect("legacy fixture");

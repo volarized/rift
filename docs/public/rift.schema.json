@@ -717,11 +717,32 @@
             "min": "1s"
           }
         },
+        "max_facets": {
+          "default": 16,
+          "description": "Most selected facets in one global relationship request.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
         "max_in_flight": {
           "default": 4,
           "description": "Global API requests running at once, 1 to 32.",
           "format": "uint64",
           "maximum": 32,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_occurrences": {
+          "default": 1000,
+          "description": "Most occurrence projections in one global relationship group.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_relationships": {
+          "default": 1000,
+          "description": "Most relationship projections in one global relationship group.",
+          "format": "uint64",
           "minimum": 1,
           "type": "integer"
         },
@@ -743,6 +764,13 @@
             "min": "1b"
           }
         },
+        "max_seeds": {
+          "default": 64,
+          "description": "Most subjects in one global relationship request.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
         "max_source": {
           "$ref": "#/$defs/ByteSize",
           "default": "1mb",
@@ -751,6 +779,20 @@
             "max": "64mb",
             "min": "1b"
           }
+        },
+        "max_sources": {
+          "default": 10000,
+          "description": "Most original source units in one global relationship page.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_symbols": {
+          "default": 10000,
+          "description": "Most original symbol records in one global relationship page.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
         },
         "request_timeout": {
           "$ref": "#/$defs/Duration",
@@ -2279,10 +2321,16 @@
         "enabled": true,
         "endpoint": "https://api.volar.sh/rift/rest",
         "failure_ttl": "30s",
+        "max_facets": 16,
         "max_in_flight": 4,
+        "max_occurrences": 1000,
+        "max_relationships": 1000,
         "max_request": "4mb",
         "max_response": "32mb",
+        "max_seeds": 64,
         "max_source": "1mb",
+        "max_sources": 10000,
+        "max_symbols": 10000,
         "request_timeout": "15s",
         "resolution_ttl": "15m",
         "token_env": "RIFT_API_TOKEN"
