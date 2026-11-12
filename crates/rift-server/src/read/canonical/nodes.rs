@@ -1,10 +1,9 @@
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::SystemTime;
 
 use rift_error::RiftError;
 use rift_protocol::identity::SymbolOwner;
-use rift_protocol::read::{Extensions, Node, NodesParams, NodesResult, SymbolId};
+use rift_protocol::read::{NodesParams, NodesResult};
 use rift_protocol::symbol_read::{CapturedView, CapturedViewId, SymbolUnavailableReason};
 
 use super::{CapturedMetadata, LocalSymbolMaterial, LocalSymbolViews, invalid, material_error};
@@ -58,31 +57,24 @@ impl LocalSymbolMaterial {
                 "position must be inside captured source",
             ));
         }
-        let Some(matched) = self.index.nodes(&path, request.position)? else {
+        let Some(document) = self.index.syntax(&path)? else {
             return Ok(Err(SymbolUnavailableReason::InsufficientCoverage));
         };
         let metadata: CapturedMetadata = serde_json::from_slice(&self.metadata)
             .map_err(|error| material_error("decode captured metadata", &error))?;
+        let declarations: Vec<_> = (0..document.symbols().len())
+            .map(|position| {
+                self.index
+                    .declaration_address(&path, position)
+                    .map(|(identity, ordinal)| (identity.clone(), ordinal))
+            })
+            .collect();
+        let (matched, places) =
+            super::super::covering_nodes(&document, &declarations, request.position);
         let nodes = matched
             .iter()
-            .map(|node| {
-                let language = file.syntax().language();
-                Node {
-                    id: super::super::node_id(file, node.range),
-                    symbol: self
-                        .index
-                        .symbol_identity(&path, node.range)
-                        .map(|identity| SymbolId(identity.as_str().to_owned())),
-                    unit: super::super::file_id(file.path()),
-                    language: language.clone(),
-                    kind: super::super::wire_kind(node.kind),
-                    facets: super::super::language_provider(language).node_facets(node.kind),
-                    range: super::super::text_range(node.range),
-                    regions: Vec::new(),
-                    parent: None,
-                    extensions: Extensions(BTreeMap::new()),
-                }
-            })
+            .zip(places)
+            .map(|(node, place)| super::super::wire_node(file, node, place, &declarations))
             .collect();
         let source = matched
             .iter()

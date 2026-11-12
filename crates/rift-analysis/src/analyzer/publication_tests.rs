@@ -174,7 +174,7 @@ fn same_module_keeps_implementation_and_stub_bindings_on_one_object() {
         &["click"],
     );
     let id = "rift://symbol/pypi/pypi.org/click@8.3.3/python/click/core/echo";
-    assert_eq!(result.format_revision, 3);
+    assert_eq!(result.format_revision, 4);
     assert_eq!(
         result.identity_format,
         rift_protocol::identity::SYMBOL_IDENTITY_FORMAT_REVISION

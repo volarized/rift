@@ -1711,13 +1711,11 @@ pub(crate) fn find_symbol_hit_mut<'a>(
         .find(|hit| hit_symbol_id(hit) == Some(&identity)))
 }
 
-/// One hit's declaration identity: absent for a node, file, documentation, or commit
-/// hit, and for a symbol hit whose identity no accepted evidence established.
+/// One hit's declaration identity: absent for a file, documentation, or commit hit, and for a symbol hit whose identity no accepted evidence established.
 pub(crate) fn hit_symbol_id(hit: &SearchHit) -> Option<&SymbolId> {
     match &hit.hit {
         SearchHitTarget::Symbol { symbol } => symbol.id.as_ref(),
-        SearchHitTarget::Node { .. }
-        | SearchHitTarget::File { .. }
+        SearchHitTarget::File { .. }
         | SearchHitTarget::Documentation { .. }
         | SearchHitTarget::Commit { .. } => None,
     }
@@ -1877,7 +1875,6 @@ fn hit_identity(hit: &SearchHit) -> &str {
         // Every file hit is built with its project path set; the empty fallback
         // only orders a hit no constructor in this crate produces.
         SearchHitTarget::File { .. } => hit.path.as_ref().map_or("", |path| path.0.as_str()),
-        SearchHitTarget::Node { node } => node.0.as_str(),
         SearchHitTarget::Documentation { documentation } => &documentation.block.identity.0,
         SearchHitTarget::Commit { commit } => commit.revision.0.as_str(),
     }
@@ -1893,8 +1890,8 @@ mod tests {
     use rift_index::{LexicalIndexLimits, WorkspaceIndexLimits};
     use rift_protocol::configuration::{HistoryConfiguration, RankingConfiguration};
     use rift_protocol::read::{
-        MatchedField, NodeId, ReadWarning, ResultOrder, SearchParams, SearchParamsTarget,
-        SearchResult, SourceUnitId,
+        MatchedField, ReadWarning, ResultOrder, SearchParams, SearchParamsTarget, SearchResult,
+        SourceUnitId,
     };
     use rift_ranking::{
         DocumentIdentity, DocumentKind, FieldSet, PARSED_QUERY_MEMBERS_MAX, ParsedQuery,
@@ -4820,25 +4817,21 @@ impl Tower {
 
     /// `order: "path"` groups by project path, breaking a tie - two hits at the same path -
     /// on the hit's own wire identity, the same tie-break `relevance` uses. A file hit's
-    /// own identity is its `path`, so two file hits can never tie this way; a node hit's
-    /// identity is its own witnessed id, distinct from the path it also carries, so this
-    /// proves the tie-break through node hits instead.
+    /// own identity is its `path`, so two file hits can never tie this way; a commit hit's
+    /// identity is its revision, distinct from any path it carries, so this proves the
+    /// tie-break through commit hits instead.
     #[test]
     fn order_hits_path_sorts_by_path_then_breaks_ties_on_identity() {
         let mut hits = vec![
-            node_hit_stub_with_path("rift://node/rust/z.rs@0-1#00000000", Some("z.rs"), 0.9),
-            node_hit_stub_with_path("rift://node/rust/a.rs@0-1#00000002", Some("a.rs"), 0.1),
-            node_hit_stub_with_path("rift://node/rust/a.rs@0-1#00000001", Some("a.rs"), 0.5),
+            commit_hit_stub("9c1d4e70", Some("z.rs"), None, 0.9),
+            commit_hit_stub("9c1d4e72", Some("a.rs"), None, 0.1),
+            commit_hit_stub("9c1d4e71", Some("a.rs"), None, 0.5),
         ];
         super::order_hits(&mut hits, ResultOrder::Path);
         let ids: Vec<&str> = hits.iter().map(super::hit_identity).collect();
         assert_eq!(
             ids,
-            [
-                "rift://node/rust/a.rs@0-1#00000001",
-                "rift://node/rust/a.rs@0-1#00000002",
-                "rift://node/rust/z.rs@0-1#00000000",
-            ],
+            ["9c1d4e71", "9c1d4e72", "9c1d4e70"],
             "path order groups by path; two hits at the same path break the tie on identity"
         );
     }
@@ -4855,53 +4848,33 @@ impl Tower {
         assert_eq!(ids, ["rift://file/a.rs", "rift://file/z.rs"]);
     }
 
-    fn node_hit_stub(id: &str, score: f64) -> SearchHit {
-        node_hit_stub_with_path(id, None, score)
-    }
-
-    fn node_hit_stub_with_path(id: &str, path: Option<&str>, score: f64) -> SearchHit {
-        SearchHit {
-            view: None,
-            hit: SearchHitTarget::Node {
-                node: NodeId(id.to_owned()),
-            },
-            score: Some(score),
-            matched_by: vec![MatchedField::Content],
-            source: None,
-            range: None,
-            line: None,
-            path: path.map(|path| rift_protocol::read::ProjectPath(path.to_owned())),
-            unit: None,
-            traversal_path: None,
-            distance: None,
-            change: None,
-        }
-    }
-
-    /// A node hit addressed by `unit` alone, the location shape a dependency hit takes.
-    fn node_hit_stub_with_unit(id: &str, unit: &str, score: f64) -> SearchHit {
-        let mut hit = node_hit_stub(id, score);
-        hit.unit = Some(SourceUnitId(unit.to_owned()));
-        hit
-    }
-
-    /// `hit_identity`'s `Node` arm never runs through the live `search` path - a `target:
-    /// "node"` request is refused before any hit is ever built - so this proves the arm
-    /// directly: a `Node` hit tied in score with a `File` hit still breaks the tie on the
-    /// node's own wire id, exactly as the `File` and `Symbol` arms already do.
-    #[test]
-    fn hit_identity_uses_the_node_id_as_tiebreak() {
-        let mut results = vec![
-            file_hit_stub("rift://file/z.rs", 0.5),
-            node_hit_stub("rift://node/rust/lib.rs@0-1#00000000", 0.5),
-        ];
-        super::order_hits(&mut results, ResultOrder::Relevance);
-        let ids: Vec<&str> = results.iter().map(super::hit_identity).collect();
-        // "rift://file/..." sorts before "rift://node/..." lexicographically ('f' < 'n').
-        assert_eq!(
-            ids,
-            ["rift://file/z.rs", "rift://node/rust/lib.rs@0-1#00000000",]
-        );
+    /// A commit hit whose identity is `revision`, placed at `path` or `unit` so an ordering
+    /// test can tie two hits on place and part them on identity.
+    fn commit_hit_stub(
+        revision: &str,
+        path: Option<&str>,
+        unit: Option<&str>,
+        score: f64,
+    ) -> SearchHit {
+        serde_json::from_value(serde_json::json!({
+            "hit": {"target": "commit", "commit": {
+                "revision": revision,
+                "message": "Bound comparisons\n",
+                "message_truncated": false,
+                "author": {"name": "Alice", "email": "alice@example.com"},
+                "timestamp": "2026-09-22T14:03:11+02:00",
+                "paths": [],
+                "paths_truncated": false
+            }},
+            "score": score,
+            "matched_by": ["content"],
+            "path": path
+        }))
+        .map(|mut hit: SearchHit| {
+            hit.unit = unit.map(|unit| SourceUnitId(unit.to_owned()));
+            hit
+        })
+        .expect("a commit hit stub")
     }
 
     /// `path` order lists every project path before any unit, then the units in their own
@@ -4909,15 +4882,17 @@ impl Tower {
     #[test]
     fn order_hits_path_lists_project_paths_before_units_and_units_in_unit_order() {
         let mut results = vec![
-            node_hit_stub_with_unit(
-                "rift://node/rust/lib.rs@0-1#00000000",
-                "rift://source/cargo/zeta@1.0.0/src/lib.rs",
+            commit_hit_stub(
+                "9c1d4e70",
+                None,
+                Some("rift://source/cargo/zeta@1.0.0/src/lib.rs"),
                 0.5,
             ),
             file_hit_stub("z.rs", 0.5),
-            node_hit_stub_with_unit(
-                "rift://node/rust/lib.rs@2-3#00000000",
-                "rift://source/cargo/alpha@1.0.0/src/lib.rs",
+            commit_hit_stub(
+                "9c1d4e71",
+                None,
+                Some("rift://source/cargo/alpha@1.0.0/src/lib.rs"),
                 0.5,
             ),
         ];

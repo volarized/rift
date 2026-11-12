@@ -84,9 +84,9 @@ impl GetSize for crate::read::SourceUnitId {
 }
 
 use crate::read::{
-    Documentation, ExactKind, ExtensionKey, Extensions, Language, NodeId, PackageIdentity,
-    Parameter, RuntimeIdentity, Signature, SignatureLink, Symbol, SymbolFacet, SymbolId,
-    SymbolOrigin, TypeBinding, TypeExpression,
+    Documentation, ExactKind, ExtensionKey, Extensions, Language, PackageIdentity, Parameter,
+    RuntimeIdentity, Signature, SignatureLink, Symbol, SymbolFacet, SymbolId, SymbolOrigin,
+    TypeBinding, TypeExpression,
 };
 
 macro_rules! heap_field {
@@ -208,7 +208,6 @@ heap_fields!(
     origin,
     path,
     unit,
-    node,
     source,
     signature_indices,
     type_indices,
@@ -292,7 +291,6 @@ heap_fields!(Language, name, dialect);
 heap_fields!(Documentation, text);
 heap_fields!(ExactKind, 0);
 heap_fields!(SymbolId, 0);
-heap_fields!(NodeId, 0);
 heap_fields!(ExtensionKey, 0);
 heap_fields!(PackageIdentity, manager, registry, name, version);
 heap_fields!(RuntimeIdentity, runtime, version);
@@ -300,7 +298,7 @@ heap_fields!(SymbolOrigin, package, runtime);
 heap_fields!(SignatureLink, symbol);
 heap_fields!(TypeBinding, r#type);
 heap_fields!(TypeExpression, language, source, resolved, extensions);
-heap_fields!(Parameter, name, node, types => vector, default, extensions);
+heap_fields!(Parameter, name, types => vector, default, extensions);
 heap_fields!(
     Signature,
     display,
@@ -510,7 +508,7 @@ pub fn btree_material_bytes<K, V>(len: usize) -> usize {
 }
 
 heap_fields!(crate::read::SourceUnitSpan, unit);
-heap_fields!(crate::read::Relationship, from, kind, facets => vector, to, evidence => vector, occurrence, extensions);
+heap_fields!(crate::read::Relationship, from, kind, facets => vector, to, occurrence, extensions);
 heap_fields!(crate::search::GraphHop, relationship);
 
 impl GetSize for crate::read::RelationshipFacet {
@@ -568,7 +566,6 @@ mod tests {
             kind: ExactKind(kind),
             facets,
             to: SymbolId("rift://symbol/local/rust/app/callee".to_owned()),
-            evidence: vec![NodeId("rift://node/rust/lib.rs@0-12#12345678".to_owned())],
             occurrence: Some(crate::read::SourceUnitSpan {
                 unit: crate::read::SourceUnitId("rift://source/project/src/lib.rs".to_owned()),
                 range: crate::read::TextRange { start: 0, end: 12 },
@@ -700,7 +697,6 @@ mod tests {
             receiver: None,
             parameters: vec![Parameter {
                 name: Some("value".to_owned()),
-                node: None,
                 types: Vec::new(),
                 optional: false,
                 variadic: false,

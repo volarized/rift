@@ -33,7 +33,7 @@ pub use semantic::{
     CONTRIBUTION_NAMESPACES_MAX, Contribution, ContributionBuilder, ContributionKey,
     ContributionOrigin, ContributionReference, ContributionRelationship, ContributionViolation,
     DeclarationBinding, Documentation, DocumentationFormat, EquivalenceEvidence, ExactKind,
-    ExtensionKey, ExtensionValue, Extensions, Language, NodeId, PROVIDER_SYMBOL_ID_BYTES_MAX,
+    ExtensionKey, ExtensionValue, Extensions, Language, PROVIDER_SYMBOL_ID_BYTES_MAX,
     PackageIdentity, PortableSymbolFacts, ReferenceRole, RelationshipKind, SemanticReference,
     Signature, SourceApplicability, SourceKind, SourceLocation, SourceRange, SymbolFacet,
     SymbolRecord, SymbolResolution, TypeBinding, fact_indices, is_portable_name,

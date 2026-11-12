@@ -282,7 +282,7 @@ async fn assert_workspace_symbol_node(
         .max_by_key(|(_, node)| node["range"]["start"].as_u64())
         .ok_or_else(|| format!("{name} declaration node: {output}"))?;
     assert!(
-        node["id"].is_string(),
+        node["index"].is_u64(),
         "source carries node address: {node}"
     );
     assert_eq!(node["language"], case.language, "{node}");

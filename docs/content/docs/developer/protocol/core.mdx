@@ -38,8 +38,13 @@ symbol identities remain separate from these physical addresses.
 
 The key is never a digest. A [`Digest`](/docs/developer/protocol/reference#Digest) reaches the
 wire only as a short witness where byte identity matters: the first eight hex characters of a
-SHA-256, the same convention `NodeId`'s witness uses. The server computes and compares the full
-digest internally, so it never travels whole.
+SHA-256. The server computes and compares the full digest internally, so it never travels whole.
+
+A syntax node has no identity of its own. A [`Node`](/docs/developer/protocol/reference#Node) is
+addressed by its place: node `index` of declaration `declaration` of `symbol`, counted in
+pre-order from the declaration's item node at 0, or node `index` of its `unit` when no declaration
+holds it. A nested declaration's subtree counts toward the nested symbol alone, so an edit inside
+one declaration leaves the indexes of every other declaration's nodes unchanged.
 
 [`SourceLocationKind`](/docs/developer/protocol/reference#SourceLocationKind) names where a
 declaration's source belongs: project, dependency, standard library, or external source.

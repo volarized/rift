@@ -51,8 +51,7 @@ pub struct RelationshipEdge {
 }
 
 impl RelationshipEdge {
-    /// Projects this resolved reference without dropping a physical occurrence when no
-    /// source node was supplied.
+    /// Projects this resolved reference with its physical occurrence.
     #[must_use]
     pub fn to_protocol(&self) -> rift_protocol::read::Relationship {
         rift_protocol::read::Relationship {
@@ -60,7 +59,6 @@ impl RelationshipEdge {
             to: rift_protocol::read::SymbolId(self.to.as_str().to_owned()),
             kind: rift_protocol::read::ExactKind(self.facet.as_ref().to_owned()),
             facets: vec![self.facet],
-            evidence: self.occurrence.node().cloned().into_iter().collect(),
             occurrence: Some(rift_protocol::read::SourceUnitSpan {
                 unit: rift_protocol::read::SourceUnitId(self.occurrence.unit().to_string()),
                 range: rift_protocol::read::TextRange {
@@ -384,7 +382,6 @@ mod tests {
         DeclarationBinding::new(
             source_unit(path),
             SourceRange::new(start, end).expect("fixture range"),
-            None,
         )
     }
 

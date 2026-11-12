@@ -628,7 +628,6 @@ mod tests {
                     SourceUnitId::parse("rift://source/rift.sources.project/src/lib.rs")
                         .expect("source unit"),
                     SourceRange::new(0, 8).expect("range"),
-                    None,
                 ))
                 .identity_anchor(SymbolId::new(identity).expect("identity"));
         }

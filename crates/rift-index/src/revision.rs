@@ -594,7 +594,12 @@ path = "src/lib.rs"
         let path = ProjectPath::new("src/lib.rs").expect("path");
         assert!(
             !index
-                .nodes(&path, 4)
+                .syntax(&path)
+                .map(|document| document.map(|document| document
+                    .nodes_at(4)
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>()))
                 .expect("node parse")
                 .expect("indexed path")
                 .is_empty(),

@@ -32,7 +32,7 @@ macro_rules! heap_fields {
 
 heap_fields!(ContributionReference; provider, symbol);
 heap_fields!(ContributionKey; reference);
-heap_fields!(DeclarationBinding; unit, node);
+heap_fields!(DeclarationBinding; unit);
 heap_fields!(ContributionOrigin; location);
 heap_fields!(SemanticReference; source, targets);
 heap_fields!(ContributionRelationship; target, occurrence);

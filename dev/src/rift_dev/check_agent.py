@@ -189,7 +189,11 @@ async def declaration_node(client: Client, name: str) -> str:
     require(len(matches) == 1, f"nodes omitted the declaration: {listing}")
     node, excerpt = matches[0]
     require(excerpt == declaration.get("source"), f"nodes changed source: {listing}")
-    return string_value(node.get("id"), "node.id")
+    require(
+        node.get("declaration") == 0 and node.get("index") == 0,
+        f"the declaration's item node is not node 0 of its declaration: {listing}",
+    )
+    return identity
 
 
 async def check_agent(binary: Path, version: str | None = None) -> None:

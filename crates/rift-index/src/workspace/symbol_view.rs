@@ -169,6 +169,18 @@ impl WorkspaceSymbolView {
         self.identities.get(&(path.clone(), position))
     }
 
+    /// The symbol the captured declaration at `position` of `path`'s symbols binds, and that
+    /// declaration's ordinal among the symbol's declarations in the order
+    /// [`Self::symbols_by_identity_page`] lists them.
+    #[must_use]
+    pub fn declaration_address(
+        &self,
+        path: &ProjectPath,
+        position: usize,
+    ) -> Option<(&SymbolId, usize)> {
+        self.declarations.address(path, position)
+    }
+
     /// Captured source file, without any filesystem read or path selection.
     #[must_use]
     pub fn file(&self, path: &ProjectPath) -> Option<&IndexedFile> {
@@ -201,18 +213,18 @@ impl WorkspaceSymbolView {
             .or_else(|| self.text_files.get(path).map(|file| file.content()))
     }
 
-    /// Parses captured bytes with their admitted language, framework context and bounds.
+    /// Parses captured bytes with their admitted language, framework context and bounds, and
+    /// returns the document with its complete node table.
     ///
     /// No path matcher or filesystem read selects the provider. Temporary node material
     /// remains bounded by the captured syntax limits and is not stored after the read.
     ///
     /// # Errors
     /// Returns the captured source or syntax refusal when node reconstruction fails.
-    pub fn nodes(
+    pub fn syntax(
         &self,
         path: &ProjectPath,
-        position: u64,
-    ) -> Result<Option<Vec<rift_syntax::SyntaxNode>>, RiftError> {
+    ) -> Result<Option<rift_syntax::SyntaxDocument>, RiftError> {
         let Some(file) = self.file(path) else {
             return Ok(None);
         };
@@ -248,9 +260,7 @@ impl WorkspaceSymbolView {
                 })?;
             syntax = interpreted;
         }
-        Ok(Some(
-            syntax.nodes_at(position).into_iter().cloned().collect(),
-        ))
+        Ok(Some(syntax))
     }
 
     /// Captured normalized graph, shared with the original publication.

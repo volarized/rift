@@ -177,7 +177,6 @@ impl GraphFixture {
                 u64::try_from(end).expect("source end"),
             )
             .expect("nonempty source range"),
-            None,
         )
     }
 
@@ -590,7 +589,6 @@ fn portable_relationships_keep_two_original_call_sites_without_nodes() {
             assert_eq!(edge.to.0, fixture.identity("finish").as_str());
             assert_eq!(edge.derivation, RelationshipDerivation::Syntax);
             assert_eq!(edge.facets, [RelationshipFacet::References]);
-            assert!(edge.evidence.is_empty());
             assert!(edge.confidence.is_none());
             let occurrence = edge.occurrence.as_ref().expect("original call site");
             assert_eq!(occurrence.unit, publication.units[0].unit);
@@ -644,11 +642,8 @@ fn invalid_occurrence_refuses_original_byte_range_and_unknown_unit() {
     }
     let unit = rift_core::SourceUnitId::for_owner(fixture.owner.clone(), "missing.rs")
         .expect("canonical unit outside selected inventory");
-    let occurrence = DeclarationBinding::new(
-        unit,
-        SourceRange::new(0, 1).expect("nonempty source range"),
-        None,
-    );
+    let occurrence =
+        DeclarationBinding::new(unit, SourceRange::new(0, 1).expect("nonempty source range"));
     let semantics = fixture.graph(vec![fixture.edge(occurrence)]);
     let publication = fixture
         .publication(&semantics, ExactPackageLimits::new(1, 1024))

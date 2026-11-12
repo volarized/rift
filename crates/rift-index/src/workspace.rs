@@ -44,7 +44,10 @@ use rift_ranking::{
     IndexDocument, ParsedQuery, RankingInput, SIGNATURE_BYTES_MAX, SearchableField,
     identifier_terms,
 };
-use rift_syntax::{SyntaxLimits, SyntaxNode, SyntaxProvider, SyntaxSource, SyntaxSymbol, registry};
+use rift_syntax::{
+    NodePlace, SyntaxDocument, SyntaxLimits, SyntaxNode, SyntaxProvider, SyntaxSource,
+    SyntaxSymbol, registry,
+};
 use sha2::{Digest as _, Sha256};
 
 use crate::capture::{CaptureBoundary, CapturedPath, LastCapture, capture_path, root_identity};
@@ -1237,8 +1240,11 @@ fn is_syntax_bound(slug: ErrorSlug) -> bool {
 pub struct IndexedFileNodes {
     /// Parsed file used to validate source identity and position.
     pub file: IndexedFile,
-    /// Nodes that cover the requested position.
+    /// Nodes that cover the requested position, outermost first.
     pub nodes: Vec<SyntaxNode>,
+    /// The place of each node in `nodes`, in the same order. The file is not published, so
+    /// no declaration of it has an established identity and the unit holds every node.
+    pub places: Vec<NodePlace>,
     /// Framework context unresolved for these captured source bytes.
     pub warnings: Vec<rift_protocol::read::ReadWarning>,
 }
@@ -2666,9 +2672,22 @@ struct SymbolDeclarations {
     objects: BTreeMap<SymbolId, usize>,
     assembled: BTreeMap<SymbolId, Result<ReadableSymbol, RiftError>>,
     facts: BTreeMap<(ProjectPath, usize), rift_protocol::symbol_read::SymbolDeclaration>,
+    addresses: BTreeMap<(ProjectPath, usize), (SymbolId, usize)>,
 }
 
 impl SymbolDeclarations {
+    /// The symbol one declaration binds, and the declaration's ordinal among that symbol's
+    /// bindings in the order a symbol read lists them.
+    pub(super) fn address(
+        &self,
+        path: &ProjectPath,
+        position: usize,
+    ) -> Option<(&SymbolId, usize)> {
+        self.addresses
+            .get(&(path.clone(), position))
+            .map(|(identity, ordinal)| (identity, *ordinal))
+    }
+
     fn object_positions(records: &[rift_core::SymbolRecord]) -> BTreeMap<SymbolId, usize> {
         records
             .iter()
@@ -3916,6 +3935,28 @@ impl WorkspaceIndex {
             .transpose()
     }
 
+    /// The symbol the declaration at `position` of `path`'s symbols binds, and that
+    /// declaration's ordinal among the symbol's declarations in the order
+    /// [`Self::symbols_by_identity_page`] lists them. `None` for a declaration without an
+    /// established identity.
+    ///
+    /// # Errors
+    /// Returns [`RiftError`] when the canonical declaration directory cannot be built.
+    pub fn declaration_address(
+        &self,
+        path: &ProjectPath,
+        position: usize,
+    ) -> Result<Option<(SymbolId, usize)>, RiftError> {
+        let declarations = self
+            .symbol_declarations
+            .get_or_init(|| self.build_symbol_declarations().map(Arc::new))
+            .as_ref()
+            .map_err(Clone::clone)?;
+        Ok(declarations
+            .address(path, position)
+            .map(|(identity, ordinal)| (identity.clone(), ordinal)))
+    }
+
     /// Returns a bounded page of physical declarations and the complete binding count.
     ///
     /// # Errors
@@ -3970,7 +4011,6 @@ impl WorkspaceIndex {
                 end: binding.range().end(),
             },
             line: rift_core::line::line_of(starts, binding.range().start()),
-            node: None,
             source: None,
             source_complete: false,
             signature_indices: rift_core::fact_indices(
@@ -4119,6 +4159,13 @@ impl WorkspaceIndex {
                     .map(|matched| (matched.rank, matched.symbol.qualified_name.as_str()))
             });
         }
+        for (identity, bindings) in &declarations.canonical {
+            for (ordinal, binding) in bindings.iter().enumerate() {
+                declarations
+                    .addresses
+                    .insert(binding.clone(), (identity.clone(), ordinal));
+            }
+        }
         Ok(declarations)
     }
 
@@ -4217,7 +4264,13 @@ impl WorkspaceIndex {
                 Err(error) => return error.fail(),
             },
         };
-        let nodes = syntax.nodes_at(position).into_iter().cloned().collect();
+        let (nodes, places) = syntax
+            .nodes()
+            .iter()
+            .zip(syntax.node_places(|_, _| false))
+            .filter(|(node, _)| node.range.contains(position))
+            .map(|(node, place)| (node.clone(), place))
+            .unzip();
         let file = IndexedFile::new(
             text_file.path().clone(),
             Arc::clone(&text_file.content),
@@ -4228,6 +4281,7 @@ impl WorkspaceIndex {
         Ok(Some(IndexRead::Included(IndexedFileNodes {
             file,
             nodes,
+            places,
             warnings,
         })))
     }
@@ -4299,21 +4353,17 @@ impl WorkspaceIndex {
         checked_chunk_bytes_max(self.text_chunk_bytes_max())
     }
 
-    /// Parses one selected source path and returns syntax nodes covering byte position.
+    /// Parses one held source file again and returns its document with the complete node
+    /// table, which the index itself does not keep.
     ///
-    /// The selected provider and syntax bounds belong to this index. `None` means no
-    /// provider selected the path; `Skipped` carries a catalog or syntax warning; `Included`
-    /// carries the parsed file and matching nodes.
+    /// The selected provider, framework context, and syntax bounds belong to this index.
+    /// `None` means the index holds no parsed file at `path`.
     ///
     /// # Errors
     ///
     /// Returns [`RiftError`] when the provider refuses captured source or path
     /// policy no longer identifies the held file.
-    pub fn nodes(
-        &self,
-        path: &ProjectPath,
-        position: u64,
-    ) -> Result<Option<Vec<SyntaxNode>>, RiftError> {
+    pub fn syntax(&self, path: &ProjectPath) -> Result<Option<SyntaxDocument>, RiftError> {
         let Some(file) = self.file(path) else {
             return Ok(None);
         };
@@ -4344,9 +4394,7 @@ impl WorkspaceIndex {
                     .cause(error)
                     .error()
             })?;
-        Ok(Some(
-            syntax.nodes_at(position).into_iter().cloned().collect(),
-        ))
+        Ok(Some(syntax))
     }
 
     /// Walks the workspace on demand for `.rs` files matching `force_include`'s globs that are
@@ -8933,7 +8981,14 @@ mod tests {
             .cloned()
             .collect::<Vec<_>>();
         assert_eq!(
-            index.nodes(&path, 4).expect("node parse"),
+            index
+                .syntax(&path)
+                .map(|document| document.map(|document| document
+                    .nodes_at(4)
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>()))
+                .expect("node parse"),
             Some(expected),
             "reparsed nodes preserve complete provider rows and order"
         );
@@ -10230,7 +10285,12 @@ mod tests {
         assert!(index.file(&missing).is_none());
         assert!(
             index
-                .nodes(&missing, 0)
+                .syntax(&missing)
+                .map(|document| document.map(|document| document
+                    .nodes_at(0)
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>()))
                 .expect("missing path has no node parse")
                 .is_none()
         );

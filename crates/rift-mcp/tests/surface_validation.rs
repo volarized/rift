@@ -116,12 +116,9 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
                 expects_source,
                 "a hit carries source exactly when the request includes it: {request:#} {hit:#}"
             );
-            // A package hit carries `unit` and no node address.
-            let addressable = hit.get("unit").is_none();
-            assert_eq!(
-                hit.get("node").is_some(),
-                expects_source && addressable,
-                "the node address rides with source on a project hit: {request:#} {hit:#}"
+            assert!(
+                hit.get("node").is_none(),
+                "a declaration carries no node identity: {request:#} {hit:#}"
             );
             if !expects_history {
                 assert!(
@@ -786,7 +783,7 @@ impl CorpusArms {
                 self.added_entries += 1;
             }
         }
-        for identity in node_identities(structured) {
+        for identity in node_units(structured) {
             if identity.contains('@') && !identity.contains("%40") {
                 self.literal_at_identities += 1;
             }
@@ -874,10 +871,9 @@ fn warning_count(structured: &Value, code: &str) -> usize {
         .count()
 }
 
-/// Every node identity one answer carries, whatever tool produced it.
-///
-/// A `nodes` answer lists them under `id`; a search hit carries one under `node`.
-fn node_identities(structured: &Value) -> Vec<String> {
+/// Every file identity one answer's nodes carry under `unit`: the identity whose path the
+/// server encodes, since a node's own identity is a content digest with no path.
+fn node_units(structured: &Value) -> Vec<String> {
     let mut found = Vec::new();
     let mut pending = vec![structured];
     while let Some(value) = pending.pop() {
@@ -886,8 +882,7 @@ fn node_identities(structured: &Value) -> Vec<String> {
                 for (key, member) in members {
                     match member {
                         Value::String(identity)
-                            if matches!(key.as_str(), "id" | "node")
-                                && identity.starts_with("rift://node/") =>
+                            if key == "unit" && identity.starts_with("rift://file/") =>
                         {
                             found.push(identity.clone());
                         }

@@ -1201,14 +1201,6 @@ fn ranking_identity(hit: &SearchHit) -> Result<DocumentIdentity, RiftError> {
                     .error()
             })?
         }
-        (SearchHitTarget::Node { node }, ..) => {
-            DocumentIdentity::new(node.0.clone()).map_err(|error| {
-                errors::mcp::project_hit_identity_refused()
-                    .hit(&node.0)
-                    .cause(error)
-                    .error()
-            })?
-        }
         (SearchHitTarget::Documentation { documentation }, ..) => {
             DocumentIdentity::for_documentation_block(&documentation.block.identity.0).map_err(
                 |error| {
@@ -1275,7 +1267,6 @@ fn search_hit_key(hit: &SearchHit) -> &str {
             .as_ref()
             .map_or(symbol.name.as_str(), |identity| identity.0.as_str()),
         SearchHitTarget::File { .. } => hit.path.as_ref().map_or("", |path| path.0.as_str()),
-        SearchHitTarget::Node { node } => node.0.as_str(),
         SearchHitTarget::Documentation { documentation } => documentation.block.identity.0.as_str(),
         SearchHitTarget::Commit { commit } => commit.revision.0.as_str(),
     }
@@ -1945,11 +1936,6 @@ mod tests {
         let mut unit_hit = example.results[0].clone();
         unit_hit.path = None;
         unit_hit.unit = Some(SourceUnitId(unit.to_owned()));
-        let node_hit: SearchHit = serde_json::from_value(serde_json::json!({
-            "hit": {"target": "node", "node": "rift://node/rust/src/lib.rs@0-10#dcbef6dd"},
-            "path": "src/lib.rs"
-        }))
-        .expect("a node hit");
         let documentation_hit = documentation_hits().remove(0);
         let revision = "9c1d4e7a2b8f03d5e6a1c4b7d9e2f0a3b5c8d1e4";
         let commit_hit: SearchHit = serde_json::from_value(serde_json::json!({
@@ -1974,7 +1960,6 @@ mod tests {
             example.results[0].clone(),
             unit_hit,
             example.results[1].clone(),
-            node_hit,
             documentation_hit,
             commit_hit,
         ];
@@ -1982,7 +1967,6 @@ mod tests {
             "rift://symbol/local/rust/app/config/load_config",
             unit_identity.as_str(),
             "src/lib.rs",
-            "rift://node/rust/src/lib.rs@0-10#dcbef6dd",
             block_identity.as_str(),
             revision,
         ];
