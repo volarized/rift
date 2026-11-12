@@ -50,7 +50,7 @@ pub struct Revision(Point);
 enum Point {
     Commit(String),
     Reference(String),
-    Release(SymbolOwner),
+    Release(SymbolOwner, String),
     Tree(String),
 }
 
@@ -61,8 +61,8 @@ pub enum RevisionPoint<'a> {
     Commit(&'a str),
     /// A git branch, tag, or `HEAD`, optionally followed by `~N` ancestry suffixes.
     Reference(&'a str),
-    /// One package or runtime release.
-    Release(&'a SymbolOwner),
+    /// One package or runtime release: the versionless owner and the release's version.
+    Release(&'a SymbolOwner, &'a str),
     /// The complete lowercase SHA-256 digest of one served working tree.
     Tree(&'a str),
 }
@@ -129,16 +129,17 @@ impl Revision {
         Ok(Self(Point::Tree(digest.to_owned())))
     }
 
-    /// The revision of the release a package or runtime owner names.
+    /// The revision of one release of a package or runtime owner, as
+    /// `rift://revision/cargo/crates.io/demo@1.0.0`.
     ///
     /// # Errors
-    /// Returns `read_invalid` naming `revision` for a local owner or invalid coordinates.
-    pub fn release(owner: &SymbolOwner) -> Result<Self, RiftError> {
-        let accepted = owner.validate().is_ok() && !owner.is_local();
-        if !accepted {
+    /// Returns `read_invalid` naming `revision` for a local owner, invalid coordinates, or a
+    /// version the owner's ecosystem does not spell canonically.
+    pub fn release(owner: &SymbolOwner, version: &str) -> Result<Self, RiftError> {
+        if !owner.accepts_release(version) {
             return Err(RevisionViolation::Release.error());
         }
-        Ok(Self(Point::Release(owner.clone())))
+        Ok(Self(Point::Release(owner.clone(), version.to_owned())))
     }
 
     /// Parses one revision IRI without resolving it.
@@ -162,7 +163,7 @@ impl Revision {
             TREE_FORM if is_hex(body, SHA256_HEX_BYTES) => Ok(Point::Tree(body.to_owned())),
             TREE_FORM => Err(RevisionViolation::Digest),
             _ => parse_release_owner(rest)
-                .map(Point::Release)
+                .map(|(owner, version)| Point::Release(owner, version))
                 .map_err(|_| RevisionViolation::Release),
         }
         .map(Self)
@@ -174,18 +175,17 @@ impl Revision {
         match &self.0 {
             Point::Commit(id) => RevisionPoint::Commit(id),
             Point::Reference(name) => RevisionPoint::Reference(name),
-            Point::Release(owner) => RevisionPoint::Release(owner),
+            Point::Release(owner, version) => RevisionPoint::Release(owner, version),
             Point::Tree(digest) => RevisionPoint::Tree(digest),
         }
     }
 
-    /// Whether an answer about a symbol of `owner` may report this revision: the
-    /// owner's own release for a package or runtime, a commit or a working tree for a
-    /// project.
+    /// Whether an answer about a symbol of `owner` may report this revision: a release of
+    /// that package or runtime, a commit or a working tree for a project.
     #[must_use]
     pub fn answers_for(&self, owner: &SymbolOwner) -> bool {
         match &self.0 {
-            Point::Release(release) => release == owner,
+            Point::Release(release, _) => release == owner,
             Point::Commit(_) | Point::Tree(_) => owner.is_local(),
             Point::Reference(_) => false,
         }
@@ -199,7 +199,16 @@ impl Revision {
             Point::Commit(spelling) | Point::Reference(spelling) => {
                 Some(RevisionId(spelling.clone()))
             }
-            Point::Release(_) | Point::Tree(_) => None,
+            Point::Release(..) | Point::Tree(_) => None,
+        }
+    }
+
+    /// The version a release revision names; absent for a commit, reference, or tree.
+    #[must_use]
+    pub fn release_version(&self) -> Option<&str> {
+        match &self.0 {
+            Point::Release(_, version) => Some(version),
+            Point::Commit(_) | Point::Reference(_) | Point::Tree(_) => None,
         }
     }
 }
@@ -236,8 +245,8 @@ impl fmt::Display for Revision {
                 write!(formatter, "{GIT_FORM}/{spelling}")
             }
             Point::Tree(digest) => write!(formatter, "{TREE_FORM}/{digest}"),
-            Point::Release(owner) => {
-                formatter.write_str(&owner.release_spelling().unwrap_or_default())
+            Point::Release(owner, version) => {
+                formatter.write_str(&owner.release_spelling(version).unwrap_or_default())
             }
         }
     }

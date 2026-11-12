@@ -413,17 +413,14 @@ mod tests {
                 manager: "cargo".to_owned(),
                 registry: "crates.io".to_owned(),
                 name: "beacon".to_owned(),
-                version: "1.0.0".to_owned(),
             },
             SymbolOwner::Package {
                 manager: "cargo".to_owned(),
                 registry: "registry.example:8443/cargo".to_owned(),
                 name: "beacon".to_owned(),
-                version: "1.0.0".to_owned(),
             },
             SymbolOwner::Runtime {
                 runtime: "rustc".to_owned(),
-                version: "1.91.0".to_owned(),
             },
         ];
         let mut identities = std::collections::BTreeSet::new();

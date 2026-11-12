@@ -33,10 +33,11 @@ the environment.
 
 [`SourceUnitId`](/docs/developer/protocol/reference#SourceUnitId) names one unit in that catalog,
 and a package file the global index answers from takes the same form:
-`rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs`. This package address names its manager,
-registry, package and exact served version, then the physical path in that release. A project
-source address uses `rift://source/project/` followed by its project-relative path. Logical
-symbol identities remain separate from these physical addresses.
+`rift://source/cargo/crates.io/demo/src/lib.rs`. This package address names its manager,
+registry and package, then the physical path in the package. It names no version: a read selects
+the release whose bytes it answers through its `revision`. A project source address uses
+`rift://source/project/` followed by its project-relative path. Logical symbol identities remain
+separate from these physical addresses.
 
 The key is never a digest. A [`Digest`](/docs/developer/protocol/reference#Digest) reaches the
 wire only as a short witness where byte identity matters: the first eight hex characters of a

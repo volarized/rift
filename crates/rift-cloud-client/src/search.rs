@@ -78,7 +78,7 @@ mod tests {
 
     fn runtime_hit() -> Value {
         json!({"hit": {"target": "symbol", "symbol": {
-            "id": "rift://symbol/stdlib/node@26.11.1/javascript/fs/readFile",
+            "id": "rift://symbol/stdlib/node/javascript/fs/readFile",
             "language": "javascript", "name": "readFile", "kind": "function",
             "origin": {"location": "stdlib", "source_kind": "authored",
                 "runtime": {"runtime": "node", "version": "26.11.1"}}
@@ -105,7 +105,7 @@ mod tests {
         assert!(symbol.origin.package.is_none());
         assert_eq!(
             symbol.id.expect("canonical identity").0,
-            "rift://symbol/stdlib/node@26.11.1/javascript/fs/readFile"
+            "rift://symbol/stdlib/node/javascript/fs/readFile"
         );
     }
 
@@ -116,8 +116,8 @@ mod tests {
         value["traversal_path"] = json!([{
             "direction": "outgoing",
             "relationship": {
-                "from": "rift://symbol/stdlib/node@26.11.1/javascript/fs/open",
-                "to": "rift://symbol/stdlib/node@26.11.1/javascript/fs/readFile",
+                "from": "rift://symbol/stdlib/node/javascript/fs/open",
+                "to": "rift://symbol/stdlib/node/javascript/fs/readFile",
                 "kind": "call", "facets": ["calls"], "derivation": "resolution"
             }
         }]);
@@ -162,7 +162,7 @@ mod tests {
             "package": {"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"},
             "symbol": {"id": "rift://symbol/local/rust/demo/parse", "language": "rust",
                 "name": "parse", "kind": "function"},
-            "unit": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs",
+            "unit": "rift://source/cargo/crates.io/demo/src/lib.rs",
             "range": {"start": 0, "end": 4}, "line": 1,
             "contributing_fields": ["qualified_name"], "match_class": "qualified_exact"
         });

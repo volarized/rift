@@ -68,7 +68,7 @@ fn assert_runtime_library_root(name: &str) {
             .expect("original declaration");
         assert_eq!(
             object.id.as_ref().expect("canonical runtime object").0,
-            format!("rift://symbol/stdlib/{name}@3.14.7/python/json/{declaration_name}")
+            format!("rift://symbol/stdlib/{name}/python/json/{declaration_name}")
         );
         assert!(
             publication
@@ -94,7 +94,10 @@ fn runtime_root_refuses_foreign_owner_language_and_unselected_prefix() {
     )
     .expect("selected source");
     for roots in [
-        [PackageImportRoot::runtime(runtime("3.13.7").0, None).expect("different exact runtime")],
+        [
+            PackageImportRoot::runtime(python_runtime("cpython", "3.14.7").0, None)
+                .expect("different runtime"),
+        ],
         [PackageImportRoot::runtime(
             owner.clone(),
             Some(ProjectPath::new("Lib").expect("different prefix")),
@@ -134,11 +137,9 @@ fn runtime_root_refuses_foreign_owner_language_and_unselected_prefix() {
             manager: "pypi".to_owned(),
             registry: "pypi.org".to_owned(),
             name: "python".to_owned(),
-            version: "3.14.7".to_owned(),
         },
         SymbolOwner::Runtime {
             runtime: "node".to_owned(),
-            version: "26.11.1".to_owned(),
         },
     ] {
         assert!(PackageImportRoot::runtime(invalid, None).is_err());
@@ -269,8 +270,7 @@ fn runtime_root_cannot_assign_same_source_bytes_to_package_or_local_owner() {
     assert!(
         PackageImportRoot::runtime(
             SymbolOwner::Runtime {
-                runtime: "python".to_owned(),
-                version: "3.14".to_owned()
+                runtime: "Python".to_owned(),
             },
             None
         )

@@ -2,10 +2,7 @@ use rift_error::RiftError;
 
 use rift_protocol::{
     identity::{SymbolIdentity, SymbolOwner},
-    read::{
-        GetSymbolInclude, PAGE_LIMIT_MAX, PackageIdentity, SourceKind, SourceLocationKind,
-        SymbolOrigin,
-    },
+    read::{GetSymbolInclude, PAGE_LIMIT_MAX, SourceKind, SourceLocationKind, SymbolOrigin},
     symbol_read::{GetSymbolParams, GetSymbolResult},
 };
 
@@ -146,6 +143,14 @@ fn valid_result(
         return false;
     };
     let owner = identity.owner();
+    let answered = result.revision();
+    let other_release = answered
+        .zip(request.revision.as_ref())
+        .is_some_and(|(answered, requested)| answered != requested);
+    if other_release {
+        return false;
+    }
+    let version = answered.and_then(|revision| revision.release_version());
     match result {
         GetSymbolResult::Found {
             symbol,
@@ -158,7 +163,7 @@ fn valid_result(
             request.view.as_ref().is_none_or(|id| id == &view.id)
                 && u64::try_from(declarations.len())
                     .is_ok_and(|length| length <= request.declaration_limit)
-                && (valid_origin(&symbol.origin, owner)
+                && (valid_origin(&symbol.origin, owner, version)
                     || (declarations.is_empty()
                         && symbol.origin.source_kind == SourceKind::Synthetic
                         && symbol.origin.location.is_none()
@@ -168,12 +173,17 @@ fn valid_result(
                     declaration.unit.as_ref().is_some_and(|unit| {
                         rift_core::SourceUnitId::parse(&unit.0)
                             .is_ok_and(|unit| unit.source_owner() == Some(owner))
-                    }) && valid_origin(&declaration.origin, owner)
+                    }) && valid_origin(&declaration.origin, owner, version)
                 })
                 && (history.is_none() || request.include.contains(&GetSymbolInclude::History))
                 && documentation.as_ref().is_none_or(|context| {
                     request.include.contains(&GetSymbolInclude::Documentation)
-                        && valid_documentation(context, &request.id, owner, source_bytes_max)
+                        && valid_documentation(
+                            context,
+                            &request.id,
+                            (owner, &symbol.origin),
+                            source_bytes_max,
+                        )
                 })
         }
         GetSymbolResult::Missing { view, .. } => {
@@ -185,7 +195,8 @@ fn valid_result(
     }
 }
 
-fn valid_origin(origin: &SymbolOrigin, owner: &SymbolOwner) -> bool {
+/// Whether `origin` names `owner` at the answered release `version`.
+fn valid_origin(origin: &SymbolOrigin, owner: &SymbolOwner, version: Option<&str>) -> bool {
     if origin.source_kind == SourceKind::Synthetic {
         return false;
     }
@@ -193,27 +204,29 @@ fn valid_origin(origin: &SymbolOrigin, owner: &SymbolOwner) -> bool {
         SymbolOwner::Package { .. } => {
             origin.location == Some(SourceLocationKind::Dependency)
                 && origin.runtime.is_none()
-                && origin
-                    .package
-                    .as_ref()
-                    .is_some_and(|package| package.owner().is_ok_and(|actual| &actual == owner))
+                && origin.package.as_ref().is_some_and(|package| {
+                    package.owner().is_ok_and(|actual| &actual == owner)
+                        && version == Some(package.version.as_str())
+                })
         }
         SymbolOwner::Runtime { .. } => {
             origin.location == Some(SourceLocationKind::Stdlib)
                 && origin.package.is_none()
-                && origin
-                    .runtime
-                    .as_ref()
-                    .is_some_and(|runtime| runtime.owner().is_ok_and(|actual| &actual == owner))
+                && origin.runtime.as_ref().is_some_and(|runtime| {
+                    runtime.owner().is_ok_and(|actual| &actual == owner)
+                        && version == Some(runtime.version.as_str())
+                })
         }
         _ => false,
     }
 }
 
+/// Whether documentation answered for `target` stays inside its `owner` at the release of
+/// the answered symbol's `origin`.
 fn valid_documentation(
     context: &rift_protocol::documentation::DocumentationContext,
     target: &rift_protocol::read::SymbolId,
-    owner: &SymbolOwner,
+    (owner, origin): (&SymbolOwner, &SymbolOrigin),
     source_bytes_max: usize,
 ) -> bool {
     if context
@@ -229,19 +242,15 @@ fn valid_documentation(
         return false;
     }
     match owner {
-        SymbolOwner::Package {
-            manager,
-            registry,
-            name,
-            version,
-        } => {
-            let package = PackageIdentity {
-                manager: manager.clone(),
-                registry: registry.clone(),
-                name: name.clone(),
-                version: version.clone(),
+        SymbolOwner::Package { .. } => {
+            let Some(package) = origin
+                .package
+                .as_ref()
+                .filter(|package| package.owner().ok().as_ref() == Some(owner))
+            else {
+                return false;
             };
-            crate::domain::validate_documentation_context(context, target, &package).is_ok()
+            crate::domain::validate_documentation_context(context, target, package).is_ok()
         }
         SymbolOwner::Runtime { .. } => {
             if rift_analysis::documentation::validate_documentation_context(context, target)
@@ -259,14 +268,13 @@ fn valid_documentation(
                     rift_core::SourceUnitId::parse(&unit.0)
                         .is_ok_and(|unit| unit.source_owner() == Some(owner))
                 };
-            context
-                .references
+            context.references.iter().all(|reference| {
+                let source = &reference.documentation.source;
+                valid_identity(&source.identity) && source.origin.runtime == origin.runtime
+            }) && context
+                .warnings
                 .iter()
-                .all(|reference| valid_identity(&reference.documentation.source.identity))
-                && context
-                    .warnings
-                    .iter()
-                    .all(|warning| valid_identity(&warning.source))
+                .all(|warning| valid_identity(&warning.source))
         }
         _ => false,
     }

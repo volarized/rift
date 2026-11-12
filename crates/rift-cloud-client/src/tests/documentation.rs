@@ -12,7 +12,8 @@ fn capabilities() -> Capabilities {
 }
 
 fn hit() -> Value {
-    let owner = json!({"source":{"kind":"package","unit":"rift://source/cargo/crates.io/demo@1.0.0/README.md"}});
+    let owner =
+        json!({"source":{"kind":"package","unit":"rift://source/cargo/crates.io/demo/README.md"}});
     json!({
         "documentation_revision":"0123abcd",
         "block":{"identity":"1".repeat(64),"source":owner,"content_digest":"2".repeat(64),
@@ -49,7 +50,7 @@ fn stored_pages() -> (Value, Value) {
     current["documentation"]["block"]["identity"] = json!("6".repeat(64));
     current["documentation"]["source"]["origin"]["package"] = package_json("other");
     current["documentation"]["source"]["identity"]["source"]["unit"] =
-        json!("rift://source/cargo/crates.io/other@1.0.0/README.md");
+        json!("rift://source/cargo/crates.io/other/README.md");
     current["documentation"]["block"]["source"] =
         current["documentation"]["source"]["identity"].clone();
     search["items"]
@@ -197,7 +198,7 @@ async fn native_http_stored_context_refuses_wrong_targets_revisions_and_duplicat
         ),
         (
             "/documentation/references/0/reference/target",
-            json!("rift://symbol/cargo/crates.io/other@1.0.0/rust/other"),
+            json!("rift://symbol/cargo/crates.io/other/rust/other"),
         ),
         (
             "/documentation/references/0/documentation/source/origin/package/name",
@@ -386,7 +387,7 @@ async fn symbol_context_matches_requested_symbol_and_revision() {
         ("/documentation/documentation_revision", json!("abcdef01")),
         (
             "/documentation/references/0/reference/target",
-            json!("rift://symbol/cargo/crates.io/other@1.0.0/rust/other"),
+            json!("rift://symbol/cargo/crates.io/other/rust/other"),
         ),
         (
             "/documentation/references/0/documentation/source/origin/package/name",

@@ -8,12 +8,14 @@ use rift_protocol::{
 };
 use serde_json::{Value, json};
 
-const DECLARATION: &str = "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo";
-const UNIT: &str = "rift://source/cargo/crates.io/demo@1.0.0/src/first.rs";
+const DECLARATION: &str = "rift://symbol/cargo/crates.io/demo/rust/demo";
+const UNIT: &str = "rift://source/cargo/crates.io/demo/src/first.rs";
+const RELEASE: &str = "rift://revision/cargo/crates.io/demo@1.0.0";
 
 fn position(line: u64) -> SourcePosition {
     SourcePosition {
         unit: CanonicalSourceUnitId::parse(UNIT).expect("canonical source"),
+        revision: Some(rift_protocol::revision::Revision::parse(RELEASE).expect("release")),
         line,
         character: 4,
     }
@@ -38,7 +40,7 @@ fn view_json() -> Value {
 /// One declaration and one definite absence in the same captured selection.
 pub(super) fn declaration_response_json() -> Value {
     json!({"results":[
-        {"outcome":"found","position":position_json(3),"id":DECLARATION,"kind":"function","view":view_json()},
+        {"outcome":"found","position":position_json(3),"id":DECLARATION,"kind":"function","revision":RELEASE,"view":view_json()},
         {"outcome":"missing","position":position_json(0),"view":view_json()}
     ]})
 }
@@ -55,9 +57,10 @@ async fn test_fixture_declarations_answer_each_position_once() {
         .await
         .unwrap_or_else(|error| panic!("declarations: {error:?}"));
     assert!(matches!(&answer.results[..], [
-        DeclarationPositionResult::Found { position, id, kind, view },
+        DeclarationPositionResult::Found { position, id, kind, revision, view },
         DeclarationPositionResult::Missing { position: missing, view: missing_view }
     ] if position.line == 3 && id.as_str() == DECLARATION && kind.0 == "function"
+        && revision.to_string() == RELEASE
         && missing.line == 0 && view == missing_view));
     assert_eq!(
         server.state.last_path.lock().await.as_deref(),
@@ -161,7 +164,7 @@ async fn test_declaration_requests_refuse_positions_before_transport() {
     for unit in [
         "",
         "rift://source/cargo/demo@1.0.0/src/first.rs",
-        "rift://source/cargo/crates.io/demo@1.0.0/src/../first.rs",
+        "rift://source/cargo/crates.io/demo/src/../first.rs",
     ] {
         assert!(CanonicalSourceUnitId::parse(unit).is_err(), "{unit}");
     }
@@ -191,10 +194,9 @@ async fn test_declaration_requests_stay_within_the_advertised_package_bound() {
         .bounds
         .packages_max = 1;
     let mut request = declaration_request();
-    request.positions[1].unit = CanonicalSourceUnitId::parse(
-        "rift://source/cargo/registry.example/demo@1.0.0/src/first.rs",
-    )
-    .expect("distinct registry owner");
+    request.positions[1].unit =
+        CanonicalSourceUnitId::parse("rift://source/cargo/registry.example/demo/src/first.rs")
+            .expect("distinct registry owner");
     assert_registered_field(
         &client
             .find_declarations(&request)

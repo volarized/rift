@@ -2,6 +2,7 @@ use rift_error::{RiftError, errors};
 use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
 use rift_protocol::index::{PackagePublication, PackageSourceUnit, PackageSymbol};
 use rift_protocol::read::SymbolId;
+use rift_protocol::revision::{Revision, RevisionPoint};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
@@ -63,10 +64,10 @@ impl<'input> PackageDependency<'input> {
     /// # Errors
     /// Returns the existing input refusal for changed owner metadata or exceeded bounds.
     pub fn selectors(
-        owner: &SymbolOwner,
+        release: &Revision,
         manifest: PackageSource<'_>,
         limits: super::ExactPackageLimits,
-    ) -> Result<Vec<(String, SymbolOwner)>, RiftError> {
+    ) -> Result<Vec<(String, Revision)>, RiftError> {
         if manifest.path().as_str().rsplit('/').next() != Some("Cargo.toml")
             || manifest.text().len() > limits.syntax().source_bytes_max()
             || u64::try_from(manifest.text().len()).map_err(|_| invalid())? > limits.bytes_max()
@@ -74,12 +75,8 @@ impl<'input> PackageDependency<'input> {
             return Err(invalid());
         }
         let metadata: CargoDependencies = toml::from_str(manifest.text()).map_err(|_| invalid())?;
-        let SymbolOwner::Package {
-            manager,
-            name,
-            version,
-            ..
-        } = owner
+        let RevisionPoint::Release(SymbolOwner::Package { manager, name, .. }, version) =
+            release.point()
         else {
             return Err(invalid());
         };
@@ -94,7 +91,7 @@ impl<'input> PackageDependency<'input> {
         Ok(metadata
             .dependencies
             .into_iter()
-            .filter_map(|(name, selector)| selector.owner(&name).map(|owner| (name, owner)))
+            .filter_map(|(name, selector)| selector.release(&name).map(|release| (name, release)))
             .collect())
     }
 
@@ -122,23 +119,22 @@ impl<'input> PackageDependency<'input> {
         }
         let metadata: CargoDependencies =
             toml::from_str(self.manifest.text()).map_err(|_| invalid())?;
-        let SymbolOwner::Package {
-            manager,
-            name,
-            version,
-            ..
-        } = input.owner()
-        else {
+        let SymbolOwner::Package { manager, name, .. } = input.owner() else {
             return Err(invalid());
         };
         if manager != "cargo"
             || metadata.package.name != *name
-            || metadata.package.version != *version
+            || input.release_version() != Some(metadata.package.version.as_str())
         {
             return Err(invalid());
         }
         let selector = metadata.dependencies.get(self.name).ok_or_else(invalid)?;
-        if !selector.matches(self.name, &self.publication.owner) {
+        if !self
+            .publication
+            .revision
+            .answers_for(&self.publication.owner)
+            || !selector.matches(self.name, &self.publication.revision)
+        {
             return Err(invalid());
         }
         Ok(())
@@ -303,7 +299,7 @@ struct CargoSelection {
 }
 
 impl CargoDependency {
-    fn owner(&self, binding: &str) -> Option<SymbolOwner> {
+    fn release(&self, binding: &str) -> Option<Revision> {
         let (name, version) = match self {
             Self::Version(version) => (binding, version.as_str()),
             Self::Selected(selected) => {
@@ -321,24 +317,26 @@ impl CargoDependency {
             }
         };
         let version = version.strip_prefix('=')?;
-        let owner = rift_protocol::read::PackageIdentity {
+        let release = rift_protocol::read::PackageIdentity {
             manager: "cargo".to_owned(),
             registry: "crates.io".to_owned(),
             name: name.to_owned(),
             version: version.to_owned(),
         }
-        .owner()
+        .release()
         .ok()?;
-        self.matches(binding, &owner).then_some(owner)
+        self.matches(binding, &release).then_some(release)
     }
 
-    fn matches(&self, binding: &str, owner: &SymbolOwner) -> bool {
-        let SymbolOwner::Package {
-            manager,
-            registry,
-            name,
+    fn matches(&self, binding: &str, release: &Revision) -> bool {
+        let RevisionPoint::Release(
+            SymbolOwner::Package {
+                manager,
+                registry,
+                name,
+            },
             version,
-        } = owner
+        ) = release.point()
         else {
             return false;
         };
@@ -441,6 +439,13 @@ mod tests {
         );
     }
 
+    fn release(input: &NamespaceInput<'_>) -> Revision {
+        let version = input
+            .release_version()
+            .expect("package input names its release");
+        Revision::release(input.owner(), version).expect("release revision")
+    }
+
     fn identity(dependency: PackageDependency<'_>) -> &SymbolId {
         &dependency
             .publication
@@ -480,12 +485,8 @@ mod tests {
         fixture(|dependency, input| {
             for version in ["1.0.227", "1.0.229"] {
                 let mut publication = dependency.publication.clone();
-                if let SymbolOwner::Package {
-                    version: selected, ..
-                } = &mut publication.owner
-                {
-                    *selected = version.to_owned();
-                }
+                publication.revision =
+                    Revision::release(&publication.owner, version).expect("other release");
                 assert!(
                     PackageDependency {
                         publication: &publication,
@@ -586,7 +587,6 @@ mod tests {
                     manager: "cargo".to_owned(),
                     registry: "crates.io".to_owned(),
                     name: "other".to_owned(),
-                    version: "1.0.228".to_owned(),
                 },
                 "src/lib.rs",
             )
@@ -643,14 +643,17 @@ mod tests {
             let text = "[package]\nname='serde'\nversion='1.0.228'\n[dependencies]\nrenamed={package='serde_core',version='=1.0.228'}\nunknown='1.0'\nlocal={path='../local'}\nworkspace={workspace=true}\nforeign={version='=1.0.228',registry='other'}\n";
             let manifest = PackageSource::new(dependency.manifest.path(), text);
             let selected = PackageDependency::selectors(
-                input.owner(),
+                &release(&input),
                 manifest,
                 ExactPackageLimits::new(8, 1_048_576),
             )
             .expect("bounded original selectors");
             assert_eq!(
                 selected,
-                vec![("renamed".to_owned(), dependency.publication.owner.clone())]
+                vec![(
+                    "renamed".to_owned(),
+                    dependency.publication.revision.clone()
+                )]
             );
         });
     }
@@ -662,7 +665,7 @@ mod tests {
             let manifest = PackageSource::new(dependency.manifest.path(), text);
             assert!(
                 PackageDependency::selectors(
-                    input.owner(),
+                    &release(&input),
                     manifest,
                     ExactPackageLimits::new(1, 1_048_576)
                 )
@@ -670,7 +673,7 @@ mod tests {
             );
             assert!(
                 PackageDependency::selectors(
-                    input.owner(),
+                    &release(&input),
                     manifest,
                     ExactPackageLimits::new(8, 1)
                 )
@@ -678,7 +681,7 @@ mod tests {
             );
             assert!(
                 PackageDependency::selectors(
-                    &dependency.publication.owner,
+                    &dependency.publication.revision,
                     manifest,
                     ExactPackageLimits::new(8, 1_048_576)
                 )

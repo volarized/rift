@@ -31,11 +31,11 @@ pub const SYMBOL_IDENTITY_FORMAT_REVISION: u32 = 2;
 /// Prefix shared by canonical symbol addresses.
 pub const SYMBOL_URI_PREFIX: &str = "rift://symbol/";
 
-/// Structural wire pattern. The codec also validates exact versions and canonical spelling.
+/// Structural wire pattern. The codec also validates owner coordinates and canonical spelling.
 pub const SYMBOL_ID_PATTERN: &str = concat!(
     r"^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/",
-    r"|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/",
-    r"|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)",
+    r"|stdlib/[a-z][a-z0-9_-]*/",
+    r"|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+/)",
     r"[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/",
     r"(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+",
     r"(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$"
@@ -58,8 +58,8 @@ pub const GENERIC_SOURCE_UNIT_ID_PATTERN: &str = concat!(
 /// Structural released source pattern used beside generic source resolver validation.
 pub const RELEASED_SOURCE_UNIT_ID_PATTERN: &str = concat!(
     r"^rift://source/(?:(?:cargo|npm|pypi)/(?:[A-Za-z0-9._!$&'()*+,;=:-]|%[0-9A-F]{2})+/",
-    r"(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#@]+/",
-    r"|stdlib/[a-z][a-z0-9_-]*@[^/?#@]+/)",
+    r"(?:@[a-z0-9._-]+/)?[a-z0-9._-]+/",
+    r"|stdlib/[a-z][a-z0-9_-]*/)",
     r"(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+",
     r"(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
 );
@@ -114,7 +114,8 @@ pub enum SymbolOwner {
         /// Profile name defined in that project's root configuration.
         name: String,
     },
-    /// One exact release from its defining registry.
+    /// One package from its defining registry, across its releases. A release revision
+    /// names the version a read selects.
     Package {
         /// Package manager or ecosystem name.
         manager: String,
@@ -122,15 +123,12 @@ pub enum SymbolOwner {
         registry: String,
         /// Canonical package name, including an npm scope when present.
         name: String,
-        /// Exact release version.
-        version: String,
     },
-    /// Standard-library object owned by a runtime or compiler.
+    /// Standard-library object owned by a runtime or compiler, across its releases. A
+    /// release revision names the version a read selects.
     Runtime {
         /// Canonical runtime or compiler name.
         runtime: String,
-        /// Exact runtime or compiler version.
-        version: String,
     },
 }
 
@@ -211,14 +209,14 @@ impl schemars::JsonSchema for SymbolIdentity {
             "maxLength": SYMBOL_ID_BYTES_MAX,
             "pattern": SYMBOL_ID_PATTERN,
             "not": {"pattern": "/\\.{1,2}(?:/|$)"},
-            "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
+            "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.",
             "examples": [
                 "rift://symbol/local/rust/app/parser/parse",
                 "rift://symbol/local@cloud/rust/app/load",
                 "rift://symbol/local:docs/typescript/page/beacon",
                 "rift://symbol/local@cloud:docs/typescript/page/beacon",
-                "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
-                "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
+                "rift://symbol/npm/npmjs.org/@types/node/typescript/node/buffer/Buffer",
+                "rift://symbol/stdlib/cpython/python/builtins/len"
             ]
         })
     }
@@ -399,11 +397,10 @@ impl SymbolOwner {
                 manager,
                 registry,
                 name,
-                version,
-            } => [manager, registry, name, version]
+            } => [manager, registry, name]
                 .iter()
                 .fold(0usize, |total, value| total.saturating_add(value.len())),
-            Self::Runtime { runtime, version } => runtime.len().saturating_add(version.len()),
+            Self::Runtime { runtime } => runtime.len(),
         }
     }
 
@@ -427,23 +424,15 @@ impl SymbolOwner {
                 manager,
                 registry,
                 name,
-                version,
             } => {
                 manager.len() <= 128
                     && registry.len() <= 4096
                     && name.len() <= 4096
-                    && version.len() <= 4096
                     && valid_manager(manager)
                     && valid_registry(registry)
                     && valid_package_name(manager, name)
-                    && valid_version(manager, version)
             }
-            Self::Runtime { runtime, version } => {
-                runtime.len() <= 128
-                    && version.len() <= 4096
-                    && valid_word(runtime)
-                    && canonical_semver(version)
-            }
+            Self::Runtime { runtime } => runtime.len() <= 128 && valid_word(runtime),
         };
         if !accepted {
             return Err(SymbolIdentityViolation::Owner.into());
@@ -481,10 +470,28 @@ impl SymbolOwner {
         )
     }
 
-    /// A package or runtime owner's release spelling, the form a release revision carries:
-    /// `cargo/crates.io/demo@1.0.0`, `stdlib/cpython@3.12.9`. Absent for a local owner.
-    pub(crate) fn release_spelling(&self) -> Option<String> {
-        (!self.is_local()).then(|| self.wire_owner())
+    /// Whether `version` names one exact release of this package or runtime owner, in the
+    /// canonical spelling its ecosystem uses: semantic versions for `cargo`, `npm`, and
+    /// runtimes, PEP 440 for `pypi`. Always false for a local owner.
+    #[must_use]
+    pub fn accepts_release(&self, version: &str) -> bool {
+        let within = !version.is_empty() && version.len() <= 4096;
+        let spelled = match self {
+            Self::Package { manager, .. } => valid_version(manager, version),
+            Self::Runtime { .. } => canonical_semver(version),
+            Self::Local
+            | Self::NamedLocal { .. }
+            | Self::ProfileLocal { .. }
+            | Self::NamedProfileLocal { .. } => false,
+        };
+        within && spelled && self.validate().is_ok()
+    }
+
+    /// The spelling a release revision carries for one version of this package or runtime
+    /// owner: `cargo/crates.io/demo@1.0.0`, `stdlib/cpython@3.12.9`. Absent for a local
+    /// owner.
+    pub(crate) fn release_spelling(&self, version: &str) -> Option<String> {
+        (!self.is_local()).then(|| format!("{}@{}", self.wire_owner(), encode_component(version)))
     }
 
     fn wire_owner(&self) -> String {
@@ -503,22 +510,15 @@ impl SymbolOwner {
                 manager,
                 registry,
                 name,
-                version,
             } => {
                 let name = name
                     .split('/')
                     .map(encode_component)
                     .collect::<Vec<_>>()
                     .join("/");
-                format!(
-                    "{manager}/{}/{name}@{}",
-                    encode_component(registry),
-                    encode_component(version)
-                )
+                format!("{manager}/{}/{name}", encode_component(registry))
             }
-            Self::Runtime { runtime, version } => {
-                format!("stdlib/{runtime}@{}", encode_component(version))
-            }
+            Self::Runtime { runtime } => format!("stdlib/{runtime}"),
         }
     }
 }
@@ -544,10 +544,9 @@ fn parse_owner<'a>(
         return Ok(owner);
     }
     match scope {
-        "stdlib" => {
-            let (runtime, version) = parse_release(next_segment(segments)?)?;
-            Ok(SymbolOwner::Runtime { runtime, version })
-        }
+        "stdlib" => Ok(SymbolOwner::Runtime {
+            runtime: decode_component(next_segment(segments)?)?,
+        }),
         manager => parse_package_owner(manager, segments),
     }
 }
@@ -586,42 +585,42 @@ fn parse_package_owner<'a>(
 ) -> Result<SymbolOwner, RiftError> {
     let registry = decode_component(next_segment(segments)?)?;
     let first = next_segment(segments)?;
-    let (name, version) = match (manager, first.starts_with('@')) {
-        ("npm", true) => {
-            let (name, version) = parse_release(next_segment(segments)?)?;
-            (format!("{}/{name}", decode_component(first)?), version)
-        }
-        _ => parse_release(first)?,
+    let name = match (manager, first.starts_with('@')) {
+        ("npm", true) => format!(
+            "{}/{}",
+            decode_component(first)?,
+            decode_component(next_segment(segments)?)?
+        ),
+        _ => decode_component(first)?,
     };
     Ok(SymbolOwner::Package {
         manager: manager.to_owned(),
         registry,
         name,
-        version,
     })
 }
 
-/// Parses one canonical package or runtime release spelling, as
-/// [`SymbolOwner::release_spelling`] renders it.
-pub(crate) fn parse_release_owner(value: &str) -> Result<SymbolOwner, RiftError> {
-    let mut segments = value.split('/');
+/// Parses one canonical release spelling, as [`SymbolOwner::release_spelling`] renders it,
+/// into its package or runtime owner and version.
+pub(crate) fn parse_release_owner(value: &str) -> Result<(SymbolOwner, String), RiftError> {
+    let (owner, version) = value
+        .rsplit_once('@')
+        .filter(|(owner, _)| !owner.ends_with('/'))
+        .ok_or(SymbolIdentityViolation::Structure)?;
+    let mut segments = owner.split('/');
     let scope = next_segment(&mut segments)?;
     let owner = parse_owner(scope, &mut segments)?;
     if owner.is_local() || segments.next().is_some() {
         return Err(SymbolIdentityViolation::Structure.into());
     }
-    owner.validate()?;
-    if owner.wire_owner() != value {
+    let version = decode_component(version)?;
+    if !owner.accepts_release(&version) {
+        return Err(SymbolIdentityViolation::Owner.into());
+    }
+    if owner.release_spelling(&version).as_deref() != Some(value) {
         return Err(SymbolIdentityViolation::Noncanonical.into());
     }
-    Ok(owner)
-}
-
-fn parse_release(value: &str) -> Result<(String, String), RiftError> {
-    let (name, version) = value
-        .rsplit_once('@')
-        .ok_or(SymbolIdentityViolation::Owner)?;
-    Ok((decode_component(name)?, decode_component(version)?))
+    Ok((owner, version))
 }
 
 fn next_segment<'a>(segments: &mut impl Iterator<Item = &'a str>) -> Result<&'a str, RiftError> {

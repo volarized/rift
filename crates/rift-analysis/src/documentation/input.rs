@@ -868,7 +868,7 @@ mod tests {
     fn package_source(text: &str) -> DocumentationSource {
         let mut record = source("README.md", text);
         record.identity.source = DocumentationSourceIdentity::Package {
-            unit: SourceUnitId("rift://source/cargo/crates.io/beacon@1.0.0/README.md".to_owned()),
+            unit: SourceUnitId("rift://source/cargo/crates.io/beacon/README.md".to_owned()),
         };
         record.origin = SymbolOrigin {
             location: Some(SourceLocationKind::Dependency),
@@ -890,8 +890,14 @@ mod tests {
         let record = package_source("a");
         assert!(DocumentationInput::new(record.clone(), "a").is_ok());
         let mut changed = record.clone();
-        changed.origin.package.as_mut().expect("package").version = "2.0.0".to_owned();
+        changed.origin.package.as_mut().expect("package").name = "other".to_owned();
         assert_eq!(violation(changed, "a"), DocumentationViolation::Origin);
+        let mut release = record.clone();
+        release.origin.package.as_mut().expect("package").version = "2.0.0".to_owned();
+        assert!(
+            DocumentationInput::new(release, "a").is_ok(),
+            "a package source unit names no release, so any version of the package reads it"
+        );
         let mut changed = record.clone();
         changed.origin.package = None;
         assert_eq!(violation(changed, "a"), DocumentationViolation::Origin);
@@ -907,7 +913,7 @@ mod tests {
         package.registry = "registry.example:8443/team/api".to_owned();
         record.identity.source = DocumentationSourceIdentity::Package {
             unit: SourceUnitId(
-                "rift://source/cargo/registry.example:8443%2Fteam%2Fapi/beacon@1.0.0/guide.ipynb"
+                "rift://source/cargo/registry.example:8443%2Fteam%2Fapi/beacon/guide.ipynb"
                     .to_owned(),
             ),
         };
@@ -934,7 +940,10 @@ mod tests {
         );
         let mut wrong_path = record.clone();
         wrong_path.identity.source = DocumentationSourceIdentity::Package {
-            unit: SourceUnitId("rift://source/cargo/registry.example:8443%2Fteam%2Fapi/beacon@1.0.0/../guide.ipynb".to_owned()),
+            unit: SourceUnitId(
+                "rift://source/cargo/registry.example:8443%2Fteam%2Fapi/beacon/../guide.ipynb"
+                    .to_owned(),
+            ),
         };
         assert_eq!(
             violation(wrong_path, "cell"),
@@ -943,7 +952,7 @@ mod tests {
 
         let mut runtime = record.clone();
         runtime.identity.source = DocumentationSourceIdentity::Package {
-            unit: SourceUnitId("rift://source/stdlib/cpython@3.12.9/guide.ipynb".to_owned()),
+            unit: SourceUnitId("rift://source/stdlib/cpython/guide.ipynb".to_owned()),
         };
         runtime.origin.location = Some(SourceLocationKind::Stdlib);
         runtime.origin.package = None;
@@ -964,7 +973,7 @@ mod tests {
             .runtime
             .as_mut()
             .expect("runtime")
-            .version = "3.13.0".to_owned();
+            .runtime = "pypy".to_owned();
         assert_eq!(
             violation(wrong_runtime, "cell"),
             DocumentationViolation::Origin

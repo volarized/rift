@@ -753,7 +753,7 @@ fn package_json(name: &str) -> serde_json::Value {
 
 fn symbol_json(package: &str, suffix: &str) -> serde_json::Value {
     serde_json::json!({
-        "id":format!("rift://symbol/rust/cargo/{package}@1.0.0/src/{suffix}.rs/demo"),
+        "id":format!("rift://symbol/rust/cargo/{package}/src/{suffix}.rs/demo"),
         "kind":"function",
         "language":"rust",
         "name":"demo",
@@ -764,7 +764,7 @@ fn symbol_json(package: &str, suffix: &str) -> serde_json::Value {
 fn search_hit_json(package: &str, suffix: &str) -> serde_json::Value {
     serde_json::json!({
         "package":package_json(package), "symbol":symbol_json(package, suffix),
-        "unit":format!("rift://source/cargo/crates.io/{package}@1.0.0/src/{suffix}.rs"), "range":{"start":0,"end":4}, "line":1,
+        "unit":format!("rift://source/cargo/crates.io/{package}/src/{suffix}.rs"), "range":{"start":0,"end":4}, "line":1,
         "contributing_fields":["qualified_name"], "match_class":"qualified_exact"
     })
 }
@@ -791,7 +791,7 @@ fn invalid_search_page(mode: &OperationFixture) -> serde_json::Value {
         page["items"][0]["source"] = serde_json::json!("unexpected source");
     } else if matches!(mode, OperationFixture::InvalidSourceIdentity) {
         page["items"][0]["unit"] =
-            serde_json::json!("rift://source/cargo/crates.io/other@1.0.0/src/first.rs");
+            serde_json::json!("rift://source/cargo/crates.io/other/src/first.rs");
     } else {
         page["items"][0]["match_class"] = serde_json::json!("substring");
     }
@@ -2096,7 +2096,7 @@ fn traversal_request() -> PackageSearchRequest {
         target: None,
         view: None,
         traversal: Some(SearchTraversal {
-            seed: Some("rift://symbol/stdlib/node@26.11.1/javascript/fs/readFile".to_owned()),
+            seed: Some("rift://symbol/stdlib/node/javascript/fs/readFile".to_owned()),
             to: None,
             depth: Some(1),
             direction: None,
@@ -2115,7 +2115,7 @@ fn traversal_request_preserves_runtime_seed_without_lexical_fields() {
     }
     assert_eq!(
         value["traversal"]["seed"],
-        "rift://symbol/stdlib/node@26.11.1/javascript/fs/readFile"
+        "rift://symbol/stdlib/node/javascript/fs/readFile"
     );
 }
 
@@ -2129,7 +2129,7 @@ fn traversal_request_refuses_missing_seed_local_owner_and_excess_depth() {
             "traversal.seed",
         ),
         (
-            Some("rift://symbol/stdlib/node@26.11.1/javascript/fs/readFile"),
+            Some("rift://symbol/stdlib/node/javascript/fs/readFile"),
             3,
             "traversal",
         ),
@@ -2195,7 +2195,7 @@ fn search_request() -> PackageSearchRequest {
 
 fn symbol_request() -> GetSymbolParams {
     serde_json::from_value(serde_json::json!({
-        "id": "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo"
+        "id": "rift://symbol/cargo/crates.io/demo/rust/demo"
     }))
     .expect("canonical symbol request")
 }
@@ -2203,7 +2203,7 @@ fn symbol_request() -> GetSymbolParams {
 fn symbol_result_json(package: &str, suffix: &str) -> serde_json::Value {
     serde_json::json!({
         "outcome": "found", "symbol": {
-            "id": format!("rift://symbol/cargo/crates.io/{package}@1.0.0/rust/{package}"),
+            "id": format!("rift://symbol/cargo/crates.io/{package}/rust/{package}"),
             "language": "rust", "name": package, "kind": "function",
             "origin": {"location": "dependency", "package": package_json(package), "source_kind": "authored"}
         },
@@ -2211,7 +2211,7 @@ fn symbol_result_json(package: &str, suffix: &str) -> serde_json::Value {
         "revision": format!("rift://revision/cargo/crates.io/{package}@1.0.0"),
         "declarations": [{
             "origin": {"location": "dependency", "package": package_json(package), "source_kind": "authored"},
-            "unit": format!("rift://source/cargo/crates.io/{package}@1.0.0/src/{suffix}.rs"),
+            "unit": format!("rift://source/cargo/crates.io/{package}/src/{suffix}.rs"),
             "range": {"start": 0, "end": 4}, "line": 1,
             "signature_indices": [], "type_indices": [], "documentation_indices": []
         }]
@@ -2361,13 +2361,13 @@ async fn declaration_positions_refuse_unproved_global_owners_before_http() {
 async fn source_declaration_batch_preserves_runtime_and_stub_owners_with_one_view() {
     use rift_protocol::source_read::FindDeclarationsParams;
     let positions = serde_json::json!([
-        {"unit":"rift://source/stdlib/cpython@3.12.9/Lib/pathlib.py","line":0,"character":0},
-        {"unit":"rift://source/pypi/pypi.org/types-pathlib@0.1.0/pathlib.pyi","line":2,"character":3}
+        {"unit":"rift://source/stdlib/cpython/Lib/pathlib.py","revision":"rift://revision/stdlib/cpython@3.12.9","line":0,"character":0},
+        {"unit":"rift://source/pypi/pypi.org/types-pathlib/pathlib.pyi","revision":"rift://revision/pypi/pypi.org/types-pathlib@1.0.0","line":2,"character":3}
     ]);
     let request: FindDeclarationsParams = serde_json::from_value(serde_json::json!({"position_encoding":"utf-16","positions":positions,"view":"a".repeat(64)})).expect("position request");
     let view = serde_json::json!({"id":"a".repeat(64),"expires_at":"2026-10-10T10:05:00Z"});
     let value = serde_json::json!({"results":[
-        {"outcome":"found","position":positions[0],"id":"rift://symbol/stdlib/cpython@3.12.9/python/pathlib/Path","kind":"class","view":view},
+        {"outcome":"found","position":positions[0],"id":"rift://symbol/stdlib/cpython/python/pathlib/Path","kind":"class","revision":"rift://revision/stdlib/cpython@3.12.9","view":view},
         {"outcome":"unavailable","position":positions[1],"reason":"insufficient_coverage","view":view}
     ],"warnings":[]});
     let (server, client) = operation_client(OperationFixture::SourceDeclarations(
@@ -2403,8 +2403,8 @@ async fn source_declaration_batch_preserves_runtime_and_stub_owners_with_one_vie
 async fn source_declaration_batch_refuses_reordering_foreign_views_and_whole_batch_missing() {
     use rift_protocol::source_read::FindDeclarationsParams;
     let positions = serde_json::json!([
-        {"unit":"rift://source/stdlib/cpython@3.12.9/Lib/pathlib.py","line":0,"character":0},
-        {"unit":"rift://source/stdlib/cpython@3.12.9/Lib/pathlib.py","line":1,"character":0}
+        {"unit":"rift://source/stdlib/cpython/Lib/pathlib.py","revision":"rift://revision/stdlib/cpython@3.12.9","line":0,"character":0},
+        {"unit":"rift://source/stdlib/cpython/Lib/pathlib.py","revision":"rift://revision/stdlib/cpython@3.12.9","line":1,"character":0}
     ]);
     let request: FindDeclarationsParams = serde_json::from_value(
         serde_json::json!({"position_encoding":"utf-8","positions":positions}),
@@ -2434,7 +2434,7 @@ async fn source_declaration_batch_refuses_reordering_foreign_views_and_whole_bat
 async fn exact_symbol_request_carries_one_immutable_id_and_no_query_selectors() {
     use rift_protocol::read::SymbolId;
     use rift_protocol::symbol_read::{GetSymbolParams, GetSymbolResult};
-    let id = SymbolId::parse("rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/Thing")
+    let id = SymbolId::parse("rift://symbol/cargo/crates.io/demo/rust/demo/Thing")
         .expect("canonical fixture");
     let request: GetSymbolParams =
         serde_json::from_value(serde_json::json!({"id":id})).expect("request");
@@ -2814,7 +2814,7 @@ async fn test_symbol_lookup_keeps_original_names() {
         assert_eq!(declarations.len(), 1);
         assert_eq!(
             declarations[0].unit.as_ref().map(|unit| unit.0.as_str()),
-            Some("rift://source/cargo/crates.io/demo@1.0.0/src/first.rs")
+            Some("rift://source/cargo/crates.io/demo/src/first.rs")
         );
     }
     let mut request = symbol_request();
@@ -2837,9 +2837,9 @@ async fn test_symbol_lookup_refuses_discovery_match_class() {
     );
 }
 
-/// Package analysis mints a package declaration's identity over its unit's resolver and key, so
-/// a hit carries `rift://symbol/rust/cargo/demo@1.0.0/src/first.rs/demo` beside the unit
-/// `rift://source/cargo/crates.io/demo@1.0.0/src/first.rs`. The package-relative spelling names a
+/// Package analysis mints a package declaration's identity over its package and path, so
+/// a hit carries `rift://symbol/rust/cargo/demo/src/first.rs/demo` beside the unit
+/// `rift://source/cargo/crates.io/demo/src/first.rs`. The package-relative spelling names a
 /// project file, and no producer mints it for a package declaration, so it is refused.
 #[tokio::test]
 async fn test_hits_accept_the_symbol_identity_package_analysis_mints() {
@@ -2848,15 +2848,15 @@ async fn test_hits_accept_the_symbol_identity_package_analysis_mints() {
         value["symbol"]["id"] = serde_json::json!(id);
         serde_json::from_value::<PackageSearchHit>(value).expect("search hit fixture")
     };
-    let minted = rift_core::symbol_identity("rust", "cargo/demo@1.0.0/src/first.rs", "demo");
+    let minted = rift_core::symbol_identity("rust", "cargo/demo/src/first.rs", "demo");
     let candidate = PackageSearchCandidate::try_from(&hit(&minted));
     assert!(candidate.is_ok(), "{minted}: {candidate:?}");
     let refused = [
         "rift://symbol/rust/src/first.rs/demo",
-        "rift://symbol/rust/cargo/demo@2.0.0/src/first.rs/demo",
-        "rift://symbol/rust/npm/demo@1.0.0/src/first.rs/demo",
-        "rift://symbol/rust/cargo/demo@1.0.0/src/second.rs/demo",
-        "rift://symbol/rust/cargo/demo@1.0.0/demo",
+        "rift://symbol/rust/cargo/other/src/first.rs/demo",
+        "rift://symbol/rust/npm/demo/src/first.rs/demo",
+        "rift://symbol/rust/cargo/demo/src/second.rs/demo",
+        "rift://symbol/rust/cargo/demo/demo",
     ];
     for id in refused {
         let error = PackageSearchCandidate::try_from(&hit(id)).expect_err("identity refusal");
@@ -2881,11 +2881,11 @@ async fn test_hits_accept_the_symbol_identity_package_analysis_mints() {
     assert_eq!(symbol.id.as_ref(), Some(&symbol_request().id));
     assert_eq!(
         declarations[0].unit.as_ref().map(|unit| unit.0.as_str()),
-        Some("rift://source/cargo/crates.io/demo@1.0.0/src/first.rs")
+        Some("rift://source/cargo/crates.io/demo/src/first.rs")
     );
     for unit in [
-        "rift://source/cargo/crates.io/demo@2.0.0/src/first.rs",
-        "rift://source/npm/npmjs.org/demo@1.0.0/src/first.rs",
+        "rift://source/cargo/crates.io/other/src/first.rs",
+        "rift://source/npm/npmjs.org/demo/src/first.rs",
     ] {
         let mut value = symbol_result_json("demo", "first");
         value["declarations"][0]["unit"] = serde_json::json!(unit);
@@ -3031,7 +3031,7 @@ async fn test_fixture_enforces_active_server_bounds() {
 
 #[test]
 fn generated_read_warning_preserves_bound_and_source_evidence() {
-    let unit = "rift://source/stdlib/node@22.14.0/lib/fs.js";
+    let unit = "rift://source/stdlib/node/lib/fs.js";
     let value = serde_json::json!({
         "code": "object_unavailable", "unit": unit,
         "range": {"start": 4, "end": 12}, "qualified_name": "fs::wide",
@@ -3053,7 +3053,7 @@ fn generated_read_warning_preserves_bound_and_source_evidence() {
 #[test]
 fn generated_exact_symbol_shapes_keep_shared_requests_and_typed_outcomes() {
     use rift_protocol::symbol_read::{GetSymbolParams, GetSymbolResult};
-    const ID: &str = "rift://symbol/cargo/crates.io/tokio@1.50.0/rust/tokio/Beacon";
+    const ID: &str = "rift://symbol/cargo/crates.io/tokio/rust/tokio/Beacon";
     let request: GetSymbolParams = serde_json::from_value(json!({
         "id": ID, "include": ["history", "documentation"], "declaration_limit": 5,
         "view": "a".repeat(64),

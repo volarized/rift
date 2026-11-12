@@ -786,6 +786,41 @@ async fn successful_search_uses_remote_phases_without_local_request_fields() -> 
     Ok(())
 }
 
+/// A package `get_symbol` or `nodes` read naming no revision reads the release the
+/// workspace's dependencies pin, and its answer reports that release.
+#[tokio::test]
+async fn a_package_symbol_read_names_the_release_the_workspace_pins() -> TestResult {
+    let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n{DEMO_PACKAGE}",
+        fixture.endpoint
+    );
+    let workspace = served_dependent_workspace(Some(&configuration)).await?;
+    let (directory, client, server_task) = workspace.served;
+    let id = global_api::collected_identity(SymbolFixture::Valid, "beacon");
+    let release = "rift://revision/cargo/crates.io/demo@1.0.0";
+    let read = call_tool(&client, "get_symbol", json!({"id": id})).await?;
+    assert_eq!(read["revision"], release, "{read:#}");
+    let nodes = call_tool(&client, "nodes", json!({"symbol": id})).await?;
+    assert_eq!(nodes["revision"], release, "{nodes:#}");
+    for endpoint in ["/v1/symbols", "/v1/nodes"] {
+        let asked = fixture
+            .requests()
+            .await
+            .into_iter()
+            .filter(|request| request.uri.ends_with(endpoint))
+            .filter_map(|request| request.body)
+            .map(|body| body["revision"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(asked, [json!(release)], "{endpoint}");
+    }
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
 /// The nodes of a package symbol come from the global API in the shape a project symbol's
 /// nodes take: the package's `beacon` and the project's `beacon` share each node's identity,
 /// kind, and source, and differ in the unit and offsets that locate them.
@@ -845,14 +880,6 @@ async fn package_symbol_nodes_come_from_the_global_api_in_the_project_shape() ->
         package_nodes[0]["source"], "pub fn beacon() {}",
         "{package:#}"
     );
-    let asked = fixture
-        .requests()
-        .await
-        .into_iter()
-        .filter(|request| request.uri.ends_with("/v1/nodes"))
-        .map(|request| request.body)
-        .collect::<Vec<_>>();
-    assert_eq!(asked, [Some(json!({"symbol": id}))]);
 
     let view = "a".repeat(64);
     let in_view = call_tool(&client, "nodes", json!({"symbol": id, "view": view})).await?;

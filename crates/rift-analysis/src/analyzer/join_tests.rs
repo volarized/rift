@@ -602,9 +602,9 @@ fn test_node_declare_module_members_join_the_runtime_module() {
     let unit = rift_core::SourceUnitId::parse(&companion.unit.0).expect("physical companion unit");
     assert_eq!(unit.key().as_str(), "fs.d.ts");
     assert!(unit.source_owner().is_some_and(|owner| matches!(owner,
-        rift_protocol::identity::SymbolOwner::Package { manager, registry, name, version }
+        rift_protocol::identity::SymbolOwner::Package { manager, registry, name }
             if manager == "npm" && registry == "registry.npmjs.org"
-                && name == "@types/node" && version == "26.6.4")));
+                && name == "@types/node")));
     assert!(
         publication
             .files()
@@ -661,7 +661,7 @@ fn test_a_joined_declaration_records_its_stub_forms_and_ranges() {
         .expect("the stub is analyzed");
     assert_eq!(
         stub_file.placement.identity_path(),
-        "pypi/pypi.org/beacon@1.0.0/mod.pyi"
+        "pypi/pypi.org/beacon/mod.pyi"
     );
 
     let identities: Vec<String> = forms.iter().map(|form| form.identity().0.clone()).collect();
@@ -875,7 +875,7 @@ fn test_a_package_archive_is_selected_and_analyzed_as_global_ingestion_does() {
     let start = symbol_at(&analysis, "beacon/__init__.py", "start").expect("start joins");
     assert_eq!(
         start.symbol.0,
-        "rift://symbol/pypi/pypi.org/beacon@1.0.0/python/beacon/start"
+        "rift://symbol/pypi/pypi.org/beacon/python/beacon/start"
     );
     assert_eq!(
         binding_signature_displays(

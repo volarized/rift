@@ -4,6 +4,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::read::{ExactKind, ReadWarning, SourceUnitId, SymbolId};
+use crate::revision::Revision;
 use crate::symbol_read::{CapturedView, CapturedViewId, SymbolUnavailableReason};
 
 /// Most positions submitted to one declaration-position read.
@@ -22,12 +23,17 @@ pub enum PositionEncoding {
     Utf16,
 }
 
-/// One exact position in a project, package or runtime source unit.
+/// One exact position in a source unit, at the release of a package or runtime unit.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourcePosition {
     /// Canonical physical source unit, independent of the logical symbol owner.
     pub unit: SourceUnitId,
+    /// The release of the unit's package or runtime owner whose bytes hold the position, as
+    /// `rift://revision/cargo/crates.io/demo@1.0.0`. Present exactly when the unit has such an
+    /// owner: a custom resolver's unit names no release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<Revision>,
     /// Zero-based source line.
     #[schemars(range(min = 0_u64, max = SOURCE_POSITION_MAX))]
     pub line: u64,
@@ -65,6 +71,9 @@ pub enum DeclarationPositionResult {
         id: SymbolId,
         /// Declaration kind in the provider's vocabulary.
         kind: ExactKind,
+        /// The release of the declaration's owner that `id` answers in. It differs from
+        /// the position's release when a proved stub mapping names a runtime declaration.
+        revision: Revision,
         /// Immutable selection supplying this declaration.
         view: CapturedView,
     },
@@ -100,12 +109,18 @@ pub struct FindDeclarationsResult {
 }
 
 impl SourcePosition {
-    /// Checks canonical source spelling and negotiated coordinate bounds.
+    /// Checks canonical source spelling, a release exactly for a unit with a package or runtime
+    /// owner, and negotiated coordinate bounds.
     #[must_use]
     pub fn is_valid(&self) -> bool {
-        SourceUnitId::parse(self.unit.as_str()).is_ok()
-            && self.line <= SOURCE_POSITION_MAX
-            && self.character <= SOURCE_POSITION_MAX
+        let released = crate::identity::parse_source_unit_identity(self.unit.as_str()).is_ok_and(
+            |(owner, _)| match (owner, &self.revision) {
+                (Some(owner), Some(revision)) => revision.answers_for(&owner),
+                (None, None) => true,
+                (Some(_), None) | (None, Some(_)) => false,
+            },
+        );
+        released && self.line <= SOURCE_POSITION_MAX && self.character <= SOURCE_POSITION_MAX
     }
 }
 
@@ -164,8 +179,11 @@ impl FindDeclarationsResult {
                         Some(view) == selected && view_matches(view, request.view.as_ref())
                     })
                     && match result {
-                        DeclarationPositionResult::Found { id, kind, .. } => {
-                            SymbolId::parse(id.as_str()).is_ok()
+                        DeclarationPositionResult::Found {
+                            id, kind, revision, ..
+                        } => {
+                            crate::identity::SymbolIdentity::parse(id.as_str())
+                                .is_ok_and(|identity| revision.answers_for(identity.owner()))
                                 && ExactKind::try_from(kind.0.clone()).is_ok()
                         }
                         _ => true,

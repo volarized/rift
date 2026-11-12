@@ -137,7 +137,7 @@ impl PackageImportRoot {
         self.prefix.as_ref().map_or(0, |path| path.as_str().len())
             + self.modules.iter().map(String::len).sum::<usize>()
             + self.runtime.as_ref().map_or(0, |owner| match owner {
-                SymbolOwner::Runtime { runtime, version } => runtime.len() + version.len(),
+                SymbolOwner::Runtime { runtime } => runtime.len(),
                 _ => 0,
             })
     }

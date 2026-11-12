@@ -15,6 +15,7 @@ use super::{
 #[derive(Debug, Clone, Copy)]
 pub struct NamespaceInput<'input> {
     owner: &'input SymbolOwner,
+    release_version: Option<&'input str>,
     language: &'input Language,
     files: &'input [PackageSource<'input>],
     context_sources: &'input [PackageSource<'input>],
@@ -33,6 +34,7 @@ impl<'input> NamespaceInput<'input> {
     pub(super) fn from_package(input: &ExactPackageInput<'input>) -> Self {
         Self {
             owner: input.owner,
+            release_version: Some(input.release_version),
             language: input.language,
             files: input.files,
             context_sources: input.context_sources,
@@ -126,6 +128,7 @@ impl<'input> NamespaceInput<'input> {
         super::import_root::validate_runtime_roots(owner, language, files, import_roots)?;
         Ok(Self {
             owner,
+            release_version: None,
             language,
             files,
             context_sources,
@@ -311,6 +314,12 @@ impl<'input> NamespaceInput<'input> {
     #[must_use]
     pub const fn owner(self) -> &'input SymbolOwner {
         self.owner
+    }
+
+    /// Version of the package or runtime release the input analyzes; absent for a project.
+    #[must_use]
+    pub const fn release_version(self) -> Option<&'input str> {
+        self.release_version
     }
 
     /// Language selected by the caller.

@@ -68,9 +68,8 @@ fn unavailable_syntax_keeps_local_profile_and_extra_error_labels_distinct() {
         (
             SymbolOwner::Runtime {
                 runtime: "rust".to_owned(),
-                version: "1.98.0".to_owned(),
             },
-            "stdlib/rust@1.98.0",
+            "stdlib/rust",
         ),
     ] {
         owner.validate().expect("valid owner");

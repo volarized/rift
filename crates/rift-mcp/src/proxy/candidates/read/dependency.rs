@@ -175,7 +175,7 @@ mod tests {
             upstream_view: None,
         };
         let owner = SymbolIdentity::parse(
-            "rift://symbol/pypi/pypi.org/greeting@1.0.0/python/greeting/core/greet",
+            "rift://symbol/pypi/pypi.org/greeting/python/greeting/core/greet",
         )
         .expect("identity")
         .owner()
@@ -201,7 +201,7 @@ mod tests {
         for view in [Some(earlier.view.clone()), None] {
             let mut response: GetSymbolResult = serde_json::from_value(serde_json::json!({
                 "outcome":"unavailable",
-                "id":"rift://symbol/pypi/pypi.org/greeting@1.0.0/python/greeting/core/greet",
+                "id":"rift://symbol/pypi/pypi.org/greeting/python/greeting/core/greet",
                 "view":view, "reason":"insufficient_coverage"
             }))
             .expect("unavailable symbol reply");

@@ -442,7 +442,7 @@ fn changed_version_moved_file_and_changed_source_rebuild_current_identities() {
             .as_ref()
             .expect("root object")
             .0,
-        "rift://symbol/cargo/crates.io/beacon@2.0.0/rust/beacon/open"
+        "rift://symbol/cargo/crates.io/beacon/rust/beacon/open"
     );
     assert_eq!(
         object_at(&reused, "src/changed.rs", "close")
@@ -450,11 +450,18 @@ fn changed_version_moved_file_and_changed_source_rebuild_current_identities() {
             .as_ref()
             .expect("module object")
             .0,
-        "rift://symbol/cargo/crates.io/beacon@2.0.0/rust/beacon/changed/close"
+        "rift://symbol/cargo/crates.io/beacon/rust/beacon/changed/close"
+    );
+    assert_eq!(
+        reused.publication().revision.to_string(),
+        "rift://revision/cargo/crates.io/beacon@2.0.0"
     );
     for symbol in &reused.publication().declarations {
         assert!(
-            symbol.symbol.0.contains("beacon@2.0.0/"),
+            symbol
+                .symbol
+                .0
+                .starts_with("rift://symbol/cargo/crates.io/beacon/"),
             "{}",
             symbol.symbol.0
         );

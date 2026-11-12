@@ -715,7 +715,7 @@ mod tests {
         );
         assert_eq!(
             spawn.source().map(|binding| binding.unit().to_string()),
-            Some("rift://source/cargo/registry.example/tokio@1.53.1/src/lib.rs".to_owned())
+            Some("rift://source/cargo/registry.example/tokio/src/lib.rs".to_owned())
         );
         assert_eq!(
             spawn.origin().location(),

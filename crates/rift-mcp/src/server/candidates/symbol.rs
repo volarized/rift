@@ -222,10 +222,21 @@ impl RiftMcp {
             .configuration
             .accepted_for_tool(super::wire::ErrorPhase::Read)?;
         let configuration = resolved.published.configuration.global_configuration();
+        let mut selected = params.clone();
+        if selected.revision.is_none() && selected.view.is_none() && selected.node_cursor.is_none()
+        {
+            selected.revision = selected.symbol.as_ref().and_then(|symbol| {
+                let identity = SymbolIdentity::parse(symbol.as_str()).ok()?;
+                crate::global::workspace_release(
+                    resolved.published.reads.dependency_context(),
+                    identity.owner(),
+                )
+            });
+        }
         within_deadline(
             deadline,
             "nodes",
-            self.global.symbol_nodes(&configuration, params),
+            self.global.symbol_nodes(&configuration, &selected),
         )
         .await
         .map(Json)
@@ -253,10 +264,25 @@ impl RiftMcp {
             params.view.as_ref(),
             "get_symbol",
         )?;
+        let mut selected = params.clone();
+        if selected.revision.is_none()
+            && selected.view.is_none()
+            && selected.declaration_cursor.is_none()
+        {
+            selected.revision =
+                SymbolIdentity::parse(selected.id.as_str())
+                    .ok()
+                    .and_then(|identity| {
+                        crate::global::workspace_release(
+                            resolved.published.reads.dependency_context(),
+                            identity.owner(),
+                        )
+                    });
+        }
         let result = within_deadline(
             deadline,
             "get_symbol",
-            self.global.exact_symbol(&configuration, params),
+            self.global.exact_symbol(&configuration, &selected),
         )
         .await?;
         let view = match &result {
@@ -364,7 +390,7 @@ mod tests {
             return Err("initial project symbol must be found".into());
         };
         let foreign: GetSymbolParams = serde_json::from_value(json!({
-            "id":"rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
+            "id":"rift://symbol/npm/npmjs.org/@types/node/typescript/node/buffer/Buffer",
             "view":view.id
         }))?;
         let Json(answer) = server.exact_symbol(foreign).await?;
@@ -395,7 +421,7 @@ mod tests {
             "id":"claims.remote", "expires_at":"2030-01-01T00:10:00Z"
         }))?;
         let symbol: GetSymbolParams = serde_json::from_value(json!({
-            "id":"rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon", "view":view.id
+            "id":"rift://symbol/cargo/crates.io/demo/rust/demo/beacon", "view":view.id
         }))?;
         for expired in [false, true] {
             let mut selected = crate::global::candidates::SavedCandidateBackend {

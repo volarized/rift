@@ -36,12 +36,11 @@ fn selected_anchors(
     qualified_name: Option<&str>,
     restored_paths: bool,
 ) -> super::super::Anchors {
-    let owner = SymbolIdentity::parse(
-        "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/crate_root/Example",
-    )
-    .expect("exact owner")
-    .owner()
-    .clone();
+    let owner =
+        SymbolIdentity::parse("rift://symbol/cargo/crates.io/crate-root/rust/crate_root/Example")
+            .expect("exact owner")
+            .owner()
+            .clone();
     let origin = ContributionOrigin::new(
         Some(SourceLocation::Dependency {
             package: PackageIdentity {
@@ -255,11 +254,11 @@ fn captured_cargo_library_root_and_inline_members_have_logical_namespace() {
     );
     assert_eq!(
         found["start"].as_str(),
-        "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/crate_root/start"
+        "rift://symbol/cargo/crates.io/crate-root/rust/crate_root/start"
     );
     assert_eq!(
         found["inner::Runner::run"].as_str(),
-        "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/crate_root/inner/Runner/run"
+        "rift://symbol/cargo/crates.io/crate-root/rust/crate_root/inner/Runner/run"
     );
     assert!(
         !found
@@ -362,7 +361,7 @@ fn explicit_library_name_and_path_replace_physical_layout() {
     );
     assert_eq!(
         found["Runner"].as_str(),
-        "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/actual_library/Runner"
+        "rift://symbol/cargo/crates.io/crate-root/rust/actual_library/Runner"
     );
 }
 
@@ -370,7 +369,7 @@ fn explicit_library_name_and_path_replace_physical_layout() {
 fn repeated_declarations_share_one_identity() {
     let source = "pub fn repeat() {}\npub fn repeat() {}";
     let found = anchors(&[("Cargo.toml", MANIFEST)], "src/lib.rs", source);
-    let expected = "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/crate_root/repeat";
+    let expected = "rift://symbol/cargo/crates.io/crate-root/rust/crate_root/repeat";
     assert_eq!(found.len(), 1, "both declarations spell one qualified name");
     assert_eq!(found["repeat"].as_str(), expected);
 }
@@ -473,7 +472,7 @@ fn helper_uses_exact_package_owner_without_runtime_or_registry_defaults() {
     let identity =
         SymbolIdentity::parse(found["Runner"].as_str()).expect("canonical logical identity");
     assert!(
-        matches!(identity.owner(), SymbolOwner::Package {manager,registry,name,version} if manager == "cargo" && registry == "crates.io" && name == "crate-root" && version == "1.0.0")
+        matches!(identity.owner(), SymbolOwner::Package {manager,registry,name} if manager == "cargo" && registry == "crates.io" && name == "crate-root")
     );
 }
 
@@ -491,11 +490,11 @@ fn declared_sibling_modules_keep_distinct_logical_paths() {
     );
     assert_eq!(
         found["src/a.rs"]["Sender"].as_str(),
-        "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/crate_root/a/Sender"
+        "rift://symbol/cargo/crates.io/crate-root/rust/crate_root/a/Sender"
     );
     assert_eq!(
         found["src/b.rs"]["Sender"].as_str(),
-        "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/crate_root/b/Sender"
+        "rift://symbol/cargo/crates.io/crate-root/rust/crate_root/b/Sender"
     );
     assert_ne!(found["src/a.rs"]["Sender"], found["src/b.rs"]["Sender"]);
 }
@@ -516,11 +515,11 @@ fn declared_default_modules_follow_file_and_inline_directories() {
     );
     assert_eq!(
         found["src/a/b/c.rs"]["Third"].as_str(),
-        "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/crate_root/a/b/c/Third"
+        "rift://symbol/cargo/crates.io/crate-root/rust/crate_root/a/b/c/Third"
     );
     assert_eq!(
         found["src/outer/leaf.rs"]["run"].as_str(),
-        "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/crate_root/outer/leaf/run"
+        "rift://symbol/cargo/crates.io/crate-root/rust/crate_root/outer/leaf/run"
     );
 }
 
@@ -541,11 +540,11 @@ fn documented_modules_keep_default_external_and_inline_graph() {
     );
     assert_eq!(
         found["src/a.rs"]["Sender"].as_str(),
-        "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/crate_root/a/Sender"
+        "rift://symbol/cargo/crates.io/crate-root/rust/crate_root/a/Sender"
     );
     assert_eq!(
         found["src/outer/leaf.rs"]["run"].as_str(),
-        "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/crate_root/outer/leaf/run"
+        "rift://symbol/cargo/crates.io/crate-root/rust/crate_root/outer/leaf/run"
     );
 }
 
@@ -697,7 +696,6 @@ fn captured_library_name_above_canonical_identity_bound_stays_unresolved() {
 fn runtime_anchors(metadata: &[(&str, &str)], selected: &[(&str, &str)]) -> super::super::Anchors {
     let owner = rift_protocol::identity::SymbolOwner::Runtime {
         runtime: "rust".into(),
-        version: "1.98.1".into(),
     };
     let origin = ContributionOrigin::new(
         Some(SourceLocation::Stdlib {
@@ -822,19 +820,19 @@ fn runtime_cargo_roots_keep_acquisition_version_and_distinct_crates() {
     );
     assert_eq!(
         found["core/src/lib.rs"]["Root"].as_str(),
-        "rift://symbol/stdlib/rust@1.98.1/rust/core/Root"
+        "rift://symbol/stdlib/rust/rust/core/Root"
     );
     assert_eq!(
         found["core/src/option.rs"]["Option"].as_str(),
-        "rift://symbol/stdlib/rust@1.98.1/rust/core/option/Option"
+        "rift://symbol/stdlib/rust/rust/core/option/Option"
     );
     assert_eq!(
         found["alloc/src/lib.rs"]["Root"].as_str(),
-        "rift://symbol/stdlib/rust@1.98.1/rust/alloc/Root"
+        "rift://symbol/stdlib/rust/rust/alloc/Root"
     );
     assert_eq!(
         found["std/src/lib.rs"]["io::read"].as_str(),
-        "rift://symbol/stdlib/rust@1.98.1/rust/std/io/read"
+        "rift://symbol/stdlib/rust/rust/std/io/read"
     );
     assert_eq!(found.len(), 4);
 }
@@ -901,7 +899,7 @@ fn runtime_explicit_target_and_inherited_package_version_keep_runtime_owner() {
     );
     assert_eq!(
         found["wrapper/lib.rs"]["Root"].as_str(),
-        "rift://symbol/stdlib/rust@1.98.1/rust/actual_core/Root"
+        "rift://symbol/stdlib/rust/rust/actual_core/Root"
     );
 }
 
@@ -1102,12 +1100,11 @@ fn transparent_item_macros_refuse_unproved_forwarding_and_changed_items() {
 
 #[test]
 fn selected_non_test_library_context_requires_original_owner_manifest_and_root() {
-    let owner = SymbolIdentity::parse(
-        "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/crate_root/Example",
-    )
-    .expect("exact owner")
-    .owner()
-    .clone();
+    let owner =
+        SymbolIdentity::parse("rift://symbol/cargo/crates.io/crate-root/rust/crate_root/Example")
+            .expect("exact owner")
+            .owner()
+            .clone();
     let origin = ContributionOrigin::new(
         Some(SourceLocation::Dependency {
             package: PackageIdentity {
@@ -1192,12 +1189,11 @@ fn selected_non_test_library_context_requires_original_owner_manifest_and_root()
 
 #[test]
 fn selected_library_context_refuses_admitted_manifest_with_wrong_release_or_target() {
-    let owner = SymbolIdentity::parse(
-        "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/crate_root/Example",
-    )
-    .expect("exact owner")
-    .owner()
-    .clone();
+    let owner =
+        SymbolIdentity::parse("rift://symbol/cargo/crates.io/crate-root/rust/crate_root/Example")
+            .expect("exact owner")
+            .owner()
+            .clone();
     let origin = ContributionOrigin::new(
         Some(SourceLocation::Dependency {
             package: PackageIdentity {
@@ -1250,12 +1246,11 @@ fn complete_mixed_scope_keeps_selected_library_modules_after_literal_items() {
         ("src/macros.rs", definition),
         ("src/runtime.rs", "pub struct Runtime;"),
     ];
-    let owner = SymbolIdentity::parse(
-        "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/crate_root/Example",
-    )
-    .expect("actual package owner")
-    .owner()
-    .clone();
+    let owner =
+        SymbolIdentity::parse("rift://symbol/cargo/crates.io/crate-root/rust/crate_root/Example")
+            .expect("actual package owner")
+            .owner()
+            .clone();
     let origin = ContributionOrigin::new(
         Some(SourceLocation::Dependency {
             package: PackageIdentity {
@@ -1294,12 +1289,11 @@ fn complete_mixed_scope_keeps_selected_library_modules_after_literal_items() {
 fn complete_mixed_scope_refuses_later_alias_glob_nested_and_unknown_import_effects() {
     let definition =
         "macro_rules! cfg_rt { ($($item:item)*) => { $( #[cfg(feature = \"rt\")] $item )* } }";
-    let owner = SymbolIdentity::parse(
-        "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/crate_root/Example",
-    )
-    .expect("actual owner")
-    .owner()
-    .clone();
+    let owner =
+        SymbolIdentity::parse("rift://symbol/cargo/crates.io/crate-root/rust/crate_root/Example")
+            .expect("actual owner")
+            .owner()
+            .clone();
     let origin = ContributionOrigin::new(
         Some(SourceLocation::Dependency {
             package: PackageIdentity {
@@ -1526,12 +1520,11 @@ fn conditional_documentation_keeps_complete_selected_library_scope() {
     let definition =
         "macro_rules! cfg_rt { ($($item:item)*) => { $( #[cfg(feature = \"rt\")] $item )* } }";
     let source = "#[macro_use] mod macros; #[cfg_attr(docsrs, doc(cfg(feature = \"rt\")))] pub mod task; compile_error!(\"unsupported target\"); cfg_rt! { pub mod runtime; }";
-    let owner = SymbolIdentity::parse(
-        "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/crate_root/Example",
-    )
-    .expect("actual package owner")
-    .owner()
-    .clone();
+    let owner =
+        SymbolIdentity::parse("rift://symbol/cargo/crates.io/crate-root/rust/crate_root/Example")
+            .expect("actual package owner")
+            .owner()
+            .clone();
     let origin = ContributionOrigin::new(
         Some(SourceLocation::Dependency {
             package: PackageIdentity {
@@ -1570,12 +1563,11 @@ fn conditional_documentation_keeps_complete_selected_library_scope() {
 fn conditional_documentation_refuses_mixed_unknown_path_and_macro_import_effects() {
     let definition =
         "macro_rules! cfg_rt { ($($item:item)*) => { $( #[cfg(feature = \"rt\")] $item )* } }";
-    let owner = SymbolIdentity::parse(
-        "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/crate_root/Example",
-    )
-    .expect("actual package owner")
-    .owner()
-    .clone();
+    let owner =
+        SymbolIdentity::parse("rift://symbol/cargo/crates.io/crate-root/rust/crate_root/Example")
+            .expect("actual package owner")
+            .owner()
+            .clone();
     let origin = ContributionOrigin::new(
         Some(SourceLocation::Dependency {
             package: PackageIdentity {
@@ -1697,7 +1689,7 @@ fn documented_module_prefix_keeps_complete_selected_library_scope() {
             "#[macro_use] mod macros;{newline}/// Original module documentation.{newline}/// ```{newline}/// use crate_root::runtime::Runtime;{newline}/// ```{newline}pub mod stream {{}}{newline}cfg_rt! {{ pub mod runtime; }}"
         );
         let owner = SymbolIdentity::parse(
-            "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/crate_root/Example",
+            "rift://symbol/cargo/crates.io/crate-root/rust/crate_root/Example",
         )
         .expect("actual package owner")
         .owner()
@@ -1741,12 +1733,11 @@ fn documented_module_prefix_keeps_complete_selected_library_scope() {
 fn documented_module_prefix_refuses_unknown_path_and_macro_import_effects() {
     let definition =
         "macro_rules! cfg_rt { ($($item:item)*) => { $( #[cfg(feature = \"rt\")] $item )* } }";
-    let owner = SymbolIdentity::parse(
-        "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/crate_root/Example",
-    )
-    .expect("actual package owner")
-    .owner()
-    .clone();
+    let owner =
+        SymbolIdentity::parse("rift://symbol/cargo/crates.io/crate-root/rust/crate_root/Example")
+            .expect("actual package owner")
+            .owner()
+            .clone();
     let origin = ContributionOrigin::new(
         Some(SourceLocation::Dependency {
             package: PackageIdentity {
@@ -1786,12 +1777,11 @@ fn cfg_expression_anchors(prefix: &str, suffix: &str, expression: &str) -> super
     let source = format!(
         "{prefix}#[macro_use] mod macros; cfg_rt! {{ const BOX_FUTURE_THRESHOLD: usize = if {expression} {{ 2048 }} else {{ 16384 }}; pub mod runtime; }} {suffix}"
     );
-    let owner = SymbolIdentity::parse(
-        "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/crate_root/Example",
-    )
-    .expect("actual package owner")
-    .owner()
-    .clone();
+    let owner =
+        SymbolIdentity::parse("rift://symbol/cargo/crates.io/crate-root/rust/crate_root/Example")
+            .expect("actual package owner")
+            .owner()
+            .clone();
     let origin = ContributionOrigin::new(
         Some(SourceLocation::Dependency {
             package: PackageIdentity {
@@ -2047,12 +2037,11 @@ fn function_body_anchors(
     let source = format!(
         "{prefix}{definition} cfg_rt! {{ pub fn spawn<F>(future: F) -> JoinHandle<F::Output> where F: Future + Send + 'static, F::Output: Send + 'static, {{ {body} }} }} {suffix} pub fn plain() {{}}"
     );
-    let owner = SymbolIdentity::parse(
-        "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/crate_root/Example",
-    )
-    .expect("actual package owner")
-    .owner()
-    .clone();
+    let owner =
+        SymbolIdentity::parse("rift://symbol/cargo/crates.io/crate-root/rust/crate_root/Example")
+            .expect("actual package owner")
+            .owner()
+            .clone();
     let origin = ContributionOrigin::new(
         Some(SourceLocation::Dependency {
             package: PackageIdentity {
@@ -2471,9 +2460,9 @@ fn assert_local_alias(
     name: &str,
     module: &str,
 ) {
-    let alias = format!("rift://symbol/cargo/crates.io/serde_core@1.0.228/rust/serde_core/{name}");
+    let alias = format!("rift://symbol/cargo/crates.io/serde_core/rust/serde_core/{name}");
     let target =
-        format!("rift://symbol/cargo/crates.io/serde_core@1.0.228/rust/serde_core/{module}/{name}");
+        format!("rift://symbol/cargo/crates.io/serde_core/rust/serde_core/{module}/{name}");
     let object = publication
         .objects
         .iter()
@@ -2688,18 +2677,18 @@ fn external_alias_analysis(
         manager,
         registry,
         name,
-        version,
     } = &target.owner
     else {
         panic!("released package target");
     };
+    let version = target.revision.release_version().expect("package release");
     let target_origin = ContributionOrigin::new(
         Some(SourceLocation::Dependency {
             package: PackageIdentity {
                 manager: manager.clone(),
                 registry: registry.clone(),
                 name: name.clone(),
-                version: version.clone(),
+                version: version.to_owned(),
             },
         }),
         SourceKind::Authored,
@@ -2757,8 +2746,8 @@ fn external_alias_analysis(
 }
 
 fn assert_external_alias(publication: &rift_protocol::index::PackagePublication, name: &str) {
-    let alias = format!("rift://symbol/cargo/crates.io/serde@1.0.228/rust/serde/{name}");
-    let target = format!("rift://symbol/cargo/crates.io/serde_core@1.0.228/rust/serde_core/{name}");
+    let alias = format!("rift://symbol/cargo/crates.io/serde/rust/serde/{name}");
+    let target = format!("rift://symbol/cargo/crates.io/serde_core/rust/serde_core/{name}");
     let object = publication
         .objects
         .iter()

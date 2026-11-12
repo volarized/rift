@@ -135,7 +135,6 @@ fn local_context_does_not_change_released_owner_admission() {
         manager: "cargo".to_owned(),
         registry: "crates.io".to_owned(),
         name: "beacon".to_owned(),
-        version: "1.0.0".to_owned(),
     };
     assert!(NamespaceInput::project(&package, &language, &[], &[], &[], limits).is_err());
     let invalid = SymbolOwner::NamedLocal {

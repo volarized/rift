@@ -280,12 +280,11 @@ fn captured_metadata(input: &NamespaceInput<'_>) -> Option<PackageMetadata> {
     }
     let metadata: PackageMetadata = serde_json::from_str(source.text()).ok()?;
     let accepted = match input.owner() {
-        SymbolOwner::Package {
-            manager,
-            name,
-            version,
-            ..
-        } => manager == "npm" && metadata.name == *name && metadata.version == *version,
+        SymbolOwner::Package { manager, name, .. } => {
+            manager == "npm"
+                && metadata.name == *name
+                && input.release_version() == Some(metadata.version.as_str())
+        }
         SymbolOwner::Local
         | SymbolOwner::NamedLocal { .. }
         | SymbolOwner::ProfileLocal { .. }

@@ -115,7 +115,7 @@ const DECISION_TABLE: &[DecisionRow] = &[
         tools: &["search"],
         note: Some(
             "with `packages` and `scope: \"global\"` or `\"all\"`; read the returned `id` with \
-                    `get_symbol`",
+                    `get_symbol`, naming the hit's release as `revision`",
         ),
     },
     DecisionRow {
@@ -467,7 +467,8 @@ mod tests {
                 rendered.contains(
                     "| A package version the project does not use, or a package it lacks, is \
                      needed. | `search` (with `packages` and `scope: \"global\"` \
-                     or `\"all\"`; read the returned `id` with `get_symbol`) |"
+                     or `\"all\"`; read the returned `id` with `get_symbol`, naming the hit's \
+                     release as `revision`) |"
                 ),
                 "{rendered}"
             );

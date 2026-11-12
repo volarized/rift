@@ -23,6 +23,8 @@ fn every_form_round_trips_through_its_iri() {
         "rift://revision/cargo/crates.io/serde@1.0.228".to_owned(),
         "rift://revision/npm/npmjs.org/@types/node@26.6.4".to_owned(),
         "rift://revision/stdlib/cpython@3.12.9".to_owned(),
+        "rift://revision/pypi/pypi.org/demo@1!2.0.post1+local".to_owned(),
+        "rift://revision/custom/registry.example/demo@2026.10".to_owned(),
     ];
     for value in accepted {
         let revision = Revision::parse(&value).expect("accepted revision");
@@ -54,15 +56,22 @@ fn release_and_tree_forms_carry_their_coordinates_and_no_git_spelling() {
         manager: "cargo".to_owned(),
         registry: "crates.io".to_owned(),
         name: "serde".to_owned(),
-        version: "1.0.228".to_owned(),
     };
-    assert_eq!(release.point(), RevisionPoint::Release(&owner));
-    assert_eq!(release, Revision::release(&owner).expect("release"));
+    assert_eq!(release.point(), RevisionPoint::Release(&owner, "1.0.228"));
+    assert_eq!(
+        release,
+        Revision::release(&owner, "1.0.228").expect("release")
+    );
+    assert_eq!(release.release_version(), Some("1.0.228"));
+    assert!(release.answers_for(&owner));
     assert_eq!(release.git_revision(), None);
+    assert!(Revision::release(&owner, "1.0").is_err());
+    assert!(Revision::release(&owner, "").is_err());
     let tree = Revision::tree(TREE).expect("tree");
     assert_eq!(tree.point(), RevisionPoint::Tree(TREE));
     assert_eq!(tree.git_revision(), None);
-    assert!(Revision::release(&SymbolOwner::Local).is_err());
+    assert_eq!(tree.release_version(), None);
+    assert!(Revision::release(&SymbolOwner::Local, "1.0.0").is_err());
     assert!(Revision::tree(COMMIT).is_err());
 }
 
@@ -91,6 +100,23 @@ fn each_broken_spelling_names_its_violation() {
         ),
         (
             "rift://revision/cargo/crates%2Eio/serde@1.0.228",
+            RevisionViolation::Release,
+        ),
+        (
+            "rift://revision/npm/npmjs.org/@types@26.6.4",
+            RevisionViolation::Release,
+        ),
+        ("rift://revision/stdlib/@3.12.9", RevisionViolation::Release),
+        (
+            "rift://revision/cargo/crates.io/serde@^1.0.0",
+            RevisionViolation::Release,
+        ),
+        (
+            "rift://revision/pypi/pypi.org/demo@>=1",
+            RevisionViolation::Release,
+        ),
+        (
+            "rift://revision/cargo/crates.io/serde@1.0.228/src",
             RevisionViolation::Release,
         ),
     ];

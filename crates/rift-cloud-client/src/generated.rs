@@ -58,7 +58,7 @@ static REGEX_PACKAGE_SEARCH_REQUEST_VIEW: std::sync::LazyLock<regex::Regex> = st
 });
 static REGEX_SYMBOL_ID: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(
-            "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$",
+            "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$",
         )
         .expect("invalid regex")
 });
@@ -92,9 +92,9 @@ pub struct PackageIdentity {
     #[validate(length(max = 4_096u64))]
     pub version: String,
 }
-/// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
+/// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. It names no revision: a read selects the revision whose bytes it answers. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
 pub type SourceUnitId = String;
-/// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+/// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
 pub type SymbolId = String;
 /// Readable Symbol assembled from normalized Contributions. Source structure lives in Node
 /// and is connected through Relationship.
@@ -110,7 +110,7 @@ pub type SymbolId = String;
 )]
 #[serde(default)]
 pub struct Symbol {
-    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub id: Option<String>,
     /// A language name and its optional dialect, joined by `:`. `sql` and `sql:postgresql` are two languages with two symbol spaces.
@@ -133,7 +133,7 @@ pub struct Symbol {
     /// package.
     #[validate(nested)]
     pub origin: Option<SymbolOrigin>,
-    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub container: Option<String>,
     /// Language keywords qualifying the declaration: `export`, `async`, `const`. Absent
@@ -848,7 +848,7 @@ pub struct TypeExpression {
     /// The type as it is written: `Optional[Config]`, `&mut [u8]`, `string | null`.
     #[validate(length(min = 1u64))]
     pub source: String,
-    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub resolved: Option<String>,
     /// Facts a provider carries that the model has no field for, under a reverse-domain key.
@@ -875,7 +875,7 @@ pub struct SignatureLink {
     /// validation tests instead.
     #[validate(nested)]
     pub range: TextRange,
-    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub symbol: String,
 }
@@ -1265,7 +1265,7 @@ pub struct PackageSearchHit {
     /// and is connected through Relationship.
     #[validate(nested)]
     pub symbol: Symbol,
-    /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
+    /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. It names no revision: a read selects the revision whose bytes it answers. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
     #[validate(
         length(min = 17u64, max = 8_192u64),
         regex(path = "REGEX_PACKAGE_SEARCH_HIT_UNIT")
@@ -1363,7 +1363,7 @@ pub struct PackagePatternDeclaration {
 pub struct PackagePatternHit {
     /// One package as its package manager identifies it.
     pub package: PackageIdentity,
-    /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
+    /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. It names no revision: a read selects the revision whose bytes it answers. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
     pub unit: String,
     /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
     /// from whatever its toolchain counts in at its own boundary, so two toolchains' column
@@ -1465,7 +1465,7 @@ pub struct DocumentationBlock {
     /// Existing ranked documents intersecting this block, in source order.
     #[validate(nested)]
     pub chunks: Option<Vec<DocumentationChunk>>,
-    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub symbol: Option<String>,
 }
@@ -1650,7 +1650,7 @@ pub struct DocumentationReference {
     pub identity: String,
     /// Full lowercase SHA-256 digest for documentation content and identity.
     pub block: String,
-    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     pub target: String,
     /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
     /// from whatever its toolchain counts in at its own boundary, so two toolchains' column
@@ -2192,7 +2192,7 @@ pub struct SearchHit {
         regex(path = "REGEX_DOCUMENTATION_LICENSE_FILE_PATH")
     )]
     pub path: Option<String>,
-    /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
+    /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. It names no revision: a read selects the revision whose bytes it answers. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
     #[validate(
         length(min = 17u64, max = 8_192u64),
         regex(path = "REGEX_PACKAGE_SEARCH_HIT_UNIT")
@@ -2227,7 +2227,7 @@ pub struct SearchHit {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct SearchTraversal {
-    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub seed: Option<String>,
     /// Which edge direction a search traversal walks from each visited symbol. A language
@@ -2242,7 +2242,7 @@ pub struct SearchTraversal {
     #[validate(range(min = 1, max = 2))]
     #[default(Some(1u64))]
     pub depth: Option<u64>,
-    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub to: Option<String>,
 }
@@ -2555,7 +2555,7 @@ impl<'de> serde::Deserialize<'de> for HopDirection {
 )]
 #[serde(deny_unknown_fields)]
 pub struct Relationship {
-    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub from: String,
     /// A provider-local kind preserving the construct name used by that language implementation.
@@ -2565,7 +2565,7 @@ pub struct Relationship {
     /// and `use` alike.
     #[validate(length(min = 1u64))]
     pub facets: Vec<RelationshipFacet>,
-    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub to: String,
     /// One byte range in a source-catalog unit.
@@ -2809,7 +2809,7 @@ impl<'de> serde::Deserialize<'de> for GetSymbolInclude {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct GetSymbolParams {
-    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub id: String,
     /// Requested projections. Omitted or empty requests none. A declaration's source is read
@@ -3015,7 +3015,7 @@ impl<'de> serde::Deserialize<'de> for PositionEncoding {
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(default)]
 pub struct ReadWarning {
-    /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
+    /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. It names no revision: a read selects the revision whose bytes it answers. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
     pub unit: Option<String>,
     /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
     /// from whatever its toolchain counts in at its own boundary, so two toolchains' column
@@ -3067,7 +3067,7 @@ pub struct ReadWarning {
     pub files: Option<Vec<String>>,
     /// The files past `max_chunk` the request's `paths` reach.
     pub skipped: Option<u64>,
-    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     pub symbol: Option<String>,
     /// Providers whose Contribution carries a differing value for at least one
     /// presentation field, sorted and deduplicated.
@@ -3320,7 +3320,8 @@ impl<'de> serde::Deserialize<'de> for RelationshipFacet {
 pub type RevisionId = String;
 /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
 pub type Revision = String;
-/// One exact position in a project, package or runtime source unit.
+/// One exact position in a source unit, at the release of a package or runtime unit.
+#[serde_with::skip_serializing_none]
 #[derive(
     Debug,
     Clone,
@@ -3332,12 +3333,18 @@ pub type Revision = String;
 )]
 #[serde(deny_unknown_fields)]
 pub struct SourcePosition {
-    /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
+    /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. It names no revision: a read selects the revision whose bytes it answers. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
     #[validate(
         length(min = 17u64, max = 8_192u64),
         regex(path = "REGEX_PACKAGE_SEARCH_HIT_UNIT")
     )]
     pub unit: String,
+    /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
+    #[validate(
+        length(min = 1u64, max = 8_192u64),
+        regex(path = "REGEX_GET_SYMBOL_PARAMS_REVISION")
+    )]
+    pub revision: Option<String>,
     /// Zero-based source line.
     #[validate(range(min = 0_u64, max = 2_147_483_647_u64))]
     pub line: u64,
@@ -3357,7 +3364,7 @@ pub struct SourcePosition {
 )]
 #[serde(deny_unknown_fields)]
 pub struct SourceUnitSpan {
-    /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
+    /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. It names no revision: a read selects the revision whose bytes it answers. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
     #[validate(
         length(min = 17u64, max = 8_192u64),
         regex(path = "REGEX_PACKAGE_SEARCH_HIT_UNIT")
@@ -3375,7 +3382,7 @@ pub struct SourceUnitSpan {
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
 pub struct SymbolAlternative {
-    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     pub id: String,
     /// The candidate's displayed name.
     pub name: String,
@@ -3398,7 +3405,7 @@ pub struct SymbolDeclaration {
     /// UTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal
     /// fails the read that touches them with `content_unavailable`.
     pub path: Option<String>,
-    /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
+    /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. It names no revision: a read selects the revision whose bytes it answers. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
     pub unit: Option<String>,
     /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
     /// from whatever its toolchain counts in at its own boundary, so two toolchains' column
@@ -3423,7 +3430,7 @@ pub struct SymbolDeclaration {
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
 pub struct SymbolHistory {
-    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     pub symbol: String,
     /// Revisions that touched the symbol, newest first.
     pub versions: Vec<SymbolVersion>,
@@ -3433,7 +3440,7 @@ pub struct SymbolHistory {
     /// revision, so revisions older than the listed ones may have touched the symbol.
     pub complete: bool,
 }
-/// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+/// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
 pub type SymbolIdentity = String;
 /// The structural parts compared when an alternative was selected.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
@@ -3504,7 +3511,7 @@ impl<'de> serde::Deserialize<'de> for SymbolMatchContext {
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
 pub struct SymbolNotFound {
-    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     pub id: String,
     /// Actual structural candidates, never substitutions for the requested object.
     pub alternatives: Vec<SymbolAlternative>,
@@ -3514,7 +3521,7 @@ pub struct SymbolNotFound {
 /// Why an exact selection cannot establish presence or definite absence.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
 pub enum SymbolUnavailableReason {
-    /// The encoded exact release has no accepted publication.
+    /// The selected release has no accepted publication.
     #[default]
     ExactRelease,
     /// The selected index is preparing.
@@ -3717,7 +3724,7 @@ impl<'de> serde::Deserialize<'de> for SyntaxFramework {
 )]
 #[serde(deny_unknown_fields)]
 pub struct NodesParams {
-    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub symbol: Option<String>,
     /// One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift
@@ -3761,7 +3768,7 @@ pub struct NodesParams {
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct NodesResult {
-    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     pub symbol: Option<String>,
     /// Nodes the read selected, in pre-order: per declaration, in the order a symbol read
     /// lists them, or the unit's nodes from its file node on.
@@ -3970,7 +3977,7 @@ pub enum NodeUnit {
     /// whatever schema its implementation generated from.
     #[default]
     File(FileId),
-    /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
+    /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. It names no revision: a read selects the revision whose bytes it answers. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
     SourceUnit(SourceUnitId),
 }
 /// One named part of a node. A language marks these out inside a declaration, so an
@@ -5211,7 +5218,7 @@ pub struct DocumentationSourceIdentityProjectPath {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct DocumentationSourceIdentitySourceUnitId {
-    /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
+    /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. It names no revision: a read selects the revision whose bytes it answers. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
     #[validate(
         length(min = 17u64, max = 8_192u64),
         regex(path = "REGEX_PACKAGE_SEARCH_HIT_UNIT")
@@ -5376,7 +5383,7 @@ pub struct PackageSearchItemVariant0 {
     /// Readable Symbol assembled from normalized Contributions. Source structure lives in Node
     /// and is connected through Relationship.
     pub symbol: Symbol,
-    /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
+    /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. It names no revision: a read selects the revision whose bytes it answers. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
     pub unit: String,
     /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
     /// from whatever its toolchain counts in at its own boundary, so two toolchains' column
@@ -5451,7 +5458,7 @@ pub struct PackageSearchItemVariant2 {
     /// UTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal
     /// fails the read that touches them with `content_unavailable`.
     pub path: Option<String>,
-    /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
+    /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. It names no revision: a read selects the revision whose bytes it answers. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
     pub unit: Option<String>,
     /// Shortest relationship path to this hit, present when a traversal reached it,
     /// including a hit also matched lexically.
@@ -5467,12 +5474,14 @@ pub struct PackageSearchItemVariant2 {
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct DeclarationPositionResultObject {
-    /// One exact position in a project, package or runtime source unit.
+    /// One exact position in a source unit, at the release of a package or runtime unit.
     pub position: SourcePosition,
-    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     pub id: String,
     /// A provider-local kind preserving the construct name used by that language implementation.
     pub kind: String,
+    /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
+    pub revision: String,
     /// The immutable serving view and the expiry promised by its owner.
     pub view: CapturedView,
     #[default("found".to_string())]
@@ -5482,7 +5491,7 @@ pub struct DeclarationPositionResultObject {
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct DeclarationPositionResultObject2 {
-    /// One exact position in a project, package or runtime source unit.
+    /// One exact position in a source unit, at the release of a package or runtime unit.
     pub position: SourcePosition,
     /// The immutable serving view and the expiry promised by its owner.
     pub view: CapturedView,
@@ -5493,7 +5502,7 @@ pub struct DeclarationPositionResultObject2 {
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct DeclarationPositionResultObject3 {
-    /// One exact position in a project, package or runtime source unit.
+    /// One exact position in a source unit, at the release of a package or runtime unit.
     pub position: SourcePosition,
     /// The immutable serving view and the expiry promised by its owner.
     pub view: Option<CapturedView>,
@@ -5549,7 +5558,7 @@ pub struct GetSymbolResultObject2 {
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct GetSymbolResultObject3 {
-    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     pub id: String,
     /// The immutable serving view and the expiry promised by its owner.
     pub view: Option<CapturedView>,

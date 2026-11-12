@@ -303,8 +303,8 @@ mod tests {
     fn named_identity_keeps_package_runtime_and_raw_facts_unchanged()
     -> Result<(), Box<dyn std::error::Error>> {
         for value in [
-            "rift://symbol/cargo/crates.io/serde@1.0.0/rust/serde/Serialize",
-            "rift://symbol/stdlib/rust@1.90.0/rust/core/Option",
+            "rift://symbol/cargo/crates.io/serde/rust/serde/Serialize",
+            "rift://symbol/stdlib/rust/rust/core/Option",
         ] {
             let mut id = SymbolId::parse(value)?;
             let original = id.clone();

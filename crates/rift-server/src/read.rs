@@ -972,7 +972,7 @@ impl ReadService {
         let accepted = match requested.point() {
             RevisionPoint::Reference(_) => self.revision.is_some(),
             RevisionPoint::Commit(_) | RevisionPoint::Tree(_) => requested == &served,
-            RevisionPoint::Release(_) => false,
+            RevisionPoint::Release(..) => false,
         };
         if accepted {
             return Ok(());
