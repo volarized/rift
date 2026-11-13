@@ -592,12 +592,25 @@ jobs:
       # Ignored regressions retain their issue links and do not run here.
       # The Windows publisher's ignored parent runs separately below.
       # Nextest writes each run's report under its selected profile's folder.
+      - name: Report Linux ARM runner resources
+        if: ${{ matrix.os == 'ubuntu-24.04-arm' }}
+        run: |
+          nproc
+          free -m
+          df -h .
+          for metric in memory.max memory.events; do
+            if test -r "/sys/fs/cgroup/$metric"; then
+              printf '%s\n' "$metric"
+              cat "/sys/fs/cgroup/$metric"
+            fi
+          done
       - name: Build every target and run the unit suite
         env:
           RIFT_UPDATE_TEST_BINARY: >-
             ${{ github.workspace }}/target/debug/rift${{ runner.os == 'Windows' && '.exe' || '' }}
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: >-
+          ${{ matrix.os == 'ubuntu-24.04-arm' && 'env CARGO_BUILD_JOBS=2' || '' }}
           uv run --locked ${{ matrix.python && format('--python {0}', matrix.python) }} --project dev
           rift-dev test nextest run --locked
           --workspace --all-targets --all-features --profile ${{ matrix.profile || 'ci' }} --no-tests fail
