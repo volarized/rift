@@ -4324,7 +4324,7 @@ impl ServerHandler for RiftMcp {
                         let _ = context.extensions.insert(SymbolExamples(examples));
                     }
                     let result = if request.name == "search_candidates" {
-                        self.search_candidates_call(request, &operation).await
+                        Box::pin(self.search_candidates_call(request, &operation)).await
                     } else if request.name == "search_retrieval" {
                         Box::pin(self.search_retrieval_call(request)).await
                     } else {
