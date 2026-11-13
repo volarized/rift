@@ -682,7 +682,11 @@ class Corpus:
             await self.churn_case()
             return
         await self.baseline()
-        await self.symlink_root()
+        if self.pin.name == "bun":
+            await self.lexical_persistence(self.linked_root())
+        else:
+            await self.lexical_persistence()
+            await self.symlink_root()
         if self.pin.name == "fastapi":
             await self.shallow(directory / "shallow")
         if self.pin.name == "nextjs":
@@ -968,7 +972,6 @@ class Corpus:
             self.record(
                 "stop", state="idle", process_gone=server.process.poll() is not None
             )
-        await self.lexical_persistence()
 
     def dependencies(self, found: list[Line]) -> None:
         """Pin the resolver's visible manifest count separately from raw tree blobs."""
@@ -1328,7 +1331,7 @@ class Corpus:
             f"nodes omitted sampled declaration: {identity} ending at {path}:{end}",
         )
 
-    async def lexical_persistence(self) -> None:
+    async def lexical_persistence(self, link: Path | None = None) -> None:
         """Preserve unrelated lexical rows after external source creation and removal."""
         before = lexical_content(self.root)
         sizes = database_bytes(self.root)
@@ -1342,9 +1345,11 @@ class Corpus:
                 "limit": 5,
             }
         )
-        with self.server() as server:
+        with self.server(link) as server:
             async with server.connect() as client:
                 await await_startup_publication(server)
+                if link is not None:
+                    await self.require_linked_reads(client)
                 path.write_bytes(PROBE_SOURCE.encode())
                 await self.await_probe(True)
                 answer = await settled_local(client, "search", request)
@@ -1497,9 +1502,12 @@ class Corpus:
         stale_reads: list[tuple[str, datetime, datetime]] = []
         overlaps = 0
         converging = False
+        last_write_at = datetime.now(UTC)
 
         def write(edit: int) -> None:
+            nonlocal last_write_at
             source = churn_source(edit)
+            last_write_at = datetime.now(UTC)
             path.write_text(source, encoding="utf-8")
             sources.append(source.rstrip("\n"))
             written.append(time.monotonic())
@@ -1582,8 +1590,9 @@ class Corpus:
             converging = True
             convergence = time.monotonic()
             async with gate_deadline("churn final source", CONVERGENCE_SECONDS):
-                # First confirm the final publication through the exact declaration.
-                # The graph read then has its request budget for retaining that view.
+                # Give the final rebuild time inside the convergence budget before
+                # spending a public read's shorter bound on validating the source.
+                await await_filesystem_publication(server, last_write_at)
                 for name in ("symbol_nodes", "search", "nodes"):
                     while True:
                         _identity, revision = await read(name, identity)
@@ -1639,17 +1648,23 @@ class Corpus:
                 await asyncio.gather(task, return_exceptions=True)
             path.unlink(missing_ok=True)
 
-    async def symlink_root(self) -> None:
+    def linked_root(self) -> Path:
         link = self.root.parent / "linked-workspace"
         link.symlink_to(self.root, target_is_directory=True)
-        with self.server(link) as server:
+        return link
+
+    async def require_linked_reads(self, client: Client) -> None:
+        candidates = await self.symbol_candidates(client, minimum=1)
+        require(bool(candidates), "symlink root has no search results")
+        self.record("symlink_root", reads=True)
+
+    async def symlink_root(self) -> None:
+        with self.server(self.linked_root()) as server:
             async with server.connect() as client:
                 await await_startup_publication(server)
-                candidates = await self.symbol_candidates(client, minimum=1)
-                require(bool(candidates), "symlink root has no search results")
+                await self.require_linked_reads(client)
                 no_failed_builds(await logged(server, "index"))
             self.stop(server)
-        self.record("symlink_root", reads=True)
 
     async def shallow(self, root: Path) -> None:
         self.pin.checkout(root, depth=1)
@@ -1958,6 +1973,23 @@ async def await_startup_publication(server: Server) -> None:
                 ):
                     return
             await asyncio.sleep(POLL_SECONDS)
+
+
+async def await_filesystem_publication(server: Server, after: datetime) -> None:
+    """Observe a publication after the last write within the caller's deadline."""
+    while True:
+        server.check_running()
+        # Churn can fill the server's own stderr budget before the final write.
+        rows = await logged(server, "index")
+        if any(
+            row.time >= after
+            and row.operation == "index.publish"
+            and row.label("trigger") == "filesystem"
+            and row.is_message("index snapshot published")
+            for row in rows
+        ):
+            return
+        await asyncio.sleep(POLL_SECONDS)
 
 
 async def settled_pattern(client: Client, request: JsonObject) -> JsonObject:
