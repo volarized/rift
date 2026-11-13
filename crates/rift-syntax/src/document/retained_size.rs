@@ -156,6 +156,10 @@ impl GetSize for SyntaxFacts {
             )
         });
         let (markdown, tracker) = self.markdown_facts.get_heap_size_with_tracker(tracker);
+        let static_facts = self
+            .static_facts
+            .as_ref()
+            .map_or(0, crate::StaticFacts::retained_bytes);
         (
             language
                 .saturating_add(nodes)
@@ -164,6 +168,7 @@ impl GetSize for SyntaxFacts {
                 .saturating_add(exports)
                 .saturating_add(macros)
                 .saturating_add(scope)
+                .saturating_add(static_facts)
                 .saturating_add(markdown),
             tracker,
         )

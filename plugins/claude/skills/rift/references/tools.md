@@ -33,10 +33,9 @@ whose nodes cross its node count or source byte bound returns `node_cursor` for 
 rest. A file no syntax provider parses answers its file node alone. `revision` lists
 the nodes at a git commit or pins the served working tree, and the answer names the
 revision it was read at. If discovery is incomplete or a targeted read spends the
-request's remaining time, the result has empty `nodes` and carries
-`local_index_preparing`. A selected source path can answer
-within that remaining time, with the same warning until the publication records the
-path: workspace byte and declaration bounds remain unchecked.
+request's remaining time, the request returns `temporarily_unavailable` and can be
+retried. A selected source path can answer within the remaining time. The server logs
+`local_index_preparing` while the publication is being prepared.
 
 Parameters:
 

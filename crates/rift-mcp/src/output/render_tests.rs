@@ -1,4 +1,3 @@
-use rift_protocol::dependencies::{PackageAvailability, PackageContextEntry};
 use rift_protocol::documentation::{DocumentationContext, DocumentationHit};
 use rift_protocol::error::{
     ErrorCause, ErrorCode, ErrorData, ErrorPhase, LimitEvidence, RetryDirective,
@@ -23,7 +22,6 @@ use serde_json::json;
 use strum::VariantArray;
 
 use super::facts::{cut_hash, date_of, moment_of, spaced_name, wire_name, wire_names};
-use super::inline::fields_of;
 use super::{RegisteredFailure, Render, text_of};
 use crate::output::text::{INDENT_UNIT, OutputOverflow, TextError, TextWriter};
 
@@ -575,614 +573,6 @@ fn the_largest_page_index_renders_without_overflow() {
         rendered(&answer),
         format!("0 results · page {}/{}\n", u64::MAX, u64::MAX)
     );
-}
-
-// Warnings.
-
-fn warning_set() -> Vec<ReadWarning> {
-    vec![
-        ReadWarning::GlobalAccessDisabled,
-        ReadWarning::ResultsTruncated { results_max: 100 },
-        ReadWarning::PackageSubstituted {
-            entry: PackageContextEntry {
-                manager: "cargo".to_owned(),
-                registry: Some("crates.io".to_owned()),
-                name: "serde".to_owned(),
-                version: Some("1.0.0".to_owned()),
-                requirement: None,
-                availability: PackageAvailability::Canonical,
-            },
-            package: PackageIdentity {
-                manager: "cargo".to_owned(),
-                registry: "crates.io".to_owned(),
-                name: "serde".to_owned(),
-                version: "1.0.1".to_owned(),
-            },
-        },
-        ReadWarning::PatternMatchesTruncated {
-            matches_per_file: 5,
-            files: vec![
-                SourceUnitId("rift://source/project/a.rs".to_owned()),
-                SourceUnitId("rift://source/project/b.rs".to_owned()),
-            ],
-        },
-        stale_index(),
-    ]
-}
-
-const WARNING_LINES: [&str; 5] = [
-    "global_access_disabled",
-    "results_truncated · results_max 100",
-    "package_substituted · entry serde@1.0.0 (cargo) · package serde@1.0.1 (cargo)",
-    "pattern_matches_truncated · matches_per_file 5 · files rift://source/project/a.rs, rift://source/project/b.rs",
-    "stale_index · index_tree_revision 3f9a1c2e · captured_tree_revision 3f9a1c2f: index lags the captured tree",
-];
-
-/// The warnings section of [`warning_set`].
-const WARNING_SECTION: [&str; 6] = [
-    "5 warnings",
-    "\tglobal_access_disabled",
-    "\tresults_truncated · results_max 100",
-    "\tpackage_substituted · entry serde@1.0.0 (cargo) · package serde@1.0.1 (cargo)",
-    "\tpattern_matches_truncated · matches_per_file 5 · files rift://source/project/a.rs, rift://source/project/b.rs",
-    "\tstale_index · index_tree_revision 3f9a1c2e · captured_tree_revision 3f9a1c2f: index lags the captured tree",
-];
-
-#[test]
-fn warnings_follow_one_item_in_their_own_section() {
-    let hit = SearchHit {
-        source: Some("struct A;".to_owned()),
-        ..placed_symbol_hit(symbol(Some(A_ID), "A"))
-    };
-    let answer = search_result(vec![hit], pagination(0, 2), warning_set());
-    let mut expected = vec![
-        "1 result · page 1/2",
-        "\tstruct A",
-        "\ta.rs:1 · name",
-        "\trift://symbol/local/rust/app/a/A",
-        "",
-        "\tstruct A;",
-    ];
-    expected.extend(WARNING_SECTION);
-    golden(&answer, &expected);
-}
-
-#[test]
-fn warnings_follow_several_items_without_a_blank_line() {
-    let first = SearchHit {
-        source: Some("struct A;".to_owned()),
-        ..placed_symbol_hit(symbol(Some(A_ID), "A"))
-    };
-    let second = placed_symbol_hit(symbol(Some("rift://symbol/local/rust/app/a/B"), "B"));
-    let answer = search_result(
-        vec![first, second],
-        pagination(0, 1),
-        vec![
-            ReadWarning::ResultsTruncated { results_max: 2 },
-            stale_index(),
-        ],
-    );
-    golden(
-        &answer,
-        &[
-            "2 results",
-            "\t[1] struct A",
-            "\t\ta.rs:1 · name",
-            "\t\trift://symbol/local/rust/app/a/A",
-            "",
-            "\t\tstruct A;",
-            "\t[2] struct B",
-            "\t\ta.rs:1 · name",
-            "\t\trift://symbol/local/rust/app/a/B",
-            "2 warnings",
-            "\tresults_truncated · results_max 2",
-            "\tstale_index · index_tree_revision 3f9a1c2e · captured_tree_revision 3f9a1c2f: index lags the captured tree",
-        ],
-    );
-}
-
-#[test]
-fn warnings_are_written_when_the_answer_has_no_item() {
-    let answer = search_result(Vec::new(), pagination(0, 0), warning_set());
-    let mut expected = vec!["0 results"];
-    expected.extend(WARNING_SECTION);
-    golden(&answer, &expected);
-}
-
-#[test]
-fn a_single_warning_without_items_is_a_section_of_one_warning() {
-    let answer = search_result(
-        Vec::new(),
-        pagination(0, 0),
-        vec![ReadWarning::GlobalAccessDisabled],
-    );
-    golden(
-        &answer,
-        &["0 results", "1 warning", "\tglobal_access_disabled"],
-    );
-}
-
-#[test]
-fn an_answer_without_warnings_writes_no_warnings_section() {
-    let output = rendered(&only_page(vec![placed_symbol_hit(symbol(Some(A_ID), "A"))]));
-    assert!(!output.contains("warning"), "{output}");
-}
-
-#[test]
-fn warnings_follow_the_items_of_the_other_answers() {
-    let mut symbols = symbol_result(Vec::new(), pagination(0, 0));
-    symbols.warnings = vec![ReadWarning::GlobalAccessDisabled];
-    golden(
-        &symbols,
-        &["0 results", "1 warning", "\tglobal_access_disabled"],
-    );
-    let mut nodes = nodes_result(Vec::new(), Vec::new());
-    nodes.warnings = vec![stale_index(), ReadWarning::GlobalAccessDisabled];
-    golden(
-        &nodes,
-        &[
-            "0 nodes",
-            "2 warnings",
-            "\tstale_index · index_tree_revision 3f9a1c2e · captured_tree_revision 3f9a1c2f: index lags the captured tree",
-            "\tglobal_access_disabled",
-            REVISION_LINE,
-        ],
-    );
-}
-
-/// The line of the warning that the wire form `wire` states.
-fn warning_line(wire: &serde_json::Value) -> String {
-    let warning: ReadWarning = serde_json::from_value(wire.clone()).expect("warning deserializes");
-    super::warning::line(&warning).expect("warning renders")
-}
-
-/// Every warning variant with a wire form and the line it renders as.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one table pins the line of every warning variant"
-)]
-fn warning_cases() -> Vec<(serde_json::Value, &'static str)> {
-    let file = |name: &str| format!("rift://source/project/{name}");
-    let entry = |name: &str, selector: (&str, &str), availability: &str| json!({"manager": "cargo", "name": name, selector.0: selector.1, "availability": availability});
-    vec![
-        (
-            json!({"code": "symbol_not_found", "name": "Beacpn", "alternatives": [A_ID]}),
-            "symbol_not_found · name Beacpn · alternatives rift://symbol/local/rust/app/a/A: no symbols available with this name",
-        ),
-        (
-            json!({"code": "symbol_not_found", "name": "Beacpn", "alternatives": []}),
-            "symbol_not_found · name Beacpn: no symbols available with this name",
-        ),
-        (
-            json!({"code": "symbol_not_found", "name": "Beacpn", "alternatives": [],
-                "detail": "closest alternatives unavailable at the work bound"}),
-            "symbol_not_found · name Beacpn: closest alternatives unavailable at the work bound",
-        ),
-        (
-            json!({"code": "documentation", "warning": {
-                "source": {"source": {"kind": "project", "path": "docs/a.md"}},
-                "stage": "extract", "kind": "malformed_source", "count": 3}}),
-            "documentation · warning (source docs/a.md, stage extract, kind malformed_source, count 3)",
-        ),
-        (
-            json!({"code": "documentation_unavailable", "detail": "documentation crossed a bound"}),
-            "documentation_unavailable: documentation crossed a bound",
-        ),
-        (
-            json!({"code": "object_unavailable", "qualified_name": "app/a/A", "field": "name", "bound": 4096}),
-            "object_unavailable · qualified_name app/a/A · field name · bound 4096",
-        ),
-        (
-            json!({"code": "stale_index", "index_tree_revision": "3f9a1c2e",
-                "captured_tree_revision": "3f9a1c2f", "detail": "index lags the captured tree"}),
-            WARNING_LINES[4],
-        ),
-        (
-            json!({"code": "vector_index_preparing", "prepared": 1200, "total": 4800,
-                "ready_in": "45s", "detail": "Vector search is being prepared"}),
-            "vector_index_preparing · prepared 1200 · total 4800 · ready_in 45s: Vector search is being prepared",
-        ),
-        (
-            json!({"code": "local_index_preparing", "prepared": 10, "detail": "the local index is preparing"}),
-            "local_index_preparing · prepared 10: the local index is preparing",
-        ),
-        (
-            json!({"code": "local_index_preparing", "prepared": 10, "total": 40, "ready_in": "2m",
-                "detail": "the local index is preparing"}),
-            "local_index_preparing · prepared 10 · total 40 · ready_in 2m: the local index is preparing",
-        ),
-        (
-            json!({"code": "vector_ranking_unavailable", "detail": "the model weights could not be acquired"}),
-            "vector_ranking_unavailable: the model weights could not be acquired",
-        ),
-        (
-            json!({"code": "lexical_ranking_unavailable", "detail": "the full-text index did not open"}),
-            "lexical_ranking_unavailable: the full-text index did not open",
-        ),
-        (
-            json!({"code": "query_narrowed", "terms_max": 32}),
-            "query_narrowed · terms_max 32",
-        ),
-        (
-            json!({"code": "lexical_ranking_truncated", "matches_max": 1000}),
-            "lexical_ranking_truncated · matches_max 1000",
-        ),
-        (
-            json!({"code": "results_truncated", "results_max": 100}),
-            WARNING_LINES[1],
-        ),
-        (
-            json!({"code": "pattern_matches_truncated", "matches_per_file": 5,
-                "files": [file("a.rs"), file("b.rs")]}),
-            WARNING_LINES[3],
-        ),
-        (
-            json!({"code": "pattern_index_preparing", "prepared": 3, "total": 9, "detail": "rows are indexed in the background"}),
-            "pattern_index_preparing · prepared 3 · total 9: rows are indexed in the background",
-        ),
-        (
-            json!({"code": "source_unavailable", "unit": file("src/invalid.rs"), "detail": "not UTF-8"}),
-            "source_unavailable · unit rift://source/project/src/invalid.rs: not UTF-8",
-        ),
-        (
-            json!({"code": "source_unavailable", "detail": "2 more files are left out"}),
-            "source_unavailable: 2 more files are left out",
-        ),
-        (
-            json!({"code": "large_file_skipped", "skipped": 2, "detail": "past max_chunk"}),
-            "large_file_skipped · skipped 2: past max_chunk",
-        ),
-        (
-            json!({"code": "large_file_unparsed", "files": [file("big.rs")], "detail": "past max_file"}),
-            "large_file_unparsed · files rift://source/project/big.rs: past max_file",
-        ),
-        (
-            json!({"code": "lockfile_excluded", "files": [file("Cargo.lock")], "detail": "left out of search"}),
-            "lockfile_excluded · files rift://source/project/Cargo.lock: left out of search",
-        ),
-        (
-            json!({"code": "symbol_disagreement", "symbol": A_ID, "providers": ["history", "syntax"],
-                "detail": "providers disagree"}),
-            "symbol_disagreement · symbol rift://symbol/local/rust/app/a/A · providers history, syntax: providers disagree",
-        ),
-        (
-            json!({"code": "traversal_truncated", "visited": 500, "detail": "the walk stopped at its bound"}),
-            "traversal_truncated · visited 500: the walk stopped at its bound",
-        ),
-        (
-            json!({"code": "relationship_coverage_missing", "facets": ["calls", "imports"], "detail": "no lane"}),
-            "relationship_coverage_missing · facets calls, imports: no lane",
-        ),
-        (
-            json!({"code": "relationship_coverage_missing", "detail": "no lane"}),
-            "relationship_coverage_missing: no lane",
-        ),
-        (
-            json!({"code": "engine_analysis_unavailable", "language": "rust", "detail": "engine still analyzing"}),
-            "engine_analysis_unavailable · language rust: engine still analyzing",
-        ),
-        (
-            json!({"code": "callees_dropped", "callees": 4, "detail": "no declaration for them"}),
-            "callees_dropped · callees 4: no declaration for them",
-        ),
-        (
-            json!({"code": "engine_readiness_unconfirmed", "processes": ["rust-analyzer"], "detail": "no progress evidence"}),
-            "engine_readiness_unconfirmed · processes rust-analyzer: no progress evidence",
-        ),
-        (
-            json!({"code": "history_store_filling", "analyzed": 40, "total": 100, "detail": "40 of 100 commits"}),
-            "history_store_filling · analyzed 40 · total 100: 40 of 100 commits",
-        ),
-        (
-            json!({"code": "change_truncated", "paths_max": 512, "detail": "narrow the comparison"}),
-            "change_truncated · paths_max 512: narrow the comparison",
-        ),
-        (
-            json!({"code": "global_access_disabled"}),
-            "global_access_disabled",
-        ),
-        (
-            json!({"code": "global_api_unavailable", "failure_class": "retry_exhausted"}),
-            "global_api_unavailable · failure_class retry_exhausted",
-        ),
-        (
-            json!({"code": "global_publication_incompatible", "failure_class": "publication_format"}),
-            "global_publication_incompatible · failure_class publication_format",
-        ),
-        (
-            json!({"code": "global_response_invalid", "failure_class": "invalid_response"}),
-            "global_response_invalid · failure_class invalid_response",
-        ),
-        (
-            json!({"code": "global_page_warning", "warning_code": "capability_unavailable", "detail": "patterns"}),
-            "global_page_warning · warning_code capability_unavailable: patterns",
-        ),
-        (
-            json!({"code": "global_page_warning", "warning_code": "unknown"}),
-            "global_page_warning · warning_code unknown",
-        ),
-        (
-            json!({"code": "package_absent", "package": {"manager": "cargo", "registry": "crates.io", "name": "serde", "version": "1.0.0"}}),
-            "package_absent · package serde@1.0.0 (cargo)",
-        ),
-        (
-            json!({"code": "package_requirement_absent", "entry": entry("serde", ("requirement", "^1.0"), "canonical")}),
-            "package_requirement_absent · entry serde ^1.0 (cargo)",
-        ),
-        (
-            json!({"code": "package_substituted", "entry": entry("serde", ("version", "1.0.0"), "canonical"),
-                "package": {"manager": "cargo", "registry": "crates.io", "name": "serde", "version": "1.0.1"}}),
-            WARNING_LINES[2],
-        ),
-        (
-            json!({"code": "package_unavailable", "entry": entry("local", ("version", "0.1.0"), "path"),
-                "reason": "path dependencies are not indexed"}),
-            "package_unavailable · entry local@0.1.0 (cargo, path) · reason path dependencies are not indexed",
-        ),
-        (
-            json!({"code": "package_context_degraded", "resolver": "cargo", "reason": "metadata read failed"}),
-            "package_context_degraded · resolver cargo · reason metadata read failed",
-        ),
-        (
-            json!({"code": "framework_context_unresolved", "unit": file("view.html"),
-                "framework": "tailwind", "detail": "dynamic class expression"}),
-            "framework_context_unresolved · unit rift://source/project/view.html · framework tailwind: dynamic class expression",
-        ),
-        (
-            json!({"code": "framework_context_unresolved", "unit": file("component.ts"),
-                "framework": "angular", "detail": "dynamic template expression"}),
-            "framework_context_unresolved · unit rift://source/project/component.ts · framework angular: dynamic template expression",
-        ),
-    ]
-}
-
-#[test]
-fn every_warning_variant_renders_as_one_line() {
-    let cases = warning_cases();
-    for (wire, expected) in &cases {
-        assert_eq!(&warning_line(wire), expected);
-    }
-    let schema = serde_json::to_value(schema_for!(ReadWarning)).expect("warning schema");
-    let advertised: std::collections::BTreeSet<&str> = schema["oneOf"]
-        .as_array()
-        .expect("the warning union lists its arms")
-        .iter()
-        .filter_map(|arm| arm["properties"]["code"]["const"].as_str())
-        .collect();
-    let covered: std::collections::BTreeSet<&str> = cases
-        .iter()
-        .filter_map(|(wire, _)| wire["code"].as_str())
-        .collect();
-    assert_eq!(covered, advertised, "a case for every warning code");
-}
-
-#[test]
-fn a_warning_value_or_detail_holding_a_delimiter_is_quoted_and_others_stay_bare() {
-    assert_eq!(
-        warning_line(
-            &json!({"code": "package_context_degraded", "resolver": "cargo",
-            "reason": "metadata: read \"failed\" · C:\\x"})
-        ),
-        r#"package_context_degraded · resolver cargo · reason "metadata: read \"failed\" · C:\\x""#
-    );
-    assert_eq!(
-        warning_line(&json!({"code": "documentation_unavailable",
-            "detail": "bound crossed: 2 files · 9 bytes"})),
-        r#"documentation_unavailable: "bound crossed: 2 files · 9 bytes""#
-    );
-    assert_eq!(
-        warning_line(
-            &json!({"code": "package_context_degraded", "resolver": "cargo",
-            "reason": "C:\\dir \"x\" a:b a·b"})
-        ),
-        r#"package_context_degraded · resolver cargo · reason C:\dir "x" a:b a·b"#
-    );
-}
-
-#[test]
-fn a_warning_line_shows_one_line_per_payload_shape() {
-    let lines = [
-        warning_line(&json!({"code": "global_access_disabled"})),
-        warning_line(&json!({"code": "results_truncated", "results_max": 100})),
-        warning_line(
-            &json!({"code": "lockfile_excluded", "files": ["rift://source/project/Cargo.lock"],
-            "detail": "left out of search"}),
-        ),
-        warning_line(&json!({"code": "package_absent",
-            "package": {"manager": "cargo", "registry": "crates.io", "name": "serde", "version": "1.0.0"}})),
-        warning_line(&json!({"code": "package_requirement_absent", "entry":
-            {"manager": "npm", "name": "left-pad", "requirement": "^1.3", "availability": "canonical"}})),
-    ];
-    assert_eq!(
-        lines,
-        [
-            "global_access_disabled",
-            "results_truncated · results_max 100",
-            "lockfile_excluded · files rift://source/project/Cargo.lock: left out of search",
-            "package_absent · package serde@1.0.0 (cargo)",
-            "package_requirement_absent · entry left-pad ^1.3 (npm)",
-        ]
-    );
-}
-
-#[test]
-fn control_characters_in_a_detail_are_made_visible_and_the_warning_stays_one_line() {
-    let wire = json!({"code": "traversal_truncated", "visited": 1,
-        "detail": "first\nsecond\r\n\tthird\u{1b}[0m \n"});
-    let line = warning_line(&wire);
-    assert_eq!(
-        line,
-        "traversal_truncated · visited 1: first\\nsecond\\r\\n\\tthird\\u{1b}[0m"
-    );
-    let answer = search_result(
-        Vec::new(),
-        pagination(0, 0),
-        vec![serde_json::from_value(wire).expect("warning")],
-    );
-    golden(&answer, &["0 results", "1 warning", &format!("\t{line}")]);
-}
-
-#[test]
-fn a_detail_that_is_blank_or_ends_in_spaces_leaves_no_trailing_space() {
-    let blank = json!({"code": "traversal_truncated", "visited": 1, "detail": "   "});
-    assert_eq!(warning_line(&blank), "traversal_truncated · visited 1");
-    let spaced = json!({"code": "vector_ranking_unavailable", "detail": "ends here  "});
-    assert_eq!(
-        warning_line(&spaced),
-        "vector_ranking_unavailable: ends here"
-    );
-}
-
-#[test]
-fn a_long_hex_evidence_value_is_cut_to_eight_characters() {
-    let wire = json!({"code": "package_context_degraded",
-        "resolver": "0123456789abcdef0123456789abcdef", "reason": "x"});
-    assert_eq!(
-        warning_line(&wire),
-        "package_context_degraded · resolver 01234567 · reason x"
-    );
-}
-
-#[derive(Serialize)]
-struct Pair {
-    left: u8,
-    right: Option<&'static str>,
-}
-
-#[derive(Serialize)]
-struct Single {
-    only: Pair,
-}
-
-#[derive(Serialize)]
-enum Shape {
-    Unit,
-    Payload(u8),
-    Tuple(u8, u8),
-    Fields { x: u8 },
-}
-
-#[derive(Serialize)]
-struct Scalars {
-    flag: bool,
-    small: i8,
-    wide: i64,
-    unsigned: u32,
-    ratio: f32,
-    exact: f64,
-    letter: char,
-    nothing: (),
-    pair: Pair,
-    single: Single,
-    list: Vec<Option<u8>>,
-    unit_variant: Shape,
-    empty: Vec<u8>,
-}
-
-struct Bytes;
-
-impl Serialize for Bytes {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_bytes(&[1])
-    }
-}
-
-#[test]
-fn the_inline_writer_writes_each_scalar_and_nested_shape_on_one_line() {
-    let value = Scalars {
-        flag: true,
-        small: -3,
-        wide: 1 << 40,
-        unsigned: 7,
-        ratio: 0.5,
-        exact: 2.25,
-        letter: 'x',
-        nothing: (),
-        pair: Pair {
-            left: 1,
-            right: Some("r"),
-        },
-        single: Single {
-            only: Pair {
-                left: 2,
-                right: None,
-            },
-        },
-        list: vec![Some(1), None, Some(3)],
-        unit_variant: Shape::Unit,
-        empty: Vec::new(),
-    };
-    let fields = fields_of(&value).expect("fields");
-    let pairs: Vec<(&str, &str)> = fields
-        .iter()
-        .map(|(key, text)| (*key, text.as_str()))
-        .collect();
-    assert_eq!(
-        pairs,
-        [
-            ("flag", "true"),
-            ("small", "-3"),
-            ("wide", "1099511627776"),
-            ("unsigned", "7"),
-            ("ratio", "0.5"),
-            ("exact", "2.25"),
-            ("letter", "x"),
-            ("pair", "(left 1, right r)"),
-            ("single", "2"),
-            ("list", "1, 3"),
-            ("unit_variant", "Unit"),
-        ]
-    );
-}
-
-#[test]
-fn the_inline_writer_refuses_shapes_it_does_not_write() {
-    let refused = |outcome: Result<Vec<(&str, String)>, TextError>| match outcome {
-        Err(TextError::Unsupported(shape)) => shape,
-        other => panic!("expected a refusal, got {other:?}"),
-    };
-    assert_eq!(refused(fields_of(&"text")), "value that is not a struct");
-    assert_eq!(refused(fields_of(&Bytes)), "bytes");
-    assert_eq!(refused(fields_of(&(1, 2))), "tuple");
-    assert_eq!(
-        refused(fields_of(&std::collections::BTreeMap::from([(1, 2)]))),
-        "map"
-    );
-    assert_eq!(
-        refused(fields_of(&Shape::Payload(1))),
-        "variant with a payload"
-    );
-    assert_eq!(refused(fields_of(&Shape::Tuple(1, 2))), "tuple variant");
-    assert_eq!(
-        refused(fields_of(&Shape::Fields { x: 1 })),
-        "struct variant"
-    );
-    assert_eq!(refused(fields_of(&Marker(1, 2))), "tuple struct");
-}
-
-#[derive(Serialize)]
-struct Marker(u8, u8);
-
-#[derive(Serialize)]
-struct Empty;
-
-#[derive(Serialize)]
-struct Wrapped(u8);
-
-#[derive(Serialize)]
-struct Wrappers {
-    empty: Empty,
-    wrapped: Wrapped,
-}
-
-#[test]
-fn the_inline_writer_leaves_out_a_unit_struct_and_writes_a_newtype_struct_as_its_value() {
-    let fields = fields_of(&Wrappers {
-        empty: Empty,
-        wrapped: Wrapped(9),
-    })
-    .expect("fields");
-    assert_eq!(fields, [("wrapped", "9".to_owned())]);
 }
 
 // Symbol hits.
@@ -2440,7 +1830,7 @@ fn a_traversal_without_hops_is_an_item() {
 }
 
 #[test]
-fn warnings_follow_the_last_node_without_a_blank_line() {
+fn warnings_leave_the_relationship_tree_text_unchanged() {
     let answer = search_result(
         vec![readme_hit(), main_hit()],
         pagination(0, 1),
@@ -2462,8 +1852,6 @@ fn warnings_follow_the_last_node_without_a_blank_line() {
             "\t\t\t\tby async fn main()",
             "\t\t\t\tin src/main.rs:9",
             "\t\t\t\tat rift://symbol/local/rust/app/main/main",
-            "1 warning",
-            "\tstale_index · index_tree_revision 3f9a1c2e · captured_tree_revision 3f9a1c2f: index lags the captured tree",
         ],
     );
 }
@@ -3092,7 +2480,7 @@ fn a_hit_ends_after_its_last_section() {
 }
 
 #[test]
-fn page_and_warnings_of_a_get_symbol_answer_follow_the_shared_header() {
+fn warnings_leave_symbol_page_text_unchanged() {
     let mut answer = symbol_result(vec![symbol_hit()], pagination(1, 4));
     answer.warnings = vec![ReadWarning::GlobalAccessDisabled];
     golden(
@@ -3102,8 +2490,6 @@ fn page_and_warnings_of_a_get_symbol_answer_follow_the_shared_header() {
             "\tstruct A",
             "\ta.rs:1",
             "\trift://symbol/local/rust/app/a/A",
-            "1 warning",
-            "\tglobal_access_disabled",
         ],
     );
 }
@@ -3260,7 +2646,7 @@ fn a_truncated_or_empty_documentation_context_keeps_its_label() {
 }
 
 #[test]
-fn documentation_context_warnings_follow_the_references_as_documentation_warning_lines() {
+fn documentation_context_warnings_leave_reference_text_unchanged() {
     let guide = documentation_hit_at("docs/guide.md", 2, &["Guide"], None);
     let mut context = context(&json!([reference(&guide, None)]), false);
     let warning = json!({
@@ -3270,7 +2656,7 @@ fn documentation_context_warnings_follow_the_references_as_documentation_warning
         "source": {"source": {"kind": "project", "path": "docs/b.md"}},
         "stage": "source", "kind": "source_truncated", "count": 1});
     context.warnings = vec![
-        serde_json::from_value(warning.clone()).expect("documentation warning deserializes"),
+        serde_json::from_value(warning).expect("documentation warning deserializes"),
         serde_json::from_value(truncated).expect("documentation warning deserializes"),
     ];
     let mut hit = symbol_hit();
@@ -3285,22 +2671,12 @@ fn documentation_context_warnings_follow_the_references_as_documentation_warning
             "",
             "\tdocumentation:",
             "\t\tdocs/guide.md:2 · Guide",
-            "\t\tdocumentation · warning (source docs/a.md, stage extract, kind malformed_source, count 3)",
-            "\t\tdocumentation · warning (source docs/b.md, stage source, kind source_truncated, count 1)",
         ],
-    );
-    let read_warning = json!({"code": "documentation", "warning": warning});
-    let shared_line = warning_line(&read_warning);
-    let context_line =
-        "documentation · warning (source docs/a.md, stage extract, kind malformed_source, count 3)";
-    assert_eq!(
-        shared_line, context_line,
-        "one line for one warning wherever it is read"
     );
 }
 
 #[test]
-fn an_empty_documentation_context_with_a_warning_writes_the_label_and_the_warning() {
+fn an_empty_documentation_context_with_a_warning_preserves_its_truncation_label() {
     let mut context = context(&json!([]), true);
     context.warnings = vec![
         serde_json::from_value(json!({
@@ -3319,7 +2695,6 @@ fn an_empty_documentation_context_with_a_warning_writes_the_label_and_the_warnin
             "\trift://symbol/local/rust/app/a/A",
             "",
             "\tdocumentation (truncated):",
-            "\t\tdocumentation · warning (source docs/a.md, stage source, kind source_unavailable, count 2)",
         ],
     );
 }
@@ -3918,7 +3293,7 @@ fn an_empty_innermost_excerpt_is_one_empty_line_after_the_blank_line() {
 }
 
 #[test]
-fn warnings_follow_the_outermost_excerpt_of_the_nodes() {
+fn warnings_leave_node_excerpts_unchanged() {
     let mut answer = outer_and_inner();
     answer.warnings = vec![stale_index()];
     golden(
@@ -3934,8 +3309,6 @@ fn warnings_follow_the_outermost_excerpt_of_the_nodes() {
             "",
             "\t\tfn name() {}",
             "\t\t// tail",
-            "1 warning",
-            "\tstale_index · index_tree_revision 3f9a1c2e · captured_tree_revision 3f9a1c2f: index lags the captured tree",
             REVISION_LINE,
         ],
     );

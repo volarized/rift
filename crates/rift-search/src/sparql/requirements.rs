@@ -88,6 +88,28 @@ impl AdjacencySelection {
 }
 
 impl GraphQuery {
+    /// Whether a positive witness alone establishes this ASK answer.
+    #[must_use]
+    pub fn admits_partial_witness(&self) -> bool {
+        let Query::Ask(query) = self.query() else {
+            return false;
+        };
+        let mut pending = vec![&query.expression];
+        // The admitted graph pattern depth and join count bound this walk.
+        while let Some(expression) = pending.pop() {
+            match expression {
+                QueryExpression::Bgp { .. } | QueryExpression::Path { .. } => {}
+                QueryExpression::Project { inner, .. } => pending.push(inner),
+                QueryExpression::Join { left, right } => {
+                    pending.push(left);
+                    pending.push(right);
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+
     /// Proves the parsed expression can be evaluated using symbol facts alone.
     ///
     /// An expression that may inspect other facts requires the full acquisition path.

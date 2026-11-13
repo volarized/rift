@@ -361,6 +361,11 @@ impl AcquiredGraph {
             configuration,
             warnings,
         } = self;
+        if acquired.is_incomplete() && !query.admits_partial_witness() {
+            return Ok(query_unavailable(
+                SymbolUnavailableReason::InsufficientCoverage,
+            ));
+        }
         let input = reads.local_search_view_input(true)?;
         let mut dataset = GraphDataset::builder(limits);
         if let Some(selected) = &selected {
@@ -419,18 +424,55 @@ impl AcquiredGraph {
             }
             dataset.publish_local_graph()?;
         }
-        let dataset = dataset.build();
-        let answer: QueryAnswer = dataset.evaluate(query, cancellation)?.into();
+        let Some(answer) =
+            evaluate_acquired_query(&dataset.build(), query, cancellation, &acquired)?
+        else {
+            return Ok(query_unavailable(
+                SymbolUnavailableReason::InsufficientCoverage,
+            ));
+        };
         let views = views.get().ok_or_else(retention_failure)?;
         let root = input.root().to_owned();
         let owner = input.owner().clone();
+        let retention = QueryRetention {
+            root: &root,
+            owner: &owner,
+            answer: &answer,
+            configuration: &configuration,
+            warnings,
+            acquired: &acquired,
+            retrieved: &retrieved,
+        };
+        retention.store(views, input, responses, cancellation)
+    }
+}
+
+struct QueryRetention<'answer> {
+    root: &'answer std::path::Path,
+    owner: &'answer rift_protocol::identity::SymbolOwner,
+    answer: &'answer QueryAnswer,
+    configuration: &'answer QueryConfiguration,
+    warnings: Vec<ReadWarning>,
+    acquired: &'answer AcquiredAdjacency,
+    retrieved: &'answer [SearchResult],
+}
+
+impl QueryRetention<'_> {
+    fn store(
+        self,
+        views: &rift_server::LocalSymbolViews,
+        input: rift_server::LocalSymbolViewInput,
+        responses: &CandidateResponses,
+        cancellation: &QueryCancellation,
+    ) -> Result<QueryReadResult, RiftError> {
         let mut response = None;
         views.capture_with(input, |view| {
             let mut view = view.clone();
-            let provider_views = acquired
-                .remote_view()
-                .into_iter()
-                .chain(retrieved.iter().filter_map(|result| result.view.as_ref()));
+            let provider_views = self.acquired.remote_view().into_iter().chain(
+                self.retrieved
+                    .iter()
+                    .filter_map(|result| result.view.as_ref()),
+            );
             if !constrain_provider_expiry(&mut view, provider_views)? {
                 response = Some(query_unavailable(SymbolUnavailableReason::ViewExpired));
                 return Ok(false);
@@ -439,17 +481,30 @@ impl AcquiredGraph {
                 return errors::search::query_cancelled().fail();
             }
             response = Some(responses.store_query(
-                &root,
-                &owner,
+                self.root,
+                self.owner,
                 &view,
-                &answer,
-                &configuration,
-                warnings,
+                self.answer,
+                self.configuration,
+                self.warnings,
             )?);
             Ok(true)
         })?;
         response.ok_or_else(retention_failure)
     }
+}
+
+fn evaluate_acquired_query(
+    dataset: &GraphDataset,
+    query: &GraphQuery,
+    cancellation: &QueryCancellation,
+    acquired: &AcquiredAdjacency,
+) -> Result<Option<QueryAnswer>, RiftError> {
+    let answer: QueryAnswer = dataset.evaluate(query, cancellation)?.into();
+    Ok(
+        (!acquired.is_incomplete() || matches!(answer, QueryAnswer::Boolean { value: true }))
+            .then_some(answer),
+    )
 }
 
 impl CandidateResponses {
@@ -1330,7 +1385,7 @@ mod tests {
             assert_eq!(ids, expected.iter().copied().collect());
         }
 
-        let unsupported = server
+        let witness = server
             .graph_query(QueryParams {
                 query: format!("ASK {{ <{PACKAGE_GREETING}> ^:calls/^:calls ?caller }}"),
                 language: QueryLanguage::Sparql,
@@ -1340,13 +1395,11 @@ mod tests {
             .0;
         assert!(
             matches!(
-                unsupported,
-                QueryReadResult::Unavailable(SearchUnavailable::Unavailable {
-                    reason: SymbolUnavailableReason::InsufficientCoverage,
-                    ..
-                })
+                &witness,
+                QueryReadResult::Results(result)
+                    if matches!(result.answer, QueryAnswer::Boolean { value: true })
             ),
-            "{unsupported:?}"
+            "{witness:?}"
         );
 
         std::fs::write(root.join("unestablished.py"), "def might_call(): pass\n")?;
@@ -1719,5 +1772,99 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn graph_ask_accepts_static_call_witness_without_a_language_engine() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        crate::server::hermetic_workspace(directory.path(), "")?;
+        std::fs::write(
+            directory.path().join("main.mjs"),
+            "import { start as run } from './helper.mjs';\n\
+             export function caller() { run(); { const run = 0; run(); } }\n",
+        )?;
+        std::fs::write(
+            directory.path().join("helper.mjs"),
+            "export function start() {}\nexport function decoy() {}\n",
+        )?;
+        let root = directory.path().canonicalize()?;
+        let server =
+            RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
+        let source_symbol = static_endpoint(&server, "caller").await?;
+        let target_symbol = static_endpoint(&server, "start").await?;
+        for query in [
+            format!("ASK {{ <{source_symbol}> :calls <{target_symbol}> }}"),
+            format!("ASK {{ <{source_symbol}> :calls ?callee . ?callee :name 'start' }}"),
+            format!("ASK {{ ?caller :calls <{target_symbol}> . ?caller :name 'caller' }}"),
+            format!("ASK {{ <{target_symbol}> :usages ?usage . ?usage :source 'run' }}"),
+        ] {
+            let result = server
+                .graph_query(QueryParams {
+                    query: query.clone(),
+                    language: QueryLanguage::Sparql,
+                })
+                .await
+                .map_err(|failure| format!("{failure:?}"))?
+                .0;
+            assert!(
+                matches!(&result, QueryReadResult::Results(result)
+                    if matches!(&result.answer, QueryAnswer::Boolean { value: true })),
+                "{query}: {result:?}"
+            );
+        }
+        for query in [
+            format!("ASK {{ <{source_symbol}> :calls ?callee . ?callee :name 'decoy' }}"),
+            format!(
+                "ASK {{ <{source_symbol}> :name 'caller' . FILTER NOT EXISTS {{ <{source_symbol}> :calls ?callee . ?callee :name 'decoy' }} }}"
+            ),
+        ] {
+            let result = server
+                .graph_query(QueryParams {
+                    query: query.clone(),
+                    language: QueryLanguage::Sparql,
+                })
+                .await
+                .map_err(|failure| format!("{failure:?}"))?
+                .0;
+            assert!(
+                matches!(
+                    result,
+                    QueryReadResult::Unavailable(SearchUnavailable::Unavailable {
+                        reason: SymbolUnavailableReason::InsufficientCoverage,
+                        ..
+                    })
+                ),
+                "{query}: {result:?}"
+            );
+        }
+        Ok(())
+    }
+
+    async fn static_endpoint(
+        server: &RiftMcp,
+        name: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let name_literal = oxrdf::Literal::from(name);
+        let result = server
+            .graph_query(QueryParams {
+                query: format!("SELECT ?symbol {{ ?symbol a :Symbol; :name {name_literal} }}"),
+                language: QueryLanguage::Sparql,
+            })
+            .await
+            .map_err(|failure| format!("{failure:?}"))?
+            .0;
+        let QueryReadResult::Results(result) = result else {
+            return Err(format!("expected a captured symbol for {name}, found {result:?}").into());
+        };
+        let QueryAnswer::Bindings { bindings, .. } = result.answer else {
+            return Err(format!("expected captured symbol bindings for {name}").into());
+        };
+        match bindings.as_slice() {
+            [row] => match row.get("symbol") {
+                Some(rift_protocol::query::RdfTerm::Iri { value }) => Ok(value.clone()),
+                other => Err(format!("expected an IRI for {name}, found {other:?}").into()),
+            },
+            _ => Err(format!("expected one symbol for {name}, found {bindings:?}").into()),
+        }
     }
 }

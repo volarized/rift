@@ -673,6 +673,7 @@ pub fn append_framework_symbols(
         export_bindings: result.facts().export_bindings().map(<[_]>::to_vec),
         macro_invocations: result.facts().macro_invocations().map(<[_]>::to_vec),
         scope: result.facts().scope().map(<[_]>::to_vec),
+        static_facts: result.facts().static_facts().cloned(),
         source_digest: FileDigest::of(source.text.as_bytes()),
     };
     SyntaxFacts::from_parts(source.text, limits, parts)?;

@@ -29,7 +29,6 @@ pub const WORKSPACE_LSP_PROCESS_KEY_BYTES_MAX: usize = 129;
 /// One page of the effective workspace configuration and source catalog.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-#[schemars(transform = schema::declare_workspace_resource_page_empty_defaults)]
 pub struct WorkspaceResourcePage {
     /// Digest of the accepted `rift.toml` bytes this page describes.
     pub configuration_revision: Digest,
@@ -41,7 +40,7 @@ pub struct WorkspaceResourcePage {
     #[schemars(length(max = 1_000))]
     pub source: Vec<WorkspaceSourceUnit>,
     /// Conditions that qualify this page. Absent when empty.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing)]
     pub warnings: Vec<ReadWarning>,
     /// Where this page sits in the source catalog.
     pub pagination: Pagination,

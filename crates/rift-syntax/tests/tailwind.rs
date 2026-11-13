@@ -79,6 +79,7 @@ fn tailwind_static_classes_variants_and_dynamic_expressions_across_templates() {
             export_bindings: enriched.facts().export_bindings().map(<[_]>::to_vec),
             macro_invocations: enriched.facts().macro_invocations().map(<[_]>::to_vec),
             scope: enriched.facts().scope().map(<[_]>::to_vec),
+            static_facts: enriched.facts().static_facts().cloned(),
             source_digest: *enriched.source_digest().expect("digest"),
         };
         assert_eq!(

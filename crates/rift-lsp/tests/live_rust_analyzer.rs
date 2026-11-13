@@ -287,3 +287,53 @@ fn rust_engine_fixture_pins_1_98() {
     assert_eq!(fixture.program, "rustup");
     assert_eq!(fixture.arguments, ["run", "1.98", "rust-analyzer"]);
 }
+
+#[tokio::test]
+async fn rust_analyzer_omits_macro_expansion_calls_from_outgoing_hierarchy() {
+    if !engine_live() {
+        return;
+    }
+    let source = "pub fn leaf() {}\n\
+                  macro_rules! invoke { ($target:ident) => { $target(); }; }\n\
+                  pub fn root() { invoke!(leaf); }\n\
+                  pub fn direct() { leaf(); }\n";
+    let workspace = cargo_project();
+    std::fs::write(workspace.path().join("lib.rs"), source).expect("fixture source");
+    require_rust_analyzer(workspace.path());
+    let mut session = walk_ready_session(workspace.path()).await;
+    let document = ProjectPath::new("lib.rs").expect("fixture path");
+    session
+        .open(&document, "rust", source.to_owned())
+        .await
+        .expect("didOpen is sent");
+    for (line, name) in [(2, "root"), (3, "direct")] {
+        let items = session
+            .prepare_call_hierarchy(&document, lsp_types::Position::new(line, 7))
+            .await
+            .expect("prepare answers");
+        let [caller] = items.as_slice() else {
+            panic!("one item at {name}: {items:?}");
+        };
+        assert_eq!(caller.name, name);
+        let calls = session
+            .outgoing_calls(caller.clone())
+            .await
+            .expect("outgoing calls answer");
+        if name == "root" {
+            assert!(calls.is_empty(), "{calls:?}");
+        } else {
+            let [call] = calls.as_slice() else {
+                panic!("one authored call: {calls:?}");
+            };
+            assert_eq!(call.to.name, "leaf");
+            assert_eq!(
+                call.from_ranges,
+                [lsp_types::Range::new(
+                    lsp_types::Position::new(line, 18),
+                    lsp_types::Position::new(line, 22),
+                )]
+            );
+        }
+    }
+    session.shutdown().await;
+}

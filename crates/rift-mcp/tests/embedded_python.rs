@@ -1,6 +1,8 @@
-//! Incoming Python references through the embedded ty engine and public MCP tools.
+//! Incoming Python references through the embedded and external ty engines.
 
 mod hermetic_search;
+#[path = "../../rift-lsp/tests/live_engine_gate.rs"]
+mod live_engine_gate;
 #[expect(
     dead_code,
     reason = "This suite uses the relative-root workspace fixture."
@@ -18,16 +20,30 @@ const PYPROJECT: &str = "[build-system]\nrequires=['setuptools==80.9.0']\nbuild-
 const CONFIGURATION: &str = "\
 [languages.python.lsp]\nembedded = \"ty\"\n\
 retry = { attempts = 2, delay = \"1ms\", delay_limit = \"1ms\" }\n";
+const EXTERNAL_CONFIGURATION: &str = "\
+[languages.python.lsp]\ncommand = [\"uvx\", \"ty@0.0.103\", \"server\"]\n";
 
 #[tokio::test]
 async fn incoming_references_resolve_cross_file_callers_without_writes() -> TestResult {
+    incoming_references(CONFIGURATION).await
+}
+
+#[tokio::test]
+async fn live_external_ty_resolves_the_same_cross_file_callers() -> TestResult {
+    if !live_engine_gate::engine_live() {
+        return Ok(());
+    }
+    incoming_references(EXTERNAL_CONFIGURATION).await
+}
+
+async fn incoming_references(configuration: &str) -> TestResult {
     let (directory, client, server_task) = served_relative_workspace(
         &[
             ("service.py", SERVICE),
             ("main.py", CALLER),
             ("pyproject.toml", PYPROJECT),
         ],
-        Some(CONFIGURATION.to_owned()),
+        Some(configuration.to_owned()),
     )
     .await?;
     let seed = workspace_client::captured_seed(&client, "serve", "service.py").await?;

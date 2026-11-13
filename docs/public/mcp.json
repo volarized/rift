@@ -306,14 +306,6 @@
               "truncated": {
                 "description": "Whether the reference count or total excerpt bytes reached its bound.",
                 "type": "boolean"
-              },
-              "warnings": {
-                "description": "Incomplete source conditions for requested excerpts.",
-                "items": {
-                  "$ref": "#/$defs/DocumentationWarning"
-                },
-                "maxItems": 65536,
-                "type": "array"
               }
             },
             "required": [
@@ -3534,13 +3526,6 @@
               "symbol": {
                 "$ref": "#/$defs/Symbol",
                 "description": "One logical symbol. Its established `id` is required by read validation."
-              },
-              "warnings": {
-                "description": "Projection cuts and other typed read warnings.",
-                "items": {
-                  "$ref": "#/$defs/ReadWarning"
-                },
-                "type": "array"
               }
             },
             "required": [
@@ -3566,13 +3551,6 @@
               "symbol_not_found": {
                 "$ref": "#/$defs/SymbolNotFound",
                 "description": "Definite exact miss and its actual structural candidates."
-              },
-              "warnings": {
-                "description": "Warnings, including incomplete candidate work.",
-                "items": {
-                  "$ref": "#/$defs/ReadWarning"
-                },
-                "type": "array"
               }
             },
             "required": [
@@ -3601,13 +3579,6 @@
               "revision": {
                 "$ref": "#/$defs/Revision",
                 "description": "The revision the read selected, when it established one."
-              },
-              "warnings": {
-                "description": "Details and available partial-read warnings.",
-                "items": {
-                  "$ref": "#/$defs/ReadWarning"
-                },
-                "type": "array"
               }
             },
             "required": [
@@ -3622,7 +3593,7 @@
       }
     },
     {
-      "description": "Lists syntax nodes with their source text: every node of one `symbol`, or, for one\nUTF-8 byte `position` in one file, every node of the symbol whose declaration holds\nit, or the file's unit nodes when no declaration holds it. A symbol read is the way to\nread a declaration's source, and a package or runtime symbol's nodes come from the\nglobal API, each in a source unit of that symbol's release. The answer names `symbol`;\neach node is addressed by its place: node `index` of declaration `declaration` of\nthat symbol, or node `index` of its unit, from the file node at 0, with `parent` an\nindex in the same declaration or unit. An edit renumbers the nodes after it. An answer\nwhose nodes cross its node count or source byte bound returns `node_cursor` for the\nrest. A file no syntax provider parses answers its file node alone. `revision` lists\nthe nodes at a git commit or pins the served working tree, and the answer names the\nrevision it was read at. If discovery is incomplete or a targeted read spends the\nrequest's remaining time, the result has empty `nodes` and carries\n`local_index_preparing`. A selected source path can answer\nwithin that remaining time, with the same warning until the publication records the\npath: workspace byte and declaration bounds remain unchecked.",
+      "description": "Lists syntax nodes with their source text: every node of one `symbol`, or, for one\nUTF-8 byte `position` in one file, every node of the symbol whose declaration holds\nit, or the file's unit nodes when no declaration holds it. A symbol read is the way to\nread a declaration's source, and a package or runtime symbol's nodes come from the\nglobal API, each in a source unit of that symbol's release. The answer names `symbol`;\neach node is addressed by its place: node `index` of declaration `declaration` of\nthat symbol, or node `index` of its unit, from the file node at 0, with `parent` an\nindex in the same declaration or unit. An edit renumbers the nodes after it. An answer\nwhose nodes cross its node count or source byte bound returns `node_cursor` for the\nrest. A file no syntax provider parses answers its file node alone. `revision` lists\nthe nodes at a git commit or pins the served working tree, and the answer names the\nrevision it was read at. If discovery is incomplete or a targeted read spends the\nrequest's remaining time, the request returns `temporarily_unavailable` and can be\nretried. A selected source path can answer within the remaining time. The server logs\n`local_index_preparing` while the publication is being prepared.",
       "input_schema": {
         "$defs": {
           "ProjectPath": {
@@ -6012,14 +5983,6 @@
           "symbol": {
             "$ref": "#/$defs/SymbolId",
             "description": "The symbol whose declarations hold the listed nodes: the requested one for a `symbol`\nread, the innermost declaration's symbol for a `position` read. Absent when the nodes\nbelong to a unit outside every declaration."
-          },
-          "warnings": {
-            "default": [],
-            "description": "Warnings attached to this result. Absent when there is nothing to warn about.",
-            "items": {
-              "$ref": "#/$defs/ReadWarning"
-            },
-            "type": "array"
           }
         },
         "required": [
@@ -6709,13 +6672,6 @@
               "view": {
                 "$ref": "#/$defs/CapturedView",
                 "description": "The retained execution and its original expiry."
-              },
-              "warnings": {
-                "description": "Conditions the caller must consider when reading this answer.",
-                "items": {
-                  "$ref": "#/$defs/ReadWarning"
-                },
-                "type": "array"
               }
             },
             "required": [
@@ -8062,13 +8018,6 @@
                   "view": {
                     "$ref": "#/$defs/CapturedView",
                     "description": "Selected view, when one could be captured."
-                  },
-                  "warnings": {
-                    "description": "Details and partial-read warnings.",
-                    "items": {
-                      "$ref": "#/$defs/ReadWarning"
-                    },
-                    "type": "array"
                   }
                 },
                 "required": [
@@ -8275,8 +8224,7 @@
           },
           {
             "outcome": "unavailable",
-            "reason": "view_context",
-            "warnings": []
+            "reason": "view_context"
           }
         ],
         "type": "object"

@@ -1308,8 +1308,17 @@ pub(crate) fn analyze_included(
         kinds,
         &mut rules.exports.bindings,
     )?;
-    let (nodes, symbols, export_bindings) =
-        extract::extract_with_export_bindings(tree.root_node(), source, limits, language, &rules)?;
+    let mut capture = (language == &crate::ShippedLanguage::JavaScript.language()
+        && ranges.is_empty())
+    .then(|| crate::static_analysis::Capture::for_javascript(source.text));
+    let (nodes, symbols, export_bindings) = extract::extract_with_capture(
+        tree.root_node(),
+        source,
+        limits,
+        language,
+        &rules,
+        capture.as_mut(),
+    )?;
     Ok(SyntaxDocument::new(
         language.clone(),
         source.path.clone(),
@@ -1319,6 +1328,7 @@ pub(crate) fn analyze_included(
     )
     .with_source_witness(source.text)
     .with_export_bindings(export_bindings)
+    .with_static_facts(capture.map(crate::static_analysis::Capture::finish))
     .with_syntax_limits(limits))
 }
 

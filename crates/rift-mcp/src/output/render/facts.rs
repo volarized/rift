@@ -195,31 +195,6 @@ pub(super) fn moment_of(timestamp: &str) -> String {
     format!("{date} {minute} {offset}")
 }
 
-/// Wire spelling of the availability that is the normal state of a package.
-pub(super) const CANONICAL_AVAILABILITY: &str = "canonical";
-
-/// A package context entry as `name@version` or `name requirement`, then its manager.
-///
-/// The manager sits in parentheses, with the availability after it unless the availability is
-/// canonical. An empty `version` or `requirement` is absent. Warnings and the map write package
-/// entries through this one function.
-pub(super) fn package_text(
-    (manager, name): (&str, &str),
-    (version, requirement): (&str, &str),
-    availability: &str,
-) -> String {
-    let selector = match (version, requirement) {
-        ("", "") => name.to_owned(),
-        ("", requirement) => format!("{name} {requirement}"),
-        (version, _) => format!("{name}@{version}"),
-    };
-    if availability == CANONICAL_AVAILABILITY {
-        format!("{selector} ({manager})")
-    } else {
-        format!("{selector} ({manager}, {availability})")
-    }
-}
-
 /// An author as `name <email>`.
 pub(super) fn author_of(author: &CommitAuthor) -> String {
     let CommitAuthor { name, email } = author;

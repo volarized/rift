@@ -11,11 +11,8 @@ use rift_index::WorkspaceIndexLimits;
 use rift_mcp::RiftMcp;
 use rift_protocol::error::{ErrorCode, RetryDirective};
 use rmcp::ServiceExt as _;
-use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ReadResourceRequestParams, ReadResourceResult,
-    ResourceContents,
-};
-use serde_json::Value;
+use rmcp::model::{CallToolRequestParams, CallToolResult, ReadResourceResult, ResourceContents};
+use serde_json::{Value, json};
 
 pub(crate) type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -235,28 +232,25 @@ pub(crate) fn resource_text<'a>(answer: &'a ReadResourceResult, uri: &str) -> Te
     }
 }
 
-/// Reads map through MCP until local file preparation has completed.
+/// Waits for the first captured workspace through the public search route.
 pub(crate) async fn await_workspace_ready(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
-) -> TestResult<Value> {
+) -> TestResult<()> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    let probe = tool_request("search", &json!({"query": "ASK {}"}));
     loop {
-        let answer = tokio::time::timeout_at(
-            deadline,
-            client.read_resource(ReadResourceRequestParams::new("rift://map".to_owned())),
-        )
-        .await??;
-        let body = resource_json(&answer, "rift://map")?;
-        let preparing = body["warnings"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|warning| warning["code"] == "local_index_preparing");
-        if !preparing {
-            return Ok(body);
+        let body =
+            tokio::time::timeout_at(deadline, call_retrying_acceptance(client, probe.clone()))
+                .await??;
+        if body["reason"] != "index_preparing" {
+            assert!(
+                body["answer"]["value"] == true,
+                "graph readiness probe: {body}"
+            );
+            return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(format!("workspace map remained in preparation: {body}").into());
+            return Err(format!("workspace graph remained in preparation: {body}").into());
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
@@ -286,6 +280,7 @@ pub(crate) async fn query_after_population(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     arguments: &rift_protocol::query::QueryParams,
 ) -> TestResult<Value> {
+    search_after_population(client, &json!({"query":"beacon","scope":"local"})).await?;
     populated_answer(client, "search", &serde_json::to_value(arguments)?).await
 }
 
@@ -298,16 +293,21 @@ async fn populated_answer(
     const DELAY: std::time::Duration = std::time::Duration::from_millis(50);
     let mut answer = call_retrying_acceptance(client, tool_request(tool, arguments)).await?;
     for _attempt in 0..ATTEMPTS {
-        let pending = answer["warnings"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|warning| {
-                matches!(
-                    warning["code"].as_str(),
-                    Some("lexical_ranking_unavailable" | "stale_index" | "pattern_index_preparing")
-                )
-            });
+        let pending = answer["reason"] == "index_preparing"
+            || answer["warnings"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|warning| {
+                    matches!(
+                        warning["code"].as_str(),
+                        Some(
+                            "lexical_ranking_unavailable"
+                                | "stale_index"
+                                | "pattern_index_preparing"
+                        )
+                    )
+                });
         if !pending {
             return Ok(answer);
         }

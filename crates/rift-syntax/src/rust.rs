@@ -356,12 +356,14 @@ impl SyntaxProvider for RustSyntaxProvider {
         let tree = parser
             .parse(parsed.as_ref(), None)
             .ok_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())?;
-        let (nodes, symbols) = extract::extract(
+        let mut capture = crate::static_analysis::Capture::for_rust(source.text);
+        let (nodes, symbols, _) = extract::extract_with_capture(
             tree.root_node(),
             source,
             limits,
             &self.language,
             &RustGrammarRules,
+            Some(&mut capture),
         )?;
         Ok(SyntaxDocument::new_rust(
             self.language.clone(),
@@ -370,7 +372,8 @@ impl SyntaxProvider for RustSyntaxProvider {
             nodes,
             symbols,
             tree.root_node().has_error(),
-        ))
+        )
+        .with_static_facts(Some(capture.finish())))
     }
 
     fn node_facets(&self, kind: &str) -> Vec<NodeFacet> {

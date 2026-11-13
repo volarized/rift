@@ -1,8 +1,8 @@
 //! Text of the `rift://workspace` resource: language configuration and one page of source units.
 //!
 //! The header names the configuration revision, and the page when there are several. The sections
-//! follow directly under it, and the warnings section comes last. A language writes only what
-//! departs from the normal state of an enabled language.
+//! follow directly under it. A language writes only what departs from the normal state of an
+//! enabled language.
 
 use std::borrow::Cow;
 
@@ -17,14 +17,14 @@ use crate::output::text::{TextError, TextWriter};
 /// Levels that put `include` and `exclude` lines under their language.
 const PATTERN_DEPTH: usize = 1;
 
-/// Writes the header, the languages, the source units, and the warnings section.
+/// Writes the header, language configuration, and source units.
 pub(super) fn answer(out: &mut TextWriter, page: &WorkspaceResourcePage) -> Result<(), TextError> {
     let WorkspaceResourcePage {
         configuration_revision,
         languages,
         source,
-        warnings,
         pagination,
+        ..
     } = page;
     let mut header = Facts::default();
     header.push(&format!(
@@ -48,7 +48,7 @@ pub(super) fn answer(out: &mut TextWriter, page: &WorkspaceResourcePage) -> Resu
             sections.entry(0, &unit_line(unit))?;
         }
     }
-    sections.warnings(warnings)
+    Ok(())
 }
 
 /// The language line, then its `include` and `exclude` lines.

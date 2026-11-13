@@ -946,22 +946,7 @@ async fn await_search_population(
 ) -> TestResult<serde_json::Value> {
     for _poll in 0..SEARCH_POPULATION_POLLS_MAX {
         let answer = proxied_call(client, "search", request).await?;
-        let coverage_pending =
-            answer["outcome"] == "unavailable" && answer["reason"] == "insufficient_coverage";
-        let pending = answer["warnings"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|warning| {
-                warning["code"] == "stale_index"
-                    || (coverage_pending
-                        && warning["code"] == "lexical_ranking_unavailable"
-                        && warning["detail"].as_str().is_some_and(|detail| {
-                            detail
-                                .starts_with("the lexical index is still committing tree revision ")
-                        }))
-            });
-        if !pending {
+        if answer["reason"] != "index_preparing" {
             return Ok(answer);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;

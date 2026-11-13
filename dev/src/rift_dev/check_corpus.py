@@ -11,6 +11,7 @@ import tempfile
 import time
 import traceback
 from collections.abc import Callable, Iterator, Sequence
+from datetime import UTC, datetime
 from itertools import batched
 from pathlib import Path
 
@@ -25,6 +26,7 @@ from rift_dev.corpus_assertions import (
     active_stdout,
     build_records,
     chunked_answer,
+    chunked_warnings,
     churn_answer,
     database_bytes,
     declaration_pool,
@@ -34,6 +36,7 @@ from rift_dev.corpus_assertions import (
     lexical_breach,
     lexical_content,
     lists_position,
+    logged_read_warnings,
     map_paths,
     no_failed_builds,
     number,
@@ -119,8 +122,8 @@ READ_SECONDS = READINESS_SECONDS + 10.0
 # well above that outlier and strictly inside the readiness budget, so a steady read that
 # starts waiting for the index fails the case instead of hiding in the first read's room.
 STEADY_READ_SECONDS = READINESS_SECONDS * 2 / 3
-# One `settled_local` call resends a read until the local index preparation warning
-# clears, so it spans the startup snapshot's publication, the wait for the next poll, the
+# One `settled_local` call resends a read until the index is ready, so it spans the
+# startup snapshot's publication, the wait for the next poll, the
 # server's answer, and the client's own handling of that answer. Over 17 passing runs of
 # the `nextjs` workspace case the interval from the first `search` to the return from
 # `settled_local` was 44.79 to 59.12 seconds: publication of the startup snapshot 41.68 to
@@ -166,6 +169,64 @@ REQUIRED_LANGUAGES = {
     "nextjs": {"typescript"},
     "fastapi": {"python"},
 }
+# These paths yielded the declaration samples at the pinned revisions.
+# Catalog fallback keeps the sampling contract when a pin changes.
+BUN_SAMPLE_PATHS = (
+    "packages/bun-types/test.d.ts",
+    "src/runtime/cli/test/parallel/Coordinator.rs",
+    "src/runtime/cli/test/Scanner.rs",
+    "src/runtime/cli/test/ChangedFilesFilter.rs",
+    "src/patch_jsc/testing.rs",
+    "src/bundler/defines.rs",
+    "src/runtime/cli/test/parallel/Worker.rs",
+    "packages/bun-types/test-globals.d.ts",
+    "src/runtime/cli/init/react-tailwind/src/APITester.tsx",
+    "src/runtime/cli/init/react-app/src/APITester.tsx",
+    "src/runtime/cli/test/parallel/Frame.rs",
+    "src/runtime/cli/init/react-shadcn/src/APITester.tsx",
+    "src/runtime/cli/test/Timings.rs",
+    "bench/stress/hot-reload-files/stress-test.ts",
+    "src/jsc/bindgen_test.rs",
+    "src/dispatch/tests/shape.rs",
+    "src/runtime/cli/test/parallel/Channel.rs",
+    "src/runtime/cli/test/parallel/aggregate.rs",
+    "bench/test/isolate/setup.ts",
+)
+NEXTJS_SAMPLE_PATHS = (
+    "turbopack/crates/turbo-persistence/src/tests.rs",
+    "turbopack/crates/turbo-tasks-backend/tests/effects.rs",
+    "crates/next-code-frame/src/tests.rs",
+    "crates/next-custom-transforms/tests/fixture.rs",
+    "turbopack/crates/turbo-tasks-backend/tests/errors.rs",
+    "turbopack/crates/turbo-tasks-backend/tests/debug.rs",
+    "turbopack/crates/turbo-tasks-backend/tests/derive_value_to_string.rs",
+    "crates/next-custom-transforms/tests/errors.rs",
+    "turbopack/crates/turbo-tasks-backend/tests/collectibles.rs",
+    "turbopack/crates/turbo-tasks-backend/tests/call_types.rs",
+    "crates/next-custom-transforms/tests/full.rs",
+    "turbopack/crates/turbo-tasks-backend/tests/bug.rs",
+    "turbopack/crates/turbo-tasks-backend/tests/basic.rs",
+    "turbopack/crates/turbo-tasks-backend/tests/all_in_one.rs",
+    "turbopack/crates/turbo-tasks-backend/tests/bug2.rs",
+    "turbopack/crates/turbo-tasks-backend/tests/detached.rs",
+    "turbopack/crates/turbo-tasks-backend/tests/emptied_cells.rs",
+    "turbopack/crates/turbo-tasks-backend/tests/emptied_cells_session_dependent.rs",
+    "crates/next-custom-transforms/tests/telemetry.rs",
+    "crates/next-build-test/src/main.rs",
+    "examples/with-sentry/pages/api/test1.ts",
+    "examples/with-sentry/pages/api/test2.ts",
+    "examples/with-sentry/pages/api/test3.ts",
+    "examples/with-sentry/pages/api/test4.ts",
+    "examples/with-sentry/pages/client/test1.tsx",
+    "examples/with-sentry/pages/client/test2.tsx",
+    "examples/with-sentry/pages/client/test3.tsx",
+    "examples/with-sentry/pages/client/test4.tsx",
+    "examples/with-sentry/pages/client/test5.tsx",
+    "examples/with-sentry/pages/ssr/test1.tsx",
+    "examples/with-sentry/pages/ssr/test2.tsx",
+    "examples/with-sentry/pages/ssr/test3.tsx",
+    "examples/with-sentry/pages/ssr/test4.tsx",
+)
 CORPUS_COLUMNS = ("symbol", "name", "kind", "language", "path", "unit", "start", "end")
 PATH_HIT_LIMIT = 1000
 
@@ -219,9 +280,46 @@ def sample_path_request(path: str, query: str = "test") -> JsonObject:
 async def read_sample_paths(
     client: Client, paths: Sequence[str]
 ) -> list[list[JsonObject]]:
+    """Read each exact path under the original preparation deadline.
+
+    >>> from unittest.mock import AsyncMock, patch
+    >>> from typing import cast
+    >>> async def split_sample():
+    ...     failure = ToolFailure("search", "", "limit_exceeded", "", "never", identity="rift.search.query_deadline_exceeded")
+    ...     with patch(__name__ + "._read_sample_query", new_callable=AsyncMock) as query:
+    ...         query.side_effect = [failure, [[{"path": "a.ts"}]], [[{"path": "b.ts"}]]]
+    ...         grouped = await read_sample_paths(cast(Client, object()), ["a.ts", "b.ts"])
+    ...         return grouped, [call.args[1] for call in query.await_args_list]
+    >>> asyncio.run(split_sample())
+    ([[{'path': 'a.ts'}], [{'path': 'b.ts'}]], [['a.ts', 'b.ts'], ['a.ts'], ['b.ts']])
+    """
+
+    async def read(paths: Sequence[str]) -> list[list[JsonObject]]:
+        try:
+            return await _read_sample_query(client, paths)
+        except ToolFailure as failure:
+            if (
+                len(paths) == 1
+                or failure.identity != "rift.search.query_deadline_exceeded"
+            ):
+                raise
+        middle = len(paths) // 2
+        return await read(paths[:middle]) + await read(paths[middle:])
+
+    async with gate_deadline("sample paths", LOCAL_PREPARATION_SECONDS):
+        return await read(paths)
+
+
+async def _read_sample_query(
+    client: Client, paths: Sequence[str]
+) -> list[list[JsonObject]]:
     """Read independently ranked exact paths through one retained graph query."""
-    request = retrieval_batch_request(
-        [sample_path_request(path) for path in paths], CORPUS_COLUMNS
+    requests = [sample_path_request(path) for path in paths]
+    multiple = len(paths) > 1
+    request = (
+        retrieval_batch_request(requests, CORPUS_COLUMNS)
+        if multiple
+        else corpus_request(requests[0])
     )
     answer = await settled_local(client, "search", request)
     warnings(answer)
@@ -253,7 +351,7 @@ async def read_sample_paths(
         )
         require(count > 0 or not rows, "sample returned rows without pages")
         for row in rows:
-            slot = int(literal(row, "slot"))
+            slot = int(literal(row, "slot")) if multiple else 0
             require(
                 0 <= slot < len(paths) and slot >= previous, "sample slot out of order"
             )
@@ -274,15 +372,18 @@ async def read_sample_paths(
     return grouped
 
 
-CHURN_SEARCH_INPUTS: JsonObject = {
-    "query": "corpus_probe",
-    "target": "symbol",
-    "include": ["source"],
-    "limit": 1,
-}
+def churn_source(edit: int) -> str:
+    return f"pub fn corpus_probe() {{ let value = {edit}; }}\n"
+
+
+CHURN_PROBE_ID = "rift://symbol/local/rust/rift_corpus_probe/corpus_probe"
 CHURN_REQUESTS: dict[str, JsonObject] = {
-    "search": corpus_request(CHURN_SEARCH_INPUTS),
-    "symbol_nodes": {},
+    "search": {
+        "query": f"SELECT (<{CHURN_PROBE_ID}> AS ?symbol) ?unit ?source ?start ?end "
+        f"{{ ?node :of <{CHURN_PROBE_ID}>; :index 0; :source ?source; "
+        ":range [ :unit ?unit; :start ?start; :end ?end ] }"
+    },
+    "symbol_nodes": {"symbol": CHURN_PROBE_ID},
     "nodes": {"path": PROBE_PATH, "position": 0},
 }
 # The tool each churn read calls: `symbol_nodes` reads the probe declaration's nodes by its
@@ -581,7 +682,11 @@ class Corpus:
             await self.churn_case()
             return
         await self.baseline()
-        await self.symlink_root()
+        if self.pin.name == "bun":
+            await self.lexical_persistence(self.linked_root())
+        else:
+            await self.lexical_persistence()
+            await self.symlink_root()
         if self.pin.name == "fastapi":
             await self.shallow(directory / "shallow")
         if self.pin.name == "nextjs":
@@ -657,19 +762,16 @@ class Corpus:
         >>> common = {"configuration_revision": "0123abcd", "languages": languages}
         >>> first = {**common, "pagination": {"page_index": 0, "total_pages": 2}, "source": [{"path": f"docs/a{index:04}.md", "digest": "0123abcd", "language": "markdown"} for index in range(1000)]}
         >>> second = {**common, "pagination": {"page_index": 1, "total_pages": 2}, "source": [{"path": path, "digest": "0123abcd", "language": language} for path, language in [("src/test.ts", "typescript"), ("src/ztest.tsx", "typescript:tsx")]]}
-        >>> admission = {"answer": {"result": "boolean", "value": True}}
-        >>> client = SimpleNamespace(resource=AsyncMock(side_effect=[first, second]), call=AsyncMock(side_effect=[admission, answer(rows[:100], 0, next_query="retained next page"), answer(rows[100:], 1)]))
+        >>> client = SimpleNamespace(resource=AsyncMock(side_effect=[first, second]), call=AsyncMock(side_effect=[answer(rows[:100], 0, next_query="retained next page"), answer(rows[100:], 1)]))
         >>> sample = Corpus(cast(Pin, SimpleNamespace(name="nextjs")), Path("rift"), Path("report"))
         >>> selected = asyncio.run(sample.symbol_candidates(cast(Client, client)))
         >>> len(selected), client.call.await_count, client.resource.await_count
-        (200, 3, 2)
+        (200, 2, 2)
         >>> all(literal(row, "path") == "src/test.ts" for row in selected)
         True
-        >>> client.call.await_args_list[0].args[1] == {"query": "ASK {}"}
-        True
-        >>> client.call.await_args_list[1].args[1]["query"].count("SERVICE :search")
+        >>> client.call.await_args_list[0].args[1]["query"].count("SERVICE :search")
         2
-        >>> client.call.await_args_list[2].args[1] == {"query": "retained next page"}
+        >>> client.call.await_args_list[1].args[1] == {"query": "retained next page"}
         True
         """
         languages = SAMPLE_LANGUAGES[self.pin.name]
@@ -688,7 +790,6 @@ class Corpus:
             )
             return found
 
-        await await_index_ready(client)
         pool: list[JsonObject] = []
         represented: set[str] = set()
         workspace, groups = await self.source_catalog(client)
@@ -741,11 +842,21 @@ class Corpus:
                 anchor in symbol_pool(pool),
                 "scoped search lost the canonical sample anchor",
             )
+        preferred: dict[str, int] = {}
+        if minimum == SYMBOL_COUNT:
+            paths = {"bun": BUN_SAMPLE_PATHS, "nextjs": NEXTJS_SAMPLE_PATHS}.get(
+                self.pin.name, ()
+            )
+            preferred = {path: index for index, path in enumerate(paths)}
         pending = {
             language: iter(
                 sorted(
                     groups.get(language, []),
-                    key=lambda path: ("test" not in path.lower(), path),
+                    key=lambda path: (
+                        preferred.get(path, len(preferred)),
+                        "test" not in path.lower(),
+                        path,
+                    ),
                 )
             )
             for language in languages
@@ -830,6 +941,7 @@ class Corpus:
     async def baseline(self) -> None:
         with self.server() as server:
             async with server.connect() as client:
+                await await_startup_publication(server)
                 candidates = await self.symbol_candidates(client)
                 require(
                     len(candidates) >= SYMBOL_COUNT,
@@ -851,7 +963,6 @@ class Corpus:
                         "uv.lock produced no pypi packages",
                     )
                 await self.symbols(client, candidates)
-                await self.lexical_persistence(client)
                 await self.oversized(client, server)
                 await self.unparsed(client, server)
                 if self.pin.name == "nextjs":
@@ -947,6 +1058,7 @@ class Corpus:
             len(data) == self.pin.oversized_bytes, f"{path}: pinned byte count changed"
         )
         token, offset = token_past_chunk(data)
+        started = datetime.now(UTC)
         answer = await settled_pattern(
             client,
             {
@@ -956,7 +1068,14 @@ class Corpus:
                 "limit": 1,
             },
         )
-        named = chunked_answer(answer, path, len(data), offset)
+        ended = datetime.now(UTC)
+        chunked_answer(answer, path, len(data), offset)
+        named = chunked_warnings(
+            await pattern_warnings(
+                server, started, ended, self.pin.name == "bun", path
+            ),
+            path,
+        )
         if self.pin.name == "bun":
             workspace = await client.resource("rift://workspace")
             claimed = [
@@ -990,7 +1109,7 @@ class Corpus:
         """Search the pinned file past `[providers.syntax] max_file` held as text.
 
         The provider refuses its source for its size alone, so under the default `split`
-        its text answers search, every answer names it in `large_file_unparsed`, and the
+        its text answers search, the logs name it in `large_file_unparsed`, and the
         build that reads it records it as held unparsed rather than left out.
         """
         if not self.pin.unparsed_path:
@@ -1001,6 +1120,7 @@ class Corpus:
             len(data) == self.pin.unparsed_bytes, f"{path}: pinned byte count changed"
         )
         pattern, offset = last_line_pattern(data)
+        started = datetime.now(UTC)
         answer = await settled_pattern(
             client,
             {
@@ -1010,7 +1130,11 @@ class Corpus:
                 "limit": 1,
             },
         )
-        named = chunked_answer(answer, path, len(data), offset)
+        ended = datetime.now(UTC)
+        chunked_answer(answer, path, len(data), offset)
+        named = chunked_warnings(
+            await pattern_warnings(server, started, ended, True, path), path
+        )
         require(
             named == ["large_file_unparsed"],
             f"{path}: named by {named}, expected large_file_unparsed alone",
@@ -1207,12 +1331,11 @@ class Corpus:
             f"nodes omitted sampled declaration: {identity} ending at {path}:{end}",
         )
 
-    async def lexical_persistence(self, client: Client) -> None:
+    async def lexical_persistence(self, link: Path | None = None) -> None:
         """Preserve unrelated lexical rows after external source creation and removal."""
         before = lexical_content(self.root)
         sizes = database_bytes(self.root)
         path = self.root / PROBE_PATH
-        path.write_bytes(PROBE_SOURCE.encode())
         request: JsonObject = corpus_request(
             {
                 "query": "corpus_probe",
@@ -1222,32 +1345,44 @@ class Corpus:
                 "limit": 5,
             }
         )
-        answer = await settled_local(client, "search", request)
-        hits = bindings(answer)
-        require(
-            len(hits) == 1 and literal(hits[0], "source") == PROBE_SOURCE.rstrip("\n"),
-            f"new source was absent from reads: {answer}",
-        )
-        await self.await_probe(True)
-        require(
-            lexical_content(self.root) == before,
-            "source creation changed unrelated persisted lexical rows",
-        )
-        require(
-            path.read_bytes() == PROBE_SOURCE.encode(),
-            "source read changed probe bytes",
-        )
-        self.record(
-            "lexical_persistence", before=sizes, after=database_bytes(self.root)
-        )
-        path.unlink()
-        answer = await settled_local(client, "search", request)
-        require(not bindings(answer), f"removed source remained indexed: {answer}")
-        await self.await_probe(False)
-        require(
-            lexical_content(self.root) == before,
-            "source removal changed unrelated persisted lexical rows",
-        )
+        with self.server(link) as server:
+            async with server.connect() as client:
+                await await_startup_publication(server)
+                if link is not None:
+                    await self.require_linked_reads(client)
+                path.write_bytes(PROBE_SOURCE.encode())
+                await self.await_probe(True)
+                answer = await settled_local(client, "search", request)
+                hits = bindings(answer)
+                require(
+                    len(hits) == 1
+                    and literal(hits[0], "path") == PROBE_PATH
+                    and literal(hits[0], "source") == PROBE_SOURCE.rstrip("\n"),
+                    f"new source was absent from reads: {answer}",
+                )
+                require(
+                    lexical_content(self.root) == before,
+                    "source creation changed unrelated persisted lexical rows",
+                )
+                require(
+                    path.read_bytes() == PROBE_SOURCE.encode(),
+                    "source read changed probe bytes",
+                )
+                self.record(
+                    "lexical_persistence", before=sizes, after=database_bytes(self.root)
+                )
+                path.unlink()
+                await self.await_probe(False)
+                answer = await settled_local(client, "search", request)
+                require(
+                    not bindings(answer), f"removed source remained indexed: {answer}"
+                )
+                require(
+                    lexical_content(self.root) == before,
+                    "source removal changed unrelated persisted lexical rows",
+                )
+                no_failed_builds(await logged(server, "index"))
+            self.stop(server)
 
     async def await_probe(self, present: bool) -> None:
         """Wait for the lexical publication to reach `present` under one budget.
@@ -1341,12 +1476,13 @@ class Corpus:
                 f'[lib]\npath = "{PROBE_PATH}"\n[workspace]\n',
                 encoding="utf-8",
             )
+            probe.write_text(churn_source(0), encoding="utf-8")
             with self.server() as server:
                 async with server.connect() as client:
-                    # Listener readiness precedes file preparation. Observe the existing
-                    # startup budget before measuring reads against external writes.
-                    await await_index_ready(client)
-                    await self.churn(client, probe.relative_to(self.root).as_posix())
+                    await await_startup_publication(server)
+                    await self.churn(
+                        client, server, probe.relative_to(self.root).as_posix()
+                    )
                     no_failed_builds(await logged(server, "index"))
                 self.stop(server)
                 self.record("stop", state="after_churn", process_gone=True)
@@ -1355,22 +1491,23 @@ class Corpus:
             manifest.unlink(missing_ok=True)
             directory.rmdir()
 
-    async def churn(self, client: Client, probe_path: str = PROBE_PATH) -> None:
+    async def churn(self, client: Client, server: Server, probe_path: str) -> None:
         """Read complete source revisions while external writes continue every two seconds."""
         path = self.root / probe_path
         requests = {name: dict(request) for name, request in CHURN_REQUESTS.items()}
         requests["nodes"] = {"path": probe_path, "position": 0}
-        requests["search"] = corpus_request(
-            {**CHURN_SEARCH_INPUTS, "paths": {"include": [probe_path]}}
-        )
-        sources: list[str] = []
-        written: list[float] = []
+        sources = [churn_source(0).rstrip("\n")]
+        written = [time.monotonic()]
         timings: dict[str, list[float]] = {name: [] for name in CHURN_REQUESTS}
+        stale_reads: list[tuple[str, datetime, datetime]] = []
         overlaps = 0
         converging = False
+        last_write_at = datetime.now(UTC)
 
         def write(edit: int) -> None:
-            source = f"pub fn corpus_probe() {{ let value = {edit}; }}\n"
+            nonlocal last_write_at
+            source = churn_source(edit)
+            last_write_at = datetime.now(UTC)
             path.write_text(source, encoding="utf-8")
             sources.append(source.rstrip("\n"))
             written.append(time.monotonic())
@@ -1388,7 +1525,7 @@ class Corpus:
             first = not timings[name]
             budget = READ_SECONDS if first or converging else STEADY_READ_SECONDS
             started = time.monotonic()
-            codes: list[str] = []
+            started_at = datetime.now(UTC)
             revision: int | None = None
             try:
                 async with gate_deadline(f"churn {name}", budget):
@@ -1400,18 +1537,13 @@ class Corpus:
                         poll_seconds=POLL_SECONDS,
                         selection="current",
                     )
-                codes = [
-                    string_value(warning.get("code"), "warning code")
-                    for warning in warnings(answer)
-                ]
+                ended_at = datetime.now(UTC)
                 found, source = churn_answer(
                     name, answer, sources, identity, probe_path
                 )
                 revision = sources.index(source)
-                require(
-                    revision >= before - 1 or "stale_index" in codes,
-                    f"{name} returned old source without stale_index",
-                )
+                if revision < before - 1:
+                    stale_reads.append((name, started_at, ended_at))
                 return found, revision
             finally:
                 elapsed = time.monotonic() - started
@@ -1432,20 +1564,11 @@ class Corpus:
                     # these say which write the server still owed a publication for.
                     seconds_since_write=started - written[before - 1],
                     convergence=converging,
-                    warning_codes=codes,
                 )
 
-        write(0)
         task: asyncio.Task[None] | None = None
         try:
-            identity, _revision = await read("search", None)
-            # Read the known declaration from one published snapshot while edits continue.
-            requests["search"] = {
-                "query": f"SELECT (<{identity}> AS ?symbol) ?unit ?source ?start ?end "
-                f"{{ ?node :of <{identity}>; :index 0; :source ?source; "
-                ":range [ :unit ?unit; :start ?start; :end ?end ] }"
-            }
-            requests["symbol_nodes"] = {"symbol": identity}
+            identity, _revision = await read("symbol_nodes", CHURN_PROBE_ID)
             task = asyncio.create_task(writer())
             reads = 0
             tools = tuple(CHURN_REQUESTS)
@@ -1467,13 +1590,30 @@ class Corpus:
             converging = True
             convergence = time.monotonic()
             async with gate_deadline("churn final source", CONVERGENCE_SECONDS):
-                for name in CHURN_REQUESTS:
+                # Give the final rebuild time inside the convergence budget before
+                # spending a public read's shorter bound on validating the source.
+                await await_filesystem_publication(server, last_write_at)
+                for name in ("symbol_nodes", "search", "nodes"):
                     while True:
                         _identity, revision = await read(name, identity)
                         if revision == len(sources) - 1:
                             break
-                        # read already refused every older answer without stale_index.
                         await asyncio.sleep(POLL_SECONDS)
+            if stale_reads:
+                await observed(
+                    server,
+                    "mcp",
+                    lambda rows: all(
+                        any(
+                            started <= row.time <= ended
+                            and row.operation == "read.warning"
+                            and row.label("tool") == CHURN_TOOLS.get(name, name)
+                            and row.label("warning_code") == "stale_index"
+                            for row in rows
+                        )
+                        for name, started, ended in stale_reads
+                    ),
+                )
             self.record(
                 "churn_convergence",
                 seconds=time.monotonic() - convergence,
@@ -1508,16 +1648,48 @@ class Corpus:
                 await asyncio.gather(task, return_exceptions=True)
             path.unlink(missing_ok=True)
 
-    async def symlink_root(self) -> None:
+    def linked_root(self) -> Path:
         link = self.root.parent / "linked-workspace"
         link.symlink_to(self.root, target_is_directory=True)
-        with self.server(link) as server:
+        return link
+
+    async def require_linked_reads(self, client: Client) -> None:
+        if self.pin.name == "bun":
+            anchor = "rift://symbol/local/rust/bun_bundler/defines/TEST"
+            path = "src/bundler/defines.rs"
+            exact = await client.call("get_symbol", {"id": anchor})
+            require(
+                exact.get("outcome") == "found"
+                and object_value(exact.get("symbol"), "linked symbol").get("id")
+                == anchor,
+                "symlink root lost the canonical Bun declaration",
+            )
+            declared = [
+                row for row in objects(exact, "declarations") if row.get("path") == path
+            ]
+            require(len(declared) == 1, "linked symbol lost its declaration path")
+            end = number(
+                object_value(declared[0].get("range"), "linked declaration range").get(
+                    "end"
+                ),
+                "linked declaration end",
+            )
+            source = self.root / path
+            await self.require_symbol_item(
+                client, anchor, path, end, source.read_bytes(), source
+            )
+        else:
+            candidates = await self.symbol_candidates(client, minimum=1)
+            require(bool(candidates), "symlink root has no search results")
+        self.record("symlink_root", reads=True)
+
+    async def symlink_root(self) -> None:
+        with self.server(self.linked_root()) as server:
             async with server.connect() as client:
-                candidates = await self.symbol_candidates(client, minimum=1)
-                require(bool(candidates), "symlink root has no search results")
+                await await_startup_publication(server)
+                await self.require_linked_reads(client)
                 no_failed_builds(await logged(server, "index"))
             self.stop(server)
-        self.record("symlink_root", reads=True)
 
     async def shallow(self, root: Path) -> None:
         self.pin.checkout(root, depth=1)
@@ -1666,26 +1838,23 @@ class Corpus:
         self.configure("[search.lexical]\nunits_max = 20000\n")
         with self.server() as server:
             async with server.connect() as client:
-                await settled_local(
-                    client, "search", corpus_request({"query": "test", "limit": 1})
-                )
-                await observed(
+                await await_startup_publication(server)
+                failure_records = await observed(
                     server,
                     "search",
                     lambda rows: any(
-                        row.is_message(
-                            "the lexical commit failed; the next publication compares every "
-                            "file with the digests the store recorded"
-                        )
+                        row.operation == "search.commit"
+                        and row.label("outcome") == "error"
                         for row in rows
                     ),
                 )
+                count = lexical_breach(failure_records, 20000)
                 answer = await client.call(
                     "search", corpus_request({"query": "test", "limit": 1})
                 )
-                count = lexical_breach(answer, 20000)
                 require(
-                    answer.get("outcome") == "unavailable",
+                    answer.get("outcome") == "unavailable"
+                    and answer.get("reason") == "insufficient_coverage",
                     "incomplete lexical ranking reported a complete answer",
                 )
                 anchor = "rift://symbol/local/rust/bun_bundler/defines/TEST"
@@ -1716,6 +1885,7 @@ class Corpus:
     async def stop_states(self) -> None:
         with self.server() as server:
             async with server.connect() as client:
+                await await_startup_publication(server)
                 await client.call(
                     "search", corpus_request({"query": "test", "limit": 1})
                 )
@@ -1728,13 +1898,10 @@ class Corpus:
     async def stop_during_rebuild(self) -> None:
         """Observe filesystem rebuild output without a proxy that restarts a stopped server."""
         with self.server() as server:
-            startup = await observed_state(
-                server, 0, STARTUP_PUBLICATION, startup_published
-            )
+            await await_startup_publication(server)
+            offset = len(server.read_log())
             (self.root / PROBE_PATH).write_text(PROBE_SOURCE)
-            output = await observed_output(
-                server, len(startup), "index capture started"
-            )
+            output = await observed_output(server, offset, "index capture started")
             await self.stop_observed(server, "rebuild", output)
         (self.root / PROBE_PATH).unlink(missing_ok=True)
 
@@ -1776,7 +1943,10 @@ async def observed_output(server: Server, offset: int, message: str) -> str:
 
 
 async def observed_state(
-    server: Server, offset: int, wanted: str, holds: Callable[[str], bool]
+    server: Server,
+    offset: int,
+    wanted: str,
+    holds: Callable[[str], bool],
 ) -> str:
     """Read owned output until its complete records satisfy `holds`.
 
@@ -1791,8 +1961,7 @@ async def observed_state(
             return output
         await asyncio.sleep(POLL_SECONDS)
     raise AssertionError(
-        f"required record never reached server output within "
-        f"{OBSERVATION_SECONDS}s: {wanted}"
+        f"required record never reached server output within {OBSERVATION_SECONDS}s: {wanted}"
     )
 
 
@@ -1812,38 +1981,84 @@ async def settled_local(client: Client, name: str, request: JsonObject) -> JsonO
     )
 
 
-async def await_index_ready(client: Client) -> None:
-    """Wait for a published graph without requiring whole-workspace symbol coverage."""
-    answer = await settled_local(client, "search", {"query": "ASK {}"})
-    result = object_value(answer.get("answer"), "startup graph answer")
-    require(
-        result.get("result") == "boolean" and result.get("value") is True,
-        f"startup graph query did not return true: {answer}",
-    )
+async def await_startup_publication(server: Server) -> None:
+    """Wait for startup publication before asking the server to retain a view."""
+    async with gate_deadline(STARTUP_PUBLICATION, LOCAL_PREPARATION_SECONDS):
+        while True:
+            server.check_running()
+            output = server.read_log()
+            if startup_published(output):
+                return
+            if server.output_cut:
+                published = await logged(server, "index")
+                if any(
+                    row.operation == "index.publish"
+                    and row.label("trigger") == "startup"
+                    for row in published
+                ):
+                    return
+            await asyncio.sleep(POLL_SECONDS)
+
+
+async def await_filesystem_publication(server: Server, after: datetime) -> None:
+    """Observe a publication after the last write within the caller's deadline."""
+    while True:
+        server.check_running()
+        # Churn can fill the server's own stderr budget before the final write.
+        rows = await logged(server, "index")
+        if any(
+            row.time >= after
+            and row.operation == "index.publish"
+            and row.label("trigger") == "filesystem"
+            and row.is_message("index snapshot published")
+            for row in rows
+        ):
+            return
+        await asyncio.sleep(POLL_SECONDS)
 
 
 async def settled_pattern(client: Client, request: JsonObject) -> JsonObject:
-    """Resend a `pattern` search until the trigram index covers every stored row.
-
-    An answer warning `pattern_index_preparing` covers only the rows the trigram index
-    holds, and the warning asks the caller to resend once the index catches up. The
-    deadline alone bounds the loop, as in `Corpus.await_probe`.
-    """
-    deadline = time.monotonic() + OBSERVATION_SECONDS
-    query = corpus_request(request)
-    while time.monotonic() < deadline:
-        answer = await client.call("search", query)
-        preparing = [
-            warning
-            for warning in warnings(answer)
-            if warning.get("code") == "pattern_index_preparing"
-        ]
-        if not preparing:
-            return answer
-        await asyncio.sleep(POLL_SECONDS)
-    raise AssertionError(
-        f"the trigram index never covered every stored row within {OBSERVATION_SECONDS}s"
+    """Resend a current pattern search while its trigram index is preparing."""
+    return await read_settled_local(
+        client,
+        "search",
+        corpus_request(request),
+        seconds=OBSERVATION_SECONDS,
+        poll_seconds=POLL_SECONDS,
+        selection="current",
     )
+
+
+async def pattern_warnings(
+    server: Server, started: datetime, ended: datetime, expected: bool, path: str
+) -> list[JsonObject]:
+    """Read diagnostics from the completed pattern request, including pending log writes."""
+
+    def selected(rows: list[Line]) -> list[Line]:
+        matching = [
+            row
+            for row in rows
+            if started <= row.time <= ended and row.label("tool") == "search"
+        ]
+        completed = [
+            row for row in matching if row.is_message("tool request completed")
+        ]
+        if not completed:
+            return []
+        request = completed[-1].label("req")
+        return [row for row in matching if row.label("req") == request]
+
+    def available(rows: list[Line]) -> bool:
+        request_rows = selected(rows)
+        if not request_rows:
+            return False
+        if not expected:
+            return True
+        return "large_file_unparsed" in chunked_warnings(
+            logged_read_warnings(request_rows), path
+        )
+
+    return logged_read_warnings(selected(await observed(server, "mcp", available)))
 
 
 def objects(answer: JsonObject, key: str) -> list[JsonObject]:
