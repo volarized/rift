@@ -1,0 +1,34 @@
+[package]
+name = "rift-collect"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Incremental collection of source-backed semantic facts"
+
+[lints]
+workspace = true
+
+[features]
+default = ["runtime"]
+runtime = ["dep:rift-lsp", "dep:serde_json", "dep:tokio", "dep:toasty", "dep:toasty-driver-sqlite"]
+
+[dependencies]
+rift-core.workspace = true
+rift-lsp = { workspace = true, optional = true }
+schemars.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, optional = true }
+thiserror.workspace = true
+toasty = { workspace = true, optional = true }
+toasty-driver-sqlite = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["process"], optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[bin]]
+name = "rift-collect"
+path = "src/main.rs"
+required-features = ["runtime"]

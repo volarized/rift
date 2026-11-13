@@ -4831,6 +4831,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "rift-collect"
+version = "0.0.73"
+dependencies = [
+ "rift-core",
+ "rift-lsp",
+ "schemars 1.2.3",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "toasty",
+ "toasty-driver-sqlite",
+ "tokio",
+]
+
+[[package]]
 name = "rift-core"
 version = "0.0.73"
 dependencies = [
