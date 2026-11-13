@@ -1654,8 +1654,33 @@ class Corpus:
         return link
 
     async def require_linked_reads(self, client: Client) -> None:
-        candidates = await self.symbol_candidates(client, minimum=1)
-        require(bool(candidates), "symlink root has no search results")
+        if self.pin.name == "bun":
+            anchor = "rift://symbol/local/rust/bun_bundler/defines/TEST"
+            path = "src/bundler/defines.rs"
+            exact = await client.call("get_symbol", {"id": anchor})
+            require(
+                exact.get("outcome") == "found"
+                and object_value(exact.get("symbol"), "linked symbol").get("id")
+                == anchor,
+                "symlink root lost the canonical Bun declaration",
+            )
+            declared = [
+                row for row in objects(exact, "declarations") if row.get("path") == path
+            ]
+            require(len(declared) == 1, "linked symbol lost its declaration path")
+            end = number(
+                object_value(declared[0].get("range"), "linked declaration range").get(
+                    "end"
+                ),
+                "linked declaration end",
+            )
+            source = self.root / path
+            await self.require_symbol_item(
+                client, anchor, path, end, source.read_bytes(), source
+            )
+        else:
+            candidates = await self.symbol_candidates(client, minimum=1)
+            require(bool(candidates), "symlink root has no search results")
         self.record("symlink_root", reads=True)
 
     async def symlink_root(self) -> None:
