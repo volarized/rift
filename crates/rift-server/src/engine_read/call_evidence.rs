@@ -14,6 +14,7 @@ use super::{CallCorroboration, CallDestination, CallProvider, GraphCalls};
 
 /// The calls one captured static pass established for a selected declaration.
 pub(super) struct CapturedCalls<'read> {
+    reads: &'read ReadService,
     direction: TraversalDirection,
     edges: Vec<&'read rift_index::RelationshipEdge>,
     truncated: bool,
@@ -35,6 +36,7 @@ impl<'read> CapturedCalls<'read> {
         });
         let edges = calls.by_ref().take(TRAVERSAL_NODES_MAX).collect();
         Self {
+            reads,
             direction,
             edges,
             truncated: calls.next().is_some(),
@@ -78,8 +80,12 @@ impl<'read> CapturedCalls<'read> {
                 &span,
                 callee,
                 &neighbor,
-                &mut removed,
-                &mut engine.corroboration,
+                (&mut removed, &mut engine.corroboration),
+                |destination| {
+                    matches!(destination, CallDestination::Local(id) if id == &neighbor
+                        || self.direction == TraversalDirection::Incoming
+                            && caller_contains(self.reads, id, &neighbor, &span))
+                },
             );
             if conflict {
                 engine.complete = false;
@@ -101,6 +107,32 @@ impl<'read> CapturedCalls<'read> {
         merge_call_neighbors(&mut engine.local);
         engine
     }
+}
+
+fn caller_contains(
+    reads: &ReadService,
+    engine: &SymbolId,
+    authored: &SymbolId,
+    occurrence: &SourceUnitSpan,
+) -> bool {
+    let declaration = |id: &SymbolId| {
+        let id = CoreSymbolId::new(id.as_str().to_owned()).ok()?;
+        let (declarations, count) = reads.index().symbols_by_identity_page(&id, 0, 1).ok()?;
+        let [declaration] = declarations.as_slice() else {
+            return None;
+        };
+        (count == 1 && crate::read::source_unit_id(declaration.file.path()) == occurrence.unit)
+            .then_some(declaration.symbol.item_range)
+    };
+    let (Some(outer), Some(inner)) = (declaration(engine), declaration(authored)) else {
+        return false;
+    };
+    // Incoming observations already name the same callee. An engine can group a
+    // nested initializer with its enclosing callable. Keep the innermost caller.
+    outer != inner
+        && outer.encloses(inner)
+        && inner.start <= occurrence.range.start
+        && occurrence.range.end <= inner.end
 }
 
 type CallKey = (String, u64, u64);
@@ -168,14 +200,14 @@ impl CallEvidence {
         span: &SourceUnitSpan,
         callee: rift_syntax::ByteRange,
         target: &SymbolId,
-        removed: &mut BTreeSet<CallKey>,
-        records: &mut Vec<CallCorroboration>,
+        (removed, records): (&mut BTreeSet<CallKey>, &mut Vec<CallCorroboration>),
+        agrees_with: impl Fn(&CallDestination) -> bool,
     ) -> bool {
         let mut conflict = false;
         for (key, destinations) in self.at(span, callee) {
             removed.insert(key.clone());
             for (provider, destination) in destinations {
-                let agrees = matches!(destination, CallDestination::Local(id) if id == target);
+                let agrees = agrees_with(destination);
                 conflict |= !agrees;
                 if records.len() == TRAVERSAL_NODES_MAX {
                     return true;
@@ -215,6 +247,74 @@ fn merge_call_neighbors(neighbors: &mut Vec<(SymbolId, Vec<SourceUnitSpan>)>) {
 #[cfg(test)]
 mod tests {
     use rift_protocol::read::SymbolId;
+
+    #[test]
+    fn incoming_engine_group_preserves_the_authored_initializer_caller() {
+        use rift_protocol::read::{TextRange, TraversalDirection};
+
+        let directory = tempfile::tempdir().expect("workspace");
+        let source = "function callee() {}\nexport function outer() { const token = callee(); return token; }\nfunction other() {}\n";
+        std::fs::write(directory.path().join("entry.mjs"), source).expect("source");
+        let reads = super::ReadService::build(
+            directory.path(),
+            rift_index::WorkspaceIndexLimits::default(),
+            &rift_core::SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            rift_protocol::configuration::HistoryConfiguration::default(),
+        )
+        .expect("captured workspace");
+        let identity = |name| {
+            super::CoreSymbolId::new(format!(
+                "rift://symbol/local/javascript/.%2Fentry.mjs/{name}"
+            ))
+            .expect("canonical identity")
+        };
+        let callee = identity("callee");
+        let outer = SymbolId(identity("outer").as_str().to_owned());
+        let other = SymbolId(identity("other").as_str().to_owned());
+        let start = u64::try_from(source.find("callee();").expect("call")).expect("byte position");
+        let captured = super::CapturedCalls::read(&reads, &callee, TraversalDirection::Incoming);
+        let [edge] = captured.edges.as_slice() else {
+            panic!("expected one static call");
+        };
+        let initializer = SymbolId(edge.from().as_str().to_owned());
+        assert_ne!(initializer, outer);
+        assert!(initializer.as_str().ends_with("/token"));
+        let observed = super::SourceUnitSpan {
+            unit: super::SourceUnitId(edge.occurrence().unit().to_string()),
+            range: TextRange {
+                start,
+                end: start + 6,
+            },
+        };
+        for (engine_caller, agrees) in [(outer, true), (other, false)] {
+            let calls = super::CapturedCalls::read(&reads, &callee, TraversalDirection::Incoming)
+                .combine(super::GraphCalls {
+                    local: vec![(engine_caller.clone(), vec![observed.clone()])],
+                    complete: true,
+                    ..super::GraphCalls::default()
+                });
+            assert_eq!(calls.complete, agrees);
+            let [record] = calls.corroboration.as_slice() else {
+                panic!("expected one corroboration record");
+            };
+            assert_eq!(
+                record.engine_target,
+                super::CallDestination::Local(engine_caller)
+            );
+            assert_eq!(record.observed, observed);
+            assert_eq!(record.agrees, agrees);
+            if agrees {
+                let [(actual, ranges)] = calls.local.as_slice() else {
+                    panic!("expected one incoming caller");
+                };
+                assert_eq!(actual, &initializer);
+                assert_eq!(ranges, std::slice::from_ref(&record.authored));
+            } else {
+                assert!(calls.local.is_empty());
+            }
+        }
+    }
 
     #[test]
     fn authored_call_evidence_matches_full_and_identifier_ranges_only() {
@@ -290,8 +390,8 @@ mod tests {
             &authored,
             rift_syntax::ByteRange { start: 20, end: 24 },
             &static_target,
-            &mut removed,
-            &mut records,
+            (&mut removed, &mut records),
+            |destination| matches!(destination, super::CallDestination::Local(id) if id == &static_target),
         );
         assert!(conflict);
         assert_eq!(
