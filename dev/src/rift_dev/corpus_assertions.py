@@ -357,25 +357,25 @@ def build_records(found: list[Line], path: str) -> list[str]:
     ]
 
 
-def lexical_breach(answer: JsonObject, maximum: int) -> int:
-    """Require the exact rendered lexical bound and a count beyond that maximum."""
+def lexical_breach(records: list[Line], maximum: int) -> int:
+    """Require the failed lexical commit to log the exact bound and observed count."""
     found = [
-        entry
-        for entry in warnings(answer)
-        if entry.get("code") == "lexical_ranking_unavailable"
+        record.label("error")
+        for record in records
+        if record.operation == "search.commit" and record.label("outcome") == "error"
     ]
     require(
-        len(found) == 1, "lexical overflow must warn exactly once and keep publication"
+        len(found) == 1, "lexical overflow must log exactly one failed commit"
     )
-    detail = string_value(found[0].get("detail"), "lexical warning detail")
+    detail = found[0]
     matched = re.search(
         rf"lexical index received more units than its accepted limit of {maximum}: "
         r"field units_max, observed ([0-9]+); "
-        r"resend the same request after a short delay$",
+        r"resend the same request after a short delay",
         detail,
     )
     if matched is None:
-        raise AssertionError(f"lexical warning lost its exact bound: {detail}")
+        raise AssertionError(f"lexical commit record lost its exact bound: {detail}")
     observed = int(matched.group(1))
     require(observed > maximum, f"lexical observed {observed} did not exceed {maximum}")
     return observed

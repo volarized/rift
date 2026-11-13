@@ -11,6 +11,7 @@ import tempfile
 import time
 import traceback
 from collections.abc import Callable, Iterator, Sequence
+from datetime import UTC, datetime
 from itertools import batched
 from pathlib import Path
 
@@ -119,8 +120,8 @@ READ_SECONDS = READINESS_SECONDS + 10.0
 # well above that outlier and strictly inside the readiness budget, so a steady read that
 # starts waiting for the index fails the case instead of hiding in the first read's room.
 STEADY_READ_SECONDS = READINESS_SECONDS * 2 / 3
-# One `settled_local` call resends a read until the local index preparation warning
-# clears, so it spans the startup snapshot's publication, the wait for the next poll, the
+# One `settled_local` call resends a read until the index is ready, so it spans the
+# startup snapshot's publication, the wait for the next poll, the
 # server's answer, and the client's own handling of that answer. Over 17 passing runs of
 # the `nextjs` workspace case the interval from the first `search` to the return from
 # `settled_local` was 44.79 to 59.12 seconds: publication of the startup snapshot 41.68 to
@@ -272,6 +273,10 @@ async def read_sample_paths(
         pagination.get("next_query") is None, "sample returned an unadvertised page"
     )
     return grouped
+
+
+def churn_source(edit: int) -> str:
+    return f"pub fn corpus_probe() {{ let value = {edit}; }}\n"
 
 
 CHURN_SEARCH_INPUTS: JsonObject = {
@@ -1341,12 +1346,13 @@ class Corpus:
                 f'[lib]\npath = "{PROBE_PATH}"\n[workspace]\n',
                 encoding="utf-8",
             )
+            probe.write_text(churn_source(0), encoding="utf-8")
             with self.server() as server:
                 async with server.connect() as client:
                     # Listener readiness precedes file preparation. Observe the existing
                     # startup budget before measuring reads against external writes.
                     await await_index_ready(client)
-                    await self.churn(client, probe.relative_to(self.root).as_posix())
+                    await self.churn(client, server, probe.relative_to(self.root).as_posix())
                     no_failed_builds(await logged(server, "index"))
                 self.stop(server)
                 self.record("stop", state="after_churn", process_gone=True)
@@ -1355,7 +1361,7 @@ class Corpus:
             manifest.unlink(missing_ok=True)
             directory.rmdir()
 
-    async def churn(self, client: Client, probe_path: str = PROBE_PATH) -> None:
+    async def churn(self, client: Client, server: Server, probe_path: str) -> None:
         """Read complete source revisions while external writes continue every two seconds."""
         path = self.root / probe_path
         requests = {name: dict(request) for name, request in CHURN_REQUESTS.items()}
@@ -1363,14 +1369,15 @@ class Corpus:
         requests["search"] = corpus_request(
             {**CHURN_SEARCH_INPUTS, "paths": {"include": [probe_path]}}
         )
-        sources: list[str] = []
-        written: list[float] = []
+        sources = [churn_source(0).rstrip("\n")]
+        written = [time.monotonic()]
         timings: dict[str, list[float]] = {name: [] for name in CHURN_REQUESTS}
+        stale_reads: list[tuple[str, datetime, datetime]] = []
         overlaps = 0
         converging = False
 
         def write(edit: int) -> None:
-            source = f"pub fn corpus_probe() {{ let value = {edit}; }}\n"
+            source = churn_source(edit)
             path.write_text(source, encoding="utf-8")
             sources.append(source.rstrip("\n"))
             written.append(time.monotonic())
@@ -1388,7 +1395,7 @@ class Corpus:
             first = not timings[name]
             budget = READ_SECONDS if first or converging else STEADY_READ_SECONDS
             started = time.monotonic()
-            codes: list[str] = []
+            started_at = datetime.now(UTC)
             revision: int | None = None
             try:
                 async with gate_deadline(f"churn {name}", budget):
@@ -1400,18 +1407,13 @@ class Corpus:
                         poll_seconds=POLL_SECONDS,
                         selection="current",
                     )
-                codes = [
-                    string_value(warning.get("code"), "warning code")
-                    for warning in warnings(answer)
-                ]
+                ended_at = datetime.now(UTC)
                 found, source = churn_answer(
                     name, answer, sources, identity, probe_path
                 )
                 revision = sources.index(source)
-                require(
-                    revision >= before - 1 or "stale_index" in codes,
-                    f"{name} returned old source without stale_index",
-                )
+                if revision < before - 1:
+                    stale_reads.append((name, started_at, ended_at))
                 return found, revision
             finally:
                 elapsed = time.monotonic() - started
@@ -1432,10 +1434,8 @@ class Corpus:
                     # these say which write the server still owed a publication for.
                     seconds_since_write=started - written[before - 1],
                     convergence=converging,
-                    warning_codes=codes,
                 )
 
-        write(0)
         task: asyncio.Task[None] | None = None
         try:
             identity, _revision = await read("search", None)
@@ -1472,8 +1472,22 @@ class Corpus:
                         _identity, revision = await read(name, identity)
                         if revision == len(sources) - 1:
                             break
-                        # read already refused every older answer without stale_index.
                         await asyncio.sleep(POLL_SECONDS)
+            if stale_reads:
+                await observed(
+                    server,
+                    "mcp",
+                    lambda rows: all(
+                        any(
+                            started <= row.time <= ended
+                            and row.operation == "read.warning"
+                            and row.label("tool") == CHURN_TOOLS.get(name, name)
+                            and row.label("warning_code") == "stale_index"
+                            for row in rows
+                        )
+                        for name, started, ended in stale_reads
+                    ),
+                )
             self.record(
                 "churn_convergence",
                 seconds=time.monotonic() - convergence,
@@ -1669,23 +1683,21 @@ class Corpus:
                 await settled_local(
                     client, "search", corpus_request({"query": "test", "limit": 1})
                 )
-                await observed(
+                failure_records = await observed(
                     server,
                     "search",
                     lambda rows: any(
-                        row.is_message(
-                            "the lexical commit failed; the next publication compares every "
-                            "file with the digests the store recorded"
-                        )
+                        row.operation == "search.commit" and row.label("outcome") == "error"
                         for row in rows
                     ),
                 )
+                count = lexical_breach(failure_records, 20000)
                 answer = await client.call(
                     "search", corpus_request({"query": "test", "limit": 1})
                 )
-                count = lexical_breach(answer, 20000)
                 require(
-                    answer.get("outcome") == "unavailable",
+                    answer.get("outcome") == "unavailable"
+                    and answer.get("reason") == "insufficient_coverage",
                     "incomplete lexical ranking reported a complete answer",
                 )
                 anchor = "rift://symbol/local/rust/bun_bundler/defines/TEST"
@@ -1823,26 +1835,14 @@ async def await_index_ready(client: Client) -> None:
 
 
 async def settled_pattern(client: Client, request: JsonObject) -> JsonObject:
-    """Resend a `pattern` search until the trigram index covers every stored row.
-
-    An answer warning `pattern_index_preparing` covers only the rows the trigram index
-    holds, and the warning asks the caller to resend once the index catches up. The
-    deadline alone bounds the loop, as in `Corpus.await_probe`.
-    """
-    deadline = time.monotonic() + OBSERVATION_SECONDS
-    query = corpus_request(request)
-    while time.monotonic() < deadline:
-        answer = await client.call("search", query)
-        preparing = [
-            warning
-            for warning in warnings(answer)
-            if warning.get("code") == "pattern_index_preparing"
-        ]
-        if not preparing:
-            return answer
-        await asyncio.sleep(POLL_SECONDS)
-    raise AssertionError(
-        f"the trigram index never covered every stored row within {OBSERVATION_SECONDS}s"
+    """Resend a current pattern search while its trigram index is preparing."""
+    return await read_settled_local(
+        client,
+        "search",
+        corpus_request(request),
+        seconds=OBSERVATION_SECONDS,
+        poll_seconds=POLL_SECONDS,
+        selection="current",
     )
 
 

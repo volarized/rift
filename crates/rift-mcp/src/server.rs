@@ -1441,6 +1441,7 @@ struct PhasedRanking {
 struct SearchRanking {
     answer: StoreAnswer,
     warnings: Vec<ReadWarning>,
+    lexical_commit_pending: bool,
 }
 
 impl SearchRanking {
@@ -1452,6 +1453,7 @@ impl SearchRanking {
             warnings: vec![ReadWarning::LexicalRankingUnavailable {
                 detail: detail.to_owned(),
             }],
+            lexical_commit_pending: false,
         }
     }
 
@@ -1465,6 +1467,7 @@ impl SearchRanking {
         Self {
             answer,
             warnings: Vec::new(),
+            lexical_commit_pending: false,
         }
     }
 }
@@ -1493,16 +1496,20 @@ fn ranking_of(
                 answer: StoreAnswer::new(phased.precise, phased.broad, weights)
                     .with_file_rows(phased.file_rows),
                 warnings,
+                lexical_commit_pending: false,
             })
         }
-        (_, LexicalCommitState::Committing) => Some(SearchRanking::unavailable(
-            &format!(
-                "the lexical index is still committing tree revision {tree_revision}, so the \
-                 answer was ranked by identifier matching alone; resend the request once the \
-                 commit lands"
-            ),
-            weights,
-        )),
+        (_, LexicalCommitState::Committing) => Some(SearchRanking {
+            lexical_commit_pending: true,
+            ..SearchRanking::unavailable(
+                &format!(
+                    "the lexical index is still committing tree revision {tree_revision}, so the \
+                     answer was ranked by identifier matching alone; resend the request once the \
+                     commit lands"
+                ),
+                weights,
+            )
+        }),
         (_, LexicalCommitState::Owed { cause }) => Some(SearchRanking::unavailable(
             &bounded_detail(
                 format!(
@@ -2364,14 +2371,37 @@ impl RiftMcp {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<Json<rift_protocol::search_read::SearchReadResult>, ToolFailure> {
-        if let Some(captured) = self.captured_query(&params).await? {
+        if let Some(captured) = self.captured_query(&params, false).await? {
             return Ok(Json(captured));
         }
-        self.search_result(params).await.map(|Json(answer)| {
+        self.search_result(params).await.map(|(Json(answer), _)| {
             Json(rift_protocol::search_read::SearchReadResult::Results(
                 Box::new(answer),
             ))
         })
+    }
+
+    async fn graph_search(
+        &self,
+        params: SearchParams,
+    ) -> Result<rift_protocol::search_read::SearchReadResult, ToolFailure> {
+        use rift_protocol::search_read::SearchReadResult;
+
+        if let Some(captured) = self.captured_query(&params, true).await? {
+            return Ok(captured);
+        }
+        let current = params.view.is_none() && params.revision.is_none();
+        let (Json(page), lexical_commit_pending) = self.search_result(params).await?;
+        if current && lexical_commit_pending {
+            return Ok(SearchReadResult::Unavailable(
+                rift_protocol::search_read::SearchUnavailable::Unavailable {
+                    reason: rift_protocol::symbol_read::SymbolUnavailableReason::IndexPreparing,
+                    view: page.view,
+                    warnings: page.warnings,
+                },
+            ));
+        }
+        Ok(SearchReadResult::Results(Box::new(page)))
     }
 
     async fn search_retrieval_call(
@@ -2397,12 +2427,21 @@ impl RiftMcp {
         }
     }
 
-    async fn search_result(&self, params: SearchParams) -> Result<Json<SearchResult>, ToolFailure> {
+    async fn search_result(
+        &self,
+        params: SearchParams,
+    ) -> Result<(Json<SearchResult>, bool), ToolFailure> {
         if params.target == rift_protocol::read::SearchParamsTarget::Commit {
-            return self.commit_search(params).await;
+            return self
+                .commit_search(params)
+                .await
+                .map(|answer| (answer, false));
         }
         if let Some(change) = params.change.clone() {
-            return self.change_search(params, change).await;
+            return self
+                .change_search(params, change)
+                .await
+                .map(|answer| (answer, false));
         }
         let Some(git) = params.revision.as_ref().and_then(Revision::git_revision) else {
             return rift_tracing::traced!(
@@ -2418,6 +2457,7 @@ impl RiftMcp {
             reads.search(&params, &StoreAnswer::identifier_only())
         })
         .await
+        .map(|answer| (answer, false))
     }
 
     /// Answers a commit search from the history store the server opened, behind the
@@ -2519,11 +2559,19 @@ impl RiftMcp {
     async fn current_tree_search(
         &self,
         params: SearchParams,
-    ) -> Result<Json<SearchResult>, ToolFailure> {
-        let (resolved, answer, warnings, references, deadline) =
-            self.current_search_inputs(&params).await?;
-        self.route_current_tree_search(resolved, params, answer, warnings, references, deadline)
-            .await
+    ) -> Result<(Json<SearchResult>, bool), ToolFailure> {
+        let (resolved, ranking, references, deadline) = self.current_search_inputs(&params).await?;
+        let lexical_commit_pending = ranking.lexical_commit_pending;
+        self.route_current_tree_search(
+            resolved,
+            params,
+            ranking.answer,
+            ranking.warnings,
+            references,
+            deadline,
+        )
+        .await
+        .map(|answer| (answer, lexical_commit_pending))
     }
 
     async fn current_search_inputs(
@@ -2532,8 +2580,7 @@ impl RiftMcp {
     ) -> Result<
         (
             ResolvedWorkspace,
-            StoreAnswer,
-            Vec<ReadWarning>,
+            SearchRanking,
             EngineReferences,
             RequestDeadline,
         ),
@@ -2579,10 +2626,7 @@ impl RiftMcp {
         let callee_warnings = self
             .name_package_callees(&resolved, &mut references, deadline)
             .await;
-        let SearchRanking {
-            answer,
-            mut warnings,
-        } = ranking.unwrap_or_else(|| {
+        let mut ranking = ranking.unwrap_or_else(|| {
             SearchRanking::unavailable(
                 "the lexical index is stamped for a publication newer than the one this \
                  request captured, and the workspace kept publishing across the bounded \
@@ -2591,8 +2635,8 @@ impl RiftMcp {
                 self.ranking_weights,
             )
         });
-        warnings.extend(callee_warnings);
-        Ok((resolved, answer, warnings, references, deadline))
+        ranking.warnings.extend(callee_warnings);
+        Ok((resolved, ranking, references, deadline))
     }
 
     /// Routes one current-tree search: the project hits come from the published snapshot,
@@ -9983,6 +10027,18 @@ done
             "{detail}"
         );
 
+        let params = serde_json::from_value(json!({"query": "beacon", "scope": "local"}))?;
+        let pending = server.graph_search(params).await?;
+        assert!(matches!(
+            pending,
+            rift_protocol::search_read::SearchReadResult::Unavailable(
+                rift_protocol::search_read::SearchUnavailable::Unavailable {
+                    reason: rift_protocol::symbol_read::SymbolUnavailableReason::IndexPreparing,
+                    ..
+                }
+            )
+        ));
+
         double.release_one();
         let ranked = search_after_population(&server, "beacon").await?;
         assert!(
@@ -11480,6 +11536,7 @@ done
             shipped_weights(),
         )
         .ok_or("a store holding no tree still ranks, by identifier matching alone")?;
+        assert!(!ranking.lexical_commit_pending);
         assert!(ranks_by_identifier_alone(&ranking));
         let detail = unavailable_detail(&ranking).ok_or("the tier warns")?;
         assert!(detail.contains("holds no indexed tree"), "{detail}");
@@ -11525,6 +11582,7 @@ done
             shipped_weights(),
         )
         .ok_or("a store that missed a commit ranks by identifier matching alone")?;
+        assert!(!ranking.lexical_commit_pending);
         let detail = unavailable_detail(&ranking).ok_or("the tier warns")?;
         assert!(detail.contains("missed a commit"), "{detail}");
         assert!(detail.contains("tree revision bbbbbbbb"), "{detail}");

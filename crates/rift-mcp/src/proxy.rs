@@ -4092,7 +4092,7 @@ mod tests {
             let request = CallToolRequestParams::new("search")
                 .with_arguments(serde_json::from_value(arguments.clone())?);
             let CallToolResponse::Complete(answer) = proxy
-                .captured_search(&request)
+                .captured_search(&request, false)
                 .await?
                 .ok_or("initial search")??
             else {
@@ -4104,7 +4104,7 @@ mod tests {
             let request = CallToolRequestParams::new("search")
                 .with_arguments(serde_json::from_value(arguments)?);
             let CallToolResponse::Complete(answer) = proxy
-                .captured_search(&request)
+                .captured_search(&request, false)
                 .await?
                 .ok_or("held search")??
             else {

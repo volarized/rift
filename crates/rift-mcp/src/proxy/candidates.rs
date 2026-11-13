@@ -291,6 +291,7 @@ impl RiftProxy {
     pub(super) async fn captured_search(
         &self,
         request: &CallToolRequestParams,
+        require_ready_ranking: bool,
     ) -> Result<Option<Result<rmcp::model::CallToolResponse, rmcp::ErrorData>>, RiftError> {
         if request.name != "search" {
             return Ok(None);
@@ -328,7 +329,10 @@ impl RiftProxy {
                 SymbolUnavailableReason::ViewContext,
             )));
         }
-        let captured = match self.captured_candidates(&params, pools).await? {
+        let captured = match self
+            .captured_candidates(&params, pools, require_ready_ranking)
+            .await?
+        {
             Err(error) => return Ok(Some(Err(error))),
             Ok(CandidateAnswer::Response(result)) => return Ok(Some(Ok(result.into()))),
             Ok(CandidateAnswer::Captured(captured)) => captured,
@@ -416,6 +420,7 @@ impl RiftProxy {
         &self,
         params: &SearchParams,
         previous: &[SearchCandidatePool],
+        require_ready_ranking: bool,
     ) -> Result<Result<CandidateAnswer, rmcp::ErrorData>, RiftError> {
         let mut pools = Vec::new();
         let mut ranking = None;
@@ -447,6 +452,7 @@ impl RiftProxy {
                 .candidate_response(SearchCandidateRequest {
                     params: selected,
                     view,
+                    require_ready_ranking,
                 })
                 .await?;
             let mut response = match result {
@@ -457,7 +463,7 @@ impl RiftProxy {
                 Ok(result) => match decode_response(&result)? {
                     SearchCandidateResult::Captured(response) => *response,
                     SearchCandidateResult::Unavailable(answer) => {
-                        validate_preparing_response(&answer)?;
+                        validate_preparing_response(&answer, require_ready_ranking)?;
                         return Ok(Ok(CandidateAnswer::Response(result)));
                     }
                 },
@@ -540,6 +546,7 @@ fn decode_response(result: &CallToolResult) -> Result<SearchCandidateResult, Rif
 
 fn validate_preparing_response(
     answer: &rift_protocol::search_read::SearchUnavailable,
+    require_ready_ranking: bool,
 ) -> Result<(), RiftError> {
     let rift_protocol::search_read::SearchUnavailable::Unavailable {
         reason,
@@ -553,7 +560,11 @@ fn validate_preparing_response(
                 warning,
                 rift_protocol::read::ReadWarning::LocalIndexPreparing { prepared, total, .. }
                     if total.is_none_or(|total| *prepared < total)
-            )
+            ) || require_ready_ranking
+                && matches!(
+                    warning,
+                    rift_protocol::read::ReadWarning::LexicalRankingUnavailable { .. }
+                )
         })
     {
         return Err(invalid("view", "captured search selector is unavailable"));
@@ -676,7 +687,7 @@ mod tests {
         });
         let answer: rift_protocol::search_read::SearchUnavailable =
             serde_json::from_value(valid.clone()).expect("existing preparing outcome");
-        validate_preparing_response(&answer).expect("warning matches preparing reason");
+        validate_preparing_response(&answer, false).expect("warning matches preparing reason");
         for field in ["results", "root", "unexpected"] {
             let mut invalid = valid.clone();
             invalid[field] = json!([]);
@@ -686,16 +697,16 @@ mod tests {
         wrong_reason["reason"] = json!("read_failed");
         let wrong_reason =
             serde_json::from_value(wrong_reason).expect("existing read-failed outcome");
-        assert!(validate_preparing_response(&wrong_reason).is_err());
+        assert!(validate_preparing_response(&wrong_reason, false).is_err());
         let mut no_warning = valid.clone();
         no_warning["warnings"] = json!([]);
         let no_warning = serde_json::from_value(no_warning).expect("existing empty warnings");
-        assert!(validate_preparing_response(&no_warning).is_err());
+        assert!(validate_preparing_response(&no_warning, false).is_err());
         let mut complete_warning = valid.clone();
         complete_warning["warnings"][0]["total"] = json!(0);
         let complete_warning =
             serde_json::from_value(complete_warning).expect("existing complete progress fields");
-        assert!(validate_preparing_response(&complete_warning).is_err());
+        assert!(validate_preparing_response(&complete_warning, false).is_err());
         let mut other_warning = valid.clone();
         other_warning["warnings"][0]["code"] = json!("lexical_ranking_unavailable");
         other_warning["warnings"][0]
@@ -704,12 +715,13 @@ mod tests {
             .remove("prepared");
         let other_warning =
             serde_json::from_value(other_warning).expect("existing lexical warning");
-        assert!(validate_preparing_response(&other_warning).is_err());
+        assert!(validate_preparing_response(&other_warning, false).is_err());
+        validate_preparing_response(&other_warning, true).expect("strict ranked producer");
         let mut with_view = valid;
         with_view["view"] =
             serde_json::to_value(captured().pools[0].view.clone()).expect("existing captured view");
         let with_view = serde_json::from_value(with_view).expect("existing selected view");
-        assert!(validate_preparing_response(&with_view).is_err());
+        assert!(validate_preparing_response(&with_view, false).is_err());
     }
 
     fn pool(backend: &str, root: &str, key: &str, expiry: &str) -> SearchCandidatePool {
