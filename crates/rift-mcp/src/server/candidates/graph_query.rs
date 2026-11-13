@@ -425,7 +425,7 @@ impl AcquiredGraph {
             dataset.publish_local_graph()?;
         }
         let Some(answer) =
-            evaluate_acquired_query(dataset.build(), query, cancellation, &acquired)?
+            evaluate_acquired_query(&dataset.build(), query, cancellation, &acquired)?
         else {
             return Ok(query_unavailable(
                 SymbolUnavailableReason::InsufficientCoverage,
@@ -495,7 +495,7 @@ impl QueryRetention<'_> {
 }
 
 fn evaluate_acquired_query(
-    dataset: GraphDataset,
+    dataset: &GraphDataset,
     query: &GraphQuery,
     cancellation: &QueryCancellation,
     acquired: &AcquiredAdjacency,
