@@ -1385,7 +1385,7 @@ mod tests {
             assert_eq!(ids, expected.iter().copied().collect());
         }
 
-        let unsupported = server
+        let witness = server
             .graph_query(QueryParams {
                 query: format!("ASK {{ <{PACKAGE_GREETING}> ^:calls/^:calls ?caller }}"),
                 language: QueryLanguage::Sparql,
@@ -1395,13 +1395,13 @@ mod tests {
             .0;
         assert!(
             matches!(
-                unsupported,
-                QueryReadResult::Unavailable(SearchUnavailable::Unavailable {
-                    reason: SymbolUnavailableReason::InsufficientCoverage,
+                witness,
+                QueryReadResult::Results(QueryResult {
+                    answer: QueryAnswer::Boolean { value: true },
                     ..
                 })
             ),
-            "{unsupported:?}"
+            "{witness:?}"
         );
 
         std::fs::write(root.join("unestablished.py"), "def might_call(): pass\n")?;

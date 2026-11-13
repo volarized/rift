@@ -232,19 +232,19 @@ pub(crate) fn resource_text<'a>(answer: &'a ReadResourceResult, uri: &str) -> Te
     }
 }
 
-/// Waits for a complete captured local graph through the public search route.
+/// Waits for the first captured workspace through the public search route.
 pub(crate) async fn await_workspace_ready(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
 ) -> TestResult<()> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-    let probe = tool_request("search", &json!({"query": "ASK { ?subject a :Symbol }"}));
+    let probe = tool_request("search", &json!({"query": "ASK {}"}));
     loop {
         let body =
             tokio::time::timeout_at(deadline, call_retrying_acceptance(client, probe.clone()))
                 .await??;
         if body["reason"] != "index_preparing" {
             assert!(
-                body["answer"]["value"].is_boolean(),
+                body["answer"]["value"] == true,
                 "graph readiness probe: {body}"
             );
             return Ok(());
@@ -281,11 +281,7 @@ pub(crate) async fn query_after_population(
     arguments: &rift_protocol::query::QueryParams,
 ) -> TestResult<Value> {
     search_after_population(client, &json!({"query":"beacon","scope":"local"})).await?;
-    call_retrying_acceptance(
-        client,
-        tool_request("search", &serde_json::to_value(arguments)?),
-    )
-    .await
+    populated_answer(client, "search", &serde_json::to_value(arguments)?).await
 }
 
 async fn populated_answer(
@@ -297,16 +293,21 @@ async fn populated_answer(
     const DELAY: std::time::Duration = std::time::Duration::from_millis(50);
     let mut answer = call_retrying_acceptance(client, tool_request(tool, arguments)).await?;
     for _attempt in 0..ATTEMPTS {
-        let pending = answer["warnings"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|warning| {
-                matches!(
-                    warning["code"].as_str(),
-                    Some("lexical_ranking_unavailable" | "stale_index" | "pattern_index_preparing")
-                )
-            });
+        let pending = answer["reason"] == "index_preparing"
+            || answer["warnings"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|warning| {
+                    matches!(
+                        warning["code"].as_str(),
+                        Some(
+                            "lexical_ranking_unavailable"
+                                | "stale_index"
+                                | "pattern_index_preparing"
+                        )
+                    )
+                });
         if !pending {
             return Ok(answer);
         }

@@ -2287,7 +2287,7 @@ mod tests {
     fn each_outermost_source_ends_the_text_after_a_blank_line() -> Result<(), String> {
         nodes_refusal("\t\ta\n\n\t\tb\n", "\t\ta\n\n\t\tc\n", "$.nodes[1].source")?;
         nodes_refusal("\t\ta\n\n\t\tb\n", "\t\ta\n\n\t\t b\n", "$.nodes[1].source")?;
-        nodes_refusal("\t\ta\n\n\t\tb\n", "\t\ta\n\nb\n", "$.warnings")?;
+        nodes_refusal("\t\ta\n\n\t\tb\n", "\t\ta\n\nb\n", "$.layout")?;
         let blank = edited(NODES_TEXT, "// tail\n\n\t\ta", "// tail\n\t\ta")?;
         let failure = refused(Tool::Nodes, &blank, &nodes_answer())?;
         assert!(failure.contains("$.nodes[1].source"), "{failure}");

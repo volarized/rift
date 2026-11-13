@@ -1247,6 +1247,10 @@ async fn a_package_walk_with_missing_relationship_coverage_matches_the_served_sc
 async fn packages_beside_the_local_scope_or_rev_refuse_naming_packages() -> TestResult {
     let (_directory, client, server_task) = served_fixture().await?;
     let validators = tool_validators(&client.list_all_tools().await?)?;
+    let warmup = workspace_client::query::retrieval(&serde_json::from_value(
+        json!({"query": "helper_beacon"}),
+    )?)?;
+    workspace_client::query_after_population(&client, &warmup).await?;
     let packages = json!([{ "manager": "cargo", "name": "demo", "version": "1.0.0" }]);
     let id = workspace_client::captured_seed(&client, "beacon_one", "lib.rs").await?;
     let requests = [

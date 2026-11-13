@@ -1744,13 +1744,34 @@ pub(crate) async fn await_workspace_ready(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let arguments = serde_json::json!({"query": "ASK { ?subject a :Symbol }"});
     loop {
-        let body =
-            tokio::time::timeout_at(deadline, proxied_call(client, "search", &arguments)).await??;
-        if body["reason"] != "index_preparing" {
-            assert!(
-                body["answer"]["value"].is_boolean(),
-                "graph readiness probe: {body}"
-            );
+        let result =
+            tokio::time::timeout_at(deadline, proxied_result(client, "search", &arguments))
+                .await??;
+        if result.is_error == Some(true) {
+            return Err(format!(
+                "graph readiness probe failed: {}",
+                tool_failure(&result)?.text
+            )
+            .into());
+        }
+        let preparing = match &result.structured_content {
+            Some(body) if body["reason"] == "index_preparing" => true,
+            Some(body) if body["answer"]["value"].is_boolean() => false,
+            None => match result
+                .content
+                .first()
+                .and_then(|block| block.as_text())
+                .and_then(|block| block.text.lines().next())
+            {
+                Some("unavailable · IndexPreparing") => true,
+                Some("true" | "false") => false,
+                _ => {
+                    return Err(format!("unexpected text graph readiness probe: {result:?}").into());
+                }
+            },
+            Some(body) => return Err(format!("unexpected graph readiness probe: {body}").into()),
+        };
+        if !preparing {
             let answer = tokio::time::timeout_at(
                 deadline,
                 client.read_resource(ReadResourceRequestParams::new("rift://map".to_owned())),
@@ -1759,7 +1780,7 @@ pub(crate) async fn await_workspace_ready(
             return resource_json(&answer, "rift://map");
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(format!("workspace graph remained in preparation: {body}").into());
+            return Err("workspace graph remained in preparation".into());
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
