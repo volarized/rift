@@ -169,6 +169,43 @@ REQUIRED_LANGUAGES = {
     "nextjs": {"typescript"},
     "fastapi": {"python"},
 }
+# These paths yielded the bulk of the declaration sample at the Next.js pin.
+# Catalog fallback keeps the sampling contract if the pin changes.
+NEXTJS_SAMPLE_PATHS = (
+    "turbopack/crates/turbo-persistence/src/tests.rs",
+    "turbopack/crates/turbo-tasks-backend/tests/effects.rs",
+    "crates/next-code-frame/src/tests.rs",
+    "crates/next-custom-transforms/tests/fixture.rs",
+    "turbopack/crates/turbo-tasks-backend/tests/errors.rs",
+    "turbopack/crates/turbo-tasks-backend/tests/debug.rs",
+    "turbopack/crates/turbo-tasks-backend/tests/derive_value_to_string.rs",
+    "crates/next-custom-transforms/tests/errors.rs",
+    "turbopack/crates/turbo-tasks-backend/tests/collectibles.rs",
+    "turbopack/crates/turbo-tasks-backend/tests/call_types.rs",
+    "crates/next-custom-transforms/tests/full.rs",
+    "turbopack/crates/turbo-tasks-backend/tests/bug.rs",
+    "turbopack/crates/turbo-tasks-backend/tests/basic.rs",
+    "turbopack/crates/turbo-tasks-backend/tests/all_in_one.rs",
+    "turbopack/crates/turbo-tasks-backend/tests/bug2.rs",
+    "turbopack/crates/turbo-tasks-backend/tests/detached.rs",
+    "turbopack/crates/turbo-tasks-backend/tests/emptied_cells.rs",
+    "turbopack/crates/turbo-tasks-backend/tests/emptied_cells_session_dependent.rs",
+    "crates/next-custom-transforms/tests/telemetry.rs",
+    "crates/next-build-test/src/main.rs",
+    "examples/with-sentry/pages/api/test1.ts",
+    "examples/with-sentry/pages/api/test2.ts",
+    "examples/with-sentry/pages/api/test3.ts",
+    "examples/with-sentry/pages/api/test4.ts",
+    "examples/with-sentry/pages/client/test1.tsx",
+    "examples/with-sentry/pages/client/test2.tsx",
+    "examples/with-sentry/pages/client/test3.tsx",
+    "examples/with-sentry/pages/client/test4.tsx",
+    "examples/with-sentry/pages/client/test5.tsx",
+    "examples/with-sentry/pages/ssr/test1.tsx",
+    "examples/with-sentry/pages/ssr/test2.tsx",
+    "examples/with-sentry/pages/ssr/test3.tsx",
+    "examples/with-sentry/pages/ssr/test4.tsx",
+)
 CORPUS_COLUMNS = ("symbol", "name", "kind", "language", "path", "unit", "start", "end")
 PATH_HIT_LIMIT = 1000
 
@@ -780,11 +817,18 @@ class Corpus:
                 anchor in symbol_pool(pool),
                 "scoped search lost the canonical sample anchor",
             )
+        preferred: dict[str, int] = {}
+        if minimum == SYMBOL_COUNT and self.pin.name == "nextjs":
+            preferred = {path: index for index, path in enumerate(NEXTJS_SAMPLE_PATHS)}
         pending = {
             language: iter(
                 sorted(
                     groups.get(language, []),
-                    key=lambda path: ("test" not in path.lower(), path),
+                    key=lambda path: (
+                        preferred.get(path, len(preferred)),
+                        "test" not in path.lower(),
+                        path,
+                    ),
                 )
             )
             for language in languages
@@ -1779,6 +1823,7 @@ class Corpus:
     async def stop_states(self) -> None:
         with self.server() as server:
             async with server.connect() as client:
+                await await_startup_publication(server)
                 await client.call(
                     "search", corpus_request({"query": "test", "limit": 1})
                 )
@@ -1791,13 +1836,10 @@ class Corpus:
     async def stop_during_rebuild(self) -> None:
         """Observe filesystem rebuild output without a proxy that restarts a stopped server."""
         with self.server() as server:
-            startup = await observed_state(
-                server, 0, STARTUP_PUBLICATION, startup_published
-            )
+            await await_startup_publication(server)
+            offset = len(server.read_log())
             (self.root / PROBE_PATH).write_text(PROBE_SOURCE)
-            output = await observed_output(
-                server, len(startup), "index capture started"
-            )
+            output = await observed_output(server, offset, "index capture started")
             await self.stop_observed(server, "rebuild", output)
         (self.root / PROBE_PATH).unlink(missing_ok=True)
 
