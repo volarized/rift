@@ -4806,12 +4806,20 @@ fn captured_project_semantics(
     );
     let documents = contents.files.values().map(Arc::as_ref).collect::<Vec<_>>();
     let Some(first) = documents.first() else {
-        return WorkspaceSemantics::build_project_facts_with_relationships(
-            std::iter::empty(),
-            limits.declarations_max(),
-            limits.relationships_max(),
-            revision,
-            previous,
+        return rift_tracing::traced!(
+            component = "index",
+            operation = "WorkspaceSemantics::build_project_facts",
+            phase = "WorkspaceSemantics::build_project_facts",
+            files = 0,
+            {
+                WorkspaceSemantics::build_project_facts_with_relationships(
+                    std::iter::empty(),
+                    limits.declarations_max(),
+                    limits.relationships_max(),
+                    revision,
+                    previous,
+                )
+            }
         )
         .map(|built| ProjectSemanticsAdmission::Built(Box::new(built)));
     };
@@ -4854,9 +4862,14 @@ fn captured_project_semantics(
             refused_contributions: prepared.take_refused_contributions(),
         });
     }
-    prepared
-        .build(limits.relationships_max(), previous)
-        .map(|built| ProjectSemanticsAdmission::Built(Box::new(built)))
+    rift_tracing::traced!(
+        component = "index",
+        operation = "WorkspaceSemantics::build_project_facts",
+        phase = "WorkspaceSemantics::build_project_facts",
+        files = documents.len(),
+        { prepared.build(limits.relationships_max(), previous) }
+    )
+    .map(|built| ProjectSemanticsAdmission::Built(Box::new(built)))
 }
 
 fn validate_captured_source_bytes(contents: &IndexContents) -> Result<(), RiftError> {
@@ -5001,20 +5014,12 @@ fn built_contents_with_owner(
                     &contents.framework_sources,
                     &contents.left_out,
                 );
-                let built = rift_tracing::traced!(
-                    component = "index",
-                    operation = "WorkspaceSemantics::build_project_facts",
-                    phase = "WorkspaceSemantics::build_project_facts",
-                    files = contents.files.len(),
-                    {
-                        captured_project_semantics(
-                            (root, owner),
-                            &contents,
-                            limits,
-                            &fingerprint,
-                            previous,
-                        )
-                    }
+                let built = captured_project_semantics(
+                    (root, owner),
+                    &contents,
+                    limits,
+                    &fingerprint,
+                    previous,
                 );
                 match built {
                     Ok(ProjectSemanticsAdmission::Omitted {

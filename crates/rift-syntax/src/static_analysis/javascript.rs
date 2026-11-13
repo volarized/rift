@@ -25,6 +25,7 @@ pub(super) struct Kinds {
     named_expression: [u16; 3],
     class: u16,
     parameters: u16,
+    arrow: u16,
     import: u16,
     import_clause: u16,
     import_specifier: u16,
@@ -65,13 +66,14 @@ pub(super) fn kinds() -> &'static Kinds {
             id("generator_function"),
             id("class"),
         ];
+        let arrow = id("arrow_function");
         let function_scopes = [
             program,
             function[0],
             function[1],
             named_expression[0],
             named_expression[1],
-            id("arrow_function"),
+            arrow,
             id("method_definition"),
             id("class_static_block"),
         ];
@@ -93,6 +95,7 @@ pub(super) fn kinds() -> &'static Kinds {
             named_expression,
             class: id("class_declaration"),
             parameters: id("formal_parameters"),
+            arrow,
             import: id("import_statement"),
             import_clause: id("import_clause"),
             import_specifier: id("import_specifier"),
@@ -446,11 +449,10 @@ impl Kinds {
             || self.function_scopes.last() == Some(&id)
         {
             self.record_named_shadow(node, facts)?;
-        } else if let Some(parent) = node.parent()
-            && parent.child_by_field_id(self.parameter) == Some(node)
-            && self.function_scopes.contains(&parent.kind_id())
+        } else if id == self.arrow
+            && let Some(parameter) = node.child_by_field_id(self.parameter)
         {
-            self.record_parameter(node, parent, facts)?;
+            self.record_parameter(parameter, node, facts)?;
         }
         Ok(())
     }
