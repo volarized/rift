@@ -663,19 +663,16 @@ class Corpus:
         >>> common = {"configuration_revision": "0123abcd", "languages": languages}
         >>> first = {**common, "pagination": {"page_index": 0, "total_pages": 2}, "source": [{"path": f"docs/a{index:04}.md", "digest": "0123abcd", "language": "markdown"} for index in range(1000)]}
         >>> second = {**common, "pagination": {"page_index": 1, "total_pages": 2}, "source": [{"path": path, "digest": "0123abcd", "language": language} for path, language in [("src/test.ts", "typescript"), ("src/ztest.tsx", "typescript:tsx")]]}
-        >>> admission = {"answer": {"result": "boolean", "value": True}}
-        >>> client = SimpleNamespace(resource=AsyncMock(side_effect=[first, second]), call=AsyncMock(side_effect=[admission, answer(rows[:100], 0, next_query="retained next page"), answer(rows[100:], 1)]))
+        >>> client = SimpleNamespace(resource=AsyncMock(side_effect=[first, second]), call=AsyncMock(side_effect=[answer(rows[:100], 0, next_query="retained next page"), answer(rows[100:], 1)]))
         >>> sample = Corpus(cast(Pin, SimpleNamespace(name="nextjs")), Path("rift"), Path("report"))
         >>> selected = asyncio.run(sample.symbol_candidates(cast(Client, client)))
         >>> len(selected), client.call.await_count, client.resource.await_count
-        (200, 3, 2)
+        (200, 2, 2)
         >>> all(literal(row, "path") == "src/test.ts" for row in selected)
         True
-        >>> client.call.await_args_list[0].args[1] == {"query": "ASK {}"}
-        True
-        >>> client.call.await_args_list[1].args[1]["query"].count("SERVICE :search")
+        >>> client.call.await_args_list[0].args[1]["query"].count("SERVICE :search")
         2
-        >>> client.call.await_args_list[2].args[1] == {"query": "retained next page"}
+        >>> client.call.await_args_list[1].args[1] == {"query": "retained next page"}
         True
         """
         languages = SAMPLE_LANGUAGES[self.pin.name]
@@ -694,7 +691,6 @@ class Corpus:
             )
             return found
 
-        await await_index_ready(client)
         pool: list[JsonObject] = []
         represented: set[str] = set()
         workspace, groups = await self.source_catalog(client)
@@ -836,6 +832,7 @@ class Corpus:
     async def baseline(self) -> None:
         with self.server() as server:
             async with server.connect() as client:
+                await await_startup_publication(server)
                 candidates = await self.symbol_candidates(client)
                 require(
                     len(candidates) >= SYMBOL_COUNT,
@@ -1242,13 +1239,7 @@ class Corpus:
         )
         with self.server() as server:
             async with server.connect() as client:
-                await observed_state(
-                    server,
-                    0,
-                    STARTUP_PUBLICATION,
-                    startup_published,
-                    seconds=LOCAL_PREPARATION_SECONDS,
-                )
+                await await_startup_publication(server)
                 path.write_bytes(PROBE_SOURCE.encode())
                 await self.await_probe(True)
                 answer = await settled_local(client, "search", request)
@@ -1378,13 +1369,7 @@ class Corpus:
             probe.write_text(churn_source(0), encoding="utf-8")
             with self.server() as server:
                 async with server.connect() as client:
-                    await observed_state(
-                        server,
-                        0,
-                        STARTUP_PUBLICATION,
-                        startup_published,
-                        seconds=LOCAL_PREPARATION_SECONDS,
-                    )
+                    await await_startup_publication(server)
                     await self.churn(
                         client, server, probe.relative_to(self.root).as_posix()
                     )
@@ -1554,6 +1539,7 @@ class Corpus:
         link.symlink_to(self.root, target_is_directory=True)
         with self.server(link) as server:
             async with server.connect() as client:
+                await await_startup_publication(server)
                 candidates = await self.symbol_candidates(client, minimum=1)
                 require(bool(candidates), "symlink root has no search results")
                 no_failed_builds(await logged(server, "index"))
@@ -1820,15 +1806,13 @@ async def observed_state(
     offset: int,
     wanted: str,
     holds: Callable[[str], bool],
-    *,
-    seconds: float = OBSERVATION_SECONDS,
 ) -> str:
     """Read owned output until its complete records satisfy `holds`.
 
     The deadline alone bounds the loop, as in `Corpus.await_probe`, so a breach fails
     naming what the case waited for.
     """
-    deadline = time.monotonic() + seconds
+    deadline = time.monotonic() + OBSERVATION_SECONDS
     while time.monotonic() < deadline:
         server.check_running()
         output = server.read_log()[offset:]
@@ -1836,7 +1820,7 @@ async def observed_state(
             return output
         await asyncio.sleep(POLL_SECONDS)
     raise AssertionError(
-        f"required record never reached server output within {seconds}s: {wanted}"
+        f"required record never reached server output within {OBSERVATION_SECONDS}s: {wanted}"
     )
 
 
@@ -1856,14 +1840,23 @@ async def settled_local(client: Client, name: str, request: JsonObject) -> JsonO
     )
 
 
-async def await_index_ready(client: Client) -> None:
-    """Wait for a published graph without requiring whole-workspace symbol coverage."""
-    answer = await settled_local(client, "search", {"query": "ASK {}"})
-    result = object_value(answer.get("answer"), "startup graph answer")
-    require(
-        result.get("result") == "boolean" and result.get("value") is True,
-        f"startup graph query did not return true: {answer}",
-    )
+async def await_startup_publication(server: Server) -> None:
+    """Wait for startup publication before asking the server to retain a view."""
+    async with gate_deadline(STARTUP_PUBLICATION, LOCAL_PREPARATION_SECONDS):
+        while True:
+            server.check_running()
+            output = server.read_log()
+            if startup_published(output):
+                return
+            if server.output_cut:
+                published = await logged(server, "index")
+                if any(
+                    row.operation == "index.publish"
+                    and row.label("trigger") == "startup"
+                    for row in published
+                ):
+                    return
+            await asyncio.sleep(POLL_SECONDS)
 
 
 async def settled_pattern(client: Client, request: JsonObject) -> JsonObject:
