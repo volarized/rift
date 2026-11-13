@@ -279,15 +279,14 @@ def churn_source(edit: int) -> str:
     return f"pub fn corpus_probe() {{ let value = {edit}; }}\n"
 
 
-CHURN_SEARCH_INPUTS: JsonObject = {
-    "query": "corpus_probe",
-    "target": "symbol",
-    "include": ["source"],
-    "limit": 1,
-}
+CHURN_PROBE_ID = "rift://symbol/local/rust/rift_corpus_probe/corpus_probe"
 CHURN_REQUESTS: dict[str, JsonObject] = {
-    "search": corpus_request(CHURN_SEARCH_INPUTS),
-    "symbol_nodes": {},
+    "search": {
+        "query": f"SELECT (<{CHURN_PROBE_ID}> AS ?symbol) ?unit ?source ?start ?end "
+        f"{{ ?node :of <{CHURN_PROBE_ID}>; :index 0; :source ?source; "
+        ":range [ :unit ?unit; :start ?start; :end ?end ] }"
+    },
+    "symbol_nodes": {"symbol": CHURN_PROBE_ID},
     "nodes": {"path": PROBE_PATH, "position": 0},
 }
 # The tool each churn read calls: `symbol_nodes` reads the probe declaration's nodes by its
@@ -1349,9 +1348,13 @@ class Corpus:
             probe.write_text(churn_source(0), encoding="utf-8")
             with self.server() as server:
                 async with server.connect() as client:
-                    # Listener readiness precedes file preparation. Observe the existing
-                    # startup budget before measuring reads against external writes.
-                    await await_index_ready(client)
+                    await observed_state(
+                        server,
+                        0,
+                        STARTUP_PUBLICATION,
+                        startup_published,
+                        seconds=LOCAL_PREPARATION_SECONDS,
+                    )
                     await self.churn(client, server, probe.relative_to(self.root).as_posix())
                     no_failed_builds(await logged(server, "index"))
                 self.stop(server)
@@ -1366,9 +1369,6 @@ class Corpus:
         path = self.root / probe_path
         requests = {name: dict(request) for name, request in CHURN_REQUESTS.items()}
         requests["nodes"] = {"path": probe_path, "position": 0}
-        requests["search"] = corpus_request(
-            {**CHURN_SEARCH_INPUTS, "paths": {"include": [probe_path]}}
-        )
         sources = [churn_source(0).rstrip("\n")]
         written = [time.monotonic()]
         timings: dict[str, list[float]] = {name: [] for name in CHURN_REQUESTS}
@@ -1438,14 +1438,7 @@ class Corpus:
 
         task: asyncio.Task[None] | None = None
         try:
-            identity, _revision = await read("search", None)
-            # Read the known declaration from one published snapshot while edits continue.
-            requests["search"] = {
-                "query": f"SELECT (<{identity}> AS ?symbol) ?unit ?source ?start ?end "
-                f"{{ ?node :of <{identity}>; :index 0; :source ?source; "
-                ":range [ :unit ?unit; :start ?start; :end ?end ] }"
-            }
-            requests["symbol_nodes"] = {"symbol": identity}
+            identity, _revision = await read("symbol_nodes", CHURN_PROBE_ID)
             task = asyncio.create_task(writer())
             reads = 0
             tools = tuple(CHURN_REQUESTS)
@@ -1788,14 +1781,19 @@ async def observed_output(server: Server, offset: int, message: str) -> str:
 
 
 async def observed_state(
-    server: Server, offset: int, wanted: str, holds: Callable[[str], bool]
+    server: Server,
+    offset: int,
+    wanted: str,
+    holds: Callable[[str], bool],
+    *,
+    seconds: float = OBSERVATION_SECONDS,
 ) -> str:
     """Read owned output until its complete records satisfy `holds`.
 
     The deadline alone bounds the loop, as in `Corpus.await_probe`, so a breach fails
     naming what the case waited for.
     """
-    deadline = time.monotonic() + OBSERVATION_SECONDS
+    deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         server.check_running()
         output = server.read_log()[offset:]
@@ -1804,7 +1802,7 @@ async def observed_state(
         await asyncio.sleep(POLL_SECONDS)
     raise AssertionError(
         f"required record never reached server output within "
-        f"{OBSERVATION_SECONDS}s: {wanted}"
+        f"{seconds}s: {wanted}"
     )
 
 
