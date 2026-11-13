@@ -1460,7 +1460,9 @@ class Corpus:
             converging = True
             convergence = time.monotonic()
             async with gate_deadline("churn final source", CONVERGENCE_SECONDS):
-                for name in CHURN_REQUESTS:
+                # First confirm the final publication through the exact declaration.
+                # The graph read then has its request budget for retaining that view.
+                for name in ("symbol_nodes", "search", "nodes"):
                     while True:
                         _identity, revision = await read(name, identity)
                         if revision == len(sources) - 1:
