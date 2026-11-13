@@ -26,6 +26,7 @@ from rift_dev.corpus_assertions import (
     active_stdout,
     build_records,
     chunked_answer,
+    chunked_warnings,
     churn_answer,
     database_bytes,
     declaration_pool,
@@ -35,6 +36,7 @@ from rift_dev.corpus_assertions import (
     lexical_breach,
     lexical_content,
     lists_position,
+    logged_read_warnings,
     map_paths,
     no_failed_builds,
     number,
@@ -855,7 +857,6 @@ class Corpus:
                         "uv.lock produced no pypi packages",
                     )
                 await self.symbols(client, candidates)
-                await self.lexical_persistence(client)
                 await self.oversized(client, server)
                 await self.unparsed(client, server)
                 if self.pin.name == "nextjs":
@@ -865,6 +866,7 @@ class Corpus:
             self.record(
                 "stop", state="idle", process_gone=server.process.poll() is not None
             )
+        await self.lexical_persistence()
 
     def dependencies(self, found: list[Line]) -> None:
         """Pin the resolver's visible manifest count separately from raw tree blobs."""
@@ -951,6 +953,7 @@ class Corpus:
             len(data) == self.pin.oversized_bytes, f"{path}: pinned byte count changed"
         )
         token, offset = token_past_chunk(data)
+        started = datetime.now(UTC)
         answer = await settled_pattern(
             client,
             {
@@ -960,7 +963,14 @@ class Corpus:
                 "limit": 1,
             },
         )
-        named = chunked_answer(answer, path, len(data), offset)
+        ended = datetime.now(UTC)
+        chunked_answer(answer, path, len(data), offset)
+        named = chunked_warnings(
+            await pattern_warnings(
+                server, started, ended, self.pin.name == "bun", path
+            ),
+            path,
+        )
         if self.pin.name == "bun":
             workspace = await client.resource("rift://workspace")
             claimed = [
@@ -994,7 +1004,7 @@ class Corpus:
         """Search the pinned file past `[providers.syntax] max_file` held as text.
 
         The provider refuses its source for its size alone, so under the default `split`
-        its text answers search, every answer names it in `large_file_unparsed`, and the
+        its text answers search, the logs name it in `large_file_unparsed`, and the
         build that reads it records it as held unparsed rather than left out.
         """
         if not self.pin.unparsed_path:
@@ -1005,6 +1015,7 @@ class Corpus:
             len(data) == self.pin.unparsed_bytes, f"{path}: pinned byte count changed"
         )
         pattern, offset = last_line_pattern(data)
+        started = datetime.now(UTC)
         answer = await settled_pattern(
             client,
             {
@@ -1014,7 +1025,11 @@ class Corpus:
                 "limit": 1,
             },
         )
-        named = chunked_answer(answer, path, len(data), offset)
+        ended = datetime.now(UTC)
+        chunked_answer(answer, path, len(data), offset)
+        named = chunked_warnings(
+            await pattern_warnings(server, started, ended, True, path), path
+        )
         require(
             named == ["large_file_unparsed"],
             f"{path}: named by {named}, expected large_file_unparsed alone",
@@ -1211,12 +1226,11 @@ class Corpus:
             f"nodes omitted sampled declaration: {identity} ending at {path}:{end}",
         )
 
-    async def lexical_persistence(self, client: Client) -> None:
+    async def lexical_persistence(self) -> None:
         """Preserve unrelated lexical rows after external source creation and removal."""
         before = lexical_content(self.root)
         sizes = database_bytes(self.root)
         path = self.root / PROBE_PATH
-        path.write_bytes(PROBE_SOURCE.encode())
         request: JsonObject = corpus_request(
             {
                 "query": "corpus_probe",
@@ -1226,32 +1240,48 @@ class Corpus:
                 "limit": 5,
             }
         )
-        answer = await settled_local(client, "search", request)
-        hits = bindings(answer)
-        require(
-            len(hits) == 1 and literal(hits[0], "source") == PROBE_SOURCE.rstrip("\n"),
-            f"new source was absent from reads: {answer}",
-        )
-        await self.await_probe(True)
-        require(
-            lexical_content(self.root) == before,
-            "source creation changed unrelated persisted lexical rows",
-        )
-        require(
-            path.read_bytes() == PROBE_SOURCE.encode(),
-            "source read changed probe bytes",
-        )
-        self.record(
-            "lexical_persistence", before=sizes, after=database_bytes(self.root)
-        )
-        path.unlink()
-        answer = await settled_local(client, "search", request)
-        require(not bindings(answer), f"removed source remained indexed: {answer}")
-        await self.await_probe(False)
-        require(
-            lexical_content(self.root) == before,
-            "source removal changed unrelated persisted lexical rows",
-        )
+        with self.server() as server:
+            async with server.connect() as client:
+                await observed_state(
+                    server,
+                    0,
+                    STARTUP_PUBLICATION,
+                    startup_published,
+                    seconds=LOCAL_PREPARATION_SECONDS,
+                )
+                path.write_bytes(PROBE_SOURCE.encode())
+                await self.await_probe(True)
+                answer = await settled_local(client, "search", request)
+                hits = bindings(answer)
+                require(
+                    len(hits) == 1
+                    and literal(hits[0], "path") == PROBE_PATH
+                    and literal(hits[0], "source") == PROBE_SOURCE.rstrip("\n"),
+                    f"new source was absent from reads: {answer}",
+                )
+                require(
+                    lexical_content(self.root) == before,
+                    "source creation changed unrelated persisted lexical rows",
+                )
+                require(
+                    path.read_bytes() == PROBE_SOURCE.encode(),
+                    "source read changed probe bytes",
+                )
+                self.record(
+                    "lexical_persistence", before=sizes, after=database_bytes(self.root)
+                )
+                path.unlink()
+                await self.await_probe(False)
+                answer = await settled_local(client, "search", request)
+                require(
+                    not bindings(answer), f"removed source remained indexed: {answer}"
+                )
+                require(
+                    lexical_content(self.root) == before,
+                    "source removal changed unrelated persisted lexical rows",
+                )
+                no_failed_builds(await logged(server, "index"))
+            self.stop(server)
 
     async def await_probe(self, present: bool) -> None:
         """Wait for the lexical publication to reach `present` under one budget.
@@ -1355,7 +1385,9 @@ class Corpus:
                         startup_published,
                         seconds=LOCAL_PREPARATION_SECONDS,
                     )
-                    await self.churn(client, server, probe.relative_to(self.root).as_posix())
+                    await self.churn(
+                        client, server, probe.relative_to(self.root).as_posix()
+                    )
                     no_failed_builds(await logged(server, "index"))
                 self.stop(server)
                 self.record("stop", state="after_churn", process_gone=True)
@@ -1682,7 +1714,8 @@ class Corpus:
                     server,
                     "search",
                     lambda rows: any(
-                        row.operation == "search.commit" and row.label("outcome") == "error"
+                        row.operation == "search.commit"
+                        and row.label("outcome") == "error"
                         for row in rows
                     ),
                 )
@@ -1803,8 +1836,7 @@ async def observed_state(
             return output
         await asyncio.sleep(POLL_SECONDS)
     raise AssertionError(
-        f"required record never reached server output within "
-        f"{seconds}s: {wanted}"
+        f"required record never reached server output within {seconds}s: {wanted}"
     )
 
 
@@ -1844,6 +1876,38 @@ async def settled_pattern(client: Client, request: JsonObject) -> JsonObject:
         poll_seconds=POLL_SECONDS,
         selection="current",
     )
+
+
+async def pattern_warnings(
+    server: Server, started: datetime, ended: datetime, expected: bool, path: str
+) -> list[JsonObject]:
+    """Read diagnostics from the completed pattern request, including pending log writes."""
+
+    def selected(rows: list[Line]) -> list[Line]:
+        matching = [
+            row
+            for row in rows
+            if started <= row.time <= ended and row.label("tool") == "search"
+        ]
+        completed = [
+            row for row in matching if row.is_message("tool request completed")
+        ]
+        if not completed:
+            return []
+        request = completed[-1].label("req")
+        return [row for row in matching if row.label("req") == request]
+
+    def available(rows: list[Line]) -> bool:
+        request_rows = selected(rows)
+        if not request_rows:
+            return False
+        if not expected:
+            return True
+        return "large_file_unparsed" in chunked_warnings(
+            logged_read_warnings(request_rows), path
+        )
+
+    return logged_read_warnings(selected(await observed(server, "mcp", available)))
 
 
 def objects(answer: JsonObject, key: str) -> list[JsonObject]:
