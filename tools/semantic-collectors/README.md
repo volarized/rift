@@ -37,7 +37,7 @@ The manifest resolves `path` relative to its own directory. The collector uses `
 
 Repeat the command with the same database. The runner reuses a checkpoint when the producer, context, category, selected source and supporting source witnesses match. A read of a missing unit is also a witness. Adding that unit invalidates the dependent batch. Removing a unit from the selection removes it from subsequent output. Complete batches commit independently. A restart after failure reuses them. A partial batch remains due, and the CLI exits with status 2 after returning its output. Other failures exit with status 1.
 
-Use a separate database for each collection. A new database has a 1 GiB page limit. The runner accepts up to 20,000 sources, 128 MiB of total source text and 1 MiB per source. It admits up to 4,096 observations and 512 supporting units per batch. The CLI gives each request 30 seconds. A complete batch establishes coverage of the selected source and category. A candidate does not establish runtime dispatch.
+Use a separate database for each collection. A new database has a 1 GiB page limit. The runner accepts up to 20,000 sources, 128 MiB of total source text and 1 MiB per source. It admits up to 16,384 observations and 512 supporting units per batch. The CLI gives each request 30 seconds. A complete batch establishes coverage of the selected source and category. A candidate does not establish runtime dispatch.
 
 ## Use a collector from another host
 

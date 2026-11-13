@@ -14,7 +14,7 @@ pub const SOURCE_BYTES_MAX: usize = 1 << 20;
 /// Maximum number of units in one inventory or selection.
 pub const SOURCE_COUNT_MAX: usize = 20_000;
 /// Maximum observations in one batch.
-pub const OBSERVATIONS_MAX: usize = 4_096;
+pub const OBSERVATIONS_MAX: usize = 16_384;
 /// Maximum distinct supporting units read by one batch.
 pub const DEPENDENCIES_MAX: usize = 512;
 
