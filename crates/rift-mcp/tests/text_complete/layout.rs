@@ -2,7 +2,7 @@
 //!
 //! The text is a curated layout, so it does not state every field of the structured answer: the
 //! normal state is implicit. This check asserts only what `crates/rift-mcp/src/output/render.rs`
-//! and `render/{layout,facts,search,symbol,nodes,warning}.rs` write for the exceptional state, and
+//! and `render/{layout,facts,search,symbol,nodes}.rs` write for the exceptional state, and
 //! never asserts the absence of other text.
 //!
 //! The text is a sequence of counted sections. A section is a title at column 0, then its
@@ -11,9 +11,6 @@
 //! - Items section, always first: the title is `N result` or `N results` (`N node` or `N nodes`
 //!   for `nodes`), then ` · page P/T` when `total_pages > 1` or the page lies past the end. A
 //!   `nodes` answer has no page. No blank line follows the title or separates two items.
-//! - Warnings section, second and only when the answer has warnings: the title `N warning` or
-//!   `N warnings`, then one line per warning at one level that opens with its `code`. Without
-//!   warnings the text has no second section.
 //! - One item has no marker and indents every line by one level. Several items each start with
 //!   `[n] ` at one level and indent their further lines by two.
 //! - Per `search` hit, in order: the location, every `matched_by` name, and `score <value>` on the
@@ -61,8 +58,6 @@ const HISTORY_INCOMPLETE_LABEL: &str = "history (incomplete):";
 const MESSAGE_TRUNCATED_LINE: &str = "message truncated";
 /// Tail of the label of a cut path list.
 const PATHS_TRUNCATED_TAIL: &str = "+ paths · truncated";
-/// Noun counted by the title of the warnings section.
-const WARNING_NOUN: &str = "warning";
 /// Facets of a node that the head line states.
 const NODE_FACT_FACETS: [&str; 2] = ["generated", "test"];
 
@@ -166,7 +161,12 @@ pub(super) fn text_states(tool: Tool, text: &str, structured: &Value) -> Result<
     };
     let rest = revision_states(rest, structured.get("revision"))?;
     let rest = cursor_states(rest, structured.get("node_cursor"))?;
-    warnings_states(rest, structured.get("warnings"))?;
+    require(rest.is_empty(), "$.layout", || {
+        format!("unexpected section: {}", rest[0].title)
+    })?;
+    require(structured.get("warnings").is_none(), "$.warnings", || {
+        "read warnings belong in the logs".to_owned()
+    })?;
     items_states(tool, &first.entries, items, structured)
 }
 
@@ -325,75 +325,6 @@ fn title_states(title: &str, count: usize, tool: Tool, structured: &Value) -> Re
     require(facts.any(|fact| fact == page), "$.pagination", || {
         format!("the title must state `{page}`, got `{title}`")
     })
-}
-
-/// Checks the sections after the items: one warnings section exactly when there are warnings.
-fn warnings_states(rest: &[Section<'_>], warnings: Option<&Value>) -> Result<(), String> {
-    let mut codes = Vec::new();
-    for (index, warning) in warnings
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .enumerate()
-    {
-        let at = format!("$.warnings[{index}].code");
-        codes.push(
-            warning
-                .get("code")
-                .and_then(Value::as_str)
-                .ok_or_else(|| format!("{at}: must be a string"))?,
-        );
-    }
-    match (codes.is_empty(), rest) {
-        (true, []) => Ok(()),
-        (true, [extra, ..]) => Err(format!(
-            "$.warnings: the answer has no warnings, but the text has the section `{}`",
-            extra.title
-        )),
-        (false, []) => Err(format!(
-            "$.warnings[0].code: the answer has {} warnings, but the text has no warnings section",
-            codes.len()
-        )),
-        (false, [section]) => warning_section_states(section, &codes),
-        (false, [_, extra, ..]) => Err(format!(
-            "$.warnings: unexpected section `{}` after the warnings",
-            extra.title
-        )),
-    }
-}
-
-/// Checks the warnings section: its title count, its entries, and each code in order.
-///
-/// The code ends the line, or is followed by ` · ` for evidence or `:` for the detail.
-fn warning_section_states(section: &Section<'_>, codes: &[&str]) -> Result<(), String> {
-    let counted = counted(codes.len(), WARNING_NOUN);
-    require(section.title == counted, "$.warnings", || {
-        format!(
-            "the second section must be titled `{counted}`, got `{}`",
-            section.title
-        )
-    })?;
-    require(section.entries.len() == codes.len(), "$.warnings", || {
-        format!(
-            "the title counts {} but the section holds {} lines",
-            codes.len(),
-            section.entries.len()
-        )
-    })?;
-    for (index, (code, line)) in codes.iter().zip(&section.entries).enumerate() {
-        let at = format!("$.warnings[{index}].code");
-        let entry = line
-            .strip_prefix(INDENT_UNIT)
-            .filter(|entry| !entry.starts_with(INDENT_UNIT))
-            .ok_or_else(|| format!("{at}: the line `{line}` must be indented by one level"))?;
-        let stated = entry
-            .strip_prefix(code)
-            .is_some_and(|tail| tail.is_empty() || tail.starts_with([' ', ':']));
-        require(stated, &at, || {
-            format!("the line must open with `{code}`, got `{entry}`")
-        })?;
-    }
-    Ok(())
 }
 
 /// The lines of one item, indent removed.
@@ -1056,7 +987,7 @@ mod tests {
     use super::*;
 
     /// A `search` answer with a symbol hit, a commit hit, and a walk hit two hops from `main`, on
-    /// page 2 of 3, and a warning.
+    /// page 2 of 3.
     fn search_answer() -> Value {
         json!({
             "results": [
@@ -1120,8 +1051,7 @@ mod tests {
                     ]
                 }
             ],
-            "pagination": { "page_index": 1, "total_pages": 3 },
-            "warnings": [{ "code": "stale_index", "detail": "index lags" }]
+            "pagination": { "page_index": 1, "total_pages": 3 }
         })
     }
 
@@ -1159,8 +1089,6 @@ mod tests {
 \t\t\t\tpub fn d() {
 \t\t\t\t    2
 \t\t\t\t}
-1 warning
-\tstale_index: index lags
 ";
 
     /// A `get_symbol` answer with an incomplete history and a source.
@@ -1309,77 +1237,9 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_warnings_section_is_refused() -> Result<(), String> {
-        search_refusal(
-            "1 warning\n\tstale_index: index lags\n",
-            "",
-            "$.warnings[0].code",
-        )?;
-        search_refusal("\tstale_index: index lags\n", "", "$.warnings")
-    }
-
-    #[test]
-    fn a_warnings_section_without_warnings_is_refused() -> Result<(), String> {
-        let answer = with(search_answer(), "/warnings", json!([]))?;
-        let failure = refused(Tool::Search, SEARCH_TEXT, &answer)?;
-        assert!(failure.contains("$.warnings"), "{failure}");
-        let absent = json!({
-            "results": [],
-            "pagination": { "page_index": 0, "total_pages": 0 }
-        });
-        let failure = refused(Tool::Search, "0 results\n1 warning\n\tx\n", &absent)?;
-        assert!(failure.contains("$.warnings"), "{failure}");
-        Ok(())
-    }
-
-    #[test]
-    fn a_warning_under_the_header_in_the_old_form_is_refused() -> Result<(), String> {
-        let bare = edited(SEARCH_TEXT, "1 warning\n\tstale_index: index lags\n", "")?;
-        let old = edited(&bare, "page 2/3\n", "page 2/3\n! stale_index: index lags\n")?;
-        let failure = refused(Tool::Search, &old, &search_answer())?;
-        assert!(failure.contains("$.warnings"), "{failure}");
-        Ok(())
-    }
-
-    #[test]
-    fn a_warnings_title_that_disagrees_with_its_lines_is_refused() -> Result<(), String> {
-        search_refusal("1 warning\n", "2 warnings\n", "$.warnings")?;
-        search_refusal("index lags\n", "index lags\n\tstale_index\n", "$.warnings")
-    }
-
-    #[test]
-    fn a_warning_line_at_a_wrong_indent_or_before_the_items_is_refused() -> Result<(), String> {
-        search_refusal(
-            "\tstale_index: index lags",
-            "\t\tstale_index: index lags",
-            "$.warnings[0].code",
-        )?;
-        search_refusal(
-            "\tstale_index: index lags",
-            "stale_index: index lags",
-            "$.warnings",
-        )?;
-        let bare = edited(SEARCH_TEXT, "1 warning\n\tstale_index: index lags\n", "")?;
-        let moved = edited(
-            &bare,
-            "page 2/3\n",
-            "page 2/3\n1 warning\n\tstale_index: index lags\n",
-        )?;
-        let failure = refused(Tool::Search, &moved, &search_answer())?;
-        assert!(failure.contains("$.warnings"), "{failure}");
-        Ok(())
-    }
-
-    #[test]
-    fn a_blank_line_after_a_title_between_items_or_between_sections_is_refused()
-    -> Result<(), String> {
+    fn a_blank_line_after_a_title_or_between_items_is_refused() -> Result<(), String> {
         search_refusal("page 2/3\n\t[1]", "page 2/3\n\n\t[1]", "$.results")?;
-        search_refusal("\t\t}\n\t[2]", "\t\t}\n\n\t[2]", "$.results[0]")?;
-        search_refusal(
-            "\t\t\t\t}\n1 warning",
-            "\t\t\t\t}\n\n1 warning",
-            "$.results[2]",
-        )
+        search_refusal("\t\t}\n\t[2]", "\t\t}\n\n\t[2]", "$.results[0]")
     }
 
     #[test]
@@ -1419,8 +1279,7 @@ mod tests {
     #[test]
     fn a_marker_at_a_wrong_indent_or_an_extra_item_is_refused() -> Result<(), String> {
         search_refusal("\t[2] 9c1d", "\t\t[2] 9c1d", "$.results[1]")?;
-        let bare = edited(SEARCH_TEXT, "1 warning\n\tstale_index: index lags\n", "")?;
-        let extra = format!("{bare}\t[3] x\n1 warning\n\tstale_index: index lags\n");
+        let extra = format!("{SEARCH_TEXT}\t[3] x\n");
         let failure = refused(Tool::Search, &extra, &search_answer())?;
         assert!(failure.contains("[3]"), "{failure}");
         Ok(())
@@ -1459,30 +1318,6 @@ mod tests {
         assert!(!SEARCH_TEXT.contains("distance"));
         assert_eq!(
             text_states(Tool::Search, SEARCH_TEXT, &search_answer()),
-            Ok(())
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn a_warning_line_names_its_code_whole() -> Result<(), String> {
-        search_refusal(
-            "\tstale_index: index lags\n",
-            "\tstale_index_other: index lags\n",
-            "$.warnings[0].code",
-        )?;
-        let spelled = edited(SEARCH_TEXT, "\tstale_index: index lags", "\tstale_index")?;
-        assert_eq!(
-            text_states(Tool::Search, &spelled, &search_answer()),
-            Ok(())
-        );
-        let evidence = edited(
-            SEARCH_TEXT,
-            "\tstale_index: index lags",
-            "\tstale_index · index_tree_revision 3f9a1c2e",
-        )?;
-        assert_eq!(
-            text_states(Tool::Search, &evidence, &search_answer()),
             Ok(())
         );
         Ok(())
@@ -2184,7 +2019,7 @@ mod tests {
         assert!(failure.contains("must end with the source"), "{failure}");
         let after = format!("{SYMBOL_TEXT}rift://symbol/rust/src/a.rs/a\n");
         let failure = refused(Tool::GetSymbol, &after, &symbol_answer())?;
-        assert!(failure.contains("$.warnings"), "{failure}");
+        assert!(failure.contains("$.layout"), "{failure}");
         Ok(())
     }
 
@@ -2342,8 +2177,7 @@ mod tests {
                     "range": { "start": 21, "end": 29 },
                     "source": "a\n\nb"
                 }
-            ],
-            "warnings": [{ "code": "stale_index", "detail": "index lags" }]
+            ]
         })
     }
 
@@ -2366,8 +2200,6 @@ mod tests {
 \t\ta
 
 \t\tb
-1 warning
-\tstale_index: index lags
 ";
 
     /// Asserts the failure of the nodes text edited by `from` to `to` names `path`.
@@ -2506,11 +2338,14 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_nodes_warnings_section_is_refused() -> Result<(), String> {
-        nodes_refusal(
-            "1 warning\n\tstale_index: index lags\n",
-            "",
-            "$.warnings[0].code",
-        )
+    fn warnings_in_text_or_structured_content_are_refused() -> Result<(), String> {
+        let text = format!("{NODES_TEXT}1 warning\n\tstale_index: index lags\n");
+        let failure = refused(Tool::Nodes, &text, &nodes_answer())?;
+        assert!(failure.contains("$.layout"), "{failure}");
+        let mut answer = nodes_answer();
+        answer["warnings"] = json!([]);
+        let failure = refused(Tool::Nodes, NODES_TEXT, &answer)?;
+        assert!(failure.contains("$.warnings"), "{failure}");
+        Ok(())
     }
 }

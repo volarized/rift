@@ -2,7 +2,6 @@ use rift_error::{RiftError, errors};
 use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
 use rift_protocol::read::{SearchParams, SearchScope};
 use rift_protocol::symbol_read::{CapturedView, CapturedViewId, SymbolUnavailableReason};
-use rmcp::handler::server::tool::IntoCallToolResult;
 use rmcp::model::{
     CallToolRequest, CallToolRequestParams, CallToolResult, ClientRequest, ServerResult,
 };
@@ -363,7 +362,7 @@ impl RiftProxy {
             captured.results_max,
         )?;
         merged.view = Some(view);
-        Ok(Some(crate::output::Json(merged).into_call_tool_result()))
+        Ok(Some(crate::output::Json(merged).retrieval_result()))
     }
     fn candidate_context_matches(
         &self,
@@ -642,7 +641,8 @@ fn invalid(field: &str, detail: &str) -> RiftError {
 fn unavailable_search(
     reason: SymbolUnavailableReason,
 ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
-    use rmcp::handler::server::tool::IntoCallToolResult;
+    use rmcp::handler::server::tool::IntoCallToolResult as _;
+
     crate::output::Json(rift_protocol::search_read::SearchReadResult::Unavailable(
         rift_protocol::search_read::SearchUnavailable::Unavailable {
             reason,

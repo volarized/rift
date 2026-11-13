@@ -71,22 +71,47 @@ fn text_of_failure(result: &CallToolResult) -> &str {
 }
 
 #[test]
-fn an_answer_serves_compact_text_and_the_same_value_as_structured_content() {
+fn an_answer_records_warnings_and_serves_only_result_facts() {
+    let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+        .install()
+        .expect("capture MCP logs");
     let answer = search_answer();
     let expected_text = text_of(&answer).expect("answer renders");
-    let expected_value = serde_json::to_value(&answer).expect("answer serializes");
+    let mut expected = answer.clone();
+    expected.warnings.clear();
+    let expected_value = serde_json::to_value(&expected).expect("answer serializes");
     let Ok(CallToolResponse::Complete(result)) = Json(answer).into_call_tool_result() else {
         panic!("a rendered answer completes the call");
     };
     assert_eq!(result.content.len(), 1, "one text block");
     let block = result.content[0].as_text().expect("a text block");
-    assert_eq!(
-        block.text,
-        "0 results\n1 warning\n\tglobal_access_disabled\n"
-    );
+    assert_eq!(block.text, "0 results\n");
     assert_eq!(block.text, expected_text);
     assert_eq!(result.structured_content, Some(expected_value));
     assert_eq!(result.is_error, Some(false));
+    let records = drain.queued_records();
+    let record = records
+        .iter()
+        .find(|record| record.message() == "read warning")
+        .expect("warning is logged");
+    let fields: serde_json::Value = serde_json::from_str(record.fields()).expect("log fields");
+    assert_eq!(fields["warning_code"], "global_access_disabled");
+    assert_eq!(fields["evidence"], r#"{"code":"global_access_disabled"}"#);
+}
+
+#[test]
+fn retrieval_retains_warning_evidence_for_peer_coverage_checks() {
+    let Ok(CallToolResponse::Complete(result)) = Json(search_answer()).retrieval_result() else {
+        panic!("internal retrieval completes");
+    };
+    assert_eq!(
+        result.structured_content.expect("structured result")["warnings"][0]["code"],
+        "global_access_disabled"
+    );
+    assert_eq!(
+        result.content[0].as_text().expect("text").text,
+        "0 results\n"
+    );
 }
 
 #[test]

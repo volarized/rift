@@ -1737,28 +1737,29 @@ pub(crate) fn resource_json(
     Ok(serde_json::from_str(body)?)
 }
 
-/// Reads map until workspace file preparation finishes, within fixture bound.
+/// Waits for a complete captured local graph through the public search route.
 pub(crate) async fn await_workspace_ready(
     client: &RunningService<RoleClient, ()>,
 ) -> TestResult<serde_json::Value> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let arguments = serde_json::json!({"query": "ASK { ?subject a :Symbol }"});
     loop {
-        let answer = tokio::time::timeout_at(
-            deadline,
-            client.read_resource(ReadResourceRequestParams::new("rift://map".to_owned())),
-        )
-        .await??;
-        let body = resource_json(&answer, "rift://map")?;
-        let preparing = body["warnings"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|warning| warning["code"] == "local_index_preparing");
-        if !preparing {
-            return Ok(body);
+        let body =
+            tokio::time::timeout_at(deadline, proxied_call(client, "search", &arguments)).await??;
+        if body["reason"] != "index_preparing" {
+            assert!(
+                body["answer"]["value"].is_boolean(),
+                "graph readiness probe: {body}"
+            );
+            let answer = tokio::time::timeout_at(
+                deadline,
+                client.read_resource(ReadResourceRequestParams::new("rift://map".to_owned())),
+            )
+            .await??;
+            return resource_json(&answer, "rift://map");
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(format!("workspace map remained in preparation: {body}").into());
+            return Err(format!("workspace graph remained in preparation: {body}").into());
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

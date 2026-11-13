@@ -19,13 +19,11 @@
 //!       }
 //!   [2] src/lib.rs:7 · content
 //!           let config = load_config(&arguments.path)?;
-//! 1 warning
-//!   results_truncated · results_max 100
 //! ```
 //!
 //! The title counts the results and names the page when there are several; the page is the only
-//! pagination fact. The warnings section follows the items and is left out without warnings. One
-//! item has no marker and indents its lines by one level; several items each start with `[n] `
+//! pagination fact. One item has no marker and indents its lines by one level. Several items each
+//! start with `[n] `
 //! at one level and indent their further lines by two. Text an answer copies, such as source,
 //! keeps its own whitespace after the indent. No blank line separates two items or two sections.
 //! The hits a relationship walk reached are written as a tree; see the `walk` module.
@@ -34,14 +32,12 @@
 
 mod error;
 mod facts;
-mod inline;
 mod layout;
 mod nodes;
 mod query;
 mod search;
 mod symbol;
 mod walk;
-mod warning;
 mod workspace;
 
 use rift_protocol::error::ErrorData;
@@ -50,6 +46,7 @@ use rift_protocol::search::SearchResult;
 use rift_protocol::workspace::WorkspaceResourcePage;
 
 use super::text::{OUTPUT_TEXT_BYTES_MAX, TextError, TextWriter};
+use super::warnings::{record_documentation, record_warnings};
 use layout::Page;
 
 pub(crate) use error::RegisteredFailure;
@@ -60,6 +57,9 @@ pub(crate) trait Render {
     fn is_error(&self) -> bool {
         false
     }
+
+    /// Records read warnings and clears them before serialization to a client.
+    fn log_warnings(&mut self) {}
 
     /// Writes this answer into `out`.
     ///
@@ -82,18 +82,19 @@ pub(crate) fn text_of<T: Render + ?Sized>(answer: &T) -> Result<String, TextErro
 }
 
 impl Render for SearchResult {
+    fn log_warnings(&mut self) {
+        record_warnings(&mut self.warnings);
+    }
+
     fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
         let Self {
             view,
             revision,
             results,
             pagination,
-            warnings,
+            ..
         } = self;
-        let page = Page {
-            pagination,
-            warnings,
-        };
+        let page = Page { pagination };
         search::answer(out, &page, results)?;
         layout::revision(out, revision.as_ref())?;
         if let Some(view) = view {
@@ -107,6 +108,13 @@ impl Render for SearchResult {
 }
 
 impl Render for rift_protocol::search_read::SearchReadResult {
+    fn log_warnings(&mut self) {
+        match self {
+            Self::Results(result) => result.log_warnings(),
+            Self::Unavailable(result) => result.log_warnings(),
+        }
+    }
+
     fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
         match self {
             Self::Results(result) => result.render(out),
@@ -116,12 +124,13 @@ impl Render for rift_protocol::search_read::SearchReadResult {
 }
 
 impl Render for rift_protocol::search_read::SearchUnavailable {
+    fn log_warnings(&mut self) {
+        let Self::Unavailable { warnings, .. } = self;
+        record_warnings(warnings);
+    }
+
     fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
-        let Self::Unavailable {
-            reason,
-            view,
-            warnings,
-        } = self;
+        let Self::Unavailable { reason, view, .. } = self;
         out.raw_line(0, &format!("unavailable · {reason:?}"))?;
         if let Some(view) = view {
             out.raw_line(
@@ -129,26 +138,32 @@ impl Render for rift_protocol::search_read::SearchUnavailable {
                 &format!("view {} · expires {}", view.id.as_str(), view.expires_at),
             )?;
         }
-        warning::section(out, warnings)
+        Ok(())
     }
 }
 
 impl Render for GetSymbolResult {
+    fn log_warnings(&mut self) {
+        record_warnings(&mut self.warnings);
+        for hit in &mut self.hits {
+            record_documentation(&mut hit.documentation);
+        }
+    }
+
     fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
         let Self {
-            hits,
-            pagination,
-            warnings,
+            hits, pagination, ..
         } = self;
-        let page = Page {
-            pagination,
-            warnings,
-        };
+        let page = Page { pagination };
         layout::answer(out, &page, hits, symbol::hit)
     }
 }
 
 impl Render for NodesResult {
+    fn log_warnings(&mut self) {
+        record_warnings(&mut self.warnings);
+    }
+
     fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
         nodes::answer(out, self)
     }
@@ -181,6 +196,22 @@ mod tests;
 mod resource_tests;
 
 impl Render for rift_protocol::symbol_read::GetSymbolResult {
+    fn log_warnings(&mut self) {
+        match self {
+            Self::Found {
+                warnings,
+                documentation,
+                ..
+            } => {
+                record_warnings(warnings);
+                record_documentation(documentation);
+            }
+            Self::Missing { warnings, .. } | Self::Unavailable { warnings, .. } => {
+                record_warnings(warnings);
+            }
+        }
+    }
+
     fn is_error(&self) -> bool {
         matches!(self, Self::Missing { .. })
     }

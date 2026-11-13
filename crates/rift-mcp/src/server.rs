@@ -888,19 +888,13 @@ impl ResolvedWorkspace {
     }
 }
 
-fn nodes_preparing_answer(resolved: &ResolvedWorkspace) -> Result<NodesResult, ToolFailure> {
-    let revision = resolved
-        .published
-        .reads
-        .served_revision()
-        .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))?;
-    Ok(NodesResult {
-        symbol: None,
-        nodes: Vec::new(),
-        node_cursor: None,
-        revision,
-        warnings: nodes_preparing_warnings(resolved),
-    })
+fn nodes_preparing_failure(resolved: &ResolvedWorkspace) -> ToolFailure {
+    crate::output::log_warnings(&nodes_preparing_warnings(resolved));
+    errors::server::read_unavailable()
+        .operation("node read")
+        .detail("the selected source is still being prepared")
+        .mcp()
+        .tool_failure(wire::ErrorPhase::Read)
 }
 
 /// Whether `symbol` belongs to a package or a runtime release, whose nodes the global API
@@ -2397,9 +2391,10 @@ impl RiftMcp {
                         .into_call_tool_result();
                 }
             };
-        self.search(Parameters(params))
-            .await
-            .into_call_tool_result()
+        match self.search(Parameters(params)).await {
+            Ok(answer) => answer.retrieval_result(),
+            Err(failure) => failure.into_call_tool_result(),
+        }
     }
 
     async fn search_result(&self, params: SearchParams) -> Result<Json<SearchResult>, ToolFailure> {
@@ -3298,10 +3293,9 @@ impl RiftMcp {
     /// rest. A file no syntax provider parses answers its file node alone. `revision` lists
     /// the nodes at a git commit or pins the served working tree, and the answer names the
     /// revision it was read at. If discovery is incomplete or a targeted read spends the
-    /// request's remaining time, the result has empty `nodes` and carries
-    /// `local_index_preparing`. A selected source path can answer
-    /// within that remaining time, with the same warning until the publication records the
-    /// path: workspace byte and declaration bounds remain unchecked.
+    /// request's remaining time, the request returns `temporarily_unavailable` and can be
+    /// retried. A selected source path can answer within the remaining time. The server logs
+    /// `local_index_preparing` while the publication is being prepared.
     #[tool]
     async fn nodes(
         &self,
@@ -3335,7 +3329,7 @@ impl RiftMcp {
                     .tool_failure(wire::ErrorPhase::Read)
             })?;
         if preparation.is_some_and(|preparation| preparation.total.is_none()) {
-            return nodes_preparing_answer(&resolved).map(Json);
+            return Err(nodes_preparing_failure(&resolved));
         }
         // A complete batch clears `preparation`; retained selected paths therefore carry
         // the warning used by a deadline answer.
@@ -3517,7 +3511,7 @@ impl RiftMcp {
             Ok(Err(error)) => error.mcp().tool_failure(wire::ErrorPhase::Read).fail(),
             Err(_) => {
                 timed_cancellation.cancel();
-                nodes_preparing_answer(resolved).map(Json)
+                Err(nodes_preparing_failure(resolved))
             }
         }
     }
@@ -4392,20 +4386,32 @@ impl ServerHandler for RiftMcp {
         request: ReadResourceRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
+        let span = rift_tracing::info_span!(
+            "mcp.request",
+            component = "mcp",
+            operation = "resources/read",
+            request_id = %context.id,
+            resource = %request.uri,
+            workspace = %self.root.display()
+        );
         let answered;
         let elapsed = rift_tracing::measure_elapsed!("resources/read", {
-            answered = if resource::is_workspace_uri(&request.uri) {
-                Box::pin(self.read_workspace(&request.uri))
-                    .await
-                    .map(Into::into)
-            } else if request.uri == resource::MAP_URI {
-                self.read_map(&request.uri).await.map(Into::into)
-            } else {
-                Err(ErrorData::resource_not_found(
-                    format!("no resource is published at {:?}", request.uri),
-                    None,
-                ))
-            };
+            answered = span
+                .instrument(async {
+                    if resource::is_workspace_uri(&request.uri) {
+                        Box::pin(self.read_workspace(&request.uri))
+                            .await
+                            .map(Into::into)
+                    } else if request.uri == resource::MAP_URI {
+                        self.read_map(&request.uri).await.map(Into::into)
+                    } else {
+                        Err(ErrorData::resource_not_found(
+                            format!("no resource is published at {:?}", request.uri),
+                            None,
+                        ))
+                    }
+                })
+                .await;
         })
         .ok()
         .map(|((), measurement)| measurement.elapsed());
@@ -5058,7 +5064,7 @@ done
 
     use crate::validation::RebuildRequest;
 
-    use super::{BlockingExecutor, Parameters, RequestDeadline, RiftMcp};
+    use super::{BlockingExecutor, Parameters, RequestDeadline, RiftMcp, ToolFailure};
     use crate::storage::WorkspaceStorage;
     use crate::validation::lexical_double::StoreDouble;
     use crate::validation::{
@@ -5157,16 +5163,39 @@ done
         }
     }
 
+    async fn call_nodes(
+        client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+        path: &str,
+    ) -> TestResult<CallToolResult> {
+        let request = CallToolRequestParams::new("nodes")
+            .with_arguments(arguments(&json!({"path": path, "position": 8}))?);
+        Ok(client.call_tool(request).await?)
+    }
+
     async fn served_nodes(
         client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
         path: &str,
     ) -> TestResult<NodesResult> {
-        let request = CallToolRequestParams::new("nodes")
-            .with_arguments(arguments(&json!({"path": path, "position": 8}))?);
-        let answer = client.call_tool(request).await?;
+        let answer = call_nodes(client, path).await?;
         Ok(serde_json::from_value(
             answer.structured_content.ok_or("structured node answer")?,
         )?)
+    }
+
+    fn assert_preparing_nodes_refusal(answer: &CallToolResult) -> TestResult {
+        assert_eq!(answer.is_error, Some(true));
+        assert!(answer.structured_content.is_none());
+        let [content] = answer.content.as_slice() else {
+            return Err("node read refusal has one content block".into());
+        };
+        let text = &content.as_text().ok_or("node read refusal is text")?.text;
+        assert!(
+            text.contains("temporarily_unavailable · retry same_request"),
+            "{text}"
+        );
+        assert!(text.contains("rift.server.read_unavailable"), "{text}");
+        assert!(!text.contains("local_index_preparing"), "{text}");
+        Ok(())
     }
 
     fn cold_nodes(
@@ -5212,20 +5241,10 @@ done
         )));
         for uri in ["rift://map", "rift://workspace"] {
             let value = preparation_resource(client, uri).await?;
-            assert_eq!(value["warnings"][0]["code"], "local_index_preparing");
-            assert_eq!(value["warnings"][0]["prepared"], 0);
-            assert!(value["warnings"][0].get("total").is_none());
+            assert!(value.get("warnings").is_none());
         }
-        let before_discovery = served_nodes(client, "src/lib.rs").await?;
-        assert!(before_discovery.nodes.is_empty());
-        assert!(before_discovery.warnings.iter().any(|warning| matches!(
-            warning,
-            ReadWarning::LocalIndexPreparing {
-                prepared: 0,
-                total: None,
-                ..
-            }
-        )));
+        let before_discovery = call_nodes(client, "src/lib.rs").await?;
+        assert_preparing_nodes_refusal(&before_discovery)?;
         let invalid = client
             .call_tool(
                 CallToolRequestParams::new("nodes")
@@ -5248,6 +5267,7 @@ done
 
     #[tokio::test]
     async fn preparation_serves_empty_answers_before_discovery_then_complete_facts() -> TestResult {
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let (_directory, assembled) = starting_fixture().await?;
         let server = assembled.server.clone();
         let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
@@ -5267,8 +5287,7 @@ done
             .await?
             .ok_or("initial discovery was cancelled")?;
         let map = preparation_resource(&client, "rift://map").await?;
-        assert_eq!(map["warnings"][0]["prepared"], 0);
-        assert_eq!(map["warnings"][0]["total"], 2);
+        assert!(map.get("warnings").is_none());
         assert_eq!(map["languages"][0]["language"], "rust");
         assert_eq!(map["languages"][0]["files"], 1);
         assert_eq!(map["languages"][0]["symbols"], 0);
@@ -5278,14 +5297,7 @@ done
 
         let nodes = served_nodes(&client, "src/lib.rs").await?;
         assert!(!nodes.nodes.is_empty());
-        assert!(nodes.warnings.iter().any(|warning| matches!(
-            warning,
-            ReadWarning::LocalIndexPreparing {
-                prepared: 0,
-                total: Some(2),
-                ..
-            }
-        )));
+        assert!(nodes.warnings.is_empty());
 
         let answer = client.call_tool(request.clone()).await?;
         let partial: SearchResult = serde_json::from_value(
@@ -5324,8 +5336,40 @@ done
             let value = preparation_resource(&client, uri).await?;
             assert!(value.get("warnings").is_none());
         }
+        assert_preparation_warnings_logged(&mut drain, assembled.server.root.as_ref())?;
         client.cancel().await?;
         serving.await?;
+        Ok(())
+    }
+
+    fn assert_preparation_warnings_logged(
+        drain: &mut rift_tracing::LogDrain,
+        root: &std::path::Path,
+    ) -> TestResult {
+        let mut sources = std::collections::BTreeSet::new();
+        for record in drain.queued_records() {
+            if record.message() != "read warning" {
+                continue;
+            }
+            let fields: serde_json::Value = serde_json::from_str(record.fields())?;
+            if fields["warning_code"] != "local_index_preparing" {
+                continue;
+            }
+            let request = &fields["root_span"]["fields"];
+            assert_eq!(request["workspace"], root.display().to_string());
+            if let Some(source) = request["tool"]
+                .as_str()
+                .or_else(|| request["resource"].as_str())
+            {
+                sources.insert(source.to_owned());
+            }
+        }
+        assert_eq!(
+            sources,
+            ["nodes", "rift://map", "rift://workspace"]
+                .map(str::to_owned)
+                .into()
+        );
         Ok(())
     }
 
@@ -5605,7 +5649,7 @@ done
         let client = ().serve(client_transport).await?;
         let response = tokio::time::timeout(
             Duration::from_millis(1_500),
-            served_nodes(&client, "src/lib.rs"),
+            call_nodes(&client, "src/lib.rs"),
         )
         .await;
         if response.is_err() {
@@ -5614,8 +5658,7 @@ done
             let _ = tokio::time::timeout(Duration::from_secs(3), serving).await;
             return Err("queued nodes request must spend its 1s deadline".into());
         }
-        let nodes = response??;
-        assert_empty_preparing_nodes(&nodes, 0, Some(2));
+        assert_preparing_nodes_refusal(&response??)?;
         assert_stale_nodes_timeout_warning(&server, &published, params.clone()).await?;
         drop(held);
         let after_timeout = Arc::clone(&server.published.read().await.current);
@@ -5627,9 +5670,6 @@ done
             tokio::time::timeout(Duration::from_secs(3), served_nodes(&client, "src/lib.rs"))
                 .await??;
         let mut expected = expected;
-        expected.warnings.extend(super::nodes_preparing_warnings(
-            &super::ResolvedWorkspace::current(published, Duration::ZERO),
-        ));
         // The targeted parse answers at its own partial tree; every other field matches.
         expected.revision = retried.revision.clone();
         assert_eq!(retried, expected);
@@ -5653,6 +5693,7 @@ done
             stale: Some(stale_warning.clone()),
             capture_elapsed: Duration::ZERO,
         };
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let stale_answer = server
             .targeted_nodes_read(
                 &stale,
@@ -5662,10 +5703,21 @@ done
                     move |reads| reads.nodes_for_preparation(&params)
                 },
             )
-            .await?
-            .0;
-        assert!(stale_answer.warnings.contains(&stale_warning));
-        assert_empty_preparing_nodes(&stale_answer, 0, Some(2));
+            .await
+            .err()
+            .ok_or("stale preparation must refuse")?;
+        assert_node_failure(&stale_answer);
+        let records = drain.queued_records();
+        for code in ["stale_index", "local_index_preparing"] {
+            assert!(
+                records.iter().any(|record| {
+                    record.message() == "read warning"
+                        && serde_json::from_str::<serde_json::Value>(record.fields())
+                            .is_ok_and(|fields| fields["warning_code"] == code)
+                }),
+                "{code}: {records:?}"
+            );
+        }
         Ok(())
     }
 
@@ -5685,17 +5737,14 @@ done
         Ok(())
     }
 
-    fn assert_empty_preparing_nodes(answer: &NodesResult, prepared: u64, total: Option<u64>) {
-        assert!(answer.nodes.is_empty());
-        assert_eq!(answer.node_cursor, None);
-        assert!(answer.warnings.iter().any(|warning| matches!(
-            warning,
-            ReadWarning::LocalIndexPreparing {
-                prepared: actual_prepared,
-                total: actual_total,
-                ..
-            } if *actual_prepared == prepared && *actual_total == total
-        )));
+    fn assert_node_failure(answer: &ToolFailure) {
+        let ToolFailure::Registered(failure, _) = answer else {
+            panic!("node readiness refusal must have a registered error");
+        };
+        assert_eq!(
+            failure.registered().slug(),
+            errors::server::read_unavailable::SLUG
+        );
     }
 
     #[tokio::test]
@@ -5729,8 +5778,10 @@ done
         tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(2)))
             .await??;
         let joined = tokio::time::timeout(Duration::from_secs(2), read).await??;
-        let answer = joined?.0;
-        assert_empty_preparing_nodes(&answer, 0, Some(2));
+        let refusal = joined
+            .err()
+            .ok_or("admitted nodes must refuse at its deadline")?;
+        assert_node_failure(&refusal);
         assert_eq!(
             u32::try_from(server.blocking.operations.available_permits())?,
             permits_max - 1,

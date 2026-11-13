@@ -220,7 +220,6 @@ struct RiftProxy {
     backends: Arc<BTreeMap<String, RiftProxy>>,
     candidate_views: Arc<candidates::CandidateViews>,
     query_routes: Arc<query::QueryRoutes>,
-    framework_warnings: Arc<crate::output::FrameworkWarnings>,
 }
 
 /// The proxy's one upstream connection and the generation counter that
@@ -383,7 +382,6 @@ impl RiftProxy {
             backends: Arc::new(BTreeMap::new()),
             candidate_views: Arc::new(candidates::CandidateViews::default()),
             query_routes: Arc::new(query::QueryRoutes::default()),
-            framework_warnings: Arc::new(crate::output::FrameworkWarnings::default()),
         }
     }
 
@@ -392,30 +390,13 @@ impl RiftProxy {
     ///
     /// Only a completed result carries `structuredContent`; an input
     /// request and a task pass through untouched.
-    fn selected_response(&self, response: CallToolResponse, project: &str) -> CallToolResponse {
+    fn selected_response(&self, response: CallToolResponse) -> CallToolResponse {
         match response {
             CallToolResponse::Complete(result) => {
-                let result = self.framework_warnings.select_result(result, project);
                 CallToolResponse::Complete(self.output.select_result(result))
             }
             other => other,
         }
-    }
-
-    /// The project whose framework warnings a `tools/call` answer reports: the extra
-    /// project a `get_symbol` identity names, else the primary one.
-    fn warning_project(request: &CallToolRequestParams) -> String {
-        if request.name != "get_symbol" {
-            return "local".to_owned();
-        }
-        request
-            .arguments
-            .as_ref()
-            .and_then(|arguments| arguments.get("id"))
-            .and_then(serde_json::Value::as_str)
-            .and_then(|id| rift_protocol::identity::SymbolIdentity::parse(id).ok())
-            .and_then(|identity| identity::backend_key(identity.owner()))
-            .unwrap_or_else(|| "local".to_owned())
     }
 
     fn call_backend(&self, request: &CallToolRequestParams) -> Result<&Self, RiftError> {
@@ -1713,7 +1694,6 @@ impl ServerHandler for RiftProxy {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        let warning_project = Self::warning_project(&request);
         let measured = McpRequest::tool_call(&request.name);
         let span = rift_tracing::info_span!(
             "mcp.forward",
@@ -1756,7 +1736,7 @@ impl ServerHandler for RiftProxy {
             elapsed,
             Ending::of_tool_call(&answered),
         );
-        Ok(self.selected_response(answered?, &warning_project))
+        Ok(self.selected_response(answered?))
     }
 
     async fn list_resources(
@@ -4611,64 +4591,6 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let proxy = RiftProxy::new(directory.path(), test_identity(), OutputPolicy::Text);
         assert_eq!(proxy.clone().output, OutputPolicy::Text);
-        assert!(Arc::ptr_eq(
-            &proxy.framework_warnings,
-            &proxy.clone().framework_warnings
-        ));
-    }
-
-    #[test]
-    fn named_symbol_warning_context_matches_retained_profile_selection() {
-        use rmcp::handler::server::tool::IntoCallToolResult as _;
-
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let proxy = RiftProxy::new(directory.path(), test_identity(), OutputPolicy::All);
-        let id = "rift://symbol/local@docs/rust/app/missing";
-        let request = CallToolRequestParams::new("get_symbol")
-            .with_arguments(serde_json::from_value(json!({"id":id})).expect("symbol arguments"));
-        let first_project = RiftProxy::warning_project(&request);
-        assert_eq!(first_project, "docs");
-        let answer: rift_protocol::symbol_read::GetSymbolResult = serde_json::from_value(json!({
-            "outcome":"missing", "symbol_not_found":{"id":id,"alternatives":[]},
-            "revision":format!("rift://revision/tree/{}", "0".repeat(64)),
-            "warnings":[{"code":"framework_context_unresolved", "unit":"rift://source/project/a.ts",
-                "framework":"tailwind", "detail":"missing version"}]
-        }))
-        .expect("typed profile answer");
-        let Ok(CallToolResponse::Complete(answer)) =
-            crate::output::Json(answer).into_call_tool_result()
-        else {
-            panic!("profile symbol read completes");
-        };
-        let CallToolResponse::Complete(first) =
-            proxy.selected_response(CallToolResponse::Complete(answer.clone()), &first_project)
-        else {
-            panic!("first answer completes");
-        };
-        // A retained profile view selects the accepted backend name.
-        let CallToolResponse::Complete(repeated) = proxy
-            .clone()
-            .selected_response(CallToolResponse::Complete(answer), "docs")
-        else {
-            panic!("retained answer completes");
-        };
-        assert!(
-            first.content[0]
-                .as_text()
-                .expect("text")
-                .text
-                .contains("framework_context_unresolved")
-        );
-        assert!(
-            !repeated.content[0]
-                .as_text()
-                .expect("text")
-                .text
-                .contains("framework_context_unresolved")
-        );
-        assert_eq!(first.structured_content, repeated.structured_content);
-        assert_eq!(first.is_error, Some(true));
-        assert_eq!(repeated.is_error, Some(true));
     }
 
     #[test]
@@ -4677,10 +4599,7 @@ mod tests {
         let proxy = RiftProxy::new(directory.path(), test_identity(), OutputPolicy::Text);
 
         let input_required = InputRequiredResult::from_request_state("opaque");
-        match proxy.selected_response(
-            CallToolResponse::InputRequired(input_required.clone()),
-            "local",
-        ) {
+        match proxy.selected_response(CallToolResponse::InputRequired(input_required.clone())) {
             CallToolResponse::InputRequired(passed) => {
                 assert_eq!(passed.request_state, input_required.request_state);
             }
@@ -4693,7 +4612,7 @@ mod tests {
             "2026-01-01T00:00:00Z",
             "2026-01-01T00:00:00Z",
         ));
-        match proxy.selected_response(CallToolResponse::Task(task.clone()), "local") {
+        match proxy.selected_response(CallToolResponse::Task(task.clone())) {
             CallToolResponse::Task(passed) => assert_eq!(passed, task),
             other => panic!("a task answer must pass through, got {other:?}"),
         }

@@ -539,6 +539,29 @@ pub fn strip_optional_null_arms(schema: &mut Map<String, Value>) {
     }
 }
 
+/// Removes response diagnostics from the MCP view of shared result schemas.
+pub fn strip_response_warnings(schema: &mut Map<String, Value>) {
+    let mut pending = vec![schema];
+    while let Some(node) = pending.pop() {
+        if let Some(properties) = node
+            .get_mut(keyword::PROPERTIES)
+            .and_then(Value::as_object_mut)
+        {
+            properties.remove("warnings");
+        }
+        if let Some(required) = node
+            .get_mut(keyword::REQUIRED)
+            .and_then(Value::as_array_mut)
+        {
+            required.retain(|name| name.as_str() != Some("warnings"));
+            if required.is_empty() {
+                node.remove(keyword::REQUIRED);
+            }
+        }
+        pending.extend(subschemas(node));
+    }
+}
+
 /// The subschemas one schema object holds directly.
 fn subschemas(node: &mut Map<String, Value>) -> Vec<&mut Map<String, Value>> {
     let mut found = Vec::new();
@@ -1909,13 +1932,6 @@ pub fn declare_workspace_language_summary_empty_defaults(schema: &mut Schema) {
     );
 }
 
-/// A [`WorkspaceResourcePage`](crate::workspace::WorkspaceResourcePage) states
-/// `default: []` on `warnings`.
-pub fn declare_workspace_resource_page_empty_defaults(schema: &mut Schema) {
-    use crate::workspace::WorkspaceResourcePage;
-    declare_empty_array_defaults(schema, &[property!(WorkspaceResourcePage, warnings)]);
-}
-
 /// A [`WorkspaceMap`](crate::map::WorkspaceMap) states `default: []` on its collection
 /// fields.
 pub fn declare_workspace_map_empty_defaults(schema: &mut Schema) {
@@ -1931,7 +1947,6 @@ pub fn declare_workspace_map_empty_defaults(schema: &mut Schema) {
             property!(WorkspaceMap, module_relationships),
             property!(WorkspaceMap, packages),
             property!(WorkspaceMap, recommendations),
-            property!(WorkspaceMap, warnings),
         ],
     );
 }
@@ -1950,6 +1965,29 @@ mod tests {
 
     fn schema_from(value: Value) -> Schema {
         Schema::try_from(value).expect("test schema literal must be a valid schema object")
+    }
+
+    #[test]
+    fn strips_response_warning_properties_and_requirements_through_conditionals() {
+        let mut schema = json!({
+            "properties": {"warnings": {"type": "array"}, "value": {"type": "string"}},
+            "required": ["warnings", "value"],
+            "then": {
+                "properties": {"warnings": {"type": "array"}},
+                "required": ["warnings"]
+            },
+            "$defs": {"Child": {"properties": {"warnings": {"type": "array"}}}}
+        });
+        super::strip_response_warnings(schema.as_object_mut().expect("schema object"));
+        assert_eq!(schema["required"], json!(["value"]));
+        assert!(schema["properties"].get("warnings").is_none());
+        assert!(schema["then"].get("required").is_none());
+        assert!(schema["then"]["properties"].get("warnings").is_none());
+        assert!(
+            schema["$defs"]["Child"]["properties"]
+                .get("warnings")
+                .is_none()
+        );
     }
 
     #[test]

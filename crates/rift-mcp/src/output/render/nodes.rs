@@ -1,18 +1,15 @@
-//! Text of a `nodes` answer: one item per node, the written sources, the cursor, then the
-//! warnings.
+//! Text of a `nodes` answer, including its source and continuation.
 
 use rift_protocol::read::{Node, NodeFacet, NodeRegion, NodesResult};
 
 use super::facts::{Facts, wire_name};
 use super::layout::{self, Lines};
-use super::warning;
 use crate::output::text::{TextError, TextWriter};
 
 /// Noun counted by the title of a `nodes` answer.
 const NODE_NOUN: &str = "node";
 
-/// Writes the title with the answer's symbol, the nodes section, the written sources, the
-/// cursor, and the warnings section.
+/// Writes the title, nodes, source, and continuation.
 ///
 /// An outer node's source holds the sources of the nodes inside it, so the text writes each
 /// source once: the source of each node no earlier node encloses, one per declaration of a
@@ -23,7 +20,7 @@ pub(super) fn answer(out: &mut TextWriter, result: &NodesResult) -> Result<(), T
         nodes,
         node_cursor,
         revision,
-        warnings,
+        ..
     } = result;
     layout::title(
         out,
@@ -40,7 +37,6 @@ pub(super) fn answer(out: &mut TextWriter, result: &NodesResult) -> Result<(), T
     if let Some(cursor) = node_cursor {
         out.raw_line(0, &format!("node_cursor {cursor}"))?;
     }
-    warning::section(out, warnings)?;
     layout::revision(out, Some(revision))
 }
 

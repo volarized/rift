@@ -16,10 +16,9 @@
 
 use std::fmt::Display;
 
-use rift_protocol::read::{Pagination, ReadWarning};
+use rift_protocol::read::Pagination;
 
 use super::facts::FACT_SEPARATOR;
-use super::warning;
 use crate::output::text::{TextError, TextWriter, visible};
 
 /// Levels that indent an entry of a section.
@@ -32,12 +31,10 @@ const NODE_INDENT: usize = 1;
 /// Noun counted by the title of the items of `search` and `get_symbol`.
 const RESULT_NOUN: &str = "result";
 
-/// Where an answer sits among its pages, and the warnings it carries.
+/// Where an answer sits among its pages.
 pub(super) struct Page<'a> {
     /// Page index and page count of the answer.
     pub(super) pagination: &'a Pagination,
-    /// Warnings written in their own section after the items.
-    pub(super) warnings: &'a [ReadWarning],
 }
 
 /// The lines of one item, indented as its place in the answer requires.
@@ -141,7 +138,7 @@ fn item_indent(count: usize) -> usize {
     }
 }
 
-/// Writes a `search` or `get_symbol` answer: the results section, then the warnings section.
+/// Writes the results section of a `search` or `get_symbol` answer.
 ///
 /// `item` writes one item through the [`Lines`] it is given and starts with [`Lines::head`].
 pub(super) fn answer<T>(
@@ -153,7 +150,7 @@ pub(super) fn answer<T>(
     answer_of(out, page, results.len(), |out| items(out, results, item))
 }
 
-/// Writes the results section of `count` results through `entries`, then the warnings section.
+/// Writes a section of `count` results through `entries`.
 pub(super) fn answer_of(
     out: &mut TextWriter,
     page: &Page<'_>,
@@ -162,8 +159,7 @@ pub(super) fn answer_of(
 ) -> Result<(), TextError> {
     let page_fact = page_fact(page.pagination);
     title(out, count, RESULT_NOUN, page_fact.as_deref())?;
-    entries(out)?;
-    warning::section(out, page.warnings)
+    entries(out)
 }
 
 /// Writes each item under the title, with markers when there are several.
@@ -241,11 +237,6 @@ impl<'a> Sections<'a> {
     /// Control characters are made visible. Empty text writes nothing.
     pub(super) fn entry(&mut self, depth: usize, text: &str) -> Result<(), TextError> {
         entry(self.out, depth, text)
-    }
-
-    /// Writes the warnings section after the last named section.
-    pub(super) fn warnings(&mut self, warnings: &[ReadWarning]) -> Result<(), TextError> {
-        warning::section(self.out, warnings)
     }
 }
 

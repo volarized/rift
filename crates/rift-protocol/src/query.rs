@@ -47,7 +47,7 @@ pub struct QueryResult {
     pub view: Option<CapturedView>,
     /// The transport page within this retained execution.
     pub pagination: QueryPagination,
-    /// Conditions the caller must consider when reading this answer.
+    /// Warnings recorded by the serving process.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<ReadWarning>,
 }
@@ -65,7 +65,7 @@ pub struct QueryResult {
     },
     { "answer": { "result": "boolean", "value": true }, "pagination": { "page_index": 0, "total_pages": 1 } },
     { "answer": { "result": "graph", "triples": [] }, "pagination": { "page_index": 0, "total_pages": 0 } },
-    { "outcome": "unavailable", "reason": "view_context", "warnings": [] }
+    { "outcome": "unavailable", "reason": "view_context" }
 ]))]
 pub enum QueryReadResult {
     /// An answer evaluated over every required fact.

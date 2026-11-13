@@ -2,9 +2,17 @@
 
 use rift_protocol::query::{QueryAnswer, QueryReadResult, QueryResult, RdfTerm};
 
-use super::{Render, TextError, TextWriter, warning};
+use super::record_warnings;
+use super::{Render, TextError, TextWriter};
 
 impl Render for QueryReadResult {
+    fn log_warnings(&mut self) {
+        match self {
+            Self::Results(result) => result.log_warnings(),
+            Self::Unavailable(result) => result.log_warnings(),
+        }
+    }
+
     fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
         match self {
             Self::Results(result) => result.render(out),
@@ -14,6 +22,10 @@ impl Render for QueryReadResult {
 }
 
 impl Render for QueryResult {
+    fn log_warnings(&mut self) {
+        record_warnings(&mut self.warnings);
+    }
+
     fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
         match &self.answer {
             QueryAnswer::Boolean { value } => {
@@ -67,7 +79,6 @@ impl Render for QueryResult {
         if let Some(next) = &self.pagination.next_query {
             out.raw_line(0, &format!("next query · {next}"))?;
         }
-        warning::section(out, &self.warnings)?;
         if let Some(view) = &self.view {
             out.raw_line(
                 0,
