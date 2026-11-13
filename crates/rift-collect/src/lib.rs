@@ -40,7 +40,7 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     /// A durable checkpoint could not be read or written.
     #[error(transparent)]
-    Cache(#[from] rusqlite::Error),
+    Cache(#[from] toasty::Error),
 }
 
 #[cfg(feature = "runtime")]

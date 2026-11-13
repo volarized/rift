@@ -164,7 +164,7 @@ async fn restart_reuses_exact_batches_and_recollects_changed_or_missing_dependen
     let first_inventory = inventory(Some("def f(): pass"), "entry.py");
     let id = producer(b"one", b"context");
     let mut worker = Fixture::default();
-    let cache = CollectionCache::open(&path).expect("open");
+    let cache = CollectionCache::open(&path).await.expect("open");
     let (cold, held) = collect(
         &cache,
         &id,
@@ -183,7 +183,7 @@ async fn restart_reuses_exact_batches_and_recollects_changed_or_missing_dependen
     );
     drop(cache);
 
-    let cache = CollectionCache::open(&path).expect("restart");
+    let cache = CollectionCache::open(&path).await.expect("restart");
     worker.requests.clear();
     let (warm, reused) = collect(
         &cache,
@@ -213,7 +213,9 @@ async fn restart_reuses_exact_batches_and_recollects_changed_or_missing_dependen
     assert_eq!((delta.reused, delta.collected), (1, 1));
     assert_eq!(worker.requests, [unit("entry.py")]);
     assert_ne!(held[0], after_edit[0]);
-    let independent = CollectionCache::open(std::path::Path::new(":memory:")).expect("fresh cache");
+    let independent = CollectionCache::open(std::path::Path::new(":memory:"))
+        .await
+        .expect("fresh cache");
     let (_, cold_changed) = collect(
         &independent,
         &id,
@@ -263,7 +265,9 @@ async fn restart_reuses_exact_batches_and_recollects_changed_or_missing_dependen
 
 #[tokio::test]
 async fn adding_a_previously_absent_unit_invalidates_its_dependent() {
-    let cache = CollectionCache::open(std::path::Path::new(":memory:")).expect("open");
+    let cache = CollectionCache::open(std::path::Path::new(":memory:"))
+        .await
+        .expect("open");
     let selected = [unit("entry.py"), unit("other.py")];
     let id = producer(b"one", b"context");
     let mut worker = Fixture::default();
@@ -299,7 +303,7 @@ async fn interruption_and_partial_coverage_do_not_mark_work_complete() {
         other: OtherSource::Interrupted,
         ..Fixture::default()
     };
-    let cache = CollectionCache::open(&path).expect("open");
+    let cache = CollectionCache::open(&path).await.expect("open");
     assert!(matches!(
         collect(
             &cache,
@@ -314,7 +318,7 @@ async fn interruption_and_partial_coverage_do_not_mark_work_complete() {
     ));
     drop(cache);
 
-    let cache = CollectionCache::open(&path).expect("restart");
+    let cache = CollectionCache::open(&path).await.expect("restart");
     worker = Fixture {
         other: OtherSource::Partial,
         ..Fixture::default()
@@ -354,7 +358,9 @@ async fn interruption_and_partial_coverage_do_not_mark_work_complete() {
 
 #[tokio::test]
 async fn category_context_and_parser_filename_are_independent_inputs() {
-    let cache = CollectionCache::open(std::path::Path::new(":memory:")).expect("open");
+    let cache = CollectionCache::open(std::path::Path::new(":memory:"))
+        .await
+        .expect("open");
     let selected = [unit("entry.py")];
     let inputs = inventory(None, "entry.py");
     let id = producer(b"one", b"context");
@@ -413,7 +419,9 @@ async fn category_context_and_parser_filename_are_independent_inputs() {
 
 #[tokio::test]
 async fn refuses_a_split_utf8_boundary_before_checkpointing() {
-    let cache = CollectionCache::open(std::path::Path::new(":memory:")).expect("open");
+    let cache = CollectionCache::open(std::path::Path::new(":memory:"))
+        .await
+        .expect("open");
     let selected = [unit("entry.py")];
     let inputs = inventory(None, "entry.py");
     let id = producer(b"one", b"context");
@@ -448,7 +456,9 @@ async fn refuses_a_split_utf8_boundary_before_checkpointing() {
 
 #[tokio::test]
 async fn a_stale_target_digest_cannot_checkpoint_a_plausible_range() {
-    let cache = CollectionCache::open(std::path::Path::new(":memory:")).expect("open");
+    let cache = CollectionCache::open(std::path::Path::new(":memory:"))
+        .await
+        .expect("open");
     let selected = [unit("entry.py")];
     let inputs = inventory(Some("def f(): pass"), "entry.py");
     let id = producer(b"one", b"context");
@@ -482,7 +492,9 @@ async fn a_stale_target_digest_cannot_checkpoint_a_plausible_range() {
 
 #[tokio::test]
 async fn recollecting_an_old_dependency_promotes_it_into_the_reuse_window() {
-    let cache = CollectionCache::open(std::path::Path::new(":memory:")).expect("open");
+    let cache = CollectionCache::open(std::path::Path::new(":memory:"))
+        .await
+        .expect("open");
     let selected = [unit("entry.py")];
     let id = producer(b"one", b"context");
     let mut worker = Fixture::default();
@@ -604,7 +616,9 @@ fn evidence_and_coverage_must_match_admitted_occurrences() {
 
 #[tokio::test]
 async fn invalid_selection_runs_no_collector() {
-    let cache = CollectionCache::open(std::path::Path::new(":memory:")).expect("open");
+    let cache = CollectionCache::open(std::path::Path::new(":memory:"))
+        .await
+        .expect("open");
     let inputs = inventory(None, "entry.py");
     let id = producer(b"one", b"context");
     let mut worker = Fixture::default();
@@ -630,7 +644,9 @@ async fn invalid_selection_runs_no_collector() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_host_deadline_leaves_the_batch_owed() {
-    let cache = CollectionCache::open(std::path::Path::new(":memory:")).expect("open");
+    let cache = CollectionCache::open(std::path::Path::new(":memory:"))
+        .await
+        .expect("open");
     let selected = [unit("entry.py")];
     let inputs = inventory(None, "entry.py");
     let id = producer(b"one", b"context");

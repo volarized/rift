@@ -110,7 +110,7 @@ async fn run() -> Result<bool, Error> {
         }
         inventory.insert(CollectionSource::new(unit, source.filename, text.into())?)?;
     }
-    let cache = CollectionCache::open(Path::new(&cache))?;
+    let cache = CollectionCache::open(Path::new(&cache)).await?;
     let mut collector = StdioCollector::new(program, arguments, Duration::from_secs(30));
     let mut output = BufWriter::new(io::stdout().lock());
     let result = cache.collect(&producer, &mut collector, &inventory, &selection, manifest.category, |source, batch| {
