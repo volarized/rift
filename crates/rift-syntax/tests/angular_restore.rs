@@ -72,6 +72,7 @@ fn assert_nested_template(shipped: ShippedLanguage) {
             export_bindings: document.facts().export_bindings().map(<[_]>::to_vec),
             macro_invocations: document.facts().macro_invocations().map(<[_]>::to_vec),
             scope: document.facts().scope().map(<[_]>::to_vec),
+            static_facts: document.facts().static_facts().cloned(),
             source_digest: FileDigest::of(text.as_bytes()),
         },
     )
@@ -98,6 +99,7 @@ fn assert_nested_template(shipped: ShippedLanguage) {
             export_bindings: document.facts().export_bindings().map(<[_]>::to_vec),
             macro_invocations: document.facts().macro_invocations().map(<[_]>::to_vec),
             scope: document.facts().scope().map(<[_]>::to_vec),
+            static_facts: document.facts().static_facts().cloned(),
             source_digest: FileDigest::of(text.as_bytes()),
         },
     );

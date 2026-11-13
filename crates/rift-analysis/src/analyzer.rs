@@ -38,8 +38,8 @@ use rift_protocol::documentation::{
 use rift_protocol::identity::SymbolOwner;
 use rift_protocol::index::{
     PACKAGE_PUBLICATION_FORMAT_REVISION, PACKAGE_SOURCE_BYTES_MAX, PackageAnalysisWarning,
-    PackageCoverage, PackageDocument, PackageDocumentKind, PackagePublication, PackageSourceUnit,
-    PackageSymbol,
+    PackageCoverage, PackageDocument, PackageDocumentKind, PackageOccurrence, PackagePublication,
+    PackageSourceUnit, PackageSymbol,
 };
 use rift_protocol::producer::{FactCoverage, FactKind};
 use rift_protocol::read::{
@@ -93,6 +93,14 @@ pub struct AnalyzedFile {
 }
 
 impl AnalyzedFile {
+    fn placed_facts(&self) -> PlacedFacts<'_> {
+        PlacedFacts {
+            facts: self.file.syntax(),
+            path: self.file.path(),
+            placement: self.placement.clone(),
+        }
+    }
+
     /// The parsed file.
     #[must_use]
     pub const fn file(&self) -> &IndexedFile {
@@ -361,14 +369,10 @@ impl PackageAnalyzer {
         join::join_modules(&mut analyzed);
         let placed = analyzed
             .iter()
-            .map(|held| PlacedFacts {
-                facts: held.file.syntax(),
-                path: held.file.path(),
-                placement: held.placement.clone(),
-            })
+            .map(AnalyzedFile::placed_facts)
             .collect::<Vec<_>>();
         let (external_work, external_work_max) = external_work_limits(&input);
-        let built = WorkspaceSemantics::build_facts_placed_with_external(
+        let mut built = WorkspaceSemantics::build_facts_placed_with_external(
             &placed,
             input.limits().declarations_max(),
             input.limits().relationships_max(),
@@ -410,6 +414,7 @@ impl PackageAnalyzer {
                 .path(path.as_str())
                 .fail();
         }
+        resolve_package_static(&input, &analyzed, &mut built.semantics);
         let (publication, notebook_cells) = publish(
             &input,
             &analyzed,
@@ -425,6 +430,27 @@ impl PackageAnalyzer {
             warnings,
         })
     }
+}
+
+fn resolve_package_static(
+    input: &ExactPackageInput<'_>,
+    analyzed: &[AnalyzedFile],
+    semantics: &mut WorkspaceSemantics,
+) {
+    let sources = analyzed
+        .iter()
+        .map(|held| crate::static_resolution::StaticSource {
+            path: held.file.path(),
+            source: held.file.source(),
+            facts: held.file.syntax(),
+            placement: &held.placement,
+        })
+        .collect::<Vec<_>>();
+    semantics.add_static_resolution(
+        &sources,
+        &input.namespace_input(),
+        input.limits().relationships_max(),
+    );
 }
 
 fn relationship_facet(kind: rift_core::RelationshipKind) -> rift_protocol::read::RelationshipFacet {
@@ -535,6 +561,7 @@ fn publish(
     records.graph(package, &origin, semantics, analyzed)?;
     let retained_syntax_complete = records.retained_syntax(analyzed);
     records.relationships(package, semantics, analyzed, limits.relationships_max())?;
+    records.static_occurrences(semantics, analyzed, limits.relationships_max());
     let (documentation, notebook_cells) = package_documentation(
         package,
         package_language,
@@ -584,7 +611,7 @@ fn publish(
     );
     Ok((
         PackagePublication {
-            occurrences: Vec::new(),
+            occurrences: records.occurrences,
             format_revision: PACKAGE_PUBLICATION_FORMAT_REVISION,
             identity_format: rift_protocol::identity::SYMBOL_IDENTITY_FORMAT_REVISION,
             analyzer_revision: analyzer_revision(),
@@ -683,11 +710,21 @@ fn publication_coverage(
                 syntax_complete &= !held.file.syntax().has_errors()
                     && held.file.syntax().left_out_declaration_count() == 0;
             }
-            PackageCoverage {
-                facts: vec![FactCoverage {
-                    kind: FactKind::Relationships,
+            let mut facts = vec![FactCoverage {
+                kind: FactKind::Relationships,
+                producer: None,
+            }];
+            if records
+                .occurrence_languages
+                .contains(&language.identity_segment())
+            {
+                facts.push(FactCoverage {
+                    kind: FactKind::Occurrences,
                     producer: None,
-                }],
+                });
+            }
+            PackageCoverage {
+                facts,
                 inventory_complete,
                 identity_complete: !records.symbols_truncated
                     && !records.identity_incomplete
@@ -1383,6 +1420,8 @@ struct Records {
     objects: Vec<Symbol>,
     declarations: Vec<PackageSymbol>,
     relationships: Vec<rift_protocol::read::Relationship>,
+    occurrences: Vec<PackageOccurrence>,
+    occurrence_languages: BTreeSet<String>,
     documents: Vec<PackageDocument>,
     warnings: Vec<PackageAnalysisWarning>,
     symbols_truncated: bool,
@@ -1396,6 +1435,60 @@ struct Records {
 }
 
 impl Records {
+    fn static_occurrences(
+        &mut self,
+        semantics: &WorkspaceSemantics,
+        analyzed: &[AnalyzedFile],
+        limit: usize,
+    ) {
+        let sources = self
+            .units
+            .iter()
+            .map(|unit| (unit.unit.as_str(), (unit.source.as_str(), &unit.language)))
+            .collect::<BTreeMap<_, _>>();
+        let digests = analyzed
+            .iter()
+            .map(|held| (held.placement.unit(), held.file.digest()))
+            .collect::<BTreeMap<_, _>>();
+        let mut occurrences = BTreeSet::new();
+        for occurrence in semantics.static_occurrences() {
+            let rift_provider::NormalizedTarget::Symbol(target) = &occurrence.target else {
+                continue;
+            };
+            let unit = occurrence.binding.unit().to_string();
+            if digests.get(occurrence.binding.unit()) != Some(&occurrence.source_digest) {
+                continue;
+            }
+            let range = occurrence.callee_range;
+            let Some((source, language)) = sources.get(unit.as_str()) else {
+                continue;
+            };
+            let bytes = usize::try_from(range.start)
+                .ok()
+                .zip(usize::try_from(range.end).ok())
+                .and_then(|(start, end)| source.get(start..end));
+            if bytes.is_none() {
+                continue;
+            }
+            let key = (unit, range.start, range.end, target.as_str().to_owned());
+            if occurrences.len() == limit && !occurrences.contains(&key) {
+                break;
+            }
+            self.occurrence_languages
+                .insert(language.identity_segment());
+            occurrences.insert(key);
+        }
+        self.occurrences = occurrences
+            .into_iter()
+            .map(|(unit, start, end, symbol)| PackageOccurrence {
+                symbol: SymbolId(symbol),
+                unit: SourceUnitId(unit),
+                range: TextRange { start, end },
+                producer: None,
+            })
+            .collect();
+    }
+
     /// Records one warning, dropping it once the publication's warning bound is reached:
     /// the bound is what a reader can act on, and the log carries the rest.
     fn warn(&mut self, warning: PackageAnalysisWarning) {

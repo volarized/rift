@@ -251,6 +251,17 @@ pub(crate) fn extract_with_export_bindings(
     language: &Language,
     rules: &dyn GrammarRules,
 ) -> Result<Extraction, RiftError> {
+    extract_with_capture(root, source, limits, language, rules, None)
+}
+
+pub(crate) fn extract_with_capture(
+    root: Node<'_>,
+    source: SyntaxSource<'_>,
+    limits: SyntaxLimits,
+    language: &Language,
+    rules: &dyn GrammarRules,
+    mut capture: Option<&mut crate::static_analysis::Capture<'_>>,
+) -> Result<Extraction, RiftError> {
     let text = source.text;
     let names = SyntaxNames::new(language).expect("a syntax provider uses a shipped grammar");
     let grammar = names.grammar();
@@ -305,6 +316,9 @@ pub(crate) fn extract_with_export_bindings(
         });
 
         let visited = visits.visited(node_index);
+        if let Some(capture) = capture.as_deref_mut() {
+            capture.record(node)?;
+        }
         if let Some(binding) = rules.export_binding(visited, text, &qualification)? {
             export_bindings.push(binding);
         }

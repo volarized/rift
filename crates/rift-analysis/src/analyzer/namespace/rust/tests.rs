@@ -169,6 +169,7 @@ fn selected_anchors_for_context(
                     export_bindings: None,
                     macro_invocations: facts.macro_invocations().map(<[_]>::to_vec),
                     scope: facts.scope().map(<[_]>::to_vec),
+                    static_facts: facts.static_facts().cloned(),
                     source_digest: rift_core::FileDigest::of(source.as_bytes()),
                 },
             )
@@ -188,9 +189,8 @@ fn selected_anchors_for_context(
         .iter()
         .map(|path| physical_unit(owner, path))
         .collect::<Vec<_>>();
-    let result = super::prepare(&input, &admitted).anchors;
     assert_original_sources(&input, selected, &units);
-    result
+    super::prepare(&input, &admitted).anchors
 }
 
 fn selected_library<'input>(

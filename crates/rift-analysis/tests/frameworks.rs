@@ -417,6 +417,7 @@ fn package_framework_publication_matches_fresh_supplied_and_restored_syntax() {
                     export_bindings: facts.export_bindings().map(<[_]>::to_vec),
                     macro_invocations: facts.macro_invocations().map(<[_]>::to_vec),
                     scope: facts.scope().map(<[_]>::to_vec),
+                    static_facts: facts.static_facts().cloned(),
                     source_digest: syntax.identity().source_digest,
                 },
             )

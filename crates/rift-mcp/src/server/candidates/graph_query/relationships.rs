@@ -39,9 +39,14 @@ pub(super) struct AcquiredAdjacency {
     revisions: BTreeMap<SymbolOwner, RevisionIri>,
     view: Option<CapturedView>,
     warnings: Vec<ReadWarning>,
+    incomplete: bool,
 }
 
 impl AcquiredAdjacency {
+    pub(super) const fn is_incomplete(&self) -> bool {
+        self.incomplete
+    }
+
     pub(super) const fn remote_view(&self) -> Option<&CapturedView> {
         self.view.as_ref()
     }
@@ -357,14 +362,17 @@ impl RiftMcp {
         let roots = rift_server::CalleeRoots::default();
         for seed in seeds {
             if references {
-                let occurrences = Box::pin(rift_server::graph_references(
+                let references = Box::pin(rift_server::graph_references(
                     reads, &engines, &seed, enclosing, end,
                 ))
                 .await?;
+                if !references.complete {
+                    return Err(coverage_failure());
+                }
                 remaining = remaining
-                    .checked_sub(occurrences.len())
+                    .checked_sub(references.occurrences.len())
                     .ok_or_else(coverage_failure)?;
-                acquired.admit_references(&seed, occurrences);
+                acquired.admit_references(&seed, references.occurrences);
             }
             if required.calls {
                 let calls = Box::pin(rift_server::graph_calls(
@@ -376,6 +384,9 @@ impl RiftMcp {
                     end,
                 ))
                 .await?;
+                if !calls.complete {
+                    return Err(coverage_failure());
+                }
                 if !calls.packages.is_empty() {
                     return Err(coverage_failure());
                 }
@@ -535,20 +546,32 @@ impl AdjacencyWalk<'_> {
         let deadline = self.deadline.walk_end(self.resolved.capture_elapsed);
         match (direction, self.step.facet) {
             (TraversalDirection::Incoming, RelationshipFacet::References) => {
-                let occurrences = Box::pin(rift_server::graph_references(
+                let references = Box::pin(rift_server::graph_references(
                     reads,
                     engines,
                     seed,
                     self.selected.requires_enclosing(),
                     deadline,
                 ))
-                .await?;
+                .await;
+                let references = match references {
+                    Ok(references) => references,
+                    Err(error)
+                        if error.slug() == errors::server::search_coverage_unavailable::SLUG =>
+                    {
+                        self.acquired.incomplete = true;
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                };
+                self.acquired.incomplete |= !references.complete;
+                let occurrences = references.occurrences;
                 charge_records(&mut self.remaining, occurrences.len())?;
                 frontier.extend(occurrences.iter().filter_map(|item| item.enclosing.clone()));
                 self.acquired.admit_references(seed, occurrences);
             }
             (_, RelationshipFacet::Calls) => {
-                let mut calls = if let Some(target) = self.acquired.installed.get(seed) {
+                let answer = if let Some(target) = self.acquired.installed.get(seed) {
                     if direction != TraversalDirection::Outgoing {
                         return Err(coverage_failure());
                     }
@@ -565,13 +588,24 @@ impl AdjacencyWalk<'_> {
                         ),
                         deadline,
                     ))
-                    .await?
+                    .await
                 } else {
                     Box::pin(rift_server::graph_calls(
                         reads, engines, roots, seed, direction, deadline,
                     ))
-                    .await?
+                    .await
                 };
+                let mut calls = match answer {
+                    Ok(calls) => calls,
+                    Err(error)
+                        if error.slug() == errors::server::search_coverage_unavailable::SLUG =>
+                    {
+                        self.acquired.incomplete = true;
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                };
+                self.acquired.incomplete |= !calls.complete;
                 self.name_package_calls(&mut calls, self.selected.symbol_details)
                     .await?;
                 self.admit_local_calls(seed, calls, frontier)?;
@@ -587,6 +621,22 @@ impl AdjacencyWalk<'_> {
         calls: rift_server::GraphCalls,
         frontier: &mut BTreeSet<SymbolId>,
     ) -> Result<(), RiftError> {
+        charge_records(&mut self.remaining, calls.corroboration.len())?;
+        for conflict in calls.corroboration.iter().filter(|record| !record.agrees) {
+            let engine_target = match &conflict.engine_target {
+                rift_server::CallDestination::Local(target) => target.as_str(),
+                rift_server::CallDestination::Dependency(target) => target.path().as_str(),
+            };
+            rift_tracing::warn!(
+                component = "relationships",
+                authored = ?conflict.authored,
+                observed = ?conflict.observed,
+                static_target = %conflict.static_target.as_str(),
+                engine_target,
+                provider = ?conflict.provider,
+                "providers resolved the same call to different targets"
+            );
+        }
         charge_records(&mut self.remaining, calls.local.len())?;
         for (neighbor, ranges) in calls.local {
             charge_records(&mut self.remaining, ranges.len())?;
@@ -819,6 +869,9 @@ impl AdjacencyWalk<'_> {
                 deadline,
             ))
             .await?;
+            if !calls.complete {
+                return Err(coverage_failure());
+            }
             if !calls.packages.is_empty() {
                 if published_declarations {
                     self.name_published_calls(&mut calls, false).await?;

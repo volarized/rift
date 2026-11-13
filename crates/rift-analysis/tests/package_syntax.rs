@@ -242,6 +242,7 @@ fn checked_restored(syntax: &PackageSyntax, text: &str) -> PackageSyntax {
             export_bindings: facts.export_bindings().map(<[_]>::to_vec),
             macro_invocations: facts.macro_invocations().map(<[_]>::to_vec),
             scope: facts.scope().map(<[_]>::to_vec),
+            static_facts: facts.static_facts().cloned(),
             source_digest: digest,
         },
     )
@@ -392,6 +393,52 @@ fn every_package_provider_keeps_canonical_facts_and_reports_actual_calls() {
             retained[1].facts()
         ));
     }
+}
+
+#[test]
+fn captured_static_occurrences_survive_package_fact_restoration() {
+    use rift_protocol::producer::FactKind;
+    use rift_protocol::read::RelationshipFacet;
+
+    let source = "pub fn target() {}\npub fn caller() { target(); target(); }\n";
+    let files = [("src/lib.rs", source)];
+    let mut retained = Vec::new();
+    let first = analyze(
+        "1.0.0",
+        ShippedLanguage::Rust,
+        &files,
+        SyntaxLimits::default(),
+        |source| capture(source, &mut retained),
+    )
+    .expect("first package");
+    let restored = [checked_restored(&retained[0], source)];
+    let reused = analyze(
+        "1.0.0",
+        ShippedLanguage::Rust,
+        &files,
+        SyntaxLimits::default(),
+        |source| lookup(source, &restored),
+    )
+    .expect("restored package");
+    let publication = reused.publication();
+    publication
+        .validate_facts()
+        .expect("coverage matches facts");
+    let calls = publication
+        .relationships
+        .iter()
+        .filter(|relationship| relationship.facets.contains(&RelationshipFacet::Calls))
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 2);
+    assert_ne!(calls[0].occurrence, calls[1].occurrence);
+    assert_eq!(publication.occurrences.len(), 2);
+    assert!(
+        publication
+            .coverage
+            .iter()
+            .any(|coverage| coverage.covers(FactKind::Occurrences, None))
+    );
+    assert_eq!(canonical(&first), canonical(&reused));
 }
 
 #[test]

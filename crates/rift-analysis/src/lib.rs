@@ -23,6 +23,7 @@ mod selection;
 mod semantic;
 #[cfg(feature = "collector")]
 mod source;
+mod static_resolution;
 mod traversal;
 
 #[cfg(feature = "collector")]
@@ -54,6 +55,7 @@ pub use selection::{
     DOCUMENTATION_EXCLUDED_FOLDERS, DocumentationSelection, PackageFileSelection, SelectedFiles,
     documentation_format,
 };
+pub use semantic::PreparedProjectSemantics;
 #[cfg(feature = "collector")]
 pub use semantic::{BuiltSemantics, PlacedDocument, PreparedSemantics, WorkspaceSemantics};
 #[cfg(feature = "collector")]

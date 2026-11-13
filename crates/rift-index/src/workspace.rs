@@ -3780,6 +3780,21 @@ impl WorkspaceIndex {
         self.semantics.relationships()
     }
 
+    /// Resolved physical usages of one established target in this publication.
+    pub fn static_usages(
+        &self,
+        target: &rift_core::SymbolId,
+    ) -> impl Iterator<
+        Item = (
+            &rift_core::DeclarationBinding,
+            rift_syntax::ByteRange,
+            rift_core::FileDigest,
+            rift_core::ReferenceRole,
+        ),
+    > {
+        self.semantics.static_usages(target)
+    }
+
     /// Assembles readable symbol through its normalized record.
     ///
     /// # Errors
@@ -4768,13 +4783,21 @@ struct BuiltContents {
     semantics: WorkspaceSemantics,
 }
 
+enum ProjectSemanticsAdmission {
+    Built(Box<BuiltSemantics>),
+    Omitted {
+        beyond_declaration_bound: Vec<ProjectPath>,
+        refused_contributions: Vec<(ProjectPath, RiftError)>,
+    },
+}
+
 fn captured_project_semantics(
-    root: &Path,
+    (root, owner): (&Path, &SymbolOwner),
     contents: &IndexContents,
     limits: WorkspaceIndexLimits,
     fingerprint: &WorkspaceFingerprint,
-    owner: &SymbolOwner,
-) -> Result<rift_analysis::PreparedSemantics, RiftError> {
+    previous: Option<&NormalizedGraph>,
+) -> Result<ProjectSemanticsAdmission, RiftError> {
     let revision = captured_semantic_revision(fingerprint, root, owner)?;
     let revision = captured_build_paths_revision(
         revision,
@@ -4783,11 +4806,14 @@ fn captured_project_semantics(
     );
     let documents = contents.files.values().map(Arc::as_ref).collect::<Vec<_>>();
     let Some(first) = documents.first() else {
-        return WorkspaceSemantics::prepare_project_facts(
+        return WorkspaceSemantics::build_project_facts_with_relationships(
             std::iter::empty(),
             limits.declarations_max(),
+            limits.relationships_max(),
             revision,
-        );
+            previous,
+        )
+        .map(|built| ProjectSemanticsAdmission::Built(Box::new(built)));
     };
     let files = documents
         .iter()
@@ -4816,12 +4842,21 @@ fn captured_project_semantics(
         ),
     )?
     .with_build_paths(&contents.build_paths)?;
-    WorkspaceSemantics::prepare_captured_project_facts(
+    let mut prepared = WorkspaceSemantics::prepare_captured_project_facts(
         input,
         &documents,
         limits.declarations_max(),
         revision,
-    )
+    )?;
+    if !prepared.admitted_all() {
+        return Ok(ProjectSemanticsAdmission::Omitted {
+            beyond_declaration_bound: prepared.beyond_declaration_bound().to_vec(),
+            refused_contributions: prepared.take_refused_contributions(),
+        });
+    }
+    prepared
+        .build(limits.relationships_max(), previous)
+        .map(|built| ProjectSemanticsAdmission::Built(Box::new(built)))
 }
 
 fn validate_captured_source_bytes(contents: &IndexContents) -> Result<(), RiftError> {
@@ -4966,38 +5001,40 @@ fn built_contents_with_owner(
                     &contents.framework_sources,
                     &contents.left_out,
                 );
-                let built =
-                    captured_project_semantics(root, &contents, limits, &fingerprint, owner);
-                match built {
-                    Ok(prepared) => {
-                        if !prepared.beyond_declaration_bound.is_empty()
-                            || !prepared.refused_contributions.is_empty()
-                        {
-                            passes = passes.saturating_add(1);
-                            leave_out_refused_contributions(
-                                &mut contents,
-                                prepared.refused_contributions,
-                                passes < passes_max,
-                            )?;
-                            leave_out_beyond_declaration_bound(
-                                &mut contents,
-                                &prepared.beyond_declaration_bound,
-                                passes < passes_max,
-                            )?;
-                            continue;
-                        }
-                        let BuiltSemantics { semantics, .. } = rift_tracing::traced!(
-                            component = "index",
-                            operation = "WorkspaceSemantics::build_project_facts",
-                            phase = "WorkspaceSemantics::build_project_facts",
-                            files = contents.files.len(),
-                            { prepared.build(limits.relationships_max(), previous) }
+                let built = rift_tracing::traced!(
+                    component = "index",
+                    operation = "WorkspaceSemantics::build_project_facts",
+                    phase = "WorkspaceSemantics::build_project_facts",
+                    files = contents.files.len(),
+                    {
+                        captured_project_semantics(
+                            (root, owner),
+                            &contents,
+                            limits,
+                            &fingerprint,
+                            previous,
                         )
-                        .map_err(|error| {
-                            error
-                                .with(ctx::operation("index.build"))
-                                .with(ctx::workspace(root))
-                        })?;
+                    }
+                );
+                match built {
+                    Ok(ProjectSemanticsAdmission::Omitted {
+                        beyond_declaration_bound,
+                        refused_contributions,
+                    }) => {
+                        passes = passes.saturating_add(1);
+                        leave_out_refused_contributions(
+                            &mut contents,
+                            refused_contributions,
+                            passes < passes_max,
+                        )?;
+                        leave_out_beyond_declaration_bound(
+                            &mut contents,
+                            &beyond_declaration_bound,
+                            passes < passes_max,
+                        )?;
+                    }
+                    Ok(ProjectSemanticsAdmission::Built(built)) => {
+                        let BuiltSemantics { semantics, .. } = *built;
                         let IndexContents {
                             files,
                             text_files,
