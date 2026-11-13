@@ -1395,11 +1395,9 @@ mod tests {
             .0;
         assert!(
             matches!(
-                witness,
-                QueryReadResult::Results(QueryResult {
-                    answer: QueryAnswer::Boolean { value: true },
-                    ..
-                })
+                &witness,
+                QueryReadResult::Results(result)
+                    if matches!(result.answer, QueryAnswer::Boolean { value: true })
             ),
             "{witness:?}"
         );
