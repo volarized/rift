@@ -169,8 +169,29 @@ REQUIRED_LANGUAGES = {
     "nextjs": {"typescript"},
     "fastapi": {"python"},
 }
-# These paths yielded the bulk of the declaration sample at the Next.js pin.
-# Catalog fallback keeps the sampling contract if the pin changes.
+# These paths yielded the declaration samples at the pinned revisions.
+# Catalog fallback keeps the sampling contract when a pin changes.
+BUN_SAMPLE_PATHS = (
+    "packages/bun-types/test.d.ts",
+    "src/runtime/cli/test/parallel/Coordinator.rs",
+    "src/runtime/cli/test/Scanner.rs",
+    "src/runtime/cli/test/ChangedFilesFilter.rs",
+    "src/patch_jsc/testing.rs",
+    "src/bundler/defines.rs",
+    "src/runtime/cli/test/parallel/Worker.rs",
+    "packages/bun-types/test-globals.d.ts",
+    "src/runtime/cli/init/react-tailwind/src/APITester.tsx",
+    "src/runtime/cli/init/react-app/src/APITester.tsx",
+    "src/runtime/cli/test/parallel/Frame.rs",
+    "src/runtime/cli/init/react-shadcn/src/APITester.tsx",
+    "src/runtime/cli/test/Timings.rs",
+    "bench/stress/hot-reload-files/stress-test.ts",
+    "src/jsc/bindgen_test.rs",
+    "src/dispatch/tests/shape.rs",
+    "src/runtime/cli/test/parallel/Channel.rs",
+    "src/runtime/cli/test/parallel/aggregate.rs",
+    "bench/test/isolate/setup.ts",
+)
 NEXTJS_SAMPLE_PATHS = (
     "turbopack/crates/turbo-persistence/src/tests.rs",
     "turbopack/crates/turbo-tasks-backend/tests/effects.rs",
@@ -818,8 +839,11 @@ class Corpus:
                 "scoped search lost the canonical sample anchor",
             )
         preferred: dict[str, int] = {}
-        if minimum == SYMBOL_COUNT and self.pin.name == "nextjs":
-            preferred = {path: index for index, path in enumerate(NEXTJS_SAMPLE_PATHS)}
+        if minimum == SYMBOL_COUNT:
+            paths = {"bun": BUN_SAMPLE_PATHS, "nextjs": NEXTJS_SAMPLE_PATHS}.get(
+                self.pin.name, ()
+            )
+            preferred = {path: index for index, path in enumerate(paths)}
         pending = {
             language: iter(
                 sorted(
@@ -1774,9 +1798,7 @@ class Corpus:
         self.configure("[search.lexical]\nunits_max = 20000\n")
         with self.server() as server:
             async with server.connect() as client:
-                await settled_local(
-                    client, "search", corpus_request({"query": "test", "limit": 1})
-                )
+                await await_startup_publication(server)
                 failure_records = await observed(
                     server,
                     "search",
