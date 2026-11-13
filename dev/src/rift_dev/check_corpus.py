@@ -222,9 +222,46 @@ def sample_path_request(path: str, query: str = "test") -> JsonObject:
 async def read_sample_paths(
     client: Client, paths: Sequence[str]
 ) -> list[list[JsonObject]]:
+    """Read each exact path under the original preparation deadline.
+
+    >>> from unittest.mock import AsyncMock, patch
+    >>> from typing import cast
+    >>> async def split_sample():
+    ...     failure = ToolFailure("search", "", "limit_exceeded", "", "never", identity="rift.search.query_deadline_exceeded")
+    ...     with patch(__name__ + "._read_sample_query", new_callable=AsyncMock) as query:
+    ...         query.side_effect = [failure, [[{"path": "a.ts"}]], [[{"path": "b.ts"}]]]
+    ...         grouped = await read_sample_paths(cast(Client, object()), ["a.ts", "b.ts"])
+    ...         return grouped, [call.args[1] for call in query.await_args_list]
+    >>> asyncio.run(split_sample())
+    ([[{'path': 'a.ts'}], [{'path': 'b.ts'}]], [['a.ts', 'b.ts'], ['a.ts'], ['b.ts']])
+    """
+
+    async def read(paths: Sequence[str]) -> list[list[JsonObject]]:
+        try:
+            return await _read_sample_query(client, paths)
+        except ToolFailure as failure:
+            if (
+                len(paths) == 1
+                or failure.identity != "rift.search.query_deadline_exceeded"
+            ):
+                raise
+        middle = len(paths) // 2
+        return await read(paths[:middle]) + await read(paths[middle:])
+
+    async with gate_deadline("sample paths", LOCAL_PREPARATION_SECONDS):
+        return await read(paths)
+
+
+async def _read_sample_query(
+    client: Client, paths: Sequence[str]
+) -> list[list[JsonObject]]:
     """Read independently ranked exact paths through one retained graph query."""
-    request = retrieval_batch_request(
-        [sample_path_request(path) for path in paths], CORPUS_COLUMNS
+    requests = [sample_path_request(path) for path in paths]
+    multiple = len(paths) > 1
+    request = (
+        retrieval_batch_request(requests, CORPUS_COLUMNS)
+        if multiple
+        else corpus_request(requests[0])
     )
     answer = await settled_local(client, "search", request)
     warnings(answer)
@@ -256,7 +293,7 @@ async def read_sample_paths(
         )
         require(count > 0 or not rows, "sample returned rows without pages")
         for row in rows:
-            slot = int(literal(row, "slot"))
+            slot = int(literal(row, "slot")) if multiple else 0
             require(
                 0 <= slot < len(paths) and slot >= previous, "sample slot out of order"
             )
