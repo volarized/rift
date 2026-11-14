@@ -1655,15 +1655,24 @@ class Corpus:
         return link
 
     async def require_linked_reads(self, client: Client) -> None:
-        if self.pin.name == "bun":
-            anchor = "rift://symbol/local/rust/bun_bundler/defines/TEST"
-            path = "src/bundler/defines.rs"
+        anchors = {
+            "bun": (
+                "rift://symbol/local/rust/bun_bundler/defines/TEST",
+                "src/bundler/defines.rs",
+            ),
+            "nextjs": (
+                "rift://symbol/local/rust/next_code_frame/tests/test_with_message",
+                "crates/next-code-frame/src/tests.rs",
+            ),
+        }
+        if self.pin.name in anchors:
+            anchor, path = anchors[self.pin.name]
             exact = await client.call("get_symbol", {"id": anchor})
             require(
                 exact.get("outcome") == "found"
                 and object_value(exact.get("symbol"), "linked symbol").get("id")
                 == anchor,
-                "symlink root lost the canonical Bun declaration",
+                "symlink root lost the canonical declaration",
             )
             declared = [
                 row for row in objects(exact, "declarations") if row.get("path") == path
