@@ -2422,7 +2422,18 @@ impl RiftMcp {
                 }
             };
         match self.search(Parameters(params)).await {
-            Ok(answer) => answer.retrieval_result(),
+            Ok(answer) => {
+                use rift_protocol::search_read::{SearchReadResult, SearchUnavailable};
+                let warnings = match &answer.0 {
+                    SearchReadResult::Results(page) => &page.warnings,
+                    SearchReadResult::Unavailable(SearchUnavailable::Unavailable {
+                        warnings,
+                        ..
+                    }) => warnings,
+                };
+                crate::output::log_warnings(warnings);
+                answer.retrieval_result()
+            }
             Err(failure) => failure.into_call_tool_result(),
         }
     }
@@ -5410,9 +5421,14 @@ done
         }
         assert_eq!(
             sources,
-            ["nodes", "rift://map", "rift://workspace"]
-                .map(str::to_owned)
-                .into()
+            [
+                "nodes",
+                "rift://map",
+                "rift://workspace",
+                "search_retrieval"
+            ]
+            .map(str::to_owned)
+            .into()
         );
         Ok(())
     }

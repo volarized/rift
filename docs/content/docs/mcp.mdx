@@ -74,7 +74,7 @@ its entries indented under it, and a package shows the version the project locks
 Rift updates the map when it publishes a new index, so later reads follow changes to the project.
 
 While Rift prepares the local index, the map can show discovered files before their symbols
-are available. A `local_index_preparing` warning reports that incomplete preparation.
+are available. `rift server logs` reports incomplete preparation as `local_index_preparing`.
 
 The [map reference](/docs/developer/protocol/mcp#resource-map) describes additional facts, such as
 entry points and relationships, and when they are available. It also shows a map as compact text.
@@ -138,7 +138,7 @@ before SPARQL evaluates filters, joins, and aggregates.
 The same service combines identifier matching, full-text matching, and available vector
 ranking. Existing [search configuration](/docs/developer/configuration#search) controls
 weights, model selection, and indexed text. A query requiring unavailable or incomplete
-ranking facts returns typed unavailability with warnings.
+ranking facts returns typed unavailability.
 
 ### Regex search [#search-pattern]
 
@@ -293,8 +293,7 @@ A package or runtime identity names an owner across releases. Discover it with
 <ReadExample name="global-symbol-documentation" />
 
 If the requested release has no complete coverage, `search` can return an unavailable
-answer with package warnings. Use the release named by the warning when that is the release
-you want to query.
+answer. Check `rift server logs` for the release and the coverage details.
 
 Several declaration bindings share one identity. `declaration_limit` and its returned cursor
 continue those bindings at the same revision:
@@ -392,9 +391,9 @@ RDF triples for a graph query. Follow `pagination.next_query` to read the next p
 same execution. An exact `get_symbol` read bounds declaration bindings with
 `declaration_limit` and continues with `declaration_cursor` at the reported revision.
 
-Warnings explain missing facts or preparation still in progress. A query that requires
-missing facts returns `outcome: "unavailable"`. A completed query can return an empty result
-when its required facts are available.
+A query that requires missing facts returns `outcome: "unavailable"`. A completed query can
+return an empty result when its required facts are available. Run `rift server logs` to
+inspect missing facts or preparation still in progress.
 
 The proxy returns compact text by default. Start `rift mcp --output=all` for structured
 results and output schemas. The workspace resource then carries compact text and JSON.
@@ -511,7 +510,7 @@ and languages Rift serves.
 </IconCard>
 <IconCard title="MCP reference" href="/docs/developer/protocol/mcp" icon={BookOpenIcon}>
 
-Complete tool examples, resource fields, limits, warnings, and failure behavior.
+Complete tool examples, resource fields, limits, and failure behavior.
 
 </IconCard>
 </Cards>

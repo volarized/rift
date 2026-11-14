@@ -1710,12 +1710,22 @@ impl ServerHandler for RiftProxy {
             answered = span
                 .instrument(async {
                     rift_tracing::debug!("tool forward started");
-                    let registered: Result<_, RiftError> = match self.routed_read(&request).await {
-                        Err(error) => Err(error),
-                        Ok(Some(answer)) => Ok(answer),
-                        Ok(None) => match self.call_backend(&request) {
-                            Err(refusal) => Err(refusal),
-                            Ok(backend) => backend.forward_read(request).await,
+                    // These peer calls carry evidence a proxy needs to decide coverage.
+                    // They are unavailable to clients of the proxy's MCP connection.
+                    let registered: Result<_, RiftError> = match request.name.as_ref() {
+                        "search_candidates" | "search_retrieval" => {
+                            Ok(Err(ErrorData::invalid_params(
+                                format!("unknown tool {}", request.name),
+                                None,
+                            )))
+                        }
+                        _ => match self.routed_read(&request).await {
+                            Err(error) => Err(error),
+                            Ok(Some(answer)) => Ok(answer),
+                            Ok(None) => match self.call_backend(&request) {
+                                Err(refusal) => Err(refusal),
+                                Ok(backend) => backend.forward_read(request).await,
+                            },
                         },
                     };
                     if let Err(error) = &registered {
@@ -3380,7 +3390,18 @@ mod tests {
                 "search_retrieval" => {
                     let arguments = request.arguments.expect("search arguments");
                     assert_eq!(arguments["scope"], "local");
-                    assert_eq!(arguments["pattern"], "beacon");
+                    let pattern = arguments["pattern"].as_str().expect("search pattern");
+                    if pattern == "refused" {
+                        let answer = rift_protocol::search_read::SearchReadResult::Unavailable(
+                            rift_protocol::search_read::SearchUnavailable::Unavailable {
+                                reason: rift_protocol::symbol_read::SymbolUnavailableReason::InsufficientCoverage,
+                                view: None,
+                                warnings: vec![rift_protocol::read::ReadWarning::GlobalAccessDisabled],
+                            },
+                        );
+                        return std::future::ready(crate::output::Json(answer).retrieval_result());
+                    }
+                    assert_eq!(pattern, "beacon");
                     let answer: rift_protocol::search_read::SearchReadResult = serde_json::from_value(json!({
                         "results": [{"hit":{"target":"symbol", "symbol":{
                             "id":"rift://symbol/local/rust/app/beacon", "language":"rust", "name":"beacon", "kind":"function"
@@ -3476,6 +3497,26 @@ mod tests {
         assert_eq!(result.structured_content, None);
         assert_eq!(result.content.len(), 1, "content must stay: {result:?}");
         assert_eq!(result.is_error, Some(false));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_proxy_keeps_retrieval_evidence_on_its_peer_connection() -> TestResult {
+        let proxied = proxied_client(OutputPolicy::All).await?;
+        for name in ["search_candidates", "search_retrieval"] {
+            let result = proxied
+                .client
+                .call_tool(CallToolRequestParams::new(name))
+                .await;
+            let Err(ServiceError::McpError(error)) = result else {
+                return Err(
+                    format!("{name} must be unavailable to the proxy client: {result:?}").into(),
+                );
+            };
+            assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+            assert_eq!(error.message, format!("unknown tool {name}"));
+            assert!(error.data.is_none());
+        }
         Ok(())
     }
 
@@ -3848,6 +3889,35 @@ mod tests {
         };
         assert_selected_pattern(answer, "rift://symbol/local@cloud/rust/app/beacon")?;
         assert_eq!(proxy.upstream.lock().await.generation_next, 0);
+        upstream.cancel().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_project_profile_query_logs_unavailable_diagnostics() -> TestResult {
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let primary = tempfile::tempdir()?;
+        let proxy = profile_proxy(primary.path())?;
+        let upstream = connect_selected_upstream(&proxy, ":docs").await?;
+        let request = selected_pattern("refused", "local:docs")?;
+        let CallToolResponse::Complete(answer) = proxy
+            .routed_read(&request)
+            .await?
+            .ok_or("selected search")??
+        else {
+            return Err("complete selected search".into());
+        };
+        assert_eq!(
+            answer.structured_content,
+            Some(json!({"outcome": "unavailable", "reason": "insufficient_coverage"})),
+        );
+        assert_eq!(
+            answer.content[0].as_text().ok_or("text answer")?.text,
+            "unavailable · InsufficientCoverage\n",
+        );
+        assert!(drain.queued_records().iter().any(|record| {
+            record.message() == "read warning" && record.fields().contains("global_access_disabled")
+        }));
         upstream.cancel().await?;
         Ok(())
     }
