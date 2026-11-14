@@ -609,7 +609,8 @@ mod captured_search_startup_tests {
         let server =
             RiftMcp::build_settled(&root, super::super::WorkspaceIndexLimits::default()).await?;
         let params: SearchParams = serde_json::from_value(serde_json::json!({
-            "query": "captured_nonexistent_symbol_329b", "scope": "local"
+            "query": "captured_nonexistent_symbol_329b", "scope": "local",
+            "paths": {"include": ["missing.rs"]}
         }))?;
         let request = serde_json::to_value(SearchCandidateRequest {
             params: params.clone(),
