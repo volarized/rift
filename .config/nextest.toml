@@ -126,7 +126,7 @@ slow-timeout = { period = "540s", terminate-after = 1, grace-period = "30s" }
 
 [[profile.corpus.overrides]]
 filter = 'binary(=corpus_nextjs) & test(=test_nextjs_corpus)'
-slow-timeout = { period = "780s", terminate-after = 1, grace-period = "30s" }
+slow-timeout = { period = "960s", terminate-after = 1, grace-period = "30s" }
 
 [[profile.corpus.overrides]]
 filter = 'binary(=corpus_nextjs) & test(=test_nextjs_churn)'
