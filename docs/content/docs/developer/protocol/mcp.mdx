@@ -391,6 +391,10 @@ selection failures. A malformed identity is refused before lookup:
 A request selects its nodes through exactly one of `symbol` or `path` with `position`; the server
 **MUST** refuse any other combination with `invalid_request`.
 
+A path request **MAY** carry `scope` to select an [accepted project or profile](/docs/developer/configuration#extra-projects).
+The server resolves `path` and any Git `revision` in the selected project. Omitting `scope`
+selects `local`. The caller **MUST** omit `scope` beside `symbol`.
+
 A `symbol` read answers every node of the symbol: per declaration, in the order
 [`get_symbol`](#tool-get_symbol) lists its declarations, the item node, which spans the
 declaration without its attached documentation, then each node of its item subtree in

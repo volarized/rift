@@ -129,7 +129,19 @@ async fn extra_project_profiles_serve_distinct_scopes_through_one_connection() -
     };
     assert_eq!(query::literal(count, "count")?, "3");
 
-    let found = proxied_call(&client, "get_symbol", &json!({"id":profile_id})).await?;
+    assert_exact_profile_reads(&client, profile_id).await?;
+    for scope in ["local@other:api", "local:docs"] {
+        require_unregistered_scope(&client, scope).await?;
+    }
+    client.cancel().await?;
+    Ok(())
+}
+
+async fn assert_exact_profile_reads(
+    client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
+    profile_id: &str,
+) -> TestResult {
+    let found = proxied_call(client, "get_symbol", &json!({"id":profile_id})).await?;
     let found: GetSymbolResult = serde_json::from_value(found)?;
     let GetSymbolResult::Found {
         symbol,
@@ -144,7 +156,7 @@ async fn extra_project_profiles_serve_distinct_scopes_through_one_connection() -
             .id
             .as_ref()
             .map(rift_protocol::read::SymbolId::as_str),
-        Some(profile_id.as_str())
+        Some(profile_id)
     );
     assert_eq!(
         SymbolIdentity::parse(profile_id)?.owner(),
@@ -155,19 +167,20 @@ async fn extra_project_profiles_serve_distinct_scopes_through_one_connection() -
     );
     assert_eq!(declarations.len(), 1);
 
-    let nodes = proxied_call(&client, "nodes", &json!({"symbol":profile_id})).await?;
+    let nodes = proxied_call(client, "nodes", &json!({"symbol":profile_id})).await?;
     let item = &nodes["nodes"][0];
-    assert_eq!(
-        nodes["symbol"].as_str(),
-        Some(profile_id.as_str()),
-        "{nodes}"
-    );
+    assert_eq!(nodes["symbol"].as_str(), Some(profile_id), "{nodes}");
     assert_eq!(item["index"].as_u64(), Some(0), "{nodes}");
     assert_eq!(item["source"].as_str(), Some(PROFILE_SOURCE), "{nodes}");
 
-    for scope in ["local@other:api", "local:docs"] {
-        require_unregistered_scope(&client, scope).await?;
-    }
-    client.cancel().await?;
+    let by_path = proxied_call(
+        client,
+        "nodes",
+        &json!({"path": "lib.rs", "position": 8, "scope": "local@other:docs"}),
+    )
+    .await?;
+    assert_eq!(by_path["symbol"], profile_id, "{by_path}");
+    assert_eq!(by_path["nodes"][0]["source"], PROFILE_SOURCE, "{by_path}");
+
     Ok(())
 }

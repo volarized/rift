@@ -3340,7 +3340,8 @@ impl RiftMcp {
     /// UTF-8 byte `position` in one file, every node of the symbol whose declaration holds
     /// it, or the file's unit nodes when no declaration holds it. A symbol read is the way to
     /// read a declaration's source, and a package or runtime symbol's nodes come from the
-    /// global API, each in a source unit of that symbol's release. The answer names `symbol`;
+    /// global API, each in a source unit of that symbol's release. A path read can select
+    /// a registered project or profile with `scope`. The answer names `symbol`;
     /// each node is addressed by its place: node `index` of declaration `declaration` of
     /// that symbol, or node `index` of its unit, from the file node at 0, with `parent` an
     /// index in the same declaration or unit. An edit renumbers the nodes after it. An answer
@@ -3354,8 +3355,26 @@ impl RiftMcp {
     #[tool]
     async fn nodes(
         &self,
-        Parameters(params): Parameters<NodesParams>,
+        Parameters(selected): Parameters<crate::parameters::NodesToolParams>,
     ) -> Result<Json<NodesResult>, ToolFailure> {
+        let (params, scope) = selected.split();
+        if scope.is_some_and(|scope| {
+            scope != SearchScope::Local
+                || params.symbol.is_some()
+                || params.path.is_none()
+                || params.position.is_none()
+        }) {
+            return Err(errors::mcp::parameter_invalid()
+                .tool("nodes")
+                .field("scope")
+                .accepted("a path in the project this server serves")
+                .mcp()
+                .tool_failure(wire::ErrorPhase::Read));
+        }
+        self.read_nodes(params).await
+    }
+
+    async fn read_nodes(&self, params: NodesParams) -> Result<Json<NodesResult>, ToolFailure> {
         if let Some(symbol) = &params.symbol
             && is_release_symbol(symbol)?
         {
@@ -5614,7 +5633,7 @@ done
             .await?
             .ok_or("discovery was cancelled")?;
         let params: NodesParams = serde_json::from_value(json!({"path": "b.rs", "position": 8}))?;
-        let answer = assembled.server.nodes(Parameters(params.clone())).await?.0;
+        let answer = assembled.server.read_nodes(params.clone()).await?.0;
         assert!(!answer.nodes.is_empty());
         assert!(answer.warnings.iter().any(|warning| matches!(
             warning,
@@ -5627,7 +5646,7 @@ done
         crate::validation::prepare_initial_workspace_from(&assembled.context, initial).await?;
         let error = assembled
             .server
-            .nodes(Parameters(params))
+            .read_nodes(params)
             .await
             .err()
             .ok_or("the complete index must refuse a path beyond its declaration bound")?;
@@ -8898,7 +8917,7 @@ done
         capture_a_tree_that_keeps_moving(&server, directory.path());
         let params = serde_json::from_value(json!({"path": "lib.rs", "position": 8}))?;
 
-        let answer = tokio::time::timeout(RECONCILED_READ_MAX, server.nodes(Parameters(params)))
+        let answer = tokio::time::timeout(RECONCILED_READ_MAX, server.read_nodes(params))
             .await
             .map_err(|_| "a node listing whose tree keeps moving must answer within the bound")??
             .0;
@@ -10871,7 +10890,7 @@ done
             Some("src/blob.rs")
         );
         let nodes = server
-            .nodes(Parameters(rift_protocol::read::NodesParams::of(id.clone())))
+            .read_nodes(rift_protocol::read::NodesParams::of(id.clone()))
             .await?
             .0;
         assert_eq!(nodes.symbol.as_ref(), Some(&id), "{nodes:?}");

@@ -25,7 +25,8 @@ Lists syntax nodes with their source text: every node of one `symbol`, or, for o
 UTF-8 byte `position` in one file, every node of the symbol whose declaration holds
 it, or the file's unit nodes when no declaration holds it. A symbol read is the way to
 read a declaration's source, and a package or runtime symbol's nodes come from the
-global API, each in a source unit of that symbol's release. The answer names `symbol`;
+global API, each in a source unit of that symbol's release. A path read can select
+a registered project or profile with `scope`. The answer names `symbol`;
 each node is addressed by its place: node `index` of declaration `declaration` of
 that symbol, or node `index` of its unit, from the file node at 0, with `parent` an
 index in the same declaration or unit. An edit renumbers the nodes after it. An answer
@@ -44,6 +45,7 @@ Parameters:
 - `position` - UTF-8 byte offset inside the declaration whose nodes the read lists - one position, not a range; the nodes themselves carry the spans.
 - `node_cursor` - Continuation a preceding read returned, bound to the symbol or unit its answer listed and the tree revision it read.
 - `revision` - The revision to read: a git revision reads that commit, a tree revision the served working tree, and a release revision selects the release of a package or runtime `symbol`'s owner.
+- `scope` - Project that owns `path`.
 
 ## search
 

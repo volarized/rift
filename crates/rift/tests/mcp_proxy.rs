@@ -579,6 +579,179 @@ fn repository_linked_workspaces(
     Ok((linked_parent, roots))
 }
 
+#[tokio::test]
+async fn named_path_nodes_select_linked_worktrees_and_their_revisions() -> TestResult {
+    let main = laid_out_workspace(
+        &[("lib.rs", "pub fn baseline() {}\n")],
+        "[search]\nresults = 2\n",
+    )?;
+    let (_linked_parent, roots) =
+        repository_linked_workspaces(main.path(), &["baseline", "review", "topic"])?;
+    let [_, review, topic] = roots.as_slice() else {
+        return Err("expected two linked worktrees".into());
+    };
+    fs::write(review.join("lib.rs"), "pub fn committed_review() {}\n")?;
+    fixture_git(review, &["add", "lib.rs"])?;
+    fixture_git(
+        review,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "change the review worktree's commit",
+        ],
+    )?;
+    fs::write(review.join("lib.rs"), "pub fn review() {}\n")?;
+    let umbrella = laid_out_workspace(
+        &[("lib.rs", "pub fn umbrella() {}\n")],
+        &format!(
+            "[mcp.extra]\nrepository = {}\nreview = {}\ntopic = {}\n",
+            json!(main.path()),
+            json!(review),
+            json!(topic)
+        ),
+    )?;
+    let _umbrella_stop = StopOnDrop::new(umbrella.path());
+    let _main_stop = StopOnDrop::new(main.path());
+    let _review_stop = StopOnDrop::new(review);
+    let _topic_stop = StopOnDrop::new(topic);
+    let client = proxy_client(umbrella.path()).await?;
+    await_workspace_ready(&client).await?;
+    let input_schema = listed_tools(&client)
+        .await?
+        .into_iter()
+        .find(|tool| tool.name == "nodes")
+        .ok_or("nodes must be advertised")?
+        .input_schema;
+    let schema = jsonschema::validator_for(&json!(input_schema.as_ref()))?;
+
+    assert_worktree_node_reads(&client, &schema).await?;
+    assert_worktree_scope_refusals(&client, &schema).await?;
+    client.cancel().await?;
+    Ok(())
+}
+
+async fn assert_worktree_node_reads(
+    client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
+    schema: &jsonschema::Validator,
+) -> TestResult {
+    for (scope, source) in [
+        (None, "pub fn umbrella() {}"),
+        (Some("local"), "pub fn umbrella() {}"),
+        (Some("local@repository"), "pub fn baseline() {}"),
+        (Some("local@review"), "pub fn review() {}"),
+        (Some("local@topic"), "pub fn topic() {}"),
+    ] {
+        let mut request = json!({"path": "lib.rs", "position": 8});
+        if let Some(scope) = scope {
+            request["scope"] = json!(scope);
+        }
+        assert!(schema.is_valid(&request), "{request}");
+        let answer = proxied_call(client, "nodes", &request).await?;
+        assert_eq!(
+            answer["nodes"][0]["source"].as_str().map(str::trim_end),
+            Some(source),
+            "{request}: {answer}"
+        );
+    }
+
+    let found = proxied_call(
+        client,
+        "search",
+        &json!({
+        "query": "SELECT DISTINCT ?path { SERVICE :search { ?hit :pattern 'fn review'; :target 'file'; \
+                      :scope 'local@review'; :path ?path } } LIMIT 2"
+        }),
+    )
+    .await?;
+    let [hit] = workspace_client::query::rows(&found)? else {
+        return Err(format!("expected one path in the review worktree: {found}").into());
+    };
+    assert_eq!(workspace_client::query::literal(hit, "path")?, "lib.rs");
+
+    let committed = proxied_call(
+        client,
+        "nodes",
+        &json!({
+            "path": "lib.rs", "position": 8, "scope": "local@review",
+            "revision": "rift://revision/git/HEAD",
+        }),
+    )
+    .await?;
+    assert_eq!(
+        committed["nodes"][0]["source"].as_str().map(str::trim_end),
+        Some("pub fn committed_review() {}")
+    );
+    assert!(
+        committed["revision"]
+            .as_str()
+            .is_some_and(|revision| revision.starts_with("rift://revision/git/")
+                && revision != "rift://revision/git/HEAD"),
+        "{committed}"
+    );
+
+    let mut review_page = json!({"path": "lib.rs", "position": 8, "scope": "local@review"});
+    let first = proxied_call(client, "nodes", &review_page).await?;
+    assert_eq!(
+        first["nodes"][0]["source"].as_str().map(str::trim_end),
+        Some("pub fn review() {}")
+    );
+    review_page["node_cursor"] = first["node_cursor"]
+        .as_str()
+        .ok_or("the first page must supply a cursor")?
+        .into();
+    let continued = proxied_call(client, "nodes", &review_page).await?;
+    assert_eq!(continued["revision"], first["revision"]);
+    assert_eq!(continued["symbol"], first["symbol"]);
+    assert_eq!(continued["nodes"][0]["index"], 2);
+    Ok(())
+}
+
+async fn assert_worktree_scope_refusals(
+    client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
+    schema: &jsonschema::Validator,
+) -> TestResult {
+    for (request, valid_shape) in [
+        (
+            json!({"path": "lib.rs", "position": 8, "scope": "all"}),
+            false,
+        ),
+        (
+            json!({"path": "lib.rs", "position": 8, "scope": null}),
+            false,
+        ),
+        (
+            json!({"path": "lib.rs", "position": 8, "scope": "global"}),
+            false,
+        ),
+        (
+            json!({"path": "lib.rs", "position": 8, "scope": "local@unregistered"}),
+            true,
+        ),
+        (
+            json!({"symbol": "rift://symbol/local/rust/umbrella", "scope": "local"}),
+            false,
+        ),
+    ] {
+        assert_eq!(schema.is_valid(&request), valid_shape, "{request}");
+        let response = within(
+            "unavailable nodes scope",
+            client.call_tool(workspace_client::tool_request("nodes", &request)),
+        )
+        .await?;
+        let Err(rmcp::ServiceError::McpError(failure)) = response else {
+            return Err(format!("expected a nodes scope refusal: {response:?}").into());
+        };
+        assert_eq!(
+            failure.data.as_ref().and_then(|data| data.get("code")),
+            Some(&json!("invalid_request"))
+        );
+        assert!(failure.message.contains("scope"), "{failure:?}");
+    }
+    Ok(())
+}
+
 /// All internal root routes share one elected process and retain separate workspace facts.
 #[tokio::test]
 async fn repository_foreground_routes_four_linked_workspaces_and_restarts_changed_settings()
