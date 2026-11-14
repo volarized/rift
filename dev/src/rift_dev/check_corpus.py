@@ -133,7 +133,7 @@ STEADY_READ_SECONDS = READINESS_SECONDS * 2 / 3
 # 0.53 seconds with the server's answer already sent at 58.47 seconds. The bound is twice
 # the longest passing interval, 59.12 seconds, rounded up. Callers are the `workspace`
 # case of `bun`, `nextjs`, and `fastapi` (the `shallow` read only for `fastapi`) and the
-# `nextjs` `churn` case, with work budgets of 570, 750, 690, and 210 seconds for
+# `nextjs` `churn` case, with work budgets of 570, 930, 690, and 210 seconds for
 # Bun workspace, Next.js workspace, Next.js churn, and FastAPI, respectively.
 # The bound stands inside the smallest, `fastapi` at 210. A case where every read
 # ran to this bound would reach its work budget first and fail there, naming the action.
@@ -143,10 +143,11 @@ LOCAL_PREPARATION_SECONDS = 120.0
 # it ends a corpus case, so the two bounds agree on what cleanup costs.
 CLEANUP_RESERVE_SECONDS = 30.0
 # The Bun and Next.js workspace cases measure the full declaration sample and two
-# further cold starts. Retained Linux timings put Next.js at up to 688 seconds and
-# Bun at 463 seconds before its final cold start and checks, which took 64 seconds
-# on the preceding green run. Keep one minute in the matching Nextest overrides.
-WORKSPACE_ALLOWANCE_SECONDS = 60
+# further cold starts. Bun took 463 seconds before its final cold start and checks,
+# which took 64 seconds. Next.js reached 621 seconds before persistence, then used
+# most of the remaining 129 seconds before removal and the final cold-start checks.
+# Keep each allowance in sync with its Nextest override and CI step limit.
+WORKSPACE_ALLOWANCE_SECONDS = {"bun": 60, "nextjs": 240}
 SEED = 34
 POLL_SECONDS = 0.1
 OBSERVATION_SECONDS = 60.0
@@ -478,8 +479,8 @@ class Corpus:
         killed with no evidence of where it stood.
         """
         deadline = self.pin.seconds
-        if self.pin.name in {"bun", "nextjs"} and self.case == "workspace":
-            deadline += WORKSPACE_ALLOWANCE_SECONDS
+        if self.case == "workspace":
+            deadline += WORKSPACE_ALLOWANCE_SECONDS.get(self.pin.name, 0)
         return max(deadline - CLEANUP_RESERVE_SECONDS, 1.0)
 
     async def run(self) -> None:
