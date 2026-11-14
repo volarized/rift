@@ -292,6 +292,15 @@ impl RiftMcp {
         let result = self.search_candidates_request(request).await;
         match result {
             Ok(answer) => {
+                use rift_protocol::search_read::SearchUnavailable;
+                let warnings = match &answer {
+                    SearchCandidateResult::Captured(response) => &response.inputs.warnings,
+                    SearchCandidateResult::Unavailable(SearchUnavailable::Unavailable {
+                        warnings,
+                        ..
+                    }) => warnings,
+                };
+                crate::output::log_warnings(warnings);
                 let value = serde_json::to_value(answer).map_err(|source| {
                     let error = errors::mcp::forward_failed().source(source).error();
                     operation.record("error.type", error.slug().as_str());
@@ -600,7 +609,8 @@ mod captured_search_startup_tests {
         let server =
             RiftMcp::build_settled(&root, super::super::WorkspaceIndexLimits::default()).await?;
         let params: SearchParams = serde_json::from_value(serde_json::json!({
-            "query": "captured_nonexistent_symbol_329b", "scope": "local"
+            "query": "captured_nonexistent_symbol_329b", "scope": "local",
+            "paths": {"include": ["missing.rs"]}
         }))?;
         let request = serde_json::to_value(SearchCandidateRequest {
             params: params.clone(),

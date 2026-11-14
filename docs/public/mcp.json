@@ -3593,7 +3593,7 @@
       }
     },
     {
-      "description": "Lists syntax nodes with their source text: every node of one `symbol`, or, for one\nUTF-8 byte `position` in one file, every node of the symbol whose declaration holds\nit, or the file's unit nodes when no declaration holds it. A symbol read is the way to\nread a declaration's source, and a package or runtime symbol's nodes come from the\nglobal API, each in a source unit of that symbol's release. The answer names `symbol`;\neach node is addressed by its place: node `index` of declaration `declaration` of\nthat symbol, or node `index` of its unit, from the file node at 0, with `parent` an\nindex in the same declaration or unit. An edit renumbers the nodes after it. An answer\nwhose nodes cross its node count or source byte bound returns `node_cursor` for the\nrest. A file no syntax provider parses answers its file node alone. `revision` lists\nthe nodes at a git commit or pins the served working tree, and the answer names the\nrevision it was read at. If discovery is incomplete or a targeted read spends the\nrequest's remaining time, the request returns `temporarily_unavailable` and can be\nretried. A selected source path can answer within the remaining time. The server logs\n`local_index_preparing` while the publication is being prepared.",
+      "description": "Lists syntax nodes with their source text: every node of one `symbol`, or, for one\nUTF-8 byte `position` in one file, every node of the symbol whose declaration holds\nit, or the file's unit nodes when no declaration holds it. A symbol read is the way to\nread a declaration's source, and a package or runtime symbol's nodes come from the\nglobal API, each in a source unit of that symbol's release. A path read can select\na registered project or profile with `scope`. The answer names `symbol`;\neach node is addressed by its place: node `index` of declaration `declaration` of\nthat symbol, or node `index` of its unit, from the file node at 0, with `parent` an\nindex in the same declaration or unit. An edit renumbers the nodes after it. An answer\nwhose nodes cross its node count or source byte bound returns `node_cursor` for the\nrest. A file no syntax provider parses answers its file node alone. `revision` lists\nthe nodes at a git commit or pins the served working tree, and the answer names the\nrevision it was read at. If discovery is incomplete or a targeted read spends the\nrequest's remaining time, the request returns `temporarily_unavailable` and can be\nretried. A selected source path can answer within the remaining time. The server logs\n`local_index_preparing` while the publication is being prepared.",
       "input_schema": {
         "$defs": {
           "ProjectPath": {
@@ -3676,6 +3676,19 @@
                 ]
               }
             ]
+          },
+          {
+            "if": {
+              "required": [
+                "scope"
+              ]
+            },
+            "then": {
+              "required": [
+                "path",
+                "position"
+              ]
+            }
           }
         ],
         "examples": [
@@ -3685,6 +3698,11 @@
           {
             "path": "src/config.rs",
             "position": 338
+          },
+          {
+            "path": "src/config.rs",
+            "position": 338,
+            "scope": "local@review"
           }
         ],
         "properties": {
@@ -3708,6 +3726,15 @@
           "revision": {
             "$ref": "#/$defs/Revision",
             "description": "The revision to read: a git revision reads that commit, a tree revision the served\nworking tree, and a release revision selects the release of a package or runtime\n`symbol`'s owner. Omitted reads the served working tree, or for a package the version\nthe workspace's dependencies pin, else the newest collected release. The server refuses\na git revision when the workspace has no version-control repository, and a tree\nrevision once the index serves another tree."
+          },
+          "scope": {
+            "description": "Project that owns `path`. Omitted or `local` selects the current project. The caller MAY select a registered project or profile by its local scope.",
+            "maxLength": 8192,
+            "not": {
+              "pattern": "[@:](?:local|global|all)(?::|$)"
+            },
+            "pattern": "^local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?$",
+            "type": "string"
           },
           "symbol": {
             "$ref": "#/$defs/SymbolId",

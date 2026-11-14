@@ -818,6 +818,11 @@ range; the root's `server.port` and `server.port_range` apply to the primary pro
 path starts at the primary project root. `rift mcp --extra name=path` adds a registration for one
 connection and replaces a saved one with the same name.
 
+To read a linked Git worktree through the same connection, register its checkout directory under
+its own name. For example, `rift mcp --extra review=../web-review` serves the linked checkout under
+`local@review`. A `nodes` path read can send `"scope": "local@review"` with a path relative to
+that checkout. `revision` selects a commit in its repository when the read needs committed source.
+
 <VersionBadge version="v0.0.72" />
 
 Each extra project also serves the profiles its own `rift.toml` defines. Rift serves each such

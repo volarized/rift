@@ -1,11 +1,13 @@
 use super::{CANDIDATE_BYTES_MAX, RiftProxy, invalid};
 use rift_error::{RiftError, errors};
-use rift_protocol::identity::SymbolIdentity;
+use rift_protocol::identity::{SymbolIdentity, parse_local_scope};
 use rift_protocol::symbol_read::{GetSymbolParams, GetSymbolResult};
 use rmcp::handler::server::tool::IntoCallToolResult;
 use rmcp::model::{
     CallToolRequest, CallToolRequestParams, CallToolResponse, ClientRequest, ServerResult,
 };
+
+use crate::parameters::NodesToolParams;
 
 impl RiftProxy {
     /// Routes one read to the project whose owner its identities or scope name, with those
@@ -59,13 +61,34 @@ impl RiftProxy {
         Ok(Some(response))
     }
 
-    /// Reads the nodes of a symbol an accepted extra project or profile owns from that
-    /// project's own server, which knows the symbol under its `local` owner.
+    /// Reads the nodes of an accepted project or profile from its own server.
     async fn project_nodes(
         &self,
         request: &CallToolRequestParams,
     ) -> Result<Option<Result<CallToolResponse, rmcp::ErrorData>>, RiftError> {
-        let arguments = request.arguments.clone().unwrap_or_default();
+        let Some(arguments) = request.arguments.as_ref() else {
+            return Ok(None);
+        };
+        if let Some(scope) = arguments.get("scope") {
+            let owner = scope
+                .as_str()
+                .and_then(|scope| parse_local_scope(scope).ok())
+                .ok_or_else(nodes_scope_refusal)?;
+            if arguments.contains_key("symbol")
+                || !arguments
+                    .get("path")
+                    .is_some_and(serde_json::Value::is_string)
+                || !arguments
+                    .get("position")
+                    .is_some_and(serde_json::Value::is_u64)
+            {
+                return Err(nodes_scope_refusal());
+            }
+            let Some(name) = super::super::identity::backend_key(&owner) else {
+                return Ok(None);
+            };
+            return self.project_read(request, &name).await.map(Some);
+        }
         let Some(symbol) = arguments.get("symbol").and_then(serde_json::Value::as_str) else {
             return Ok(None);
         };
@@ -83,7 +106,10 @@ impl RiftProxy {
         request: &CallToolRequestParams,
         name: &str,
     ) -> Result<Result<CallToolResponse, rmcp::ErrorData>, RiftError> {
-        let backend = self.call_backend(request)?;
+        let backend = self
+            .backends
+            .get(name)
+            .ok_or_else(|| self.extra.refusal(name, &request.name, "scope"))?;
         let upstream = dispatch_nodes_request(request, name)?;
         let mut response = backend.forward_read(upstream).await?;
         if let Ok(CallToolResponse::Complete(result)) = &response
@@ -125,12 +151,20 @@ impl RiftProxy {
     }
 }
 
-/// `request` with its `symbol` dispatched to `backend`'s own `local` owner.
+fn nodes_scope_refusal() -> RiftError {
+    errors::mcp::parameter_invalid()
+        .tool("nodes")
+        .field("scope")
+        .accepted("a local project scope beside path and position")
+        .error()
+}
+
+/// `request` with its selector dispatched to `backend`'s own `local` owner.
 pub(in crate::proxy) fn dispatch_nodes_request(
     request: &CallToolRequestParams,
     backend: &str,
 ) -> Result<CallToolRequestParams, RiftError> {
-    let mut params: rift_protocol::read::NodesParams = serde_json::from_value(
+    let selected: NodesToolParams = serde_json::from_value(
         request.arguments.clone().unwrap_or_default().into(),
     )
     .map_err(|source| {
@@ -140,6 +174,7 @@ pub(in crate::proxy) fn dispatch_nodes_request(
             .accepted(source.to_string())
             .error()
     })?;
+    let (mut params, _) = selected.split();
     if let Some(symbol) = &mut params.symbol {
         *symbol = super::super::identity::dispatch_id(symbol, backend)?;
     }
