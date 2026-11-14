@@ -1933,6 +1933,10 @@ async fn a_refused_package_scoped_read_makes_no_global_request() -> TestResult {
     let workspace = served_dependent_workspace(Some(&configuration)).await?;
     let (directory, client, server_task) = workspace.served;
     let id = workspace_client::captured_seed(&client, "beacon", "src/lib.rs").await?;
+    let ready = workspace_client::query::retrieval(&serde_json::from_value(json!({
+        "query": "beacon"
+    }))?)?;
+    workspace_client::query_after_population(&client, &ready).await?;
     let refused = [
         (
             "search",
@@ -1961,7 +1965,8 @@ async fn a_refused_package_scoped_read_makes_no_global_request() -> TestResult {
         ),
     ];
     for (tool, request, diagnostic) in refused {
-        let failure = failed_call(client.call_tool(tool_request(tool, &request)).await)?;
+        let failure = failed_call(client.call_tool(tool_request(tool, &request)).await)
+            .map_err(|error| format!("{tool} request {request}: {error}"))?;
         assert_eq!(
             failure.code,
             ErrorCode::InvalidRequest,

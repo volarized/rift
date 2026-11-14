@@ -25,6 +25,8 @@ pub(crate) struct SearchCandidateRequest {
     pub(crate) params: SearchParams,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) view: Option<CapturedView>,
+    #[serde(default)]
+    pub(crate) require_ready_ranking: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -98,16 +100,19 @@ fn validate_candidate_query(params: &SearchParams) -> Result<(), ToolFailure> {
 fn preparing_candidates(
     resolved: &super::ResolvedWorkspace,
     warnings: &[ReadWarning],
+    lexical_commit_pending: bool,
 ) -> Option<rift_protocol::search_read::SearchUnavailable> {
     let warning = resolved
         .published
         .preparation
         .as_ref()
-        .and_then(crate::validation::LocalIndexPreparation::warning)?;
-    let mut answer_warnings = Vec::new();
-    answer_warnings.extend(warnings.iter().cloned());
+        .and_then(crate::validation::LocalIndexPreparation::warning);
+    if warning.is_none() && !lexical_commit_pending {
+        return None;
+    }
+    let mut answer_warnings = warnings.to_vec();
     answer_warnings.extend(resolved.stale.clone());
-    answer_warnings.push(warning);
+    answer_warnings.extend(warning);
     Some(rift_protocol::search_read::SearchUnavailable::Unavailable {
         reason: rift_protocol::symbol_read::SymbolUnavailableReason::IndexPreparing,
         view: None,
@@ -119,6 +124,7 @@ impl RiftMcp {
     pub(in crate::server) async fn captured_query(
         &self,
         params: &SearchParams,
+        require_ready_ranking: bool,
     ) -> Result<Option<rift_protocol::search_read::SearchReadResult>, ToolFailure> {
         use rift_protocol::symbol_read::SymbolUnavailableReason;
         let unavailable = |reason, view| {
@@ -176,6 +182,7 @@ impl RiftMcp {
         let arguments = serde_json::to_value(SearchCandidateRequest {
             params: normalized,
             view: selected,
+            require_ready_ranking,
         })
         .map_err(transport_failure)?
         .as_object()
@@ -285,6 +292,15 @@ impl RiftMcp {
         let result = self.search_candidates_request(request).await;
         match result {
             Ok(answer) => {
+                use rift_protocol::search_read::SearchUnavailable;
+                let warnings = match &answer {
+                    SearchCandidateResult::Captured(response) => &response.inputs.warnings,
+                    SearchCandidateResult::Unavailable(SearchUnavailable::Unavailable {
+                        warnings,
+                        ..
+                    }) => warnings,
+                };
+                crate::output::log_warnings(warnings);
                 let value = serde_json::to_value(answer).map_err(|source| {
                     let error = errors::mcp::forward_failed().source(source).error();
                     operation.record("error.type", error.slug().as_str());
@@ -336,11 +352,17 @@ impl RiftMcp {
             return Ok(SearchCandidateResult::Captured(Box::new(response)));
         }
         validate_candidate_query(&requested.params)?;
-        let (resolved, answer, warnings, references, deadline) =
+        let (resolved, ranking, references, deadline) =
             self.current_search_inputs(&requested.params).await?;
-        if let Some(answer) = preparing_candidates(&resolved, &warnings) {
+        if let Some(answer) = preparing_candidates(
+            &resolved,
+            &ranking.warnings,
+            requested.require_ready_ranking && ranking.lexical_commit_pending,
+        ) {
             return Ok(SearchCandidateResult::Unavailable(answer));
         }
+        let answer = ranking.answer;
+        let warnings = ranking.warnings;
         let ready = resolved.published.preparation.is_none();
         let params = requested.params.clone();
         let (mut inputs, material) = self
@@ -587,11 +609,13 @@ mod captured_search_startup_tests {
         let server =
             RiftMcp::build_settled(&root, super::super::WorkspaceIndexLimits::default()).await?;
         let params: SearchParams = serde_json::from_value(serde_json::json!({
-            "query": "captured_nonexistent_symbol_329b", "scope": "local"
+            "query": "captured_nonexistent_symbol_329b", "scope": "local",
+            "paths": {"include": ["missing.rs"]}
         }))?;
         let request = serde_json::to_value(SearchCandidateRequest {
             params: params.clone(),
             view: None,
+            require_ready_ranking: false,
         })?
         .as_object()
         .ok_or("candidate arguments must be an object")?
@@ -665,6 +689,7 @@ mod captured_search_startup_tests {
         let arguments = serde_json::to_value(SearchCandidateRequest {
             params: params.clone(),
             view: None,
+            require_ready_ranking: false,
         })?
         .as_object()
         .ok_or("candidate arguments must be an object")?
@@ -686,6 +711,7 @@ mod captured_search_startup_tests {
         let arguments = serde_json::to_value(SearchCandidateRequest {
             params,
             view: Some(captured.view.clone()),
+            require_ready_ranking: false,
         })?
         .as_object()
         .ok_or("candidate arguments must be an object")?

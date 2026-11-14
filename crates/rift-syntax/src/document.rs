@@ -218,6 +218,7 @@ pub struct SyntaxFacts {
     export_bindings: Option<Vec<SyntaxExportBinding>>,
     macro_invocations: Option<Vec<MacroInvocation>>,
     scope: Option<Vec<Scope>>,
+    static_facts: Option<crate::StaticFacts>,
     has_errors: bool,
     left_out_declarations: usize,
     markdown_facts: Option<MarkdownFacts>,
@@ -236,6 +237,7 @@ impl PartialEq for SyntaxFacts {
             export_bindings,
             macro_invocations,
             scope,
+            static_facts,
             has_errors,
             left_out_declarations,
             markdown_facts,
@@ -249,6 +251,7 @@ impl PartialEq for SyntaxFacts {
             && *export_bindings == other.export_bindings
             && *macro_invocations == other.macro_invocations
             && *scope == other.scope
+            && *static_facts == other.static_facts
             && *has_errors == other.has_errors
             && *left_out_declarations == other.left_out_declarations
             && *markdown_facts == other.markdown_facts
@@ -438,6 +441,7 @@ impl SyntaxDocument {
                 export_bindings: None,
                 macro_invocations,
                 scope: None,
+                static_facts: None,
                 has_errors,
                 left_out_declarations,
                 markdown_facts: None,
@@ -470,6 +474,11 @@ impl SyntaxDocument {
     /// Attaches export bindings extracted from the same syntax tree.
     pub(crate) fn with_export_bindings(mut self, bindings: Vec<SyntaxExportBinding>) -> Self {
         Arc::make_mut(&mut self.facts).export_bindings = Some(bindings);
+        self
+    }
+
+    pub(crate) fn with_static_facts(mut self, facts: Option<crate::StaticFacts>) -> Self {
+        Arc::make_mut(&mut self.facts).static_facts = facts;
         self
     }
 
@@ -584,6 +593,12 @@ impl SyntaxDocument {
 }
 
 impl SyntaxFacts {
+    /// Returns captured source-based name-resolution evidence, when recorded.
+    #[must_use]
+    pub const fn static_facts(&self) -> Option<&crate::StaticFacts> {
+        self.static_facts.as_ref()
+    }
+
     /// Returns the complete named tree in pre-order, or `None` when these facts hold none.
     #[must_use]
     pub fn nodes(&self) -> Option<&[SyntaxNode]> {
@@ -712,6 +727,7 @@ impl SyntaxFacts {
             export_bindings: parts.export_bindings,
             macro_invocations: parts.macro_invocations,
             scope: parts.scope,
+            static_facts: parts.static_facts,
             has_errors: parts.has_errors,
             left_out_declarations: parts.left_out_declarations,
             markdown_facts: parts.markdown_facts,

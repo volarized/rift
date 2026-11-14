@@ -34,6 +34,8 @@ pub struct SyntaxFactsParts {
     pub macro_invocations: Option<Vec<crate::MacroInvocation>>,
     /// Captured root and module scopes; missing direct ranges remain unknown.
     pub scope: Option<Vec<crate::Scope>>,
+    /// Captured name-resolution syntax, when produced by the source provider.
+    pub static_facts: Option<crate::StaticFacts>,
     /// Whether the provider reported parser errors.
     pub has_errors: bool,
     /// Number of extracted declarations the provider omitted.
@@ -779,6 +781,14 @@ impl SyntaxFacts {
         validate_export_bindings(source, limits, &parts)?;
         validate_macro_invocations(source, limits, &parts)?;
         validate_scope(source, limits, &parts)?;
+        if let Some(facts) = &parts.static_facts {
+            if parts.language != ShippedLanguage::Rust.language()
+                && parts.language != ShippedLanguage::JavaScript.language()
+            {
+                return errors::syntax::facts_structure_invalid().fail();
+            }
+            facts.validate(source, limits)?;
+        }
         if let Some(markdown) = &parts.markdown_facts {
             if parts.language != ShippedLanguage::Markdown.language() {
                 return Err(errors::syntax::facts_structure_invalid().error());

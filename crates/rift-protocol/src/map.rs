@@ -86,7 +86,7 @@ pub struct WorkspaceMap {
     #[schemars(length(max = 100))]
     pub recommendations: Vec<MapRecommendation>,
     /// Conditions that qualify this map. Absent when empty.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing)]
     pub warnings: Vec<ReadWarning>,
     /// Always the whole map on one page.
     pub pagination: Pagination,

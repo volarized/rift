@@ -1,6 +1,5 @@
 //! Retains the complete selected producer pages before graph evaluation.
 
-use crate::parameters::Parameters;
 use rift_error::RiftError;
 use rift_protocol::read::{PAGE_LIMIT_MAX, ReadWarning, SearchParams, SearchResult};
 use rift_protocol::search_read::{SearchReadResult, SearchUnavailable};
@@ -17,16 +16,9 @@ impl RiftMcp {
         selection: &RetrievalSelection,
         limits: rift_search::sparql::GraphLimits,
     ) -> Result<Result<Box<SearchResult>, SearchUnavailable>, ToolFailure> {
-        collect_retrieval(
-            selection.request.clone(),
-            limits,
-            read_failure,
-            |request| async move {
-                self.search(Parameters(request))
-                    .await
-                    .map(|result| result.0)
-            },
-        )
+        collect_retrieval(selection.request.clone(), limits, read_failure, |request| {
+            self.graph_search(request)
+        })
         .await
     }
 }
@@ -53,16 +45,16 @@ where
             SearchReadResult::Results(page) => page,
             SearchReadResult::Unavailable(reason) => return Ok(Err(reason)),
         };
-        let failure = if page.warnings.iter().any(incomplete_retrieval) {
-            Some(SymbolUnavailableReason::InsufficientCoverage)
-        } else if page.pagination.page_index != request.page_index
+        let failure = if page.pagination.page_index != request.page_index
             || held.as_ref().is_some_and(|held| {
                 page.view != held.view || page.pagination.total_pages != held.pagination.total_pages
-            })
-        {
+            }) {
             Some(SymbolUnavailableReason::ViewContext)
         } else {
-            None
+            retrieval_coverage(
+                &page.warnings,
+                request.view.is_none() && request.revision.is_none(),
+            )
         };
         if let Some(reason) = failure {
             return Ok(Err(unavailable(reason, page)));
@@ -114,6 +106,26 @@ fn unavailable(reason: SymbolUnavailableReason, page: Box<SearchResult>) -> Sear
     }
 }
 
+fn retrieval_coverage(warnings: &[ReadWarning], current: bool) -> Option<SymbolUnavailableReason> {
+    let mut preparing = false;
+    for warning in warnings
+        .iter()
+        .filter(|warning| incomplete_retrieval(warning))
+    {
+        if current
+            && matches!(
+                warning,
+                ReadWarning::LocalIndexPreparing { .. } | ReadWarning::PatternIndexPreparing { .. }
+            )
+        {
+            preparing = true;
+        } else {
+            return Some(SymbolUnavailableReason::InsufficientCoverage);
+        }
+    }
+    preparing.then_some(SymbolUnavailableReason::IndexPreparing)
+}
+
 fn incomplete_retrieval(warning: &ReadWarning) -> bool {
     if let ReadWarning::PackageContextDegraded { resolver, .. } = warning {
         return resolver.split('/').next() != Some(rift_dependency::STANDARD_LIBRARY_MANAGER);
@@ -145,7 +157,34 @@ fn incomplete_retrieval(warning: &ReadWarning) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReadWarning, incomplete_retrieval};
+    use super::{ReadWarning, SymbolUnavailableReason, incomplete_retrieval, retrieval_coverage};
+
+    #[test]
+    fn pattern_preparation_is_retryable_only_for_current_reads() {
+        let preparing = ReadWarning::PatternIndexPreparing {
+            prepared: 1,
+            total: 2,
+            detail: "fixture".to_owned(),
+        };
+        assert_eq!(
+            retrieval_coverage(std::slice::from_ref(&preparing), true),
+            Some(SymbolUnavailableReason::IndexPreparing)
+        );
+        assert_eq!(
+            retrieval_coverage(std::slice::from_ref(&preparing), false),
+            Some(SymbolUnavailableReason::InsufficientCoverage)
+        );
+        assert_eq!(
+            retrieval_coverage(
+                &[
+                    preparing,
+                    ReadWarning::LexicalRankingTruncated { matches_max: 1 }
+                ],
+                true,
+            ),
+            Some(SymbolUnavailableReason::InsufficientCoverage)
+        );
+    }
 
     #[test]
     fn runtime_probe_does_not_invalidate_ranked_package_coverage() {

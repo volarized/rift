@@ -30,7 +30,8 @@ const CHART = `
       local_source["Current project"]
       local_text["Text"]
       local_syntax["Syntax"]
-      local_semantics["Semantics<br/>Symbol references on request"]
+      local_static["Static analysis<br/>Resolved calls"]
+      local_semantics["Semantics<br/>LSP and in-process language engines"]
       local_documentation["Documentation"]
       local_context["Revision + origin"]
       local_fts["FTS corpus<br/>Names + signatures + docs + file content"]
@@ -44,14 +45,16 @@ const CHART = `
       global_source["OSS package versions"]
       global_text["Text"]
       global_syntax["Syntax"]
-      global_semantics["Semantics<br/>Package relationships"]
+      global_static["Static analysis<br/>Resolved calls"]
+      global_semantics["Semantics<br/>Language engines"]
       global_documentation["Documentation"]
       global_context["Revision + origin"]
       global_search["FTS + vector<br/>(hybrid)"]
       global_ranking["Ranking"]
     end
 
-    local_source --> local_text --> local_syntax --> local_semantics
+    local_source --> local_text --> local_syntax --> local_static
+    local_syntax --> local_semantics
     local_syntax --> local_documentation
     local_source --> local_context
     local_documentation --> local_fts
@@ -59,14 +62,17 @@ const CHART = `
     local_vector --> local_embeddings
     local_fts --> local_search
     local_embeddings --> local_search
+    local_static --> local_mcp
     local_semantics --> local_mcp
     local_search --> local_ranking
     local_ranking -->|local| local_mcp
 
-    global_source --> global_text --> global_syntax --> global_semantics
+    global_source --> global_text --> global_syntax --> global_static
+    global_syntax --> global_semantics
     global_syntax --> global_documentation
     global_source --> global_context
     global_text --> global_search
+    global_static --> global_search
     global_semantics --> global_search
     global_documentation --> global_search
     global_context --> global_search
@@ -99,6 +105,8 @@ const ICONS: Record<string, ReactNode> = {
   global_text: <TextTIcon size={24} />,
   local_syntax: <BracketsCurlyIcon size={24} />,
   global_syntax: <BracketsCurlyIcon size={24} />,
+  local_static: <GraphIcon size={24} />,
+  global_static: <GraphIcon size={24} />,
   local_semantics: <GraphIcon size={24} />,
   global_semantics: <GraphIcon size={24} />,
   local_documentation: <FileTextIcon size={24} />,
@@ -122,11 +130,12 @@ export function CodebaseIntelligence() {
       </div>
       <FlatDiagram
         chart={CHART}
-        alt="The local index applies text, syntax, semantics, planned documentation, revision, and origin to the current project. Hybrid local search indexes names, signatures, documentation, and file content for full-text search, and qualified names with declaration source for vector search. Identifier, BM25, and vector results enter weighted reciprocal rank fusion. Embeddings can come from Hugging Face, a workspace directory, or a planned OpenAI-compatible endpoint. Planned global search combines full-text and vector search, with ranking details still to be defined. The local server exposes local, global, and all search scopes, while the planned global server also provides direct MCP access."
+        alt="Static analysis connects calls to declarations using syntax. Language servers and in-process engines supply semantic facts. The planned global index applies these layers to collected package versions. Local hybrid search combines identifier, BM25, and vector rankings through weighted reciprocal rank fusion."
         variant="soft"
         icons={ICONS}
         nodeBadges={{
           global_mcp: "Planned",
+          global_static: "Planned",
           local_documentation: "Planned",
           global_documentation: "Planned",
           global_search: "Planned",
@@ -179,8 +188,10 @@ export function CodebaseIntelligence() {
 const CAPABILITY_ICONS = {
   Text: <TextTIcon size={14} />,
   Syntax: <BracketsCurlyIcon size={14} />,
+  "Static analysis": <GraphIcon size={14} />,
+  "JavaScript static analysis": <GraphIcon size={14} />,
   LSP: <PlugsConnectedIcon size={14} />,
-  ty: <CpuIcon size={14} />,
+  "In-process engine": <CpuIcon size={14} />,
 } satisfies Record<string, ReactNode>;
 
 type Capability = keyof typeof CAPABILITY_ICONS;
@@ -208,26 +219,26 @@ const LANGUAGES: LanguageSummary[] = [
   {
     name: "Rust",
     logos: ["rust"],
-    local: ["Syntax", "LSP"],
-    global: ["Syntax", "LSP"],
+    local: ["Syntax", "Static analysis", "LSP"],
+    global: ["Syntax", "Static analysis", "LSP"],
     description:
-      "tree-sitter extracts declarations. A configured rust-analyzer supplies incoming references on request.",
+      "Tree-sitter extracts declarations. Static analysis resolves calls through supported module paths and bindings. A configured rust-analyzer supplies additional references.",
   },
   {
     name: "Python",
     logos: ["python"],
-    local: ["Syntax", "ty"],
-    global: ["Syntax", "ty"],
+    local: ["Syntax", "In-process engine"],
+    global: ["Syntax", "In-process engine"],
     description:
-      "tree-sitter extracts declarations. The embedded ty engine supplies references through the same LSP session contract used by external language engines.",
+      "Tree-sitter extracts declarations. An in-process language engine supplies references.",
   },
   {
     name: "JavaScript / TypeScript",
     logos: ["javascript", "typescript"],
-    local: ["Syntax", "LSP"],
-    global: ["Syntax", "LSP"],
+    local: ["Syntax", "JavaScript static analysis", "LSP"],
+    global: ["Syntax", "JavaScript static analysis", "LSP"],
     description:
-      "Separate syntax providers parse JavaScript, TypeScript, and TSX. Each language identity selects its engine; TypeScript and TSX can share a named typescript-language-server process.",
+      "Separate syntax providers parse JavaScript, TypeScript, and TSX. Static analysis follows supported JavaScript imports to their declarations. TypeScript and TSX can share a named typescript-language-server process.",
   },
   {
     name: "HTML / CSS / Vue / Svelte / Angular",

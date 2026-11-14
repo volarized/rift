@@ -23,6 +23,8 @@ mod selection;
 mod semantic;
 #[cfg(feature = "collector")]
 mod source;
+#[cfg(feature = "collector")]
+mod static_resolution;
 mod traversal;
 
 #[cfg(feature = "collector")]
@@ -55,7 +57,9 @@ pub use selection::{
     documentation_format,
 };
 #[cfg(feature = "collector")]
-pub use semantic::{BuiltSemantics, PlacedDocument, PreparedSemantics, WorkspaceSemantics};
+pub use semantic::{
+    BuiltSemantics, PlacedDocument, PreparedProjectSemantics, PreparedSemantics, WorkspaceSemantics,
+};
 #[cfg(feature = "collector")]
 pub use source::{FileDigest, IndexedFile};
 pub use traversal::{TraversalWalk, walk_traversal_capped, walk_traversal_capped_async};

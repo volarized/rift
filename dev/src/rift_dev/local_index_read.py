@@ -128,9 +128,8 @@ async def settled_local(
 
     Callers name the original selection; the helper does not parse query text.
     A top-level captured view always keeps captured behavior. Current preparation
-    may use `index_preparing`, or `insufficient_coverage` with the local preparation
-    warning, including unrelated source or framework warnings. Other coverage failures return
-    unchanged. One inherited deadline bounds every call and poll together.
+    uses `index_preparing`. Older servers may return `insufficient_coverage` with
+    a local preparation warning. One inherited deadline bounds every call and poll.
 
     The actual callback sequence retains typed refusals until current preparation
     completes, then preserves the strict SELECT answer.

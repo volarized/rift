@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 mod captured;
+pub use captured::PreparedProjectSemantics;
 
 use rift_core::{
     ContributionReference, IndexRevision, ProjectPath, ProviderId, ProviderRevision,
@@ -16,6 +17,7 @@ use rift_syntax::{
 };
 
 use crate::relationship::RelationshipStore;
+use crate::static_resolution::{StaticOccurrence, StaticResolution, StaticSource};
 
 /// Publication bounds for a build that holds at most `declarations_max` declarations.
 ///
@@ -56,6 +58,8 @@ pub struct WorkspaceSemantics {
     graph: NormalizedGraph,
     relationships: RelationshipStore,
     syntax_provider: ProviderId,
+    static_resolution: StaticResolution,
+    static_occurrence_order: Vec<usize>,
 }
 
 /// One build's captured semantics and documents not included in publication.
@@ -125,6 +129,8 @@ impl PreparedSemantics {
                 graph,
                 relationships,
                 syntax_provider: ProviderId::new(SYNTAX_PROVIDER_ID)?,
+                static_resolution: StaticResolution::default(),
+                static_occurrence_order: Vec::new(),
             },
             beyond_declaration_bound: self.beyond_declaration_bound,
             refused_contributions: self.refused_contributions,
@@ -134,6 +140,35 @@ impl PreparedSemantics {
 
 type ExternalTarget<'input> =
     dyn Fn(&rift_core::ContributionReference) -> Option<rift_core::SymbolId> + 'input;
+
+impl StaticResolution {
+    fn retained_size<T: get_size2::GetSizeTracker>(&self, mut tracker: T) -> (usize, T) {
+        let mut bytes = self
+            .occurrences
+            .capacity()
+            .saturating_mul(std::mem::size_of::<StaticOccurrence>());
+        for occurrence in &self.occurrences {
+            let (binding, next) =
+                get_size2::GetSize::get_heap_size_with_tracker(&occurrence.binding, tracker);
+            let (target_binding, next) =
+                get_size2::GetSize::get_heap_size_with_tracker(&occurrence.target_binding, next);
+            let (target, next) = match &occurrence.target {
+                rift_provider::NormalizedTarget::Symbol(symbol) => {
+                    get_size2::GetSize::get_heap_size_with_tracker(symbol, next)
+                }
+                rift_provider::NormalizedTarget::Contribution(reference) => {
+                    get_size2::GetSize::get_heap_size_with_tracker(reference, next)
+                }
+            };
+            bytes = bytes
+                .saturating_add(binding)
+                .saturating_add(target_binding)
+                .saturating_add(target);
+            tracker = next;
+        }
+        (bytes, tracker)
+    }
+}
 
 impl WorkspaceSemantics {
     /// Builds one syntax publication and one normalized graph over one file set.
@@ -407,6 +442,70 @@ impl WorkspaceSemantics {
         &self.relationships
     }
 
+    pub(crate) fn add_static_resolution(
+        &mut self,
+        sources: &[StaticSource<'_>],
+        input: &crate::NamespaceInput<'_>,
+        relationships_max: usize,
+    ) {
+        let work_max = relationships_max.saturating_mul(16);
+        let resolution = crate::static_resolution::resolve(&self.graph, sources, input, work_max);
+        self.relationships
+            .add_static(&self.graph, &resolution.occurrences, relationships_max);
+        self.static_occurrence_order = (0..resolution.occurrences.len()).collect();
+        self.static_occurrence_order.sort_unstable_by_key(|index| {
+            (
+                canonical_occurrence_target(&resolution.occurrences[*index]),
+                *index,
+            )
+        });
+        self.static_resolution = resolution;
+    }
+
+    pub(crate) fn static_occurrences(&self) -> &[StaticOccurrence] {
+        &self.static_resolution.occurrences
+    }
+
+    /// Resolved occurrences for one canonical target in this captured publication.
+    pub fn static_usages(
+        &self,
+        target: &rift_core::SymbolId,
+    ) -> impl Iterator<
+        Item = (
+            &rift_core::DeclarationBinding,
+            rift_syntax::ByteRange,
+            rift_core::FileDigest,
+            rift_core::ReferenceRole,
+        ),
+    > {
+        let matches = |index: &usize| {
+            canonical_occurrence_target(&self.static_resolution.occurrences[*index])
+        };
+        let start = self
+            .static_occurrence_order
+            .partition_point(|index| matches(index) < Some(target));
+        let end = self
+            .static_occurrence_order
+            .partition_point(|index| matches(index) <= Some(target));
+        self.static_occurrence_order[start..end]
+            .iter()
+            .map(|index| {
+                let occurrence = &self.static_resolution.occurrences[*index];
+                (
+                    &occurrence.binding,
+                    occurrence.callee_range,
+                    occurrence.source_digest,
+                    occurrence.role,
+                )
+            })
+    }
+
+    /// Number of captured sources that could not supply static evidence.
+    #[must_use]
+    pub const fn static_sources_unavailable(&self) -> usize {
+        self.static_resolution.unavailable_sources
+    }
+
     #[cfg(test)]
     pub(crate) fn from_graph(
         graph: NormalizedGraph,
@@ -418,6 +517,8 @@ impl WorkspaceSemantics {
             graph,
             relationships,
             syntax_provider,
+            static_resolution: StaticResolution::default(),
+            static_occurrence_order: Vec::new(),
         }
     }
 
@@ -485,7 +586,24 @@ impl get_size2::GetSize for WorkspaceSemantics {
             get_size2::GetSize::get_heap_size_with_tracker(&self.syntax_provider, tracker);
         bytes = bytes.saturating_add(field);
         tracker = next;
-        (bytes, tracker)
+        let (static_resolution, tracker) = self.static_resolution.retained_size(tracker);
+        let ordering = self
+            .static_occurrence_order
+            .capacity()
+            .saturating_mul(std::mem::size_of::<usize>());
+        (
+            bytes
+                .saturating_add(static_resolution)
+                .saturating_add(ordering),
+            tracker,
+        )
+    }
+}
+
+fn canonical_occurrence_target(occurrence: &StaticOccurrence) -> Option<&rift_core::SymbolId> {
+    match &occurrence.target {
+        rift_provider::NormalizedTarget::Symbol(target) => Some(target),
+        rift_provider::NormalizedTarget::Contribution(_) => None,
     }
 }
 

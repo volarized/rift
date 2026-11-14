@@ -319,12 +319,8 @@ def named_paths(warning: JsonObject) -> set[str]:
     return found
 
 
-def chunked_answer(answer: JsonObject, path: str, size: int, offset: int) -> list[str]:
-    """Require a `pattern` answer to hit `path` at `offset`, the file held at full size.
-
-    Under the default `large_files = "split"` no file is left out of the text index, so no
-    warning may count one as skipped. Returns the codes of the warnings naming `path`.
-    """
+def chunked_answer(answer: JsonObject, path: str, size: int, offset: int) -> None:
+    """Require a pattern hit at the expected offset in the complete file."""
     hits = bindings(answer)
     require(bool(hits), f"{path}: no pattern hit at byte {offset}: {answer}")
     first = object_value(hits[0], "pattern hit")
@@ -339,13 +335,35 @@ def chunked_answer(answer: JsonObject, path: str, size: int, offset: int) -> lis
     )
     start = int(literal(first, "start"))
     require(start == offset, f"{path}: first hit at byte {start}, expected {offset}")
-    named: list[str] = []
-    for warning in warnings(answer):
+
+
+def chunked_warnings(observed: list[JsonObject], path: str) -> list[str]:
+    """Return warning codes naming the file and reject a skipped large file."""
+    named = []
+    for warning in observed:
         code = string_value(warning.get("code"), "warning code")
         require(code != "large_file_skipped", f"split skipped a large file: {warning}")
         if path in named_paths(warning):
             named.append(code)
     return named
+
+
+def logged_read_warnings(rows: list[Line]) -> list[JsonObject]:
+    """Decode bounded diagnostic records after the server strips them from replies."""
+    observed = []
+    for row in rows:
+        if row.operation != "read.warning":
+            continue
+        payload = json.loads(row.label("evidence"))
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        warning = object_value(payload, "logged read warning")
+        require(
+            warning.get("code") == row.label("warning_code"),
+            "logged warning code disagrees with its evidence",
+        )
+        observed.append(warning)
+    return observed
 
 
 def build_records(found: list[Line], path: str) -> list[str]:
@@ -357,25 +375,23 @@ def build_records(found: list[Line], path: str) -> list[str]:
     ]
 
 
-def lexical_breach(answer: JsonObject, maximum: int) -> int:
-    """Require the exact rendered lexical bound and a count beyond that maximum."""
+def lexical_breach(records: list[Line], maximum: int) -> int:
+    """Require the failed lexical commit to log the exact bound and observed count."""
     found = [
-        entry
-        for entry in warnings(answer)
-        if entry.get("code") == "lexical_ranking_unavailable"
+        record.label("error")
+        for record in records
+        if record.operation == "search.commit" and record.label("outcome") == "error"
     ]
-    require(
-        len(found) == 1, "lexical overflow must warn exactly once and keep publication"
-    )
-    detail = string_value(found[0].get("detail"), "lexical warning detail")
+    require(len(found) == 1, "lexical overflow must log exactly one failed commit")
+    detail = found[0]
     matched = re.search(
         rf"lexical index received more units than its accepted limit of {maximum}: "
         r"field units_max, observed ([0-9]+); "
-        r"resend the same request after a short delay$",
+        r"resend the same request after a short delay",
         detail,
     )
     if matched is None:
-        raise AssertionError(f"lexical warning lost its exact bound: {detail}")
+        raise AssertionError(f"lexical commit record lost its exact bound: {detail}")
     observed = int(matched.group(1))
     require(observed > maximum, f"lexical observed {observed} did not exceed {maximum}")
     return observed

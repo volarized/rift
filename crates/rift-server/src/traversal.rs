@@ -95,8 +95,14 @@ pub(crate) fn collect_traversal_hits(
     let walked_seed = resolve_traversal_seed(reads, seed)?;
     // A dropped engine contribution answers with its warning: no resend of the same
     // request clears the condition, so a refusal would only hide what the warning names.
-    if store.is_empty() && !references.resolved(seed) && references.analysis_unavailable().is_none()
-    {
+    let adjacent = match traversal.direction {
+        TraversalDirection::Incoming => store.incoming(&walked_seed),
+        TraversalDirection::Outgoing => store.outgoing(&walked_seed),
+    };
+    let indexed = adjacent
+        .iter()
+        .any(|edge| traversal.facets.is_empty() || traversal.facets.contains(&edge.facet()));
+    if !indexed && !references.resolved(seed) && references.analysis_unavailable().is_none() {
         return errors::server::read_unsupported()
             .capability(TRAVERSAL_CAPABILITY)
             .fail();

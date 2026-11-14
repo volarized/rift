@@ -921,13 +921,55 @@ fn map_callees(
     Ok(mapped)
 }
 
-/// Calls the engine established for one selected local declaration.
+mod call_evidence;
+use call_evidence::CapturedCalls;
+
+/// Calls established for one selected local declaration.
 #[derive(Default)]
 pub struct GraphCalls {
     /// Canonical neighbors in the current tree.
     pub local: Vec<(SymbolId, Vec<SourceUnitSpan>)>,
     /// Outgoing targets in admitted dependency sources, awaiting exact identity resolution.
     pub packages: Vec<(PackageCallee, Vec<SourceUnitSpan>)>,
+    /// Whether a configured engine covered the requested direction.
+    pub complete: bool,
+    /// Original observations linked to a captured authored call site.
+    pub corroboration: Vec<CallCorroboration>,
+}
+
+/// An engine's original destination before projection into canonical adjacency.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CallDestination {
+    /// Canonical local declaration.
+    Local(SymbolId),
+    /// Address in an admitted dependency's source.
+    Dependency(Box<PackageCallee>),
+}
+
+/// Provider that supplied an independently observed call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallProvider {
+    /// Configured language engine.
+    Engine,
+    /// Language-specific extractor.
+    Extractor,
+}
+
+/// Independent call evidence attached to the same authored site.
+#[derive(Debug)]
+pub struct CallCorroboration {
+    /// Invocation span supplied by static resolution.
+    pub authored: SourceUnitSpan,
+    /// Original engine span.
+    pub observed: SourceUnitSpan,
+    /// Target selected by static resolution.
+    pub static_target: SymbolId,
+    /// Original engine target.
+    pub engine_target: CallDestination,
+    /// Origin of the observation combined with the static call.
+    pub provider: CallProvider,
+    /// Whether the evidence establishes the same target.
+    pub agrees: bool,
 }
 
 /// Reads every adjacent call and its physical call sites in the selected direction.
@@ -952,28 +994,28 @@ pub async fn graph_calls(
         return Err(unavailable());
     }
     let file = declaration.file;
-    let slot = engines
-        .engine_for(file.syntax().language())
-        .ok_or_else(unavailable)?;
+    let static_calls = CapturedCalls::read(reads, &identity, direction);
+    let Some(slot) = engines.engine_for(file.syntax().language()) else {
+        return static_calls.answer().ok_or_else(unavailable);
+    };
     let request = ReferenceTarget::new(
         slot.workspace_root(),
         reads.index().root(),
         file,
         declaration.symbol,
     )?;
-    let answered = Box::pin(calls_on_engine(slot, &request, direction, true, deadline))
-        .await
-        .map_err(|error| {
-            if graph_engine_method_missing(&error) {
-                unavailable()
-            } else {
-                error
-            }
-        })?;
-    let OutgoingAnswer::Ready(report) = answered else {
-        return Err(unavailable());
+    let answered = match Box::pin(calls_on_engine(slot, &request, direction, true, deadline)).await
+    {
+        Ok(answered) => answered,
+        Err(error) if graph_engine_method_missing(&error) => {
+            return static_calls.answer().ok_or_else(unavailable);
+        }
+        Err(error) => return Err(error),
     };
-    map_graph_calls(
+    let OutgoingAnswer::Ready(report) = answered else {
+        return static_calls.answer().ok_or_else(unavailable);
+    };
+    let engine = map_graph_calls(
         reads,
         roots,
         &identity,
@@ -984,7 +1026,14 @@ pub async fn graph_calls(
             unit: crate::read::source_unit_id(file.path()),
             direction,
         },
-    )
+    );
+    match engine {
+        Ok(engine) => Ok(static_calls.combine(engine)),
+        Err(error) if error.slug() == errors::server::search_coverage_unavailable::SLUG => {
+            static_calls.answer().ok_or(error)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 struct CallGraphSource<'source> {
@@ -1002,7 +1051,10 @@ fn map_graph_calls(
     held: &CallGraphSource<'_>,
 ) -> Result<GraphCalls, RiftError> {
     let unavailable = graph_call_coverage;
-    let mut result = GraphCalls::default();
+    let mut result = GraphCalls {
+        complete: true,
+        ..GraphCalls::default()
+    };
     let mut locations = 0usize;
     for call in report.calls.map_err(|_| unavailable())? {
         let item = &call.to;
@@ -1397,11 +1449,129 @@ async fn references_on_engine(
     .await
 }
 
+/// Physical usages and provider coverage for one local declaration.
+#[derive(Debug)]
+pub struct GraphReferences {
+    /// Captured physical usages.
+    pub occurrences: Vec<QueryOccurrence>,
+    /// Whether a configured provider covered the request.
+    pub complete: bool,
+}
+
+/// Reads physical usages from captured source and configured engines.
+///
+/// # Errors
+/// Refuses missing coverage or work outside the accepted bounds.
+pub async fn graph_references(
+    reads: &ReadService,
+    engines: &EnginePool,
+    target: &SymbolId,
+    require_caller: bool,
+    deadline: Instant,
+) -> Result<GraphReferences, RiftError> {
+    let identity =
+        CoreSymbolId::new(target.as_str().to_owned()).map_err(|_| graph_reference_coverage())?;
+    let captured = captured_references(reads, &identity, target, require_caller)?;
+    match Box::pin(engine_graph_references(
+        reads,
+        engines,
+        target,
+        require_caller,
+        deadline,
+    ))
+    .await
+    {
+        Ok(engine) => Ok(GraphReferences {
+            occurrences: merge_reference_occurrences(captured.occurrences, engine)?,
+            complete: captured.complete,
+        }),
+        Err(error)
+            if error.slug() == errors::server::search_coverage_unavailable::SLUG
+                && !captured.occurrences.is_empty() =>
+        {
+            Ok(GraphReferences {
+                complete: false,
+                ..captured
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn captured_references(
+    reads: &ReadService,
+    identity: &CoreSymbolId,
+    target: &SymbolId,
+    require_caller: bool,
+) -> Result<GraphReferences, RiftError> {
+    let mut occurrences = Vec::new();
+    let mut complete = true;
+    for (position, (binding, range, digest, _)) in reads.index().static_usages(identity).enumerate()
+    {
+        if position == TRAVERSAL_NODES_MAX {
+            complete = false;
+            break;
+        }
+        let path = ProjectPath::new(binding.unit().key().as_str())?;
+        let Some(file) = reads
+            .index()
+            .file(&path)
+            .filter(|file| file.digest() == digest)
+        else {
+            complete = false;
+            continue;
+        };
+        let enclosing = file
+            .enclosing_symbol(range.start, range.end)
+            .map(|symbol| symbol_id(reads.index(), crate::search::declared(file, symbol)))
+            .transpose()?
+            .flatten();
+        if require_caller && enclosing.is_none() {
+            continue;
+        }
+        occurrences.push(QueryOccurrence {
+            target: target.clone(),
+            enclosing,
+            source: SourceUnitSpan {
+                unit: crate::read::source_unit_id(&path),
+                range: TextRange {
+                    start: range.start,
+                    end: range.end,
+                },
+            },
+            facet: RelationshipFacet::References,
+        });
+    }
+    Ok(GraphReferences {
+        occurrences,
+        complete,
+    })
+}
+
+fn merge_reference_occurrences(
+    captured: Vec<QueryOccurrence>,
+    engine: Vec<QueryOccurrence>,
+) -> Result<Vec<QueryOccurrence>, RiftError> {
+    let mut occurrences = BTreeMap::new();
+    for occurrence in engine.into_iter().chain(captured) {
+        let key = (
+            &occurrence.source.unit.0,
+            occurrence.source.range.start,
+            occurrence.source.range.end,
+        );
+        occurrences.insert((key.0.clone(), key.1, key.2), occurrence);
+        if occurrences.len() > TRAVERSAL_NODES_MAX {
+            return Err(graph_reference_coverage());
+        }
+    }
+    Ok(occurrences.into_values().collect())
+}
+
 /// Complete physical usages from configured engines for one local declaration.
 ///
 /// # Errors
 /// Refuses missing readiness, an uncovered source location, or a response above the engine bound.
-pub async fn graph_references(
+async fn engine_graph_references(
     reads: &ReadService,
     engines: &EnginePool,
     target: &SymbolId,

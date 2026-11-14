@@ -1,10 +1,10 @@
 //! Tool answer output: compact text, structured content, and proxy selection.
 
 mod failure;
-mod framework_warnings;
 mod policy;
 mod render;
 mod text;
+mod warnings;
 
 use rift_error::{RiftError, errors};
 use rift_protocol::error as wire;
@@ -18,8 +18,8 @@ use render::{Render, text_of};
 use text::TextError;
 
 pub(crate) use failure::ToolFailure;
-pub(crate) use framework_warnings::FrameworkWarnings;
 pub use policy::OutputPolicy;
+pub(crate) use warnings::log_warnings;
 
 /// A typed tool answer that serves as compact text and as structured content.
 ///
@@ -28,7 +28,15 @@ pub use policy::OutputPolicy;
 pub(crate) struct Json<T>(pub(crate) T);
 
 impl<T: Render + Serialize> IntoCallToolResult for Json<T> {
-    fn into_call_tool_result(self) -> Result<CallToolResponse, ErrorData> {
+    fn into_call_tool_result(mut self) -> Result<CallToolResponse, ErrorData> {
+        self.0.log_warnings();
+        self.retrieval_result()
+    }
+}
+
+impl<T: Render + Serialize> Json<T> {
+    /// Encodes an internal answer whose warnings still inform retrieval coverage.
+    pub(crate) fn retrieval_result(self) -> Result<CallToolResponse, ErrorData> {
         let text = match text_of(&self.0) {
             Ok(text) => text,
             Err(error) => return refused(AnswerFault::Text(error)),

@@ -76,6 +76,22 @@ pub(super) fn prepare(
         map_declared_types(input, metadata, selected, &mut prepared);
     }
     observations::prepare(input, metadata.as_ref(), selected, &mut prepared);
+    if input.owner().is_local() {
+        for file in selected {
+            let javascript =
+                file.syntax.language() == &rift_syntax::ShippedLanguage::JavaScript.language();
+            if javascript
+                && file.syntax.static_facts().is_some()
+                && !prepared.anchors.contains_key(file.path.as_str())
+                && selected_source_is_valid(input, file)
+            {
+                // A relative module path names this source in the selected local owner.
+                // Bare names are reserved for admitted package entries and observations.
+                let module = format!("./{}", file.path.as_str());
+                prepare_file(input, file, &module, &mut prepared);
+            }
+        }
+    }
     prepared
 }
 

@@ -47,12 +47,7 @@ async fn wait_until_configured(client: &Client) -> TestResult<WorkspaceMap> {
     within("configured map recommendations", async {
         loop {
             let map = map(client).await?;
-            if map.recommendations.is_empty()
-                && !map.warnings.iter().any(|warning| {
-                    serde_json::to_value(warning)
-                        .is_ok_and(|value| value["code"] == "local_index_preparing")
-                })
-            {
+            if map.recommendations.is_empty() {
                 return Ok(map);
             }
             tokio::time::sleep(crate::PRESENCE_POLL_INTERVAL).await;

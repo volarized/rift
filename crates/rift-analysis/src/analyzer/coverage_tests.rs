@@ -104,6 +104,7 @@ fn unretained_refused_heading_count_keeps_inventory_incomplete() {
         export_bindings: original.export_bindings().map(<[_]>::to_vec),
         macro_invocations: None,
         scope: None,
+        static_facts: original.static_facts().cloned(),
         has_errors: original.has_errors(),
         left_out_declarations: original.left_out_declaration_count() + 1,
         markdown_facts: original.markdown_facts().cloned(),

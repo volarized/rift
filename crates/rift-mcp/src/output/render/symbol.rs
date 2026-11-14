@@ -4,8 +4,7 @@ use rift_protocol::documentation::{
     DocumentationContext, DocumentationHit, DocumentationReferenceHit,
 };
 use rift_protocol::read::{
-    CoChangeTruncation, GetSymbolHit, HistoryCommit, HistoryEdge, ProjectPath, ReadWarning,
-    SymbolHistory,
+    CoChangeTruncation, GetSymbolHit, HistoryCommit, HistoryEdge, ProjectPath, SymbolHistory,
 };
 use rift_protocol::revision::{Revision, RevisionPoint};
 
@@ -13,7 +12,6 @@ use super::facts::{
     Facts, author_of, block_of, cut_hash, date_of, describe, location, spaced_name,
 };
 use super::layout::{self, Lines};
-use super::warning;
 use crate::output::text::TextError;
 
 /// Levels that indent an entry under its section label.
@@ -63,14 +61,13 @@ fn text_section(lines: &mut Lines<'_>, text: &str) -> Result<(), TextError> {
     lines.verbatim(0, text)
 }
 
-/// Writes the documentation context: one entry per reference, with its excerpt, then one warning
-/// line per warning of the context, written as the `documentation` read warning.
+/// Writes each documentation reference with its excerpt.
 fn context_section(lines: &mut Lines<'_>, context: &DocumentationContext) -> Result<(), TextError> {
     let DocumentationContext {
         documentation_revision: _,
         references,
         truncated,
-        warnings,
+        ..
     } = context;
     lines.blank()?;
     lines.line(
@@ -83,12 +80,6 @@ fn context_section(lines: &mut Lines<'_>, context: &DocumentationContext) -> Res
     )?;
     for reference in references {
         reference_entry(lines, reference)?;
-    }
-    for context_warning in warnings {
-        let read_warning = ReadWarning::Documentation {
-            warning: context_warning.clone(),
-        };
-        lines.line(ENTRY_INDENT, &warning::line(&read_warning)?)?;
     }
     Ok(())
 }
@@ -232,7 +223,7 @@ pub(super) fn canonical(
     result: &rift_protocol::symbol_read::GetSymbolResult,
 ) -> Result<(), TextError> {
     use rift_protocol::symbol_read::GetSymbolResult;
-    let (revision, warnings) = match result {
+    let revision = match result {
         GetSymbolResult::Found {
             symbol,
             revision,
@@ -240,7 +231,7 @@ pub(super) fn canonical(
             declaration_cursor,
             history,
             documentation,
-            warnings,
+            ..
         } => {
             let mut lines = Lines::new(out, 0, 1);
             let described = describe(symbol)?;
@@ -268,12 +259,12 @@ pub(super) fn canonical(
             if let Some(cursor) = declaration_cursor {
                 lines.line(0, &format!("declaration_cursor {cursor}"))?;
             }
-            (Some(revision), warnings)
+            Some(revision)
         }
         GetSymbolResult::Missing {
             symbol_not_found,
             revision,
-            warnings,
+            ..
         } => {
             out.raw_line(0, "error: symbol_not_found")?;
             let mut lines = Lines::new(out, 0, 1);
@@ -291,22 +282,21 @@ pub(super) fn canonical(
             if let Some(detail) = &symbol_not_found.detail {
                 lines.verbatim(0, detail)?;
             }
-            (Some(revision), warnings)
+            Some(revision)
         }
         GetSymbolResult::Unavailable {
             id,
             revision,
             reason,
-            warnings,
+            ..
         } => {
             let mut lines = Lines::new(out, 0, 1);
             lines.head(&format!("unavailable · {reason:?}"))?;
             lines.line(0, id.as_str())?;
-            (revision.as_ref(), warnings)
+            revision.as_ref()
         }
     };
-    layout::revision(out, revision)?;
-    warning::section(out, warnings)
+    layout::revision(out, revision)
 }
 
 fn declarations_section(

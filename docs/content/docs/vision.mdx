@@ -111,39 +111,41 @@ some simpler cases, but it doesn't bring any of the necessary semantic meaning t
 greatly required in the codebase. For instance, we won't be able to say what the expected type of
 `task` is, nor will we know where the `spawn` function comes from.
 
+### Static analysis
+
+When you call an imported function, syntax gives Rift the call and the import as separate facts.
+The static analyzer joins those facts when the source shows how the name was bound. For example,
+`import { spawn as run } from "./tasks.js"` binds `run` to the `spawn` export. When the analyzer
+can follow that export to its declaration, Rift records a relationship from `run()` to that
+declaration.
+
+Rift can use these relationships to answer questions about callers and callees from the index.
+A call that needs more information, such as a method on a value whose type must be inferred,
+needs analysis from a language engine.
+
 ### Semantics
 
-Syntax tells us how code is constructed, but it doesn't tell us what names refer to or what a
-language engine concludes about them. That missing meaning belongs to semantics. In Rift today,
-semantic facts come through language engines.
-
 A [language engine](/docs/developer/configuration#languages-and-lsp) runs the language's own
-analysis and returns facts the parse does not contain. Rift currently asks language engines for
-references, call hierarchy, and diagnostics through LSP.
+analysis. Rift uses language servers through the Language Server Protocol (LSP) and language
+engines embedded in its own process.
 
-For [relationship traversal](/docs/mcp#search-traversal), Rift asks the engine for references to
-the requested declaration, or for the calls it makes, and uses syntax to map the returned source
-locations back to indexed declarations. These engine facts belong to that read; they do not enter
-the index.
-
-In some cases, Rift embeds a language engine when it is available as a Rust library. Other
-configured language engines run as separate LSP processes.
+For [relationship traversal](/docs/mcp#search-traversal), a language engine can return references
+to a declaration or the calls it makes. Rift maps the source locations returned by the engine
+back to indexed declarations. Rift can also request diagnostics from the engine.
 
 #### Relationship traversal [#relationship-graph]
 
 <VersionBadge version="v0.0.35" languages={["Rust", "TypeScript", "Python"]} />
 
-For reads over the local index, Rift supports incoming traversal within the current project. A
-language engine returns the source locations that reference the requested declaration, and syntax
-identifies the declaration containing each location. Together they establish a relationship from
-each caller to the requested declaration for that read.
+Incoming traversal follows relationships within the current project to the declarations that
+refer to the requested declaration. A language engine supplies additional reference locations
+where available. Rift uses syntax to identify the declaration containing each location.
 
-At the next depth, each caller becomes the declaration whose references Rift requests. This gives
-Rift bounded traversal within the project without indexing every relationship in advance.
+At the next depth, each caller becomes the declaration whose references Rift looks up.
 
 <VersionBadge version="v0.0.46" languages={["Rust", "TypeScript", "Python"]} inline /> Outgoing
-traversal walks the other way, from a declaration to the declarations it calls. Rift asks the
-engine for the declaration's
+traversal follows calls from a declaration to its callees. A language engine can supply the
+declaration's
 [call hierarchy](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_prepareCallHierarchy),
 and syntax identifies the declaration that holds each callee's name.
 
@@ -151,16 +153,16 @@ A callee in a standard library or an OSS package has no declaration in the local
 walk stops there and the answer counts the callees it dropped. At the next depth, each callee in
 the project becomes the declaration whose calls Rift requests.
 
-<VersionBadge version="planned" inline /> The global index will hold relationships within and
-between OSS packages, allowing similar traversal.
+<VersionBadge version="planned" inline /> The global index will support traversal within and
+between OSS packages.
 
 ### Documentation
 
 <VersionBadge version="v0.0.44" />
 
-Documentation is another layer derived from the same source. As Rift runs syntax and semantic
-analysis, it can extract doc comments and documentation files together with the code, then
-associate that text with the declarations and packages it describes.
+Documentation is another layer derived from the same source. Rift extracts doc comments and
+documentation files alongside the code and associates that text with the declarations and
+packages it describes.
 
 The documentation carries the same revision and origin as the source it accompanies. Search and
 symbol lookup can return it together with the code, while the global index can run the same
@@ -168,9 +170,8 @@ extraction once for each published package version.
 
 ## Revision and origin
 
-Rift records revision and source ownership alongside the intelligence it collects. This means a
-symbol found through syntax, semantics, or documentation can be traced back through its history
-and to the source it came from.
+Rift records revision and source ownership alongside the facts it collects. This lets you trace
+a symbol back through its history and to the source it came from.
 
 ### Revision
 
@@ -229,9 +230,10 @@ from the local or global index.
 ## Languages and providers
 
 Rift selects a syntax provider by file type. [Tree-sitter](https://tree-sitter.github.io/tree-sitter/)
-parses the source into declarations and syntax nodes; for project files, byte ranges identify the
-text each read returns. Language engines add references and calls that require name or type
-resolution.
+parses the source into declarations and syntax nodes. For project files, byte ranges identify the
+text each read returns. The static analyzer connects calls to declarations when it can resolve
+their targets from syntax. Language engines provide facts that require the language's own
+resolution rules.
 
 <CodebaseLanguages />
 
@@ -247,15 +249,14 @@ outlined above. They differ in which source they cover and where that analysis r
 ### Local
 
 The local server builds a local index for one project. It reads the project's text, syntax,
-semantics, documentation, and revision history on the user's machine. Project source does not
-enter the global index.
+documentation, and revision history and runs static analysis on the user's machine. The local
+server keeps project source in the local index.
 
 The server also reads the project's dependency list, or accepts one through configuration. It
 uses that list to identify which OSS packages are relevant. When a read needs facts about those
 packages, the local server requests them from the global index through an API, carrying the context
 of the current project. The local server analyzes no package source itself. When the global index
-is unavailable or holds no release of a dependency, the read still answers from project source,
-and a warning in the answer names the package facts it lacks.
+is unavailable or holds no release of a dependency, the read still answers from project source.
 
 ### Global <VersionBadge version="planned" inline />
 

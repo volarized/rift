@@ -52,7 +52,7 @@ impl ReadService {
         let key = rift_core::SymbolId::new(request.id.as_str())?;
         let index = self.index.symbol_view()?;
         let Some(readable) = index.object_by_identity(&key)? else {
-            if !index.identity_coverage_complete(identity.language()) {
+            if !covers_exact_identity(&index, &identity) {
                 return Ok(unavailable(
                     request,
                     SymbolUnavailableReason::InsufficientCoverage,
@@ -152,6 +152,34 @@ impl ReadService {
             .symbol_timeline(&self.index, &bindings, request.id.clone())
             .map(Some)
     }
+}
+
+fn covers_exact_identity(index: &WorkspaceSymbolView, identity: &SymbolIdentity) -> bool {
+    if !index.identity_coverage_complete(identity.language()) {
+        return false;
+    }
+    if identity.language().name != "javascript" || !identity.owner().is_local() {
+        return true;
+    }
+    let Some(namespace) = identity.qualified_path().first() else {
+        return false;
+    };
+    if namespace.starts_with("./") {
+        return true;
+    }
+    // Standalone module anchors name their physical path. Only admitted package
+    // namespace anchors can establish absence inside a bare JavaScript namespace.
+    let Ok(namespace) = SymbolIdentity::new(
+        identity.owner().clone(),
+        identity.language().clone(),
+        vec![namespace.clone()],
+    ) else {
+        return false;
+    };
+    let prefix = format!("{}/", namespace.wire_identity());
+    index
+        .objects()
+        .any(|(candidate, _)| candidate.as_str().starts_with(&prefix))
 }
 
 /// The bounded documentation that refers to the requested symbol.

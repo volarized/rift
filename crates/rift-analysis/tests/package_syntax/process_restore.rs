@@ -270,6 +270,7 @@ impl CapturedFacts {
                         .collect()
                 }),
                 source_digest: digest,
+                static_facts: None,
             },
         )
         .expect("checked facts");

@@ -19,6 +19,7 @@ mod provider;
 mod python;
 pub mod registry;
 mod rust;
+mod static_analysis;
 mod tailwind;
 mod toml;
 mod typescript;
@@ -48,6 +49,10 @@ pub use markdown::{
 pub use provider::{SyntaxBound, SyntaxLimits, SyntaxProvider, SyntaxSource};
 pub use python::PythonSyntaxProvider;
 pub use rust::{RustQuery, RustQueryCapture, RustSyntaxProvider};
+pub use static_analysis::{
+    StaticBinding, StaticBindingKind, StaticCall, StaticCallee, StaticFacts, StaticFactsParts,
+    StaticInherentImpl, StaticReexport,
+};
 pub use toml::TomlSyntaxProvider;
 pub use typescript::{TypeScriptDialect, TypeScriptSyntaxProvider};
 pub use web_component::{

@@ -31,6 +31,7 @@ use rift_protocol::read::RelationshipFacet;
 use rift_provider::{NormalizedGraph, NormalizedReference, NormalizedTarget};
 
 use crate::EnclosingDefinitions;
+use crate::static_resolution::StaticOccurrence;
 
 /// Most edges one [`RelationshipStore`] holds across both directions combined.
 ///
@@ -48,6 +49,7 @@ pub struct RelationshipEdge {
     to: SymbolId,
     facet: RelationshipFacet,
     occurrence: DeclarationBinding,
+    static_callee: Option<rift_syntax::ByteRange>,
 }
 
 impl RelationshipEdge {
@@ -95,6 +97,12 @@ impl RelationshipEdge {
     #[must_use]
     pub const fn occurrence(&self) -> &DeclarationBinding {
         &self.occurrence
+    }
+
+    /// The authored static callee range used to compare independently resolved call sites.
+    #[must_use]
+    pub const fn static_callee(&self) -> Option<rift_syntax::ByteRange> {
+        self.static_callee
     }
 }
 
@@ -181,6 +189,7 @@ fn reference_edges<'graph>(
             to: to.clone(),
             facet,
             occurrence: reference.binding().clone(),
+            static_callee: None,
         })
     })
 }
@@ -194,13 +203,17 @@ fn edge_order(left: &RelationshipEdge, right: &RelationshipEdge) -> Ordering {
         &left.from,
         &left.to,
         left.facet,
+        left.occurrence.unit(),
         left.occurrence.range().start(),
+        left.occurrence.range().end(),
     )
         .cmp(&(
             &right.from,
             &right.to,
             right.facet,
+            right.occurrence.unit(),
             right.occurrence.range().start(),
+            right.occurrence.range().end(),
         ))
 }
 
@@ -270,6 +283,70 @@ impl get_size2::GetSize for RelationshipStore {
 }
 
 impl RelationshipStore {
+    pub(crate) fn add_static(
+        &mut self,
+        graph: &NormalizedGraph,
+        occurrences: &[StaticOccurrence],
+        edges_max: usize,
+    ) {
+        if occurrences.is_empty() {
+            return;
+        }
+        let enclosing = UnitDefinitions::build(graph);
+        let existing = self.outgoing.values().map(Vec::len).sum::<usize>();
+        let mut remaining = edges_max.saturating_sub(existing);
+        let mut changed = false;
+        let mut admitted = BTreeMap::<&SymbolId, Vec<RelationshipEdge>>::new();
+        for occurrence in occurrences {
+            let NormalizedTarget::Symbol(to) = &occurrence.target else {
+                continue;
+            };
+            let Some(from) = enclosing.resolve(&occurrence.binding) else {
+                continue;
+            };
+            let edge = RelationshipEdge {
+                from: from.clone(),
+                to: to.clone(),
+                facet: role_facet(occurrence.role),
+                occurrence: occurrence.binding.clone(),
+                static_callee: Some(occurrence.callee_range),
+            };
+            admitted.entry(from).or_default().push(edge);
+        }
+        for (from, mut edges) in admitted {
+            edges.sort_by(edge_order);
+            edges.dedup();
+            let existing = self.outgoing(from);
+            edges.retain(|edge| {
+                existing
+                    .binary_search_by(|other| edge_order(other, edge))
+                    .is_err()
+            });
+            let (fits, omitted) = edges.split_at(edges.len().min(remaining));
+            self.dropped_edges = self
+                .dropped_edges
+                .saturating_add(u64::try_from(omitted.len()).unwrap_or(u64::MAX));
+            remaining -= fits.len();
+            for edge in fits {
+                self.outgoing
+                    .entry(from.clone())
+                    .or_default()
+                    .push(edge.clone());
+                self.incoming
+                    .entry(edge.to.clone())
+                    .or_default()
+                    .push(edge.clone());
+            }
+            changed |= !fits.is_empty();
+        }
+        if changed {
+            for edges in self.outgoing.values_mut().chain(self.incoming.values_mut()) {
+                edges.sort_by(edge_order);
+                edges.dedup();
+            }
+        }
+    }
+
     /// Builds the adjacency from every reference in `graph`, capped at
     /// [`RELATIONSHIP_EDGES_MAX`].
     #[must_use]

@@ -470,8 +470,8 @@ async fn search_traversal_abandons_a_retry_in_flight_past_the_readiness_timeout(
 }
 
 /// Runs three incoming walks under a 1 s `[server] readiness_timeout` over the `sh` engine
-/// `script_source`, whose `[languages.rust.lsp]` table also holds `lsp_keys`, asserts each
-/// answers `engine_analysis_unavailable` and that all three meet the one engine process, and
+/// `script_source`, whose `[languages.rust.lsp]` table also holds `lsp_keys`, checks
+/// the static caller, the engine timeout, and reuse of the same engine process, then
 /// returns the log the engine appended to by the end of the third walk.
 ///
 /// The engine's paused-clock unit owns the retry deadline. This integration covers the LSP
@@ -528,7 +528,7 @@ async fn incoming_walks_past_the_readiness_timeout(
         )
         .await?;
         eprintln!("incoming walk: answer={structured}");
-        assert!(results(&structured).is_empty(), "{structured}");
+        assert_eq!(symbol_names(&structured), ["caller"], "{structured}");
         let warning = &structured["warnings"][0];
         assert_eq!(
             warning["code"],
@@ -1374,9 +1374,8 @@ async fn search_traversal_over_an_engine_that_announces_nothing_warns_readiness_
     Ok(())
 }
 
-/// An engine answer naming a line the served `lib.rs` does not hold drops the engine's
-/// contribution with `engine_analysis_unavailable`, in either direction. The indexed store
-/// holds no edge, and the walk still answers with the warning instead of refusing.
+/// An engine answer outside the served `lib.rs` drops the engine contribution with
+/// `engine_analysis_unavailable` in either direction and retains the static edge.
 #[cfg(unix)]
 #[tokio::test]
 async fn search_traversal_over_an_unmappable_engine_answer_warns_in_both_directions() -> TestResult
@@ -1401,7 +1400,12 @@ async fn search_traversal_over_an_unmappable_engine_answer_warns_in_both_directi
             ),
         )
         .await?;
-        assert!(results(&structured).is_empty(), "{structured}");
+        let expected = if direction == "outgoing" {
+            "beacon"
+        } else {
+            "caller"
+        };
+        assert_eq!(symbol_names(&structured), [expected], "{structured}");
         let warnings = structured["warnings"]
             .as_array()
             .ok_or("the dropped contribution warns")?;
@@ -1642,8 +1646,7 @@ done
 "#;
 
 /// An outgoing walk whose engine still reads analyzing when its wait is spent
-/// answers with `engine_analysis_unavailable` and keeps the session: the second walk
-/// meets the same engine process instead of starting a replacement.
+/// retains its static callee and reuses the engine session on the next walk.
 #[cfg(unix)]
 #[tokio::test]
 async fn search_traversal_outgoing_past_the_readiness_timeout_warns_and_keeps_the_engine()
@@ -1690,7 +1693,7 @@ async fn search_traversal_outgoing_past_the_readiness_timeout_warns_and_keeps_th
         .await?;
         let elapsed = started.elapsed();
         eprintln!("outgoing walk: elapsed={elapsed:?} answer={structured}");
-        assert!(results(&structured).is_empty(), "{structured}");
+        assert_eq!(symbol_names(&structured), ["beacon"], "{structured}");
         let warning = &structured["warnings"][0];
         assert_eq!(
             warning["code"],

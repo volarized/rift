@@ -244,6 +244,35 @@ mod tests {
     }
 
     #[test]
+    fn projected_ask_can_be_decided_by_one_witness() {
+        let limits = GraphLimits::default();
+        let cases = [
+            ("ASK { <urn:caller> :calls <urn:callee> }", true),
+            (
+                "ASK { <urn:caller> :calls ?callee . ?callee :name 'leaf' }",
+                true,
+            ),
+            ("ASK { <urn:caller> :calls+ ?callee }", true),
+            (
+                "ASK { <urn:caller> :name 'caller' FILTER NOT EXISTS { <urn:caller> :calls ?callee } }",
+                false,
+            ),
+            (
+                "ASK { { SELECT ?callee { <urn:caller> :calls ?callee } LIMIT 1 OFFSET 1 } }",
+                false,
+            ),
+            (
+                "SELECT ?callee { <urn:caller> :calls ?callee } ORDER BY ?callee LIMIT 1",
+                false,
+            ),
+        ];
+        for (text, expected) in cases {
+            let query = GraphQuery::parse(text, &limits).expect("valid query");
+            assert_eq!(query.admits_partial_witness(), expected, "{text}");
+        }
+    }
+
+    #[test]
     fn test_graph_query_parse_refuses_unserved_features() {
         let syntax = refusal("SELECT WHERE {");
         assert_eq!(syntax, errors::search::query_syntax_invalid::SLUG);

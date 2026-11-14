@@ -5,7 +5,7 @@ use rift_protocol::workspace::WorkspaceResourcePage;
 use rmcp::ErrorData;
 use rmcp::model::{ReadResourceResult, Resource, ResourceContents, ResourceTemplate};
 
-use crate::output::resource_text;
+use crate::output::{log_warnings, resource_text};
 
 use crate::failure::McpErrorFailExt as _;
 
@@ -94,6 +94,7 @@ pub(crate) fn rendered_workspace(
     uri: &str,
     page: &WorkspaceResourcePage,
 ) -> Result<ReadResourceResult, ErrorData> {
+    log_warnings(&page.warnings);
     let body = serde_json::to_string(page)
         .unwrap_or_else(|error| unreachable!("workspace resource pages serialize: {error}"));
     Ok(answer(uri, resource_text(page)?, body))
@@ -101,6 +102,7 @@ pub(crate) fn rendered_workspace(
 
 /// The cached workspace map as one JSON resource content.
 pub(crate) fn map_answer(uri: &str, map: &WorkspaceMap) -> ReadResourceResult {
+    log_warnings(&map.warnings);
     let body = serde_json::to_string(map)
         .unwrap_or_else(|error| unreachable!("the workspace map serializes: {error}"));
     ReadResourceResult::new(vec![

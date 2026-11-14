@@ -377,7 +377,7 @@ impl RiftProxy {
             && request.target != SearchParamsTarget::Commit;
         let response = if ranking {
             let request = producer_request("search", &request)?;
-            self.captured_search(&request)
+            self.captured_search(&request, true)
                 .await?
                 .ok_or_else(|| query_failure("the ranked producer has no response"))?
         } else {

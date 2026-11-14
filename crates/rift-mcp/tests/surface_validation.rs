@@ -73,45 +73,20 @@ fn assert_validates(validator: &Validator, instance: &Value, context: &str) {
     );
 }
 
-/// Proves one tool result carries source-unit resolvers the request reaches,
-/// that every `search` hit names exactly one location, and that a read result
-/// warns only what it is entitled to.
-///
-/// `get_symbol` carries empty `warnings`: the live server resolves one published workspace
-/// per request, so the request cannot observe a lagging index. Query-based `nodes` and
-/// `search` preserve warnings from their actual requested families and services.
-///
-/// `search` does consult it, and the search tier is prepared behind the answers, so this
-/// fixture's default `[search.vector]` table legitimately produces
-/// `vector_index_preparing` while the corpus runs. What it must never produce is
-/// `lexical_ranking_unavailable`: a search answers a lexical commit still in flight with
-/// that warning instead of waiting for it, and waits for a busy connection pool within
-/// `[search] busy_timeout`. This suite asserts the warning never fires, so a commit in
-/// flight while it runs, or a pool busy past that bound, fails it rather than becoming a
-/// warning every caller learned to ignore.
-///
-/// A `get_symbol` request with a released owner, or a `search` request whose `scope`
-/// reaches packages, carries the package
-/// warnings and no other: the fixture's path dependency `helper` answers
-/// `package_unavailable`, the standard library entry the fixture global API cannot
-/// resolve answers `package_requirement_absent`, and the global API's own page warnings
-/// arrive as `global_page_warning`.
+/// Verifies source-unit resolvers and client-visible result fields.
 fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
     let context = format!("{name} result");
     let reaches_dependencies = request_reaches_dependencies(name, request)
         .expect("a validated exact request carries a canonical symbol identity");
-    // Schema validation above checks the separate revision and documentation digest forms.
     assert_source_unit_ids_use_served_resolvers(structured, &context, reaches_dependencies);
-    if reaches_dependencies {
-        assert_dependency_warnings_only(structured);
-    }
-    if name == "get_symbol" && !reaches_dependencies {
-        assert!(
-            structured.get("warnings").is_none(),
-            "a live {name} result must omit warnings when there is nothing to warn about: \
-             {structured:#}"
-        );
-    }
+    assert!(
+        structured.get("warnings").is_none(),
+        "{context}: {structured:#}"
+    );
+    assert!(
+        structured["documentation"].get("warnings").is_none(),
+        "{context}: {structured:#}"
+    );
     if name == "get_symbol" {
         let include = request.get("include").and_then(Value::as_array);
         let expects_history =
@@ -128,18 +103,6 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
                     "a hit omits history unless the request includes it: {request:#} {hit:#}"
                 );
             }
-        }
-    }
-    if matches!(name, "search" | "nodes")
-        && let Some(warnings) = structured["warnings"].as_array()
-    {
-        for warning in warnings {
-            assert_ne!(
-                warning["code"],
-                json!("lexical_ranking_unavailable"),
-                "an ordinary search must never rank without the full-text tier: \
-                 {structured:#}"
-            );
         }
     }
     if name == "search"
@@ -253,34 +216,6 @@ fn exact_request_owner_controls_source_resolvers_and_refuses_malformed_identity(
         Some(false)
     );
     Ok(())
-}
-
-/// A search hit in a file is addressed by exactly one of `path` and `unit`, and a file hit
-/// carries `unit` only for a package file, which a package scope alone reaches. A commit
-/// hit carries neither.
-///
-/// Every warning on a package-scoped answer is one of the package warnings.
-fn assert_dependency_warnings_only(structured: &Value) {
-    for warning in structured["warnings"].as_array().into_iter().flatten() {
-        assert!(
-            matches!(
-                warning["code"].as_str(),
-                Some(
-                    "global_access_disabled"
-                        | "global_api_unavailable"
-                        | "global_publication_incompatible"
-                        | "global_response_invalid"
-                        | "global_page_warning"
-                        | "package_absent"
-                        | "package_requirement_absent"
-                        | "package_substituted"
-                        | "package_unavailable"
-                        | "package_context_degraded"
-                )
-            ),
-            "a package-scoped answer warns of the packages alone: {warning:#}"
-        );
-    }
 }
 
 /// Walks `value`, proving every `rift://source/` identity uses a resolver the request can
@@ -765,9 +700,6 @@ struct CorpusArms {
     past_end_pages: usize,
     dependency_units: usize,
     search_dependency_units: usize,
-    unavailable_entries: usize,
-    replaced_entries: usize,
-    added_entries: usize,
     literal_at_identities: usize,
     escaped_identities: usize,
     query_forms: BTreeSet<String>,
@@ -778,19 +710,6 @@ impl CorpusArms {
     fn observe(&mut self, structured: &Value) {
         self.dependency_units += dependency_unit_count(&structured["declarations"]);
         self.search_dependency_units += dependency_unit_count(&structured["answer"]["bindings"]);
-        for warning in structured["warnings"].as_array().into_iter().flatten() {
-            if warning["code"] == "package_unavailable" {
-                self.unavailable_entries += 1;
-            }
-            if warning["code"] == "package_absent" && warning["package"]["name"] == "helper" {
-                self.replaced_entries += 1;
-            }
-            if warning["code"] == "package_requirement_absent"
-                && warning["entry"]["name"] == "extra"
-            {
-                self.added_entries += 1;
-            }
-        }
         for identity in node_units(structured) {
             if identity.contains('@') && !identity.contains("%40") {
                 self.literal_at_identities += 1;
@@ -831,14 +750,6 @@ impl CorpusArms {
         assert!(
             self.search_dependency_units > 0,
             "query bindings retain package source units"
-        );
-        assert!(
-            self.unavailable_entries > 0,
-            "path dependency remains explicitly unavailable"
-        );
-        assert!(
-            self.replaced_entries > 0 && self.added_entries > 0,
-            "package replacement and addition remain visible"
         );
         assert!(
             self.literal_at_identities > 0 && self.escaped_identities > 0,
@@ -1336,6 +1247,10 @@ async fn a_package_walk_with_missing_relationship_coverage_matches_the_served_sc
 async fn packages_beside_the_local_scope_or_rev_refuse_naming_packages() -> TestResult {
     let (_directory, client, server_task) = served_fixture().await?;
     let validators = tool_validators(&client.list_all_tools().await?)?;
+    let warmup = workspace_client::query::retrieval(&serde_json::from_value(
+        json!({"query": "helper_beacon"}),
+    )?)?;
+    workspace_client::query_after_population(&client, &warmup).await?;
     let packages = json!([{ "manager": "cargo", "name": "demo", "version": "1.0.0" }]);
     let id = workspace_client::captured_seed(&client, "beacon_one", "lib.rs").await?;
     let requests = [

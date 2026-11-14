@@ -39,6 +39,8 @@ async fn served_tool_failures_are_completed_error_results() -> TestResult {
     });
     let client = ().serve(client_transport).await?;
     workspace_client::await_workspace_ready(&client).await?;
+    let ready = query::retrieval(&serde_json::from_value(json!({ "query": "beacon" }))?)?;
+    workspace_client::query_after_population(&client, &ready).await?;
 
     let failing_requests = [
         ("search", json!({ "query": "" })),
@@ -78,7 +80,8 @@ async fn served_tool_failures_are_completed_error_results() -> TestResult {
             client
                 .call_tool(CallToolRequestParams::new(tool).with_arguments(arguments))
                 .await,
-        )?;
+        )
+        .map_err(|error| format!("{tool} request {request}: {error}"))?;
         assert!(
             !failure.message.is_empty(),
             "{tool} failure message must not be empty: {}",

@@ -8,12 +8,16 @@ use rift_syntax::{SyntaxLimits, SyntaxSource, registry};
 use crate::{ExactPackageLimits, IndexedFile, NamespaceInput, PackageSource, WorkspaceSemantics};
 
 fn source() -> IndexedFile {
-    let path = ProjectPath::new("src/lib.rs").expect("source path");
-    let text = "pub fn start() {}";
-    let syntax = registry::provider_for_extension("rs")
-        .expect("Rust provider")
+    source_file("src/lib.rs", "pub fn start() {}")
+}
+
+fn source_file(path: &str, text: &str) -> IndexedFile {
+    let path = ProjectPath::new(path).expect("source path");
+    let extension = path.as_str().rsplit_once('.').expect("source extension").1;
+    let syntax = registry::provider_for_extension(extension)
+        .expect("syntax provider")
         .analyze(SyntaxSource { path: &path, text }, SyntaxLimits::default())
-        .expect("Rust syntax");
+        .expect("source syntax");
     IndexedFile::new(
         path,
         Arc::new(text.to_owned()),
@@ -21,6 +25,74 @@ fn source() -> IndexedFile {
         false,
         syntax,
     )
+}
+
+fn static_project(
+    files: &[&IndexedFile],
+    revision: u64,
+    previous: Option<&WorkspaceSemantics>,
+) -> WorkspaceSemantics {
+    let language = Language::from_identity_segment("javascript").expect("JavaScript language");
+    let sources = files
+        .iter()
+        .map(|file| PackageSource::new(file.path(), file.source()))
+        .collect::<Vec<_>>();
+    let input = NamespaceInput::project(
+        &SymbolOwner::Local,
+        &language,
+        &sources,
+        &[],
+        &[],
+        ExactPackageLimits::new(16, 32_768),
+    )
+    .expect("captured context");
+    WorkspaceSemantics::build_captured_project_facts(
+        input,
+        files,
+        64,
+        64,
+        revision,
+        previous.map(WorkspaceSemantics::graph),
+    )
+    .expect("captured static semantics")
+    .semantics
+}
+
+#[test]
+fn static_call_targets_follow_edits_and_held_views_keep_original_occurrences() {
+    let original = source_file(
+        "main.mjs",
+        "import { start as run } from './jobs.mjs'; export function caller() { run(); }",
+    );
+    let old_target = source_file("jobs.mjs", "export function start() {}");
+    let original_view = static_project(&[&original, &old_target], 7, None);
+    let moved_target = source_file("tasks.mjs", "export function start() {}");
+    let edited = source_file(
+        "main.mjs",
+        "import { start as run } from './tasks.mjs'; export function caller() { run(); }",
+    );
+    let edited_view = static_project(&[&edited, &moved_target], 8, Some(&original_view));
+    let cold_view = static_project(&[&edited, &moved_target], 8, None);
+    for (view, source, expected) in [
+        (&original_view, &original, "rift://source/project/jobs.mjs"),
+        (&edited_view, &edited, "rift://source/project/tasks.mjs"),
+        (&cold_view, &edited, "rift://source/project/tasks.mjs"),
+    ] {
+        let call = view
+            .static_occurrences()
+            .iter()
+            .find(|occurrence| occurrence.role == rift_core::ReferenceRole::Call)
+            .expect("captured call");
+        assert_eq!(call.target_binding.unit().to_string(), expected);
+        assert_eq!(
+            call.source_digest,
+            FileDigest::of(source.source().as_bytes())
+        );
+    }
+    let deleted_view = static_project(&[&edited], 9, Some(&edited_view));
+    assert!(deleted_view.static_occurrences().is_empty());
+    assert_eq!(original_view.static_occurrences().len(), 2);
+    assert_eq!(edited_view.static_occurrences().len(), 2);
 }
 
 #[test]

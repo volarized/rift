@@ -35,6 +35,7 @@ impl RiftMcp {
             if let Some(output) = tool.output_schema.as_mut() {
                 let output = Arc::make_mut(output);
                 rift_protocol::schema::strip_optional_null_arms(output);
+                rift_protocol::schema::strip_response_warnings(output);
                 if matches!(tool.name.as_ref(), "get_symbol" | "search") {
                     // These result unions contain only objects. Keep their union constraints
                     // while declaring the root type required by earlier MCP clients.
@@ -93,6 +94,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tool_output_schemas_exclude_response_warnings() {
+        let document: serde_json::Value =
+            serde_json::from_str(&schema_document()).expect("exported MCP document");
+        for tool in document["tools"].as_array().expect("tool listing") {
+            let mut pending = vec![&tool["output_schema"]];
+            while let Some(node) = pending.pop() {
+                match node {
+                    serde_json::Value::Object(object) => {
+                        assert!(!object.contains_key("warnings"), "{node}");
+                        pending.extend(object.values());
+                    }
+                    serde_json::Value::Array(items) => pending.extend(items),
+                    serde_json::Value::String(value) => assert_ne!(value, "warnings"),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[test]
     fn object_output_unions_keep_their_original_constraints() {
         let declared = RiftMcp::declared_tool_router().list_all();
         let served = tool_listing();
@@ -111,6 +132,7 @@ mod tests {
                 .expect("declared output")
                 .clone();
             rift_protocol::schema::strip_optional_null_arms(&mut expected);
+            rift_protocol::schema::strip_response_warnings(&mut expected);
             expected.entry("type").or_insert(json!("object"));
             let actual = current
                 .output_schema

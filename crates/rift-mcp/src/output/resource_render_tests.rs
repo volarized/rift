@@ -1,10 +1,8 @@
 //! Goldens of workspace resource text.
 
-use rift_protocol::dependencies::PackageAvailability;
 use rift_protocol::workspace::WorkspaceResourcePage;
 use serde_json::{Value, json};
 
-use super::facts::{CANONICAL_AVAILABILITY, package_text, wire_name};
 use super::{Render, text_of};
 
 /// The text of `answer`, with no line ending in a space.
@@ -25,26 +23,6 @@ fn golden<T: Render>(answer: &T, expected: &[&str]) {
 
 fn page_of(value: Value) -> WorkspaceResourcePage {
     serde_json::from_value(value).expect("the workspace fixture deserializes")
-}
-
-#[test]
-fn a_package_names_its_availability_only_when_it_is_not_canonical() {
-    assert_eq!(
-        package_text(("cargo", "serde"), ("1.0.0", ""), CANONICAL_AVAILABILITY),
-        "serde@1.0.0 (cargo)"
-    );
-    assert_eq!(
-        package_text(("cargo", "serde"), ("", "^1.0"), "git"),
-        "serde ^1.0 (cargo, git)"
-    );
-    assert_eq!(
-        package_text(("cargo", "serde"), ("", ""), "url"),
-        "serde (cargo, url)"
-    );
-    assert_eq!(
-        wire_name(&PackageAvailability::Canonical).expect("a unit variant"),
-        CANONICAL_AVAILABILITY
-    );
 }
 
 /// The effective language entry of the protocol example.
@@ -177,7 +155,7 @@ fn patterns_join_by_comma_and_an_empty_list_writes_no_line() {
 }
 
 #[test]
-fn a_workspace_page_writes_its_warnings_after_the_last_section() {
+fn warnings_leave_workspace_resource_text_unchanged() {
     let page = page_of(json!({
         "configuration_revision": "3f9a1c2e",
         "languages": [],
@@ -196,8 +174,6 @@ fn a_workspace_page_writes_its_warnings_after_the_last_section() {
             "source:",
             "\ta.rs · rust · 00000001",
             "\tnotes.txt · 00000002",
-            "1 warning",
-            "\tlocal_index_preparing · prepared 1: selected local files are still being prepared",
         ],
     );
 }

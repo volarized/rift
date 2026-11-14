@@ -31,12 +31,11 @@ codebase. The answer carries:
 - `packages` - the packages the workspace's manifests and lockfiles state, in `manager`,
   `name`, then selector order
 - `pagination` - always page zero of one, the whole map on one page
-- `warnings` - conditions that qualify the answer, omitted when empty
 
-During local preparation, the map carries [`local_index_preparing`](#reads). File counts and
-documentation paths can describe discovered files before their declarations are prepared;
-symbol counts describe prepared declarations. The server **MUST** return the map's revision,
-counts, and warnings from the same publication.
+During local preparation, file counts and documentation paths can describe discovered files
+before their declarations are prepared. Symbol counts describe prepared declarations. The
+server **MUST** take the map's revision and counts from the same publication and log
+[`local_index_preparing`](#reads) for incomplete preparation.
 
 `entry_points` lists symbols carrying the `entrypoint`
 [`SymbolFacet`](/docs/developer/protocol/reference) - a file-scope `fn main`, not one
@@ -139,8 +138,7 @@ projects the corresponding producer payload. Service input triples select record
 require those input values as stored facts on every result.
 
 `:limit` and `:page_index` select a producer page. Outer `LIMIT` and `OFFSET` apply to the
-SPARQL result after evaluation. A producer warning that indicates missing coverage can make
-the query unavailable.
+SPARQL result after evaluation. Missing producer coverage can make the query unavailable.
 
 ### Pattern [#search-pattern]
 
@@ -249,14 +247,13 @@ not supplied. Existing history selection and commit-search refusals remain typed
 `:scope "local"` selects the primary project; accepted `local@name` and `local@name:profile` contexts
 select an extra project or profile. `:scope "global"` selects dependency facts and `:scope "all"`
 combines accepted contexts. `:packages` carries requested package selections as `rdf:JSON`.
-Existing dependency resolution, exact package versions, unavailable-package warnings, and
-explicit package constraints remain producer-owned.
+The producer handles dependency resolution, exact package versions, and explicit package constraints.
 
 Remote acquisition uses bounded batches and holds the selected publication for the query.
 
 ### Captured answers and pages
 
-A successful answer carries `answer`, optional `view`, `pagination`, and optional `warnings`.
+A successful answer carries `answer`, optional `view`, and `pagination`.
 `pagination.page_index` and `total_pages` describe transport pages. When another page exists,
 `pagination.next_query` contains its complete SPARQL request. Send it unchanged as `query`.
 The server decodes that stored page rather than evaluating the original statement again.
@@ -272,7 +269,7 @@ The server bounds statement size, algebra, fact acquisition, and the evaluated a
 `[search.query] page_size` sets the maximum records per transport page, from 1 to 1000.
 `[search.query] page_limit` sets the maximum encoded bytes per page, from 1 KiB to 4 MiB.
 
-A query requiring missing facts returns typed unavailability and warnings before evaluation.
+A query requiring missing facts returns typed unavailability before evaluation.
 This applies to `ASK`, counts, negation, bindings, and graphs. Available-empty facts differ
 from unavailable facts. A query needing only published symbol names does not require
 unavailable nodes, history, or engine facts. Supplied node facts are preserved; query evaluation
@@ -394,6 +391,10 @@ selection failures. A malformed identity is refused before lookup:
 A request selects its nodes through exactly one of `symbol` or `path` with `position`; the server
 **MUST** refuse any other combination with `invalid_request`.
 
+A path request **MAY** carry `scope` to select an [accepted project or profile](/docs/developer/configuration#extra-projects).
+The server resolves `path` and any Git `revision` in the selected project. Omitting `scope`
+selects `local`. The caller **MUST** omit `scope` beside `symbol`.
+
 A `symbol` read answers every node of the symbol: per declaration, in the order
 [`get_symbol`](#tool-get_symbol) lists its declarations, the item node, which spans the
 declaration without its attached documentation, then each node of its item subtree in
@@ -427,9 +428,9 @@ a syntax bound left out refuses `content_unavailable`.
 
 During local preparation, the server **MAY** prepare the requested path within the remaining
 [`readiness_timeout`](/docs/developer/configuration#server) budget. An answer for a path outside
-the published prepared files carries [`local_index_preparing`](#reads), including when syntax
-is returned; this read does not advance published progress. Exhausted preparation returns empty
-nodes with that warning.
+the prepared publication can return syntax while the server logs
+[`local_index_preparing`](#reads). This read leaves published progress at its current position.
+The server returns `temporarily_unavailable` when preparation exceeds the remaining budget.
 
 A node carries no identity. The server **MUST** address each node by its place: a node inside a
 declaration's item subtree carries the `declaration` ordinal among the declarations of the
@@ -475,31 +476,30 @@ at answers under its own path.
 immutable `view` with an expiry; later searches can retain that selection. Expiry never selects
 latest implicitly.
 
-Every read result also carries `warnings`. A `stale_index` warning reports an answer computed
-from an index that lags the tree the read captured, and names the two tree revision digests that
-disagree.
+The server writes read diagnostics to its workspace logs. Use `rift server logs` to inspect them.
+A `stale_index` record names the revision an answer used and the newer tree revision the read captured.
 
-The server **MUST** carry `local_index_preparing` once while the requested local scope remains
+The server logs `local_index_preparing` while the requested local scope remains
 incomplete. `prepared` counts visible files whose capture and analysis finished, including files
 refused under an accepted bound; `total` is omitted until discovery finishes. `ready_in` is
 omitted because the server has no preparation estimate.
 
 An exact symbol read cannot establish complete declaration coverage while selected files
-remain unprepared. Global-only reads omit local preparation warnings. Preparation counts
-describe the answer's publication and can decrease when source selection changes.
+remain unprepared. The server logs local preparation for reads that select local source.
+Preparation counts describe the answer's publication and can decrease when source selection changes.
 
-A read served while the last rebuild's failure stands carries `stale_index` too, with a `detail`
+The server also logs `stale_index` when the last rebuild failed, with a `detail`
 naming the failure; the next filesystem event retries the rebuild. When its two digests are equal,
 the tree moved in recorded files outside the syntax-indexed ones or in the configuration file, and
 `detail` says which.
 
-The search ranking tiers carry their own warnings:
+The server logs diagnostics for ranking and result bounds:
 
 - `vector_index_preparing` - the vector ranking holds no vectors for the tree this answer
   was read from: the pass over that tree is still running, or the tree was published after
   the corpus the ranking holds was described. A query sharing no token with the code it
   describes reaches nothing until that pass lands; `prepared` and `total` state how far it
-  has got, and an answer carrying no such warning is one the vector ranking took part in.
+  has progressed.
 - `vector_ranking_unavailable` - the vector ranking will not answer for the life of this
   server: the model weights could not be acquired, or the model failed to load.
 - `lexical_ranking_unavailable` - the full-text tier has not yet committed the captured tree,
@@ -508,9 +508,8 @@ The search ranking tiers carry their own warnings:
   attempts; the `detail` names which, with the tree revision in the first three cases. Ranking
   falls back to identifier matching, so a query phrased as prose finds nothing. The tier is read
   under the answer's own tree revision, so one that has moved past it is recaptured, up to those
-  attempts, rather than warned about, a case a caller cannot otherwise tell apart from a tier
-  that searched and found nothing. A pending commit keeps this warning in the answer; a later
-  search can use the full-text tier after the commit lands.
+  attempts, before the server logs the fallback. A later search can use the full-text tier after
+  the commit lands.
 - `history_store_filling` - a [commit search](#search-commits) answered while the history store
   lacks some of the commits its latest fill selects, or the commit `HEAD` names; `analyzed` and
   `total` state how far the fill has got.
@@ -526,20 +525,20 @@ The search ranking tiers carry their own warnings:
   phrase is kept. Shorten `query`, or quote the terms that must be matched.
 - `results_truncated` - the server reached `results_max`, its result bound, before ordering and
   paging. The bound covers both the candidates one read ranks and the hits it returns, so what
-  it cut never reaches any page and `total_pages` counts only what fit. The warning means the
-  bound was reached: a read that cut nothing else but filled the candidate pool carries it too.
+  it cut never reaches any page and `total_pages` counts only what fit. The server logs this
+  code whenever a read fills the candidate pool, including when every candidate fits.
   A narrower `query` or `paths` brings the read inside the bound.
 
-A `symbol_disagreement` warning names a symbol whose selected presentation and at least one
+A `symbol_disagreement` record names a symbol whose selected presentation and at least one
 provider's own facts disagree.
 
-A `source_unavailable` warning names a file the index left out - bytes that are not valid UTF-8,
+A `source_unavailable` record names a file the index left out - bytes that are not valid UTF-8,
 a file past its per-file bound, or a syntax tree the provider refused - so it answers no search or
-lookup while every other file stays available. An answer carries at most eight of them, in
-project-path order; when more files were left out, one more `source_unavailable` carries no `unit`
-and counts the rest. `rift server logs` names each omitted file.
+lookup while every other file stays available. A read logs at most eight omitted files in
+project-path order, followed by a `source_unavailable` summary if more files were omitted.
+The index build logs each omission.
 
-Text search answers can carry these warnings:
+Text search can produce these diagnostics:
 
 - `pattern_matches_truncated` - a file held more matches of `pattern` than the `[search]` key
   `pattern_matches_per_file`, so its later matches are missing while every other file answers in
@@ -558,8 +557,7 @@ Text search answers can carry these warnings:
   under the `[search.text]` key `excluded_lockfiles`. `rift://map` still carries the versions it
   pins, and naming the file in `paths.force_include` searches it for one request.
 
-A package-scope answer whose read never reached the global API, or met no answer from it,
-carries no package facts and one of these warnings naming why:
+When a package read cannot obtain global facts, the server logs the cause:
 
 - `global_access_disabled` - `[global] enabled` is `false`, so no package read reaches the
   global API.
@@ -570,7 +568,7 @@ carries no package facts and one of these warnings naming why:
 - `global_response_invalid` - the global API response is invalid or truncated. `failure_class`
   names which.
 
-Package-scope answers can also carry these package warnings:
+The server also logs these package diagnostics:
 
 - `global_page_warning` - a valid global page carried a bounded condition. `warning_code`
   identifies it and optional `detail` explains it. `result_truncated` names a page the global API
@@ -609,13 +607,11 @@ Each `availability` a `package_unavailable` warning names carries its own `reaso
 A path dependency inside the workspace is project source: the local index covers it, and the
 dependency context names no entry for it.
 
-An answer carries at most eight `package_context_degraded`, `package_unavailable`,
+A read logs at most eight `package_context_degraded`, `package_unavailable`,
 `package_absent`, `package_requirement_absent`, and `package_substituted` warnings together: the
 degraded resolvers first, in resolver order, then the entries no public registry serves, then the
 packages and requirements the global publication lacks, then the entries a nearest release
-answers for. The global warning naming why the global API did not answer rides before them,
-outside that bound. The `source_unavailable` bound above is separate, so an answer can carry
-eight of each.
+answers for. The global API failure and source omission diagnostics have separate bounds.
 
 `get_symbol` and `nodes` accept an optional `revision`. A local read with no revision
 selects the working tree.
@@ -636,8 +632,8 @@ The proxy **MUST** keep the selected output for its lifetime. Direct HTTP access
 `rift server` carries both tool representations.
 
 Search text shows the query answer and any continuation. An exact read states its outcome and
-selected object. Warnings state their code and details. The [tool execution failure](#tool-execution-failures)
-form applies when `isError` is set.
+selected object. Use `rift server logs` for diagnostic codes and details.
+The [tool execution failure](#tool-execution-failures) form applies when `isError` is set.
 
 ### Revision-addressed reads [#revision-reads]
 
@@ -781,7 +777,7 @@ the caller runs it from the map project's root.
 
 The listings of resources and resource templates declare `application/json`, the type of the JSON body. A caller **SHOULD** select a content by its `mimeType`, because the `text` [output selection](#result-content) leaves compact text as the only content of a workspace read. The map remains JSON under both selections.
 
-The compact text of the workspace resource follows the layout of a [tool result](#result-content): the facts of one line are separated by ` · `, a direction is written with `→`, a lowercase hex value of at least 8 characters is cut to its first 8, and the normal state of a fact is left out. Warnings form the section `N warnings`, or `1 warning`, after the last section, and a section with no entry is omitted. The server enforces a byte limit on the text and refuses a read whose text crosses it as a protocol failure, with the typed `ErrorData` as `data`.
+The compact text of the workspace resource follows the layout of a [tool result](#result-content): the facts of one line are separated by ` · `, a direction is written with `→`, a lowercase hex value of at least 8 characters is cut to its first 8, and the normal state of a fact is left out. The server omits sections with no entries. The server enforces a byte limit on the text and refuses a read whose text crosses it as a protocol failure, with the typed `ErrorData` as `data`.
 
 ### Workspace [#resource-workspace]
 
@@ -793,7 +789,6 @@ The answer carries:
   syntax availability, and selected LSP process state
 - `source` - captured project paths, content digests, and matched language identities
 - `pagination` - the zero-based page and total page count
-- `warnings` - conditions that qualify the page, omitted when empty
 
 The bare URI selects page zero. `rift://workspace?page_index=1` selects another page. Each page
 holds at most 1000 source units; language summaries repeat so every page can be read
@@ -806,7 +801,6 @@ A read answers the [two contents](#resource-contents) of a resource. The compact
 - a language entry: the language identity, `disabled` when `enabled` is `false`, `syntax` and `execution` when they hold, and `lsp <process> <state>` when the language has a selected LSP process
 - under a language entry, `include` and `exclude` lines with their patterns joined by `, `, each only when the list is not empty
 - a source entry as `path · language · digest`, without the language when none matched
-- after the last section, when the page carries warnings, the section `N warnings`, or `1 warning`, with one line per warning as in a [tool result](#result-content)
 
 The tabs below show the page of a workspace with one TypeScript language and one source unit:
 
@@ -876,9 +870,9 @@ source:
 </ExampleTabs>
 
 The source page describes one published catalog. The server **MUST** return its configuration
-revision, source digests, pagination, and preparation warning from that publication. During
-preparation, the page carries [`local_index_preparing`](#reads) and lists prepared files;
-after preparation, the catalog also includes visible files without enabled syntax.
+revision, source digests, and pagination from that publication. During preparation, the server
+logs [`local_index_preparing`](#reads) and the page lists prepared files.
+After preparation, the catalog also includes visible files without enabled syntax.
 
 ## Errors
 
