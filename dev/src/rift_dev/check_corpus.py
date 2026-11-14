@@ -683,7 +683,7 @@ class Corpus:
             await self.churn_case()
             return
         await self.baseline()
-        if self.pin.name == "bun":
+        if self.pin.name in {"bun", "nextjs"}:
             await self.lexical_persistence(self.linked_root())
         else:
             await self.lexical_persistence()
