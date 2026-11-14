@@ -275,12 +275,11 @@ pub(crate) async fn search_after_population(
     populated_answer(client, "search_retrieval", arguments).await
 }
 
-/// Calls the public SPARQL route once its required local population is ready.
+/// Retries the public SPARQL query while its selected corpus is still preparing.
 pub(crate) async fn query_after_population(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     arguments: &rift_protocol::query::QueryParams,
 ) -> TestResult<Value> {
-    search_after_population(client, &json!({"query":"beacon","scope":"local"})).await?;
     populated_answer(client, "search", &serde_json::to_value(arguments)?).await
 }
 

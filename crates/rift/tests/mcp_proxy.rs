@@ -656,13 +656,14 @@ async fn assert_worktree_node_reads(
         );
     }
 
-    let found = proxied_call(
+    let found = workspace_client::query_after_population(
         client,
-        "search",
-        &json!({
-        "query": "SELECT DISTINCT ?path { SERVICE :search { ?hit :pattern 'fn review'; :target 'file'; \
-                      :scope 'local@review'; :path ?path } } LIMIT 2"
-        }),
+        &rift_protocol::query::QueryParams {
+            query: "SELECT DISTINCT ?path { SERVICE :search { ?hit :pattern 'fn review'; \
+                    :target 'file'; :scope 'local@review'; :path ?path } } LIMIT 2"
+                .to_owned(),
+            language: rift_protocol::query::QueryLanguage::Sparql,
+        },
     )
     .await?;
     let [hit] = workspace_client::query::rows(&found)? else {
