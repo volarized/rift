@@ -1687,6 +1687,15 @@ message = "workspace server identity differs from this rift process: server pid 
 action = "run rift server stop, then retry"
 fields = { pid = { type = "pid" }, server_version = { type = "string" }, server_schema_digest = { type = "string" }, version = { type = "string" }, schema_digest = { type = "string" } }
 
+[error.mcp.feedback_intake_unavailable]
+message = "feedback intake is unavailable"
+action = "set RIFT_FEEDBACK_URL and restart the workspace server"
+
+[error.mcp.feedback_unconfirmed]
+message = "feedback submission is unconfirmed"
+action = "check with the intake operator before sending the report again"
+fields = { detail = { type = "string" } }
+
 [error.mcp.forward_failed]
 message = "the workspace's rift server failed the forwarded request: {source}"
 action = "check the server with `rift server start --foreground`"

@@ -370,6 +370,26 @@ The agent chooses the range it needs and applies the change with its own editing
 After the file changes, it should read again before using its ranges for another edit.
 See the [nodes reference](/docs/developer/protocol/mcp#tool-nodes) for the response shape and supported files.
 
+## Feedback [#tool-feedback]
+
+`feedback` sends a report from the local Rift server to a configured HTTPS intake.
+Set `RIFT_FEEDBACK_URL` to the full intake URL in the environment that starts the server.
+If a workspace server is already running, restart it from that environment for the change to apply.
+
+Describe the Rift behavior and what the caller expected. A report can include a short,
+redacted Rift error or response excerpt. Before including an exact excerpt from the
+conversation, show the user that excerpt and get approval to send it in this report.
+
+```json
+{
+  "text": "The nodes tool returned an empty result for a symbol it found.",
+  "include_details": ["os", "rift_version"]
+}
+```
+
+The server sends the diagnostic fields named in `include_details`. Omit it to send the text alone.
+See the [feedback reference](/docs/developer/protocol/mcp#tool-feedback) for the payload and failure behavior.
+
 ## Edits and index updates [#edit-and-index-updates]
 
 As the agents edit the codebase, rift watches the project files and updates the local index

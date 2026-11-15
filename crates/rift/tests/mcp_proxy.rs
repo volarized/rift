@@ -97,7 +97,7 @@ use surface_corpus::SurfaceFixture;
 use tokio::sync::Notify;
 
 /// The tools the workspace server advertises, in served order.
-const SERVED_TOOL_NAMES: [&str; 3] = ["get_symbol", "nodes", "search"];
+const SERVED_TOOL_NAMES: [&str; 4] = ["feedback", "get_symbol", "nodes", "search"];
 
 #[test]
 fn proxied_engine_bound_covers_two_retry_sequences_and_election() {

@@ -525,6 +525,25 @@ full syntax tree of `load_config`, the declaration holding it:
 
 <ReadExample name="local-nodes" />
 
+## Feedback [#tool-feedback]
+
+`feedback` submits one report to the HTTPS intake named by the server process's
+`RIFT_FEEDBACK_URL`. The URL carries no credentials, query, or fragment.
+
+The server sends `text` verbatim. It MUST contain at least one non-whitespace character
+and fit within 4,096 UTF-8 bytes. The optional `include_details` array accepts `os`
+for the server's operating system name and `rift_version` for its package version.
+Each entry can appear once. Omit the array or pass an empty array to send only `text`.
+The server reads no workspace files, logs, or conversation history to construct the report.
+
+The caller MUST redact secrets, personal data, and private source material before sending
+the report. The caller MUST obtain approval for the exact conversation excerpt before
+sending it as part of `text`.
+
+The server returns `{"submitted": true}` after the intake confirms storage with HTTP 204.
+If confirmation is lost, the call reports an unconfirmed submission. Rift makes at most
+one submission attempt per call.
+
 ## Reads
 
 Callers read code through these tools:
@@ -1066,13 +1085,14 @@ Every failure carries a `retry` directive, which is the field to branch on - it 
 instance rather than the code, because the same `storage_failure` can be transient once and
 permanent the next time:
 
-- `never` - the same bytes will fail the same way
+- `never` - the caller cannot resolve the failure by retrying the same request
 - `same_request` - it was transient: an index still filling, a tree with a filesystem
   write in flight
-- `operator_action` - the workspace requires a local state or configuration change before retry
+- `operator_action` - an operator must check or change state before a retry
 
-The `phase` field of `ErrorData` names the operation that failed while serving the request; its only value, `read`, covers reading
-workspace or provider data. A `limit_exceeded` also carries which limit and by how much, so a
+The `phase` field of `ErrorData` names the operation that failed. `read` covers argument
+acceptance and reading workspace or provider data. `submit` covers sending feedback.
+A `limit_exceeded` also carries which limit and by how much, so a
 request can be resized without parsing the message meant for a human. Any other code omits
 `limit`.
 

@@ -2,6 +2,82 @@
   "description": "Tools served by the Rift MCP server, with the JSON Schemas derived from the Rust wire models.",
   "tools": [
     {
+      "description": "Sends a feedback report to the configured intake over HTTPS. The server sends the\ncaller's text and any selected diagnostic fields. The caller MUST omit secrets,\npersonal data, and private source material. The caller MUST obtain the user's\napproval for any exact conversation excerpt before including it in a report.",
+      "input_schema": {
+        "$defs": {
+          "FeedbackDetail": {
+            "description": "One optional detail the caller may send with a feedback report.",
+            "oneOf": [
+              {
+                "const": "os",
+                "description": "Operating system name, such as `linux`.",
+                "type": "string"
+              },
+              {
+                "const": "rift_version",
+                "description": "Rift's package version, such as `0.0.78`.",
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "examples": [
+          {
+            "include_details": [
+              "os",
+              "rift_version"
+            ],
+            "text": "The nodes tool returned an empty result for a symbol it found."
+          }
+        ],
+        "properties": {
+          "include_details": {
+            "description": "Diagnostic fields to send alongside `text`. Omitted or empty sends no diagnostic fields.",
+            "items": {
+              "$ref": "#/$defs/FeedbackDetail"
+            },
+            "maxItems": 2,
+            "type": "array",
+            "uniqueItems": true
+          },
+          "text": {
+            "description": "Report text sent verbatim. The caller MUST send nonblank text of at most 4096 UTF-8 bytes.",
+            "maxLength": 4096,
+            "minLength": 1,
+            "pattern": "\\S",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "rift:since": "v0.0.79",
+        "type": "object"
+      },
+      "name": "feedback",
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "examples": [
+          {
+            "submitted": true
+          }
+        ],
+        "properties": {
+          "submitted": {
+            "const": true,
+            "description": "The intake confirmed that it stored the report.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "submitted"
+        ],
+        "type": "object"
+      }
+    },
+    {
       "description": "Reads one logical symbol by its canonical `id` at one `revision`; the answer names the\nrevision it read, and `declaration_cursor` continues its declarations at that revision.\nA complete exact miss returns `symbol_not_found` and up to three alternatives.\nAn unavailable selection returns its typed cause. A found symbol carries its facts and\neach declaration's location; `nodes` with `symbol` reads a declaration's source. Use\n`search` for discovery.",
       "input_schema": {
         "$defs": {

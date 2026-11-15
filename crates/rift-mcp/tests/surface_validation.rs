@@ -867,11 +867,15 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
         workspace_client::query::retrieval(&serde_json::from_value(json!({"query":"beacon"}))?)?;
     workspace_client::query_after_population(&client, &warmup).await?;
     let tools = client.list_all_tools().await?;
-    let advertised: BTreeSet<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
+    let advertised: BTreeSet<&str> = tools
+        .iter()
+        .filter(|tool| tool.name != "feedback")
+        .map(|tool| tool.name.as_ref())
+        .collect();
     let covered: BTreeSet<&str> = corpus().iter().map(|(name, _)| *name).collect();
     assert_eq!(
         advertised, covered,
-        "every advertised tool has a corpus request"
+        "every advertised read tool has a corpus request"
     );
     let validators = tool_validators(&tools)?;
     let mut arms = CorpusArms::default();

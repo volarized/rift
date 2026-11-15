@@ -214,6 +214,7 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
             Retry::OperatorAction,
             &[
                 "rift.history.unversioned",
+                "rift.mcp.feedback_intake_unavailable",
                 "rift.server.read_unclaimed_extension",
                 "rift.server.read_unsupported",
                 "rift.tracing.log_stream_unavailable",
@@ -286,6 +287,7 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
                 "rift.cli.update_rollback_cleanup_failed",
                 "rift.cli.update_rollback_failed",
                 "rift.cli.update_staging_failed",
+                "rift.mcp.feedback_unconfirmed",
                 "rift.mcp.forward_failed",
                 "rift.mcp.server_identity_mismatch",
                 "rift.mcp.start_unreachable",

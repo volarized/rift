@@ -239,6 +239,8 @@ pub const REGISTERED_SLUGS: &[&str] = &[
     "rift.mcp.election_already_serving",
     "rift.mcp.election_document_invalid",
     "rift.mcp.election_storage_failed",
+    "rift.mcp.feedback_intake_unavailable",
+    "rift.mcp.feedback_unconfirmed",
     "rift.mcp.forward_failed",
     "rift.mcp.forward_unanswered",
     "rift.mcp.http_ports_exhausted",

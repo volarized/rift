@@ -84,8 +84,10 @@ pub enum RetryDirective {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorPhase {
-    /// Reading workspace or provider data.
+    /// Reading workspace or provider data or accepting MCP arguments.
     Read,
+    /// Submitting a report to the feedback intake.
+    Submit,
 }
 
 /// One cause in a failure chain. Entries appear from the outer operation to the concrete

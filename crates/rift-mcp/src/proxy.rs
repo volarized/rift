@@ -4,7 +4,7 @@
 //! one `rift server` process. Every request forwards to that server: the
 //! proxy adopts a recorded server when the lock document names a live one,
 //! starts a detached server when the workspace has none, and reconnects -
-//! single-flight, one retry per request - when the server it held goes
+//! single-flight, one retry per read - when the server it held goes
 //! away, so an agent session survives server restarts.
 
 use std::cmp::Ordering;
@@ -24,7 +24,6 @@ use rift_protocol::configuration::ServerConfiguration;
 use rift_protocol::error as wire;
 use rift_protocol::identity::SymbolOwner;
 use rift_protocol::lock::{ProductIdentity, ServerLock};
-#[cfg(test)]
 use rmcp::model::CallToolRequest;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, ClientRequest, Extensions, Implementation,
@@ -568,6 +567,37 @@ impl RiftProxy {
         self.forward_registered(request, answer)
             .await
             .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))?
+    }
+
+    /// Sends a feedback call once. Losing the response leaves storage unconfirmed.
+    async fn forward_feedback(
+        &self,
+        request: CallToolRequestParams,
+    ) -> Result<Result<CallToolResponse, ErrorData>, RiftError> {
+        let (peer, generation) = self.leased_peer(None).await?;
+        let request = ClientRequest::CallToolRequest(CallToolRequest::new(request));
+        match self.answered(&peer, request).await {
+            Ok(Ok(ServerResult::CallToolResult(result))) => {
+                Ok(Ok(CallToolResponse::Complete(result)))
+            }
+            Ok(Err(ServiceError::McpError(error))) => Ok(Err(error)),
+            Ok(Err(ref error)) if transport_failed(error) => {
+                let mut slot = self.upstream.lock().await;
+                if slot
+                    .connected
+                    .as_ref()
+                    .is_some_and(|current| current.generation == generation)
+                {
+                    drop(slot.connected.take());
+                }
+                Err(crate::feedback::unconfirmed(
+                    "the workspace server connection closed before confirmation",
+                ))
+            }
+            _ => Err(crate::feedback::unconfirmed(
+                "the workspace server returned no confirmation",
+            )),
+        }
     }
 
     async fn forward_registered<Value>(
@@ -1587,6 +1617,7 @@ async fn connect_recorded_with_root(
             reqwest::Client::builder()
                 .pool_max_idle_per_host(0)
                 .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
                 .build()
                 .map_err(|source| {
                     errors::mcp::proxy_initialization_failed()
@@ -1695,6 +1726,11 @@ impl ServerHandler for RiftProxy {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let measured = McpRequest::tool_call(&request.name);
+        let phase = if request.name == crate::feedback::TOOL_NAME {
+            wire::ErrorPhase::Submit
+        } else {
+            wire::ErrorPhase::Read
+        };
         let span = rift_tracing::info_span!(
             "mcp.forward",
             component = "mcp",
@@ -1713,6 +1749,7 @@ impl ServerHandler for RiftProxy {
                     // These peer calls carry evidence a proxy needs to decide coverage.
                     // They are unavailable to clients of the proxy's MCP connection.
                     let registered: Result<_, RiftError> = match request.name.as_ref() {
+                        crate::feedback::TOOL_NAME => self.forward_feedback(request).await,
                         "search_candidates" | "search_retrieval" => {
                             Ok(Err(ErrorData::invalid_params(
                                 format!("unknown tool {}", request.name),
@@ -1732,7 +1769,7 @@ impl ServerHandler for RiftProxy {
                         operation.record("error.type", error.slug().as_str());
                     }
                     let result = registered
-                        .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))
+                        .map_err(|error| error.mcp().tool_error(phase))
                         .and_then(std::convert::identity);
                     rift_tracing::debug!(is_error = result.is_err(), "tool forward completed");
                     result
@@ -5008,6 +5045,39 @@ mod tests {
         );
         assert!(failure.contains("Send message error"), "{failure}");
         closing.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lost_feedback_response_invalidates_the_lease_without_replay() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let proxy = RiftProxy::new(directory.path(), test_identity(), OutputPolicy::All);
+        let (running, mut upstream) = direct_upstream();
+        {
+            let mut slot = proxy.upstream.lock().await;
+            slot.connected = Some(Upstream {
+                running,
+                generation: 0,
+            });
+            slot.generation_next = 1;
+        }
+        let observed = tokio::spawn(async move {
+            let mut line = String::new();
+            tokio::io::BufReader::new(&mut upstream)
+                .read_line(&mut line)
+                .await?;
+            Ok::<_, std::io::Error>(serde_json::from_str::<serde_json::Value>(&line)?)
+        });
+        let request = CallToolRequestParams::new("feedback").with_arguments(
+            serde_json::from_value(json!({"text":"sensitive report fixture"}))?,
+        );
+        let result = proxy.forward_feedback(request).await;
+        let error = result.expect_err("lost response leaves delivery unconfirmed");
+        assert_eq!(error.slug(), errors::mcp::feedback_unconfirmed::SLUG);
+        assert!(!error.to_string().contains("sensitive report fixture"));
+        let observed = observed.await??;
+        assert_eq!(observed["params"]["name"], "feedback");
+        assert!(proxy.upstream.lock().await.connected.is_none());
         Ok(())
     }
 

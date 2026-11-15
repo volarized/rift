@@ -69,6 +69,24 @@ __rift_error_definition!(
 );
 
 __rift_error_definition!(
+    feedback_intake_unavailable,
+    slug = "rift.mcp.feedback_intake_unavailable",
+    message = "feedback intake is unavailable",
+    action = "set RIFT_FEEDBACK_URL and restart the workspace server",
+    fields = {},
+);
+
+__rift_error_definition!(
+    feedback_unconfirmed,
+    slug = "rift.mcp.feedback_unconfirmed",
+    message = "feedback submission is unconfirmed",
+    action = "check with the intake operator before sending the report again",
+    fields = {
+        detail: required(string),
+    },
+);
+
+__rift_error_definition!(
     forward_failed,
     slug = "rift.mcp.forward_failed",
     message = "the workspace's rift server failed the forwarded request: {source}",

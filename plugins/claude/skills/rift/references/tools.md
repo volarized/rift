@@ -2,6 +2,18 @@
 
 Generated from the served tool surface.
 
+## feedback
+
+Sends a feedback report to the configured intake over HTTPS. The server sends the
+caller's text and any selected diagnostic fields. The caller MUST omit secrets,
+personal data, and private source material. The caller MUST obtain the user's
+approval for any exact conversation excerpt before including it in a report.
+
+Parameters:
+
+- `text` (required) - Report text sent verbatim.
+- `include_details` - Diagnostic fields to send alongside `text`.
+
 ## get_symbol
 
 Reads one logical symbol by its canonical `id` at one `revision`; the answer names the

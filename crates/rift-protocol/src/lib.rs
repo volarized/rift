@@ -18,6 +18,7 @@ pub mod dependencies;
 pub mod diagnostic;
 pub mod documentation;
 pub mod error;
+pub mod feedback;
 pub mod identity;
 pub mod index;
 pub mod lock;
