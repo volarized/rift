@@ -11,7 +11,10 @@ use sha2::{Digest as _, Sha256};
 use super::limits::GraphLimits;
 use super::vocabulary::{VocabularyClass, VocabularyProperty};
 
+mod flows;
 mod retrieval;
+
+pub use flows::{FlowCallSite, QueryFlows};
 
 /// IRI prefix of a symbol identity.
 const SYMBOL_PREFIX: &str = "rift://symbol/";

@@ -35,7 +35,10 @@ impl RiftMcp {
             if let Some(output) = tool.output_schema.as_mut() {
                 let output = Arc::make_mut(output);
                 rift_protocol::schema::strip_optional_null_arms(output);
-                rift_protocol::schema::strip_response_warnings(output);
+                // Query callers use coverage warnings to interpret a partial answer.
+                if tool.name != "search" {
+                    rift_protocol::schema::strip_response_warnings(output);
+                }
                 if matches!(tool.name.as_ref(), "get_symbol" | "search") {
                     // These result unions contain only objects. Keep their union constraints
                     // while declaring the root type required by earlier MCP clients.
@@ -94,10 +97,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_output_schemas_exclude_response_warnings() {
+    fn tool_output_schemas_exclude_operator_diagnostics_outside_queries() {
         let document: serde_json::Value =
             serde_json::from_str(&schema_document()).expect("exported MCP document");
         for tool in document["tools"].as_array().expect("tool listing") {
+            if tool["name"] == "search" {
+                continue;
+            }
             let mut pending = vec![&tool["output_schema"]];
             while let Some(node) = pending.pop() {
                 match node {
@@ -132,7 +138,9 @@ mod tests {
                 .expect("declared output")
                 .clone();
             rift_protocol::schema::strip_optional_null_arms(&mut expected);
-            rift_protocol::schema::strip_response_warnings(&mut expected);
+            if name != "search" {
+                rift_protocol::schema::strip_response_warnings(&mut expected);
+            }
             expected.entry("type").or_insert(json!("object"));
             let actual = current
                 .output_schema

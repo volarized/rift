@@ -26,6 +26,9 @@ use super::super::super::{RequestDeadline, ResolvedWorkspace, RiftMcp};
 use super::exact::{exact_request, selected_release};
 use super::installed::InstalledTarget;
 
+mod flows;
+pub(super) use flows::{AcquiredFlows, FlowAcquisition};
+
 const REQUESTS_MAX: u64 = 64;
 const RECORDS_MAX: u64 = 10_000;
 
@@ -417,25 +420,14 @@ impl RiftMcp {
         limits: GraphLimits,
         deadline: RequestDeadline,
     ) -> Result<Result<AcquiredAdjacency, SearchUnavailable>, RiftError> {
-        let mut walk = AdjacencyWalk {
-            server: self,
+        let mut walk = AdjacencyWalk::new(
+            self,
             resolved,
-            selected,
-            step: selected.step(0),
+            Some(selected),
+            selected.step(0),
+            limits,
             deadline,
-            configuration: resolved.published.configuration.global_configuration(),
-            remaining: RelationshipReadLimits {
-                requests_max: REQUESTS_MAX,
-                records_max: RECORDS_MAX,
-                bytes_max: u64::try_from(limits.literal_bytes_max()).unwrap_or(u64::MAX),
-            },
-            acquired: AcquiredAdjacency::default(),
-            remote: None,
-            local: None,
-            neighbors: BTreeMap::new(),
-            local_reverse: None,
-            use_installed: None,
-        };
+        );
         let mut frontier = BTreeSet::from([selected.seed.clone()]);
         let mut visited = BTreeSet::new();
         let mut depth = 0u32;
@@ -491,7 +483,7 @@ impl RiftMcp {
 struct AdjacencyWalk<'request> {
     server: &'request RiftMcp,
     resolved: &'request ResolvedWorkspace,
-    selected: &'request AdjacencySelection,
+    selected: Option<&'request AdjacencySelection>,
     step: AdjacencyStep,
     deadline: RequestDeadline,
     configuration: rift_protocol::configuration::GlobalConfiguration,
@@ -507,7 +499,36 @@ struct AdjacencyWalk<'request> {
     use_installed: Option<bool>,
 }
 
-impl AdjacencyWalk<'_> {
+impl<'request> AdjacencyWalk<'request> {
+    fn new(
+        server: &'request RiftMcp,
+        resolved: &'request ResolvedWorkspace,
+        selected: Option<&'request AdjacencySelection>,
+        step: AdjacencyStep,
+        limits: GraphLimits,
+        deadline: RequestDeadline,
+    ) -> Self {
+        Self {
+            server,
+            resolved,
+            selected,
+            step,
+            deadline,
+            configuration: resolved.published.configuration.global_configuration(),
+            remaining: RelationshipReadLimits {
+                requests_max: REQUESTS_MAX,
+                records_max: RECORDS_MAX,
+                bytes_max: u64::try_from(limits.literal_bytes_max()).unwrap_or(u64::MAX),
+            },
+            acquired: AcquiredAdjacency::default(),
+            remote: None,
+            local: None,
+            neighbors: BTreeMap::new(),
+            local_reverse: None,
+            use_installed: None,
+        }
+    }
+
     async fn ensure_local(&mut self) -> Result<(), RiftError> {
         if self.resolved.stale.is_some() {
             return Err(coverage_failure());
@@ -516,19 +537,22 @@ impl AdjacencyWalk<'_> {
             return Ok(());
         }
         let engines = self.server.engine_pool_for(&self.resolved.published).await;
-        let roots =
-            if self.step.facet == RelationshipFacet::Calls || self.selected.has_distinct_steps() {
-                let reads = Arc::clone(&self.resolved.published.reads);
-                let engines = Arc::clone(&engines);
-                self.server
-                    .blocking
-                    .run("graph callee package roots", move || {
-                        Ok(rift_server::CalleeRoots::read(&reads, &engines))
-                    })
-                    .await?
-            } else {
-                rift_server::CalleeRoots::default()
-            };
+        let roots = if self.step.facet == RelationshipFacet::Calls
+            || self
+                .selected
+                .is_some_and(AdjacencySelection::has_distinct_steps)
+        {
+            let reads = Arc::clone(&self.resolved.published.reads);
+            let engines = Arc::clone(&engines);
+            self.server
+                .blocking
+                .run("graph callee package roots", move || {
+                    Ok(rift_server::CalleeRoots::read(&reads, &engines))
+                })
+                .await?
+        } else {
+            rift_server::CalleeRoots::default()
+        };
         self.local = Some((engines, roots));
         Ok(())
     }
@@ -550,7 +574,8 @@ impl AdjacencyWalk<'_> {
                     reads,
                     engines,
                     seed,
-                    self.selected.requires_enclosing(),
+                    self.selected
+                        .is_some_and(AdjacencySelection::requires_enclosing),
                     deadline,
                 ))
                 .await;
@@ -606,8 +631,15 @@ impl AdjacencyWalk<'_> {
                     Err(error) => return Err(error),
                 };
                 self.acquired.incomplete |= !calls.complete;
-                self.name_package_calls(&mut calls, self.selected.symbol_details)
-                    .await?;
+                let details = self
+                    .selected
+                    .is_some_and(|selection| selection.symbol_details);
+                if let Err(error) = self.name_package_calls(&mut calls, details).await {
+                    if self.selected.is_some() || !super::lacks_coverage(&error) {
+                        return Err(error);
+                    }
+                    self.acquired.incomplete = true;
+                }
                 self.admit_local_calls(seed, calls, frontier)?;
             }
             _ => return Err(coverage_failure()),
@@ -637,6 +669,26 @@ impl AdjacencyWalk<'_> {
                 "providers resolved the same call to different targets"
             );
         }
+        if self.selected.is_none() {
+            self.acquired.local.extend(
+                calls
+                    .corroboration
+                    .iter()
+                    .filter(|record| record.agrees)
+                    .map(|record| {
+                        let (caller, target) = match self.step.direction {
+                            TraversalDirection::Outgoing => (seed, &record.static_target),
+                            TraversalDirection::Incoming => (&record.static_target, seed),
+                        };
+                        QueryOccurrence {
+                            target: target.clone(),
+                            enclosing: Some(caller.clone()),
+                            source: record.observed.clone(),
+                            facet: RelationshipFacet::Calls,
+                        }
+                    }),
+            );
+        }
         charge_records(&mut self.remaining, calls.local.len())?;
         for (neighbor, ranges) in calls.local {
             charge_records(&mut self.remaining, ranges.len())?;
@@ -648,7 +700,10 @@ impl AdjacencyWalk<'_> {
                 .local_edges
                 .push((caller.clone(), SymbolRelation::Calls, target.clone()));
             frontier.insert(neighbor.clone());
-            if self.selected.occurrences.is_some() {
+            if self
+                .selected
+                .is_none_or(|selection| selection.occurrences.is_some())
+            {
                 self.acquired
                     .local
                     .extend(ranges.into_iter().map(|source| QueryOccurrence {
@@ -960,7 +1015,7 @@ impl AdjacencyWalk<'_> {
         remote_seeds: &[SymbolId],
         frontier: &mut BTreeSet<SymbolId>,
     ) -> Result<Option<SearchUnavailable>, RiftError> {
-        let selected = self.selected;
+        let selected = self.selected.ok_or_else(coverage_failure)?;
         let step = self.step;
         let incoming = step.direction == TraversalDirection::Incoming;
         if !self.configuration.enabled

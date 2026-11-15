@@ -1007,7 +1007,10 @@ pub async fn graph_calls(
     let answered = match Box::pin(calls_on_engine(slot, &request, direction, true, deadline)).await
     {
         Ok(answered) => answered,
-        Err(error) if graph_engine_method_missing(&error) => {
+        Err(error)
+            if graph_engine_method_missing(&error)
+                || error.slug() == errors::server::search_coverage_unavailable::SLUG =>
+        {
             return static_calls.answer().ok_or_else(unavailable);
         }
         Err(error) => return Err(error),
@@ -1068,10 +1071,16 @@ fn map_graph_calls(
         let (source, unit) = match (&neighbor, held.direction) {
             (_, TraversalDirection::Outgoing) => (held.source, held.unit.clone()),
             (CalleeFile::Project(path), TraversalDirection::Incoming) => {
-                let file = reads.index().file(path).ok_or_else(unavailable)?;
+                let Some(file) = reads.index().file(path) else {
+                    result.complete = false;
+                    continue;
+                };
                 (file.source(), crate::read::source_unit_id(file.path()))
             }
-            _ => return Err(unavailable()),
+            _ => {
+                result.complete = false;
+                continue;
+            }
         };
         let index = LineIndex::new(source);
         let mut occurrences = Vec::new();
@@ -1100,12 +1109,15 @@ fn map_graph_calls(
                     &path,
                     (item.selection_range, report.encoding),
                     "graph calls",
-                )?
-                .ok_or_else(unavailable)?;
-                result.local.push((target, occurrences));
+                )?;
+                if let Some(target) = target {
+                    result.local.push((target, occurrences));
+                } else {
+                    result.complete = false;
+                }
             }
             CalleeFile::Package(target) => result.packages.push((target, occurrences)),
-            CalleeFile::Unaddressed => return Err(unavailable()),
+            CalleeFile::Unaddressed => result.complete = false,
         }
     }
     Ok(result)
@@ -1940,6 +1952,47 @@ mod tests {
             },
             from_ranges: Vec::new(),
         }
+    }
+
+    #[test]
+    fn graph_calls_keep_mapped_occurrences_when_an_endpoint_is_unaddressed() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        let source = "pub fn beacon() {}\npub fn larger() { beacon(); }\n";
+        fs::write(directory.path().join("lib.rs"), source)?;
+        let reads = reads(directory.path())?;
+        let mut valid = item(location(directory.path(), "lib.rs", 0, 7, 13), "beacon");
+        valid
+            .from_ranges
+            .push(Range::new(Position::new(1, 18), Position::new(1, 24)));
+        let absent = item(location(outside.path(), "lib.rs", 0, 7, 13), "outside");
+        let report = CalleeReport {
+            calls: Ok(vec![absent, valid]),
+            encoding: PositionEncoding::Utf16,
+        };
+        let caller = rift_core::SymbolId::new(symbol(&reads, "larger").0)?;
+        let roots = CalleeRoots::default();
+        let held = super::CallGraphSource {
+            trees: [directory.path(), directory.path()],
+            source,
+            unit: crate::read::source_unit_id(&ProjectPath::new("lib.rs")?),
+            direction: rift_protocol::read::TraversalDirection::Outgoing,
+        };
+        let graph = super::map_graph_calls(&reads, &roots, &caller, report, &held)?;
+        assert!(!graph.complete);
+        let [(target, sites)] = graph.local.as_slice() else {
+            panic!("expected the mapped callee and its call site");
+        };
+        assert_eq!(target, &symbol(&reads, "beacon"));
+        let [site] = sites.as_slice() else {
+            panic!("expected one original call site");
+        };
+        assert_eq!(site.unit, held.unit);
+        assert_eq!(
+            source.get(usize::try_from(site.range.start)?..usize::try_from(site.range.end)?),
+            Some("beacon")
+        );
+        Ok(())
     }
 
     /// Each callee maps to the declaration holding its name when the tree indexes that

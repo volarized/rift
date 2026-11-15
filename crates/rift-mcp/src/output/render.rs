@@ -58,7 +58,7 @@ pub(crate) trait Render {
         false
     }
 
-    /// Records read warnings and clears them before serialization to a client.
+    /// Records read warnings before serialization to a client.
     fn log_warnings(&mut self) {}
 
     /// Writes this answer into `out`.

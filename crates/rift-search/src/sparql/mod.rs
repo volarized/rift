@@ -59,8 +59,8 @@ mod tests;
 pub const LOCAL_GRAPH: &str = "urn:rift:graph:local";
 
 pub use dataset::{
-    GraphDataset, GraphDatasetBuilder, GraphFact, HistoryEvent, NodeAddress, NodeFact,
-    NodeLocation, RevisionIri, SymbolAddress, SymbolRelation,
+    FlowCallSite, GraphDataset, GraphDatasetBuilder, GraphFact, HistoryEvent, NodeAddress,
+    NodeFact, NodeLocation, QueryFlows, RevisionIri, SymbolAddress, SymbolRelation,
 };
 pub use evaluation::{GraphAnswer, GraphTerm, QueryCancellation, SolutionTable};
 pub use inventory::{OccurrenceSelection, SemanticInventory};

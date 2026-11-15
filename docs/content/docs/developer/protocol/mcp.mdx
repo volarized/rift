@@ -203,6 +203,51 @@ missing source authority, or a bound reached before completeness returns explici
 unavailability. Global query serving reads existing collected facts; it does not collect,
 ingest, or backfill global language-engine facts. Local request facts do not enter collection.
 
+### Flow search [#search-flows]
+
+The local `SERVICE :flows` discovers directed call paths through symbols matched by ranked text
+retrieval. Each path contains at least one matched symbol and one resolved call edge. The server
+can follow calls into and out of a matched symbol, so that symbol can be a step in the middle.
+
+The caller supplies a constant string in `:query` and may supply an integer `:limit` from 1 to 32.
+The default is 5. The server rejects conflicting inputs before it runs retrieval.
+
+**Query**
+
+```sparql
+SELECT ?flow ?score ?index ?symbol {
+  SERVICE :flows {
+    ?flow :query "authentication middleware";
+          :limit 5;
+          :score ?score;
+          :steps ?step .
+    ?step :index ?index; :value ?symbol .
+  }
+}
+ORDER BY DESC(?score) ?flow ?index
+```
+
+`:steps` links a flow to its ordered steps. Each step carries a zero-based `:index` and a
+`:value` that identifies the symbol. The caller can join that value with symbol facts such as
+`:name`.
+
+The destination step of a call can carry multiple `:evidence` occurrences. Each occurrence
+has a `:range` with `:unit`, `:start`, and `:end` for the original call site. Multiple call sites
+between the same steps contribute evidence to the same path.
+
+The server scores each path by the strongest matched symbol and adds a quarter of the second
+strongest score when a distinct matched symbol is present. Step order follows the direction
+of the calls in the graph.
+
+The service applies `:limit` to whole flows before SPARQL evaluates the outer query. Outer
+`LIMIT` and `OFFSET` apply to solution rows and can split a flow's steps. When the caller
+follows `pagination.next_query`, the retained result keeps the original flow and step identities.
+
+The server returns usable paths in a positive `SELECT` with `relationship_coverage_missing`
+when a provider covers only part of the required calls. The server returns typed unavailability
+when the available calls cannot establish the requested result. A discovery bound that cuts the
+search reports `traversal_truncated`.
+
 ### Change [#search-change]
 
 `:change` selects the existing revision-comparison producer inside `SERVICE :search`:

@@ -9,8 +9,8 @@
 //!
 //! The served surface is the subset the server itself asks engines for:
 //! `initialize`, document open and close, `textDocument/references`, call
-//! hierarchy (`textDocument/prepareCallHierarchy` and
-//! `callHierarchy/outgoingCalls`), and the `textDocument/diagnostic` pull.
+//! hierarchy (`textDocument/prepareCallHierarchy`, `callHierarchy/incomingCalls`,
+//! and `callHierarchy/outgoingCalls`), and the `textDocument/diagnostic` pull.
 //! Ranges cross the wire in UTF-8 positions, the encoding the answer
 //! advertises.
 //!
@@ -243,6 +243,9 @@ fn handle_message(message: &Value, root: &Path, documents: &DocumentStore) -> Ha
             DOCUMENT_URI,
             prepared_call_hierarchy,
         ),
+        ("callHierarchy/incomingCalls", Some(id)) => {
+            answered(&id, root, documents, &params, ITEM_URI, incoming_calls)
+        }
         ("callHierarchy/outgoingCalls", Some(id)) => {
             answered(&id, root, documents, &params, ITEM_URI, outgoing_calls)
         }
@@ -751,19 +754,16 @@ fn prepared_call_hierarchy(
     })
 }
 
-/// Answers `callHierarchy/outgoingCalls` for an item this engine prepared.
+/// Locates a prepared item by the start of its selection range.
 ///
-/// The item is found again from its URI and the start of its selection
-/// range, the key `ty_ide::outgoing_calls` reads. Each call's `fromRanges`
-/// sit in the item's own file.
-fn outgoing_calls(
+/// The call hierarchy uses this position as the key to resolve the item again.
+fn call_hierarchy_anchor(
     database: &mut ProjectDatabase,
     exchange: &Exchange<'_>,
     params: &Value,
-) -> Result<Value, AnswerRefusal> {
+) -> Result<(File, TextSize), AnswerRefusal> {
     let file = file_at(database, params.pointer(ITEM_URI).unwrap_or(&Value::Null))?;
     database.project().open_file(database, file);
-    let program_file = database.program_file(file);
     let text = source_text(database, file);
     let offset = offset_at(
         exchange.conversion_text(text.as_str()),
@@ -771,6 +771,42 @@ fn outgoing_calls(
             .pointer("/item/selectionRange/start")
             .unwrap_or(&Value::Null),
     )?;
+    Ok((file, offset))
+}
+
+/// Answers `callHierarchy/incomingCalls` with ranges in each caller's file.
+fn incoming_calls(
+    database: &mut ProjectDatabase,
+    exchange: &Exchange<'_>,
+    params: &Value,
+) -> Result<Value, AnswerRefusal> {
+    let (file, offset) = call_hierarchy_anchor(database, exchange, params)?;
+    let program_file = database.program_file(file);
+    let mut calls = Vec::new();
+    for call in ty_ide::incoming_calls(database, program_file, offset) {
+        let Some(from) = hierarchy_item(database, exchange, &call.from)? else {
+            continue;
+        };
+        let text = source_text(database, call.from.file);
+        let from_ranges = call
+            .from_ranges
+            .iter()
+            .map(|range| range_at(text.as_str(), *range))
+            .collect::<Result<Vec<_>, _>>()?;
+        calls.push(json!({ "from": from, "fromRanges": from_ranges }));
+    }
+    Ok(Value::Array(calls))
+}
+
+/// Answers `callHierarchy/outgoingCalls` with ranges in the prepared item's file.
+fn outgoing_calls(
+    database: &mut ProjectDatabase,
+    exchange: &Exchange<'_>,
+    params: &Value,
+) -> Result<Value, AnswerRefusal> {
+    let (file, offset) = call_hierarchy_anchor(database, exchange, params)?;
+    let program_file = database.program_file(file);
+    let text = source_text(database, file);
     let mut calls = Vec::new();
     for call in ty_ide::outgoing_calls(database, program_file, offset) {
         let Some(to) = hierarchy_item(database, exchange, &call.to)? else {
@@ -1462,6 +1498,62 @@ mod tests {
             reply["result"],
             serde_json::json!([]),
             "a position resolving no symbol answers the empty list"
+        );
+    }
+
+    #[test]
+    fn test_incoming_call_ranges_belong_to_the_callers_file() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let root = directory.path();
+        std::fs::write(
+            root.join("pyproject.toml"),
+            "[project]\nname = \"beacon\"\nversion = \"0.0.1\"\n",
+        )
+        .expect("project marker");
+        let definition = root.join("callee.py");
+        let caller = root.join("caller.py");
+        std::fs::write(&definition, "def helper():\n    return 1\n").expect("callee");
+        std::fs::write(
+            &caller,
+            "from callee import helper\n\ndef total():\n    count = helper()\n    return count + helper()\n",
+        )
+        .expect("caller");
+        let documents = empty_documents();
+        let prepare = serde_json::json!({
+            "id": 1,
+            "method": "textDocument/prepareCallHierarchy",
+            "params": {
+                "textDocument": { "uri": uri_of(&definition) },
+                "position": { "line": 0, "character": 4 },
+            },
+        });
+        let Handled::Reply(prepared) = handle_message(&prepare, root, &documents) else {
+            panic!("prepare must reply");
+        };
+        let incoming = serde_json::json!({
+            "id": 2,
+            "method": "callHierarchy/incomingCalls",
+            "params": { "item": prepared["result"][0] },
+        });
+        let Handled::Reply(answer) = handle_message(&incoming, root, &documents) else {
+            panic!("incoming calls must reply");
+        };
+        let calls = answer["result"].as_array().expect("incoming calls");
+        assert_eq!(calls.len(), 1, "{answer:#}");
+        assert_eq!(calls[0]["from"]["uri"], serde_json::json!(uri_of(&caller)));
+        assert_eq!(calls[0]["from"]["name"], "total");
+        assert_eq!(
+            calls[0]["fromRanges"],
+            serde_json::json!([
+                {
+                    "start": { "line": 3, "character": 12 },
+                    "end": { "line": 3, "character": 18 },
+                },
+                {
+                    "start": { "line": 4, "character": 19 },
+                    "end": { "line": 4, "character": 25 },
+                },
+            ]),
         );
     }
 

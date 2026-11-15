@@ -1,29 +1,35 @@
 //! Compact text for the RDF terms and result forms of one query page.
 
 use rift_protocol::query::{QueryAnswer, QueryReadResult, QueryResult, RdfTerm};
+use rift_protocol::read::ReadWarning;
+use rift_protocol::search_read::SearchUnavailable;
 
-use super::record_warnings;
 use super::{Render, TextError, TextWriter};
 
 impl Render for QueryReadResult {
     fn log_warnings(&mut self) {
         match self {
             Self::Results(result) => result.log_warnings(),
-            Self::Unavailable(result) => result.log_warnings(),
+            Self::Unavailable(SearchUnavailable::Unavailable { warnings, .. }) => {
+                record_query_warnings(warnings);
+            }
         }
     }
 
     fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
         match self {
             Self::Results(result) => result.render(out),
-            Self::Unavailable(reason) => reason.render(out),
+            Self::Unavailable(reason @ SearchUnavailable::Unavailable { warnings, .. }) => {
+                reason.render(out)?;
+                write_query_warnings(out, warnings)
+            }
         }
     }
 }
 
 impl Render for QueryResult {
     fn log_warnings(&mut self) {
-        record_warnings(&mut self.warnings);
+        record_query_warnings(&mut self.warnings);
     }
 
     fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
@@ -85,7 +91,27 @@ impl Render for QueryResult {
                 &format!("view {} · expires {}", view.id.as_str(), view.expires_at),
             )?;
         }
-        Ok(())
+        write_query_warnings(out, &self.warnings)
+    }
+}
+
+fn record_query_warnings(warnings: &mut Vec<ReadWarning>) {
+    crate::output::log_warnings(warnings);
+    warnings.retain(|warning| query_warning_detail(warning).is_some());
+}
+
+fn write_query_warnings(out: &mut TextWriter, warnings: &[ReadWarning]) -> Result<(), TextError> {
+    for detail in warnings.iter().filter_map(query_warning_detail) {
+        out.raw_line(0, &format!("warning · {detail}"))?;
+    }
+    Ok(())
+}
+
+fn query_warning_detail(warning: &ReadWarning) -> Option<&str> {
+    match warning {
+        ReadWarning::RelationshipCoverageMissing { detail, .. }
+        | ReadWarning::TraversalTruncated { detail, .. } => Some(detail),
+        _ => None,
     }
 }
 

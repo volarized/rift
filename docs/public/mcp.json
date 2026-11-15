@@ -6020,7 +6020,7 @@
       }
     },
     {
-      "description": "Evaluate SPARQL over captured code facts. Use `SERVICE :search` for ranked text and\nregex retrieval. Continue a paged answer with its `next_query`.",
+      "description": "Evaluate SPARQL over captured code facts. Use `SERVICE :search` for text and regex\nretrieval and `SERVICE :flows` for call paths around ranked symbols. Continue a\npaged answer with its `next_query`.",
       "input_schema": {
         "$defs": {
           "QueryLanguage": {
@@ -6699,6 +6699,13 @@
               "view": {
                 "$ref": "#/$defs/CapturedView",
                 "description": "The retained execution and its original expiry."
+              },
+              "warnings": {
+                "description": "Coverage and discovery limits affecting the query result. For `SERVICE :flows`,\n`traversal_truncated` reports the visited symbol count and names the bound in `detail`.",
+                "items": {
+                  "$ref": "#/$defs/ReadWarning"
+                },
+                "type": "array"
               }
             },
             "required": [
@@ -8045,6 +8052,13 @@
                   "view": {
                     "$ref": "#/$defs/CapturedView",
                     "description": "Selected view, when one could be captured."
+                  },
+                  "warnings": {
+                    "description": "Details and partial-read warnings.",
+                    "items": {
+                      "$ref": "#/$defs/ReadWarning"
+                    },
+                    "type": "array"
                   }
                 },
                 "required": [

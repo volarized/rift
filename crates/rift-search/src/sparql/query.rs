@@ -77,6 +77,34 @@ impl GraphQuery {
         &self.admission.retrieval
     }
 
+    /// Whether an incomplete flow producer can contribute positive solution rows.
+    #[must_use]
+    pub fn projects_flow_rows(&self) -> bool {
+        use spargebra::algebra::QueryExpression;
+
+        let Query::Select(query) = self.query() else {
+            return false;
+        };
+        let mut pending = vec![&query.expression];
+        // Admission bounds the number and depth of patterns inspected here.
+        while let Some(expression) = pending.pop() {
+            match expression {
+                QueryExpression::Bgp { .. } => {}
+                QueryExpression::Join { left, right } => {
+                    pending.extend([left.as_ref(), right.as_ref()]);
+                }
+                QueryExpression::Project { inner, .. }
+                | QueryExpression::Graph { inner, .. }
+                | QueryExpression::OrderBy { inner, .. }
+                | QueryExpression::Distinct { inner, .. }
+                | QueryExpression::Reduced { inner, .. }
+                | QueryExpression::Slice { inner, .. } => pending.push(inner),
+                _ => return false,
+            }
+        }
+        true
+    }
+
     /// Whether evaluation requires code facts outside its retrieval services.
     #[must_use]
     pub const fn reads_base(&self) -> bool {

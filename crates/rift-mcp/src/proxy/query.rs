@@ -175,7 +175,12 @@ impl RiftProxy {
         if !combined {
             return self.forward_read(request.clone()).await;
         }
-        if query.reads_base() {
+        if query.reads_base()
+            || query
+                .retrieval_requests()
+                .iter()
+                .any(|service| service.flow_limit.is_some())
+        {
             return Ok(render(unavailable(
                 SymbolUnavailableReason::InsufficientCoverage,
             )));

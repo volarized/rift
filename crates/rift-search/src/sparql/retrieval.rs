@@ -7,15 +7,20 @@ use oxrdf::{
     vocab::{rdf, xsd},
 };
 use rift_error::{RiftError, errors};
-use rift_protocol::read::SearchParams;
+use rift_protocol::read::{SearchInclude, SearchParams, SearchParamsTarget, SearchScope};
 use serde_json::{Map, Value};
 use spargebra::algebra::QueryExpression;
 use spargebra::term::{NamedNodePattern, TermPattern};
 
 use super::VOCABULARY_NAMESPACE;
+use crate::flow::FLOW_RANKED_ROWS_MAX;
 
 const SEARCH_SERVICE: &str = "urn:rift:vocabulary:search";
+const FLOWS_SERVICE: &str = "urn:rift:vocabulary:flows";
+pub(super) const FLOW_CLASS: &str = "Flow";
 const SEARCH_GRAPH_PREFIX: &str = "urn:rift:retrieval:";
+const FLOW_LIMIT_DEFAULT: u64 = 5;
+const FLOW_LIMIT_MAX: u64 = 32;
 pub(super) const RDF_JSON: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON";
 const INPUT_FIELDS: &[&str] = &[
     "view",
@@ -39,6 +44,8 @@ pub struct RetrievalSelection {
     pub(super) graph: NamedNode,
     /// Producer parameters selected by the service's constant input triples.
     pub request: SearchParams,
+    /// Maximum complete flow records, when the service selects call paths.
+    pub flow_limit: Option<usize>,
 }
 
 pub(super) fn rewrite(
@@ -53,12 +60,18 @@ pub(super) fn rewrite(
     else {
         return Err(invalid("expected a retrieval service"));
     };
-    if *silent
-        || !matches!(name, NamedNodePattern::NamedNode(name) if name.as_str() == SEARCH_SERVICE)
-    {
+    let service = match name {
+        NamedNodePattern::NamedNode(name) if !*silent => name.as_str(),
+        _ => "",
+    };
+    if ![SEARCH_SERVICE, FLOWS_SERVICE].contains(&service) {
         return super::query::refused(&format!("SERVICE {name}"));
     }
-    let request = request(inner)?;
+    let flows = service == FLOWS_SERVICE;
+    let mut request = request(inner, flows)?;
+    let flow_limit = flows
+        .then(|| prepare_flow_request(&mut request))
+        .transpose()?;
     let graph = NamedNode::new_unchecked(format!("{SEARCH_GRAPH_PREFIX}{index}"));
     let inner = std::mem::replace(
         inner,
@@ -70,10 +83,33 @@ pub(super) fn rewrite(
         name: NamedNodePattern::NamedNode(graph.clone()),
         inner,
     };
-    Ok(RetrievalSelection { graph, request })
+    Ok(RetrievalSelection {
+        graph,
+        request,
+        flow_limit,
+    })
 }
 
-fn request(inner: &mut QueryExpression) -> Result<SearchParams, RiftError> {
+fn prepare_flow_request(request: &mut SearchParams) -> Result<usize, RiftError> {
+    if request
+        .query
+        .as_ref()
+        .is_none_or(|query| query.trim().is_empty())
+    {
+        return Err(invalid("flow search requires a nonempty constant query"));
+    }
+    let limit = request.limit.unwrap_or(FLOW_LIMIT_DEFAULT);
+    if !(1..=FLOW_LIMIT_MAX).contains(&limit) {
+        return Err(invalid("flow limit must be between 1 and 32"));
+    }
+    request.scope = SearchScope::Local;
+    request.target = SearchParamsTarget::Symbol;
+    request.limit = Some(FLOW_RANKED_ROWS_MAX);
+    request.include = Some(vec![SearchInclude::Score]);
+    usize::try_from(limit).map_err(|error| invalid(&error.to_string()))
+}
+
+fn request(inner: &mut QueryExpression, flows: bool) -> Result<SearchParams, RiftError> {
     let mut fields = Map::new();
     let mut include = BTreeSet::new();
     let mut pending = vec![(inner, true)];
@@ -90,10 +126,27 @@ fn request(inner: &mut QueryExpression) -> Result<SearchParams, RiftError> {
                     if matches!(key, "source" | "score") {
                         include.insert(key.to_owned());
                     }
+                    if flows
+                        && INPUT_FIELDS.contains(&key)
+                        && matches!(&triple.object, TermPattern::Variable(_))
+                    {
+                        return Err(invalid("flow search inputs must be constant"));
+                    }
                     if !INPUT_FIELDS.contains(&key)
                         || matches!(&triple.object, TermPattern::Variable(_))
                     {
                         continue;
+                    }
+                    if flows && !matches!(key, "query" | "limit") {
+                        return Err(invalid(
+                            "flow search accepts constant query and limit inputs",
+                        ));
+                    }
+                    if flows
+                        && key == "limit"
+                        && !matches!(&triple.object, TermPattern::Literal(value) if *value.datatype() == xsd::INTEGER)
+                    {
+                        return Err(invalid("flow limit must be an integer literal"));
                     }
                     if !required {
                         return Err(invalid(
@@ -109,8 +162,9 @@ fn request(inner: &mut QueryExpression) -> Result<SearchParams, RiftError> {
                         return Err(invalid("retrieval input carries conflicting values"));
                     }
                     triple.predicate = NamedNodePattern::NamedNode(rdf::TYPE);
+                    let class = if flows { FLOW_CLASS } else { "SearchHit" };
                     triple.object = TermPattern::NamedNode(NamedNode::new_unchecked(format!(
-                        "{VOCABULARY_NAMESPACE}SearchHit"
+                        "{VOCABULARY_NAMESPACE}{class}"
                     )));
                 }
             }
@@ -181,4 +235,58 @@ fn invalid(detail: &str) -> RiftError {
     errors::search::query_syntax_invalid()
         .detail(detail)
         .error()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::sparql::{GraphLimits, GraphQuery};
+    use rift_error::errors;
+    use rift_protocol::read::{SearchInclude, SearchParamsTarget, SearchScope};
+
+    #[test]
+    fn flow_service_selects_ranked_local_symbols_and_limits_whole_records()
+    -> Result<(), rift_error::RiftError> {
+        let limits = GraphLimits::default();
+        let query = GraphQuery::parse(
+            "SELECT ?flow { SERVICE :flows { ?flow :query 'middleware'; :limit 2 } }",
+            &limits,
+        )?;
+        let [selection] = query.retrieval_requests() else {
+            panic!("expected one flow producer");
+        };
+        assert_eq!(selection.flow_limit, Some(2));
+        assert_eq!(selection.request.scope, SearchScope::Local);
+        assert_eq!(selection.request.target, SearchParamsTarget::Symbol);
+        assert_eq!(selection.request.query.as_deref(), Some("middleware"));
+        assert_eq!(
+            selection.request.include.as_deref(),
+            Some([SearchInclude::Score].as_slice())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn flow_service_refuses_variable_conflicting_or_unsupported_inputs() {
+        let limits = GraphLimits::default();
+        for input in [
+            "?flow :query ?query",
+            "?flow :query 'a', 'b'",
+            "?flow :query 'a'; :scope :all",
+            "?flow :query 'a'; :limit 0",
+            "?flow :query 'a'; :limit 33",
+            "?flow :query 'a'; :limit '5'",
+            "?flow :query 'a'; :limit ?limit",
+            "?flow :query ''",
+            "?flow :limit 5",
+            "?flow :query 'a' OPTIONAL { ?flow :limit 3 }",
+        ] {
+            let query = format!("SELECT ?flow {{ SERVICE :flows {{ {input} }} }}");
+            let error = GraphQuery::parse(&query, &limits).expect_err(input);
+            assert_eq!(
+                error.slug(),
+                errors::search::query_syntax_invalid::SLUG,
+                "{input}"
+            );
+        }
+    }
 }
