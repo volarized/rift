@@ -57,10 +57,46 @@ fn text_states(tool: &str, result: &CallToolResult) -> Result<(), String> {
             canonical_text_states(text, structured)
         }
         GET_SYMBOL_TOOL => layout::text_states(Tool::GetSymbol, text, structured),
+        NODES_TOOL if structured.get("declarations").is_some() => {
+            nodes_summary_text_states(text, structured)
+        }
         NODES_TOOL => layout::text_states(Tool::Nodes, text, structured),
         other => Err(format!("no text check for the tool `{other}`")),
     };
     verdict.map_err(|failure| format!("{failure}\n--- text ---\n{text}"))
+}
+
+/// Checks that a compact nodes read carries its exact excerpt and named structure.
+fn nodes_summary_text_states(text: &str, structured: &serde_json::Value) -> Result<(), String> {
+    let declarations = structured["declarations"]
+        .as_array()
+        .ok_or("declarations")?;
+    for declaration in declarations {
+        source_lines(text, &declaration["source"]["text"], "\t")?;
+        token(text, &declaration["kind"], "declaration kind")?;
+        if let Some(parts) = declaration["parts"].as_array() {
+            for part in parts {
+                let kind = part["kind"].as_str().ok_or("part kind")?.replace('_', " ");
+                let shown = text
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("\tStructure | "))
+                    .any(|line| line.split(" | ").any(|fact| fact == kind));
+                if !shown {
+                    return Err(format!("missing part {kind}"));
+                }
+            }
+        }
+    }
+    if let Some(excerpt) = structured.get("excerpt") {
+        source_lines(text, &excerpt["text"], "\t")?;
+    }
+    if let Some(revision) = structured["revision"].as_str()
+        && revision.starts_with("rift://revision/tree/")
+        && text.contains(revision)
+    {
+        return Err("working tree revision in compact text".to_owned());
+    }
+    Ok(())
 }
 
 /// Checks the exact symbol and its original declaration projections in canonical text.
@@ -127,7 +163,13 @@ fn canonical_text_states(text: &str, structured: &serde_json::Value) -> Result<(
     } else {
         token(text, &structured["id"], "$.id")?;
     }
-    view_text(text, structured)
+    if let Some(revision) = structured["revision"].as_str()
+        && revision.starts_with("rift://revision/tree/")
+        && text.contains(revision)
+    {
+        return Err("working tree revision in compact text".to_owned());
+    }
+    Ok(())
 }
 
 fn token(text: &str, value: &serde_json::Value, at: &str) -> Result<(), String> {
@@ -166,8 +208,8 @@ fn query_term(term: &serde_json::Value) -> Result<String, String> {
     let value = term["value"].as_str().ok_or("query term value")?;
     let quoted = || serde_json::to_string(value).map_err(|error| error.to_string());
     match term["type"].as_str() {
-        Some("iri") => Ok(format!("<{value}>")),
-        Some("blank_node") => Ok(format!("_:{value}")),
+        Some("iri") => Ok(query_iri(value)),
+        Some("blank_node") => Ok(format!("_:{}", &value[..value.ceil_char_boundary(12)])),
         Some("language_literal") => Ok(format!(
             "{}@{}",
             quoted()?,
@@ -175,17 +217,36 @@ fn query_term(term: &serde_json::Value) -> Result<String, String> {
         )),
         Some("literal") => {
             let datatype = term["datatype"].as_str().ok_or("term datatype")?;
-            if datatype == "http://www.w3.org/2001/XMLSchema#string" {
-                quoted()
-            } else {
-                Ok(format!("{}^^<{datatype}>", quoted()?))
+            match datatype {
+                "http://www.w3.org/2001/XMLSchema#string" => quoted(),
+                "http://www.w3.org/2001/XMLSchema#integer" if value.parse::<i128>().is_ok() => {
+                    Ok(value.to_owned())
+                }
+                "http://www.w3.org/2001/XMLSchema#boolean" if matches!(value, "true" | "false") => {
+                    Ok(value.to_owned())
+                }
+                _ => Ok(format!("{}^^{}", quoted()?, query_iri(datatype))),
             }
         }
         _ => Err("unknown RDF term".into()),
     }
 }
 
-fn bindings_text(answer: &serde_json::Value, text: &mut std::str::Lines<'_>) -> Result<(), String> {
+fn query_iri(value: &str) -> String {
+    for (namespace, prefix) in [
+        ("urn:rift:vocabulary:", ":"),
+        ("http://www.w3.org/2001/XMLSchema#", "xsd:"),
+        ("http://www.w3.org/1999/02/22-rdf-syntax-ns#", "rdf:"),
+        ("http://www.w3.org/2000/01/rdf-schema#", "rdfs:"),
+    ] {
+        if let Some(local) = value.strip_prefix(namespace) {
+            return format!("{prefix}{local}");
+        }
+    }
+    format!("<{value}>")
+}
+
+fn bindings_text(answer: &serde_json::Value, mut text: std::str::Lines<'_>) -> Result<(), String> {
     let variables = answer["variables"]
         .as_array()
         .ok_or("query variables")?
@@ -197,16 +258,16 @@ fn bindings_text(answer: &serde_json::Value, text: &mut std::str::Lines<'_>) -> 
         .map(|name| format!("?{name}"))
         .collect::<Vec<_>>()
         .join("\t");
-    if text.next() != Some(header.as_str()) {
-        return Err("binding variables differ".into());
-    }
-    for row in answer["bindings"].as_array().ok_or("binding rows")? {
-        let cells = variables
-            .iter()
-            .map(|name| row.get(*name).map_or_else(|| Ok(String::new()), query_term))
-            .collect::<Result<Vec<_>, _>>()?;
-        if text.next() != Some(cells.join("\t").as_str()) {
-            return Err("binding row differs".into());
+    let rows = answer["bindings"].as_array().ok_or("binding rows")?;
+    if text.next() == Some(header.as_str()) {
+        for row in rows {
+            let cells = variables
+                .iter()
+                .map(|name| row.get(*name).map_or_else(|| Ok(String::new()), query_term))
+                .collect::<Result<Vec<_>, _>>()?;
+            if text.next() != Some(cells.join("\t").as_str()) {
+                return Err("binding row differs".into());
+            }
         }
     }
     Ok(())
@@ -219,13 +280,29 @@ fn query_text_states(text: &str, structured: &serde_json::Value) -> Result<(), S
         }
     } else {
         let answer = &structured["answer"];
+        let pagination = &structured["pagination"];
+        let total = pagination["total_pages"]
+            .as_u64()
+            .ok_or("query total pages")?;
+        if total > 1 {
+            let page = pagination["page_index"]
+                .as_u64()
+                .ok_or("query page index")?
+                .saturating_add(1);
+            if !text
+                .lines()
+                .any(|line| line == format!("page {page}/{total}"))
+            {
+                return Err("query page differs".into());
+            }
+        }
         let mut lines = text.lines();
         match answer["result"].as_str() {
             Some("boolean")
                 if lines.next().and_then(|value| value.parse::<bool>().ok())
                     == answer["value"].as_bool() => {}
             Some("boolean") => return Err("query boolean differs".into()),
-            Some("bindings") => bindings_text(answer, &mut lines)?,
+            Some("bindings") => bindings_text(answer, lines)?,
             Some("graph") => {
                 for triple in answer["triples"].as_array().ok_or("query triples")? {
                     let expected = format!(
@@ -241,33 +318,13 @@ fn query_text_states(text: &str, structured: &serde_json::Value) -> Result<(), S
             }
             _ => return Err("unknown query result".into()),
         }
-        let total = structured["pagination"]["total_pages"]
-            .as_u64()
-            .ok_or("query total pages")?;
-        if total > 1 {
-            let page = structured["pagination"]["page_index"]
-                .as_u64()
-                .ok_or("query page index")?;
-            let expected = format!("page {}/{total}", page.saturating_add(1));
-            if lines.next() != Some(expected.as_str()) {
-                return Err("query page differs".into());
-            }
-        }
     }
     query_continuation_text(text, structured)?;
-    view_text(text, structured)
-}
-
-fn view_text(text: &str, structured: &serde_json::Value) -> Result<(), String> {
-    if let Some(view) = structured.get("view") {
-        token(text, &view["id"], "$.view.id")?;
-        token(text, &view["expires_at"], "$.view.expires_at")?;
-    }
-    if let Some(revision) = structured.get("revision") {
-        token(text, revision, "$.revision")?;
+    if text.lines().any(|line| line.starts_with("view ")) {
+        return Err("routine view in query text".into());
     }
     for warning in structured["warnings"].as_array().into_iter().flatten() {
-        token(text, &warning["code"], "$.warnings.code")?;
+        token(text, &warning["detail"], "$.warnings.detail")?;
     }
     Ok(())
 }
@@ -338,38 +395,29 @@ mod tests {
     }
 
     #[test]
-    fn search_query_requires_its_exact_captured_view_and_original_expiry() {
+    fn query_text_omits_routine_view_metadata() {
         let structured = json!({
             "answer": { "result": "boolean", "value": true },
             "pagination": { "page_index": 0, "total_pages": 1 },
-            "warnings": [],
             "view": { "id": "claims.nodes", "expires_at": "2030-01-01T00:15:00Z" }
         });
-        let original = "true\nview claims.nodes · expires 2030-01-01T00:15:00Z\n";
         assert_eq!(
-            text_states(SEARCH_TOOL, &result_of(original, structured.clone())),
+            text_states(SEARCH_TOOL, &result_of("true\n", structured.clone())),
             Ok(())
         );
-        for text in [
-            "true\n",
-            "true\nview claims.other · expires 2030-01-01T00:15:00Z\n",
-            "true\nview claims.nodes · expires 2030-01-01T00:16:00Z\n",
-        ] {
-            assert!(text_states(SEARCH_TOOL, &result_of(text, structured.clone())).is_err());
-        }
+        let with_view = "true\nview claims.nodes · expires 2030-01-01T00:15:00Z\n";
+        assert!(text_states(SEARCH_TOOL, &result_of(with_view, structured)).is_err());
     }
 
     #[test]
-    fn query_captured_view_does_not_replace_required_warning() {
+    fn query_text_keeps_discovery_warnings() {
         let structured = json!({
             "answer": { "result": "boolean", "value": true },
             "pagination": { "page_index": 0, "total_pages": 1 },
-            "warnings": [{ "code": "stale_index", "detail": "index lags" }],
-            "view": { "id": "claims.nodes", "expires_at": "2030-01-01T00:15:00Z" }
+            "warnings": [{ "code": "traversal_truncated", "detail": "flow discovery reached the provider request bound" }]
         });
-        let missing = "true\nview claims.nodes · expires 2030-01-01T00:15:00Z\n";
-        assert!(text_states(SEARCH_TOOL, &result_of(missing, structured.clone())).is_err());
-        let complete = "true\n1 warning\n\tstale_index: index lags\nview claims.nodes · expires 2030-01-01T00:15:00Z\n";
+        assert!(text_states(SEARCH_TOOL, &result_of("true\n", structured.clone())).is_err());
+        let complete = "true\nwarning · flow discovery reached the provider request bound\n";
         assert_eq!(
             text_states(SEARCH_TOOL, &result_of(complete, structured)),
             Ok(())

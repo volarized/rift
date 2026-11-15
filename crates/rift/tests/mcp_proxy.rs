@@ -309,7 +309,13 @@ async fn repository_workspace_reads(
     name: &str,
     names: &[&str],
 ) -> TestResult<String> {
-    let map = await_workspace_ready(client).await?;
+    await_workspace_ready(client).await?;
+    let map = within(
+        "map resource",
+        client.read_resource(rmcp::model::ReadResourceRequestParams::new("rift://map")),
+    )
+    .await??;
+    let map = resource_json(&map, "rift://map")?;
     let revision = map["revision"]
         .as_str()
         .ok_or("map carries its revision")?
@@ -350,13 +356,7 @@ async fn repository_workspace_reads(
         .await
         .map_err(|error| format!("nodes: {error:?}"))?;
     assert!(
-        nodes["nodes"]
-            .as_array()
-            .ok_or("nodes carries nodes")?
-            .iter()
-            .any(|node| node["source"]
-                .as_str()
-                .is_some_and(|source| source.contains(name))),
+        position_source(&nodes).is_some_and(|source| source.contains(name)),
         "{nodes}"
     );
     Ok(revision)
@@ -650,7 +650,7 @@ async fn assert_worktree_node_reads(
         assert!(schema.is_valid(&request), "{request}");
         let answer = proxied_call(client, "nodes", &request).await?;
         assert_eq!(
-            answer["nodes"][0]["source"].as_str().map(str::trim_end),
+            position_source(&answer).map(str::trim_end),
             Some(source),
             "{request}: {answer}"
         );
@@ -681,7 +681,7 @@ async fn assert_worktree_node_reads(
     )
     .await?;
     assert_eq!(
-        committed["nodes"][0]["source"].as_str().map(str::trim_end),
+        position_source(&committed).map(str::trim_end),
         Some("pub fn committed_review() {}")
     );
     assert!(
@@ -692,7 +692,8 @@ async fn assert_worktree_node_reads(
         "{committed}"
     );
 
-    let mut review_page = json!({"path": "lib.rs", "position": 8, "scope": "local@review"});
+    let mut review_page =
+        json!({"path": "lib.rs", "position": 8, "scope": "local@review", "syntax": true});
     let first = proxied_call(client, "nodes", &review_page).await?;
     assert_eq!(
         first["nodes"][0]["source"].as_str().map(str::trim_end),
@@ -707,6 +708,13 @@ async fn assert_worktree_node_reads(
     assert_eq!(continued["symbol"], first["symbol"]);
     assert_eq!(continued["nodes"][0]["index"], 2);
     Ok(())
+}
+
+/// Source at the requested position, inside a declaration or in the unit excerpt.
+fn position_source(answer: &serde_json::Value) -> Option<&str> {
+    answer["declarations"][0]["source"]["text"]
+        .as_str()
+        .or_else(|| answer["excerpt"]["text"].as_str())
 }
 
 async fn assert_worktree_scope_refusals(
@@ -1018,9 +1026,9 @@ async fn default_proxy_lists_no_output_schemas_and_returns_text() -> TestResult 
     Ok(())
 }
 
-/// A map read carries one JSON payload regardless of the proxy's tool output selection.
+/// A text proxy returns only the compact map.
 #[tokio::test]
-async fn text_output_proxy_returns_the_map_as_one_json_content() -> TestResult {
+async fn text_output_proxy_returns_the_map_as_compact_text() -> TestResult {
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
@@ -1033,16 +1041,16 @@ async fn text_output_proxy_returns_the_map_as_one_json_content() -> TestResult {
     )
     .await??;
     assert_eq!(answer.contents.len(), 1, "{:?}", answer.contents);
-    let body = resource_json(&answer, "rift://map")?;
-    assert!(body["revision"].is_string(), "{body}");
+    let compact = workspace_client::resource_text(&answer, "rift://map")?;
+    assert!(compact.starts_with("workspace map\n"), "{compact}");
     client.cancel().await?;
     failure_window.passed();
     Ok(())
 }
 
-/// A map read carries one JSON payload regardless of the proxy's tool output selection.
+/// A text proxy returns only the compact map.
 #[tokio::test]
-async fn default_proxy_returns_the_map_as_one_json_content() -> TestResult {
+async fn default_proxy_returns_the_map_as_compact_text() -> TestResult {
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
@@ -1055,8 +1063,8 @@ async fn default_proxy_returns_the_map_as_one_json_content() -> TestResult {
     )
     .await??;
     assert_eq!(answer.contents.len(), 1, "{:?}", answer.contents);
-    let body = resource_json(&answer, "rift://map")?;
-    assert!(body["revision"].is_string(), "{body}");
+    let compact = workspace_client::resource_text(&answer, "rift://map")?;
+    assert!(compact.starts_with("workspace map\n"), "{compact}");
     client.cancel().await?;
     failure_window.passed();
     Ok(())
@@ -1081,20 +1089,21 @@ async fn all_and_text_proxies_share_one_server_and_keep_their_own_shape() -> Tes
     let (all_result, text_result) = (all_result?, text_result?);
     assert_all_shape(&all_tools, &all_result);
     assert_text_shape(&text_tools, &text_result);
-    let mut maps = Vec::new();
-    for client in [&all, &text] {
-        let answer = within(
-            "map resource",
-            client.read_resource(rmcp::model::ReadResourceRequestParams::new("rift://map")),
+    let (all_map, text_map) = Box::pin(within("map resource", async {
+        tokio::join!(
+            all.read_resource(rmcp::model::ReadResourceRequestParams::new("rift://map")),
+            text.read_resource(rmcp::model::ReadResourceRequestParams::new("rift://map")),
         )
-        .await??;
-        assert_eq!(answer.contents.len(), 1, "{:?}", answer.contents);
-        maps.push(resource_json(&answer, "rift://map")?);
-    }
+    }))
+    .await?;
+    let (all_map, text_map) = (all_map?, text_map?);
+    assert_eq!(all_map.contents.len(), 2, "{:?}", all_map.contents);
+    assert_eq!(text_map.contents.len(), 1, "{:?}", text_map.contents);
     assert_eq!(
-        maps[0], maps[1],
-        "both output modes carry the same JSON map"
+        workspace_client::resource_text(&all_map, "rift://map")?,
+        workspace_client::resource_text(&text_map, "rift://map")?,
     );
+    assert!(resource_json(&all_map, "rift://map")?["revision"].is_string());
 
     let serving = serving_document(root).ok_or("one elected server must serve both")?;
     all.cancel().await?;
@@ -1150,34 +1159,6 @@ async fn await_commit_population(
     }
 }
 
-/// The identities the text of a request must state: the symbol ids of the `search` and
-/// `get_symbol` hits, and the node ids of the `nodes` answer.
-///
-/// The layout leaves other identities, such as file ids, to the structured content.
-fn stated_identities<'value>(
-    name: &str,
-    structured: &'value serde_json::Value,
-) -> Vec<&'value str> {
-    if name == "get_symbol" {
-        return structured["symbol"]["id"].as_str().into_iter().collect();
-    }
-    if name == "nodes" {
-        return structured["symbol"].as_str().into_iter().collect();
-    }
-    if name == "search" {
-        return structured["answer"]["bindings"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(serde_json::Value::as_object)
-            .flat_map(|row| row.values())
-            .filter(|term| term["type"] == "iri")
-            .filter_map(|term| term["value"].as_str())
-            .collect();
-    }
-    Vec::new()
-}
-
 /// The text of a result that is one text block.
 fn text_of(result: &CallToolResult) -> TestResult<&str> {
     let [block] = result.content.as_slice() else {
@@ -1188,34 +1169,6 @@ fn text_of(result: &CallToolResult) -> TestResult<&str> {
         .ok_or("the block must be text")?
         .text
         .as_str())
-}
-
-/// Removes one rendered view after parsing its exact identity and expiry.
-fn proxy_text_view(
-    text: &str,
-) -> TestResult<(String, Option<rift_protocol::symbol_read::CapturedView>)> {
-    use rift_protocol::symbol_read::{CapturedView, CapturedViewId};
-    let mut body = String::new();
-    let mut view = None;
-    for line in text.split_inclusive('\n') {
-        if let Some(value) = line.trim_end_matches(['\r', '\n']).strip_prefix("view ") {
-            let (id, expires_at) = value
-                .split_once(" · expires ")
-                .ok_or("the captured view must state its expiry")?;
-            assert!(view.is_none(), "one captured view per result");
-            assert!(
-                !expires_at.is_empty(),
-                "the captured expiry must be present"
-            );
-            view = Some(CapturedView {
-                id: CapturedViewId::parse(id)?,
-                expires_at: expires_at.to_owned(),
-            });
-        } else {
-            body.push_str(line);
-        }
-    }
-    Ok((body, view))
 }
 
 /// Checks the one generated blank node alongside every fixed term in the fixture.
@@ -1231,84 +1184,9 @@ fn assert_term_kind_text(text: &str) -> TestResult {
             .strip_prefix("_:")
             .is_some_and(|value| !value.is_empty())
     );
-    assert_eq!(
-        rest,
-        "<urn:fixture:term>\t\"1\"^^<http://www.w3.org/2001/XMLSchema#integer>\t\"hello\"@en"
-    );
+    assert_eq!(rest, "<urn:fixture:term>\t1\t\"hello\"@en");
     assert!(lines.next().is_none());
     Ok(())
-}
-
-fn validate_query_without_continuation(
-    request: &serde_json::Value,
-    reference: &serde_json::Value,
-) -> TestResult {
-    let answer: rift_protocol::query::QueryReadResult = serde_json::from_value(reference.clone())?;
-    match answer {
-        rift_protocol::query::QueryReadResult::Unavailable(_) => {}
-        rift_protocol::query::QueryReadResult::Results(result) => {
-            assert_eq!(
-                request["query"],
-                "ASK { ?symbol a :Symbol; :name 'beacon_one' }"
-            );
-            assert_eq!(
-                result.answer,
-                rift_protocol::query::QueryAnswer::Boolean { value: true }
-            );
-            assert!(
-                result.view.is_some(),
-                "the reference query retains its own view"
-            );
-            assert_eq!(result.pagination.page.page_index, 0);
-            assert_eq!(result.pagination.page.total_pages, 1);
-            assert!(result.pagination.next_query.is_none());
-        }
-    }
-    Ok(())
-}
-
-/// Reads each advertised view through its owning proxy before comparing the remaining text.
-async fn validated_proxy_text(
-    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
-    name: &'static str,
-    request: &serde_json::Value,
-    result: &CallToolResult,
-    reference: &serde_json::Value,
-) -> TestResult<String> {
-    let original = text_of(result)?;
-    let (body, view) = proxy_text_view(original)?;
-    if let Some(structured) = &result.structured_content {
-        assert_eq!(
-            structured.get("view").filter(|value| !value.is_null()),
-            view.as_ref()
-                .map(serde_json::to_value)
-                .transpose()?
-                .as_ref(),
-            "{name}: text states the exact structured view and expiry"
-        );
-    }
-    if let Some(view) = view {
-        if reference["answer"].is_null() || reference["answer"]["result"] == "boolean" {
-            validate_query_without_continuation(request, reference)?;
-            return Ok(body);
-        }
-        if name == "search" {
-            let answer: rift_protocol::query::QueryAnswer =
-                serde_json::from_value(reference["answer"].clone())?;
-            let page = reference["pagination"]["page_index"]
-                .as_u64()
-                .ok_or("query pagination.page_index must be an integer")?;
-            let held_request =
-                json!({"query":rift_search::sparql::continuation_query(&answer, &view.id, page)?});
-            let held = proxied_result(client, name, &held_request).await?;
-            assert_ne!(held.is_error, Some(true), "{name}: {held:?}");
-            assert_eq!(text_of(&held)?, original, "{name}: captured page text");
-            if let Some(structured) = &held.structured_content {
-                assert_eq!(structured.get("view"), Some(&serde_json::to_value(view)?));
-            }
-        }
-    }
-    Ok(body)
 }
 
 fn assert_proxy_result_forms(
@@ -1324,37 +1202,14 @@ fn assert_proxy_result_forms(
     );
 }
 
-fn assert_stated_identities<'answer>(
-    name: &str,
-    result: &'answer rmcp::model::CallToolResult,
-    text: &str,
-) -> TestResult<&'answer serde_json::Value> {
-    let structured = result
-        .structured_content
-        .as_ref()
-        .ok_or_else(|| format!("{name}: the all proxy must return structured content"))?;
-    for identity in stated_identities(name, structured) {
-        assert!(
-            (if name == "search" {
-                text.contains(&format!("<{identity}>"))
-            } else {
-                text.split_whitespace().any(|token| token == identity)
-            }),
-            "{name}: identity {identity} is no bare token of the text:\n{text}"
-        );
-    }
-    Ok(structured)
-}
-
-/// The `all` and `text` proxies write the same source and identity text. Each proxy's captured
-/// view is read back through that proxy with its original expiry. The `text` result carries no
-/// structured content, and each symbol and node identity is a bare token in the `all` text.
+/// The `all` and `text` proxies write the same compact answer. Each continuation from
+/// an independently evaluated query can be replayed through the proxy that returned it.
 ///
 /// The text-against-structured checks of `rift-mcp` (`crates/rift-mcp/tests/text_complete`) live
 /// in that crate's test binary and are not shared here: they run over the whole surface corpus
 /// there.
 #[tokio::test]
-async fn both_proxies_write_the_same_text_and_the_text_states_every_identity() -> TestResult {
+async fn both_proxies_write_the_same_text_and_continue_retained_pages() -> TestResult {
     let fixture = SurfaceFixture::start_with_configuration(Ok).await?;
     let root = fixture.root();
     let _cleanup = StopOnDrop::new(root);
@@ -1369,7 +1224,6 @@ async fn both_proxies_write_the_same_text_and_the_text_states_every_identity() -
 
     'cases: for (name, initial_request) in surface_corpus::prepared_corpus(&all).await? {
         let mut request = initial_request;
-        let mut page_index = request["page_index"].as_u64().unwrap_or(0);
         loop {
             if name == "search"
                 && let Err(error) = await_search_population(&all, &request).await
@@ -1419,42 +1273,15 @@ async fn both_proxies_write_the_same_text_and_the_text_states_every_identity() -
             let (all_result, text_result) = (all_result?, text_result?);
             assert_proxy_result_forms(name, &all_result, &text_result);
             text_complete::assert_text_states(name, &all_result);
-            let all_text = text_of(&all_result)?;
             let reference = all_result
                 .structured_content
                 .as_ref()
                 .ok_or("all proxy must return structured content")?;
-            assert_proxy_texts(
-                &all,
-                &text,
-                name,
-                &request,
-                &all_result,
-                &text_result,
-                reference,
-            )
-            .await?;
-
-            let structured = assert_stated_identities(name, &all_result, all_text)?;
-
-            let Some(pagination) = structured.get("pagination") else {
+            assert_proxy_texts(&all, &text, &request, &all_result, &text_result).await?;
+            let Some(next_query) = reference["pagination"]["next_query"].as_str() else {
                 break;
             };
-            if matches!(name, "search" | "nodes") {
-                let Some(next_query) = pagination["next_query"].as_str() else {
-                    break;
-                };
-                request = json!({"query":next_query});
-                continue;
-            }
-            let total_pages = pagination["total_pages"]
-                .as_u64()
-                .ok_or_else(|| format!("{name}: pagination.total_pages must be an integer"))?;
-            if page_index + 1 >= total_pages {
-                break;
-            }
-            page_index += 1;
-            request["page_index"] = json!(page_index);
+            request = json!({"query": next_query});
         }
     }
 
@@ -1487,53 +1314,45 @@ fn is_paged_index_request(name: &str, request: &serde_json::Value) -> bool {
             .is_some_and(|(tool, expected)| *tool == name && expected == request)
 }
 
-fn assert_paged_index_text(
+/// Checks the first page and follows the continuation printed by this proxy.
+async fn assert_paged_index_text(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     result: &CallToolResult,
-    body: &str,
-    answer: &rift_protocol::query::QueryAnswer,
 ) -> TestResult {
-    use rift_protocol::query::{QueryAnswer, QueryReadResult, RdfTerm};
+    use rift_protocol::query::{QueryConfiguration, QueryReadResult};
+    use rift_search::sparql::{GraphLimits, GraphQuery};
 
-    let QueryAnswer::Bindings {
-        variables,
-        bindings,
-    } = answer
-    else {
-        return Err("paged index query returns bindings".into());
-    };
-    assert_eq!(variables, &vec!["index".to_owned()]);
-    assert_eq!(bindings.len(), 1000);
-    let (_, view) = proxy_text_view(text_of(result)?)?;
-    let view = view.ok_or("paged index query retains its own view")?;
-    let next = rift_search::sparql::continuation_query(answer, &view.id, 1)?;
+    let (body, next_query) = text_of(result)?
+        .split_once("next query · ")
+        .ok_or("paged query text needs a continuation")?;
+    let next_query = next_query.trim_end();
+    let page_size = QueryConfiguration::default().page_size;
     let mut expected = String::from("?index\n");
-    for (index, row) in bindings.iter().enumerate() {
-        assert_eq!(row.len(), 1);
-        assert_eq!(
-            row.get("index"),
-            Some(&RdfTerm::Literal {
-                value: index.to_string(),
-                datatype: "http://www.w3.org/2001/XMLSchema#integer".to_owned(),
-            })
-        );
-        writeln!(
-            expected,
-            "\"{index}\"^^<http://www.w3.org/2001/XMLSchema#integer>"
-        )?;
+    for index in 0..page_size {
+        writeln!(expected, "{index}")?;
     }
-    expected.push_str("page 1/2\nnext query · ");
-    expected.push_str(&next);
-    expected.push('\n');
+    expected.push_str("page 1/2\n");
     assert_eq!(body, expected);
+
+    let selection = GraphQuery::parse(next_query, &GraphLimits::default())?
+        .page_selection()
+        .ok_or("next query selects a retained page")?;
+    assert_eq!(selection.page, 1);
+    let held = proxied_result(client, "search", &json!({"query": next_query})).await?;
+    assert_ne!(held.is_error, Some(true), "{held:?}");
+    assert_eq!(text_of(&held)?, format!("?index\n{page_size}\npage 2/2\n"));
+
     if let Some(structured) = &result.structured_content {
         let QueryReadResult::Results(own) = serde_json::from_value(structured.clone())? else {
             return Err("paged index query returns structured bindings".into());
         };
-        assert_eq!(&own.answer, answer);
-        assert_eq!(own.view.as_ref(), Some(&view));
-        assert_eq!(own.pagination.page.page_index, 0);
-        assert_eq!(own.pagination.page.total_pages, 2);
-        assert_eq!(own.pagination.next_query.as_deref(), Some(next.as_str()));
+        let view = own.view.ok_or("the first page retains a view")?;
+        assert_eq!(view.id, selection.view);
+        assert_eq!(own.pagination.next_query.as_deref(), Some(next_query));
+        let retained = held
+            .structured_content
+            .ok_or("the second page has structured content")?;
+        assert_eq!(retained["view"], serde_json::to_value(view)?);
     }
     Ok(())
 }
@@ -1541,30 +1360,20 @@ fn assert_paged_index_text(
 async fn assert_proxy_texts(
     all: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     text: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
-    name: &'static str,
     request: &serde_json::Value,
     all_result: &CallToolResult,
     text_result: &CallToolResult,
-    reference: &serde_json::Value,
 ) -> TestResult {
-    let (all_body, text_body) = tokio::join!(
-        validated_proxy_text(all, name, request, all_result, reference),
-        validated_proxy_text(text, name, request, text_result, reference),
-    );
-    let (all_body, text_body) = (all_body?, text_body?);
-    if name == "search"
-        && request["query"]
-            == "SELECT (BNODE() AS ?blank) (<urn:fixture:term> AS ?iri) (1 AS ?number) ('hello'@en AS ?language) WHERE {}"
+    if request["query"]
+        == "SELECT (BNODE() AS ?blank) (<urn:fixture:term> AS ?iri) (1 AS ?number) ('hello'@en AS ?language) WHERE {}"
     {
-        assert_term_kind_text(&all_body)?;
-        assert_term_kind_text(&text_body)?;
-    } else if is_paged_index_request(name, request) {
-        let answer: rift_protocol::query::QueryAnswer =
-            serde_json::from_value(reference["answer"].clone())?;
-        assert_paged_index_text(all_result, &all_body, &answer)?;
-        assert_paged_index_text(text_result, &text_body, &answer)?;
+        assert_term_kind_text(text_of(all_result)?)?;
+        assert_term_kind_text(text_of(text_result)?)?;
+    } else if is_paged_index_request("search", request) {
+        Box::pin(assert_paged_index_text(all, all_result)).await?;
+        Box::pin(assert_paged_index_text(text, text_result)).await?;
     } else {
-        assert_eq!(all_body, text_body, "{name}: texts differ");
+        assert_eq!(text_of(all_result)?, text_of(text_result)?, "{request}");
     }
     Ok(())
 }
@@ -2304,7 +2113,10 @@ async fn live_proxied_read_resolves_incoming_references() -> TestResult {
     let original = harness::RUST_PROJECT_CALLER
         .get(start..end)
         .ok_or("original caller range")?;
-    assert_eq!(nodes["nodes"][0]["source"], original, "{nodes}");
+    assert_eq!(
+        nodes["declarations"][0]["source"]["text"], original,
+        "{nodes}"
+    );
     let workspace = within(
         "workspace resource",
         client.read_resource(rmcp::model::ReadResourceRequestParams::new(
@@ -2367,7 +2179,7 @@ async fn proxy_query_nodes_and_source_keep_recorded_bytes_after_index_removal() 
         &json!({"symbol":symbol,"revision":exact["revision"]}),
     )
     .await?;
-    assert_eq!(nodes["nodes"][0]["source"], source);
+    assert_eq!(nodes["declarations"][0]["source"]["text"], source);
     let replay = query::retained_page(&original, 0)?;
     for removed in [false, true] {
         if removed {

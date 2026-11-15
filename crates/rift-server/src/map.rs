@@ -14,11 +14,11 @@ use rift_dependency::DependencyContext;
 use rift_index::WorkspaceIndex;
 use rift_protocol::map::{
     MAP_DOCS_MAX, MAP_ENTRY_POINTS_MAX, MAP_HUBS_MAX, MAP_MODULE_DEPTH_MAX,
-    MAP_MODULE_RELATIONSHIPS_MAX, MAP_PACKAGES_MAX, MapHub, MapLanguage, MapModule,
-    MapModuleRelationship, WorkspaceMap,
+    MAP_MODULE_RELATIONSHIPS_MAX, MAP_MODULES_MAX, MAP_PACKAGES_MAX, MapHub, MapLanguage,
+    MapModule, MapModuleRelationship, WorkspaceMap,
 };
 use rift_protocol::read::{Digest, Language, Pagination, ProjectPath, SymbolFacet, SymbolId};
-use rift_protocol::workspace::{WORKSPACE_LANGUAGE_SUMMARIES_MAX, WORKSPACE_SOURCE_UNITS_MAX};
+use rift_protocol::workspace::WORKSPACE_LANGUAGE_SUMMARIES_MAX;
 use rift_provider::{NormalizedGraph, NormalizedTarget, SymbolAssembler};
 use rift_syntax::ShippedLanguage;
 
@@ -291,7 +291,7 @@ fn credit_directories(
 }
 
 /// Assembles the flat per-directory counts into the nested [`MapModule`] tree, in path order,
-/// capped at [`WORKSPACE_SOURCE_UNITS_MAX`] entries per level - the same cap the schema
+/// capped at [`MAP_MODULES_MAX`] entries per level - the same cap the schema
 /// declares on `modules` and on [`MapModule::children`].
 fn module_tree(directory_counts: &BTreeMap<ProjectPath, FileSymbolCounts>) -> Vec<MapModule> {
     let mut children_of: BTreeMap<ProjectPath, Vec<ProjectPath>> = BTreeMap::new();
@@ -309,7 +309,7 @@ fn module_tree(directory_counts: &BTreeMap<ProjectPath, FileSymbolCounts>) -> Ve
         .into_iter()
         .map(|root| module_node(root, directory_counts, &children_of, 1))
         .collect();
-    modules.truncate(WORKSPACE_SOURCE_UNITS_MAX);
+    modules.truncate(MAP_MODULES_MAX);
     modules
 }
 
@@ -334,7 +334,7 @@ fn module_node(
         .cloned()
         .map(|child| module_node(child, counts, children_of, depth + 1))
         .collect();
-    children.truncate(WORKSPACE_SOURCE_UNITS_MAX);
+    children.truncate(MAP_MODULES_MAX);
     MapModule {
         path,
         files: node_counts.files,

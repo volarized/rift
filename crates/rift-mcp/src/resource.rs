@@ -100,14 +100,12 @@ pub(crate) fn rendered_workspace(
     Ok(answer(uri, resource_text(page)?, body))
 }
 
-/// The cached workspace map as one JSON resource content.
-pub(crate) fn map_answer(uri: &str, map: &WorkspaceMap) -> ReadResourceResult {
+/// The cached workspace map in text and JSON.
+pub(crate) fn map_answer(uri: &str, map: &WorkspaceMap) -> Result<ReadResourceResult, ErrorData> {
     log_warnings(&map.warnings);
     let body = serde_json::to_string(map)
         .unwrap_or_else(|error| unreachable!("the workspace map serializes: {error}"));
-    ReadResourceResult::new(vec![
-        ResourceContents::text(body, uri).with_mime_type(RESOURCE_MEDIA_TYPE),
-    ])
+    Ok(answer(uri, resource_text(map)?, body))
 }
 
 /// One read answer: the compact text first, then the JSON body, both for `uri`.
@@ -228,7 +226,7 @@ mod tests {
         assert_eq!(body["languages"], json!([]));
         assert_eq!(body["source"], json!([]));
         assert_eq!(compact, resource_text(&page).expect("page renders"));
-        assert_eq!(compact, "workspace 3f9a1c2e\n");
+        assert_eq!(compact, "workspace\nNo source files on this page.\n");
     }
 
     #[test]
@@ -244,7 +242,7 @@ mod tests {
 
         assert_eq!(
             contents(&rendered, uri).0,
-            "workspace 3f9a1c2e · page 3/4\n"
+            "workspace · page 3/4\nnext · rift://workspace?page_index=3\n"
         );
     }
 
@@ -269,23 +267,15 @@ mod tests {
     }
 
     #[test]
-    fn map_answer_carries_typed_json_alone() {
+    fn map_answer_carries_text_and_typed_json() {
         let map = empty_map();
-        let answer = map_answer(MAP_URI, &map);
-        let [
-            ResourceContents::TextResourceContents {
-                uri,
-                mime_type,
-                text,
-                ..
-            },
-        ] = &answer.contents[..]
-        else {
-            panic!("map returns one JSON content: {answer:?}");
-        };
-        assert_eq!(uri, MAP_URI);
-        assert_eq!(mime_type.as_deref(), Some("application/json"));
-        assert_eq!(text, &serde_json::to_string(&map).expect("map serializes"));
+        let answer = map_answer(MAP_URI, &map).expect("the map renders");
+        let (compact, body) = contents(&answer, MAP_URI);
+        assert_eq!(
+            compact,
+            "workspace map\nNo indexed files.\nsource catalog · rift://workspace\n"
+        );
+        assert_eq!(body, serde_json::to_string(&map).expect("map serializes"));
     }
 
     #[test]

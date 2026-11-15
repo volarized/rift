@@ -1628,7 +1628,7 @@
           "description": "Most encoded bytes on one page, from 1 KiB to 4 MiB."
         },
         "page_size": {
-          "default": 1000,
+          "default": 50,
           "description": "Most bindings or triples on one page, from 1 to 1000.",
           "format": "uint64",
           "maximum": 1000,
@@ -1815,7 +1815,7 @@
           "$ref": "#/$defs/QueryConfiguration",
           "default": {
             "page_limit": "4mb",
-            "page_size": 1000
+            "page_size": 50
           },
           "description": "Transport bounds for retained graph query answers."
         },
@@ -2495,7 +2495,7 @@
         "pool_slots": 4,
         "query": {
           "page_limit": "4mb",
-          "page_size": 1000
+          "page_size": 50
         },
         "ranking": {
           "fusion_k": 60,

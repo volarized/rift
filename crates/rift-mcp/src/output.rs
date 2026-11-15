@@ -19,6 +19,7 @@ use text::TextError;
 
 pub(crate) use failure::ToolFailure;
 pub use policy::OutputPolicy;
+pub(crate) use render::{QueryDisplay, QueryOutput, select_nodes};
 pub(crate) use warnings::log_warnings;
 
 /// A typed tool answer that serves as compact text and as structured content.
@@ -52,6 +53,10 @@ impl<T: Render + Serialize> Json<T> {
             CallToolResult::success(content)
         };
         result.structured_content = Some(structured);
+        result.meta = match self.0.metadata() {
+            Ok(meta) => meta,
+            Err(error) => return refused(AnswerFault::Structured(error)),
+        };
         Ok(result.into())
     }
 }

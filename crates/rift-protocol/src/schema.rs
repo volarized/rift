@@ -99,8 +99,8 @@ mod keyword {
     pub(super) const ADDITIONAL_PROPERTIES: &str = "additionalProperties";
 }
 
-/// The search tool returns an object for each result form.
-pub fn require_query_result_object(schema: &mut Schema) {
+/// A tool returns an object for each result form.
+pub fn require_result_object(schema: &mut Schema) {
     schema.insert(keyword::TYPE.to_owned(), Value::String("object".to_owned()));
 }
 

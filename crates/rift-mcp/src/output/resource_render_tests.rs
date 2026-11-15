@@ -46,13 +46,13 @@ fn one_workspace_page_renders_languages_and_source() {
     golden(
         &page,
         &[
-            "workspace 3f9a1c2e",
+            "workspace",
             "languages:",
             "\ttypescript:tsx · syntax · lsp typescript:tsx ready",
             "\t\tinclude src/**/*.tsx",
             "\t\texclude src/generated/**",
             "source:",
-            "\tsrc/view.tsx · typescript:tsx · 8a4d20bc",
+            "\tsrc/view.tsx · typescript:tsx",
         ],
     );
 }
@@ -68,11 +68,12 @@ fn several_workspace_pages_name_the_page_in_the_header() {
     golden(
         &page,
         &[
-            "workspace 3f9a1c2e · page 1/3",
+            "workspace · page 1/3",
             "languages:",
             "\tpython · disabled",
             "source:",
-            "\tsrc/view.tsx · 8a4d20bc",
+            "\tsrc/view.tsx",
+            "next · rift://workspace?page_index=1",
         ],
     );
 }
@@ -84,7 +85,10 @@ fn a_page_past_the_end_names_itself_and_holds_no_source() {
         "languages": [], "source": [],
         "pagination": {"page_index": 4, "total_pages": 3}
     }));
-    golden(&page, &["workspace 3f9a1c2e · page 5/3"]);
+    golden(
+        &page,
+        &["workspace · page 5/3", "No source files on this page."],
+    );
 }
 
 #[test]
@@ -94,7 +98,7 @@ fn an_empty_workspace_with_one_page_is_its_header_alone() {
         "languages": [], "source": [],
         "pagination": {"page_index": 0, "total_pages": 0}
     }));
-    golden(&page, &["workspace 3f9a1c2e"]);
+    golden(&page, &["workspace", "No source files on this page."]);
 }
 
 #[test]
@@ -117,7 +121,7 @@ fn a_language_writes_each_capability_and_every_lsp_state() {
     golden(
         &page,
         &[
-            "workspace 3f9a1c2e",
+            "workspace",
             "languages:",
             "\tlang-stopped · syntax · execution · lsp server stopped",
             "\tlang-starting · syntax · execution · lsp server starting",
@@ -144,7 +148,7 @@ fn patterns_join_by_comma_and_an_empty_list_writes_no_line() {
     golden(
         &page,
         &[
-            "workspace 3f9a1c2e",
+            "workspace",
             "languages:",
             "\trust · syntax",
             "\t\tinclude a/**, b/**",
@@ -170,10 +174,10 @@ fn warnings_leave_workspace_resource_text_unchanged() {
     golden(
         &page,
         &[
-            "workspace 3f9a1c2e · page 2/2",
+            "workspace · page 2/2",
             "source:",
-            "\ta.rs · rust · 00000001",
-            "\tnotes.txt · 00000002",
+            "\ta.rs · rust",
+            "\tnotes.txt",
         ],
     );
 }

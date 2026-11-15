@@ -17,7 +17,7 @@ use rift_search::sparql::{
 use serde::{Deserialize, Serialize};
 
 use super::{BYTES_MAX, CandidateResponses, RiftMcp, read_failure};
-use crate::output::{Json, ToolFailure};
+use crate::output::{Json, QueryDisplay, QueryOutput, ToolFailure};
 
 mod exact;
 mod installed;
@@ -36,12 +36,21 @@ struct SavedQuery {
     template_end: usize,
     pages: Vec<QueryPage>,
     warnings: Vec<ReadWarning>,
+    #[serde(default)]
+    display: QueryDisplay,
 }
 
 #[derive(Deserialize, Serialize)]
 struct QueryPage {
     start: usize,
     end: usize,
+}
+
+/// Settings and presentation retained with one query execution.
+pub(crate) struct QueryPageOptions<'a> {
+    pub(crate) configuration: &'a QueryConfiguration,
+    pub(crate) warnings: Vec<ReadWarning>,
+    pub(crate) display: QueryDisplay,
 }
 
 struct QueryGuard(QueryCancellation);
@@ -56,7 +65,7 @@ impl RiftMcp {
     pub(in crate::server) async fn graph_query(
         &self,
         params: QueryParams,
-    ) -> Result<Json<QueryReadResult>, ToolFailure> {
+    ) -> Result<Json<QueryOutput>, ToolFailure> {
         let deadline = self.request_deadline().await;
         let limits = GraphLimits::default();
         let query = tokio::time::timeout_at(
@@ -73,7 +82,7 @@ impl RiftMcp {
         }
         let graph = match Box::pin(self.prepare_graph(&query, limits, deadline)).await? {
             Ok(graph) => graph,
-            Err(unavailable) => return Ok(Json(QueryReadResult::Unavailable(unavailable))),
+            Err(unavailable) => return Ok(Json(QueryReadResult::Unavailable(unavailable).into())),
         };
         let views = Arc::clone(&self.local_views);
         let responses = Arc::clone(&self.candidate_responses);
@@ -94,20 +103,20 @@ impl RiftMcp {
     async fn replay_graph_query(
         &self,
         selection: PageSelection,
-    ) -> Result<QueryReadResult, ToolFailure> {
+    ) -> Result<QueryOutput, ToolFailure> {
         let responses = Arc::clone(&self.candidate_responses);
         let views = Arc::clone(&self.local_views);
         self.blocking
             .run("retained graph query", move || {
                 let (saved, answer) = match responses.replay_query(&selection)? {
                     Ok(result) => result,
-                    Err(reason) => return Ok(query_unavailable(reason)),
+                    Err(reason) => return Ok(query_unavailable(reason).into()),
                 };
                 let views = views.get().ok_or_else(retention_failure)?;
                 if let Err(reason) =
                     views.captured_view(selection.view.as_str(), &saved.root, &saved.owner)?
                 {
-                    return Ok(query_unavailable(reason));
+                    return Ok(query_unavailable(reason).into());
                 }
                 saved.response(answer, selection.page)
             })
@@ -428,7 +437,7 @@ impl AcquiredGraph {
         cancellation: &QueryCancellation,
         views: &std::sync::OnceLock<rift_server::LocalSymbolViews>,
         responses: &CandidateResponses,
-    ) -> Result<QueryReadResult, RiftError> {
+    ) -> Result<QueryOutput, RiftError> {
         let Self {
             reads,
             selected,
@@ -440,18 +449,16 @@ impl AcquiredGraph {
             mut warnings,
         } = self;
         if acquired.is_incomplete() && !query.admits_partial_witness() {
-            return Ok(query_unavailable(
-                SymbolUnavailableReason::InsufficientCoverage,
-            ));
+            return Ok(query_unavailable(SymbolUnavailableReason::InsufficientCoverage).into());
         }
         let input = reads.local_search_view_input(true)?;
         let mut dataset = GraphDataset::builder(limits);
         if let Some(selected) = &selected {
             if let Err(error) = acquired.project(&mut dataset, selected, &input) {
                 if lacks_coverage(&error) {
-                    return Ok(query_unavailable(
-                        SymbolUnavailableReason::InsufficientCoverage,
-                    ));
+                    return Ok(
+                        query_unavailable(SymbolUnavailableReason::InsufficientCoverage).into(),
+                    );
                 }
                 return Err(error);
             }
@@ -493,27 +500,23 @@ impl AcquiredGraph {
         }
         let coverage = project_retrievals(query, &mut retrieved, &mut dataset, &mut warnings)?;
         if coverage == ProjectedRetrievals::Unavailable {
-            return Ok(incomplete_flows(warnings));
+            return Ok(incomplete_flows(warnings).into());
         }
         if query.names_local_graph() {
             if selected.is_some() {
-                return Ok(query_unavailable(
-                    SymbolUnavailableReason::InsufficientCoverage,
-                ));
+                return Ok(query_unavailable(SymbolUnavailableReason::InsufficientCoverage).into());
             }
             dataset.publish_local_graph()?;
         }
         let Some(answer) =
             evaluate_acquired_query(&dataset.build(), query, cancellation, &acquired)?
         else {
-            return Ok(query_unavailable(
-                SymbolUnavailableReason::InsufficientCoverage,
-            ));
+            return Ok(query_unavailable(SymbolUnavailableReason::InsufficientCoverage).into());
         };
         if coverage == ProjectedRetrievals::Partial
             && matches!(&answer, QueryAnswer::Bindings { bindings, .. } if bindings.is_empty())
         {
-            return Ok(incomplete_flows(warnings));
+            return Ok(incomplete_flows(warnings).into());
         }
         let views = views.get().ok_or_else(retention_failure)?;
         let root = input.root().to_owned();
@@ -524,6 +527,7 @@ impl AcquiredGraph {
             answer: &answer,
             configuration: &configuration,
             warnings,
+            display: QueryDisplay::selected(&answer, query.presentation()),
             acquired: &acquired,
             retrieved: &retrieved,
         };
@@ -537,6 +541,7 @@ struct QueryRetention<'answer> {
     answer: &'answer QueryAnswer,
     configuration: &'answer QueryConfiguration,
     warnings: Vec<ReadWarning>,
+    display: QueryDisplay,
     acquired: &'answer AcquiredAdjacency,
     retrieved: &'answer [AcquiredRetrieval],
 }
@@ -548,7 +553,7 @@ impl QueryRetention<'_> {
         input: rift_server::LocalSymbolViewInput,
         responses: &CandidateResponses,
         cancellation: &QueryCancellation,
-    ) -> Result<QueryReadResult, RiftError> {
+    ) -> Result<QueryOutput, RiftError> {
         let mut response = None;
         views.capture_with(input, |view| {
             let mut view = view.clone();
@@ -558,7 +563,7 @@ impl QueryRetention<'_> {
                     .filter_map(|entry| entry.result.view.as_ref()),
             );
             if !constrain_provider_expiry(&mut view, provider_views)? {
-                response = Some(query_unavailable(SymbolUnavailableReason::ViewExpired));
+                response = Some(query_unavailable(SymbolUnavailableReason::ViewExpired).into());
                 return Ok(false);
             }
             if cancellation.is_cancelled() {
@@ -569,8 +574,11 @@ impl QueryRetention<'_> {
                 self.owner,
                 &view,
                 self.answer,
-                self.configuration,
-                self.warnings,
+                QueryPageOptions {
+                    configuration: self.configuration,
+                    warnings: self.warnings,
+                    display: self.display,
+                },
             )?);
             Ok(true)
         })?;
@@ -599,13 +607,11 @@ impl CandidateResponses {
         owner: &rift_protocol::identity::SymbolOwner,
         view: &CapturedView,
         answer: &QueryAnswer,
-        configuration: &QueryConfiguration,
-        warnings: Vec<ReadWarning>,
-    ) -> Result<QueryReadResult, RiftError> {
-        let (saved, bytes, first) =
-            SavedQuery::encoded(root, owner, view, answer, configuration, warnings)?;
-        let maximum =
-            usize::try_from(configuration.page_limit.bytes()).map_err(|_| page_failure())?;
+        options: QueryPageOptions<'_>,
+    ) -> Result<QueryOutput, RiftError> {
+        let maximum = usize::try_from(options.configuration.page_limit.bytes())
+            .map_err(|_| page_failure())?;
+        let (saved, bytes, first) = SavedQuery::encoded(root, owner, view, answer, options)?;
         if encoded_size(&first)? > maximum {
             return Err(page_failure());
         }
@@ -619,13 +625,13 @@ impl CandidateResponses {
         selection: &PageSelection,
         root: &std::path::Path,
         owner: &rift_protocol::identity::SymbolOwner,
-    ) -> Result<QueryReadResult, RiftError> {
+    ) -> Result<QueryOutput, RiftError> {
         let (saved, answer) = match self.replay_query(selection)? {
             Ok(found) => found,
-            Err(reason) => return Ok(query_unavailable(reason)),
+            Err(reason) => return Ok(query_unavailable(reason).into()),
         };
         if saved.root != root || &saved.owner != owner {
-            return Ok(query_unavailable(SymbolUnavailableReason::ViewContext));
+            return Ok(query_unavailable(SymbolUnavailableReason::ViewContext).into());
         }
         saved.response(answer, selection.page)
     }
@@ -856,9 +862,8 @@ impl SavedQuery {
         owner: &rift_protocol::identity::SymbolOwner,
         view: &CapturedView,
         answer: &QueryAnswer,
-        configuration: &QueryConfiguration,
-        warnings: Vec<ReadWarning>,
-    ) -> Result<(Self, Vec<u8>, QueryReadResult), RiftError> {
+        options: QueryPageOptions<'_>,
+    ) -> Result<(Self, Vec<u8>, QueryOutput), RiftError> {
         let (bytes, template_end, offsets) = encode_records(answer, BYTES_MAX)?;
         let mut saved = Self {
             root: root.to_owned(),
@@ -866,9 +871,10 @@ impl SavedQuery {
             view: view.clone(),
             template_end,
             pages: Vec::new(),
-            warnings,
+            warnings: options.warnings,
+            display: options.display,
         };
-        saved.pages = plan_pages(answer, &offsets, &saved, configuration)?;
+        saved.pages = plan_pages(answer, &offsets, &saved, options.configuration)?;
         let response = saved.response(first_page(answer, saved.pages.first(), &offsets), 0)?;
         Ok((saved, bytes, response))
     }
@@ -895,7 +901,7 @@ impl SavedQuery {
         Ok(answer)
     }
 
-    fn response(&self, answer: QueryAnswer, page_index: u64) -> Result<QueryReadResult, RiftError> {
+    fn response(&self, answer: QueryAnswer, page_index: u64) -> Result<QueryOutput, RiftError> {
         let total_pages = u64::try_from(self.pages.len()).map_err(|_| page_failure())?;
         let next = page_index.checked_add(1).filter(|next| *next < total_pages);
         let mut pagination = rift_protocol::query::QueryPagination::from(Pagination {
@@ -905,12 +911,15 @@ impl SavedQuery {
         pagination.next_query = next
             .map(|next| continuation_query(&answer, &self.view.id, next))
             .transpose()?;
-        Ok(QueryReadResult::Results(Box::new(QueryResult {
-            answer,
-            view: Some(self.view.clone()),
-            pagination,
-            warnings: self.warnings.clone(),
-        })))
+        Ok(QueryOutput::new(
+            QueryReadResult::Results(Box::new(QueryResult {
+                answer,
+                view: Some(self.view.clone()),
+                pagination,
+                warnings: self.warnings.clone(),
+            })),
+            self.display.clone(),
+        ))
     }
 }
 
@@ -991,7 +1000,7 @@ mod tests {
             })
             .await
             .map_err(|failure| format!("{failure:?}"))?
-            .0
+            .0.result
         else {
             return Err("expected a query result".into());
         };
@@ -1010,6 +1019,7 @@ mod tests {
             .await
             .map_err(|failure| format!("{failure:?}"))?
             .0
+            .result
         else {
             return Err("expected retained query result".into());
         };
@@ -1058,7 +1068,8 @@ mod tests {
             })
             .await
             .map_err(|failure| format!("{failure:?}"))?
-            .0;
+            .0
+            .result;
         assert!(
             matches!(&count, QueryReadResult::Results(result)
                 if matches!(&result.answer, QueryAnswer::Bindings { bindings, .. }
@@ -1076,7 +1087,8 @@ mod tests {
             })
             .await
             .map_err(|failure| format!("{failure:?}"))?
-            .0;
+            .0
+            .result;
         assert!(
             matches!(&negative, QueryReadResult::Results(result)
                 if matches!(&result.answer, QueryAnswer::Boolean { value: true })),
@@ -1090,7 +1102,7 @@ mod tests {
             })
             .await
             .map_err(|failure| format!("{failure:?}"))?
-            .0;
+            .0.result;
         assert!(
             matches!(&mixed, QueryReadResult::Results(result)
                 if matches!(&result.answer, QueryAnswer::Bindings { bindings, .. }
@@ -1143,7 +1155,8 @@ mod tests {
             .graph_query(params)
             .await
             .map_err(|failure| format!("{failure:?}"))?
-            .0;
+            .0
+            .result;
         let QueryReadResult::Results(result) = result else {
             return Err(format!("expected captured usages, received {result:?}").into());
         };
@@ -1164,7 +1177,8 @@ mod tests {
             })
             .await
             .map_err(|failure| format!("{failure:?}"))?
-            .0;
+            .0
+            .result;
         assert!(
             matches!(count, QueryReadResult::Results(ref result)
             if matches!(&result.answer, QueryAnswer::Bindings { bindings, .. }
@@ -1182,7 +1196,8 @@ mod tests {
             })
             .await
             .map_err(|failure| format!("{failure:?}"))?
-            .0;
+            .0
+            .result;
         assert!(
             matches!(metadata, QueryReadResult::Results(ref result)
             if matches!(&result.answer, QueryAnswer::Bindings { bindings, .. }
@@ -1192,7 +1207,7 @@ mod tests {
         let evidence = server.graph_query(QueryParams {
             query: format!("SELECT ?source ?unit {{ ?node :of <{}> ; :index 0 ; :source ?source ; :range [ :unit ?unit ; :start ?start ; :end ?end ] }}", id.as_str()),
             language: QueryLanguage::Sparql,
-        }).await.map_err(|failure| format!("{failure:?}"))?.0;
+        }).await.map_err(|failure| format!("{failure:?}"))?.0.result;
         assert!(
             matches!(evidence, QueryReadResult::Results(ref result)
             if matches!(&result.answer, QueryAnswer::Bindings { bindings, .. }
@@ -1465,7 +1480,8 @@ mod tests {
                 .graph_query(query)
                 .await
                 .map_err(|failure| format!("{failure:?}"))?
-                .0;
+                .0
+                .result;
             let QueryReadResult::Results(result) = response else {
                 return Err(
                     format!("expected complete local and package callers: {response:?}").into(),
@@ -1491,7 +1507,8 @@ mod tests {
             })
             .await
             .map_err(|failure| format!("{failure:?}"))?
-            .0;
+            .0
+            .result;
         assert!(
             matches!(
                 &witness,
@@ -1507,7 +1524,8 @@ mod tests {
             .graph_query(query)
             .await
             .map_err(|failure| format!("{failure:?}"))?
-            .0;
+            .0
+            .result;
         assert!(
             matches!(
                 response,
@@ -1568,7 +1586,8 @@ mod tests {
             })
             .await
             .map_err(|failure| format!("{failure:?}"))?
-            .0;
+            .0
+            .result;
         service.abort();
         let QueryReadResult::Results(result) = result else {
             return Err(format!(
@@ -1638,7 +1657,8 @@ mod tests {
             })
             .await
             .map_err(|failure| format!("{failure:?}"))?
-            .0;
+            .0
+            .result;
         let QueryReadResult::Results(result) = response else {
             return Err(
                 format!("expected captured declaration excerpt, received {response:?}").into(),
@@ -1660,7 +1680,7 @@ mod tests {
         let metadata = server.graph_query(QueryParams {
             query: format!("SELECT ?kind {{ <{ROOT}> :calls ?target . ?node :of ?target; :index 0; :kind ?kind }}"),
             language: QueryLanguage::Sparql,
-        }).await.map_err(|failure| format!("{failure:?}"))?.0;
+        }).await.map_err(|failure| format!("{failure:?}"))?.0.result;
         assert!(
             matches!(
                 metadata,
@@ -1748,7 +1768,8 @@ mod tests {
             })
             .await
             .map_err(|failure| format!("{failure:?}"))?
-            .0;
+            .0
+            .result;
         service.abort();
         let QueryReadResult::Results(result) = result else {
             return Err(format!("expected exact node rows, received {result:?}").into());
@@ -1791,7 +1812,8 @@ mod tests {
             .graph_query(params)
             .await
             .map_err(|failure| format!("{failure:?}"))?
-            .0;
+            .0
+            .result;
         assert!(
             matches!(result, QueryReadResult::Results(ref result)
             if matches!(&result.answer, QueryAnswer::Bindings { bindings, .. }
@@ -1820,7 +1842,8 @@ mod tests {
             .graph_query(params)
             .await
             .map_err(|failure| format!("{failure:?}"))?
-            .0;
+            .0
+            .result;
         let QueryReadResult::Results(result) = result else {
             return Err(format!("expected producer regex results, received {result:?}").into());
         };
@@ -1858,7 +1881,8 @@ mod tests {
                 })
                 .await
                 .map_err(|failure| format!("{failure:?}"))?
-                .0;
+                .0
+                .result;
             assert!(
                 matches!(
                     result,
@@ -1904,7 +1928,8 @@ mod tests {
                 })
                 .await
                 .map_err(|failure| format!("{failure:?}"))?
-                .0;
+                .0
+                .result;
             assert!(
                 matches!(&result, QueryReadResult::Results(result)
                     if matches!(&result.answer, QueryAnswer::Boolean { value: true })),
@@ -1924,7 +1949,8 @@ mod tests {
                 })
                 .await
                 .map_err(|failure| format!("{failure:?}"))?
-                .0;
+                .0
+                .result;
             assert!(
                 matches!(
                     result,
@@ -1951,7 +1977,8 @@ mod tests {
             })
             .await
             .map_err(|failure| format!("{failure:?}"))?
-            .0;
+            .0
+            .result;
         let QueryReadResult::Results(result) = result else {
             return Err(format!("expected a captured symbol for {name}, found {result:?}").into());
         };

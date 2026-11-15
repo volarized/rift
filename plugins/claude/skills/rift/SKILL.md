@@ -20,7 +20,7 @@ Read `rift://map` first for served languages, workspace layout, and language ser
 | The exact symbol identity is known. | `get_symbol` |
 | A package or runtime declaration is needed. | `search` (with `:scope "global"` or `"all"` in `SERVICE :search`; read the returned symbol IRI with `get_symbol`) |
 | A package version the project does not use, or a package it lacks, is needed. | `search` (with `:packages` and `:scope "global"` or `"all"` in `SERVICE :search`; read the returned IRI with `get_symbol`, naming the hit's release as `revision`) |
-| A declaration's source, or the syntax nodes of a symbol's declarations, is needed. | `nodes` (with `symbol`, a project, package, or runtime one; send `node_cursor` back for the rest of a long answer) |
+| A declaration's source, or the syntax nodes of a symbol's declarations, is needed. | `nodes` (with `symbol`, a project, package, or runtime one; send `syntax: true` for the full syntax tree, and return `node_cursor` with the same selector to continue) |
 | The syntax structure at one position is needed. | `nodes` |
 | The declarations that reference a symbol, its impact (what changes when it does), or a path between two symbols is needed. | `search` (with SPARQL property paths) |
 | The declarations two revisions, or a revision and the working tree, hold differently are needed. | `search` (with `:change` in `SERVICE :search`) |

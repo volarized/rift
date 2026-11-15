@@ -33,6 +33,7 @@
 mod error;
 mod facts;
 mod layout;
+mod map;
 mod nodes;
 mod query;
 mod search;
@@ -41,6 +42,7 @@ mod walk;
 mod workspace;
 
 use rift_protocol::error::ErrorData;
+use rift_protocol::nodes_read::NodesToolResult;
 use rift_protocol::read::{GetSymbolResult, NodesResult};
 use rift_protocol::search::SearchResult;
 use rift_protocol::workspace::WorkspaceResourcePage;
@@ -50,6 +52,8 @@ use super::warnings::{record_documentation, record_warnings};
 use layout::Page;
 
 pub(crate) use error::RegisteredFailure;
+pub(crate) use nodes::select as select_nodes;
+pub(crate) use query::{QueryDisplay, QueryOutput};
 
 /// An answer that writes itself as text.
 pub(crate) trait Render {
@@ -60,6 +64,11 @@ pub(crate) trait Render {
 
     /// Records read warnings before serialization to a client.
     fn log_warnings(&mut self) {}
+
+    /// Keeps presentation context available to a proxy that qualifies the structured answer.
+    fn metadata(&self) -> Result<Option<rmcp::model::MetaObject>, serde_json::Error> {
+        Ok(None)
+    }
 
     /// Writes this answer into `out`.
     ///
@@ -159,6 +168,22 @@ impl Render for GetSymbolResult {
     }
 }
 
+impl Render for NodesToolResult {
+    fn log_warnings(&mut self) {
+        match self {
+            Self::Summary(summary) => record_warnings(&mut summary.warnings),
+            Self::Syntax(result) => result.log_warnings(),
+        }
+    }
+
+    fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
+        match self {
+            Self::Summary(summary) => nodes::summary(out, summary),
+            Self::Syntax(result) => result.render(out),
+        }
+    }
+}
+
 impl Render for NodesResult {
     fn log_warnings(&mut self) {
         record_warnings(&mut self.warnings);
@@ -178,6 +203,12 @@ impl Render for ErrorData {
 impl Render for RegisteredFailure<'_> {
     fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
         error::registered(out, self)
+    }
+}
+
+impl Render for rift_protocol::map::WorkspaceMap {
+    fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
+        map::answer(out, self)
     }
 }
 

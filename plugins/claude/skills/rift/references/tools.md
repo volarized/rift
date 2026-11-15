@@ -21,22 +21,14 @@ Parameters:
 
 ## nodes
 
-Lists syntax nodes with their source text: every node of one `symbol`, or, for one
-UTF-8 byte `position` in one file, every node of the symbol whose declaration holds
-it, or the file's unit nodes when no declaration holds it. A symbol read is the way to
-read a declaration's source, and a package or runtime symbol's nodes come from the
-global API, each in a source unit of that symbol's release. A path read can select
-a registered project or profile with `scope`. The answer names `symbol`;
-each node is addressed by its place: node `index` of declaration `declaration` of
-that symbol, or node `index` of its unit, from the file node at 0, with `parent` an
-index in the same declaration or unit. An edit renumbers the nodes after it. An answer
-whose nodes cross its node count or source byte bound returns `node_cursor` for the
-rest. A file no syntax provider parses answers its file node alone. `revision` lists
-the nodes at a git commit or pins the served working tree, and the answer names the
-revision it was read at. If discovery is incomplete or a targeted read spends the
-request's remaining time, the request returns `temporarily_unavailable` and can be
-retried. A selected source path can answer within the remaining time. The server logs
-`local_index_preparing` while the publication is being prepared.
+Reads the selected symbol's declarations with their source and structure. A UTF-8
+byte `position` selects its enclosing declaration, or a source excerpt if none holds
+it. Use `scope` to select a registered project or profile for a path read.
+Send `syntax: true` for the full syntax tree, including individual tokens. Use the
+returned `node_cursor` with the same selector to continue declarations or syntax.
+A node's `index` and `parent` address nodes
+within the same declaration or source unit.
+Use `revision` to read a commit or release, or to pin the served working tree.
 
 Parameters:
 
@@ -46,6 +38,7 @@ Parameters:
 - `node_cursor` - Continuation a preceding read returned, bound to the symbol or unit its answer listed and the tree revision it read.
 - `revision` - The revision to read: a git revision reads that commit, a tree revision the served working tree, and a release revision selects the release of a package or runtime `symbol`'s owner.
 - `scope` - Project that owns `path`.
+- `syntax` - Return a page of the full syntax tree.
 
 ## search
 

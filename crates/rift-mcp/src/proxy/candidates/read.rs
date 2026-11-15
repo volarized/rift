@@ -1,6 +1,7 @@
 use super::{CANDIDATE_BYTES_MAX, RiftProxy, invalid};
 use rift_error::{RiftError, errors};
 use rift_protocol::identity::{SymbolIdentity, parse_local_scope};
+use rift_protocol::nodes_read::NodesToolResult;
 use rift_protocol::symbol_read::{GetSymbolParams, GetSymbolResult};
 use rmcp::handler::server::tool::IntoCallToolResult;
 use rmcp::model::{
@@ -174,19 +175,21 @@ pub(in crate::proxy) fn dispatch_nodes_request(
             .accepted(source.to_string())
             .error()
     })?;
-    let (mut params, _) = selected.split();
+    let (mut params, _, syntax) = selected.split();
     if let Some(symbol) = &mut params.symbol {
         *symbol = super::super::identity::dispatch_id(symbol, backend)?;
     }
     let value = serde_json::to_value(params)
         .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
     let mut upstream = request.clone();
-    upstream.arguments = Some(
-        value
-            .as_object()
-            .cloned()
-            .ok_or_else(|| invalid("arguments", "nodes request is not an object"))?,
-    );
+    let mut arguments = value
+        .as_object()
+        .cloned()
+        .ok_or_else(|| invalid("arguments", "nodes request is not an object"))?;
+    if syntax {
+        arguments.insert("syntax".to_owned(), syntax.into());
+    }
+    upstream.arguments = Some(arguments);
     Ok(upstream)
 }
 
@@ -194,7 +197,7 @@ fn qualified_nodes_response(
     value: serde_json::Value,
     backend: &str,
 ) -> Result<Result<CallToolResponse, rmcp::ErrorData>, RiftError> {
-    let mut result: rift_protocol::read::NodesResult = serde_json::from_value(value)
+    let mut result: NodesToolResult = serde_json::from_value(value)
         .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
     super::super::identity::qualify_nodes(&mut result, backend)?;
     bounded_response(crate::output::Json(result).into_call_tool_result())

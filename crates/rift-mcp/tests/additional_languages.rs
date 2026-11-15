@@ -133,7 +133,10 @@ async fn workspace_discovers_native_web_and_explicit_template_languages() -> Tes
     }
     let unknown = call_retrying_acceptance(
         &client,
-        tool_request("nodes", &json!({"path":"unknown.beacon", "position":0})),
+        tool_request(
+            "nodes",
+            &json!({"path":"unknown.beacon", "position":0, "syntax":true}),
+        ),
     )
     .await?;
     assert_eq!(unknown["nodes"][0]["kind"], "file", "{unknown}");
@@ -147,7 +150,10 @@ async fn workspace_discovers_native_web_and_explicit_template_languages() -> Tes
 async fn assert_workspace_nodes(client: &Client, case: &SourceCase) -> TestResult {
     let output = call_retrying_acceptance(
         client,
-        tool_request("nodes", &json!({"path":case.path, "position":0})),
+        tool_request(
+            "nodes",
+            &json!({"path":case.path, "position":0, "syntax":true}),
+        ),
     )
     .await?;
     let nodes = output["nodes"].as_array().ok_or("nodes array")?;
@@ -253,7 +259,10 @@ async fn assert_workspace_symbol_node(
     let position = u64::try_from(start.checked_add(positions[0].0).ok_or("name offset")?)?;
     let output = call_retrying_acceptance(
         client,
-        tool_request("nodes", &json!({"path":case.path, "position":position})),
+        tool_request(
+            "nodes",
+            &json!({"path":case.path, "position":position, "syntax":true}),
+        ),
     )
     .await?;
     let nodes = output["nodes"].as_array().ok_or("nodes array")?;
@@ -280,5 +289,75 @@ async fn assert_workspace_symbol_node(
         node["source"],
         Value::from(&case.text[node_start..node_end])
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn nodes_summaries_continue_over_declarations_and_refuse_another_selector() -> TestResult {
+    use workspace_client::served_workspace;
+
+    let (_directory, client, task) = served_workspace(
+        &[
+            (
+                "package.json",
+                r#"{"name":"beacon","version":"1.0.0","main":"index.js","types":"index.d.ts"}"#,
+            ),
+            ("index.js", "export function open(path) {}\n"),
+            (
+                "index.d.ts",
+                concat!(
+                    "export declare function open(path: string): void;\n",
+                    "export declare function open(path: number): void;\n",
+                    "export declare function open(path: boolean): void;\n",
+                    "export declare function open(path: bigint): void;\n",
+                    "export declare function open(path: symbol): void;\n",
+                ),
+            ),
+        ],
+        None,
+    )
+    .await?;
+    let symbol = "rift://symbol/local/javascript/beacon/open";
+    let default =
+        call_retrying_acceptance(&client, tool_request("nodes", &json!({"symbol":symbol}))).await?;
+    let cursor = default["node_cursor"]
+        .as_str()
+        .ok_or("declaration continuation")?;
+    let next = call_retrying_acceptance(
+        &client,
+        tool_request("nodes", &json!({"symbol":symbol, "node_cursor":cursor})),
+    )
+    .await?;
+    let declarations = |value: Value| -> TestResult<Vec<u64>> {
+        value["declarations"]
+            .as_array()
+            .ok_or("declarations")?
+            .iter()
+            .map(|declaration| {
+                declaration["declaration"]
+                    .as_u64()
+                    .ok_or("declaration index".into())
+            })
+            .collect()
+    };
+    assert!(next.get("node_cursor").is_none(), "{next}");
+    assert_eq!(declarations(default.clone())?, [0, 1, 2, 3]);
+    assert_eq!(declarations(next)?, [4, 5]);
+    let refused = client
+        .call_tool(tool_request(
+            "nodes",
+            &json!({"symbol":symbol, "node_cursor":cursor, "syntax":true}),
+        ))
+        .await?;
+    assert_eq!(refused.is_error, Some(true), "{refused:?}");
+    let refused = client
+        .call_tool(tool_request(
+            "nodes",
+            &json!({"path":"index.js", "position":17, "node_cursor":cursor}),
+        ))
+        .await?;
+    assert_eq!(refused.is_error, Some(true), "{refused:?}");
+    client.cancel().await?;
+    task.await?;
     Ok(())
 }

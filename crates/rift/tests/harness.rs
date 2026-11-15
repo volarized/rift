@@ -20,10 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rift_protocol::error::{ErrorCode, RetryDirective};
-use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ReadResourceRequestParams, ReadResourceResult,
-    ResourceContents,
-};
+use rmcp::model::{CallToolRequestParams, CallToolResult, ReadResourceResult, ResourceContents};
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::transport::TokioChildProcess;
 use rmcp::{ServiceExt as _, transport::child_process::TokioChildProcessBuilder};
@@ -1738,9 +1735,7 @@ pub(crate) fn resource_json(
 }
 
 /// Waits for a complete captured local graph through the public search route.
-pub(crate) async fn await_workspace_ready(
-    client: &RunningService<RoleClient, ()>,
-) -> TestResult<serde_json::Value> {
+pub(crate) async fn await_workspace_ready(client: &RunningService<RoleClient, ()>) -> TestResult {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let arguments = serde_json::json!({"query": "ASK { ?subject a :Symbol }"});
     loop {
@@ -1772,12 +1767,7 @@ pub(crate) async fn await_workspace_ready(
             Some(body) => return Err(format!("unexpected graph readiness probe: {body}").into()),
         };
         if !preparing {
-            let answer = tokio::time::timeout_at(
-                deadline,
-                client.read_resource(ReadResourceRequestParams::new("rift://map".to_owned())),
-            )
-            .await??;
-            return resource_json(&answer, "rift://map");
+            return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
             return Err("workspace graph remained in preparation".into());

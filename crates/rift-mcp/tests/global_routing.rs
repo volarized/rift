@@ -831,7 +831,7 @@ async fn package_symbol_nodes_come_from_the_global_api_in_the_project_shape() ->
     let workspace = served_dependent_workspace(Some(&configuration)).await?;
     let (directory, client, server_task) = workspace.served;
     let id = global_api::collected_identity(SymbolFixture::Valid, "beacon");
-    let package = call_tool(&client, "nodes", json!({"symbol": id})).await?;
+    let package = call_tool(&client, "nodes", json!({"symbol": id, "syntax": true})).await?;
     let found = search_symbols(
         &client,
         json!({"query": "beacon", "scope": "local", "target": "symbol"}),
@@ -844,7 +844,8 @@ async fn package_symbol_nodes_come_from_the_global_api_in_the_project_shape() ->
         .find(|hit| hit["hit"]["symbol"]["name"] == "beacon")
         .and_then(|hit| hit["hit"]["symbol"]["id"].as_str())
         .ok_or("the project declares beacon")?;
-    let local = call_tool(&client, "nodes", json!({"symbol": local_id})).await?;
+    let local_request = json!({"symbol": local_id, "syntax": true});
+    let local = call_tool(&client, "nodes", local_request).await?;
 
     let package_nodes = package["nodes"].as_array().ok_or("package nodes")?;
     let local_nodes = local["nodes"].as_array().ok_or("project nodes")?;
@@ -883,7 +884,7 @@ async fn package_symbol_nodes_come_from_the_global_api_in_the_project_shape() ->
     let at_release = call_tool(
         &client,
         "nodes",
-        json!({"symbol": id, "revision": package["revision"]}),
+        json!({"symbol": id, "revision": package["revision"], "syntax": true}),
     )
     .await?;
     assert_eq!(

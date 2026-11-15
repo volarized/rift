@@ -44,6 +44,7 @@ mod expression;
 mod inventory;
 mod limits;
 mod page;
+mod presentation;
 mod query;
 mod query_thread;
 mod requirements;
@@ -70,6 +71,7 @@ pub use limits::{
     PATTERNS_MAX, QUERY_BYTES_MAX, SOLUTIONS_MAX, TRIPLES_MAX,
 };
 pub use page::{PageForm, PageSelection, continuation_query};
+pub use presentation::{QueryField, QueryPresentation};
 pub use query::GraphQuery;
 pub use requirements::{
     AdjacencySelection, AdjacencyStep, NodeSelection, ReachedNodes, SymbolSelection,
