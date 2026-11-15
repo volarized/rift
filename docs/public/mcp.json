@@ -3593,7 +3593,7 @@
       }
     },
     {
-      "description": "Lists syntax nodes with their source text: every node of one `symbol`, or, for one\nUTF-8 byte `position` in one file, every node of the symbol whose declaration holds\nit, or the file's unit nodes when no declaration holds it. A symbol read is the way to\nread a declaration's source, and a package or runtime symbol's nodes come from the\nglobal API, each in a source unit of that symbol's release. A path read can select\na registered project or profile with `scope`. The answer names `symbol`;\neach node is addressed by its place: node `index` of declaration `declaration` of\nthat symbol, or node `index` of its unit, from the file node at 0, with `parent` an\nindex in the same declaration or unit. An edit renumbers the nodes after it. An answer\nwhose nodes cross its node count or source byte bound returns `node_cursor` for the\nrest. A file no syntax provider parses answers its file node alone. `revision` lists\nthe nodes at a git commit or pins the served working tree, and the answer names the\nrevision it was read at. If discovery is incomplete or a targeted read spends the\nrequest's remaining time, the request returns `temporarily_unavailable` and can be\nretried. A selected source path can answer within the remaining time. The server logs\n`local_index_preparing` while the publication is being prepared.",
+      "description": "Reads the selected symbol's declarations with their source and structure. A UTF-8\nbyte `position` selects its enclosing declaration, or a source excerpt if none holds\nit. Use `scope` to select a registered project or profile for a path read.\nSend `syntax: true` for the full syntax tree, including individual tokens. Use the\nreturned `node_cursor` with the same selector to continue declarations or syntax.\nA node's `index` and `parent` address nodes\nwithin the same declaration or source unit.\nUse `revision` to read a commit or release, or to pin the served working tree.",
       "input_schema": {
         "$defs": {
           "ProjectPath": {
@@ -3739,6 +3739,11 @@
           "symbol": {
             "$ref": "#/$defs/SymbolId",
             "description": "The symbol whose nodes the read lists: each declaration's item node, then the\ndescendants that belong to that declaration and not to a declaration nested in it,\noutermost first per declaration. A package or runtime symbol's nodes come from the\nglobal API. The caller MUST omit `path` and `position` beside it."
+          },
+          "syntax": {
+            "default": false,
+            "description": "Return a page of the full syntax tree. Omitted returns declaration summaries or continues the view selected by node_cursor.",
+            "type": "boolean"
           }
         },
         "rift:since": "v0.0.4",
@@ -4128,6 +4133,51 @@
             ],
             "type": "object"
           },
+          "NodeDeclaration": {
+            "additionalProperties": false,
+            "description": "One declaration, with its source and the parts the syntax provider identified.",
+            "properties": {
+              "declaration": {
+                "description": "Declaration ordinal in the symbol, from zero.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "$ref": "#/$defs/ExactKind",
+                "description": "Kind of its root syntax node."
+              },
+              "parts": {
+                "description": "Selected children of the root node.",
+                "items": {
+                  "$ref": "#/$defs/NodePart"
+                },
+                "type": "array"
+              },
+              "range": {
+                "$ref": "#/$defs/TextRange",
+                "description": "Full byte range of the declaration."
+              },
+              "regions": {
+                "description": "Named regions of the root node, when supplied by the syntax provider.",
+                "items": {
+                  "$ref": "#/$defs/NodeRegion"
+                },
+                "type": "array"
+              },
+              "source": {
+                "$ref": "#/$defs/SourceExcerpt",
+                "description": "Source from the declaration. Its span identifies the returned bytes."
+              }
+            },
+            "required": [
+              "declaration",
+              "kind",
+              "range",
+              "source"
+            ],
+            "type": "object"
+          },
           "NodeFacet": {
             "description": "Portable structural facets, so a filter can ask for bodies or imports without knowing the\ngrammar that produced them.",
             "oneOf": [
@@ -4223,6 +4273,32 @@
               }
             ]
           },
+          "NodePart": {
+            "additionalProperties": false,
+            "description": "A syntax node directly inside a declaration, addressed at the answer's revision.",
+            "properties": {
+              "index": {
+                "description": "Index in the declaration's full syntax tree.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "$ref": "#/$defs/ExactKind",
+                "description": "Kind of the node in the provider's vocabulary."
+              },
+              "range": {
+                "$ref": "#/$defs/TextRange",
+                "description": "Byte range in the declaration's source unit."
+              }
+            },
+            "required": [
+              "index",
+              "kind",
+              "range"
+            ],
+            "type": "object"
+          },
           "NodeRegion": {
             "additionalProperties": false,
             "description": "One named part of a node, and the bytes it spans.",
@@ -4239,6 +4315,245 @@
             "required": [
               "role",
               "range"
+            ],
+            "type": "object"
+          },
+          "NodesResult": {
+            "additionalProperties": false,
+            "description": "The nodes a read selected, each with its source text and its place inside its symbol or\nunit.",
+            "examples": [
+              {
+                "nodes": [
+                  {
+                    "declaration": 0,
+                    "facets": [
+                      "declaration",
+                      "definition"
+                    ],
+                    "index": 0,
+                    "kind": "struct_item",
+                    "language": "rust",
+                    "range": {
+                      "end": 160,
+                      "start": 105
+                    },
+                    "source": "pub struct Config {\n    pub root: std::path::PathBuf,\n}",
+                    "unit": "rift://source/project/src/config.rs"
+                  },
+                  {
+                    "declaration": 0,
+                    "index": 1,
+                    "kind": "visibility_modifier",
+                    "language": "rust",
+                    "parent": 0,
+                    "range": {
+                      "end": 108,
+                      "start": 105
+                    },
+                    "source": "pub",
+                    "unit": "rift://source/project/src/config.rs"
+                  },
+                  {
+                    "declaration": 0,
+                    "index": 2,
+                    "kind": "type_identifier",
+                    "language": "rust",
+                    "parent": 0,
+                    "range": {
+                      "end": 122,
+                      "start": 116
+                    },
+                    "source": "Config",
+                    "unit": "rift://source/project/src/config.rs"
+                  },
+                  {
+                    "declaration": 0,
+                    "index": 3,
+                    "kind": "field_declaration_list",
+                    "language": "rust",
+                    "parent": 0,
+                    "range": {
+                      "end": 160,
+                      "start": 123
+                    },
+                    "source": "{\n    pub root: std::path::PathBuf,\n}",
+                    "unit": "rift://source/project/src/config.rs"
+                  },
+                  {
+                    "declaration": 0,
+                    "facets": [
+                      "declaration",
+                      "definition"
+                    ],
+                    "index": 4,
+                    "kind": "field_declaration",
+                    "language": "rust",
+                    "parent": 3,
+                    "range": {
+                      "end": 157,
+                      "start": 129
+                    },
+                    "source": "pub root: std::path::PathBuf",
+                    "unit": "rift://source/project/src/config.rs"
+                  },
+                  {
+                    "declaration": 0,
+                    "index": 5,
+                    "kind": "visibility_modifier",
+                    "language": "rust",
+                    "parent": 4,
+                    "range": {
+                      "end": 132,
+                      "start": 129
+                    },
+                    "source": "pub",
+                    "unit": "rift://source/project/src/config.rs"
+                  },
+                  {
+                    "declaration": 0,
+                    "index": 6,
+                    "kind": "field_identifier",
+                    "language": "rust",
+                    "parent": 4,
+                    "range": {
+                      "end": 137,
+                      "start": 133
+                    },
+                    "source": "root",
+                    "unit": "rift://source/project/src/config.rs"
+                  },
+                  {
+                    "declaration": 0,
+                    "index": 7,
+                    "kind": "scoped_type_identifier",
+                    "language": "rust",
+                    "parent": 4,
+                    "range": {
+                      "end": 157,
+                      "start": 139
+                    },
+                    "source": "std::path::PathBuf",
+                    "unit": "rift://source/project/src/config.rs"
+                  },
+                  {
+                    "declaration": 0,
+                    "index": 8,
+                    "kind": "scoped_identifier",
+                    "language": "rust",
+                    "parent": 7,
+                    "range": {
+                      "end": 148,
+                      "start": 139
+                    },
+                    "source": "std::path",
+                    "unit": "rift://source/project/src/config.rs"
+                  },
+                  {
+                    "declaration": 0,
+                    "index": 9,
+                    "kind": "identifier",
+                    "language": "rust",
+                    "parent": 8,
+                    "range": {
+                      "end": 142,
+                      "start": 139
+                    },
+                    "source": "std",
+                    "unit": "rift://source/project/src/config.rs"
+                  },
+                  {
+                    "declaration": 0,
+                    "index": 10,
+                    "kind": "identifier",
+                    "language": "rust",
+                    "parent": 8,
+                    "range": {
+                      "end": 148,
+                      "start": 144
+                    },
+                    "source": "path",
+                    "unit": "rift://source/project/src/config.rs"
+                  },
+                  {
+                    "declaration": 0,
+                    "index": 11,
+                    "kind": "type_identifier",
+                    "language": "rust",
+                    "parent": 7,
+                    "range": {
+                      "end": 157,
+                      "start": 150
+                    },
+                    "source": "PathBuf",
+                    "unit": "rift://source/project/src/config.rs"
+                  }
+                ],
+                "revision": "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11",
+                "symbol": "rift://symbol/local/rust/app/config/Config"
+              }
+            ],
+            "properties": {
+              "node_cursor": {
+                "description": "Continuation for the rest of an answer whose nodes crossed its node count or source\nbyte bound. Absent when the answer holds the last node.",
+                "type": "string"
+              },
+              "nodes": {
+                "description": "Nodes the read selected, in pre-order: per declaration, in the order a symbol read\nlists them, or the unit's nodes from its file node on.",
+                "items": {
+                  "$ref": "#/$defs/Node"
+                },
+                "type": "array"
+              },
+              "revision": {
+                "$ref": "#/$defs/Revision",
+                "description": "The revision this answer was read at: a commit, a release, or a working tree."
+              },
+              "symbol": {
+                "$ref": "#/$defs/SymbolId",
+                "description": "The symbol whose declarations hold the listed nodes: the requested one for a `symbol`\nread, the innermost declaration's symbol for a `position` read. Absent when the nodes\nbelong to a unit outside every declaration."
+              }
+            },
+            "required": [
+              "nodes",
+              "revision"
+            ],
+            "type": "object"
+          },
+          "NodesSummary": {
+            "additionalProperties": false,
+            "description": "Source and structure selected by a nodes request.",
+            "properties": {
+              "declarations": {
+                "description": "Declarations in symbol order.",
+                "items": {
+                  "$ref": "#/$defs/NodeDeclaration"
+                },
+                "type": "array"
+              },
+              "excerpt": {
+                "$ref": "#/$defs/SourceExcerpt",
+                "description": "Source around the selected file position when no declaration holds it."
+              },
+              "node_cursor": {
+                "description": "Continues the declaration summaries with the same selector.",
+                "type": "string"
+              },
+              "revision": {
+                "$ref": "#/$defs/Revision",
+                "description": "The revision this answer was read at."
+              },
+              "symbol": {
+                "$ref": "#/$defs/SymbolId",
+                "description": "The symbol whose declarations were selected."
+              },
+              "truncated": {
+                "description": "True when the summary clipped a declaration's source.",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "declarations",
+              "revision"
             ],
             "type": "object"
           },
@@ -5717,6 +6032,25 @@
             "pattern": "^rift://revision/(?:git/[A-Za-z0-9._/-]+(?:~[0-9]*)*|tree/[0-9a-f]{64}|stdlib/[a-z][a-z0-9_-]*@[^/?#]+|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+)$",
             "type": "string"
           },
+          "SourceExcerpt": {
+            "additionalProperties": false,
+            "description": "A copy of source from the catalog. The unit may belong to the project, a dependency, or\nthe standard library; the excerpt preserves bytes as they were when the answer was\nproduced.",
+            "properties": {
+              "span": {
+                "$ref": "#/$defs/SourceUnitSpan",
+                "description": "The source unit and byte range the text was taken from."
+              },
+              "text": {
+                "description": "The source bytes returned by the request.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "span",
+              "text"
+            ],
+            "type": "object"
+          },
           "SourceUnitId": {
             "description": "Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. It names no revision: a read selects the revision whose bytes it answers. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.",
             "else": {
@@ -5753,6 +6087,25 @@
               "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/(?:[A-Za-z0-9._!$&'()*+,;=:-]|%[0-9A-F]{2})+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+/|stdlib/[a-z][a-z0-9_-]*/)(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
             },
             "type": "string"
+          },
+          "SourceUnitSpan": {
+            "additionalProperties": false,
+            "description": "One byte range in a source-catalog unit.",
+            "properties": {
+              "range": {
+                "$ref": "#/$defs/TextRange",
+                "description": "Half-open UTF-8 byte range in that unit."
+              },
+              "unit": {
+                "$ref": "#/$defs/SourceUnitId",
+                "description": "Source unit containing the bytes."
+              }
+            },
+            "required": [
+              "unit",
+              "range"
+            ],
+            "type": "object"
           },
           "SymbolId": {
             "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.",
@@ -5819,202 +6172,15 @@
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "additionalProperties": false,
-        "examples": [
+        "anyOf": [
           {
-            "nodes": [
-              {
-                "declaration": 0,
-                "facets": [
-                  "declaration",
-                  "definition"
-                ],
-                "index": 0,
-                "kind": "struct_item",
-                "language": "rust",
-                "range": {
-                  "end": 160,
-                  "start": 105
-                },
-                "source": "pub struct Config {\n    pub root: std::path::PathBuf,\n}",
-                "unit": "rift://source/project/src/config.rs"
-              },
-              {
-                "declaration": 0,
-                "index": 1,
-                "kind": "visibility_modifier",
-                "language": "rust",
-                "parent": 0,
-                "range": {
-                  "end": 108,
-                  "start": 105
-                },
-                "source": "pub",
-                "unit": "rift://source/project/src/config.rs"
-              },
-              {
-                "declaration": 0,
-                "index": 2,
-                "kind": "type_identifier",
-                "language": "rust",
-                "parent": 0,
-                "range": {
-                  "end": 122,
-                  "start": 116
-                },
-                "source": "Config",
-                "unit": "rift://source/project/src/config.rs"
-              },
-              {
-                "declaration": 0,
-                "index": 3,
-                "kind": "field_declaration_list",
-                "language": "rust",
-                "parent": 0,
-                "range": {
-                  "end": 160,
-                  "start": 123
-                },
-                "source": "{\n    pub root: std::path::PathBuf,\n}",
-                "unit": "rift://source/project/src/config.rs"
-              },
-              {
-                "declaration": 0,
-                "facets": [
-                  "declaration",
-                  "definition"
-                ],
-                "index": 4,
-                "kind": "field_declaration",
-                "language": "rust",
-                "parent": 3,
-                "range": {
-                  "end": 157,
-                  "start": 129
-                },
-                "source": "pub root: std::path::PathBuf",
-                "unit": "rift://source/project/src/config.rs"
-              },
-              {
-                "declaration": 0,
-                "index": 5,
-                "kind": "visibility_modifier",
-                "language": "rust",
-                "parent": 4,
-                "range": {
-                  "end": 132,
-                  "start": 129
-                },
-                "source": "pub",
-                "unit": "rift://source/project/src/config.rs"
-              },
-              {
-                "declaration": 0,
-                "index": 6,
-                "kind": "field_identifier",
-                "language": "rust",
-                "parent": 4,
-                "range": {
-                  "end": 137,
-                  "start": 133
-                },
-                "source": "root",
-                "unit": "rift://source/project/src/config.rs"
-              },
-              {
-                "declaration": 0,
-                "index": 7,
-                "kind": "scoped_type_identifier",
-                "language": "rust",
-                "parent": 4,
-                "range": {
-                  "end": 157,
-                  "start": 139
-                },
-                "source": "std::path::PathBuf",
-                "unit": "rift://source/project/src/config.rs"
-              },
-              {
-                "declaration": 0,
-                "index": 8,
-                "kind": "scoped_identifier",
-                "language": "rust",
-                "parent": 7,
-                "range": {
-                  "end": 148,
-                  "start": 139
-                },
-                "source": "std::path",
-                "unit": "rift://source/project/src/config.rs"
-              },
-              {
-                "declaration": 0,
-                "index": 9,
-                "kind": "identifier",
-                "language": "rust",
-                "parent": 8,
-                "range": {
-                  "end": 142,
-                  "start": 139
-                },
-                "source": "std",
-                "unit": "rift://source/project/src/config.rs"
-              },
-              {
-                "declaration": 0,
-                "index": 10,
-                "kind": "identifier",
-                "language": "rust",
-                "parent": 8,
-                "range": {
-                  "end": 148,
-                  "start": 144
-                },
-                "source": "path",
-                "unit": "rift://source/project/src/config.rs"
-              },
-              {
-                "declaration": 0,
-                "index": 11,
-                "kind": "type_identifier",
-                "language": "rust",
-                "parent": 7,
-                "range": {
-                  "end": 157,
-                  "start": 150
-                },
-                "source": "PathBuf",
-                "unit": "rift://source/project/src/config.rs"
-              }
-            ],
-            "revision": "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11",
-            "symbol": "rift://symbol/local/rust/app/config/Config"
+            "$ref": "#/$defs/NodesSummary",
+            "description": "Source and structure for the selected declarations or file position."
+          },
+          {
+            "$ref": "#/$defs/NodesResult",
+            "description": "Syntax nodes with their exact source and addresses."
           }
-        ],
-        "properties": {
-          "node_cursor": {
-            "description": "Continuation for the rest of an answer whose nodes crossed its node count or source\nbyte bound. Absent when the answer holds the last node.",
-            "type": "string"
-          },
-          "nodes": {
-            "description": "Nodes the read selected, in pre-order: per declaration, in the order a symbol read\nlists them, or the unit's nodes from its file node on.",
-            "items": {
-              "$ref": "#/$defs/Node"
-            },
-            "type": "array"
-          },
-          "revision": {
-            "$ref": "#/$defs/Revision",
-            "description": "The revision this answer was read at: a commit, a release, or a working tree."
-          },
-          "symbol": {
-            "$ref": "#/$defs/SymbolId",
-            "description": "The symbol whose declarations hold the listed nodes: the requested one for a `symbol`\nread, the innermost declaration's symbol for a `position` read. Absent when the nodes\nbelong to a unit outside every declaration."
-          }
-        },
-        "required": [
-          "nodes",
-          "revision"
         ],
         "type": "object"
       }
@@ -6681,6 +6847,67 @@
             "required": [
               "page_index",
               "total_pages"
+            ],
+            "type": "object"
+          },
+          "QueryReadResult": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/QueryResult",
+                "description": "An answer evaluated over every required fact."
+              },
+              {
+                "$ref": "#/$defs/SearchUnavailable",
+                "description": "Required facts or retained state cannot be established."
+              }
+            ],
+            "description": "A complete query answer or the typed cause preventing evaluation.",
+            "examples": [
+              {
+                "answer": {
+                  "bindings": [
+                    {
+                      "name": {
+                        "datatype": "http://www.w3.org/2001/XMLSchema#string",
+                        "type": "literal",
+                        "value": "ReadService"
+                      }
+                    }
+                  ],
+                  "result": "bindings",
+                  "variables": [
+                    "name"
+                  ]
+                },
+                "pagination": {
+                  "page_index": 0,
+                  "total_pages": 1
+                }
+              },
+              {
+                "answer": {
+                  "result": "boolean",
+                  "value": true
+                },
+                "pagination": {
+                  "page_index": 0,
+                  "total_pages": 1
+                }
+              },
+              {
+                "answer": {
+                  "result": "graph",
+                  "triples": []
+                },
+                "pagination": {
+                  "page_index": 0,
+                  "total_pages": 0
+                }
+              },
+              {
+                "outcome": "unavailable",
+                "reason": "view_context"
+              }
             ],
             "type": "object"
           },
@@ -8210,64 +8437,8 @@
             "type": "object"
           }
         },
+        "$ref": "#/$defs/QueryReadResult",
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "anyOf": [
-          {
-            "$ref": "#/$defs/QueryResult",
-            "description": "An answer evaluated over every required fact."
-          },
-          {
-            "$ref": "#/$defs/SearchUnavailable",
-            "description": "Required facts or retained state cannot be established."
-          }
-        ],
-        "examples": [
-          {
-            "answer": {
-              "bindings": [
-                {
-                  "name": {
-                    "datatype": "http://www.w3.org/2001/XMLSchema#string",
-                    "type": "literal",
-                    "value": "ReadService"
-                  }
-                }
-              ],
-              "result": "bindings",
-              "variables": [
-                "name"
-              ]
-            },
-            "pagination": {
-              "page_index": 0,
-              "total_pages": 1
-            }
-          },
-          {
-            "answer": {
-              "result": "boolean",
-              "value": true
-            },
-            "pagination": {
-              "page_index": 0,
-              "total_pages": 1
-            }
-          },
-          {
-            "answer": {
-              "result": "graph",
-              "triples": []
-            },
-            "pagination": {
-              "page_index": 0,
-              "total_pages": 0
-            }
-          },
-          {
-            "outcome": "unavailable",
-            "reason": "view_context"
-          }
-        ],
         "type": "object"
       }
     }

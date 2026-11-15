@@ -167,7 +167,12 @@ async fn assert_exact_profile_reads(
     );
     assert_eq!(declarations.len(), 1);
 
-    let nodes = proxied_call(client, "nodes", &json!({"symbol":profile_id})).await?;
+    let nodes = proxied_call(
+        client,
+        "nodes",
+        &json!({"symbol":profile_id, "syntax":true}),
+    )
+    .await?;
     let item = &nodes["nodes"][0];
     assert_eq!(nodes["symbol"].as_str(), Some(profile_id), "{nodes}");
     assert_eq!(item["index"].as_u64(), Some(0), "{nodes}");
@@ -180,7 +185,11 @@ async fn assert_exact_profile_reads(
     )
     .await?;
     assert_eq!(by_path["symbol"], profile_id, "{by_path}");
-    assert_eq!(by_path["nodes"][0]["source"], PROFILE_SOURCE, "{by_path}");
+    assert_eq!(
+        by_path["declarations"][0]["source"]["text"], PROFILE_SOURCE,
+        "{by_path}"
+    );
+    assert!(by_path.get("nodes").is_none());
 
     Ok(())
 }

@@ -1,8 +1,7 @@
 //! Text of the `rift://workspace` resource: language configuration and one page of source units.
 //!
-//! The header names the configuration revision, and the page when there are several. The sections
-//! follow directly under it. A language writes only what departs from the normal state of an
-//! enabled language.
+//! The header names the source page when there are several. The catalog and language
+//! configuration follow, with the URI to read when another page exists.
 
 use std::borrow::Cow;
 
@@ -10,9 +9,10 @@ use rift_protocol::workspace::{
     WorkspaceLanguageSummary, WorkspaceLspSummary, WorkspaceResourcePage, WorkspaceSourceUnit,
 };
 
-use super::facts::{Facts, cut_hash, quoted_value, wire_name};
+use super::facts::{Facts, quoted_value, wire_name};
 use super::layout::{self, Sections};
 use crate::output::text::{TextError, TextWriter};
+use crate::resource::WORKSPACE_URI;
 
 /// Levels that put `include` and `exclude` lines under their language.
 const PATTERN_DEPTH: usize = 1;
@@ -20,17 +20,13 @@ const PATTERN_DEPTH: usize = 1;
 /// Writes the header, language configuration, and source units.
 pub(super) fn answer(out: &mut TextWriter, page: &WorkspaceResourcePage) -> Result<(), TextError> {
     let WorkspaceResourcePage {
-        configuration_revision,
         languages,
         source,
         pagination,
         ..
     } = page;
     let mut header = Facts::default();
-    header.push(&format!(
-        "workspace {}",
-        cut_hash(&configuration_revision.0)
-    ));
+    header.push("workspace");
     if let Some(position) = layout::page_fact(pagination) {
         header.push(&position);
     }
@@ -47,6 +43,15 @@ pub(super) fn answer(out: &mut TextWriter, page: &WorkspaceResourcePage) -> Resu
         for unit in source {
             sections.entry(0, &unit_line(unit))?;
         }
+    } else if pagination.page_index >= pagination.total_pages {
+        out.raw_line(0, "No source files on this page.")?;
+    }
+    if let Some(next) = pagination
+        .page_index
+        .checked_add(1)
+        .filter(|next| *next < pagination.total_pages)
+    {
+        out.raw_line(0, &format!("next · {WORKSPACE_URI}?page_index={next}"))?;
     }
     Ok(())
 }
@@ -105,18 +110,13 @@ fn patterns_line<'a>(
     sections.entry(PATTERN_DEPTH, &format!("{label} {}", patterns.join(", ")))
 }
 
-/// `path · language · digest`, without the language when no language matched.
+/// `path · language`, with only the path when no language matched.
 fn unit_line(unit: &WorkspaceSourceUnit) -> String {
-    let WorkspaceSourceUnit {
-        path,
-        digest,
-        language,
-    } = unit;
+    let WorkspaceSourceUnit { path, language, .. } = unit;
     let mut facts = Facts::default();
     facts.push_value(&path.0);
     if let Some(language) = language {
         facts.push(&language.identity_segment());
     }
-    facts.push(cut_hash(&digest.0));
     facts.as_str().to_owned()
 }

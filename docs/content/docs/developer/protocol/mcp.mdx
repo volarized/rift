@@ -69,8 +69,10 @@ or `stdlib/python`. Its version comes from the workspace's pins, or from a versi
 [`[dependencies]`](/docs/developer/configuration#dependencies) `resolution = "auto"`, and the
 [dependency context](/docs/developer/architecture#standard-libraries) lists where each one is read.
 
-A read of `rift://map` returns one `application/json` content under either
-[output selection](#result-content):
+By default, `rift://map` returns a compact text overview with language counts, top-level
+directories, entry points, most-referenced symbols, documentation, and available language
+server recommendations. Each text section shows up to eight entries. With
+`rift mcp --output=all`, the read also returns the JSON snapshot.
 
 <ReadExample name="map" />
 
@@ -110,6 +112,14 @@ records such as parameters. Use `a :Symbol` when the question requires symbols a
 Each binding or triple term carries its kind: `iri`, `blank_node`, `literal` with `datatype`, or
 `language_literal` with `language`. Unbound variables are omitted from the row. Duplicate
 bindings and projected variable order follow SPARQL. Graph answers use RDF set semantics.
+
+MCP text leads with selected matches and call paths for direct retrieval projections. Other
+queries show their projected rows, boolean, or triples. Text shortens common RDF namespaces
+and writes ordinary integers and booleans without datatype names. If one page holds the
+entire graph and its only subject is an unreferenced blank node, text groups that subject's
+properties as `[ :active true ; :count 7 ] .` Labels shown in text stay distinct and keep
+the same spelling across pages of the retained answer. Structured content carries the exact
+RDF terms and retained identities.
 
 `DESCRIBE` uses the library's description behavior over all authoritative captured and published records in its selected dataset. It does not implicitly request every language-engine facet. Facts explicitly required by its `WHERE` pattern retain the same strict acquisition and missing-facts rules as other query forms; bounds still refuse incomplete admission.
 
@@ -237,7 +247,10 @@ between the same steps contribute evidence to the same path.
 
 The server scores each path by the strongest matched symbol and adds a quarter of the second
 strongest score when a distinct matched symbol is present. Step order follows the direction
-of the calls in the graph.
+of the calls in the graph. Text shows ordinary scores as decimals and writes each step with its
+index and an arrow, such as `0 → ReadService`. An answer with a single anonymous path needs
+no path label in text. Multiple anonymous paths carry numbers on a single page or retain
+their shortened labels across pages.
 
 The service applies `:limit` to whole flows before SPARQL evaluates the outer query. Outer
 `LIMIT` and `OFFSET` apply to solution rows and can split a flow's steps. When the caller
@@ -246,7 +259,8 @@ follows `pagination.next_query`, the retained result keeps the original flow and
 The server returns usable paths in a positive `SELECT` with `relationship_coverage_missing`
 when a provider covers only part of the required calls. The server returns typed unavailability
 when the available calls cannot establish the requested result. A discovery bound that cuts the
-search reports `traversal_truncated`.
+search reports `traversal_truncated`. A page continues the selected flow rows. If discovery reaches a
+bound, narrow the flow query and run it again to discover paths within that request.
 
 ### Change [#search-change]
 
@@ -306,7 +320,9 @@ The server decodes that stored page rather than evaluating the original statemen
 A continuation uses `SERVICE <urn:rift:result:<view-id>?page=<index>>` to address a
 single page of the original binding or graph answer. The page preserves rows, blank nodes,
 triples, and source selected by the original statement. A continuation can expire or request
-a page outside the retained answer. SPARQL `LIMIT` and `OFFSET` apply before transport paging.
+a page outside the retained answer. SPARQL `LIMIT` and `OFFSET` apply before transport paging. The text
+writes `next query` when another page is available. The retained view and expiry are available
+in structured content.
 
 ### Bounds and missing facts
 
@@ -371,7 +387,8 @@ source is read by [`nodes`](#tool-nodes) with `symbol`.
 the declarations of the same symbol at the revision the answer names; the server refuses it for
 another symbol and once that revision is no longer served. Each binding
 retains `origin`, exactly one of `path` and `unit`, `range`, `line`, and
-indices into the symbol's signatures, types, and documentation.
+indices into the symbol's signatures, types, and documentation. The text places each location
+next to the signature and prints `next declarations` when another page is available.
 
 <ReadExample name="multi-declaration-full" />
 
@@ -440,7 +457,13 @@ A path request **MAY** carry `scope` to select an [accepted project or profile](
 The server resolves `path` and any Git `revision` in the selected project. Omitting `scope`
 selects `local`. The caller **MUST** omit `scope` beside `symbol`.
 
-A `symbol` read answers every node of the symbol: per declaration, in the order
+A `symbol` read names the symbol and returns its declarations in symbol order. Each declaration
+has its kind, byte range, source excerpt, and selected parts of its syntax tree. The excerpt's
+span names the bytes returned. A summary shows up to four declarations and up to 1536 source
+bytes per declaration. A clipped source excerpt names the returned byte range. Send
+`syntax: true` for the exact source and the full syntax tree.
+
+With `syntax: true`, a `symbol` read answers every node of the symbol: per declaration, in the order
 [`get_symbol`](#tool-get_symbol) lists its declarations, the item node, which spans the
 declaration without its attached documentation, then each node of its item subtree in
 pre-order that no declaration nested in it holds. The answer names the symbol in `symbol`, and
@@ -456,18 +479,18 @@ carries the release it read as its `revision`.
 
 One answer holds at most `results_max` nodes, or the global API's `page_limit_max` for a package
 or runtime symbol, and 1 MiB of node source, and at least one node.
-When nodes remain, the answer carries `node_cursor`; the caller **MUST** send it back with the
-same selector to read the next page. A cursor binds the answer's symbol or unit and the tree
-revision the read served, so the server refuses it with `invalid_request` for another symbol or
-unit or once the tree has moved, and the caller restarts the read without it.
+When declarations or syntax nodes remain, the answer carries `node_cursor`. The caller **MUST**
+send it back with the same selector to continue the same view. A summary cursor continues
+declarations. A syntax cursor continues the full tree. When one declaration spans several
+syntax pages, a summary continuation can scan a page without another declaration. Follow its
+cursor while one is present. The server refuses a cursor for a different selection or a
+revision it no longer serves. Restart the read without the cursor.
 
-A `position` read answers the nodes of the innermost declaration holding one byte: every node of
-that declaration's symbol, as a `symbol` read answers them. A byte no declaration holds answers
-the nodes of the file's unit instead: the file node, then every node no declaration holds, with
-no `symbol`. Every file has a file node: kind `file`, spanning the whole file, with the file's
-source. A visible text
-file no syntax provider parses - `justfile`, `notes.txt` - answers its file node alone, in the
-language `text`. A path the index holds no text for, such as a lockfile, refuses
+A `position` read selects the symbol of the innermost declaration holding the byte. A byte no
+declaration holds returns an excerpt of up to 1536 bytes around that position. With `syntax: true`,
+a byte outside every declaration selects the file's unit nodes, starting at the file node.
+The file node spans the whole file. A visible text file no syntax provider parses, such as
+`justfile` or `notes.txt`, has one file node in the language `text`. A path the index holds no text for, such as a lockfile, refuses
 `capability_unavailable`, naming the extension or stating that the path carries none, and a file
 a syntax bound left out refuses `content_unavailable`.
 
@@ -486,17 +509,19 @@ nested declaration count toward the nested symbol.
 `parent` names the `index` of the enclosing node in the same declaration or unit, and is absent
 for a declaration's item node and for the file node. An address names a place at the read's
 revision, so an edit renumbers the nodes after it.
+The syntax text shows each node on one line with its byte range and address. The structured
+summary carries each selected part's `index` to match it against the full tree.
 
 A node of a project file names that file as a [`SourceUnitId`](/docs/developer/protocol/reference#SourceUnitId),
 such as `rift://source/project/src/config.rs`. The unit names no revision: the answer's
 `revision` names the tree or commit its bytes were read at.
 
-This call lists the nodes of the `Config` struct:
+This call reads the declaration of the `Config` struct:
 
 <ReadExample name="symbol-nodes" />
 
-This call reads byte 338 of `src/config.rs`, inside the `parse_config` call, and lists the nodes
-of `load_config`, the declaration holding it:
+This call reads byte 338 of `src/config.rs`, inside the `parse_config` call, and requests the
+full syntax tree of `load_config`, the declaration holding it:
 
 <ReadExample name="local-nodes" />
 
@@ -508,7 +533,7 @@ Callers read code through these tools:
 | --- | --- |
 | [`get_symbol`](#tool-get_symbol) | one logical symbol by canonical identity |
 | [`search`](#tool-search) | bindings, booleans, or RDF triples from selected facts |
-| [`nodes`](#tool-nodes) | the syntax nodes of one symbol, or of the declaration holding one position, with their source |
+| [`nodes`](#tool-nodes) | source and syntax structure of a symbol or the declaration holding one position |
 
 [Result content](#result-content) defines the representations a tool result carries and the proxy output selection that chooses them.
 
@@ -808,10 +833,9 @@ reaches the global API.
 
 ### Resource contents [#resource-contents]
 
-A read of `rift://map` answers `contents` with one JSON entry whose `mimeType` is
-`application/json`. A read of `rift://workspace` answers with two entries, both naming the
-requested `uri`: compact text with `mimeType` `text/plain`, then the JSON body with `mimeType`
-`application/json`. The server makes both workspace contents from the same data.
+A read of `rift://map` or `rift://workspace` returns compact text with `mimeType` `text/plain`.
+With `rift mcp --output=all`, the compact text is followed by JSON with `mimeType`
+`application/json`. Both contents name the requested `uri` and read the same publication.
 
 The map's `recommendations` entries carry `language`, `root`, and `command` for installed
 language servers without a selected configuration. The server **MUST** omit `recommendations`
@@ -820,9 +844,12 @@ configuration. `root` is relative to the map's project, with `.` selecting the p
 A `command` is a `rift config set` invocation quoted for the server's operating system;
 the caller runs it from the map project's root.
 
-The listings of resources and resource templates declare `application/json`, the type of the JSON body. A caller **SHOULD** select a content by its `mimeType`, because the `text` [output selection](#result-content) leaves compact text as the only content of a workspace read. The map remains JSON under both selections.
+The listings of resources and resource templates declare `application/json`, the type of the
+JSON body. A caller **SHOULD** select a content by its `mimeType`.
 
-The compact text of the workspace resource follows the layout of a [tool result](#result-content): the facts of one line are separated by ` · `, a direction is written with `→`, a lowercase hex value of at least 8 characters is cut to its first 8, and the normal state of a fact is left out. The server omits sections with no entries. The server enforces a byte limit on the text and refuses a read whose text crosses it as a protocol failure, with the typed `ErrorData` as `data`.
+Compact resource text uses ` · ` between facts on one line. The server omits sections with
+no entries. It refuses a read whose text exceeds the byte limit, with typed `ErrorData` as
+`data`.
 
 ### Workspace [#resource-workspace]
 
@@ -836,16 +863,17 @@ The answer carries:
 - `pagination` - the zero-based page and total page count
 
 The bare URI selects page zero. `rift://workspace?page_index=1` selects another page. Each page
-holds at most 1000 source units; language summaries repeat so every page can be read
-alone. A page past the end returns an empty `source` list with the true page count.
+holds at most 50 source units and repeats the language summaries. When another page exists,
+the compact response ends with its URI. A page past the end returns an empty `source` list
+with the actual page count.
 
-A read answers the [two contents](#resource-contents) of a resource. The compact text has these parts:
+The compact text has these parts:
 
-- the header `workspace <configuration_revision>`, with ` · page P/T` added under the rule of the [tool results](#result-content)
+- the header `workspace`, with ` · page P/T` on a multi-page answer
 - directly below the header, the sections `languages` and `source`, in that order, each a title such as `languages:` with its entries indented by one level; the server **MUST** omit a section that has no entry
 - a language entry: the language identity, `disabled` when `enabled` is `false`, `syntax` and `execution` when they hold, and `lsp <process> <state>` when the language has a selected LSP process
 - under a language entry, `include` and `exclude` lines with their patterns joined by `, `, each only when the list is not empty
-- a source entry as `path · language · digest`, without the language when none matched
+- a source entry as `path · language`, with only the path when no language matched
 
 The tabs below show the page of a workspace with one TypeScript language and one source unit:
 
@@ -858,13 +886,13 @@ The tabs below show the page of a workspace with one TypeScript language and one
 **Response, compact text:**
 
 ```text
-workspace 3f9a1c2e
+workspace
 languages:
 	typescript:tsx · syntax · lsp typescript:tsx ready
 		include src/**/*.tsx
 		exclude src/generated/**
 source:
-	src/view.tsx · typescript:tsx · 8a4d20bc
+	src/view.tsx · typescript:tsx
 ```
 
 </Tab>

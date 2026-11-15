@@ -2776,7 +2776,7 @@ fn a_search_value_holding_a_delimiter_is_quoted_and_others_stay_bare() {
 fn a_node_kind_holding_a_delimiter_is_quoted_and_others_stay_bare() {
     let answer = nodes_result(
         vec![
-            node(0, "a · b", 0, 9),
+            node(0, "a | b", 0, 9),
             node(1, "c: d", 1, 8),
             node(2, "e:f·g", 2, 7),
         ],
@@ -2786,15 +2786,9 @@ fn a_node_kind_holding_a_delimiter_is_quoted_and_others_stay_bare() {
         &answer,
         &[
             "3 nodes",
-            "\t[1] \"a · b\"",
-            "\t\t0..9",
-            "\t\tindex 0",
-            "\t[2] \"c: d\"",
-            "\t\t1..8",
-            "\t\tindex 1",
-            "\t[3] e:f·g",
-            "\t\t2..7",
-            "\t\tindex 2",
+            "\t\"a | b\" | bytes 0..9 | index 0",
+            "\tc: d | bytes 1..8 | index 1",
+            "\te:f·g | bytes 2..7 | index 2",
             "",
             "\t\ta",
             REVISION_LINE,
@@ -2819,15 +2813,15 @@ fn a_workspace_value_holding_a_delimiter_is_quoted_and_others_stay_bare() {
     golden(
         &page,
         &[
-            "workspace 3f9a1c2e",
+            "workspace",
             "languages:",
             "\tpython",
             "\t\tinclude \"src/a · b/**\"",
             "\t\texclude \"docs: old/**\", a:b·c/**",
             "source:",
-            "\t\"src/a · b.py\" · python · 8a4d20bc",
-            "\t\"x: y.py\" · 8a4d20bc",
-            "\ta:b·c.py · 8a4d20bc",
+            "\t\"src/a · b.py\" · python",
+            "\t\"x: y.py\"",
+            "\ta:b·c.py",
         ],
     );
 }
@@ -3063,6 +3057,21 @@ fn control_characters_in_get_symbol_facts_are_escaped() {
 
 // Nodes answers.
 
+#[test]
+fn a_declaration_summary_names_the_parts_and_keeps_their_addresses_in_structured_content() {
+    use rift_protocol::nodes_read::NodesToolResult;
+
+    let (summary, _) = super::nodes::select(example::<NodesResult>(0), None, 0);
+    assert_eq!(summary.declarations[0].parts[0].index, 3);
+    let output = rendered(&NodesToolResult::Summary(summary));
+    assert!(
+        output
+            .lines()
+            .any(|line| line == "\tStructure | field declaration list"),
+        "{output}"
+    );
+}
+
 fn outer_and_inner() -> NodesResult {
     let outer = node(0, "function_item", 0, 20);
     let mut inner = node(1, "identifier", 3, 9);
@@ -3094,13 +3103,9 @@ fn a_package_symbol_answer_writes_like_a_project_symbol_answer() {
     golden(
         &answer,
         &[
-            "2 nodes · rift://symbol/cargo/crates.io/demo/rust/demo/beacon",
-            "\t[1] function_item",
-            "\t\t26..44",
-            "\t\tdeclaration 0 · index 0",
-            "\t[2] identifier",
-            "\t\t33..39",
-            "\t\tdeclaration 0 · index 2 · parent 0",
+            "2 nodes | rift://symbol/cargo/crates.io/demo/rust/demo/beacon",
+            "\tfunction_item | bytes 26..44 | declaration 0 | index 0",
+            "\tidentifier | bytes 33..39 | declaration 0 | index 2 | parent 0",
             "",
             "\t\tpub fn beacon() {}",
             REVISION_LINE,
@@ -3124,16 +3129,10 @@ fn a_symbol_answer_writes_each_declaration_source_then_its_cursor() {
     golden(
         &answer,
         &[
-            "3 nodes · rift://symbol/local/rust/app/a/A",
-            "\t[1] function_item",
-            "\t\t0..9",
-            "\t\tdeclaration 0 · index 0",
-            "\t[2] identifier",
-            "\t\t3..4",
-            "\t\tindex 1",
-            "\t[3] function_item",
-            "\t\t20..29",
-            "\t\tdeclaration 1 · index 0",
+            "3 nodes | rift://symbol/local/rust/app/a/A",
+            "\tfunction_item | bytes 0..9 | declaration 0 | index 0",
+            "\tidentifier | bytes 3..4 | index 1",
+            "\tfunction_item | bytes 20..29 | declaration 1 | index 0",
             "",
             "\t\tfn a() {}",
             "",
@@ -3157,9 +3156,7 @@ fn one_node_has_no_marker_and_its_excerpt_follows_a_blank_line() {
         &answer,
         &[
             "1 node",
-            "\tidentifier",
-            "\t3..9",
-            "\tindex 1",
+            "\tidentifier | bytes 3..9 | index 1",
             "",
             "\tname",
             REVISION_LINE,
@@ -3175,12 +3172,8 @@ fn several_nodes_follow_each_other_without_a_blank_line_and_only_the_outermost_e
         &answer,
         &[
             "2 nodes",
-            "\t[1] function_item · 2 lines",
-            "\t\t0..20",
-            "\t\tindex 0",
-            "\t[2] identifier",
-            "\t\t3..9",
-            "\t\tindex 1 · parent 0",
+            "\tfunction_item | bytes 0..20 | index 0 | 2 lines",
+            "\tidentifier | bytes 3..9 | index 1 | parent 0",
             "",
             "\t\tfn name() {}",
             "\t\t// tail",
@@ -3219,13 +3212,8 @@ fn a_node_names_its_symbol_its_regions_and_its_generated_and_test_facets() {
         &nodes_result(vec![item, plain], vec!["fn a() {\n    b\n}", "{"]),
         &[
             "2 nodes",
-            "\t[1] function_item · 3 lines · generated · test",
-            "\t\t0..20",
-            "\t\tdeclaration 0 · index 0",
-            "\t\tname 3..4 · body 8..20",
-            "\t[2] block",
-            "\t\t9..10",
-            "\t\tindex 1",
+            "\tfunction_item | bytes 0..20 | declaration 0 | index 0 | 3 lines | generated | test | name 3..4 | body 8..20",
+            "\tblock | bytes 9..10 | index 1",
             "",
             "\t\tfn a() {",
             "\t\t    b",
@@ -3247,18 +3235,10 @@ fn the_line_count_follows_the_excerpt_lines_and_not_its_trailing_line_feed() {
         &nodes_result(nodes, vec!["", "x\n", "x\ny\n", "z"]),
         &[
             "4 nodes",
-            "\t[1] a",
-            "\t\t0..1",
-            "\t\tindex 0",
-            "\t[2] b",
-            "\t\t1..2",
-            "\t\tindex 1",
-            "\t[3] c · 2 lines",
-            "\t\t2..3",
-            "\t\tindex 2",
-            "\t[4] d",
-            "\t\t3..4",
-            "\t\tindex 3",
+            "\ta | bytes 0..1 | index 0",
+            "\tb | bytes 1..2 | index 1",
+            "\tc | bytes 2..3 | index 2 | 2 lines",
+            "\td | bytes 3..4 | index 3",
             "",
             "",
             "",
@@ -3282,9 +3262,7 @@ fn an_empty_innermost_excerpt_is_one_empty_line_after_the_blank_line() {
         rendered(&answer),
         text(&[
             "1 node",
-            "\ta",
-            "\t0..1",
-            "\tindex 0",
+            "\ta | bytes 0..1 | index 0",
             "",
             "",
             REVISION_LINE
@@ -3300,12 +3278,8 @@ fn warnings_leave_node_excerpts_unchanged() {
         &answer,
         &[
             "2 nodes",
-            "\t[1] function_item · 2 lines",
-            "\t\t0..20",
-            "\t\tindex 0",
-            "\t[2] identifier",
-            "\t\t3..9",
-            "\t\tindex 1 · parent 0",
+            "\tfunction_item | bytes 0..20 | index 0 | 2 lines",
+            "\tidentifier | bytes 3..9 | index 1 | parent 0",
             "",
             "\t\tfn name() {}",
             "\t\t// tail",
@@ -3323,9 +3297,7 @@ fn an_excerpt_with_backticks_and_header_lines_stays_verbatim_under_the_node() {
         &single,
         &[
             "1 node",
-            "\ta · 7 lines",
-            "\t0..9",
-            "\tindex 0",
+            "\ta | bytes 0..9 | index 0 | 7 lines",
             "",
             "\t````rust",
             "\t```",
@@ -3345,7 +3317,7 @@ fn an_excerpt_with_backticks_and_header_lines_stays_verbatim_under_the_node() {
     assert_no_trailing_space(&output);
     let block: Vec<&str> = output
         .lines()
-        .skip(8)
+        .skip(4)
         .take_while(|line| !line.starts_with("revision "))
         .collect();
     assert_eq!(block.len(), 7);
@@ -3660,43 +3632,19 @@ fn the_authored_nodes_example_renders_one_entry_per_node_and_the_outermost_sourc
     golden(
         &example::<NodesResult>(0),
         &[
-            "12 nodes · rift://symbol/local/rust/app/config/Config",
-            "\t[1] struct_item · 3 lines",
-            "\t\t105..160",
-            "\t\tdeclaration 0 · index 0",
-            "\t[2] visibility_modifier",
-            "\t\t105..108",
-            "\t\tdeclaration 0 · index 1 · parent 0",
-            "\t[3] type_identifier",
-            "\t\t116..122",
-            "\t\tdeclaration 0 · index 2 · parent 0",
-            "\t[4] field_declaration_list · 3 lines",
-            "\t\t123..160",
-            "\t\tdeclaration 0 · index 3 · parent 0",
-            "\t[5] field_declaration",
-            "\t\t129..157",
-            "\t\tdeclaration 0 · index 4 · parent 3",
-            "\t[6] visibility_modifier",
-            "\t\t129..132",
-            "\t\tdeclaration 0 · index 5 · parent 4",
-            "\t[7] field_identifier",
-            "\t\t133..137",
-            "\t\tdeclaration 0 · index 6 · parent 4",
-            "\t[8] scoped_type_identifier",
-            "\t\t139..157",
-            "\t\tdeclaration 0 · index 7 · parent 4",
-            "\t[9] scoped_identifier",
-            "\t\t139..148",
-            "\t\tdeclaration 0 · index 8 · parent 7",
-            "\t[10] identifier",
-            "\t\t139..142",
-            "\t\tdeclaration 0 · index 9 · parent 8",
-            "\t[11] identifier",
-            "\t\t144..148",
-            "\t\tdeclaration 0 · index 10 · parent 8",
-            "\t[12] type_identifier",
-            "\t\t150..157",
-            "\t\tdeclaration 0 · index 11 · parent 7",
+            "12 nodes | rift://symbol/local/rust/app/config/Config",
+            "\tstruct_item | bytes 105..160 | declaration 0 | index 0 | 3 lines",
+            "\tvisibility_modifier | bytes 105..108 | declaration 0 | index 1 | parent 0",
+            "\ttype_identifier | bytes 116..122 | declaration 0 | index 2 | parent 0",
+            "\tfield_declaration_list | bytes 123..160 | declaration 0 | index 3 | parent 0 | 3 lines",
+            "\tfield_declaration | bytes 129..157 | declaration 0 | index 4 | parent 3",
+            "\tvisibility_modifier | bytes 129..132 | declaration 0 | index 5 | parent 4",
+            "\tfield_identifier | bytes 133..137 | declaration 0 | index 6 | parent 4",
+            "\tscoped_type_identifier | bytes 139..157 | declaration 0 | index 7 | parent 4",
+            "\tscoped_identifier | bytes 139..148 | declaration 0 | index 8 | parent 7",
+            "\tidentifier | bytes 139..142 | declaration 0 | index 9 | parent 8",
+            "\tidentifier | bytes 144..148 | declaration 0 | index 10 | parent 8",
+            "\ttype_identifier | bytes 150..157 | declaration 0 | index 11 | parent 7",
             "",
             "\t\tpub struct Config {",
             "\t\t    pub root: std::path::PathBuf,",

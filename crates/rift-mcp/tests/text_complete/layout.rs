@@ -11,8 +11,8 @@
 //! - Items section, always first: the title is `N result` or `N results` (`N node` or `N nodes`
 //!   for `nodes`), then ` · page P/T` when `total_pages > 1` or the page lies past the end. A
 //!   `nodes` answer has no page. No blank line follows the title or separates two items.
-//! - One item has no marker and indents every line by one level. Several items each start with
-//!   `[n] ` at one level and indent their further lines by two.
+//! - One hit has no marker and indents every line by one level. Several hits each start with
+//!   a numbered marker at one level and indent their further lines by two.
 //! - Per `search` hit, in order: the location, every `matched_by` name, and `score <value>` on the
 //!   location line; the symbol, node, or documented-symbol identity as a line; the returned source
 //!   line by line. A commit hit states its revision cut to 8 characters, author, subject, paths,
@@ -24,12 +24,9 @@
 //! - Per `get_symbol` hit: the location line, the symbol identity, every history version, the
 //!   `history (incomplete):` label exactly when the history is incomplete, and the source.
 //!   A single-item answer ends its items section with its source.
-//! - Per `nodes` entry: the kind on the head line, ` · <L> lines` exactly when the source has
-//!   more than one line, `generated` and `test` when the facet holds, the node identity on the
-//!   next line, the `of` symbol identity and the regions line when present. The written sources
-//!   end the items section, each line by line after one blank line: when the first node declares
-//!   a symbol, the source of each node no earlier node encloses; otherwise the innermost
-//!   node's source. Other sources are not checked.
+//! - Per `nodes` entry: kind, byte range, address, line count for multiline source, facets, and
+//!   regions on one line. Sources end the section, each after one blank line. The text writes
+//!   the source of each node no earlier node in the same unit encloses.
 
 mod walk;
 
@@ -46,6 +43,8 @@ const SECTION_LEVELS: usize = 1;
 const MARKER_LEVELS: usize = 1;
 /// Separates the facts of one line.
 const SEPARATOR: &str = " · ";
+/// Separates the facts of a syntax node.
+const NODE_SEPARATOR: &str = " | ";
 /// Characters of a hash that stay when it is cut.
 const HASH_CUT: usize = 8;
 /// Relative difference under which a score token states a score.
@@ -167,62 +166,42 @@ pub(super) fn text_states(tool: Tool, text: &str, structured: &Value) -> Result<
     require(structured.get("warnings").is_none(), "$.warnings", || {
         "read warnings belong in the logs".to_owned()
     })?;
-    items_states(tool, &first.entries, items, structured)
+    items_states(tool, &first.entries, items)
 }
 
 /// Checks the items section: its markers, indents, blank lines, every item, and the walk tree.
-fn items_states(
-    tool: Tool,
-    entries: &[&str],
-    items: &[Value],
-    structured: &Value,
-) -> Result<(), String> {
+fn items_states(tool: Tool, entries: &[&str], items: &[Value]) -> Result<(), String> {
     let key = tool.items_key();
     require(entries.first() != Some(&""), &format!("$.{key}"), || {
         "no blank line may follow the title".to_owned()
     })?;
+    if tool == Tool::Nodes {
+        return node_entries_states(entries, items);
+    }
     let plan = Plan::of(items, tool == Tool::Search)?;
     let (item_entries, nodes) = plan.split(entries)?;
     let listed = plan.outside();
     let chunks = chunk_items(&item_entries, listed.len(), key)?;
     for ((index, hit), chunk) in listed.iter().zip(&chunks) {
         let at = format!("$.{key}[{index}]");
-        let may_end_blank = may_end_blank(tool, hit, structured, *index, items.len());
+        let may_end_blank = source_may_end_blank(hit.get("source"));
         require(
             may_end_blank || chunk.len() < 2 || chunk.last() != Some(&""),
             &at,
             || "a blank line may not end an item, before the next item or section".to_owned(),
         )?;
         let item = Item::new(chunk, listed.len() > 1, &at)?;
-        match tool {
-            Tool::Search => search_hit(&item, hit, &at)?,
-            Tool::GetSymbol => symbol_hit(&item, hit, &at)?,
-            Tool::Nodes => node_entry(&item, hit, &at)?,
+        if tool == Tool::Search {
+            search_hit(&item, hit, &at)?;
+        } else {
+            symbol_hit(&item, hit, &at)?;
         }
     }
     plan.states(&nodes)?;
-    match tool {
-        Tool::Search => Ok(()),
-        Tool::GetSymbol => single_symbol_ends_with_source(entries, items),
-        Tool::Nodes => written_sources_end_section(entries, items),
+    if tool == Tool::GetSymbol {
+        single_symbol_ends_with_source(entries, items)?;
     }
-}
-
-/// Whether the text of item `index` may end in an empty line.
-///
-/// That is the case when the source the item writes last is empty or ends in a line feed. A
-/// `nodes` answer writes its sources after the last item, so only its last item may.
-fn may_end_blank(tool: Tool, hit: &Value, structured: &Value, index: usize, count: usize) -> bool {
-    let source = match tool {
-        Tool::Nodes if index + 1 == count => structured
-            .get("nodes")
-            .and_then(Value::as_array)
-            .and_then(|nodes| written_nodes(nodes).last().map(|(_, node)| *node))
-            .and_then(|node| node.get("source")),
-        Tool::Nodes => None,
-        Tool::Search | Tool::GetSymbol => hit.get("source"),
-    };
-    source_may_end_blank(source)
+    Ok(())
 }
 
 /// Whether a hit with this `source` may end in an empty line: the source is empty or ends in a
@@ -296,7 +275,12 @@ fn require(holds: bool, at: &str, what: impl FnOnce() -> String) -> Result<(), S
 /// Checks the count and, for a paged tool, the page of the title of the items section.
 fn title_states(title: &str, count: usize, tool: Tool, structured: &Value) -> Result<(), String> {
     let counted = counted(count, tool.noun());
-    let mut facts = title.split(SEPARATOR);
+    let separator = if tool == Tool::Nodes {
+        NODE_SEPARATOR
+    } else {
+        SEPARATOR
+    };
+    let mut facts = title.split(separator);
     require(
         facts.next() == Some(counted.as_str()),
         &format!("$.{}", tool.items_key()),
@@ -788,107 +772,94 @@ fn edge_states(entry: Option<&str>, edge: &Value, at: &str) -> Result<(), String
     Ok(())
 }
 
-/// Checks one `nodes` entry against its lines: head, byte range, address, and regions.
-fn node_entry(item: &Item<'_>, node: &Value, at: &str) -> Result<(), String> {
-    let place = node
-        .pointer("/index")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| format!("{at}.index: must be an integer"))?;
-    let mut address = Vec::new();
-    if let Some(declaration) = node.pointer("/declaration").and_then(Value::as_u64) {
-        address.push(format!("declaration {declaration}"));
+/// Checks one line per syntax node, followed by the written sources.
+fn node_entries_states(entries: &[&str], nodes: &[Value]) -> Result<(), String> {
+    let (rows, sources) = entries
+        .split_at_checked(nodes.len())
+        .ok_or("$.nodes: missing node rows")?;
+    for (index, (row, node)) in rows.iter().zip(nodes).enumerate() {
+        let at = format!("$.nodes[{index}]");
+        let row = row
+            .strip_prefix(INDENT_UNIT)
+            .ok_or_else(|| format!("{at}: missing node row indent"))?;
+        node_entry(row, node, &at)?;
     }
-    address.push(format!("index {place}"));
-    if let Some(parent) = node.pointer("/parent").and_then(Value::as_u64) {
-        address.push(format!("parent {parent}"));
-    }
-    let address = address.join(" · ");
-    let excerpt =
-        text_at(node, "/source").ok_or_else(|| format!("{at}.source: must be a string"))?;
-    node_head_states(item, node, excerpt, (at, &format!("{at}.source")))?;
-    let range = format!(
-        "{}..{}",
-        node.pointer("/range/start")
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
-        node.pointer("/range/end")
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
-    );
-    require(item.plain(1) == range, &format!("{at}.range"), || {
-        format!("the second line must be `{range}`, got `{}`", item.plain(1))
-    })?;
-    require(item.plain(2) == address, &format!("{at}.index"), || {
-        format!(
-            "the third line must be `{address}`, got `{}`",
-            item.plain(2)
-        )
-    })?;
-    regions_states(item, node, at)
+    written_sources_states(sources, nodes)
 }
 
-/// Checks the head line: the kind, the line count, and the `generated` and `test` facts.
-///
-/// `(at, excerpt_at)` are the JSON paths of the node and of its excerpt.
-fn node_head_states(
-    item: &Item<'_>,
-    node: &Value,
-    excerpt: &str,
-    (at, excerpt_at): (&str, &str),
-) -> Result<(), String> {
+/// Checks the kind, byte range, address, and other facts on one syntax node line.
+fn node_entry(row: &str, node: &Value, at: &str) -> Result<(), String> {
     let kind = text_at(node, "/kind").ok_or_else(|| format!("{at}.kind: must be a string"))?;
-    let head: Vec<&str> = item.plain(0).split(SEPARATOR).collect();
+    let mut facts = row.split(NODE_SEPARATOR);
     let kind = visible(kind);
-    require(head.first() == Some(&kind.as_str()), at, || {
-        format!("the head line must open with the kind `{kind}`, got {head:?}")
+    require(facts.next() == Some(kind.as_str()), at, || {
+        format!("the node row must open with the kind `{kind}`, got `{row}`")
     })?;
-    let count = excerpt.lines().count();
+    let number = |pointer: &str| node.pointer(pointer).and_then(Value::as_u64);
+    let range = format!(
+        "bytes {}..{}",
+        number("/range/start").unwrap_or_default(),
+        number("/range/end").unwrap_or_default(),
+    );
+    require(
+        facts.next() == Some(range.as_str()),
+        &format!("{at}.range"),
+        || format!("the node row must give the byte range `{range}`"),
+    )?;
+    let index = number("/index").ok_or_else(|| format!("{at}.index: must be an integer"))?;
+    let declaration =
+        number("/declaration").map(|declaration| format!("declaration {declaration}"));
+    let parent = number("/parent").map(|parent| format!("parent {parent}"));
+    let address = declaration
+        .into_iter()
+        .chain([format!("index {index}")])
+        .chain(parent);
+    for field in address {
+        require(
+            facts.next() == Some(field.as_str()),
+            &format!("{at}.index"),
+            || format!("the node address must include `{field}` in order"),
+        )?;
+    }
+    let facts = facts.collect::<Vec<_>>();
+    let source =
+        text_at(node, "/source").ok_or_else(|| format!("{at}.source: must be a string"))?;
+    let count = source.lines().count();
     let counted = format!("{count} lines");
     require(
-        head.contains(&counted.as_str()) == (count > 1),
-        excerpt_at,
-        || format!("`{counted}` must appear exactly when the excerpt has several lines: {head:?}"),
+        facts.contains(&counted.as_str()) == (count > 1),
+        &format!("{at}.source"),
+        || format!("`{counted}` must appear exactly when the excerpt has several lines"),
     )?;
-    let facet_list = node.get("facets").and_then(Value::as_array);
+    let node_facets = node.get("facets").and_then(Value::as_array);
     for name in NODE_FACT_FACETS {
-        let holds = facet_list
+        let holds = node_facets
             .into_iter()
             .flatten()
             .any(|facet| facet.as_str() == Some(name));
         require(
-            head.iter().skip(1).any(|fact| *fact == name) == holds,
+            facts.contains(&name) == holds,
             &format!("{at}.facets"),
-            || format!("`{name}` must appear exactly when the facet holds: {head:?}"),
+            || format!("`{name}` must appear exactly when the facet holds"),
         )?;
     }
-    Ok(())
-}
-
-/// Checks the regions line: `<role> <START>..<END>` per region, joined by ` · `.
-fn regions_states(item: &Item<'_>, node: &Value, at: &str) -> Result<(), String> {
-    let regions: Vec<String> = node
+    for region in node
         .get("regions")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .map(|region| {
-            let number = |name: &str| region.pointer(&format!("/range/{name}"))?.as_u64();
-            Some(format!(
-                "{} {}..{}",
-                text_at(region, "/role")?,
-                number("start")?,
-                number("end")?
-            ))
-        })
-        .collect::<Option<_>>()
-        .ok_or_else(|| format!("{at}.regions: each region needs a role and a range"))?;
-    if regions.is_empty() {
-        return Ok(());
+    {
+        let number = |position: &str| region.pointer(position).and_then(Value::as_u64);
+        let at = format!("{at}.regions");
+        let role = text_at(region, "/role").ok_or_else(|| format!("{at}: missing role"))?;
+        let start = number("/range/start").ok_or_else(|| format!("{at}: missing start"))?;
+        let end = number("/range/end").ok_or_else(|| format!("{at}: missing end"))?;
+        let region = format!("{role} {start}..{end}");
+        require(facts.contains(&region.as_str()), &at, || {
+            format!("the node row must state region `{region}`")
+        })?;
     }
-    let line = regions.join(SEPARATOR);
-    require(item.has_line(&line), &format!("{at}.regions"), || {
-        format!("no line equals the regions `{line}`")
-    })
+    Ok(())
 }
 
 /// Checks the `node_cursor CURSOR` line that opens the sections after the items when the answer
@@ -955,14 +926,16 @@ fn written_nodes(nodes: &[Value]) -> Vec<(usize, &Value)> {
     outermost
 }
 
-/// Checks that the items section ends with the written sources, each after one blank line.
+/// Checks the source section, with each written source after one blank line.
 ///
 /// The sources carry the item indent. An answer without nodes writes no source.
-fn written_sources_end_section(entries: &[&str], nodes: &[Value]) -> Result<(), String> {
+fn written_sources_states(entries: &[&str], nodes: &[Value]) -> Result<(), String> {
     let levels = item_indent(nodes.len() > 1);
     let written = written_nodes(nodes);
     let Some((last, _)) = written.last() else {
-        return Ok(());
+        return require(entries.is_empty(), "$.nodes", || {
+            "empty node section has entries".to_owned()
+        });
     };
     let at = format!("$.nodes[{last}].source");
     let mut expected = Vec::new();
@@ -972,12 +945,19 @@ fn written_sources_end_section(entries: &[&str], nodes: &[Value]) -> Result<(), 
         expected.push(String::new());
         expected.extend(indented_lines(source, levels));
     }
-    require(ends_with_lines(entries, &expected), &at, || {
-        format!(
-            "the items section must end with each written source after a blank line, indented by \
+    require(
+        entries
+            .iter()
+            .copied()
+            .eq(expected.iter().map(String::as_str)),
+        &at,
+        || {
+            format!(
+                "the items section must end with each written source after a blank line, indented by \
              {levels} levels"
-        )
-    })
+            )
+        },
+    )
 }
 
 #[cfg(test)]
@@ -2184,13 +2164,8 @@ mod tests {
     /// The text the layout writes for [`nodes_answer`].
     const NODES_TEXT: &str = "\
 2 nodes
-\t[1] function_item · 4 lines · generated · test
-\t\t0..20
-\t\tdeclaration 0 · index 0
-\t\tname 3..4 · body 8..20
-\t[2] identifier · 3 lines
-\t\t21..29
-\t\tindex 1
+\tfunction_item | bytes 0..20 | declaration 0 | index 0 | 4 lines | generated | test | name 3..4 | body 8..20
+\tidentifier | bytes 21..29 | index 1 | 3 lines
 
 \t\tfn a() {
 \t\t    b
@@ -2228,7 +2203,7 @@ mod tests {
                 "source": "name"
             }]
         });
-        let text = "1 node\n\tidentifier\n\t3..9\n\tindex 1\n\n\tname\n";
+        let text = "1 node\n\tidentifier | bytes 3..9 | index 1\n\n\tname\n";
         assert_eq!(text_states(Tool::Nodes, text, &answer), Ok(()));
         let indented = text.replace("\n\tname\n", "\n\t\tname\n");
         assert!(text_states(Tool::Nodes, &indented, &answer).is_err());
@@ -2249,35 +2224,27 @@ mod tests {
 
     #[test]
     fn a_node_head_states_its_kind_range_and_identity_in_order() -> Result<(), String> {
-        nodes_refusal("[1] function_item", "[1] block", "$.nodes[0]")?;
-        nodes_refusal("\t\t0..20\n", "\t\t0..21\n", "$.nodes[0].range")?;
-        nodes_refusal("index 0\n", "index 2\n", "$.nodes[0].index")?;
-        nodes_refusal("[2] identifier", "[2] function_item", "$.nodes[1]")?;
-        nodes_refusal("\t\t21..29\n", "", "$.nodes[1].range")?;
-        nodes_refusal("index 1\n", "index 2\n", "$.nodes[1].index")?;
-        nodes_refusal("\t\tname 3..4 · body 8..20\n", "", "$.nodes[0].regions")?;
+        nodes_refusal("function_item", "block", "$.nodes[0]")?;
+        nodes_refusal("bytes 0..20", "bytes 0..21", "$.nodes[0].range")?;
+        nodes_refusal("index 0", "index 2", "$.nodes[0].index")?;
+        nodes_refusal("identifier", "function_item", "$.nodes[1]")?;
+        nodes_refusal("bytes 21..29 | ", "", "$.nodes[1].range")?;
+        nodes_refusal("index 1", "index 2", "$.nodes[1].index")?;
+        nodes_refusal(" | name 3..4 | body 8..20", "", "$.nodes[0].regions")?;
         nodes_refusal("name 3..4", "name 3..5", "$.nodes[0].regions")
     }
 
     #[test]
     fn the_line_count_and_the_facets_appear_exactly_when_they_hold() -> Result<(), String> {
-        nodes_refusal(" · 4 lines", "", "$.nodes[0].source")?;
-        nodes_refusal(" · 3 lines", "", "$.nodes[1].source")?;
-        nodes_refusal(
-            "function_item · 4 lines",
-            "function_item",
-            "$.nodes[0].source",
-        )?;
-        nodes_refusal(" · generated", "", "$.nodes[0].facets")?;
-        nodes_refusal(" · test", "", "$.nodes[0].facets")?;
+        nodes_refusal(" | 4 lines", "", "$.nodes[0].source")?;
+        nodes_refusal(" | 3 lines", "", "$.nodes[1].source")?;
+        nodes_refusal("index 0 | 4 lines", "index 0", "$.nodes[0].source")?;
+        nodes_refusal(" | generated", "", "$.nodes[0].facets")?;
+        nodes_refusal(" | test", "", "$.nodes[0].facets")?;
         let answer = with(nodes_answer(), "/nodes/1/kind", json!("block"))?;
-        let text = edited(NODES_TEXT, "[2] identifier", "[2] block")?;
+        let text = edited(NODES_TEXT, "identifier", "block")?;
         assert_eq!(text_states(Tool::Nodes, &text, &answer), Ok(()));
-        let spurious = edited(
-            NODES_TEXT,
-            "[2] identifier · 3 lines",
-            "[2] identifier · 2 lines",
-        )?;
+        let spurious = edited(NODES_TEXT, "index 1 | 3 lines", "index 1 | 2 lines")?;
         let failure = refused(Tool::Nodes, &spurious, &nodes_answer())?;
         assert!(failure.contains("$.nodes[1].source"), "{failure}");
         Ok(())
@@ -2327,7 +2294,7 @@ mod tests {
             ],
             "node_cursor": "3.0123456789abcdef"
         });
-        let text = "3 nodes · rift://symbol/rust/a.rs/A\n\t[1] function_item\n\t\t0..9\n\t\tdeclaration 0 · index 0\n\t[2] identifier\n\t\t3..4\n\t\tdeclaration 0 · index 2 · parent 0\n\t[3] function_item\n\t\t0..9\n\t\tdeclaration 1 · index 0\n\n\t\tfn a() {}\n\n\t\tfn a() {}\nnode_cursor 3.0123456789abcdef\n";
+        let text = "3 nodes | rift://symbol/rust/a.rs/A\n\tfunction_item | bytes 0..9 | declaration 0 | index 0\n\tidentifier | bytes 3..4 | declaration 0 | index 2 | parent 0\n\tfunction_item | bytes 0..9 | declaration 1 | index 0\n\n\t\tfn a() {}\n\n\t\tfn a() {}\nnode_cursor 3.0123456789abcdef\n";
         assert_eq!(text_states(Tool::Nodes, text, &answer), Ok(()));
         let one_source = text.replace("\n\n\t\tfn a() {}\nnode_cursor", "\nnode_cursor");
         assert!(text_states(Tool::Nodes, &one_source, &answer).is_err());

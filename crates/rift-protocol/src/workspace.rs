@@ -8,7 +8,7 @@ use crate::schema;
 use crate::search::PathPattern;
 
 /// Source units one workspace resource page may carry, at most.
-pub const WORKSPACE_SOURCE_UNITS_MAX: usize = 1_000;
+pub const WORKSPACE_SOURCE_UNITS_MAX: usize = 50;
 /// Effective language entries one workspace resource page may carry, at most.
 ///
 /// A page reports one entry per shipped syntax provider plus one per
@@ -37,7 +37,7 @@ pub struct WorkspaceResourcePage {
     pub languages: Vec<WorkspaceLanguageSummary>,
 
     /// Source units on this page, sorted by project path.
-    #[schemars(length(max = 1_000))]
+    #[schemars(length(max = WORKSPACE_SOURCE_UNITS_MAX))]
     pub source: Vec<WorkspaceSourceUnit>,
     /// Conditions that qualify this page. Absent when empty.
     #[serde(default, skip_serializing)]

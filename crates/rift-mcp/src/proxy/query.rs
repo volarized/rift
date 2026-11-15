@@ -17,7 +17,8 @@ use rmcp::handler::server::tool::IntoCallToolResult as _;
 use rmcp::model::{CallToolRequestParams, CallToolResponse};
 
 use super::{RiftProxy, candidates, identity};
-use crate::server::candidates::{CandidateResponses, collect_retrieval};
+use crate::output::{QueryDisplay, QueryOutput};
+use crate::server::candidates::{CandidateResponses, QueryPageOptions, collect_retrieval};
 use crate::validation::ConfigurationState;
 
 const ROUTES_MAX: usize = 256;
@@ -139,7 +140,11 @@ impl RiftProxy {
         let Ok(query) = parsed else {
             return self.forward_read(request.clone()).await;
         };
-        self.query_plan(request, query, limits, deadline).await
+        let mut response = self.query_plan(request, query, limits, deadline).await?;
+        if let Ok(CallToolResponse::Complete(result)) = &mut response {
+            QueryOutput::take_display(&mut result.meta);
+        }
+        Ok(response)
     }
 
     async fn query_plan(
@@ -245,9 +250,11 @@ impl RiftProxy {
                 identity::qualify_warnings(warnings, backend)?;
             }
         }
-        let mut qualified = render(answer);
+        let mut meta = result.meta.clone();
+        let display = QueryOutput::take_display(&mut meta);
+        let mut qualified = render(QueryOutput::new(answer, display));
         if let Ok(CallToolResponse::Complete(qualified)) = &mut qualified {
-            qualified.meta.clone_from(&result.meta);
+            qualified.meta = meta;
         }
         Ok(qualified)
     }
@@ -306,7 +313,17 @@ impl RiftProxy {
                 if cancellation.is_cancelled() {
                     return errors::search::query_cancelled().fail();
                 }
-                store.store_query(&root, &owner, &view, &answer, &configuration, warnings)
+                store.store_query(
+                    &root,
+                    &owner,
+                    &view,
+                    &answer,
+                    QueryPageOptions {
+                        configuration: &configuration,
+                        warnings,
+                        display: QueryDisplay::selected(&answer, query.presentation()),
+                    },
+                )
             })
             .await?;
         Ok(render(answer))
@@ -510,8 +527,8 @@ fn unavailable_read(reason: SymbolUnavailableReason) -> SearchUnavailable {
     }
 }
 
-fn render(answer: QueryReadResult) -> Response {
-    crate::output::Json(answer).into_call_tool_result()
+fn render(answer: impl Into<QueryOutput>) -> Response {
+    crate::output::Json(answer.into()).into_call_tool_result()
 }
 
 fn query_failure(detail: &str) -> RiftError {

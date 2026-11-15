@@ -26,16 +26,28 @@ async fn resource_body(
     resource_json(&answer, uri)
 }
 
-/// A map read answers one JSON content for the requested URI.
+/// A map read answers compact text and JSON for the requested URI.
 #[tokio::test]
-async fn the_map_resource_answers_json_alone() -> TestResult {
+async fn the_map_resource_answers_compact_text_then_json() -> TestResult {
     let (_directory, client, server_task) =
         served_workspace(&[("lib.rs", "pub fn beacon() {}\n")], None).await?;
 
     let answer = client
         .read_resource(ReadResourceRequestParams::new("rift://map".to_owned()))
         .await?;
-    assert_eq!(answer.contents.len(), 1, "{:?}", answer.contents);
+    assert_eq!(answer.contents.len(), 2, "{:?}", answer.contents);
+    let rmcp::model::ResourceContents::TextResourceContents {
+        uri,
+        mime_type,
+        text,
+        ..
+    } = &answer.contents[0]
+    else {
+        return Err("compact map content".into());
+    };
+    assert_eq!(uri, "rift://map");
+    assert_eq!(mime_type.as_deref(), Some("text/plain"));
+    assert!(text.contains("rust · 1 file"), "{text}");
     let body = resource_json(&answer, "rift://map")?;
     assert!(body.is_object(), "{body}");
 

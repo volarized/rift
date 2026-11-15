@@ -762,18 +762,10 @@ class Client:
         return answer
 
     async def resource(self, uri: str) -> JsonObject:
-        """Select the JSON document from the SDK resource envelope.
-
-        The map carries one `application/json` content. The workspace also
-        carries its compact `text/plain` content.
-        """
+        """Select JSON beside the compact text in the SDK resource envelope."""
         async with asyncio.timeout(self.call_seconds):
             result = await self.session.read_resource(uri)
-        expected = 1 if uri == "rift://map" else 2
-        require(
-            len(result.contents) == expected,
-            f"{uri}: expected {expected} resource contents",
-        )
+        require(len(result.contents) == 2, f"{uri}: expected two resource contents")
         texts: list[types.TextResourceContents] = []
         for content in result.contents:
             if not isinstance(content, types.TextResourceContents):
@@ -783,8 +775,7 @@ class Client:
         documents = [text for text in texts if text.mime_type == "application/json"]
         require(len(documents) == 1, f"{uri}: expected one application/json content")
         require(
-            len(texts) == 1
-            or {text.mime_type for text in texts} == {"text/plain", "application/json"},
+            {text.mime_type for text in texts} == {"text/plain", "application/json"},
             f"{uri}: expected text/plain beside application/json",
         )
         document = documents[0]

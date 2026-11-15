@@ -68,6 +68,10 @@ pub(crate) fn corpus() -> Vec<(&'static str, Value)> {
         ),
         ("nodes", json!({ "path": "lib.rs", "position": 0 })),
         ("nodes", json!({ "path": "lib.rs", "position": 8 })),
+        (
+            "nodes",
+            json!({ "path": "lib.rs", "position": 8, "syntax": true }),
+        ),
         ("nodes", json!({ "symbol_name": "beacon_one" })),
         ("nodes", json!({ "path": "notes.txt", "position": 0 })),
         ("nodes", json!({ "path": "justfile", "position": 0 })),
@@ -92,7 +96,7 @@ pub(crate) fn corpus() -> Vec<(&'static str, Value)> {
         ("search", json!({"language":"sparql", "query":"ASK { ?symbol a :Symbol; :name 'beacon_one' }"})),
         ("search", json!({"language":"sparql", "query":"CONSTRUCT { ?symbol :name 'beacon_one' } WHERE { ?symbol a :Symbol; :name 'beacon_one' }"})),
         ("search", json!({"language":"sparql", "query":"SELECT (BNODE() AS ?blank) (<urn:fixture:term> AS ?iri) (1 AS ?number) ('hello'@en AS ?language) WHERE {}"})),
-        ("search", json!({"language":"sparql", "query":format!("SELECT ?index {{ VALUES ?index {{ {} }} }} ORDER BY ?index", (0..1001).map(|index| index.to_string()).collect::<Vec<_>>().join(" "))})),
+        ("search", json!({"language":"sparql", "query":format!("SELECT ?index {{ VALUES ?index {{ {} }} }} ORDER BY ?index", (0..=rift_protocol::query::QueryConfiguration::default().page_size).map(|index| index.to_string()).collect::<Vec<_>>().join(" "))})),
     ]);
     requests
         .into_iter()

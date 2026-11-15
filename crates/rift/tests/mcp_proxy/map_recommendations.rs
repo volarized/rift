@@ -37,7 +37,7 @@ async fn map(client: &Client) -> TestResult<WorkspaceMap> {
         Box::pin(client.read_resource(rmcp::model::ReadResourceRequestParams::new("rift://map"))),
     )
     .await??;
-    assert_eq!(answer.contents.len(), 1, "map is one JSON resource");
+    assert_eq!(answer.contents.len(), 2, "map returns text and JSON");
     let body = resource_json(&answer, "rift://map")?;
     serde_json::from_value(body.clone())
         .map_err(|error| format!("invalid workspace map: {error}; {body}").into())

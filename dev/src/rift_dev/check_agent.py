@@ -192,6 +192,7 @@ async def declaration_node(client: Client, name: str) -> str:
         {
             "path": path,
             "position": cast(int, end) - 1,
+            "syntax": True,
             "revision": revision,
         },
     )

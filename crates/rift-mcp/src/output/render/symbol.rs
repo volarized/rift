@@ -69,6 +69,9 @@ fn context_section(lines: &mut Lines<'_>, context: &DocumentationContext) -> Res
         truncated,
         ..
     } = context;
+    if references.is_empty() && !truncated {
+        return Ok(());
+    }
     lines.blank()?;
     lines.line(
         0,
@@ -236,6 +239,7 @@ pub(super) fn canonical(
             let mut lines = Lines::new(out, 0, 1);
             let described = describe(symbol)?;
             lines.head(&described.declaration)?;
+            declarations_section(&mut lines, declarations)?;
             if let Some(id) = described.id {
                 lines.line(0, id.as_str())?;
             }
@@ -255,9 +259,11 @@ pub(super) fn canonical(
                         .and_then(|declaration| declaration.path.as_ref()),
                 )?;
             }
-            declarations_section(&mut lines, declarations)?;
             if let Some(cursor) = declaration_cursor {
-                lines.line(0, &format!("declaration_cursor {cursor}"))?;
+                lines.line(
+                    0,
+                    &format!("next declarations · declaration_cursor {cursor}"),
+                )?;
             }
             Some(revision)
         }
@@ -296,30 +302,25 @@ pub(super) fn canonical(
             revision.as_ref()
         }
     };
-    layout::revision(out, revision)
+    layout::selected_revision(out, revision)
 }
 
 fn declarations_section(
     lines: &mut Lines<'_>,
     declarations: &[rift_protocol::symbol_read::SymbolDeclaration],
 ) -> Result<(), TextError> {
-    if !declarations.is_empty() {
-        lines.blank()?;
-        lines.line(0, "declarations:")?;
-    }
     for declaration in declarations {
-        lines.line(
-            1,
-            &location(
-                declaration.path.as_ref(),
-                declaration.unit.as_ref(),
-                Some(declaration.line),
-            ),
-        )?;
-        lines.line(
-            1,
-            &format!("{}..{}", declaration.range.start, declaration.range.end),
-        )?;
+        let mut facts = Facts::default();
+        facts.push(&location(
+            declaration.path.as_ref(),
+            declaration.unit.as_ref(),
+            Some(declaration.line),
+        ));
+        facts.push(&format!(
+            "bytes {}..{}",
+            declaration.range.start, declaration.range.end
+        ));
+        lines.line(0, facts.as_str())?;
     }
     Ok(())
 }

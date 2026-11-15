@@ -123,8 +123,8 @@ const DECISION_TABLE: &[DecisionRow] = &[
                     needed.",
         tools: &["nodes"],
         note: Some(
-            "with `symbol`, a project, package, or runtime one; send `node_cursor` back for the \
-             rest of a long answer",
+            "with `symbol`, a project, package, or runtime one; send `syntax: true` for the \
+             full syntax tree, and return `node_cursor` with the same selector to continue",
         ),
     },
     DecisionRow {

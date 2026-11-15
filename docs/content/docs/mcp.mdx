@@ -324,22 +324,20 @@ See the [symbol reference](/docs/developer/protocol/mcp#tool-get_symbol) for bou
 
 ## Nodes [#tool-nodes]
 
-After reading a declaration, the agent may need its source, or only its name, body, or one
-expression. `nodes` lists syntax nodes with their source: every node of one symbol, or of the
-declaration around a position in a local file, giving the agent source ranges for a precise edit
-target.
+`nodes` reads a symbol's declarations with their source and structure. Use a symbol identity or a
+position inside a declaration. The answer shows the declaration's source before its parts and
+gives byte ranges for a precise edit target.
 
 To read the `Config` struct of the sample project, the agent passes its symbol identity:
 
 <ReadExample name="symbol-nodes" />
 
-The first node is the declaration itself, and its source is the declaration's source. The nodes
-after it are the parts inside it, down to each identifier. A symbol with several declarations,
-such as an overloaded function, lists each declaration's nodes in turn. A long answer ends with
-`node_cursor`, which the agent sends back to read the rest.
+The summary shows a source excerpt and selected syntax parts for each declaration. Use
+`syntax: true` to read every node, down to each identifier. If the answer includes
+`node_cursor`, send it back with the same selector to continue declarations or syntax.
 
-A package or runtime symbol that `search` returned through `SERVICE :search` with `:scope "global"` lists its nodes the same
-way. Rift reads them from the global API at the release `revision` names, such as
+For a package or runtime symbol found through `SERVICE :search` with `:scope "global"`, Rift reads
+the declaration from the global API at the release `revision` names, such as
 `rift://revision/cargo/crates.io/demo@1.0.0`, or at the version your project's dependencies pin when the
 request names none. Each node's `unit` names a source unit of the package, such as
 `rift://source/cargo/crates.io/demo/src/lib.rs`.
@@ -350,8 +348,8 @@ The position is a UTF-8 byte offset, rather than a line or character number.
 
 </Callout>
 
-In the sample `src/config.rs`, byte `338` lies inside the `parse_config` call. A position read
-answers every node of the declaration holding it, `load_config`:
+In the sample `src/config.rs`, byte `338` lies inside the `parse_config` call. With `syntax: true`,
+the position selects the syntax tree of `load_config`, the declaration holding it:
 
 <ReadExample name="local-nodes" />
 
@@ -364,11 +362,9 @@ The answer names the symbol once, and each node carries its address inside it:
 - A node has no identity of its own. Its address names its place in the current code, so the
   agent reads again after an edit before using it.
 
-A byte outside every declaration, such as one in an import, answers the file's own nodes: the
-file node at index 0, then each node no declaration holds.
-
-Every file has a file node spanning all of it, so a file no syntax provider parses, such as a
-`justfile`, answers that one node with the file's text.
+A byte outside every declaration, such as one in an import, returns a source excerpt around
+that position. With `syntax: true`, the same position selects the file's nodes, starting with
+the file node at index 0.
 
 The agent chooses the range it needs and applies the change with its own editing tools.
 After the file changes, it should read again before using its ranges for another edit.
@@ -396,8 +392,8 @@ return an empty result when its required facts are available. Run `rift server l
 inspect missing facts or preparation still in progress.
 
 The proxy returns compact text by default. Start `rift mcp --output=all` for structured
-results and output schemas. The workspace resource then carries compact text and JSON.
-The map always returns JSON.
+results and output schemas. The map and workspace resources then carry both compact text
+and JSON.
 
 The [result content reference](/docs/developer/protocol/mcp#result-content) defines the form.
 
@@ -520,19 +516,18 @@ The workspace resource comes as compact text, in the same form as a tool result:
 **`rift://workspace`, compact text** of a workspace with one TypeScript language and one source file:
 
 ```text
-workspace 3f9a1c2e
+workspace
 languages:
 	typescript:tsx · syntax · lsp typescript:tsx ready
 		include src/**/*.tsx
 		exclude src/generated/**
 source:
-	src/view.tsx · typescript:tsx · 8a4d20bc
+	src/view.tsx · typescript:tsx
 ```
 
 
-- The workspace text starts with the digest of the accepted `rift.toml`, then lists each language
-  with its include and exclude patterns, and each source file with its language and content
-  digest.
+The workspace text lists effective languages with their include and exclude patterns, then
+lists source paths with their languages. Follow the next URI when the catalog spans pages.
 
 
 See [resource contents](/docs/developer/protocol/mcp#resource-contents) for the compact text and

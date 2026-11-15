@@ -309,7 +309,13 @@ async fn repository_workspace_reads(
     name: &str,
     names: &[&str],
 ) -> TestResult<String> {
-    let map = await_workspace_ready(client).await?;
+    await_workspace_ready(client).await?;
+    let map = within(
+        "map resource",
+        client.read_resource(rmcp::model::ReadResourceRequestParams::new("rift://map")),
+    )
+    .await??;
+    let map = resource_json(&map, "rift://map")?;
     let revision = map["revision"]
         .as_str()
         .ok_or("map carries its revision")?
@@ -350,11 +356,11 @@ async fn repository_workspace_reads(
         .await
         .map_err(|error| format!("nodes: {error:?}"))?;
     assert!(
-        nodes["nodes"]
+        nodes["declarations"]
             .as_array()
-            .ok_or("nodes carries nodes")?
+            .ok_or("nodes carries declarations")?
             .iter()
-            .any(|node| node["source"]
+            .any(|declaration| declaration["source"]["text"]
                 .as_str()
                 .is_some_and(|source| source.contains(name))),
         "{nodes}"
@@ -650,7 +656,9 @@ async fn assert_worktree_node_reads(
         assert!(schema.is_valid(&request), "{request}");
         let answer = proxied_call(client, "nodes", &request).await?;
         assert_eq!(
-            answer["nodes"][0]["source"].as_str().map(str::trim_end),
+            answer["declarations"][0]["source"]["text"]
+                .as_str()
+                .map(str::trim_end),
             Some(source),
             "{request}: {answer}"
         );
@@ -681,7 +689,9 @@ async fn assert_worktree_node_reads(
     )
     .await?;
     assert_eq!(
-        committed["nodes"][0]["source"].as_str().map(str::trim_end),
+        committed["declarations"][0]["source"]["text"]
+            .as_str()
+            .map(str::trim_end),
         Some("pub fn committed_review() {}")
     );
     assert!(
@@ -692,7 +702,8 @@ async fn assert_worktree_node_reads(
         "{committed}"
     );
 
-    let mut review_page = json!({"path": "lib.rs", "position": 8, "scope": "local@review"});
+    let mut review_page =
+        json!({"path": "lib.rs", "position": 8, "scope": "local@review", "syntax": true});
     let first = proxied_call(client, "nodes", &review_page).await?;
     assert_eq!(
         first["nodes"][0]["source"].as_str().map(str::trim_end),
@@ -1018,9 +1029,9 @@ async fn default_proxy_lists_no_output_schemas_and_returns_text() -> TestResult 
     Ok(())
 }
 
-/// A map read carries one JSON payload regardless of the proxy's tool output selection.
+/// A text proxy returns only the compact map.
 #[tokio::test]
-async fn text_output_proxy_returns_the_map_as_one_json_content() -> TestResult {
+async fn text_output_proxy_returns_the_map_as_compact_text() -> TestResult {
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
@@ -1033,16 +1044,16 @@ async fn text_output_proxy_returns_the_map_as_one_json_content() -> TestResult {
     )
     .await??;
     assert_eq!(answer.contents.len(), 1, "{:?}", answer.contents);
-    let body = resource_json(&answer, "rift://map")?;
-    assert!(body["revision"].is_string(), "{body}");
+    let compact = workspace_client::resource_text(&answer, "rift://map")?;
+    assert!(compact.starts_with("workspace map\n"), "{compact}");
     client.cancel().await?;
     failure_window.passed();
     Ok(())
 }
 
-/// A map read carries one JSON payload regardless of the proxy's tool output selection.
+/// A text proxy returns only the compact map.
 #[tokio::test]
-async fn default_proxy_returns_the_map_as_one_json_content() -> TestResult {
+async fn default_proxy_returns_the_map_as_compact_text() -> TestResult {
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
@@ -1055,8 +1066,8 @@ async fn default_proxy_returns_the_map_as_one_json_content() -> TestResult {
     )
     .await??;
     assert_eq!(answer.contents.len(), 1, "{:?}", answer.contents);
-    let body = resource_json(&answer, "rift://map")?;
-    assert!(body["revision"].is_string(), "{body}");
+    let compact = workspace_client::resource_text(&answer, "rift://map")?;
+    assert!(compact.starts_with("workspace map\n"), "{compact}");
     client.cancel().await?;
     failure_window.passed();
     Ok(())
@@ -1081,20 +1092,21 @@ async fn all_and_text_proxies_share_one_server_and_keep_their_own_shape() -> Tes
     let (all_result, text_result) = (all_result?, text_result?);
     assert_all_shape(&all_tools, &all_result);
     assert_text_shape(&text_tools, &text_result);
-    let mut maps = Vec::new();
-    for client in [&all, &text] {
-        let answer = within(
-            "map resource",
-            client.read_resource(rmcp::model::ReadResourceRequestParams::new("rift://map")),
+    let (all_map, text_map) = Box::pin(within("map resource", async {
+        tokio::join!(
+            all.read_resource(rmcp::model::ReadResourceRequestParams::new("rift://map")),
+            text.read_resource(rmcp::model::ReadResourceRequestParams::new("rift://map")),
         )
-        .await??;
-        assert_eq!(answer.contents.len(), 1, "{:?}", answer.contents);
-        maps.push(resource_json(&answer, "rift://map")?);
-    }
+    }))
+    .await?;
+    let (all_map, text_map) = (all_map?, text_map?);
+    assert_eq!(all_map.contents.len(), 2, "{:?}", all_map.contents);
+    assert_eq!(text_map.contents.len(), 1, "{:?}", text_map.contents);
     assert_eq!(
-        maps[0], maps[1],
-        "both output modes carry the same JSON map"
+        workspace_client::resource_text(&all_map, "rift://map")?,
+        workspace_client::resource_text(&text_map, "rift://map")?,
     );
+    assert!(resource_json(&all_map, "rift://map")?["revision"].is_string());
 
     let serving = serving_document(root).ok_or("one elected server must serve both")?;
     all.cancel().await?;
@@ -2304,7 +2316,10 @@ async fn live_proxied_read_resolves_incoming_references() -> TestResult {
     let original = harness::RUST_PROJECT_CALLER
         .get(start..end)
         .ok_or("original caller range")?;
-    assert_eq!(nodes["nodes"][0]["source"], original, "{nodes}");
+    assert_eq!(
+        nodes["declarations"][0]["source"]["text"], original,
+        "{nodes}"
+    );
     let workspace = within(
         "workspace resource",
         client.read_resource(rmcp::model::ReadResourceRequestParams::new(
@@ -2367,7 +2382,7 @@ async fn proxy_query_nodes_and_source_keep_recorded_bytes_after_index_removal() 
         &json!({"symbol":symbol,"revision":exact["revision"]}),
     )
     .await?;
-    assert_eq!(nodes["nodes"][0]["source"], source);
+    assert_eq!(nodes["declarations"][0]["source"]["text"], source);
     let replay = query::retained_page(&original, 0)?;
     for removed in [false, true] {
         if removed {

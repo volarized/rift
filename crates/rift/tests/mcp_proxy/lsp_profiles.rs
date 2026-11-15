@@ -175,7 +175,7 @@ async fn symbol_read(
     let nodes = proxied_call(
         client,
         "nodes",
-        &json!({"symbol":id, "revision":answer["revision"]}),
+        &json!({"symbol":id, "revision":answer["revision"], "syntax":true}),
     )
     .await?;
     assert_eq!(
@@ -270,7 +270,7 @@ async fn caller_read(
     let rows = query::rows(&answer)?;
     assert_eq!(rows.len(), 1, "{answer}");
     let caller = query::iri(&rows[0], "symbol")?;
-    let nodes = proxied_call(client, "nodes", &json!({"symbol":caller})).await?;
+    let nodes = proxied_call(client, "nodes", &json!({"symbol":caller, "syntax":true})).await?;
     assert_eq!(
         nodes["nodes"][0]["source"], "pub fn caller() -> u32 {\n    beacon()\n}",
         "{nodes}"

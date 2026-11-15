@@ -631,7 +631,11 @@ async fn repository_beacon(
         &serde_json::json!({"symbol":identity,"revision":revision}),
     )
     .await?;
-    assert_eq!(nodes["nodes"][0]["source"], source.as_str(), "{nodes}");
+    assert_eq!(
+        nodes["declarations"][0]["source"]["text"],
+        source.as_str(),
+        "{nodes}"
+    );
     Ok(())
 }
 

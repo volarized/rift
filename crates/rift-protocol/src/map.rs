@@ -11,6 +11,8 @@ use crate::schema;
 /// Directory depth a [`MapModule`] tree carries, at most. A directory deeper than this folds
 /// into its deepest listed ancestor's counts and lists no [`MapModule::children`] of its own.
 pub const MAP_MODULE_DEPTH_MAX: usize = 3;
+/// Directories at one level of the workspace map.
+pub const MAP_MODULES_MAX: usize = 1_000;
 /// [`WorkspaceMap::hubs`] entries one map carries, at most.
 pub const MAP_HUBS_MAX: usize = 20;
 /// [`WorkspaceMap::entry_points`] entries one map carries, at most.
@@ -48,7 +50,7 @@ pub struct WorkspaceMap {
     /// inclusive of its descendants. A directory deeper than [`MAP_MODULE_DEPTH_MAX`] folds
     /// into its deepest listed ancestor. Absent when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 1_000))]
+    #[schemars(length(max = MAP_MODULES_MAX))]
     pub modules: Vec<MapModule>,
     /// The most-referenced symbols, ranked by reference count descending with identity
     /// breaking ties. Absent when empty.
@@ -150,7 +152,7 @@ pub struct MapModule {
     /// [`MAP_MODULE_DEPTH_MAX`] lists none; its deeper descendants are already folded into
     /// its own counts. Absent when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 1_000))]
+    #[schemars(length(max = MAP_MODULES_MAX))]
     pub children: Vec<MapModule>,
 }
 
@@ -174,7 +176,7 @@ mod tests {
 
     use super::*;
     use crate::dependencies::PackageAvailability;
-    use crate::workspace::{WORKSPACE_LANGUAGE_SUMMARIES_MAX, WORKSPACE_SOURCE_UNITS_MAX};
+    use crate::workspace::WORKSPACE_LANGUAGE_SUMMARIES_MAX;
 
     fn map() -> WorkspaceMap {
         WorkspaceMap {
@@ -347,10 +349,7 @@ mod tests {
             properties["languages"]["maxItems"],
             json!(WORKSPACE_LANGUAGE_SUMMARIES_MAX)
         );
-        assert_eq!(
-            properties["modules"]["maxItems"],
-            json!(WORKSPACE_SOURCE_UNITS_MAX)
-        );
+        assert_eq!(properties["modules"]["maxItems"], json!(MAP_MODULES_MAX));
         assert_eq!(properties["hubs"]["maxItems"], json!(MAP_HUBS_MAX));
         assert_eq!(
             properties["entry_points"]["maxItems"],
@@ -377,10 +376,7 @@ mod tests {
         );
 
         let module = &schema["$defs"]["MapModule"]["properties"];
-        assert_eq!(
-            module["children"]["maxItems"],
-            json!(WORKSPACE_SOURCE_UNITS_MAX)
-        );
+        assert_eq!(module["children"]["maxItems"], json!(MAP_MODULES_MAX));
     }
 
     #[test]

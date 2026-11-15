@@ -254,3 +254,17 @@ pub(super) fn revision(
         None => Ok(()),
     }
 }
+
+/// Names a historical commit or release. The working tree is the default.
+pub(super) fn selected_revision(
+    out: &mut TextWriter,
+    revision: Option<&rift_protocol::revision::Revision>,
+) -> Result<(), TextError> {
+    use rift_protocol::revision::RevisionPoint;
+
+    match revision.map(rift_protocol::revision::Revision::point) {
+        Some(RevisionPoint::Commit(commit)) => out.raw_line(0, &format!("commit {}", &commit[..8])),
+        Some(RevisionPoint::Release(_, version)) => out.raw_line(0, &format!("release {version}")),
+        _ => Ok(()),
+    }
+}

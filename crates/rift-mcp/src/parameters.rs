@@ -64,6 +64,8 @@ pub(crate) struct NodesToolParams {
     position: Option<u64>,
     node_cursor: Option<String>,
     revision: Option<Revision>,
+    #[serde(default)]
+    syntax: bool,
     #[serde(default, deserialize_with = "present_scope")]
     scope: Option<SearchScope>,
 }
@@ -75,7 +77,7 @@ fn present_scope<'de, D: serde::Deserializer<'de>>(
 }
 
 impl NodesToolParams {
-    pub(crate) fn split(self) -> (NodesParams, Option<SearchScope>) {
+    pub(crate) fn split(self) -> (NodesParams, Option<SearchScope>, bool) {
         let read = NodesParams {
             symbol: self.symbol,
             path: self.path,
@@ -83,7 +85,7 @@ impl NodesToolParams {
             node_cursor: self.node_cursor,
             revision: self.revision,
         };
-        (read, self.scope)
+        (read, self.scope, self.syntax)
     }
 }
 
@@ -107,6 +109,14 @@ impl JsonSchema for NodesToolParams {
                 "pattern": rift_protocol::identity::LOCAL_SCOPE_PATTERN,
                 "not": {"pattern": rift_protocol::identity::LOCAL_SCOPE_RESERVED_PATTERN},
                 "description": "Project that owns `path`. Omitted or `local` selects the current project. The caller MAY select a registered project or profile by its local scope."
+            }),
+        );
+        properties.insert(
+            "syntax".to_owned(),
+            json!({
+                "type": "boolean",
+                "default": false,
+                "description": "Return a page of the full syntax tree. Omitted returns declaration summaries or continues the view selected by node_cursor."
             }),
         );
         let rules = schema_object

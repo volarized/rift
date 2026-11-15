@@ -43,7 +43,7 @@ async fn the_workspace_resource_answers_compact_text_then_json() -> TestResult {
         .await?;
     assert_eq!(answer.contents.len(), 2, "{:?}", answer.contents);
     let text = resource_text(&answer, "rift://workspace")?;
-    assert!(text.starts_with("workspace "), "{text}");
+    assert!(text.starts_with("workspace"), "{text}");
     let body = resource_json(&answer, "rift://workspace")?;
     assert!(body.is_object(), "{body}");
 
@@ -128,9 +128,8 @@ async fn a_workspace_page_past_the_end_answers_an_empty_catalog() -> TestResult 
 
 #[tokio::test]
 async fn workspace_pages_partition_the_complete_visible_catalog() -> TestResult {
-    use rift_protocol::workspace::WORKSPACE_SOURCE_UNITS_MAX;
-
-    let file_count = WORKSPACE_SOURCE_UNITS_MAX + 1;
+    let page_size = rift_protocol::workspace::WORKSPACE_SOURCE_UNITS_MAX;
+    let file_count = page_size + 1;
     let configuration =
         "[languages.rust]\nenabled = false\n\n[search.text]\ninclude = [\"**/*.txt\"]\n";
     let (_directory, client, server_task) = served_prepared_workspace(
@@ -148,7 +147,7 @@ async fn workspace_pages_partition_the_complete_visible_catalog() -> TestResult 
     let second = resource_body(&client, "rift://workspace?page_index=1").await?;
     let first_rows = first["source"].as_array().ok_or("source array")?;
     let second_rows = second["source"].as_array().ok_or("source array")?;
-    assert_eq!(first_rows.len(), WORKSPACE_SOURCE_UNITS_MAX);
+    assert_eq!(first_rows.len(), page_size);
     assert_eq!(
         second_rows.len(),
         3,

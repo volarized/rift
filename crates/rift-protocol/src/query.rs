@@ -56,7 +56,7 @@ pub struct QueryResult {
 /// A complete query answer or the typed cause preventing evaluation.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(untagged)]
-#[schemars(transform = crate::schema::require_query_result_object)]
+#[schemars(transform = crate::schema::require_result_object)]
 #[schemars(extend("examples" = [
     {
         "answer": { "result": "bindings", "variables": ["name"], "bindings": [
@@ -106,10 +106,12 @@ pub struct QueryConfiguration {
     pub page_limit: crate::configuration::ByteSize,
 }
 
+const QUERY_PAGE_SIZE_DEFAULT: u64 = 50;
+
 impl Default for QueryConfiguration {
     fn default() -> Self {
         Self {
-            page_size: 1000,
+            page_size: QUERY_PAGE_SIZE_DEFAULT,
             page_limit: crate::configuration::ByteSize::from_bytes(4 * 1024 * 1024),
         }
     }

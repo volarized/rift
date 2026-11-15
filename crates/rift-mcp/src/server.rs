@@ -28,8 +28,7 @@ use rift_protocol::read::{
 };
 use rift_protocol::revision::Revision;
 use rift_protocol::workspace::{
-    WORKSPACE_SOURCE_UNITS_MAX, WorkspaceLanguageSummary, WorkspaceLspSummary,
-    WorkspaceResourcePage, WorkspaceSourceUnit,
+    WorkspaceLanguageSummary, WorkspaceLspSummary, WorkspaceResourcePage, WorkspaceSourceUnit,
 };
 use rift_ranking::{
     BodyTerms, FileRowFrequencies, ParsedQuery, QueryPhase, RankingInput, RankingWeights,
@@ -78,6 +77,63 @@ use crate::validation::{
     WatchWorkspace, capture_prepared_workspace, configuration_fingerprint, read_published,
     run_index_supervisor, workspace_watcher,
 };
+
+/// Namespace that distinguishes a declaration continuation from a syntax continuation.
+const NODE_SUMMARY_CURSOR: &str = "summary/";
+
+/// Most exact pages one summary read can scan when a declaration spans pages.
+const SUMMARY_PAGES_MAX: usize = 4;
+
+struct SummaryCursor {
+    skip: usize,
+    tag: String,
+    exact: Option<String>,
+}
+
+impl SummaryCursor {
+    fn parse(cursor: &str) -> Result<Self, ToolFailure> {
+        let mut fields = cursor
+            .strip_prefix(NODE_SUMMARY_CURSOR)
+            .ok_or_else(invalid_summary_cursor)?
+            .splitn(3, '/');
+        let skip = fields
+            .next()
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(invalid_summary_cursor)?;
+        let tag = fields
+            .next()
+            .filter(|tag| tag.len() == 16)
+            .ok_or_else(invalid_summary_cursor)?;
+        let exact = fields.next().ok_or_else(invalid_summary_cursor)?;
+        Ok(Self {
+            skip,
+            tag: tag.to_owned(),
+            exact: (!exact.is_empty()).then(|| exact.to_owned()),
+        })
+    }
+
+    fn tag(params: &NodesParams, revision: &Revision) -> String {
+        let bytes = serde_json::to_vec(&(params, revision))
+            .unwrap_or_else(|error| unreachable!("node selector serializes: {error}"));
+        let digest = rift_core::FileDigest::of(&bytes);
+        data_encoding::HEXLOWER.encode(&digest.as_bytes()[..8])
+    }
+
+    fn mint(skip: usize, tag: &str, exact: Option<&str>) -> String {
+        format!(
+            "{NODE_SUMMARY_CURSOR}{skip}/{tag}/{}",
+            exact.unwrap_or_default()
+        )
+    }
+}
+
+fn invalid_summary_cursor() -> ToolFailure {
+    errors::server::read_invalid()
+        .field("node_cursor")
+        .violation("send the cursor with the selector and view that returned it")
+        .mcp()
+        .tool_failure(wire::ErrorPhase::Read)
+}
 
 /// Vector candidates one file may contribute to a fused ranking.
 ///
@@ -2364,7 +2420,7 @@ impl RiftMcp {
     async fn search_query(
         &self,
         Parameters(params): Parameters<rift_protocol::query::QueryParams>,
-    ) -> Result<Json<rift_protocol::query::QueryReadResult>, ToolFailure> {
+    ) -> Result<Json<crate::output::QueryOutput>, ToolFailure> {
         Box::pin(self.graph_query(params)).await
     }
 
@@ -3337,28 +3393,20 @@ impl RiftMcp {
         u32::try_from(self.limits.results_max()).unwrap_or(u32::MAX)
     }
 
-    /// Lists syntax nodes with their source text: every node of one `symbol`, or, for one
-    /// UTF-8 byte `position` in one file, every node of the symbol whose declaration holds
-    /// it, or the file's unit nodes when no declaration holds it. A symbol read is the way to
-    /// read a declaration's source, and a package or runtime symbol's nodes come from the
-    /// global API, each in a source unit of that symbol's release. A path read can select
-    /// a registered project or profile with `scope`. The answer names `symbol`;
-    /// each node is addressed by its place: node `index` of declaration `declaration` of
-    /// that symbol, or node `index` of its unit, from the file node at 0, with `parent` an
-    /// index in the same declaration or unit. An edit renumbers the nodes after it. An answer
-    /// whose nodes cross its node count or source byte bound returns `node_cursor` for the
-    /// rest. A file no syntax provider parses answers its file node alone. `revision` lists
-    /// the nodes at a git commit or pins the served working tree, and the answer names the
-    /// revision it was read at. If discovery is incomplete or a targeted read spends the
-    /// request's remaining time, the request returns `temporarily_unavailable` and can be
-    /// retried. A selected source path can answer within the remaining time. The server logs
-    /// `local_index_preparing` while the publication is being prepared.
+    /// Reads the selected symbol's declarations with their source and structure. A UTF-8
+    /// byte `position` selects its enclosing declaration, or a source excerpt if none holds
+    /// it. Use `scope` to select a registered project or profile for a path read.
+    /// Send `syntax: true` for the full syntax tree, including individual tokens. Use the
+    /// returned `node_cursor` with the same selector to continue declarations or syntax.
+    /// A node's `index` and `parent` address nodes
+    /// within the same declaration or source unit.
+    /// Use `revision` to read a commit or release, or to pin the served working tree.
     #[tool]
     async fn nodes(
         &self,
         Parameters(selected): Parameters<crate::parameters::NodesToolParams>,
-    ) -> Result<Json<NodesResult>, ToolFailure> {
-        let (params, scope) = selected.split();
+    ) -> Result<Json<rift_protocol::nodes_read::NodesToolResult>, ToolFailure> {
+        let (params, scope, syntax) = selected.split();
         if scope.is_some_and(|scope| {
             scope != SearchScope::Local
                 || params.symbol.is_some()
@@ -3372,7 +3420,84 @@ impl RiftMcp {
                 .mcp()
                 .tool_failure(wire::ErrorPhase::Read));
         }
-        self.read_nodes(params).await
+        let mut params = params;
+        let (summary, exact) = match params.node_cursor.take() {
+            Some(cursor) if cursor.starts_with(NODE_SUMMARY_CURSOR) => {
+                if syntax {
+                    return Err(invalid_summary_cursor());
+                }
+                (Some(SummaryCursor::parse(&cursor)?), None)
+            }
+            exact => (None, exact),
+        };
+        if syntax || exact.is_some() {
+            params.node_cursor = exact;
+            let Json(result) = self.read_nodes(params).await?;
+            return Ok(Json(rift_protocol::nodes_read::NodesToolResult::Syntax(
+                result,
+            )));
+        }
+        let deadline = self.request_deadline().await;
+        tokio::time::timeout_at(deadline.at(), self.read_node_summary(params, summary))
+            .await
+            .map_err(|_| {
+                errors::server::read_unavailable()
+                    .operation("nodes")
+                    .detail("the declaration summary reached the request deadline")
+                    .mcp()
+                    .tool_failure(wire::ErrorPhase::Read)
+            })?
+            .map(rift_protocol::nodes_read::NodesToolResult::Summary)
+            .map(Json)
+    }
+
+    async fn read_node_summary(
+        &self,
+        params: NodesParams,
+        continuation: Option<SummaryCursor>,
+    ) -> Result<rift_protocol::nodes_read::NodesSummary, ToolFailure> {
+        let mut exact = params.clone();
+        let mut skip = 0;
+        if let Some(cursor) = &continuation {
+            exact.node_cursor.clone_from(&cursor.exact);
+            skip = cursor.skip;
+        }
+        for page in 0..SUMMARY_PAGES_MAX {
+            let Json(result) = Box::pin(self.read_nodes(exact.clone())).await?;
+            let tag = SummaryCursor::tag(&params, &result.revision);
+            if continuation
+                .as_ref()
+                .is_some_and(|cursor| cursor.tag != tag)
+            {
+                return Err(invalid_summary_cursor());
+            }
+            let next = result.node_cursor.clone();
+            let (mut summary, remaining) =
+                crate::output::select_nodes(result, params.position, skip);
+            if summary.excerpt.is_some() {
+                return Ok(summary);
+            }
+            if summary.declarations.is_empty()
+                && let Some(ref cursor) = next
+                && page + 1 < SUMMARY_PAGES_MAX
+            {
+                exact.node_cursor = Some(cursor.clone());
+                skip = 0;
+                continue;
+            }
+            summary.node_cursor = if let Some(offset) = remaining {
+                Some(SummaryCursor::mint(
+                    offset,
+                    &tag,
+                    exact.node_cursor.as_deref(),
+                ))
+            } else {
+                next.as_deref()
+                    .map(|cursor| SummaryCursor::mint(0, &tag, Some(cursor)))
+            };
+            return Ok(summary);
+        }
+        unreachable!("the last exact page returns its summary")
     }
 
     async fn read_nodes(&self, params: NodesParams) -> Result<Json<NodesResult>, ToolFailure> {
@@ -4210,7 +4335,7 @@ impl RiftMcp {
         let pool = self.engine_pool_for(&current).await;
         let languages = workspace_languages(&current, &configuration, &pool)?;
         let source_digests = &current.visible_digests;
-        let page_size = WORKSPACE_SOURCE_UNITS_MAX;
+        let page_size = rift_protocol::workspace::WORKSPACE_SOURCE_UNITS_MAX;
         let total_pages = source_digests.len().div_ceil(page_size);
         let start = usize::try_from(page_index)
             .ok()
@@ -4265,7 +4390,7 @@ impl RiftMcp {
     async fn read_map(&self, uri: &str) -> Result<ReadResourceResult, ErrorData> {
         self.ensure_workspace_root().await?;
         let current = Arc::clone(&read_published(&self.published).await.current);
-        Ok(resource::map_answer(uri, &current.map))
+        resource::map_answer(uri, &current.map)
     }
 
     /// Refuses cached workspace resources after their root disappears.
@@ -5242,8 +5367,9 @@ done
         client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
         path: &str,
     ) -> TestResult<CallToolResult> {
-        let request = CallToolRequestParams::new("nodes")
-            .with_arguments(arguments(&json!({"path": path, "position": 8}))?);
+        let request = CallToolRequestParams::new("nodes").with_arguments(arguments(
+            &json!({"path": path, "position": 8, "syntax": true}),
+        )?);
         Ok(client.call_tool(request).await?)
     }
 
@@ -7380,21 +7506,25 @@ done
         let structured = nodes
             .structured_content
             .ok_or("nodes must return structured content")?;
-        let listed = structured["nodes"]
-            .as_array()
-            .ok_or("nodes must be an array")?;
-        assert!(
-            !listed.is_empty(),
-            "position 8 sits inside `pub fn beacon`, so at least one node covers it"
-        );
-        let item = &listed[0];
+        let item = &structured["declarations"][0];
         assert_eq!(item["kind"], json!("function_item"), "{structured}");
-        assert_eq!(
-            (&item["declaration"], &item["index"]),
-            (&json!(0), &json!(0)),
-            "position 8 answers `pub fn beacon`, whose item node is node 0"
-        );
-        assert!(structured["symbol"].is_string(), "{structured}");
+        assert_eq!(item["declaration"], json!(0), "{structured}");
+        assert_eq!(item["source"]["text"], "pub fn beacon() {}");
+        assert_eq!(structured["symbol"], json!(id), "{structured}");
+        assert!(structured.get("nodes").is_none());
+
+        let syntax = client
+            .call_tool(
+                CallToolRequestParams::new("nodes").with_arguments(arguments(&json!({
+                    "path": "lib.rs", "position": 8, "syntax": true
+                }))?),
+            )
+            .await?
+            .structured_content
+            .ok_or("nodes must return structured syntax")?;
+        assert_eq!(syntax["nodes"][0]["index"], 0, "{syntax}");
+        assert_eq!(syntax["nodes"][0]["source"], item["source"]["text"]);
+        assert_eq!(syntax["revision"], structured["revision"]);
 
         client.cancel().await?;
         server_task.await?;
@@ -10325,7 +10455,7 @@ done
         let answer = server.read_workspace("rift://workspace").await?;
         assert_eq!(answer.contents.len(), 2, "{:?}", answer.contents);
         let compact = resource_compact_text(&answer, "rift://workspace")?;
-        assert!(compact.starts_with("workspace "), "{compact}");
+        assert!(compact.starts_with("workspace"), "{compact}");
         let body: serde_json::Value =
             serde_json::from_str(&resource_json_text(&answer, "rift://workspace")?)?;
         assert!(body["languages"].is_array(), "{body}");
