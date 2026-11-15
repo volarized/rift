@@ -356,13 +356,7 @@ async fn repository_workspace_reads(
         .await
         .map_err(|error| format!("nodes: {error:?}"))?;
     assert!(
-        nodes["declarations"]
-            .as_array()
-            .ok_or("nodes carries declarations")?
-            .iter()
-            .any(|declaration| declaration["source"]["text"]
-                .as_str()
-                .is_some_and(|source| source.contains(name))),
+        position_source(&nodes).is_some_and(|source| source.contains(name)),
         "{nodes}"
     );
     Ok(revision)
@@ -656,9 +650,7 @@ async fn assert_worktree_node_reads(
         assert!(schema.is_valid(&request), "{request}");
         let answer = proxied_call(client, "nodes", &request).await?;
         assert_eq!(
-            answer["declarations"][0]["source"]["text"]
-                .as_str()
-                .map(str::trim_end),
+            position_source(&answer).map(str::trim_end),
             Some(source),
             "{request}: {answer}"
         );
@@ -689,9 +681,7 @@ async fn assert_worktree_node_reads(
     )
     .await?;
     assert_eq!(
-        committed["declarations"][0]["source"]["text"]
-            .as_str()
-            .map(str::trim_end),
+        position_source(&committed).map(str::trim_end),
         Some("pub fn committed_review() {}")
     );
     assert!(
@@ -718,6 +708,13 @@ async fn assert_worktree_node_reads(
     assert_eq!(continued["symbol"], first["symbol"]);
     assert_eq!(continued["nodes"][0]["index"], 2);
     Ok(())
+}
+
+/// Source at the requested position, inside a declaration or in the unit excerpt.
+fn position_source(answer: &serde_json::Value) -> Option<&str> {
+    answer["declarations"][0]["source"]["text"]
+        .as_str()
+        .or_else(|| answer["excerpt"]["text"].as_str())
 }
 
 async fn assert_worktree_scope_refusals(
