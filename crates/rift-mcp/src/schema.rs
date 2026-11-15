@@ -97,6 +97,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn feedback_advertises_a_non_idempotent_external_write() {
+        let tool = tool_listing()
+            .into_iter()
+            .find(|tool| tool.name == "feedback")
+            .expect("feedback is advertised");
+        let annotations = tool.annotations.expect("feedback has annotations");
+        assert_eq!(annotations.read_only_hint, Some(false));
+        assert_eq!(annotations.destructive_hint, Some(false));
+        assert_eq!(annotations.idempotent_hint, Some(false));
+        assert_eq!(annotations.open_world_hint, Some(true));
+    }
+
+    #[test]
     fn tool_output_schemas_exclude_operator_diagnostics_outside_queries() {
         let document: serde_json::Value =
             serde_json::from_str(&schema_document()).expect("exported MCP document");

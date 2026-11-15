@@ -99,7 +99,7 @@ Python developer tooling lives in the locked `rift-dev` package under `dev/`:
 | `just corpus-sync [name]` | Fetch the pinned Bun, Next.js, and FastAPI trees |
 | `just corpus-test <name>` | Corpus suite for `bun`, `nextjs`, or `fastapi` |
 | `just artifact-test` | Build and serve the native release binary |
-| `just agent-test` | Validate three MCP tools and three resources |
+| `just agent-test` | Validate MCP tool and resource responses |
 | `just live-test` | Live language-engine and embedding model suites |
 | `just integration-archive` | Build the instrumented corpus test archive |
 | `just integration-cli` | Build the plain CLI the artifact checks serve |

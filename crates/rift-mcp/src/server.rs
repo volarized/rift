@@ -2392,6 +2392,26 @@ impl RiftMcp {
             .server_configuration()
     }
 
+    /// Sends a feedback report to the configured intake over HTTPS. The server sends the
+    /// caller's text and any selected diagnostic fields. The caller MUST omit secrets,
+    /// personal data, and private source material. The caller MUST obtain the user's
+    /// approval for any exact conversation excerpt before including it in a report.
+    #[tool(annotations(
+        read_only_hint = false,
+        destructive_hint = false,
+        idempotent_hint = false,
+        open_world_hint = true
+    ))]
+    async fn feedback(
+        &self,
+        Parameters(params): Parameters<rift_protocol::feedback::FeedbackParams>,
+    ) -> Result<Json<rift_protocol::feedback::FeedbackResult>, ToolFailure> {
+        crate::feedback::submit(params)
+            .await
+            .map(Json)
+            .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Submit))
+    }
+
     /// Reads one logical symbol by its canonical `id` at one `revision`; the answer names the
     /// revision it read, and `declaration_cursor` continues its declarations at that revision.
     /// A complete exact miss returns `symbol_not_found` and up to three alternatives.
@@ -7434,7 +7454,7 @@ done
     }
 
     #[tokio::test]
-    async fn client_lists_and_calls_exact_read_only_surface() -> TestResult {
+    async fn client_lists_the_surface_and_calls_the_read_tools() -> TestResult {
         let (_directory, server, id) = canonical_fixture().await?;
         let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
         let server_task = tokio::spawn(async move {
@@ -7452,7 +7472,7 @@ done
                 .iter()
                 .map(|tool| tool.name.as_ref())
                 .collect::<Vec<_>>(),
-            ["get_symbol", "nodes", "search"]
+            ["feedback", "get_symbol", "nodes", "search"]
         );
         assert!(tools.iter().all(|tool| tool.output_schema.is_some()));
 

@@ -191,6 +191,14 @@ async fn decode_response(
         return Ok(StreamableHttpPostResponse::Accepted);
     }
     if status == reqwest::StatusCode::NOT_FOUND && session_attached {
+        if matches!(
+            message,
+            ClientJsonRpcMessage::Request(request)
+                if matches!(&request.request, rmcp::model::ClientRequest::CallToolRequest(call)
+                    if call.params.name == crate::feedback::TOOL_NAME)
+        ) {
+            return Err(refused("feedback session expired"));
+        }
         return Err(StreamableHttpError::SessionExpired);
     }
     let session = response

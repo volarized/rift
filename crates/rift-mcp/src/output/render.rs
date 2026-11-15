@@ -79,6 +79,12 @@ pub(crate) trait Render {
     fn render(&self, out: &mut TextWriter) -> Result<(), TextError>;
 }
 
+impl Render for rift_protocol::feedback::FeedbackResult {
+    fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
+        out.raw_line(0, "Feedback submitted.")
+    }
+}
+
 /// Renders `answer` as text under the output byte limit.
 ///
 /// # Errors

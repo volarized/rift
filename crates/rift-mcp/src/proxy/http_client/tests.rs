@@ -362,6 +362,29 @@ async fn accepted_session_expiry_and_sse_do_not_replay() -> TestResult {
 }
 
 #[tokio::test]
+async fn feedback_session_expiry_does_not_request_transparent_reinitialization() -> TestResult {
+    let missing = fixture(StatusCode::NOT_FOUND, "", &[]).await?;
+    let request = serde_json::from_value(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "feedback", "arguments": {"text": "fixture"}}
+    }))?;
+    let result = client()
+        .post_message(
+            Arc::clone(&missing.uri),
+            request,
+            Some(Arc::from("expired")),
+            None,
+            HashMap::new(),
+        )
+        .await;
+    assert!(matches!(result, Err(error) if error.to_string().contains("feedback session expired")));
+    assert_eq!(missing.received.lock().expect("requests").len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn redirects_are_not_followed_and_reserved_headers_are_refused() -> TestResult {
     let served = fixture(StatusCode::TEMPORARY_REDIRECT, "", &[("location", "/")]).await?;
     let answer = client()
