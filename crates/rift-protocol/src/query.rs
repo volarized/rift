@@ -47,7 +47,8 @@ pub struct QueryResult {
     pub view: Option<CapturedView>,
     /// The transport page within this retained execution.
     pub pagination: QueryPagination,
-    /// Warnings recorded by the serving process.
+    /// Coverage and discovery limits affecting the query result. For `SERVICE :flows`,
+    /// `traversal_truncated` reports the visited symbol count and names the bound in `detail`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<ReadWarning>,
 }

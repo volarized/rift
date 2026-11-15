@@ -16,6 +16,7 @@ mod acquisition;
 mod document;
 mod embedding;
 mod encoder;
+pub mod flow;
 mod fusion;
 mod index;
 mod similarity;

@@ -16,17 +16,52 @@ impl RiftMcp {
         selection: &RetrievalSelection,
         limits: rift_search::sparql::GraphLimits,
     ) -> Result<Result<Box<SearchResult>, SearchUnavailable>, ToolFailure> {
-        collect_retrieval(selection.request.clone(), limits, read_failure, |request| {
-            self.graph_search(request)
-        })
+        let coverage = if selection.flow_limit.is_some() {
+            RetrievalCoverage::LexicalFallback
+        } else {
+            RetrievalCoverage::Complete
+        };
+        collect_with_coverage(
+            selection.request.clone(),
+            limits,
+            coverage,
+            read_failure,
+            |request| self.graph_search(request),
+        )
         .await
     }
 }
 
 /// Acquires the producer pages selected by one query service and validates their common context.
 pub(crate) async fn collect_retrieval<E, F>(
+    request: SearchParams,
+    limits: rift_search::sparql::GraphLimits,
+    map_error: impl Fn(RiftError) -> E,
+    read: impl FnMut(SearchParams) -> F,
+) -> Result<Result<Box<SearchResult>, SearchUnavailable>, E>
+where
+    F: std::future::Future<Output = Result<SearchReadResult, E>>,
+{
+    collect_with_coverage(
+        request,
+        limits,
+        RetrievalCoverage::Complete,
+        map_error,
+        read,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum RetrievalCoverage {
+    Complete,
+    LexicalFallback,
+}
+
+async fn collect_with_coverage<E, F>(
     mut request: SearchParams,
     limits: rift_search::sparql::GraphLimits,
+    coverage: RetrievalCoverage,
     map_error: impl Fn(RiftError) -> E,
     mut read: impl FnMut(SearchParams) -> F,
 ) -> Result<Result<Box<SearchResult>, SearchUnavailable>, E>
@@ -51,8 +86,16 @@ where
             }) {
             Some(SymbolUnavailableReason::ViewContext)
         } else {
-            retrieval_coverage(
-                &page.warnings,
+            let warnings = page.warnings.iter().filter(|warning| {
+                !matches!(coverage, RetrievalCoverage::LexicalFallback)
+                    || !matches!(
+                        warning,
+                        ReadWarning::VectorIndexPreparing { .. }
+                            | ReadWarning::VectorRankingUnavailable { .. }
+                    )
+            });
+            retrieval_coverage_for(
+                warnings,
                 request.view.is_none() && request.revision.is_none(),
             )
         };
@@ -106,12 +149,17 @@ fn unavailable(reason: SymbolUnavailableReason, page: Box<SearchResult>) -> Sear
     }
 }
 
+#[cfg(test)]
 fn retrieval_coverage(warnings: &[ReadWarning], current: bool) -> Option<SymbolUnavailableReason> {
+    retrieval_coverage_for(warnings.iter(), current)
+}
+
+fn retrieval_coverage_for<'warning>(
+    warnings: impl Iterator<Item = &'warning ReadWarning>,
+    current: bool,
+) -> Option<SymbolUnavailableReason> {
     let mut preparing = false;
-    for warning in warnings
-        .iter()
-        .filter(|warning| incomplete_retrieval(warning))
-    {
+    for warning in warnings.filter(|warning| incomplete_retrieval(warning)) {
         if current
             && matches!(
                 warning,

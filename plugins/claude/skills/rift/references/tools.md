@@ -49,8 +49,9 @@ Parameters:
 
 ## search
 
-Evaluate SPARQL over captured code facts. Use `SERVICE :search` for ranked text and
-regex retrieval. Continue a paged answer with its `next_query`.
+Evaluate SPARQL over captured code facts. Use `SERVICE :search` for text and regex
+retrieval and `SERVICE :flows` for call paths around ranked symbols. Continue a
+paged answer with its `next_query`.
 
 Parameters:
 

@@ -170,19 +170,16 @@ impl RiftMcp {
             }
             Err(error) => return Err(read_failure(error)),
         };
-        let mut retrieved = Vec::new();
-        for selection in query.retrieval_requests() {
-            let result = tokio::time::timeout_at(
-                deadline.at(),
-                Box::pin(self.query_retrieval(selection, limits)),
-            )
-            .await
-            .map_err(|_| read_failure(deadline_failure(deadline.budget())))??;
-            match result {
-                Ok(result) => retrieved.push(*result),
-                Err(reason) => return Ok(Err(reason)),
-            }
-        }
+        let retrieved = match tokio::time::timeout_at(
+            deadline.at(),
+            Box::pin(self.prepare_retrievals(&resolved, query, limits, deadline)),
+        )
+        .await
+        .map_err(|_| read_failure(deadline_failure(deadline.budget())))??
+        {
+            Ok(retrieved) => retrieved,
+            Err(reason) => return Ok(Err(reason)),
+        };
         if !retrieved.is_empty() && !self.engine_tree_matches(&resolved.published).await? {
             return Ok(Err(unavailable(
                 SymbolUnavailableReason::InsufficientCoverage,
@@ -199,7 +196,7 @@ impl RiftMcp {
         if let Some(exact) = &mut exact {
             warnings.extend(exact.take_warnings());
         }
-        for warning in retrieved.iter().flat_map(|result| &result.warnings) {
+        for warning in retrieved.iter().flat_map(|entry| &entry.result.warnings) {
             if !warnings.contains(warning) {
                 warnings.push(warning.clone());
             }
@@ -214,6 +211,51 @@ impl RiftMcp {
             configuration,
             warnings,
         }))
+    }
+
+    async fn prepare_retrievals(
+        &self,
+        resolved: &super::super::ResolvedWorkspace,
+        query: &GraphQuery,
+        limits: GraphLimits,
+        deadline: RequestDeadline,
+    ) -> Result<Result<Vec<AcquiredRetrieval>, SearchUnavailable>, ToolFailure> {
+        use relationships::FlowAcquisition;
+
+        let mut retrieved = Vec::new();
+        let mut acquisition = FlowAcquisition::new(self, resolved, limits, deadline);
+        for selection in query.retrieval_requests() {
+            let result = match self.query_retrieval(selection, limits).await? {
+                Ok(result) => result,
+                Err(reason) => return Ok(Err(reason)),
+            };
+            let flows = if let Some(limit) = selection.flow_limit {
+                let ranked = result.as_ref();
+                let ranked_rows = ranked.results.len();
+                let flow_acquisition = &mut acquisition;
+                let acquired = rift_tracing::traced!(
+                    component = "search",
+                    operation = "search.flows.acquire",
+                    ranked_rows = ranked_rows,
+                    async move { Box::pin(flow_acquisition.acquire(ranked)).await }
+                )
+                .await;
+                match acquired {
+                    Ok(flows) => Some((limit, flows)),
+                    Err(error) if lacks_coverage(&error) => {
+                        return Ok(Err(unavailable(
+                            SymbolUnavailableReason::InsufficientCoverage,
+                        )));
+                    }
+                    Err(error) => return Err(read_failure(error)),
+                }
+            } else {
+                None
+            };
+            retrieved.push(AcquiredRetrieval { result, flows });
+        }
+        acquisition.validate().await.map_err(read_failure)?;
+        Ok(Ok(retrieved))
     }
     async fn prepare_relationships(
         &self,
@@ -260,9 +302,45 @@ struct AcquiredGraph {
     local_semantics: Option<SemanticInventory>,
     acquired: AcquiredAdjacency,
     exact: Option<exact::ExactFacts>,
-    retrieved: Vec<SearchResult>,
+    retrieved: Vec<AcquiredRetrieval>,
     configuration: QueryConfiguration,
     warnings: Vec<ReadWarning>,
+}
+
+struct AcquiredRetrieval {
+    result: Box<SearchResult>,
+    flows: Option<(usize, relationships::AcquiredFlows)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProjectedRetrievals {
+    Complete,
+    Partial,
+    Unavailable,
+}
+
+fn project_retrievals(
+    query: &GraphQuery,
+    retrieved: &mut [AcquiredRetrieval],
+    dataset: &mut rift_search::sparql::GraphDatasetBuilder,
+    warnings: &mut Vec<ReadWarning>,
+) -> Result<ProjectedRetrievals, RiftError> {
+    let mut coverage = ProjectedRetrievals::Complete;
+    for (selection, entry) in query.retrieval_requests().iter().zip(retrieved) {
+        let Some((limit, flows)) = entry.flows.take() else {
+            dataset.insert_retrieval(selection, &entry.result)?;
+            continue;
+        };
+        let (flows, partial) = flows.finish(limit, warnings);
+        if partial {
+            if flows.paths.is_empty() || !query.projects_flow_rows() {
+                return Ok(ProjectedRetrievals::Unavailable);
+            }
+            coverage = ProjectedRetrievals::Partial;
+        }
+        dataset.insert_flows(selection, &flows)?;
+    }
+    Ok(coverage)
 }
 
 fn project_local_endpoints(
@@ -357,9 +435,9 @@ impl AcquiredGraph {
             local_semantics,
             acquired,
             exact,
-            retrieved,
+            mut retrieved,
             configuration,
-            warnings,
+            mut warnings,
         } = self;
         if acquired.is_incomplete() && !query.admits_partial_witness() {
             return Ok(query_unavailable(
@@ -413,8 +491,9 @@ impl AcquiredGraph {
                 deadline.at().into_std(),
             )?;
         }
-        for (selection, result) in query.retrieval_requests().iter().zip(&retrieved) {
-            dataset.insert_retrieval(selection, result)?;
+        let coverage = project_retrievals(query, &mut retrieved, &mut dataset, &mut warnings)?;
+        if coverage == ProjectedRetrievals::Unavailable {
+            return Ok(incomplete_flows(warnings));
         }
         if query.names_local_graph() {
             if selected.is_some() {
@@ -431,6 +510,11 @@ impl AcquiredGraph {
                 SymbolUnavailableReason::InsufficientCoverage,
             ));
         };
+        if coverage == ProjectedRetrievals::Partial
+            && matches!(&answer, QueryAnswer::Bindings { bindings, .. } if bindings.is_empty())
+        {
+            return Ok(incomplete_flows(warnings));
+        }
         let views = views.get().ok_or_else(retention_failure)?;
         let root = input.root().to_owned();
         let owner = input.owner().clone();
@@ -454,7 +538,7 @@ struct QueryRetention<'answer> {
     configuration: &'answer QueryConfiguration,
     warnings: Vec<ReadWarning>,
     acquired: &'answer AcquiredAdjacency,
-    retrieved: &'answer [SearchResult],
+    retrieved: &'answer [AcquiredRetrieval],
 }
 
 impl QueryRetention<'_> {
@@ -471,7 +555,7 @@ impl QueryRetention<'_> {
             let provider_views = self.acquired.remote_view().into_iter().chain(
                 self.retrieved
                     .iter()
-                    .filter_map(|result| result.view.as_ref()),
+                    .filter_map(|entry| entry.result.view.as_ref()),
             );
             if !constrain_provider_expiry(&mut view, provider_views)? {
                 response = Some(query_unavailable(SymbolUnavailableReason::ViewExpired));
@@ -563,7 +647,14 @@ impl CandidateResponses {
         encoded.push(b'\n');
         encoded.extend_from_slice(bytes);
         let expires = crate::proxy::captured_expiry(&saved.view)?;
-        self.save_bytes(saved.view.id.as_str().to_owned(), expires, encoded)
+        let retained_bytes = encoded.len();
+        self.save_bytes(saved.view.id.as_str().to_owned(), expires, encoded)?;
+        rift_tracing::debug!(
+            component = "search",
+            retained_bytes,
+            "query answer retained"
+        );
+        Ok(())
     }
 
     fn replay_query(
@@ -862,6 +953,14 @@ fn unavailable(reason: SymbolUnavailableReason) -> SearchUnavailable {
 
 fn query_unavailable(reason: SymbolUnavailableReason) -> QueryReadResult {
     QueryReadResult::Unavailable(unavailable(reason))
+}
+
+fn incomplete_flows(warnings: Vec<ReadWarning>) -> QueryReadResult {
+    QueryReadResult::Unavailable(SearchUnavailable::Unavailable {
+        reason: SymbolUnavailableReason::InsufficientCoverage,
+        view: None,
+        warnings,
+    })
 }
 
 #[cfg(test)]

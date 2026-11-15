@@ -90,6 +90,10 @@ name = "error_contract"
 path = "tests/error_contract.rs"
 
 [[test]]
+name = "flow_search"
+path = "tests/flow_search.rs"
+
+[[test]]
 name = "global_routing"
 path = "tests/global_routing.rs"
 
