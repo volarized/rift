@@ -116,16 +116,12 @@ runtime. MCP clients use its `/api/mcp` route, which serves Streamable HTTP thro
 <VersionBadge version="v0.0.62" />
 
 When the server builds a tool result, it renders compact text from the typed answer into
-`content` and serializes the same answer into `structuredContent`. Typed layout code renders every
-tool answer, every failure, and the workspace resource as sections: a title at column 0 that counts its
-entries, such as `2 results`, `1 warning`, or `2 errors`, with the entries indented under it. The
-text writer enforces a byte limit on each text and refuses one that crosses it.
+`content` and serializes the same answer into `structuredContent`. The text writer enforces
+a byte limit and refuses an answer that crosses it.
 
-A workspace resource read carries the compact text as `text/plain`, then the JSON body as
-`application/json`. A map read carries one `application/json` content under both output choices.
-
-Only `rift mcp` applies the output choice, so direct HTTP access returns both tool and workspace
-representations.
+The map and workspace resources each carry compact `text/plain` followed by
+`application/json`. Direct HTTP access and `rift mcp --output=all` return both
+representations. The default `rift mcp` output returns the compact text.
 
 Where the server converts a tool method's result, it classifies a Rift operating failure on the
 tool path as a completed tool result with `isError` set and the failure's compact text in

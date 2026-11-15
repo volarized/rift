@@ -384,8 +384,8 @@ CHURN_REQUESTS: dict[str, JsonObject] = {
         f"{{ ?node :of <{CHURN_PROBE_ID}>; :index 0; :source ?source; "
         ":range [ :unit ?unit; :start ?start; :end ?end ] }"
     },
-    "symbol_nodes": {"symbol": CHURN_PROBE_ID},
-    "nodes": {"path": PROBE_PATH, "position": 0},
+    "symbol_nodes": {"symbol": CHURN_PROBE_ID, "syntax": True},
+    "nodes": {"path": PROBE_PATH, "position": 0, "syntax": True},
 }
 # The tool each churn read calls: `symbol_nodes` reads the probe declaration's nodes by its
 # symbol identity, the way an agent reads a declaration's source.
@@ -1235,6 +1235,7 @@ class Corpus:
             request: JsonObject = {
                 "path": str(path.relative_to(self.root)),
                 "position": end - 1,
+                "syntax": True,
             }
             answer = await client.call("nodes", request)
             nodes = objects(answer, "nodes")
@@ -1307,7 +1308,7 @@ class Corpus:
         path: Path,
     ) -> None:
         """Require the symbol read of `identity` to list the sampled declaration's item."""
-        arguments: JsonObject = {"symbol": identity}
+        arguments: JsonObject = {"symbol": identity, "syntax": True}
         for _ in range(NODE_PAGES_MAX):
             answer = await client.call("nodes", arguments)
             require(
@@ -1326,7 +1327,7 @@ class Corpus:
             cursor = answer.get("node_cursor")
             if cursor is None:
                 break
-            arguments = {"symbol": identity, "node_cursor": cursor}
+            arguments["node_cursor"] = cursor
         require(
             False,
             f"nodes omitted sampled declaration: {identity} ending at {path}:{end}",
@@ -1496,7 +1497,7 @@ class Corpus:
         """Read complete source revisions while external writes continue every two seconds."""
         path = self.root / probe_path
         requests = {name: dict(request) for name, request in CHURN_REQUESTS.items()}
-        requests["nodes"] = {"path": probe_path, "position": 0}
+        requests["nodes"]["path"] = probe_path
         sources = [churn_source(0).rstrip("\n")]
         written = [time.monotonic()]
         timings: dict[str, list[float]] = {name: [] for name in CHURN_REQUESTS}
