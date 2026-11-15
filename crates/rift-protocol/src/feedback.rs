@@ -19,6 +19,7 @@ pub enum FeedbackDetail {
 /// The report and any diagnostic fields the caller elects to send.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("rift:since" = "v0.0.79"))]
 #[schemars(example = serde_json::json!({
     "text": "The nodes tool returned an empty result for a symbol it found.",
     "include_details": ["os", "rift_version"]

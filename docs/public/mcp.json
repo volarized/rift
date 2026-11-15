@@ -53,6 +53,7 @@
         "required": [
           "text"
         ],
+        "rift:since": "v0.0.79",
         "type": "object"
       },
       "name": "feedback",
