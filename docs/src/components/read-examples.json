@@ -12,11 +12,7 @@
         "language": "rust",
         "name": "load_config",
         "kind": "function",
-        "facets": [
-          "value",
-          "callable",
-          "public"
-        ],
+        "facets": ["value", "callable", "public"],
         "visibility": "pub",
         "signatures": [
           {
@@ -44,13 +40,9 @@
             "end": 355
           },
           "line": 11,
-          "signature_indices": [
-            0
-          ],
+          "signature_indices": [0],
           "type_indices": [],
-          "documentation_indices": [
-            0
-          ]
+          "documentation_indices": [0]
         }
       ]
     }
@@ -68,11 +60,7 @@
         "language": "rust",
         "name": "load_config",
         "kind": "function",
-        "facets": [
-          "value",
-          "callable",
-          "public"
-        ],
+        "facets": ["value", "callable", "public"],
         "visibility": "pub",
         "signatures": [
           {
@@ -100,13 +88,9 @@
             "end": 59
           },
           "line": 2,
-          "signature_indices": [
-            0
-          ],
+          "signature_indices": [0],
           "type_indices": [],
-          "documentation_indices": [
-            0
-          ]
+          "documentation_indices": [0]
         }
       ]
     }
@@ -148,10 +132,7 @@
           "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "function_item",
-          "facets": [
-            "declaration",
-            "definition"
-          ],
+          "facets": ["declaration", "definition"],
           "range": {
             "start": 218,
             "end": 355
@@ -333,10 +314,7 @@
           "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "let_declaration",
-          "facets": [
-            "declaration",
-            "definition"
-          ],
+          "facets": ["declaration", "definition"],
           "range": {
             "start": 287,
             "end": 329
@@ -363,9 +341,7 @@
           "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "try_expression",
-          "facets": [
-            "expression"
-          ],
+          "facets": ["expression"],
           "range": {
             "start": 298,
             "end": 328
@@ -379,9 +355,7 @@
           "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "call_expression",
-          "facets": [
-            "expression"
-          ],
+          "facets": ["expression"],
           "range": {
             "start": 298,
             "end": 327
@@ -486,9 +460,7 @@
           "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "call_expression",
-          "facets": [
-            "expression"
-          ],
+          "facets": ["expression"],
           "range": {
             "start": 334,
             "end": 353
@@ -528,9 +500,7 @@
           "unit": "rift://source/project/src/config.rs",
           "language": "rust",
           "kind": "reference_expression",
-          "facets": [
-            "expression"
-          ],
+          "facets": ["expression"],
           "range": {
             "start": 347,
             "end": 352
@@ -600,9 +570,7 @@
     "tool": "get_symbol",
     "arguments": {
       "id": "rift://symbol/cargo/crates.io/demo/rust/demo/beacon",
-      "include": [
-        "documentation"
-      ]
+      "include": ["documentation"]
     },
     "text": "\tfunction beacon\n\trift://source/cargo/crates.io/demo/src/lib.rs:2 \u00b7 bytes 26..44\n\trift://symbol/cargo/crates.io/demo/rust/demo/beacon\n\tdependency rift://revision/cargo/crates.io/demo@1.0.0\n\n\tdocumentation:\n\t\trift://source/cargo/crates.io/demo/README.md:1\n\t\t\tguide\nrelease 1.0.0\n",
     "json": {
