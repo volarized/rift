@@ -12,6 +12,27 @@ use crate::revision::Revision;
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(untagged)]
 #[schemars(transform = crate::schema::require_result_object)]
+#[schemars(extend("examples" = [{
+    "symbol": "rift://symbol/local/rust/rift_server/read/nodes/cursor_offset",
+    "declarations": [{
+        "declaration": 0,
+        "kind": "function_item",
+        "range": { "start": 3698, "end": 3862 },
+        "source": {
+            "span": {
+                "unit": "rift://source/project/crates/rift-server/src/read/nodes.rs",
+                "range": { "start": 3698, "end": 3862 }
+            },
+            "text": "pub(crate) fn cursor_offset(cursor: &str, key: &str, revision: &str) -> Result<usize, RiftError> {\n    super::cursor::offset(cursor, \"node_cursor\", key, revision)\n}"
+        },
+        "parts": [{
+            "index": 4,
+            "kind": "parameters",
+            "range": { "start": 3725, "end": 3766 }
+        }]
+    }],
+    "revision": "rift://revision/tree/41619978851e527321ce95f42acb8699a96f00882484f1e9c1d404a8fde27470"
+}]))]
 pub enum NodesToolResult {
     /// Source and structure for the selected declarations or file position.
     Summary(NodesSummary),

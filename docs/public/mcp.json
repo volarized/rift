@@ -6182,6 +6182,42 @@
             "description": "Syntax nodes with their exact source and addresses."
           }
         ],
+        "examples": [
+          {
+            "declarations": [
+              {
+                "declaration": 0,
+                "kind": "function_item",
+                "parts": [
+                  {
+                    "index": 4,
+                    "kind": "parameters",
+                    "range": {
+                      "end": 3766,
+                      "start": 3725
+                    }
+                  }
+                ],
+                "range": {
+                  "end": 3862,
+                  "start": 3698
+                },
+                "source": {
+                  "span": {
+                    "range": {
+                      "end": 3862,
+                      "start": 3698
+                    },
+                    "unit": "rift://source/project/crates/rift-server/src/read/nodes.rs"
+                  },
+                  "text": "pub(crate) fn cursor_offset(cursor: &str, key: &str, revision: &str) -> Result<usize, RiftError> {\n    super::cursor::offset(cursor, \"node_cursor\", key, revision)\n}"
+                }
+              }
+            ],
+            "revision": "rift://revision/tree/41619978851e527321ce95f42acb8699a96f00882484f1e9c1d404a8fde27470",
+            "symbol": "rift://symbol/local/rust/rift_server/read/nodes/cursor_offset"
+          }
+        ],
         "type": "object"
       }
     },
@@ -6847,67 +6883,6 @@
             "required": [
               "page_index",
               "total_pages"
-            ],
-            "type": "object"
-          },
-          "QueryReadResult": {
-            "anyOf": [
-              {
-                "$ref": "#/$defs/QueryResult",
-                "description": "An answer evaluated over every required fact."
-              },
-              {
-                "$ref": "#/$defs/SearchUnavailable",
-                "description": "Required facts or retained state cannot be established."
-              }
-            ],
-            "description": "A complete query answer or the typed cause preventing evaluation.",
-            "examples": [
-              {
-                "answer": {
-                  "bindings": [
-                    {
-                      "name": {
-                        "datatype": "http://www.w3.org/2001/XMLSchema#string",
-                        "type": "literal",
-                        "value": "ReadService"
-                      }
-                    }
-                  ],
-                  "result": "bindings",
-                  "variables": [
-                    "name"
-                  ]
-                },
-                "pagination": {
-                  "page_index": 0,
-                  "total_pages": 1
-                }
-              },
-              {
-                "answer": {
-                  "result": "boolean",
-                  "value": true
-                },
-                "pagination": {
-                  "page_index": 0,
-                  "total_pages": 1
-                }
-              },
-              {
-                "answer": {
-                  "result": "graph",
-                  "triples": []
-                },
-                "pagination": {
-                  "page_index": 0,
-                  "total_pages": 0
-                }
-              },
-              {
-                "outcome": "unavailable",
-                "reason": "view_context"
-              }
             ],
             "type": "object"
           },
@@ -8437,8 +8412,64 @@
             "type": "object"
           }
         },
-        "$ref": "#/$defs/QueryReadResult",
         "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "anyOf": [
+          {
+            "$ref": "#/$defs/QueryResult",
+            "description": "An answer evaluated over every required fact."
+          },
+          {
+            "$ref": "#/$defs/SearchUnavailable",
+            "description": "Required facts or retained state cannot be established."
+          }
+        ],
+        "examples": [
+          {
+            "answer": {
+              "bindings": [
+                {
+                  "name": {
+                    "datatype": "http://www.w3.org/2001/XMLSchema#string",
+                    "type": "literal",
+                    "value": "ReadService"
+                  }
+                }
+              ],
+              "result": "bindings",
+              "variables": [
+                "name"
+              ]
+            },
+            "pagination": {
+              "page_index": 0,
+              "total_pages": 1
+            }
+          },
+          {
+            "answer": {
+              "result": "boolean",
+              "value": true
+            },
+            "pagination": {
+              "page_index": 0,
+              "total_pages": 1
+            }
+          },
+          {
+            "answer": {
+              "result": "graph",
+              "triples": []
+            },
+            "pagination": {
+              "page_index": 0,
+              "total_pages": 0
+            }
+          },
+          {
+            "outcome": "unavailable",
+            "reason": "view_context"
+          }
+        ],
         "type": "object"
       }
     }

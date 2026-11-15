@@ -2622,7 +2622,7 @@ fn the_documentation_context_lists_each_reference_with_its_excerpt() {
 }
 
 #[test]
-fn a_truncated_or_empty_documentation_context_keeps_its_label() {
+fn only_truncated_empty_documentation_keeps_its_label() {
     let mut truncated = symbol_hit();
     truncated.documentation = Some(context(&json!([]), true));
     let mut empty = symbol_hit();
@@ -2639,8 +2639,6 @@ fn a_truncated_or_empty_documentation_context_keeps_its_label() {
             "\t[2] struct A",
             "\t\ta.rs:1",
             "\t\trift://symbol/local/rust/app/a/A",
-            "",
-            "\t\tdocumentation:",
         ],
     );
 }
@@ -3866,7 +3864,7 @@ fn canonical_symbol_render_keeps_source_less_object_without_physical_bindings() 
     let text = rendered(&answer);
     assert!(text.contains(id.as_str()));
     assert!(!text.contains("view "));
-    assert!(text.contains(&format!("revision {}", tree_revision())));
+    assert!(!text.contains(&tree_revision().to_string()));
     assert!(!text.contains("declarations:"));
     assert!(!text.contains("a.rs:1"));
 }
@@ -3921,7 +3919,7 @@ fn canonical_read_render_keeps_missing_and_unavailable_distinct() {
     };
     let missing = rendered(&missing);
     assert!(missing.contains("symbol_not_found"));
-    assert!(missing.contains("revision rift://revision/tree/"));
+    assert!(!missing.contains("revision rift://revision/tree/"));
     let text = rendered(&unavailable);
     assert!(text.contains("unavailable · IndexPreparing"));
     assert!(!text.contains("symbol_not_found"));

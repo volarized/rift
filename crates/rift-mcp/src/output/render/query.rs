@@ -96,9 +96,10 @@ fn blank_prefix(answer: &QueryAnswer) -> usize {
         .unwrap_or(0)
 }
 
-/// Query result and its text presentation. Only the result is structured content.
+// Keep the QueryReadResult schema and examples on the wire. Display data is used by text.
 #[derive(JsonSchema, Serialize)]
 #[serde(transparent)]
+#[schemars(with = "QueryReadResult")]
 pub(crate) struct QueryOutput {
     pub(crate) result: QueryReadResult,
     #[serde(skip)]
