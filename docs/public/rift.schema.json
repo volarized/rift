@@ -1747,6 +1747,16 @@
             "min": "100ms"
           }
         },
+        "default_scope": {
+          "default": "local",
+          "description": "Scope a `SERVICE :search` reads when it selects no `:scope`: `local`, `global`, or\n`all`. The server refuses a scope that selects one project or profile.",
+          "enum": [
+            "local",
+            "global",
+            "all"
+          ],
+          "type": "string"
+        },
         "journal_size_limit": {
           "$ref": "#/$defs/ByteSize",
           "default": "64mb",
@@ -2478,6 +2488,7 @@
       "$ref": "#/$defs/SearchConfiguration",
       "default": {
         "busy_timeout": "5s",
+        "default_scope": "local",
         "journal_size_limit": "64mb",
         "lexical": {
           "max_content": "16mb",

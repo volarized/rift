@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use crate::dependencies::DependenciesConfiguration;
 use crate::documentation::DocumentationConfiguration;
 use crate::lock::{SERVER_PORT_FLOOR, SERVER_PORT_MAX, SERVER_PORT_MIN};
-use crate::read::{Language, PathPattern};
+use crate::read::{Language, PathPattern, SearchScope};
 use crate::retry::{
     RESTART_ATTEMPTS_MAX, RESTART_ATTEMPTS_MIN, RESTART_WINDOW_MS_MAX, RESTART_WINDOW_MS_MIN,
     RETRY_ATTEMPTS_MAX, RETRY_ATTEMPTS_MIN, RETRY_DELAY_LIMIT_MS_MAX, RETRY_DELAY_LIMIT_MS_MIN,
@@ -1552,6 +1552,10 @@ impl ExecutionConfiguration {
 pub struct SearchConfiguration {
     /// Transport bounds for retained graph query answers.
     pub query: crate::query::QueryConfiguration,
+    /// Scope a `SERVICE :search` reads when it selects no `:scope`: `local`, `global`, or
+    /// `all`. The server refuses a scope that selects one project or profile.
+    #[schemars(schema_with = "crate::schema::default_scope_schema")]
+    pub default_scope: SearchScope,
     /// Most results one local search or symbol lookup collects, 1 to 10000.
     /// An answer that reaches this bound warns `results_truncated`.
     #[schemars(range(min = 1, max = 10_000))]
@@ -1616,6 +1620,7 @@ impl Default for SearchConfiguration {
     fn default() -> Self {
         Self {
             query: crate::query::QueryConfiguration::default(),
+            default_scope: SearchScope::Local,
             results: SEARCH_RESULTS_DEFAULT,
             symbol_alternatives_work: SEARCH_SYMBOL_ALTERNATIVES_WORK_DEFAULT,
             symbol_alternatives_lowercase_work: SEARCH_SYMBOL_ALTERNATIVES_LOWERCASE_WORK_DEFAULT,
@@ -1636,8 +1641,8 @@ impl Default for SearchConfiguration {
 
 impl SearchConfiguration {
     /// The `[search.lexical]`, `[search.ranking]`, `[search.vector]`, and
-    /// `[search.text]` tables' own rules, then this table's numeric bounds,
-    /// in key order.
+    /// `[search.text]` tables' own rules, then `default_scope`, then this table's
+    /// numeric bounds, in key order.
     fn violation(&self) -> Option<ConfigurationViolation> {
         self.lexical
             .violation()
@@ -1645,6 +1650,7 @@ impl SearchConfiguration {
             .or_else(|| self.vector.violation())
             .or_else(|| self.query.violation())
             .or_else(|| self.text.violation())
+            .or_else(|| self.default_scope_violation())
             .or_else(|| {
                 first_out_of_range([
                     (
@@ -1710,8 +1716,20 @@ impl SearchConfiguration {
                 ])
             })
     }
+
+    /// Refuses a `default_scope` outside [`SEARCH_DEFAULT_SCOPES`].
+    fn default_scope_violation(&self) -> Option<ConfigurationViolation> {
+        let accepted = SEARCH_DEFAULT_SCOPES.contains(&self.default_scope);
+        (!accepted).then(|| ConfigurationViolation::SearchDefaultScopeInvalid {
+            scope: self.default_scope.clone(),
+        })
+    }
 }
 
+/// Scopes `search.default_scope` accepts: the ones that select no single project or
+/// profile.
+pub const SEARCH_DEFAULT_SCOPES: [SearchScope; 3] =
+    [SearchScope::Local, SearchScope::Global, SearchScope::All];
 /// `search.pool_slots` connections accepted, at least.
 pub const SEARCH_POOL_SLOTS_MIN: u64 = 1;
 /// `search.pool_slots` connections accepted, at most.
@@ -3128,6 +3146,19 @@ impl Default for LanguageConfiguration {
     }
 }
 
+/// The rejected `search.default_scope` as the file spells it. A scope that has no wire
+/// spelling, which no accepted file can carry, is reported in its debug form.
+fn default_scope_evidence(scope: &SearchScope) -> Vec<(&'static str, String)> {
+    let spelled = match serde_json::to_value(scope) {
+        Ok(serde_json::Value::String(spelled)) => spelled,
+        _ => format!("{scope:?}"),
+    };
+    vec![
+        ("field", "search.default_scope".to_owned()),
+        ("scope", spelled),
+    ]
+}
+
 fn limit_evidence(
     field: &'static str,
     value: u64,
@@ -3225,6 +3256,12 @@ pub enum ConfigurationViolation {
         lexical: f64,
         /// The configured vector weight.
         vector: f64,
+    },
+    /// `search.default_scope` selects one project or profile: it must be `local`,
+    /// `global`, or `all`.
+    SearchDefaultScopeInvalid {
+        /// The rejected scope.
+        scope: SearchScope,
     },
 
     /// A command carries no executable.
@@ -3428,6 +3465,7 @@ impl ConfigurationViolation {
                 ("lexical_weight", lexical.to_string()),
                 ("vector_weight", vector.to_string()),
             ],
+            Self::SearchDefaultScopeInvalid { scope } => default_scope_evidence(scope),
 
             Self::CommandProgramEmpty { field } => vec![("field", (*field).to_owned())],
             Self::CommandProgramWhitespace { field, program }
@@ -6138,6 +6176,120 @@ mod tests {
     }
 
     #[test]
+    fn test_search_default_scope_defaults_to_local_and_reads_each_accepted_scope() {
+        assert_eq!(
+            SearchConfiguration::default().default_scope,
+            SearchScope::Local
+        );
+        let unset: WorkspaceConfiguration =
+            serde_json::from_value(json!({ "search": {} })).expect("an empty table deserializes");
+        assert_eq!(unset.search.default_scope, SearchScope::Local);
+        let spelled = [
+            ("local", SearchScope::Local),
+            ("global", SearchScope::Global),
+            ("all", SearchScope::All),
+        ];
+        assert_eq!(
+            spelled.clone().map(|(_, scope)| scope),
+            SEARCH_DEFAULT_SCOPES
+        );
+        for (spelling, scope) in spelled {
+            let written = json!({ "search": { "default_scope": spelling } });
+            let configuration: WorkspaceConfiguration =
+                serde_json::from_value(written.clone()).expect("the scope deserializes");
+            assert_eq!(configuration.search.default_scope, scope, "{spelling}");
+            assert_eq!(configuration.validate(), Ok(()), "{spelling}");
+            let rendered = serde_json::to_value(&configuration).expect("the table serializes");
+            assert_eq!(rendered["search"]["default_scope"], json!(spelling));
+        }
+    }
+
+    #[test]
+    fn test_search_default_scope_refuses_a_project_or_profile_scope() {
+        for spelling in ["local@docs", "local:docs", "local@docs:site"] {
+            let configuration: WorkspaceConfiguration =
+                serde_json::from_value(json!({ "search": { "default_scope": spelling } }))
+                    .expect("a project or profile scope deserializes");
+            let violation = configuration
+                .validate()
+                .expect_err("a default scope selecting one project or profile is refused");
+            assert_eq!(
+                violation,
+                ConfigurationViolation::SearchDefaultScopeInvalid {
+                    scope: configuration.search.default_scope.clone(),
+                },
+                "{spelling}"
+            );
+            assert_eq!(
+                violation.evidence(),
+                [
+                    ("field", "search.default_scope".to_owned()),
+                    ("scope", spelling.to_owned()),
+                ]
+            );
+            let error = configuration_violation_error(&violation);
+            let message = error.message();
+            for accepted in SEARCH_DEFAULT_SCOPES {
+                let accepted = serde_json::to_value(accepted).expect("the scope serializes");
+                let accepted = accepted.as_str().expect("a scope is a string");
+                assert!(
+                    message.contains(&format!("`{accepted}`")),
+                    "the message must name {accepted}: {message}"
+                );
+            }
+            assert!(
+                message.contains("such as `default_scope = \"global\"`"),
+                "the message must carry an example: {message}"
+            );
+        }
+        let misspelled = serde_json::from_value::<WorkspaceConfiguration>(
+            json!({ "search": { "default_scope": "everything" } }),
+        );
+        assert!(
+            misspelled.is_err(),
+            "a word that is no scope is refused: {misspelled:?}"
+        );
+    }
+
+    #[test]
+    fn test_search_default_scope_schema_advertises_exactly_the_accepted_scopes() {
+        let schema =
+            serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
+        let property = &schema["$defs"]["SearchConfiguration"]["properties"]["default_scope"];
+        assert_eq!(
+            property["enum"],
+            serde_json::to_value(SEARCH_DEFAULT_SCOPES).expect("the scopes serialize")
+        );
+        assert_eq!(
+            property["default"],
+            serde_json::to_value(SearchConfiguration::default().default_scope)
+                .expect("the default serializes")
+        );
+        let validator = jsonschema::validator_for(property).expect("the key's schema compiles");
+        let candidates = [
+            "local",
+            "global",
+            "all",
+            "local@docs",
+            "local:docs",
+            "local@docs:site",
+            "everything",
+            "",
+        ];
+        for candidate in candidates {
+            let accepted = serde_json::from_value::<WorkspaceConfiguration>(
+                json!({ "search": { "default_scope": candidate } }),
+            )
+            .is_ok_and(|configuration| configuration.validate().is_ok());
+            assert_eq!(
+                validator.is_valid(&json!(candidate)),
+                accepted,
+                "schema and acceptance must agree on {candidate:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_search_journal_size_limit_defaults_bounds_and_advertises_its_range() {
         assert_eq!(
             SearchConfiguration::default().journal_size_limit,
@@ -7172,6 +7324,9 @@ mod tests {
             ConfigurationViolation::EmbeddingModelInvalid {
                 field: "x",
                 value: text(),
+            },
+            ConfigurationViolation::SearchDefaultScopeInvalid {
+                scope: SearchScope::ProfileLocal { name: text() },
             },
             ConfigurationViolation::EmbeddingEndpointInvalid {
                 field: "x",

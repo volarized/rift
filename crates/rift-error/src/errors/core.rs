@@ -390,6 +390,17 @@ __rift_error_definition!(
 );
 
 __rift_error_definition!(
+    configuration_search_default_scope_invalid,
+    slug = "rift.core.configuration_search_default_scope_invalid",
+    message = "search default scope selects one project or profile: expected `local`, `global`, or `all`, such as `default_scope = \"global\"`",
+    action = "correct the reported configuration field, then retry",
+    fields = {
+        field: optional(string),
+        scope: optional(string),
+    },
+);
+
+__rift_error_definition!(
     configuration_search_weights_invalid,
     slug = "rift.core.configuration_search_weights_invalid",
     message = "search ranking weights are not a usable set",

@@ -38,6 +38,7 @@ mod nodes;
 mod query;
 mod search;
 mod symbol;
+mod unavailable;
 mod walk;
 mod workspace;
 
@@ -48,7 +49,7 @@ use rift_protocol::search::SearchResult;
 use rift_protocol::workspace::WorkspaceResourcePage;
 
 use super::text::{OUTPUT_TEXT_BYTES_MAX, TextError, TextWriter};
-use super::warnings::{record_documentation, record_warnings};
+use super::warnings::{log_warnings, record_documentation, record_warnings};
 use layout::Page;
 
 pub(crate) use error::RegisteredFailure;
@@ -83,6 +84,18 @@ impl Render for rift_protocol::feedback::FeedbackResult {
     fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
         out.raw_line(0, "Feedback submitted.")
     }
+}
+
+/// Logs the warnings of an unavailable answer and keeps the ones its opening line reports.
+///
+/// A preparing index keeps its progress counts for the caller. Every other warning stays an
+/// operator diagnostic and leaves the answer.
+fn record_unavailable_warnings(
+    reason: rift_protocol::symbol_read::SymbolUnavailableReason,
+    warnings: &mut Vec<rift_protocol::read::ReadWarning>,
+) {
+    log_warnings(warnings);
+    warnings.retain(|warning| unavailable::reports(reason, warning));
 }
 
 /// Renders `answer` as text under the output byte limit.
@@ -140,13 +153,19 @@ impl Render for rift_protocol::search_read::SearchReadResult {
 
 impl Render for rift_protocol::search_read::SearchUnavailable {
     fn log_warnings(&mut self) {
-        let Self::Unavailable { warnings, .. } = self;
-        record_warnings(warnings);
+        let Self::Unavailable {
+            reason, warnings, ..
+        } = self;
+        record_unavailable_warnings(*reason, warnings);
     }
 
     fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
-        let Self::Unavailable { reason, view, .. } = self;
-        out.raw_line(0, &format!("unavailable · {reason:?}"))?;
+        let Self::Unavailable {
+            reason,
+            view,
+            warnings,
+        } = self;
+        out.raw_line(0, &unavailable::line(*reason, warnings))?;
         if let Some(view) = view {
             out.raw_line(
                 0,
@@ -243,9 +262,10 @@ impl Render for rift_protocol::symbol_read::GetSymbolResult {
                 record_warnings(warnings);
                 record_documentation(documentation);
             }
-            Self::Missing { warnings, .. } | Self::Unavailable { warnings, .. } => {
-                record_warnings(warnings);
-            }
+            Self::Missing { warnings, .. } => record_warnings(warnings),
+            Self::Unavailable {
+                reason, warnings, ..
+            } => record_unavailable_warnings(*reason, warnings),
         }
     }
 
