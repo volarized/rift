@@ -1,6 +1,7 @@
 //! Routes graph queries and combines the existing project retrieval producers.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -130,10 +131,11 @@ impl RiftProxy {
             };
         let limits = GraphLimits::default();
         let deadline = tokio::time::Instant::now() + self.forward_budget;
+        let root = Arc::clone(&self.root);
         let parsed = tokio::time::timeout_at(
             deadline,
             self.query_routes
-                .work(move || GraphQuery::parse(&parameters.query, &limits)),
+                .work(move || parsed_query(&root, &parameters.query, &limits)),
         )
         .await
         .map_err(|_| query_failure("query parsing exceeded its request deadline"))?;
@@ -429,6 +431,25 @@ impl RiftProxy {
     }
 }
 
+/// Parses one statement and selects the workspace's `[search] default_scope` for every
+/// service naming no `:scope`, so backend routing meets the scope the primary server
+/// evaluates the same statement under.
+///
+/// Each call accepts `rift.toml` again, as the server does after an edit: two reads of a
+/// file of at most `CONFIGURATION_FILE_BYTES_MAX` bytes and one parse. A file acceptance
+/// refuses selects `local`, and the primary server then answers with that refusal.
+fn parsed_query(
+    root: &Path,
+    statement: &str,
+    limits: &GraphLimits,
+) -> Result<GraphQuery, RiftError> {
+    let query = GraphQuery::parse(statement, limits)?;
+    let default_scope = ConfigurationState::accept(root)
+        .search_configuration()
+        .default_scope;
+    Ok(query.with_default_scope(&default_scope))
+}
+
 fn producer_request(
     name: &'static str,
     request: &SearchParams,
@@ -552,3 +573,6 @@ impl Drop for CancelQuery {
         self.0.cancel();
     }
 }
+
+#[cfg(test)]
+mod tests;

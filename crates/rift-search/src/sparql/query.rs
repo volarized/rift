@@ -1,6 +1,7 @@
 //! Parsing and admission of one SPARQL query.
 
 use rift_error::{RiftError, errors};
+use rift_protocol::read::SearchScope;
 use spargebra::{Query, SparqlParser};
 
 use super::admission::{Admission, admit};
@@ -75,6 +76,19 @@ impl GraphQuery {
     #[must_use]
     pub fn retrieval_requests(&self) -> &[RetrievalSelection] {
         &self.admission.retrieval
+    }
+
+    /// Selects `scope` for every `SERVICE :search` that selects no `:scope` itself.
+    ///
+    /// A service that selects its own `:scope` keeps it, and `SERVICE :flows` reads `local`.
+    /// A later call replaces the scope an earlier one selected.
+    #[must_use]
+    pub fn with_default_scope(mut self, scope: &SearchScope) -> Self {
+        // Admission bounds the selections walked here by the pattern bound.
+        for selection in &mut self.admission.retrieval {
+            selection.select_default_scope(scope);
+        }
+        self
     }
 
     /// Whether an incomplete flow producer can contribute positive solution rows.

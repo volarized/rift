@@ -556,6 +556,43 @@ mod tests {
         );
     }
 
+    /// `[search] default_scope` is a closed set of words, so its variable holds the word
+    /// itself, and a word outside the set refuses naming the set.
+    #[test]
+    fn test_search_default_scope_reads_the_document_and_a_bare_word_variable() {
+        use rift_protocol::read::SearchScope;
+
+        let document = "[search]\ndefault_scope = \"global\"\n";
+        let (configuration, _) = accept(Some(document), &[]).expect("the scope is accepted");
+        assert_eq!(configuration.search.default_scope, SearchScope::Global);
+
+        let (configuration, variables) =
+            accept(Some(document), &[("RIFT_SEARCH_DEFAULT_SCOPE", "all")])
+                .expect("the variable holds the scope's own word");
+        assert_eq!(configuration.search.default_scope, SearchScope::All);
+        assert_eq!(variables, ["RIFT_SEARCH_DEFAULT_SCOPE"]);
+
+        let error = accept(Some("[search]\ndefault_scope = \"everything\"\n"), &[])
+            .expect_err("a word that is no scope is refused");
+        assert_eq!(
+            error.slug().as_str(),
+            "rift.core.configuration_malformed",
+            "{error:?}"
+        );
+        assert_eq!(
+            context_value(&error, "key").as_deref(),
+            Some("search.default_scope")
+        );
+        assert_eq!(
+            context_value(&error, "accepted").as_deref(),
+            Some("all, global, local")
+        );
+        assert_eq!(
+            context_value(&error, "example").as_deref(),
+            Some("\"local\"")
+        );
+    }
+
     #[test]
     fn test_a_value_outside_the_key_shape_refuses_naming_the_variable() {
         for (variable, value) in [

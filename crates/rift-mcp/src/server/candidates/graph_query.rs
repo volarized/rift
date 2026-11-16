@@ -80,7 +80,19 @@ impl RiftMcp {
         if let Some(selection) = query.page_selection() {
             return self.replay_graph_query(selection).await.map(Json);
         }
-        let graph = match Box::pin(self.prepare_graph(&query, limits, deadline)).await? {
+        let resolved = self
+            .published_workspace(super::super::wire::ErrorPhase::Read, deadline)
+            .await?;
+        let default_scope = resolved
+            .published
+            .configuration
+            .accepted_for_tool(super::super::wire::ErrorPhase::Read)?
+            .search
+            .default_scope;
+        // Every read of the query's retrieval requests comes after this line, so each
+        // one meets the scope the accepted workspace selects.
+        let query = query.with_default_scope(&default_scope);
+        let graph = match Box::pin(self.prepare_graph(resolved, &query, limits, deadline)).await? {
             Ok(graph) => graph,
             Err(unavailable) => return Ok(Json(QueryReadResult::Unavailable(unavailable).into())),
         };
@@ -124,19 +136,15 @@ impl RiftMcp {
             .map_err(read_failure)
     }
 
+    /// Acquires what `query` reads from `resolved`, the publication whose accepted
+    /// configuration already selected the query's default scope.
     async fn prepare_graph(
         &self,
+        resolved: super::super::ResolvedWorkspace,
         query: &GraphQuery,
         limits: GraphLimits,
         deadline: RequestDeadline,
     ) -> Result<Result<AcquiredGraph, SearchUnavailable>, ToolFailure> {
-        let resolved = self
-            .published_workspace(super::super::wire::ErrorPhase::Read, deadline)
-            .await?;
-        resolved
-            .published
-            .configuration
-            .accepted_for_tool(super::super::wire::ErrorPhase::Read)?;
         if resolved.published.preparation.is_some() {
             return Ok(Err(unavailable(SymbolUnavailableReason::IndexPreparing)));
         }
@@ -1859,6 +1867,68 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(positions, ["12", "19"]);
+        Ok(())
+    }
+
+    /// The regex occurrences of `signal` one statement answers, or the unavailability it
+    /// answered with.
+    async fn signal_occurrences(
+        server: &RiftMcp,
+        scope_input: &str,
+    ) -> Result<Result<usize, SearchUnavailable>, Box<dyn std::error::Error + Send + Sync>> {
+        let params = QueryParams {
+            query: format!(
+                "SELECT ?start {{ SERVICE :search {{ ?hit :pattern 'signal'; {scope_input} :target 'file'; :start ?start }} }}"
+            ),
+            language: QueryLanguage::Sparql,
+        };
+        let result = server
+            .graph_query(params)
+            .await
+            .map_err(|failure| format!("{failure:?}"))?
+            .0
+            .result;
+        match result {
+            QueryReadResult::Unavailable(unavailable) => Ok(Err(unavailable)),
+            QueryReadResult::Results(result) => match result.answer {
+                QueryAnswer::Bindings { bindings, .. } => Ok(Ok(bindings.len())),
+                other => Err(format!("expected bindings, received {other:?}").into()),
+            },
+        }
+    }
+
+    /// `[search] default_scope = "global"` sends a service naming no `:scope` to package
+    /// facts, which this workspace disables, while a service naming `local` still reads
+    /// the project.
+    #[tokio::test]
+    async fn graph_query_reads_the_configured_default_scope_for_a_service_naming_none() -> TestResult
+    {
+        let directory = tempfile::tempdir()?;
+        crate::server::hermetic_workspace(
+            directory.path(),
+            "[global]\nenabled = false\n\n[search]\ndefault_scope = \"global\"\n",
+        )?;
+        std::fs::write(
+            directory.path().join("lib.rs"),
+            "fn a() { /* signal signal */ }\n",
+        )?;
+        let root = directory.path().canonicalize()?;
+        let server =
+            RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
+
+        let unnamed = signal_occurrences(&server, "").await?;
+        let global = signal_occurrences(&server, ":scope 'global';").await?;
+        let local = signal_occurrences(&server, ":scope 'local';").await?;
+
+        assert_eq!(local, Ok(2), "a named local scope reads the project");
+        assert_eq!(unnamed, global, "an unnamed scope reads the default");
+        let Err(SearchUnavailable::Unavailable { warnings, .. }) = unnamed else {
+            return Err(format!("expected disabled package facts, received {unnamed:?}").into());
+        };
+        assert!(
+            warnings.contains(&ReadWarning::GlobalAccessDisabled),
+            "{warnings:?}"
+        );
         Ok(())
     }
 

@@ -319,6 +319,11 @@ message = 'search ranking weights are not a usable set'
 action = "correct the reported configuration field, then retry"
 fields = { identifier_weight = { type = "string", optional = true }, lexical_weight = { type = "string", optional = true }, vector_weight = { type = "string", optional = true } }
 
+[error.core.configuration_search_default_scope_invalid]
+message = 'search default scope selects one project or profile: expected `local`, `global`, or `all`, such as `default_scope = "global"`'
+action = "correct the reported configuration field, then retry"
+fields = { field = { type = "string", optional = true }, scope = { type = "string", optional = true } }
+
 [error.core.configuration_command_program_empty]
 message = 'configured command has no executable'
 action = "correct the reported configuration field, then retry"
