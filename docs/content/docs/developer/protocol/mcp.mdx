@@ -577,6 +577,10 @@ An exact symbol read cannot establish complete declaration coverage while select
 remain unprepared. The server logs local preparation for reads that select local source.
 Preparation counts describe the answer's publication and can decrease when source selection changes.
 
+An `unavailable` answer whose `reason` is `index_preparing` carries the `local_index_preparing`
+and `pattern_index_preparing` warnings of its read. The text of that answer opens with their
+counts, such as `unavailable · indexing is in progress (2048 of 3951 files)`.
+
 The server also logs `stale_index` when the last rebuild failed, with a `detail`
 naming the failure; the next filesystem event retries the rebuild. When its two digests are equal,
 the tree moved in recorded files outside the syntax-indexed ones or in the configuration file, and
