@@ -135,7 +135,7 @@ rig-core = { version = "=0.45.0", default-features = false }
 rig-reqwest = { version = "=0.45.0", default-features = false }
 # The index and history store link the same bundled SQLite.
 rusqlite = { version = "=0.41.1", features = ["bundled"] }
-rmcp = { version = "=3.9.0", default-features = false, features = ["macros", "server", "transport-io"] }
+rmcp = { version = "=3.10.0", default-features = false, features = ["macros", "server", "transport-io"] }
 same-file = "1.0.6"
 schemars = { version = "=1.2.3", default-features = false, features = ["derive", "std"] }
 semver = "1.0.28"
@@ -194,8 +194,8 @@ tempfile = "3.27.0"
 unicode-normalization = "0.1.24"
 unicode-ident = "1.0.24"
 unicode-width = "0.2.2"
-zip = { version = "=9.4.2", default-features = false, features = ["deflate-flate2-zlib-rs", "zstd"] }
-zstd = { version = "=0.14.3", default-features = false }
+zip = { version = "=9.5.1", default-features = false, features = ["deflate-flate2-zlib-rs", "zstd"] }
+zstd = { version = "=0.14.4", default-features = false }
 
 # Embedded ty pins the Ruff revision that moved its archive reader to zip 9.
 # Use deflate for the bundled typeshed archive.
