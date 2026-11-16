@@ -1,13 +1,8 @@
 "use client";
 
-import { ArrowSquareOutIcon } from "@phosphor-icons/react";
 import { type ComponentType, useCallback, useEffect, useState } from "react";
 
-import {
-  globalOpenApiUrl,
-  RIFT_API_VERSION,
-  RIFT_API_VERSION_HEADER,
-} from "@/components/global/constants";
+import { globalOpenApiUrl } from "@/components/global/constants";
 import { Button } from "@/components/ui/button";
 
 const LABEL = "font-mono text-[0.6875rem] uppercase tracking-[0.16em] text-muted-foreground";
@@ -82,25 +77,7 @@ export function ApiReference({ enabled = true }: { enabled?: boolean }) {
   }, [enabled, load]);
 
   return (
-    <div className="grid gap-6">
-      <div className="flex flex-wrap items-center justify-between gap-x-8 gap-y-3">
-        <p className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-          <span className={LABEL}>Sent with every request</span>
-          <code className="font-mono text-[13px]">
-            {RIFT_API_VERSION_HEADER}: {RIFT_API_VERSION}
-          </code>
-        </p>
-        <a
-          href={globalOpenApiUrl()}
-          target="_blank"
-          rel="noreferrer noopener"
-          className={`${LABEL} inline-flex min-h-6 items-center gap-1.5 underline underline-offset-4 transition-colors hover:text-foreground focus-visible:text-foreground`}
-        >
-          OpenAPI document
-          <ArrowSquareOutIcon aria-hidden="true" size={12} />
-        </a>
-      </div>
-
+    <div className="grid">
       {/* The reserved height keeps the footer still while the bundle and the
           document arrive. */}
       <div className="min-h-[40rem]">

@@ -1,10 +1,12 @@
 "use client";
 
-import { BracketsCurlyIcon, PlugsConnectedIcon } from "@phosphor-icons/react";
+import { BracketsCurlyIcon, InfoIcon, PlugsConnectedIcon } from "@phosphor-icons/react";
 import { type ReactNode, useEffect, useState } from "react";
 
 import { ApiReference } from "@/components/global/api-reference";
 import { McpInspector } from "@/components/global/mcp-inspector";
+import { Button } from "@/components/ui/button";
+import { Popover, PopoverContent, PopoverTitle, PopoverTrigger } from "@/components/ui/popover";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
 
@@ -28,13 +30,24 @@ const TRIGGER_CLASS =
   "not-first:border-l-border focus-visible:ring-1 focus-visible:outline-0 " +
   "group-data-horizontal/tabs:after:-inset-x-px group-data-horizontal/tabs:after:-bottom-0.5 group-data-horizontal/tabs:after:h-px";
 
+const LABEL = "font-mono text-[0.6875rem] uppercase tracking-[0.16em] text-muted-foreground";
+
 /**
- * The page header and the two halves of the console. The selector sits on the
- * title's line; `children` is the rest of the header, shown above either half.
+ * The page header and the two halves of the console. The title's line ends in
+ * the selector and, beside it, a button that opens `info`: the endpoints and
+ * the access rule. `children` is the introduction, shown above either half.
  * The URL hash carries the active tab, so `#api` and `#mcp` are links, and a
  * reload opens the same tab.
  */
-export function GlobalConsole({ title, children }: { title: string; children: ReactNode }) {
+export function GlobalConsole({
+  title,
+  info,
+  children,
+}: {
+  title: string;
+  info: ReactNode;
+  children: ReactNode;
+}) {
   // `null` until the hash is read: the static HTML cannot know it, so the first
   // render shows the API tab with nothing heavy mounted in it.
   const [hashTab, setHashTab] = useState<ConsoleTab | null>(null);
@@ -73,23 +86,51 @@ export function GlobalConsole({ title, children }: { title: string; children: Re
       }}
       className="gap-0"
     >
-      <header className="mb-12 grid max-w-190 gap-5">
-        <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
+      <header className="mb-10 grid gap-5">
+        <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
           <h1 className="font-mono text-3xl">{title}</h1>
-          <TabsList
-            variant="line"
-            aria-label="Console"
-            className="gap-0 border border-border p-0 group-data-horizontal/tabs:h-auto"
-          >
-            {TABS.map(({ id, label, Icon }) => (
-              <TabsTrigger key={id} value={id} className={TRIGGER_CLASS}>
-                <Icon aria-hidden="true" weight="light" className="size-3.5" />
-                {label}
-              </TabsTrigger>
-            ))}
-          </TabsList>
+          <div className="flex items-center gap-2">
+            <Popover>
+              <PopoverTrigger
+                render={
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    aria-label="Endpoints and access"
+                    className="size-9.5 bg-transparent text-muted-foreground hover:text-foreground aria-expanded:text-foreground dark:bg-transparent"
+                  />
+                }
+              >
+                <InfoIcon aria-hidden="true" weight="light" />
+              </PopoverTrigger>
+              {/* An outlined region on the void, like every other box of the
+                  site: no fill, no shadow. */}
+              <PopoverContent
+                align="end"
+                sideOffset={8}
+                className="w-[min(32rem,calc(100vw-2rem))] gap-4 border border-border bg-background p-4 text-sm shadow-none ring-0"
+              >
+                <PopoverTitle className={cn(LABEL, "font-normal")}>
+                  Endpoints and access
+                </PopoverTitle>
+                {info}
+              </PopoverContent>
+            </Popover>
+            <TabsList
+              variant="line"
+              aria-label="Console"
+              className="gap-0 border border-border p-0 group-data-horizontal/tabs:h-auto"
+            >
+              {TABS.map(({ id, label, Icon }) => (
+                <TabsTrigger key={id} value={id} className={TRIGGER_CLASS}>
+                  <Icon aria-hidden="true" weight="light" className="size-3.5" />
+                  {label}
+                </TabsTrigger>
+              ))}
+            </TabsList>
+          </div>
         </div>
-        {children}
+        <div className="max-w-190">{children}</div>
       </header>
       {/* Base UI hides a kept panel only after its animations end, and the
           loading label pulses without end, so the class hides it directly. */}
