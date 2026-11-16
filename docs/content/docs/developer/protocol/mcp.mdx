@@ -308,6 +308,10 @@ select an extra project or profile. `:scope "global"` selects dependency facts a
 combines accepted contexts. `:packages` carries requested package selections as `rdf:JSON`.
 The producer handles dependency resolution, exact package versions, and explicit package constraints.
 
+A `SERVICE :search` that selects no `:scope` reads the scope
+[`[search] default_scope`](/docs/developer/configuration#search) names: `local` unless the
+workspace configures `global` or `all`. `SERVICE :flows` reads `local`.
+
 Remote acquisition uses bounded batches and holds the selected publication for the query.
 
 ### Captured answers and pages
@@ -842,11 +846,12 @@ This search reads Tokio 1.47.1 beside the project, in place of the version the w
 }
 ```
 
-The server refuses `packages` as `invalid_request` naming the field beside the `local` scope, the
-default, since a project read consults no package, and beside a git `revision`, since package facts are
+The server refuses `packages` as `invalid_request` naming the field beside the `local` scope,
+since a project read consults no package, and beside a git `revision`, since package facts are
 served for the current tree alone. A list past 64 entries, and an entry whose `manager`, `name`,
 or `version` is empty or longer than its schema allows, refuse the same way before anything
-reaches the global API.
+reaches the global API. A service that selects no `:scope` reads `local` unless
+[`[search] default_scope`](/docs/developer/configuration#search) names another.
 
 ## Resources
 
