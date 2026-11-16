@@ -16,6 +16,9 @@ allow = [
   "Apache-2.0",
   # Ruff's parser uses stacker; its psm build uses LLVM archive writer code.
   "Apache-2.0 WITH LLVM-exception",
+  # zstd-sys 2.1.3 declares `BSD-3-Clause AND BSD-2-Clause` for the bundled
+  # zstd sources.
+  "BSD-2-Clause",
   "BSD-3-Clause",
   "CC0-1.0",
   "ISC",
