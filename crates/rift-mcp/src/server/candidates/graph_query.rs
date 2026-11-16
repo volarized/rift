@@ -145,8 +145,8 @@ impl RiftMcp {
         limits: GraphLimits,
         deadline: RequestDeadline,
     ) -> Result<Result<AcquiredGraph, SearchUnavailable>, ToolFailure> {
-        if resolved.published.preparation.is_some() {
-            return Ok(Err(unavailable(SymbolUnavailableReason::IndexPreparing)));
+        if let Some(preparation) = &resolved.published.preparation {
+            return Ok(Err(preparation.unavailable()));
         }
         let mut selected = query.adjacency_selection();
         let local_semantics = if selected.is_none() || query.names_local_graph() {

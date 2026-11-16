@@ -1758,7 +1758,7 @@ pub(crate) async fn await_workspace_ready(client: &RunningService<RoleClient, ()
                 .and_then(|block| block.as_text())
                 .and_then(|block| block.text.lines().next())
             {
-                Some("unavailable · IndexPreparing") => true,
+                Some(line) if line.starts_with("unavailable · indexing is in progress") => true,
                 Some("true" | "false") => false,
                 _ => {
                     return Err(format!("unexpected text graph readiness probe: {result:?}").into());

@@ -526,6 +526,16 @@ impl LocalIndexPreparation {
             detail: "selected local files are still being prepared".to_owned(),
         })
     }
+
+    /// The answer of a read that needs every selected file, carrying how far preparation
+    /// has come.
+    pub(crate) fn unavailable(&self) -> rift_protocol::search_read::SearchUnavailable {
+        rift_protocol::search_read::SearchUnavailable::Unavailable {
+            reason: rift_protocol::symbol_read::SymbolUnavailableReason::IndexPreparing,
+            view: None,
+            warnings: self.warning().into_iter().collect(),
+        }
+    }
 }
 
 fn publication_map(
@@ -13037,5 +13047,40 @@ pub(crate) mod tests {
             published_facts(stable_candidate(root, 0)?.as_ref())?
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_local_index_preparation_unavailable_carries_prepared_and_total_files() {
+        use crate::validation::LocalIndexPreparation;
+        use rift_protocol::read::ReadWarning;
+        use rift_protocol::search_read::SearchUnavailable;
+        use rift_protocol::symbol_read::SymbolUnavailableReason;
+        let preparation = LocalIndexPreparation {
+            prepared: 3,
+            total: Some(8),
+            source_paths: Arc::default(),
+            other_paths: Arc::default(),
+            map_source_paths: Arc::default(),
+            map_text_paths: Arc::default(),
+        };
+        let SearchUnavailable::Unavailable {
+            reason,
+            view,
+            warnings,
+        } = preparation.unavailable();
+        assert_eq!(reason, SymbolUnavailableReason::IndexPreparing);
+        assert!(view.is_none());
+        assert!(
+            matches!(
+                warnings.as_slice(),
+                [ReadWarning::LocalIndexPreparing {
+                    prepared: 3,
+                    total: Some(8),
+                    ready_in: None,
+                    ..
+                }]
+            ),
+            "one local preparation warning carries the counts: {warnings:?}"
+        );
     }
 }

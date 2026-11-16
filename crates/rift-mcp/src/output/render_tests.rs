@@ -3921,9 +3921,121 @@ fn canonical_read_render_keeps_missing_and_unavailable_distinct() {
     assert!(missing.contains("symbol_not_found"));
     assert!(!missing.contains("revision rift://revision/tree/"));
     let text = rendered(&unavailable);
-    assert!(text.contains("unavailable · IndexPreparing"));
+    assert!(text.contains("unavailable · indexing is in progress"));
     assert!(!text.contains("symbol_not_found"));
     assert!(!text.contains("revision "));
+}
+
+fn local_preparation(prepared: u64, total: Option<u64>) -> ReadWarning {
+    ReadWarning::LocalIndexPreparing {
+        prepared,
+        total,
+        ready_in: None,
+        detail: "selected local files are still being prepared".to_owned(),
+    }
+}
+
+fn pattern_preparation(prepared: u64, total: u64) -> ReadWarning {
+    ReadWarning::PatternIndexPreparing {
+        prepared,
+        total,
+        detail: "rows of file text are still entering the trigram index".to_owned(),
+    }
+}
+
+fn unavailable_search(
+    reason: rift_protocol::symbol_read::SymbolUnavailableReason,
+    warnings: Vec<ReadWarning>,
+) -> rift_protocol::search_read::SearchUnavailable {
+    rift_protocol::search_read::SearchUnavailable::Unavailable {
+        reason,
+        view: None,
+        warnings,
+    }
+}
+
+#[test]
+fn a_preparing_symbol_read_reports_prepared_and_total_files() {
+    use rift_protocol::symbol_read::{GetSymbolResult, SymbolUnavailableReason};
+    let progress = local_preparation(2048, Some(3951));
+    let mut unavailable = GetSymbolResult::Unavailable {
+        id: SymbolId::parse("rift://symbol/local/rust/app/a/A").expect("modeled local identity"),
+        revision: None,
+        reason: SymbolUnavailableReason::IndexPreparing,
+        warnings: vec![ReadWarning::GlobalAccessDisabled, progress.clone()],
+    };
+    unavailable.log_warnings();
+    let text = rendered(&unavailable);
+    let first = text.lines().next();
+    assert_eq!(
+        first,
+        Some("\tunavailable · indexing is in progress (2048 of 3951 files)")
+    );
+    let GetSymbolResult::Unavailable { warnings, .. } = unavailable else {
+        unreachable!("the answer stays unavailable");
+    };
+    assert_eq!(warnings, [progress]);
+}
+
+#[test]
+fn a_preparing_search_reports_prepared_files_before_discovery_ends() {
+    use rift_protocol::symbol_read::SymbolUnavailableReason;
+    let reason = SymbolUnavailableReason::IndexPreparing;
+    let mut unavailable = unavailable_search(reason, vec![local_preparation(17, None)]);
+    unavailable.log_warnings();
+    let text = rendered(&unavailable);
+    assert_eq!(
+        text,
+        "unavailable · indexing is in progress (17 files so far)\n"
+    );
+}
+
+#[test]
+fn a_preparing_query_reports_every_progress_count_it_carries() {
+    use rift_protocol::query::QueryReadResult;
+    use rift_protocol::symbol_read::SymbolUnavailableReason;
+    let reason = SymbolUnavailableReason::IndexPreparing;
+    let warnings = vec![
+        local_preparation(9, Some(12)),
+        pattern_preparation(12_000, 17_500),
+    ];
+    let answer = QueryReadResult::Unavailable(unavailable_search(reason, warnings));
+    let mut output = super::QueryOutput::from(answer);
+    output.log_warnings();
+    let text = rendered(&output);
+    let expected = "unavailable · indexing is in progress \
+                    (9 of 12 files, 12000 of 17500 rows of file text)\n";
+    assert_eq!(text, expected);
+}
+
+#[test]
+fn a_preparing_read_without_counts_still_says_indexing_is_in_progress() {
+    use rift_protocol::symbol_read::SymbolUnavailableReason;
+    let reason = SymbolUnavailableReason::IndexPreparing;
+    let mut unavailable = unavailable_search(reason, vec![ReadWarning::GlobalAccessDisabled]);
+    unavailable.log_warnings();
+    assert_eq!(
+        rendered(&unavailable),
+        "unavailable · indexing is in progress\n"
+    );
+}
+
+#[test]
+fn another_unavailable_reason_keeps_its_name_and_no_progress() {
+    use rift_protocol::search_read::SearchUnavailable;
+    use rift_protocol::symbol_read::SymbolUnavailableReason;
+    let reason = SymbolUnavailableReason::InsufficientCoverage;
+    let mut unavailable = unavailable_search(reason, vec![local_preparation(1, Some(2))]);
+    unavailable.log_warnings();
+    assert_eq!(
+        rendered(&unavailable),
+        "unavailable · InsufficientCoverage\n"
+    );
+    let SearchUnavailable::Unavailable { warnings, .. } = unavailable;
+    assert!(
+        warnings.is_empty(),
+        "no progress warning survives: {warnings:?}"
+    );
 }
 
 /// The `revision` line of an answer read at [`tree_revision`].

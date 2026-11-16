@@ -294,10 +294,10 @@ pub(super) fn canonical(
             id,
             revision,
             reason,
-            ..
+            warnings,
         } => {
             let mut lines = Lines::new(out, 0, 1);
-            lines.head(&format!("unavailable · {reason:?}"))?;
+            lines.head(&super::unavailable::line(*reason, warnings))?;
             lines.line(0, id.as_str())?;
             revision.as_ref()
         }
