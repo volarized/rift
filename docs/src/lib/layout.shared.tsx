@@ -3,6 +3,20 @@ import type { BaseLayoutProps } from "fumadocs-ui/layouts/shared";
 import { ThemeTogglerButton } from "@/components/animate-ui/components/buttons/theme-toggler";
 import { Logo } from "@/components/logo";
 
+type LinkItems = NonNullable<BaseLayoutProps["links"]>;
+
+const globalLink: LinkItems[number] = { text: "Global", url: "/global", active: "nested-url" };
+
+/**
+ * Link items of the docs layout.
+ *
+ * DocsLayout lists link items in the sidebar above the page tree, and takes the same set as
+ * the home mobile menu (`on: "menu" | "all"`), so `on` cannot drop an item from the sidebar
+ * alone. Install and Docs repeat page tree entries there; only the link that leaves the docs
+ * stays.
+ */
+export const docsLinks: LinkItems = [globalLink];
+
 /**
  * Shared layout configuration.
  *
@@ -37,13 +51,11 @@ export function baseOptions(): BaseLayoutProps {
         />
       ),
     },
-    // see https://fumadocs.dev/docs/ui/navigation/links
-    // links: [
-    //   {
-    //     text: 'Documentation',
-    //     url: '/docs',
-    //     active: 'nested-url',
-    //   },
-    // ],
+    links: [
+      // A shortcut into the docs section: Docs alone carries the active state there.
+      { text: "Install", url: "/docs/installation", active: "none" },
+      { text: "Docs", url: "/docs", active: "nested-url" },
+      globalLink,
+    ],
   };
 }
