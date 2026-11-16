@@ -15,8 +15,7 @@ export default function GlobalPage() {
   return (
     // The home layout width, not the prose column: the console needs the room.
     <main className="mx-auto w-full max-w-(--fd-layout-width) px-4 py-16 md:px-6">
-      <header className="mb-12 grid max-w-190 gap-5">
-        <h1 className="font-mono text-3xl">Global</h1>
+      <GlobalConsole title="Global">
         <p className="text-muted-foreground">
           The global index holds facts about top-used OSS dependencies. This page sends each request
           from your browser straight to the global API.
@@ -32,15 +31,14 @@ export default function GlobalPage() {
           </Command>
         </div>
         <p className="text-sm text-muted-foreground">
-          The API accepts anonymous requests, and a token is optional. It records daily request
-          counts; a <code className="font-mono text-[13px]">DNT: 1</code> header opts out - see{" "}
+          The API accepts anonymous requests. It records daily request counts; a{" "}
+          <code className="font-mono text-[13px]">DNT: 1</code> header opts out - see{" "}
           <Link className="underline underline-offset-2 hover:text-foreground" href="/docs/privacy">
             Privacy
           </Link>
           .
         </p>
-      </header>
-      <GlobalConsole />
+      </GlobalConsole>
     </main>
   );
 }

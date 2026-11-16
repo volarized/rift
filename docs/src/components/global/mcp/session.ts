@@ -25,7 +25,6 @@ import type {
  */
 
 const CLIENT_INFO = { name: "rift-docs-console", version: "1.0.0" };
-export const TOKEN_PLACEHOLDER = "<token>";
 
 export class SessionError extends Error {
   readonly failure: Failure;
@@ -92,7 +91,7 @@ function describeReceived(message: unknown, wire: Wire): Described {
 function recordedHeaders(init: RequestInit | undefined): Record<string, string> {
   const headers: Record<string, string> = {};
   new Headers(init?.headers).forEach((value, name) => {
-    headers[name] = name === "authorization" ? `Bearer ${TOKEN_PLACEHOLDER}` : value;
+    headers[name] = value;
   });
   return headers;
 }
@@ -252,14 +251,10 @@ function failureOf(error: unknown, wire: Wire): Failure {
 async function connect(
   mode: "auto" | "legacy",
   endpoint: URL,
-  token: string,
   fetchLike: FetchLike,
   signal: AbortSignal,
 ) {
-  const transport = new StreamableHTTPClientTransport(endpoint, {
-    fetch: fetchLike,
-    requestInit: token === "" ? undefined : { headers: { Authorization: `Bearer ${token}` } },
-  });
+  const transport = new StreamableHTTPClientTransport(endpoint, { fetch: fetchLike });
   const client = new Client(CLIENT_INFO, { versionNegotiation: { mode } });
   try {
     await client.connect(transport, { signal });
@@ -282,12 +277,10 @@ export async function openSession({
   endpoint,
   recorder,
   signal,
-  token,
 }: {
   endpoint: URL;
   recorder: Recorder;
   signal: AbortSignal;
-  token: string;
 }): Promise<Session> {
   const wire: Wire = { methods: new Map(), inflight: new Map() };
   const fetchLike = recordingFetch(recorder, wire);
@@ -299,7 +292,7 @@ export async function openSession({
   let connection: Awaited<ReturnType<typeof connect>>;
   try {
     try {
-      connection = await connect("auto", endpoint, token, fetchLike, signal);
+      connection = await connect("auto", endpoint, fetchLike, signal);
     } catch (error) {
       // In a browser the SDK reads a probe without a response as an earlier
       // revision and has sent `initialize` itself by now; elsewhere it stops
@@ -307,7 +300,7 @@ export async function openSession({
       const handshakeTried = [...wire.methods.values()].includes("initialize");
       if (signal.aborted || !wire.unreachable || handshakeTried) throw error;
       wire.unreachable = undefined;
-      connection = await connect("legacy", endpoint, token, fetchLike, signal);
+      connection = await connect("legacy", endpoint, fetchLike, signal);
     }
   } catch (error) {
     throw new SessionError(failureOf(error, wire));

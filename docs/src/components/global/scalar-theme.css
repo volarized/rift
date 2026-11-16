@@ -147,48 +147,18 @@ body > .scalar-app,
   border: 0;
 }
 
-/* ---- Introduction: document title, description, server and auth. ---- */
+/* ---- Introduction: not rendered. ---- */
 
+/* The page header names the endpoint and the access rule once, so the
+   document's title block and its server card stay out. */
 .rift-scalar .scalar-app .introduction-section {
-  padding: 0 0 2.5rem;
-  gap: 1.5rem;
-}
-
-.rift-scalar .scalar-app .introduction-section .badge {
-  border: 1px solid var(--border);
-  background: transparent;
-  padding: 0.125rem 0.5rem;
-  font-family: var(--font-geist-mono);
-  font-size: 0.6875rem;
-  letter-spacing: 0.08em;
-  color: var(--muted-foreground);
+  display: none;
 }
 
 .rift-scalar .scalar-app :is(h1, h2, h3, h4, h5, h6) {
   font-family: var(--font-geist-mono);
   font-weight: 400;
   letter-spacing: 0;
-}
-
-.rift-scalar .scalar-app .introduction-section h1.section-header-label {
-  margin-top: 0.75rem;
-  font-size: 1.25rem;
-  line-height: 1.4;
-}
-
-.rift-scalar .scalar-app .introduction-section .section-columns {
-  display: block;
-}
-
-.rift-scalar .scalar-app .introduction-description {
-  margin-top: 0;
-  max-width: 47.5rem;
-}
-
-.rift-scalar .scalar-app .introduction-description .markdown {
-  color: var(--muted-foreground);
-  font-size: 0.875rem;
-  line-height: 1.6;
 }
 
 /* Inline code: a hairline box, not a filled chip. */
@@ -200,35 +170,6 @@ body > .scalar-app,
   font-size: 0.8125em;
   white-space: nowrap;
   color: var(--foreground);
-}
-
-.rift-scalar .scalar-app .introduction-card {
-  gap: 0.75rem;
-}
-
-/* Server and Authentication: one outlined region each, a mono label on top.
-   The client picker is dropped here; each operation's request card has it. */
-.rift-scalar .scalar-app .introduction-card-item.scalar-reference-intro-clients {
-  display: none;
-}
-
-.rift-scalar .scalar-app .introduction-card-item :is(label, .bg-b-2) {
-  background: transparent;
-}
-
-.rift-scalar .scalar-app .introduction-card-item > label,
-.rift-scalar .scalar-app .introduction-card-item button[disabled] span {
-  font-family: var(--font-geist-mono);
-  font-size: 0.6875rem;
-  font-weight: 400;
-  letter-spacing: 0.16em;
-  text-transform: uppercase;
-  color: var(--muted-foreground);
-}
-
-.rift-scalar .scalar-app .scalar-reference-intro-server .overflow-x-auto {
-  font-family: var(--font-geist-mono);
-  font-size: 0.8125rem;
 }
 
 /* ---- Operations: one hairline list, a row per operation. ---- */

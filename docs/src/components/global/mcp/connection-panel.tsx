@@ -3,12 +3,10 @@
 import { CaretRightIcon, CircleIcon, CircleNotchIcon, WarningIcon } from "@phosphor-icons/react";
 
 import type { SessionInfo } from "@/components/global/mcp/types";
-import { CONTROL, LABEL } from "@/components/global/mcp/ui";
+import { LABEL } from "@/components/global/mcp/ui";
 import { type JsonValue, PayloadTree } from "@/components/json-tree";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
 
 export type Connection =
@@ -21,8 +19,6 @@ export type PingState =
   | { status: "idle" }
   | { status: "pending" }
   | { status: "done"; ok: boolean; text: string };
-
-export const ENDPOINT_INPUT_ID = "mcp-endpoint";
 
 const OUTLINE = "bg-transparent font-mono font-normal dark:bg-transparent";
 
@@ -119,117 +115,34 @@ function Details({ info }: { info: SessionInfo }) {
 }
 
 /**
- * Where the console connects: the endpoint, an optional bearer token, and what
- * the server said about itself once the connection opened.
+ * The connection to the global MCP endpoint: its state, what the server said
+ * about itself once the connection opened, and the controls that open, probe
+ * and close it. The page header names the endpoint.
  */
 export function ConnectionPanel({
   connection,
-  endpoint,
-  endpointError,
   onCancel,
   onConnect,
   onDisconnect,
-  onEndpointChange,
   onPing,
-  onTokenChange,
   ping,
-  token,
 }: {
   connection: Connection;
-  endpoint: string;
-  endpointError?: string;
   onCancel: () => void;
   onConnect: () => void;
   onDisconnect: () => void;
-  onEndpointChange: (value: string) => void;
   onPing: () => void;
-  onTokenChange: (value: string) => void;
   ping: PingState;
-  token: string;
 }) {
   const { status } = connection;
-  const locked = status === "connecting" || status === "connected";
   const info = status === "connected" ? connection.info : undefined;
   const pingLabel = info?.era === "modern" ? "Discover" : "Ping";
+  const open = status === "idle" || status === "failed";
 
   return (
     <section aria-label="Connection" className="border-b border-border">
-      <form
-        noValidate
-        onSubmit={(event) => {
-          event.preventDefault();
-          if (status === "connected") onDisconnect();
-          else if (status === "connecting") onCancel();
-          else onConnect();
-        }}
-        className="grid gap-3 p-3 md:grid-cols-[minmax(0,1fr)_minmax(0,16rem)_7.5rem]"
-      >
-        <div className="grid content-start gap-1.5">
-          <Label htmlFor={ENDPOINT_INPUT_ID} className={LABEL}>
-            Endpoint
-          </Label>
-          <Input
-            id={ENDPOINT_INPUT_ID}
-            name="endpoint"
-            type="url"
-            inputMode="url"
-            value={endpoint}
-            onChange={(event) => onEndpointChange(event.target.value)}
-            readOnly={locked}
-            aria-invalid={endpointError ? true : undefined}
-            aria-describedby="mcp-endpoint-error"
-            placeholder="https://example.com/mcp"
-            spellCheck={false}
-            autoComplete="off"
-            autoCapitalize="none"
-            className={cn(CONTROL, locked && "text-muted-foreground")}
-          />
-          <p
-            id="mcp-endpoint-error"
-            aria-live="polite"
-            className="text-xs text-destructive empty:hidden"
-          >
-            {endpointError}
-          </p>
-        </div>
-        <div className="grid content-start gap-1.5">
-          <Label htmlFor="mcp-token" className={LABEL}>
-            Bearer token <span className="normal-case tracking-normal">(optional)</span>
-          </Label>
-          <Input
-            id="mcp-token"
-            name="mcp-token"
-            type="password"
-            value={token}
-            onChange={(event) => onTokenChange(event.target.value)}
-            readOnly={locked}
-            aria-describedby={info ? undefined : "mcp-token-help"}
-            spellCheck={false}
-            autoComplete="off"
-            data-1p-ignore=""
-            data-lpignore="true"
-            className={cn(CONTROL, locked && "text-muted-foreground")}
-          />
-        </div>
-        <div className="grid content-start gap-1.5">
-          <span aria-hidden="true" className={cn(LABEL, "invisible max-md:hidden")}>
-            Action
-          </span>
-          <Button
-            type="submit"
-            variant={status === "idle" || status === "failed" ? "default" : "outline"}
-            className={cn(
-              "w-full font-mono max-md:h-10",
-              status !== "idle" && status !== "failed" && OUTLINE,
-            )}
-          >
-            {status === "connected" ? "Disconnect" : status === "connecting" ? "Cancel" : "Connect"}
-          </Button>
-        </div>
-      </form>
-
       <Collapsible>
-        <div className="flex min-h-14 flex-wrap items-center gap-x-4 gap-y-2 border-t border-border px-3 py-2">
+        <div className="flex min-h-14 flex-wrap items-center gap-x-4 gap-y-2 px-3 py-2">
           <div aria-live="polite" className="grid min-w-0 flex-1 basis-80 gap-1">
             <p
               className={cn(
@@ -246,18 +159,18 @@ export function ConnectionPanel({
             {info ? (
               <Facts info={info} />
             ) : (
-              <p id="mcp-token-help" className="text-xs text-muted-foreground">
+              <p className="text-xs text-muted-foreground">
                 {status === "failed" ? (
                   <span className="text-foreground">{connection.message}</span>
                 ) : status === "connecting" ? (
                   "Waiting for the server to answer."
                 ) : (
-                  "The page sends no request until you connect. It keeps the token in memory only."
+                  "The page sends no request until you connect."
                 )}
               </p>
             )}
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <span
               aria-live="polite"
               className={cn(
@@ -295,6 +208,15 @@ export function ConnectionPanel({
               />
               Details
             </CollapsibleTrigger>
+            <Button
+              type="button"
+              size="sm"
+              variant={open ? "default" : "outline"}
+              onClick={status === "connected" ? onDisconnect : open ? onConnect : onCancel}
+              className={cn("min-w-28 font-mono", !open && OUTLINE)}
+            >
+              {status === "connected" ? "Disconnect" : open ? "Connect" : "Cancel"}
+            </Button>
           </div>
         </div>
         <CollapsibleContent>{info ? <Details info={info} /> : null}</CollapsibleContent>

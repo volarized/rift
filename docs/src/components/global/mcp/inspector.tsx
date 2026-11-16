@@ -6,7 +6,6 @@ import { GLOBAL_MCP_ENDPOINT } from "@/components/global/constants";
 import {
   type Connection,
   ConnectionPanel,
-  ENDPOINT_INPUT_ID,
   type PingState,
 } from "@/components/global/mcp/connection-panel";
 import {
@@ -27,25 +26,15 @@ import { CODE, CopyButton, LABEL } from "@/components/global/mcp/ui";
 /** Rows the history keeps; older rows leave as newer ones arrive. */
 const HISTORY_ROWS_MAX = 500;
 
-function parseEndpoint(text: string): URL | null {
-  try {
-    const url = new URL(text.trim());
-    return url.protocol === "https:" || url.protocol === "http:" ? url : null;
-  } catch {
-    return null;
-  }
-}
+const CLIENT_CONFIGURATION = clientConfiguration("rift-global", GLOBAL_MCP_ENDPOINT);
 
 /**
- * A console for a remote MCP server: connect over Streamable HTTP, list the
+ * A console for the global MCP server: connect over Streamable HTTP, list the
  * tools, call one, and read every message that crossed the wire. All state
  * lives in this component: nothing is stored, and no request leaves the page
  * before the visitor connects.
  */
 export default function Inspector() {
-  const [endpoint, setEndpoint] = useState(GLOBAL_MCP_ENDPOINT);
-  const [endpointError, setEndpointError] = useState<string>();
-  const [token, setToken] = useState("");
   const [connection, setConnection] = useState<Connection>({ status: "idle" });
   const [ping, setPing] = useState<PingState>({ status: "idle" });
   const [tools, setTools] = useState<ToolsState>({ status: "idle" });
@@ -61,8 +50,6 @@ export default function Inspector() {
   const connecting = useRef<AbortController | null>(null);
   const calling = useRef<AbortController | null>(null);
   const sequence = useRef(0);
-  /** Endpoint the editors were typed for. */
-  const editorsOf = useRef<string | null>(null);
 
   const recorder = useMemo<Recorder>(
     () => ({
@@ -108,19 +95,10 @@ export default function Inspector() {
   useEffect(() => release, [release]);
 
   const connect = async () => {
-    const url = parseEndpoint(endpoint);
-    if (!url) {
-      setEndpointError("Enter an http or https URL.");
-      document.getElementById(ENDPOINT_INPUT_ID)?.focus();
-      return;
-    }
     release();
     const owner = generation.current;
     const controller = new AbortController();
     connecting.current = controller;
-    // Arguments typed for one server's tools do not carry to another server.
-    if (editorsOf.current !== url.href) setEditors({});
-    editorsOf.current = url.href;
     setConnection({ status: "connecting" });
     setPing({ status: "idle" });
     setTools({ status: "idle" });
@@ -129,8 +107,7 @@ export default function Inspector() {
       // The SDK loads with the first connection, not with the page.
       const { openSession } = await import("@/components/global/mcp/session");
       const opened = await openSession({
-        endpoint: url,
-        token: token.trim(),
+        endpoint: new URL(GLOBAL_MCP_ENDPOINT),
         recorder,
         signal: controller.signal,
       });
@@ -218,10 +195,6 @@ export default function Inspector() {
   const tool =
     tools.status === "ready" ? tools.tools.find((item) => item.name === selected) : undefined;
   const editor = (selected && editors[selected]) || EMPTY_EDITOR;
-  const configuration = clientConfiguration(
-    endpoint.trim() === GLOBAL_MCP_ENDPOINT ? "rift-global" : "server",
-    endpoint.trim() || GLOBAL_MCP_ENDPOINT,
-  );
 
   return (
     <div className="grid grid-cols-[minmax(0,1fr)] gap-10">
@@ -229,15 +202,7 @@ export default function Inspector() {
         <h2 className="sr-only">MCP console</h2>
         <ConnectionPanel
           connection={connection}
-          endpoint={endpoint}
-          endpointError={endpointError}
-          token={token}
           ping={ping}
-          onEndpointChange={(value) => {
-            setEndpoint(value);
-            setEndpointError(undefined);
-          }}
-          onTokenChange={setToken}
           onConnect={() => void connect()}
           onCancel={disconnect}
           onDisconnect={disconnect}
@@ -297,11 +262,11 @@ export default function Inspector() {
         </p>
         <div className="group relative min-w-0">
           <pre className={`${CODE} overflow-x-auto border border-border px-[18px] py-4 pr-12`}>
-            {configuration}
+            {CLIENT_CONFIGURATION}
           </pre>
           <CopyButton
             label="Copy the client configuration"
-            value={configuration}
+            value={CLIENT_CONFIGURATION}
             className="absolute top-2 right-2"
           />
         </div>

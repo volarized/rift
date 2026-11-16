@@ -10,7 +10,6 @@ import "@/components/global/scalar-theme.css";
 
 import {
   GLOBAL_REST_ENDPOINT,
-  globalOpenApiUrl,
   RIFT_API_VERSION,
   RIFT_API_VERSION_HEADER,
 } from "@/components/global/constants";
@@ -30,10 +29,10 @@ function openOperationFromKeyboard(event: KeyboardEvent<HTMLDivElement>) {
 }
 
 /**
- * Scalar API Reference over the tracked OpenAPI document. This module is the
- * lazy chunk `ApiReference` imports; nothing else may import it.
+ * Scalar API Reference over the OpenAPI document `ApiReference` fetched. This
+ * module is the lazy chunk `ApiReference` imports; nothing else may import it.
  */
-export function ScalarReference() {
+export function ScalarReference({ document: content }: { document: Record<string, unknown> }) {
   const { resolvedTheme } = useTheme();
   const mode = resolvedTheme === "light" ? "light" : "dark";
 
@@ -41,7 +40,7 @@ export function ScalarReference() {
   // configuration changes identity only when the site theme does.
   const configuration = useMemo<AnyApiReferenceConfiguration>(
     () => ({
-      url: globalOpenApiUrl(),
+      content,
       // The document carries no `servers` on purpose; the endpoint comes from here.
       servers: [{ url: GLOBAL_REST_ENDPOINT, description: "Global API" }],
       // No `proxyUrl`: a request goes from the browser straight to the API.
@@ -56,7 +55,7 @@ export function ScalarReference() {
       forceDarkModeState: mode,
       hideDarkModeToggle: true,
 
-      // The page owns its URL hash (`#rest`, `#mcp`) and the site owns Cmd/Ctrl+K.
+      // The page owns its URL hash (`#api`, `#mcp`) and the site owns Cmd/Ctrl+K.
       urlRouting: false,
       hideSearch: true,
       showSidebar: false,
@@ -79,7 +78,7 @@ export function ScalarReference() {
         headers?.set(RIFT_API_VERSION_HEADER, RIFT_API_VERSION);
       },
     }),
-    [mode],
+    [content, mode],
   );
 
   // Scalar marks <body> with `dark-mode` or `light-mode` when it mounts, which

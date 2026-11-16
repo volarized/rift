@@ -62,7 +62,7 @@ export type HistoryEntry = {
   id?: string | number | null;
   httpMethod: string;
   url: string;
-  /** Request headers of a sent row, the bearer token replaced by a placeholder. */
+  /** Request headers of a sent row. */
   headers?: Record<string, string>;
   status?: number;
   statusText?: string;
