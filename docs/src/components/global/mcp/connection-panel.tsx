@@ -1,0 +1,304 @@
+"use client";
+
+import { CaretRightIcon, CircleIcon, CircleNotchIcon, WarningIcon } from "@phosphor-icons/react";
+
+import type { SessionInfo } from "@/components/global/mcp/types";
+import { CONTROL, LABEL } from "@/components/global/mcp/ui";
+import { type JsonValue, PayloadTree } from "@/components/json-tree";
+import { Button } from "@/components/ui/button";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { cn } from "@/lib/utils";
+
+export type Connection =
+  | { status: "idle" }
+  | { status: "connecting" }
+  | { status: "connected"; info: SessionInfo }
+  | { status: "failed"; message: string };
+
+export type PingState =
+  | { status: "idle" }
+  | { status: "pending" }
+  | { status: "done"; ok: boolean; text: string };
+
+export const ENDPOINT_INPUT_ID = "mcp-endpoint";
+
+const OUTLINE = "bg-transparent font-mono font-normal dark:bg-transparent";
+
+function StatusGlyph({ status }: { status: Connection["status"] }) {
+  const size = "size-3 shrink-0";
+  switch (status) {
+    case "connecting":
+      return (
+        <CircleNotchIcon
+          aria-hidden="true"
+          className={cn(size, "motion-safe:animate-spin motion-reduce:opacity-60")}
+        />
+      );
+    case "connected":
+      return (
+        <CircleIcon aria-hidden="true" weight="fill" className={cn(size, "text-foreground")} />
+      );
+    case "failed":
+      return (
+        <WarningIcon aria-hidden="true" weight="light" className={cn(size, "text-destructive")} />
+      );
+    default:
+      return <CircleIcon aria-hidden="true" weight="light" className={size} />;
+  }
+}
+
+const STATUS_TEXT: Record<Connection["status"], string> = {
+  idle: "Not connected",
+  connecting: "Connecting",
+  connected: "Connected",
+  failed: "Could not connect",
+};
+
+/** How the two sides agreed on the protocol version, in the specification's words. */
+function agreement(info: SessionInfo): string {
+  return info.era === "modern" ? "per-request metadata" : "initialize handshake";
+}
+
+function Facts({ info }: { info: SessionInfo }) {
+  const capabilities = Object.keys(info.capabilities ?? {});
+  return (
+    <span className="flex flex-wrap gap-x-4 gap-y-0.5 font-mono text-[0.75rem] text-foreground">
+      <span>
+        <span className="text-muted-foreground">server </span>
+        {info.server ? `${info.server.name} ${info.server.version}` : "not named"}
+      </span>
+      <span>
+        <span className="text-muted-foreground">protocol </span>
+        {info.protocolVersion ?? "not stated"}, {agreement(info)}
+      </span>
+      <span>
+        <span className="text-muted-foreground">capabilities </span>
+        {capabilities.length > 0 ? capabilities.join(", ") : "none"}
+      </span>
+    </span>
+  );
+}
+
+function Details({ info }: { info: SessionInfo }) {
+  return (
+    <div className="grid gap-x-8 gap-y-4 border-t border-border px-3 py-3 md:grid-cols-2">
+      <div className="grid content-start gap-1.5">
+        <h3 className={LABEL}>Instructions</h3>
+        {info.instructions ? (
+          <p className="max-h-48 overflow-auto text-xs leading-relaxed whitespace-pre-line">
+            {info.instructions}
+          </p>
+        ) : (
+          <p className="text-xs text-muted-foreground">The server sent no instructions.</p>
+        )}
+        {info.server?.title ? (
+          <p className="text-xs text-muted-foreground">
+            Title <span className="text-foreground">{info.server.title}</span>
+          </p>
+        ) : null}
+        {info.sessionId ? (
+          <p className="text-xs text-muted-foreground">
+            Session <code className="font-mono break-all text-foreground">{info.sessionId}</code>
+          </p>
+        ) : null}
+      </div>
+      <div className="grid min-w-0 content-start gap-1.5">
+        <h3 className={LABEL}>Capabilities</h3>
+        <div className="max-h-48 overflow-auto">
+          <PayloadTree
+            className="font-mono text-[0.75rem] break-words"
+            schema={{}}
+            value={(info.capabilities ?? {}) as JsonValue}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Where the console connects: the endpoint, an optional bearer token, and what
+ * the server said about itself once the connection opened.
+ */
+export function ConnectionPanel({
+  connection,
+  endpoint,
+  endpointError,
+  onCancel,
+  onConnect,
+  onDisconnect,
+  onEndpointChange,
+  onPing,
+  onTokenChange,
+  ping,
+  token,
+}: {
+  connection: Connection;
+  endpoint: string;
+  endpointError?: string;
+  onCancel: () => void;
+  onConnect: () => void;
+  onDisconnect: () => void;
+  onEndpointChange: (value: string) => void;
+  onPing: () => void;
+  onTokenChange: (value: string) => void;
+  ping: PingState;
+  token: string;
+}) {
+  const { status } = connection;
+  const locked = status === "connecting" || status === "connected";
+  const info = status === "connected" ? connection.info : undefined;
+  const pingLabel = info?.era === "modern" ? "Discover" : "Ping";
+
+  return (
+    <section aria-label="Connection" className="border-b border-border">
+      <form
+        noValidate
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (status === "connected") onDisconnect();
+          else if (status === "connecting") onCancel();
+          else onConnect();
+        }}
+        className="grid gap-3 p-3 md:grid-cols-[minmax(0,1fr)_minmax(0,16rem)_7.5rem]"
+      >
+        <div className="grid content-start gap-1.5">
+          <Label htmlFor={ENDPOINT_INPUT_ID} className={LABEL}>
+            Endpoint
+          </Label>
+          <Input
+            id={ENDPOINT_INPUT_ID}
+            name="endpoint"
+            type="url"
+            inputMode="url"
+            value={endpoint}
+            onChange={(event) => onEndpointChange(event.target.value)}
+            readOnly={locked}
+            aria-invalid={endpointError ? true : undefined}
+            aria-describedby="mcp-endpoint-error"
+            placeholder="https://example.com/mcp"
+            spellCheck={false}
+            autoComplete="off"
+            autoCapitalize="none"
+            className={cn(CONTROL, locked && "text-muted-foreground")}
+          />
+          <p
+            id="mcp-endpoint-error"
+            aria-live="polite"
+            className="text-xs text-destructive empty:hidden"
+          >
+            {endpointError}
+          </p>
+        </div>
+        <div className="grid content-start gap-1.5">
+          <Label htmlFor="mcp-token" className={LABEL}>
+            Bearer token <span className="normal-case tracking-normal">(optional)</span>
+          </Label>
+          <Input
+            id="mcp-token"
+            name="mcp-token"
+            type="password"
+            value={token}
+            onChange={(event) => onTokenChange(event.target.value)}
+            readOnly={locked}
+            aria-describedby={info ? undefined : "mcp-token-help"}
+            spellCheck={false}
+            autoComplete="off"
+            data-1p-ignore=""
+            data-lpignore="true"
+            className={cn(CONTROL, locked && "text-muted-foreground")}
+          />
+        </div>
+        <div className="grid content-start gap-1.5">
+          <span aria-hidden="true" className={cn(LABEL, "invisible max-md:hidden")}>
+            Action
+          </span>
+          <Button
+            type="submit"
+            variant={status === "idle" || status === "failed" ? "default" : "outline"}
+            className={cn(
+              "w-full font-mono max-md:h-10",
+              status !== "idle" && status !== "failed" && OUTLINE,
+            )}
+          >
+            {status === "connected" ? "Disconnect" : status === "connecting" ? "Cancel" : "Connect"}
+          </Button>
+        </div>
+      </form>
+
+      <Collapsible>
+        <div className="flex min-h-14 flex-wrap items-center gap-x-4 gap-y-2 border-t border-border px-3 py-2">
+          <div aria-live="polite" className="grid min-w-0 flex-1 basis-80 gap-1">
+            <p
+              className={cn(
+                LABEL,
+                "flex items-center gap-2",
+                status !== "idle" && "text-foreground",
+              )}
+            >
+              <StatusGlyph status={status} />
+              <span className={status === "failed" ? "text-destructive" : undefined}>
+                {STATUS_TEXT[status]}
+              </span>
+            </p>
+            {info ? (
+              <Facts info={info} />
+            ) : (
+              <p id="mcp-token-help" className="text-xs text-muted-foreground">
+                {status === "failed" ? (
+                  <span className="text-foreground">{connection.message}</span>
+                ) : status === "connecting" ? (
+                  "Waiting for the server to answer."
+                ) : (
+                  "The page sends no request until you connect. It keeps the token in memory only."
+                )}
+              </p>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            <span
+              aria-live="polite"
+              className={cn(
+                "font-mono text-[0.75rem] tabular-nums text-muted-foreground",
+                ping.status === "done" && !ping.ok && "text-destructive",
+              )}
+            >
+              {ping.status === "done" ? ping.text : ping.status === "pending" ? "waiting" : ""}
+            </span>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={!info || ping.status === "pending"}
+              onClick={onPing}
+              className={OUTLINE}
+            >
+              {pingLabel}
+            </Button>
+            <CollapsibleTrigger
+              disabled={!info}
+              render={
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className={cn(OUTLINE, "group/details")}
+                />
+              }
+            >
+              <CaretRightIcon
+                aria-hidden="true"
+                weight="light"
+                className="transition-transform group-data-panel-open/details:rotate-90 motion-reduce:transition-none"
+              />
+              Details
+            </CollapsibleTrigger>
+          </div>
+        </div>
+        <CollapsibleContent>{info ? <Details info={info} /> : null}</CollapsibleContent>
+      </Collapsible>
+    </section>
+  );
+}
