@@ -1,6 +1,8 @@
 //! Additional source languages reach workspace reads with original source bytes.
 
 mod hermetic_search;
+#[path = "symbol_ids/mod.rs"]
+mod symbol_ids;
 #[expect(
     dead_code,
     reason = "This suite uses the relative-root workspace fixture."

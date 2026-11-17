@@ -73,7 +73,11 @@ pub(super) fn prepare(
         );
         anchors.insert(
             path.clone(),
-            file_anchors(input, file.syntax, &namespace, &admitted),
+            super::retain_valid_declarations(
+                input,
+                file,
+                file_anchors(input, file.syntax, &namespace, &admitted),
+            ),
         );
         for (child, local, child_scope) in children {
             let mut child_namespace = namespace.clone();
@@ -167,7 +171,6 @@ fn selected_libraries(
 fn source_is_valid(syntax: &SyntaxFacts, source: &str) -> bool {
     syntax.language().name == "rust"
         && syntax.language().dialect.is_none()
-        && !syntax.has_errors()
         && syntax.source_digest() == Some(&FileDigest::of(source.as_bytes()))
 }
 

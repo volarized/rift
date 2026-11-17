@@ -62,7 +62,7 @@ pub(super) fn prepare(
                 if file.syntax.language().name == "typescript"
                     && selected_source_is_valid(input, file)
                 {
-                    let ambient = declaration_anchors(input, file.syntax, file.source, None);
+                    let ambient = declaration_anchors(input, file, None);
                     if !ambient.is_empty() {
                         prepared
                             .anchors
@@ -78,10 +78,10 @@ pub(super) fn prepare(
     observations::prepare(input, metadata.as_ref(), selected, &mut prepared);
     if input.owner().is_local() {
         for file in selected {
-            let javascript =
-                file.syntax.language() == &rift_syntax::ShippedLanguage::JavaScript.language();
-            if javascript
-                && file.syntax.static_facts().is_some()
+            let language = file.syntax.language();
+            let supported = matches!(language.name.as_str(), "javascript" | "typescript")
+                && matches!(language.dialect.as_deref(), None | Some("tsx"));
+            if supported
                 && !prepared.anchors.contains_key(file.path.as_str())
                 && selected_source_is_valid(input, file)
             {
@@ -101,7 +101,7 @@ fn prepare_file(
     module: &str,
     prepared: &mut PreparedNamespace,
 ) -> bool {
-    let anchors = declaration_anchors(input, file.syntax, file.source, Some(module));
+    let anchors = declaration_anchors(input, file, Some(module));
     if let Some(previous) = prepared.anchors.get(file.path.as_str()) {
         prepared.unresolved_exports |= previous != &anchors;
         return previous == &anchors;
@@ -274,8 +274,7 @@ fn selected_source_is_valid(input: &NamespaceInput<'_>, file: &SelectedFile<'_>)
     matches!(
         file.syntax.language().name.as_str(),
         "typescript" | "javascript"
-    ) && !file.syntax.has_errors()
-        && file.syntax.source_digest() == Some(&FileDigest::of(file.source.as_bytes()))
+    ) && file.syntax.source_digest() == Some(&FileDigest::of(file.source.as_bytes()))
         && input
             .files()
             .iter()
@@ -712,20 +711,20 @@ impl<'de> Deserialize<'de> for OrderedConditions {
 
 fn declaration_anchors(
     input: &NamespaceInput<'_>,
-    syntax: &SyntaxFacts,
-    source: &str,
+    file: &SelectedFile<'_>,
     module: Option<&str>,
 ) -> BTreeMap<String, SymbolId> {
-    declaration_anchors_with_public(input, syntax, source, module, &BTreeSet::new())
+    declaration_anchors_with_public(input, file, module, &BTreeSet::new())
 }
 
 fn declaration_anchors_with_public(
     input: &NamespaceInput<'_>,
-    syntax: &SyntaxFacts,
-    source: &str,
+    file: &SelectedFile<'_>,
     module: Option<&str>,
     public: &BTreeSet<String>,
 ) -> BTreeMap<String, SymbolId> {
+    let syntax = file.syntax;
+    let source = file.source;
     let mut paths: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut anchors = BTreeMap::new();
     for symbol in syntax.symbols().iter().filter(|symbol| {
@@ -759,7 +758,7 @@ fn declaration_anchors_with_public(
             anchors.insert(symbol.qualified_name.clone(), identity);
         }
     }
-    anchors
+    super::retain_valid_declarations(input, file, anchors)
 }
 
 fn defining_name(symbol: &SyntaxSymbol) -> String {

@@ -6420,11 +6420,15 @@ done
         let (published, _) = crate::validation::read_published(&server.published)
             .await
             .snapshot();
-        let ids = published.reads.canonical_examples(2)?;
-        let [id] = ids.as_slice() else {
-            return Err(format!("one declared beacon identity must be captured: {ids:?}").into());
-        };
-        let id = rift_protocol::read::SymbolId::parse(id.as_str())?;
+        let answer = published.reads.get_symbol(&serde_json::from_value(json!({
+            "name": "beacon", "language": "rust"
+        }))?)?;
+        let id = answer.hits[0]
+            .symbol
+            .id
+            .as_ref()
+            .ok_or("declared beacon identity required")?;
+        let id = rift_protocol::read::SymbolId::parse(&id.0)?;
         drop(published);
         Ok((directory, server, id))
     }
@@ -8767,11 +8771,27 @@ done
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
-        let [rift_protocol::read::HistoryEdge::IntroducedIn { commit }] = filled.edges.as_slice()
-        else {
+        let introductions = filled
+            .edges
+            .iter()
+            .filter_map(|edge| match edge {
+                rift_protocol::read::HistoryEdge::IntroducedIn { commit } => Some(commit),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [commit] = introductions.as_slice() else {
             return Err(format!("one introduction expected: {:?}", filled.edges).into());
         };
         assert_eq!(commit.author.name, "Rift Fixture");
+        assert_eq!(
+            filled.edges.len(),
+            10,
+            "one introduction and nine document co-changes"
+        );
+        assert!(filled.edges.iter().skip(1).all(|edge| matches!(
+            edge,
+            rift_protocol::read::HistoryEdge::CoChanges { commits: 1, .. }
+        )));
         Ok(())
     }
 
@@ -11083,13 +11103,15 @@ done
         let (published, _) = crate::validation::read_published(&server.published)
             .await
             .snapshot();
-        let ids = published.reads.canonical_examples(2)?;
-        let [id] = ids.as_slice() else {
-            return Err(
-                format!("the declared BLOB library must supply one identity: {ids:?}").into(),
-            );
-        };
-        let id = rift_protocol::read::SymbolId::parse(id.as_str())?;
+        let answer = published.reads.get_symbol(&serde_json::from_value(json!({
+            "name": "BLOB", "language": "rust"
+        }))?)?;
+        let id = answer.hits[0]
+            .symbol
+            .id
+            .as_ref()
+            .ok_or("declared BLOB identity required")?;
+        let id = rift_protocol::read::SymbolId::parse(&id.0)?;
         let request = serde_json::from_value(json!({"id": id}))?;
         drop(published);
         let super::Json(symbol) = server

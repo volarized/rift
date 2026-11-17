@@ -2540,13 +2540,20 @@ mod tests {
         let configuration = serde_json::from_value(json!({"command":"/refused-engine"}))?;
         let engines = pool(directory.path(), "toml", configuration);
         let params: GetSymbolParams = serde_json::from_value(json!({"name": "beacon"}))?;
-        assert!(reads.get_symbol(&params)?.hits[0].symbol.id.is_none());
+        assert_eq!(
+            reads.get_symbol(&params)?.hits[0]
+                .symbol
+                .id
+                .as_ref()
+                .map(|id| id.0.as_str()),
+            Some("rift://symbol/local/toml/settings.toml/beacon")
+        );
         let language = rift_protocol::read::Language::from_identity_segment("toml")?;
         let identity = |name: &str| {
             rift_protocol::identity::SymbolIdentity::new(
                 rift_protocol::identity::SymbolOwner::Local,
                 language.clone(),
-                vec!["beacon".to_owned(), name.to_owned()],
+                vec!["settings.toml".to_owned(), name.to_owned()],
             )
             .map(|identity| identity.wire_identity())
         };
