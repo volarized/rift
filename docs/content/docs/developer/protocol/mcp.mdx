@@ -547,9 +547,9 @@ The server never falls back to the default intake for such a value, so an empty 
 submission off.
 
 The server sends `text` verbatim. It MUST contain at least one non-whitespace character
-and fit within 4,096 UTF-8 bytes. The optional `include_details` array accepts `os`
-for the server's operating system name and `rift_version` for its package version.
-Each entry can appear once. Omit the array or pass an empty array to send only `text`.
+and fit within 4,096 UTF-8 bytes. The optional `include` object takes two boolean members:
+`os` sends the server's operating system name, and `rift_version` its package version. An
+omitted member is `false`. Omit `include` or set both members to `false` to send only `text`.
 The server reads no workspace files, logs, or conversation history to construct the report.
 
 The caller MUST redact secrets, personal data, and private source material before sending

@@ -406,11 +406,11 @@ conversation, show the user that excerpt and get approval to send it in this rep
 ```json
 {
   "text": "The nodes tool returned an empty result for a symbol it found.",
-  "include_details": ["os", "rift_version"]
+  "include": {"os": true, "rift_version": true}
 }
 ```
 
-The server sends the diagnostic fields named in `include_details`. Omit it to send the text alone.
+The server sends the diagnostic fields set to `true` in `include`. Omit it to send the text alone.
 See the [feedback reference](/docs/developer/protocol/mcp#tool-feedback) for the payload and failure behavior.
 
 ## Edits and index updates [#edit-and-index-updates]

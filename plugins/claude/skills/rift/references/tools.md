@@ -13,7 +13,7 @@ approval for any exact conversation excerpt before including it in a report.
 Parameters:
 
 - `text` (required) - Report text sent verbatim.
-- `include_details` - Diagnostic fields to send alongside `text`.
+- `include` - Diagnostic fields to send alongside `text`.
 
 ## get_symbol
 

@@ -5,42 +5,45 @@
       "description": "Sends a feedback report over HTTPS to the public Rift intake, or to the intake that\n`RIFT_FEEDBACK_URL` names in the server's environment. The server sends the\ncaller's text and any selected diagnostic fields. The caller MUST omit secrets,\npersonal data, and private source material. The caller MUST obtain the user's\napproval for any exact conversation excerpt before including it in a report.",
       "input_schema": {
         "$defs": {
-          "FeedbackDetail": {
-            "description": "One optional detail the caller may send with a feedback report.",
-            "oneOf": [
+          "FeedbackInclude": {
+            "additionalProperties": false,
+            "description": "The diagnostic fields the caller elects to send with a feedback report. An omitted member\nis `false`.",
+            "examples": [
               {
-                "const": "os",
-                "description": "Operating system name, such as `linux`.",
-                "type": "string"
-              },
-              {
-                "const": "rift_version",
-                "description": "Rift's package version, such as `0.0.78`.",
-                "type": "string"
+                "os": true,
+                "rift_version": true
               }
-            ]
+            ],
+            "properties": {
+              "os": {
+                "default": false,
+                "description": "Sends the operating system name, such as `linux`.",
+                "type": "boolean"
+              },
+              "rift_version": {
+                "default": false,
+                "description": "Sends Rift's package version, such as `0.0.78`.",
+                "type": "boolean"
+              }
+            },
+            "type": "object"
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "additionalProperties": false,
         "examples": [
           {
-            "include_details": [
-              "os",
-              "rift_version"
-            ],
+            "include": {
+              "os": true,
+              "rift_version": true
+            },
             "text": "The nodes tool returned an empty result for a symbol it found."
           }
         ],
         "properties": {
-          "include_details": {
-            "description": "Diagnostic fields to send alongside `text`. Omitted or empty sends no diagnostic fields.",
-            "items": {
-              "$ref": "#/$defs/FeedbackDetail"
-            },
-            "maxItems": 2,
-            "type": "array",
-            "uniqueItems": true
+          "include": {
+            "$ref": "#/$defs/FeedbackInclude",
+            "description": "Diagnostic fields to send alongside `text`. Omitted sends no diagnostic field."
           },
           "text": {
             "description": "Report text sent verbatim. The caller MUST send nonblank text of at most 4096 UTF-8 bytes.",
