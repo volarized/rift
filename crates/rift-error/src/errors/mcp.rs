@@ -72,7 +72,7 @@ __rift_error_definition!(
     feedback_intake_unavailable,
     slug = "rift.mcp.feedback_intake_unavailable",
     message = "feedback intake is unavailable",
-    action = "set RIFT_FEEDBACK_URL and restart the workspace server",
+    action = "set RIFT_FEEDBACK_URL to an anonymous HTTPS URL, or unset it for the public intake, then restart the workspace server",
     fields = {},
 );
 

@@ -1,5 +1,6 @@
 //! Submits the report and only the diagnostics selected by the caller.
 
+use std::ffi::OsString;
 use std::time::Duration;
 
 use reqwest::{StatusCode, Url};
@@ -9,6 +10,8 @@ use serde::Serialize;
 
 pub(crate) const TOOL_NAME: &str = "feedback";
 const ENDPOINT_ENV: &str = "RIFT_FEEDBACK_URL";
+/// The public Rift feedback intake. A set `RIFT_FEEDBACK_URL` replaces it.
+const DEFAULT_ENDPOINT: &str = "https://feedback.volar.sh/rift/feedback/v1/reports";
 const SUBMISSION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Serialize)]
@@ -58,10 +61,18 @@ fn parse_endpoint(value: &str) -> Option<Url> {
     .then_some(url)
 }
 
+/// Selects the intake from the server process's `RIFT_FEEDBACK_URL` value. An unset
+/// variable selects [`DEFAULT_ENDPOINT`]. A set value, empty included, replaces it and
+/// must be an anonymous HTTPS URL, so an empty value turns submission off.
+fn resolve_endpoint(value: Option<OsString>) -> Option<Url> {
+    match value {
+        None => parse_endpoint(DEFAULT_ENDPOINT),
+        Some(value) => value.to_str().and_then(parse_endpoint),
+    }
+}
+
 pub(crate) async fn submit(params: FeedbackParams) -> Result<FeedbackResult, RiftError> {
-    let endpoint = std::env::var(ENDPOINT_ENV)
-        .ok()
-        .and_then(|value| parse_endpoint(&value))
+    let endpoint = resolve_endpoint(std::env::var_os(ENDPOINT_ENV))
         .ok_or_else(|| errors::mcp::feedback_intake_unavailable().error())?;
     post(endpoint, Report::from(params)).await
 }
@@ -126,6 +137,33 @@ mod tests {
         ] {
             assert!(parse_endpoint(invalid).is_none());
         }
+    }
+
+    #[test]
+    fn unset_variable_selects_the_public_intake_and_a_set_value_replaces_it() {
+        let resolved = |value: Option<&str>| {
+            resolve_endpoint(value.map(OsString::from)).map(|url| url.to_string())
+        };
+        assert_eq!(resolved(None).as_deref(), Some(DEFAULT_ENDPOINT));
+        assert_eq!(
+            resolved(Some("https://intake.example/submit")).as_deref(),
+            Some("https://intake.example/submit")
+        );
+        for refused in [
+            "",
+            "http://intake.example/submit",
+            "https://intake.example/?q",
+        ] {
+            assert_eq!(resolved(Some(refused)), None, "{refused:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_variable_refuses_instead_of_selecting_the_public_intake() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let value = OsString::from_vec(b"https://intake.example/\xff".to_vec());
+        assert_eq!(resolve_endpoint(Some(value)), None);
     }
 
     #[test]

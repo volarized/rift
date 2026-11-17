@@ -83,7 +83,9 @@ jobs:
       # so nothing else would *block* a vulnerable JS dependency from landing.
       # Baseline is clean as of the dependency upgrade PR; `--audit-level=high`
       # keeps moderates visible in the log without failing the build.
-      - run: bun audit --audit-level=high
+      # GHSA-fc5q-39xc-vjpf: picomatch ReDoS through fumadocs' build-time globbing; no
+      # patched picomatch release exists yet. Drop the ignore once one ships.
+      - run: bun audit --audit-level=high --ignore=GHSA-fc5q-39xc-vjpf
 
   # Every check that feeds no test job: formatting, generated files, crate
   # boundaries, Clippy, Rust documentation and its examples, dependency policy,
