@@ -219,3 +219,152 @@ fn a_symbol_past_the_public_name_bound_answers_unavailable_with_its_warning() ->
     );
     Ok(())
 }
+
+/// A Cargo package `beacon` whose library declares `config`, beside every kind of target
+/// a library namespace never reaches: a binary with its own module, a second binary, an
+/// example, an integration test, a benchmark, a build script, and a `[[bin]]` at a
+/// manifest-named path.
+fn rust_package(directory: &std::path::Path, library: &str) -> TestResult {
+    let write = |path: &str, text: &str| -> TestResult {
+        let path = directory.join(path);
+        std::fs::create_dir_all(path.parent().ok_or("parent")?)?;
+        std::fs::write(path, text)?;
+        Ok(())
+    };
+    write(
+        "Cargo.toml",
+        "[package]\nname = 'beacon'\nversion = '0.1.0'\nedition = '2024'\n\n[[bin]]\nname = 'tool'\npath = 'tools/tool.rs'\n",
+    )?;
+    write("src/lib.rs", library)?;
+    write("src/config.rs", "pub fn load_config() {}\n")?;
+    write("src/main.rs", "mod cli;\n\nfn main() {}\n")?;
+    write("src/cli.rs", "pub fn parse_arguments() {}\n")?;
+    write("src/bin/other.rs", "fn main() {}\n")?;
+    write("examples/demo/main.rs", "fn main() {}\n")?;
+    write("tests/round_trip.rs", "#[test]\nfn round_trip() {}\n")?;
+    write("benches/load.rs", "fn main() {}\n")?;
+    write("build.rs", "fn main() {}\n")?;
+    write("tools/tool.rs", "fn main() {}\n")?;
+    Ok(())
+}
+
+fn rust_miss(service: &ReadService) -> TestResult<GetSymbolResult> {
+    let params = request(SymbolId::parse(
+        "rift://symbol/local/rust/beacon/config/load_confg",
+    )?);
+    Ok(service.exact_symbol(&params, true)?)
+}
+
+// Declarations in binary targets carry no identity; they used to mark Rust coverage
+// incomplete and turn every exact miss in such a package into `InsufficientCoverage`.
+#[test]
+fn a_rust_miss_beside_binary_targets_answers_missing_with_alternatives() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    rust_package(directory.path(), "pub mod config;\n")?;
+    let service = build(directory.path())?;
+    let GetSymbolResult::Missing {
+        symbol_not_found, ..
+    } = rust_miss(&service)?
+    else {
+        return Err("an absent library identity is a definite miss".into());
+    };
+    assert!(
+        symbol_not_found
+            .alternatives
+            .iter()
+            .any(|alternative| alternative.id.as_str()
+                == "rift://symbol/local/rust/beacon/config/load_config"),
+        "{symbol_not_found:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_rust_miss_with_a_library_file_that_failed_analysis_stays_unavailable() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    rust_package(directory.path(), "pub mod config;\npub fn broken( {}\n")?;
+    let service = build(directory.path())?;
+    assert!(matches!(
+        rust_miss(&service)?,
+        GetSymbolResult::Unavailable {
+            reason: SymbolUnavailableReason::InsufficientCoverage,
+            ..
+        }
+    ));
+    Ok(())
+}
+
+// A module file whose declaring library file failed analysis is reached by no library
+// namespace. The binary declares that same library file, so the binary does not reach the
+// module either: its declarations may be library items.
+#[test]
+fn a_rust_miss_with_a_module_its_library_parent_hides_stays_unavailable() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    rust_package(directory.path(), "pub mod config;\npub mod nested;\n")?;
+    std::fs::write(
+        directory.path().join("src/main.rs"),
+        "mod cli;\nmod nested;\n\nfn main() {}\n",
+    )?;
+    std::fs::write(
+        directory.path().join("src/nested.rs"),
+        "pub mod inner;\npub fn broken( {}\n",
+    )?;
+    std::fs::create_dir_all(directory.path().join("src/nested"))?;
+    std::fs::write(
+        directory.path().join("src/nested/inner.rs"),
+        "pub fn hidden() {}\n",
+    )?;
+    let service = build(directory.path())?;
+    assert!(matches!(
+        rust_miss(&service)?,
+        GetSymbolResult::Unavailable {
+            reason: SymbolUnavailableReason::InsufficientCoverage,
+            ..
+        }
+    ));
+    Ok(())
+}
+
+#[test]
+fn a_rust_file_no_target_reaches_keeps_a_miss_unavailable() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    rust_package(directory.path(), "pub mod config;\n")?;
+    std::fs::write(
+        directory.path().join("src/orphan.rs"),
+        "pub fn unreached() {}\n",
+    )?;
+    let service = build(directory.path())?;
+    assert!(matches!(
+        rust_miss(&service)?,
+        GetSymbolResult::Unavailable {
+            reason: SymbolUnavailableReason::InsufficientCoverage,
+            ..
+        }
+    ));
+    Ok(())
+}
+
+// A module both the library and a binary declare is a library module: its declarations
+// keep their library identities, and the binary does not hide them.
+#[test]
+fn a_module_a_library_and_a_binary_share_keeps_its_library_identity() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    rust_package(directory.path(), "pub mod config;\n")?;
+    std::fs::write(
+        directory.path().join("src/main.rs"),
+        "mod cli;\nmod config;\n\nfn main() {}\n",
+    )?;
+    let service = build(directory.path())?;
+    let params = request(SymbolId::parse(
+        "rift://symbol/local/rust/beacon/config/load_config",
+    )?);
+    assert!(matches!(
+        service.exact_symbol(&params, true)?,
+        GetSymbolResult::Found { .. }
+    ));
+    assert!(matches!(
+        rust_miss(&service)?,
+        GetSymbolResult::Missing { .. }
+    ));
+    Ok(())
+}
