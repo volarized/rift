@@ -33,8 +33,12 @@ function StatusGlyph({ status }: { status: Connection["status"] }) {
         />
       );
     case "connected":
+      // A lit lamp: the dot stays, the halo behind it pulses unless motion is reduced.
       return (
-        <CircleIcon aria-hidden="true" weight="fill" className={cn(size, "text-foreground")} />
+        <span aria-hidden="true" className={cn(size, "relative grid place-items-center")}>
+          <span className="absolute size-2 rounded-full bg-positive opacity-60 motion-safe:animate-ping" />
+          <span className="relative size-2 rounded-full bg-positive" />
+        </span>
       );
     case "failed":
       return (
@@ -60,7 +64,7 @@ function agreement(info: SessionInfo): string {
 function Facts({ info }: { info: SessionInfo }) {
   const capabilities = Object.keys(info.capabilities ?? {});
   return (
-    <span className="flex flex-wrap gap-x-4 gap-y-0.5 font-mono text-[0.75rem] text-foreground">
+    <p className="flex flex-wrap gap-x-4 gap-y-0.5 font-mono text-[0.75rem] text-foreground md:col-span-2">
       <span>
         <span className="text-muted-foreground">server </span>
         {info.server ? `${info.server.name} ${info.server.version}` : "not named"}
@@ -73,13 +77,14 @@ function Facts({ info }: { info: SessionInfo }) {
         <span className="text-muted-foreground">capabilities </span>
         {capabilities.length > 0 ? capabilities.join(", ") : "none"}
       </span>
-    </span>
+    </p>
   );
 }
 
 function Details({ info }: { info: SessionInfo }) {
   return (
     <div className="grid gap-x-8 gap-y-4 border-t border-border px-3 py-3 md:grid-cols-2">
+      <Facts info={info} />
       <div className="grid content-start gap-1.5">
         <h3 className={LABEL}>Instructions</h3>
         {info.instructions ? (
@@ -115,9 +120,9 @@ function Details({ info }: { info: SessionInfo }) {
 }
 
 /**
- * The connection to the global MCP endpoint: its state, what the server said
- * about itself once the connection opened, and the controls that open, probe
- * and close it. The page header names the endpoint.
+ * The connection to the global MCP endpoint: its state and the controls that
+ * open, probe and close it. What the server said about itself once the
+ * connection opened sits under Details. The page header names the endpoint.
  */
 export function ConnectionPanel({
   connection,
@@ -156,9 +161,7 @@ export function ConnectionPanel({
                 {STATUS_TEXT[status]}
               </span>
             </p>
-            {info ? (
-              <Facts info={info} />
-            ) : (
+            {info ? null : (
               <p className="text-xs text-muted-foreground">
                 {status === "failed" ? (
                   <span className="text-foreground">{connection.message}</span>
