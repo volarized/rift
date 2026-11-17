@@ -4,7 +4,8 @@ Generated from the served tool surface.
 
 ## feedback
 
-Sends a feedback report to the configured intake over HTTPS. The server sends the
+Sends a feedback report over HTTPS to the public Rift intake, or to the intake that
+`RIFT_FEEDBACK_URL` names in the server's environment. The server sends the
 caller's text and any selected diagnostic fields. The caller MUST omit secrets,
 personal data, and private source material. The caller MUST obtain the user's
 approval for any exact conversation excerpt before including it in a report.

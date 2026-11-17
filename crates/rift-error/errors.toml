@@ -1694,7 +1694,7 @@ fields = { pid = { type = "pid" }, server_version = { type = "string" }, server_
 
 [error.mcp.feedback_intake_unavailable]
 message = "feedback intake is unavailable"
-action = "set RIFT_FEEDBACK_URL and restart the workspace server"
+action = "set RIFT_FEEDBACK_URL to an anonymous HTTPS URL, or unset it for the public intake, then restart the workspace server"
 
 [error.mcp.feedback_unconfirmed]
 message = "feedback submission is unconfirmed"
