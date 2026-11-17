@@ -22,6 +22,8 @@ const CRATES_IO_SOURCES: [&str; 2] = [
     "registry+https://github.com/rust-lang/crates.io-index",
     "sparse+https://index.crates.io",
 ];
+/// The registry a declaration naming no registry resolves from, as the context names it.
+const CRATES_IO_REGISTRY: &str = "crates.io";
 /// The folder below the standard library source that holds the packages it vendors.
 const VENDOR_DIRECTORY_NAME: &str = "vendor";
 /// The operator that pins one exact version in a Cargo requirement.
@@ -216,7 +218,7 @@ fn registry_package(
 fn source_registry(source: Option<&str>) -> Option<String> {
     let source = source?.trim_end_matches('/');
     if CRATES_IO_SOURCES.contains(&source) {
-        return Some("crates.io".to_owned());
+        return Some(CRATES_IO_REGISTRY.to_owned());
     }
     let endpoint = source
         .strip_prefix("registry+")
@@ -413,8 +415,8 @@ impl Dependency {
             Self::Requirement(requirement) => (
                 key,
                 requirement.as_str(),
-                PackageAvailability::RegistryUnresolved,
-                None,
+                PackageAvailability::Canonical,
+                Some(CRATES_IO_REGISTRY.to_owned()),
             ),
             Self::Detailed(detailed) => {
                 let (availability, registry) = detailed.origin();
@@ -446,7 +448,8 @@ impl Dependency {
 
 impl DetailedDependency {
     /// The accepted defining registry and availability. Path and Git sources take
-    /// precedence; a registry alias alone does not establish an endpoint.
+    /// precedence; a registry alias alone does not establish an endpoint. A declaration
+    /// naming no registry reads crates.io, the registry Cargo resolves it from.
     fn origin(&self) -> (PackageAvailability, Option<String>) {
         if self.path.is_some() {
             (PackageAvailability::Path, None)
@@ -454,6 +457,11 @@ impl DetailedDependency {
             (PackageAvailability::Git, None)
         } else if self.registry.is_some() {
             (PackageAvailability::RegistryUnresolved, None)
+        } else if self.registry_index.is_none() {
+            (
+                PackageAvailability::Canonical,
+                Some(CRATES_IO_REGISTRY.to_owned()),
+            )
         } else {
             let registry = self.registry_index.as_deref().and_then(|index| {
                 if index.len() > 4096 {
@@ -655,7 +663,7 @@ git = { version = "1", git = "https://git.example/source", registry-index = "htt
             RecordedInspector::default().with_file(format!("{ROOT}/Cargo.toml"), manifest);
         let answer = context(&["Cargo.toml"], &mut inspector);
         for (name, availability, registry) in [
-            ("unknown", PackageAvailability::RegistryUnresolved, None),
+            ("unknown", PackageAvailability::Canonical, Some("crates.io")),
             ("alias", PackageAvailability::RegistryUnresolved, None),
             ("conflict", PackageAvailability::RegistryUnresolved, None),
             (
@@ -748,15 +756,17 @@ shared = \"3.1\"
             unserved,
             [
                 ("local", PackageAvailability::Path),
-                ("pinned", PackageAvailability::RegistryUnresolved),
                 ("private", PackageAvailability::RegistryUnresolved),
-                ("real-name", PackageAvailability::RegistryUnresolved),
-                ("serde", PackageAvailability::RegistryUnresolved),
                 ("sourced", PackageAvailability::Git),
-                ("criterion", PackageAvailability::RegistryUnresolved),
-                ("cc", PackageAvailability::RegistryUnresolved),
-                ("shared", PackageAvailability::RegistryUnresolved)
-            ]
+            ],
+            "a declaration naming no registry reads crates.io"
+        );
+        assert!(
+            answer
+                .entries
+                .iter()
+                .filter(|entry| entry.availability == PackageAvailability::Canonical)
+                .all(|entry| entry.registry.as_deref() == Some("crates.io"))
         );
         assert!(
             answer.install_folders.is_empty(),

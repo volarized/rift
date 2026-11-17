@@ -236,12 +236,6 @@ async fn the_map_lists_context_packages_and_follows_the_lockfile() -> TestResult
             {
                 "manager": "cargo",
                 "name": "serde",
-                "requirement": "1.0.228",
-                "availability": "registry_unresolved"
-            },
-            {
-                "manager": "cargo",
-                "name": "serde",
                 "registry": "crates.io",
                 "version": "1.0.228",
                 "availability": "canonical"
