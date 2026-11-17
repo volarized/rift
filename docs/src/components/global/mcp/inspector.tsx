@@ -29,6 +29,12 @@ const HISTORY_ROWS_MAX = 500;
 const CLIENT_CONFIGURATION = clientConfiguration("rift-global", GLOBAL_MCP_ENDPOINT);
 
 /**
+ * Tool the console selects after the first listing. The server lists `feedback`
+ * first, and its example would send a report to the intake.
+ */
+const FIRST_TOOL = "search";
+
+/**
  * A console for the global MCP server: connect over Streamable HTTP, list the
  * tools, call one, and read every message that crossed the wire. All state
  * lives in this component: nothing is stored, and no request leaves the page
@@ -73,7 +79,9 @@ export default function Inspector() {
       if (generation.current !== owner) return;
       setTools({ status: "ready", tools: listed });
       setSelected((current) =>
-        listed.some((tool) => tool.name === current) ? current : listed[0]?.name,
+        listed.some((tool) => tool.name === current)
+          ? current
+          : (listed.find((tool) => tool.name === FIRST_TOOL) ?? listed[0])?.name,
       );
     } catch (error) {
       if (generation.current !== owner) return;

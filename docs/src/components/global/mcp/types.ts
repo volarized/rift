@@ -41,7 +41,7 @@ export type CallOutcome =
 /** Why a connection attempt, a listing or a ping did not complete. */
 export type Failure =
   | { reason: "unreachable"; url: string }
-  | { reason: "http"; status: number; statusText: string }
+  | { reason: "http"; status: number; statusText: string; detail?: string }
   | { reason: "protocol"; code: number; message: string }
   | { reason: "other"; message: string };
 

@@ -5,8 +5,12 @@ export function describeFailure(failure: Failure): string {
   switch (failure.reason) {
     case "unreachable":
       return `No response from ${failure.url}. The server is unreachable from this browser, or it does not allow cross-origin requests from this page.`;
-    case "http":
-      return `The server answered HTTP ${failure.status}${failure.statusText ? ` ${failure.statusText}` : ""}.`;
+    case "http": {
+      const status = `HTTP ${failure.status}${failure.statusText ? ` ${failure.statusText}` : ""}`;
+      return failure.detail
+        ? `The server answered ${status}: ${failure.detail}`
+        : `The server answered ${status}.`;
+    }
     case "protocol":
       return `The server answered JSON-RPC error ${failure.code}: ${failure.message}`;
     case "other":

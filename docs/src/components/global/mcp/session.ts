@@ -49,6 +49,8 @@ type Wire = {
   lastCallResult?: unknown;
   /** The last request that got no HTTP response at all. */
   unreachable?: string;
+  /** The last HTTP response outside 2xx, with the problem details it carried. */
+  rejected?: { status: number; statusText: string; detail?: string };
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -86,6 +88,18 @@ function describeReceived(message: unknown, wire: Wire): Described {
   const id = isRpcId(message.id) ? message.id : null;
   const method = id === null ? undefined : wire.methods.get(id);
   return { kind: "error" in message ? "error" : "result", method, id };
+}
+
+/**
+ * The `detail` of an RFC 9457 problem body, else its `title`. The SDK reports a
+ * rejected POST as plain text, so the console reads the body it recorded.
+ */
+function problemDetail(text: string, contentType: string): string | undefined {
+  if (!contentType.includes("json")) return undefined;
+  const problem = parseJson(text);
+  if (!isRecord(problem)) return undefined;
+  if (typeof problem.detail === "string" && problem.detail !== "") return problem.detail;
+  return typeof problem.title === "string" && problem.title !== "" ? problem.title : undefined;
 }
 
 function recordedHeaders(init: RequestInit | undefined): Record<string, string> {
@@ -204,6 +218,7 @@ function recordingFetch(recorder: Recorder, wire: Wire): FetchLike {
 
     const contentType = response.headers.get("content-type") ?? "";
     if (response.body && contentType.includes("text/event-stream")) {
+      wire.rejected = undefined;
       const [forClient, forHistory] = response.body.tee();
       void readEventStream(forHistory, receive).finally(() => wire.inflight.delete(controller));
       return new Response(forClient, { status, statusText, headers: response.headers });
@@ -216,6 +231,9 @@ function recordingFetch(recorder: Recorder, wire: Wire): FetchLike {
       // Aborted while the body arrived: the row keeps its status.
     }
     wire.inflight.delete(controller);
+    wire.rejected = response.ok
+      ? undefined
+      : { status, statusText, detail: problemDetail(text, contentType) };
     if (text !== "") receive(text);
     return new Response(text === "" ? null : text, {
       status,
@@ -232,6 +250,7 @@ function errorMessage(error: unknown): string {
 /** Names what went wrong from the last exchange first, the thrown error second. */
 function failureOf(error: unknown, wire: Wire): Failure {
   if (wire.unreachable) return { reason: "unreachable", url: wire.unreachable };
+  if (wire.rejected) return { reason: "http", ...wire.rejected };
   if (isRecord(error)) {
     const { code, data, message } = error as { code?: unknown; data?: unknown; message?: unknown };
     if (isRecord(data) && typeof data.status === "number") {
@@ -300,6 +319,7 @@ export async function openSession({
       const handshakeTried = [...wire.methods.values()].includes("initialize");
       if (signal.aborted || !wire.unreachable || handshakeTried) throw error;
       wire.unreachable = undefined;
+      wire.rejected = undefined;
       connection = await connect("legacy", endpoint, fetchLike, signal);
     }
   } catch (error) {
@@ -325,6 +345,7 @@ export async function openSession({
 
     async listTools() {
       wire.unreachable = undefined;
+      wire.rejected = undefined;
       try {
         const { tools } = await client.listTools(undefined, { cacheMode: "refresh" });
         return tools as ToolInfo[];
@@ -343,6 +364,7 @@ export async function openSession({
       wire.lastCallId = undefined;
       wire.lastCallResult = undefined;
       wire.unreachable = undefined;
+      wire.rejected = undefined;
       // The result as the server sent it, where the SDK returns a parsed copy.
       const wireResult = () =>
         isRecord(wire.lastCallResult) ? (wire.lastCallResult as ToolResult) : undefined;
@@ -368,6 +390,7 @@ export async function openSession({
 
     async ping() {
       wire.unreachable = undefined;
+      wire.rejected = undefined;
       try {
         if (era === "modern") await client.discover();
         else await client.ping();
