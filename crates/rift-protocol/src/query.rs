@@ -29,9 +29,10 @@ pub enum QueryLanguage {
     { "query": "ASK { ?symbol a :Symbol; :name 'ReadService' }", "language": "sparql" }
 ]))]
 pub struct QueryParams {
-    /// Query text.
+    /// Query text in `language`. A SPARQL query uses `SERVICE :search` for text and regex
+    /// retrieval and `SERVICE :flows` for call paths around ranked symbols.
     pub query: String,
-    /// Currently, only SPARQL is supported.
+    /// The language of `query`. Omitted, `sparql`, the only language the server evaluates.
     #[serde(default)]
     pub language: QueryLanguage,
 }

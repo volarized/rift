@@ -6303,7 +6303,7 @@
       }
     },
     {
-      "description": "Evaluate SPARQL over captured code facts. Use `SERVICE :search` for text and regex\nretrieval and `SERVICE :flows` for call paths around ranked symbols. Continue a\npaged answer with its `next_query`.",
+      "description": "Performs search across the index using a query language. `language` names the query\nlanguage and defaults to `sparql`.",
       "input_schema": {
         "$defs": {
           "QueryLanguage": {
@@ -6332,10 +6332,10 @@
           "language": {
             "$ref": "#/$defs/QueryLanguage",
             "default": "sparql",
-            "description": "Currently, only SPARQL is supported."
+            "description": "The language of `query`. Omitted, `sparql`, the only language the server evaluates."
           },
           "query": {
-            "description": "Query text.",
+            "description": "Query text in `language`. A SPARQL query uses `SERVICE :search` for text and regex\nretrieval and `SERVICE :flows` for call paths around ranked symbols.",
             "type": "string"
           }
         },
