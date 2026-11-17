@@ -7,6 +7,12 @@ pub(crate) fn remote(
     meta: &ResponseMeta,
     problem: Option<&ProblemDetails>,
 ) -> RiftError {
+    // The contract documents 400 for a request the global API refuses as invalid, so the
+    // caller reads it as its own invalid request.
+    if meta.status == 400 {
+        let (field, violation) = refused_field(problem);
+        return request_invalid(operation, &field, &violation);
+    }
     if unsupported_operation(operation, meta, problem) {
         return rift_error::errors::server::read_unsupported()
             .capability("global relationship operation")
@@ -56,6 +62,54 @@ pub(crate) fn remote(
             .maybe_problem(problem)
             .error(),
     }
+}
+
+/// The form the global API's read refusal message takes; the field and violation follow.
+const REFUSAL_PREFIX: &str = "the request does not match the documented form: field ";
+/// What separates the field from the violation in that message.
+const REFUSAL_VIOLATION: &str = ", violation ";
+
+/// The request field and violation a 400 refusal names: its `field` and `violation`
+/// members, else the ones its `detail` states in the registered refusal message, else the
+/// whole `detail` against the request.
+fn refused_field(problem: Option<&ProblemDetails>) -> (String, String) {
+    let Some(problem) = problem else {
+        return (
+            "request".to_owned(),
+            "the global API refused the request".to_owned(),
+        );
+    };
+    let member = |name: &str| {
+        problem
+            .additional_properties
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+    };
+    if let (Some(field), Some(violation)) = (member("field"), member("violation")) {
+        return (field.to_owned(), violation.to_owned());
+    }
+    problem
+        .detail
+        .strip_prefix(REFUSAL_PREFIX)
+        .and_then(|rest| rest.split_once(REFUSAL_VIOLATION))
+        .filter(|(field, violation)| !field.is_empty() && !violation.is_empty())
+        .map_or_else(
+            || ("request".to_owned(), problem.detail.clone()),
+            |(field, violation)| (field.to_owned(), violation.to_owned()),
+        )
+}
+
+/// Whether `error` refuses one request rather than stating the endpoint's state: the global
+/// API answered 400 for it, or the request outgrew a body bound.
+pub(crate) fn refuses_request_alone(error: &RiftError) -> bool {
+    let slug = error.slug();
+    slug == rift_error::errors::client::request_invalid::SLUG
+        || (slug == rift_error::errors::client::body_limit::SLUG
+            && error.fields().iter().any(|field| {
+                field.key() == "direction"
+                    && matches!(field.value(), rift_error::ErrorValue::Display(value) if value == "request")
+            }))
 }
 
 pub(crate) fn unsupported_operation(

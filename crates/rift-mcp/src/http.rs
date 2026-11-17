@@ -868,6 +868,53 @@ fn authenticated_router(
         .with_state(stop.clone())
         .layer(middleware::from_fn_with_state(gate, authorize_request))
         .layer(middleware::from_fn(guard_loopback_boundary))
+        .layer(middleware::from_fn(problem_details))
+}
+
+/// Media type of an RFC 9457 problem details body.
+const PROBLEM_MEDIA_TYPE: &str = "application/problem+json";
+/// Most bytes of a refusal's text read into a problem's `detail`.
+const PROBLEM_DETAIL_BYTES_MAX: usize = 4096;
+
+/// Answers a client error that carries no media type, such as the MCP transport's `406`
+/// for a missing `Accept` or `415` for a body it cannot read, as `application/problem+json`
+/// whose `detail` holds the refusal's text. An answer naming its media type, such as a
+/// JSON-RPC error, passes unchanged.
+pub(crate) async fn problem_details(request: Request, next: Next) -> Response {
+    let response = next.run(request).await;
+    let status = response.status();
+    if !status.is_client_error() || response.headers().contains_key(header::CONTENT_TYPE) {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    let text = axum::body::to_bytes(body, PROBLEM_DETAIL_BYTES_MAX * 4)
+        .await
+        .unwrap_or_default();
+    let title = status.canonical_reason().unwrap_or("Client Error");
+    let mut detail = String::from_utf8_lossy(&text).trim().to_owned();
+    if detail.len() > PROBLEM_DETAIL_BYTES_MAX {
+        let mut end = PROBLEM_DETAIL_BYTES_MAX;
+        while !detail.is_char_boundary(end) {
+            end -= 1;
+        }
+        detail.truncate(end);
+    }
+    if detail.is_empty() {
+        title.clone_into(&mut detail);
+    }
+    let body = serde_json::json!({
+        "type": "about:blank",
+        "title": title,
+        "status": status.as_u16(),
+        "detail": detail,
+    })
+    .to_string();
+    parts.headers.remove(header::CONTENT_LENGTH);
+    parts.headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(PROBLEM_MEDIA_TYPE),
+    );
+    Response::from_parts(parts, axum::body::Body::from(body))
 }
 
 /// Refuses requests whose `Host` or `Origin` reaches past the loopback.
