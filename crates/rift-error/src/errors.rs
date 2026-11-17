@@ -118,6 +118,7 @@ pub const REGISTERED_SLUGS: &[&str] = &[
     "rift.core.configuration_path_pattern_invalid",
     "rift.core.configuration_port_range_inverted",
     "rift.core.configuration_port_selection_conflict",
+    "rift.core.configuration_search_default_scope_invalid",
     "rift.core.configuration_search_weights_invalid",
     "rift.core.configuration_unit_parse",
     "rift.core.configuration_unreadable",

@@ -531,6 +531,16 @@ mod tests {
                 ],
             },
             Case {
+                violation: ConfigurationViolation::SearchDefaultScopeInvalid {
+                    scope: rift_protocol::read::SearchScope::NamedLocal {
+                        name: "docs".to_owned(),
+                    },
+                },
+                slug: "rift.core.configuration_search_default_scope_invalid",
+                message: "search default scope selects one project or profile: expected `local`, `global`, or `all`, such as `default_scope = \"global\"`",
+                evidence: &[("field", "search.default_scope"), ("scope", "local@docs")],
+            },
+            Case {
                 violation: ConfigurationViolation::CommandProgramEmpty {
                     field: "lsp.rust.command",
                 },

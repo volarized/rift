@@ -145,14 +145,25 @@ impl Render for QueryOutput {
     }
 
     fn log_warnings(&mut self) {
-        let warnings = match &mut self.result {
-            QueryReadResult::Results(result) => &mut result.warnings,
-            QueryReadResult::Unavailable(SearchUnavailable::Unavailable { warnings, .. }) => {
-                warnings
+        match &mut self.result {
+            QueryReadResult::Results(result) => {
+                crate::output::log_warnings(&result.warnings);
+                result
+                    .warnings
+                    .retain(|warning| query_warning_detail(warning).is_some());
             }
-        };
-        crate::output::log_warnings(warnings);
-        warnings.retain(|warning| query_warning_detail(warning).is_some());
+            QueryReadResult::Unavailable(SearchUnavailable::Unavailable {
+                reason,
+                warnings,
+                ..
+            }) => {
+                crate::output::log_warnings(warnings);
+                warnings.retain(|warning| {
+                    query_warning_detail(warning).is_some()
+                        || super::unavailable::reports(*reason, warning)
+                });
+            }
+        }
     }
 
     fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
@@ -163,7 +174,7 @@ impl Render for QueryOutput {
                 warnings,
                 ..
             }) => {
-                out.raw_line(0, &format!("unavailable · {reason:?}"))?;
+                out.raw_line(0, &super::unavailable::line(*reason, warnings))?;
                 write_query_warnings(out, warnings)
             }
         }

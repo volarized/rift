@@ -1182,6 +1182,26 @@ journal_size_limit = "64mb"
   checkpoint, 0b to 64gb, default `64mb`. A transaction larger than the limit still grows the
   log past it until that commit
 
+<VersionBadge version="v0.0.80" />
+
+By default, a `SERVICE :search` that selects no
+[`:scope`](/docs/developer/protocol/mcp#search-scope) reads the primary project. A workspace that
+holds no project source and serves package lookup alone would have to write `:scope "global"`
+in every query, so `default_scope` selects the scope such a service reads:
+
+```toml
+[search]
+default_scope = "global"
+```
+
+- `default_scope` is `local`, the default, `global`, or `all`. A service that selects its own
+  `:scope` keeps it, and [`SERVICE :flows`](/docs/developer/protocol/mcp#search-flows) reads
+  `local` under every value
+- a scope that selects one project or profile, such as `local@api`, is refused
+- the server refuses `global` and `all` beside `:rev`, `:change`, and a
+  [commit search](/docs/developer/protocol/mcp#search-commits), so under either value such a
+  service selects `:scope "local"` itself
+
 <VersionBadge version="v0.0.46" />
 
 `large_files` decides what search does with a file whose text runs past `max_chunk`, and

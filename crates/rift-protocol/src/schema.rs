@@ -843,6 +843,18 @@ pub(crate) fn artifact_objects_schema(generator: &mut schemars::SchemaGenerator)
     schemars::json_schema!({"type": "array", "items": object.to_value()})
 }
 
+/// The closed set `[search] default_scope` takes, each scope in its wire form. The set is
+/// [`SEARCH_DEFAULT_SCOPES`](crate::configuration::SEARCH_DEFAULT_SCOPES), which acceptance
+/// enforces: [`SearchScope`](crate::read::SearchScope)'s own schema also admits the project
+/// and profile scopes a default cannot select.
+pub(crate) fn default_scope_schema(_: &mut schemars::SchemaGenerator) -> Schema {
+    let accepted: Vec<Value> = crate::configuration::SEARCH_DEFAULT_SCOPES
+        .iter()
+        .map(wire)
+        .collect();
+    schemars::json_schema!({ keyword::TYPE: keyword::STRING, keyword::ENUM: accepted })
+}
+
 /// States `default: []` on each named array property: schemars omits `default` when a
 /// field's `skip_serializing_if` predicate matches its own `#[serde(default)]` value, the
 /// case for every empty-collection field this rule targets (proven by

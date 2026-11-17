@@ -308,6 +308,10 @@ select an extra project or profile. `:scope "global"` selects dependency facts a
 combines accepted contexts. `:packages` carries requested package selections as `rdf:JSON`.
 The producer handles dependency resolution, exact package versions, and explicit package constraints.
 
+A `SERVICE :search` that selects no `:scope` reads the scope
+[`[search] default_scope`](/docs/developer/configuration#search) names: `local` unless the
+workspace configures `global` or `all`. `SERVICE :flows` reads `local`.
+
 Remote acquisition uses bounded batches and holds the selected publication for the query.
 
 ### Captured answers and pages
@@ -577,6 +581,10 @@ An exact symbol read cannot establish complete declaration coverage while select
 remain unprepared. The server logs local preparation for reads that select local source.
 Preparation counts describe the answer's publication and can decrease when source selection changes.
 
+An `unavailable` answer whose `reason` is `index_preparing` carries the `local_index_preparing`
+and `pattern_index_preparing` warnings of its read. The text of that answer opens with their
+counts, such as `unavailable · indexing is in progress (2048 of 3951 files)`.
+
 The server also logs `stale_index` when the last rebuild failed, with a `detail`
 naming the failure; the next filesystem event retries the rebuild. When its two digests are equal,
 the tree moved in recorded files outside the syntax-indexed ones or in the configuration file, and
@@ -844,10 +852,11 @@ LIMIT 10
 ```
 
 The server refuses `:packages` as `invalid_request` naming the field `packages` beside the `local`
-scope, the default, since a project read consults no package, and beside a git revision, since package facts
+scope, since a project read consults no package, and beside a git revision, since package facts
 are served for the current tree alone. A list past 64 entries, and an entry whose `manager`, `name`,
 or `version` is empty or longer than its schema allows, refuse the same way before anything
-reaches the global API.
+reaches the global API. A service that selects no `:scope` reads `local` unless
+[`[search] default_scope`](/docs/developer/configuration#search) names another.
 
 ## Resources
 

@@ -1,10 +1,12 @@
 use super::ConfigurationViolation;
 use super::ConfigurationViolation::{
     PackageRegistryInvalid, PackageSelectorInvalid, PortSelectionConflict,
+    SearchDefaultScopeInvalid, SearchWeightsInvalid,
 };
 use rift_error::errors::core::{
     configuration_package_registry_invalid, configuration_package_selector_invalid,
-    configuration_port_selection_conflict,
+    configuration_port_selection_conflict, configuration_search_default_scope_invalid,
+    configuration_search_weights_invalid,
 };
 use rift_error::{ErrorContext, RiftError, errors};
 
@@ -44,9 +46,8 @@ pub fn configuration_violation_error(violation: &ConfigurationViolation) -> Rift
         ConfigurationViolation::EmbeddingIdentifierInvalid { .. } => {
             build!(errors::core::configuration_embedding_identifier_invalid())
         }
-        ConfigurationViolation::SearchWeightsInvalid { .. } => {
-            build!(errors::core::configuration_search_weights_invalid())
-        }
+        SearchWeightsInvalid { .. } => build!(configuration_search_weights_invalid()),
+        SearchDefaultScopeInvalid { .. } => build!(configuration_search_default_scope_invalid()),
         ConfigurationViolation::CommandProgramEmpty { .. } => {
             build!(errors::core::configuration_command_program_empty())
         }

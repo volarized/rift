@@ -22,11 +22,13 @@ const SEARCH_GRAPH_PREFIX: &str = "urn:rift:retrieval:";
 const FLOW_LIMIT_DEFAULT: u64 = 5;
 const FLOW_LIMIT_MAX: u64 = 32;
 pub(super) const RDF_JSON: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON";
+/// The input a service selects its scope with.
+const SCOPE_FIELD: &str = "scope";
 const INPUT_FIELDS: &[&str] = &[
     "view",
     "query",
     "pattern",
-    "scope",
+    SCOPE_FIELD,
     "target",
     "order",
     "packages",
@@ -46,6 +48,27 @@ pub struct RetrievalSelection {
     pub request: SearchParams,
     /// Maximum complete flow records, when the service selects call paths.
     pub flow_limit: Option<usize>,
+    scope_choice: ScopeChoice,
+}
+
+impl RetrievalSelection {
+    /// Selects `scope` when the service left the choice to the workspace.
+    pub(super) fn select_default_scope(&mut self, scope: &SearchScope) {
+        match self.scope_choice {
+            ScopeChoice::Workspace => self.request.scope.clone_from(scope),
+            ScopeChoice::Service => {}
+        }
+    }
+}
+
+/// Who chooses the scope one service reads.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScopeChoice {
+    /// The service itself: a `SERVICE :search` that selects `:scope`, or `SERVICE :flows`,
+    /// which reads `local` alone.
+    Service,
+    /// The workspace: a `SERVICE :search` that selects no `:scope`.
+    Workspace,
 }
 
 pub(super) fn rewrite(
@@ -68,7 +91,7 @@ pub(super) fn rewrite(
         return super::query::refused(&format!("SERVICE {name}"));
     }
     let flows = service == FLOWS_SERVICE;
-    let mut request = request(inner, flows)?;
+    let (mut request, scope_choice) = request(inner, flows)?;
     let flow_limit = flows
         .then(|| prepare_flow_request(&mut request))
         .transpose()?;
@@ -87,6 +110,7 @@ pub(super) fn rewrite(
         graph,
         request,
         flow_limit,
+        scope_choice,
     })
 }
 
@@ -109,7 +133,10 @@ fn prepare_flow_request(request: &mut SearchParams) -> Result<usize, RiftError> 
     usize::try_from(limit).map_err(|error| invalid(&error.to_string()))
 }
 
-fn request(inner: &mut QueryExpression, flows: bool) -> Result<SearchParams, RiftError> {
+fn request(
+    inner: &mut QueryExpression,
+    flows: bool,
+) -> Result<(SearchParams, ScopeChoice), RiftError> {
     let mut fields = Map::new();
     let mut include = BTreeSet::new();
     let mut pending = vec![(inner, true)];
@@ -200,7 +227,14 @@ fn request(inner: &mut QueryExpression, flows: bool) -> Result<SearchParams, Rif
             Value::Array(include.into_iter().map(Value::String).collect()),
         );
     }
-    serde_json::from_value(Value::Object(fields)).map_err(|error| invalid(&error.to_string()))
+    let scope_choice = if flows || fields.contains_key(SCOPE_FIELD) {
+        ScopeChoice::Service
+    } else {
+        ScopeChoice::Workspace
+    };
+    let request = serde_json::from_value(Value::Object(fields))
+        .map_err(|error| invalid(&error.to_string()))?;
+    Ok((request, scope_choice))
 }
 
 fn input(key: &str, object: &TermPattern) -> Result<Value, RiftError> {
@@ -288,5 +322,130 @@ mod tests {
                 "{input}"
             );
         }
+    }
+
+    /// Each selection's constant `:query` paired with the scope it reads, sorted by that query.
+    fn scopes_by_query(query: &GraphQuery) -> Vec<(String, SearchScope)> {
+        let mut scopes: Vec<_> = query
+            .retrieval_requests()
+            .iter()
+            .map(|selection| {
+                let query = selection.request.query.clone().unwrap_or_default();
+                (query, selection.request.scope.clone())
+            })
+            .collect();
+        scopes.sort();
+        scopes
+    }
+
+    fn parsed(text: &str) -> Result<GraphQuery, rift_error::RiftError> {
+        GraphQuery::parse(text, &GraphLimits::default())
+    }
+
+    #[test]
+    fn test_default_scope_reaches_a_search_service_naming_no_scope()
+    -> Result<(), rift_error::RiftError> {
+        let text = "SELECT ?hit { SERVICE :search { ?hit :query 'beacon' } }";
+        for default_scope in [SearchScope::Local, SearchScope::Global, SearchScope::All] {
+            let query = parsed(text)?.with_default_scope(&default_scope);
+            assert_eq!(
+                scopes_by_query(&query),
+                [("beacon".to_owned(), default_scope)]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_default_scope_leaves_a_search_service_naming_its_scope()
+    -> Result<(), rift_error::RiftError> {
+        let named = [
+            ("local", SearchScope::Local),
+            ("all", SearchScope::All),
+            ("global", SearchScope::Global),
+            (
+                "local@docs",
+                SearchScope::NamedLocal {
+                    name: "docs".to_owned(),
+                },
+            ),
+        ];
+        for (spelling, scope) in named {
+            let text = format!(
+                "SELECT ?hit {{ SERVICE :search {{ ?hit :query 'beacon'; :scope '{spelling}' }} }}"
+            );
+            for default_scope in [SearchScope::Global, SearchScope::All] {
+                let query = parsed(&text)?.with_default_scope(&default_scope);
+                assert_eq!(
+                    scopes_by_query(&query),
+                    [("beacon".to_owned(), scope.clone())],
+                    "{spelling} under {default_scope:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_default_scope_reaches_only_the_services_naming_no_scope()
+    -> Result<(), rift_error::RiftError> {
+        let query = parsed(
+            "SELECT ?symbol { \
+             SERVICE :search { ?first :query 'named'; :scope 'local'; :symbol ?symbol } \
+             SERVICE :search { ?second :query 'unnamed'; :symbol ?symbol } }",
+        )?
+        .with_default_scope(&SearchScope::All);
+        assert_eq!(
+            scopes_by_query(&query),
+            [
+                ("named".to_owned(), SearchScope::Local),
+                ("unnamed".to_owned(), SearchScope::All),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_default_scope_leaves_a_flow_service_local() -> Result<(), rift_error::RiftError> {
+        let text = "SELECT ?flow { SERVICE :flows { ?flow :query 'middleware'; :limit 2 } }";
+        for default_scope in [SearchScope::Global, SearchScope::All] {
+            let query = parsed(text)?.with_default_scope(&default_scope);
+            assert_eq!(
+                scopes_by_query(&query),
+                [("middleware".to_owned(), SearchScope::Local)],
+                "{default_scope:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_default_scope_local_changes_no_selection() -> Result<(), rift_error::RiftError> {
+        let text = "SELECT ?symbol { \
+                    SERVICE :search { ?first :query 'named'; :scope 'all'; :symbol ?symbol } \
+                    SERVICE :search { ?second :query 'unnamed'; :symbol ?symbol } }";
+        let parsed_scopes = scopes_by_query(&parsed(text)?);
+        let defaulted = parsed(text)?.with_default_scope(&SearchScope::Local);
+        assert_eq!(scopes_by_query(&defaulted), parsed_scopes);
+        assert_eq!(
+            parsed_scopes,
+            [
+                ("named".to_owned(), SearchScope::All),
+                ("unnamed".to_owned(), SearchScope::Local),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_default_scope_is_replaced_by_a_later_one() -> Result<(), rift_error::RiftError> {
+        let query = parsed("SELECT ?hit { SERVICE :search { ?hit :query 'beacon' } }")?
+            .with_default_scope(&SearchScope::Global)
+            .with_default_scope(&SearchScope::All);
+        assert_eq!(
+            scopes_by_query(&query),
+            [("beacon".to_owned(), SearchScope::All)]
+        );
+        Ok(())
     }
 }
