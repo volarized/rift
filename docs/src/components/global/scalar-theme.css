@@ -260,6 +260,35 @@ body > .scalar-app,
   }
 }
 
+/* ---- Inside an operation: two columns. ---- */
+
+/* Scalar lays an open operation out in three columns: its details, the example
+   responses, and the request example. Here the request example sits under the
+   details, which end in the list of responses, and the example responses keep
+   the second column. Both conditions are Scalar's own: below either one it
+   stacks the three in a single column, and these rules stay out. */
+@media (min-width: 1000px) {
+  @container (width > 900px) {
+    .rift-scalar .scalar-app .endpoint-content {
+      grid-auto-flow: row;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-rows: auto 1fr;
+    }
+
+    .rift-scalar .scalar-app .endpoint-content > .operation-details-card {
+      grid-area: 1 / 1;
+    }
+
+    .rift-scalar .scalar-app .endpoint-content > .scalar-card {
+      grid-area: 1 / 2 / span 2;
+    }
+
+    .rift-scalar .scalar-app .endpoint-content > :not(.operation-details-card, .scalar-card) {
+      grid-area: 2 / 1;
+    }
+  }
+}
+
 /* ---- Inside an operation: outline only, hairline weight. ---- */
 
 .rift-scalar .scalar-app .section-accordion-description {
