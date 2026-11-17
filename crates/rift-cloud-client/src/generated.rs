@@ -4631,7 +4631,7 @@ impl SearchRequestBody {
     oas3_gen_support::Default
 )]
 pub struct SearchPackagesRequestQuery {
-    /// Maximum entries in one page.
+    /// Maximum entries in one page, at most the `page_limit_max` the capabilities advertise; the server refuses a larger one.
     #[validate(range(min = 1i64, max = 1_000i64))]
     #[default(Some(100i64))]
     pub limit: Option<i64>,
@@ -5097,7 +5097,7 @@ pub enum NodesResponse {
     oas3_gen_support::Default
 )]
 pub struct SearchPackagePatternsRequestQuery {
-    /// Maximum entries in one page.
+    /// Maximum entries in one page, at most the `page_limit_max` the capabilities advertise; the server refuses a larger one.
     #[validate(range(min = 1i64, max = 1_000i64))]
     #[default(Some(100i64))]
     pub limit: Option<i64>,

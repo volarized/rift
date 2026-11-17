@@ -2891,7 +2891,7 @@
         "name": "limit",
         "in": "query",
         "required": false,
-        "description": "Maximum entries in one page.",
+        "description": "Maximum entries in one page, at most the `page_limit_max` the capabilities advertise; the server refuses a larger one.",
         "schema": {
           "type": "integer",
           "minimum": 1,
