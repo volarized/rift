@@ -46,11 +46,15 @@
                         "search",
                         "symbols",
                         "documentation_search",
-                        "symbol_documentation"
+                        "symbol_documentation",
+                        "patterns",
+                        "declarations",
+                        "nodes",
+                        "relationships"
                       ],
                       "publication_format": "rift-package-index-v2",
-                      "analyzer_revision": "2026-09-22",
-                      "corpus_revision": "2026-09-22",
+                      "analyzer_revision": "8f3371e3",
+                      "corpus_revision": "9ed97ad7",
                       "required_search_fields": [
                         "name",
                         "qualified_name",
@@ -65,17 +69,47 @@
                         "query_terms_max": 32,
                         "query_term_bytes_max": 256,
                         "identifiers_max": 16,
-                        "identifier_bytes_max": 4096,
-                        "packages_max": 20000,
+                        "identifier_bytes_max": 256,
+                        "packages_max": 64,
                         "page_limit_min": 1,
-                        "page_limit_max": 1000,
+                        "page_limit_max": 200,
                         "page_limit_default": 100,
                         "cursor_bytes_max": 4096,
                         "candidate_pool_max": 1000,
                         "warnings_max": 32,
-                        "source_bytes_max": 1048576
+                        "source_bytes_max": 33554432
                       },
-                      "documentation_revision": "0123abcd"
+                      "documentation_revision": "8f3371e3",
+                      "relationship_capabilities": [
+                        {
+                          "direction": "incoming",
+                          "facets": [
+                            "contains"
+                          ],
+                          "bounds": {
+                            "max_seeds": 64,
+                            "max_facets": 16,
+                            "max_relationships": 1000,
+                            "max_occurrences": 1000,
+                            "max_symbols": 10000,
+                            "max_sources": 10000
+                          }
+                        },
+                        {
+                          "direction": "outgoing",
+                          "facets": [
+                            "contains"
+                          ],
+                          "bounds": {
+                            "max_seeds": 64,
+                            "max_facets": 16,
+                            "max_relationships": 1000,
+                            "max_occurrences": 1000,
+                            "max_symbols": 10000,
+                            "max_sources": 10000
+                          }
+                        }
+                      ]
                     }
                   }
                 }
@@ -313,9 +347,9 @@
                       "available_exact": [
                         {
                           "manager": "cargo",
+                          "registry": "crates.io",
                           "name": "serde",
-                          "version": "1.0.219",
-                          "registry": "crates.io"
+                          "version": "1.0.219"
                         }
                       ],
                       "resolved_requirements": [
@@ -323,15 +357,15 @@
                           "entry": {
                             "manager": "npm",
                             "name": "typescript",
-                            "availability": "canonical",
+                            "registry": "npmjs.org",
                             "requirement": "^5.7.2",
-                            "registry": "npmjs.org"
+                            "availability": "canonical"
                           },
                           "package": {
                             "manager": "npm",
+                            "registry": "npmjs.org",
                             "name": "typescript",
-                            "version": "5.7.2",
-                            "registry": "npmjs.org"
+                            "version": "5.9.3"
                           }
                         }
                       ],
@@ -348,41 +382,35 @@
                           "entry": {
                             "manager": "npm",
                             "name": "typescript",
-                            "availability": "canonical",
+                            "registry": "npmjs.org",
                             "requirement": "~5.7.2",
-                            "registry": "npmjs.org"
+                            "availability": "canonical"
                           },
                           "package": {
                             "manager": "npm",
+                            "registry": "npmjs.org",
                             "name": "typescript",
-                            "version": "5.9.3",
-                            "registry": "npmjs.org"
+                            "version": "5.7.3"
                           }
                         },
                         {
                           "entry": {
                             "manager": "pypi",
                             "name": "sqlalchemy",
-                            "availability": "canonical",
+                            "registry": "pypi.org",
                             "version": "2.0.30",
-                            "registry": "pypi.org"
+                            "availability": "canonical"
                           },
                           "package": {
                             "manager": "pypi",
+                            "registry": "pypi.org",
                             "name": "sqlalchemy",
-                            "version": "2.0.28",
-                            "registry": "pypi.org"
+                            "version": "2.0.48"
                           }
                         }
                       ],
                       "missing_exact": [],
-                      "missing_requirements": [],
-                      "warnings": [
-                        {
-                          "code": "requirement_unsatisfied",
-                          "detail": "npm/typescript ~5.7.2 answered by 5.9.3"
-                        }
-                      ]
+                      "missing_requirements": []
                     }
                   }
                 }
@@ -578,22 +606,22 @@
                 "valid": {
                   "summary": "Valid request",
                   "value": {
-                    "query": "ReadService",
+                    "query": "Buffer",
                     "terms": [
                       {
-                        "text": "ReadService",
+                        "text": "Buffer",
                         "phrase": false,
                         "prefix": false
                       }
                     ],
                     "identifiers": [
-                      "readservice"
+                      "Buffer"
                     ],
                     "packages": [
                       {
                         "manager": "cargo",
-                        "name": "serde",
-                        "version": "1.0.219",
+                        "name": "itoa",
+                        "version": "1.0.18",
                         "registry": "crates.io"
                       }
                     ],
@@ -603,20 +631,22 @@
                 "documentation": {
                   "summary": "Documentation search request",
                   "value": {
-                    "query": "Serde",
+                    "query": "itoa",
                     "terms": [
                       {
-                        "text": "Serde",
+                        "text": "itoa",
                         "phrase": false,
                         "prefix": false
                       }
                     ],
-                    "identifiers": [],
+                    "identifiers": [
+                      "itoa"
+                    ],
                     "packages": [
                       {
                         "manager": "cargo",
-                        "name": "serde",
-                        "version": "1.0.219",
+                        "name": "itoa",
+                        "version": "1.0.18",
                         "registry": "crates.io"
                       }
                     ],
@@ -629,19 +659,19 @@
                   "value": {
                     "relationships": {
                       "seeds": [
-                        "rift://symbol/cargo/crates.io/demo/rust/demo/helper"
+                        "rift://symbol/pypi/pypi.org/idna/python/idna/codec/Codec"
                       ],
                       "direction": "outgoing",
                       "facets": [
-                        "calls"
+                        "contains"
                       ]
                     },
                     "packages": [
                       {
-                        "manager": "cargo",
-                        "registry": "crates.io",
-                        "name": "demo",
-                        "version": "1.0.0"
+                        "manager": "pypi",
+                        "name": "idna",
+                        "version": "3.12",
+                        "registry": "pypi.org"
                       }
                     ]
                   }
@@ -673,48 +703,349 @@
                         {
                           "package": {
                             "manager": "cargo",
-                            "name": "serde",
-                            "version": "1.0.219",
-                            "registry": "crates.io"
+                            "registry": "crates.io",
+                            "name": "itoa",
+                            "version": "1.0.18"
                           },
                           "symbol": {
-                            "id": "rift://symbol/cargo/crates.io/serde/rust/serde/de/ReadService",
+                            "id": "rift://symbol/cargo/crates.io/itoa/rust/itoa/Buffer",
                             "language": "rust",
-                            "name": "ReadService",
+                            "name": "Buffer",
                             "kind": "struct",
+                            "facets": [
+                              "type",
+                              "public"
+                            ],
                             "origin": {
                               "location": "dependency",
                               "package": {
                                 "manager": "cargo",
-                                "name": "serde",
-                                "version": "1.0.219",
-                                "registry": "crates.io"
+                                "registry": "crates.io",
+                                "name": "itoa",
+                                "version": "1.0.18"
                               },
                               "source_kind": "authored"
-                            }
+                            },
+                            "modifiers": [],
+                            "visibility": "pub",
+                            "types": [],
+                            "signatures": [],
+                            "documentation": [
+                              {
+                                "format": "markdown",
+                                "text": "A correctly sized stack allocation for the formatted integer to be written\ninto.\n\n# Example\n\n```\nlet mut buffer = itoa::Buffer::new();\nlet printed = buffer.format(1234);\nassert_eq!(printed, \"1234\");\n```"
+                              }
+                            ],
+                            "document_local": false
                           },
-                          "unit": "rift://source/cargo/crates.io/serde/src/de.rs",
+                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
                           "range": {
-                            "start": 0,
-                            "end": 10
+                            "start": 2357,
+                            "end": 2427
                           },
-                          "line": 1,
+                          "line": 72,
                           "contributing_fields": [
-                            "name"
+                            "name",
+                            "qualified_name",
+                            "documentation",
+                            "file_content"
                           ],
-                          "qualified_name": "de::ReadService",
-                          "match_class": "name_exact"
+                          "match_class": "qualified_exact",
+                          "qualified_name": "Buffer"
+                        },
+                        {
+                          "package": {
+                            "manager": "cargo",
+                            "registry": "crates.io",
+                            "name": "itoa",
+                            "version": "1.0.18"
+                          },
+                          "symbol": {
+                            "id": "rift://symbol/cargo/crates.io/itoa/rust/itoa/Buffer/format",
+                            "language": "rust",
+                            "name": "format",
+                            "kind": "function",
+                            "facets": [
+                              "value",
+                              "callable",
+                              "public"
+                            ],
+                            "origin": {
+                              "location": "dependency",
+                              "package": {
+                                "manager": "cargo",
+                                "registry": "crates.io",
+                                "name": "itoa",
+                                "version": "1.0.18"
+                              },
+                              "source_kind": "authored"
+                            },
+                            "container": "rift://symbol/cargo/crates.io/itoa/rust/itoa/Buffer",
+                            "modifiers": [],
+                            "visibility": "pub",
+                            "types": [],
+                            "signatures": [
+                              {
+                                "display": "pub fn format<I: Integer>(&mut self, i: I) -> &str",
+                                "links": [],
+                                "language": "rust",
+                                "parameters": [],
+                                "returns": [],
+                                "type_parameters": [],
+                                "throws": [],
+                                "effects": []
+                              }
+                            ],
+                            "documentation": [
+                              {
+                                "format": "markdown",
+                                "text": "Print an integer into this buffer and return a reference to its string\nrepresentation within the buffer."
+                              }
+                            ],
+                            "document_local": false
+                          },
+                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                          "range": {
+                            "start": 3181,
+                            "end": 3484
+                          },
+                          "line": 106,
+                          "contributing_fields": [
+                            "qualified_name",
+                            "documentation",
+                            "file_content"
+                          ],
+                          "match_class": "substring",
+                          "qualified_name": "Buffer::format"
+                        },
+                        {
+                          "package": {
+                            "manager": "cargo",
+                            "registry": "crates.io",
+                            "name": "itoa",
+                            "version": "1.0.18"
+                          },
+                          "symbol": {
+                            "id": "rift://symbol/cargo/crates.io/itoa/rust/itoa/Buffer/new",
+                            "language": "rust",
+                            "name": "new",
+                            "kind": "function",
+                            "facets": [
+                              "value",
+                              "callable",
+                              "public"
+                            ],
+                            "origin": {
+                              "location": "dependency",
+                              "package": {
+                                "manager": "cargo",
+                                "registry": "crates.io",
+                                "name": "itoa",
+                                "version": "1.0.18"
+                              },
+                              "source_kind": "authored"
+                            },
+                            "container": "rift://symbol/cargo/crates.io/itoa/rust/itoa/Buffer",
+                            "modifiers": [],
+                            "visibility": "pub",
+                            "types": [],
+                            "signatures": [
+                              {
+                                "display": "pub fn new() -> Buffer",
+                                "links": [],
+                                "language": "rust",
+                                "parameters": [],
+                                "returns": [],
+                                "type_parameters": [],
+                                "throws": [],
+                                "effects": []
+                              }
+                            ],
+                            "documentation": [
+                              {
+                                "format": "markdown",
+                                "text": "This is a cheap operation; you don't need to worry about reusing buffers\nfor efficiency."
+                              }
+                            ],
+                            "document_local": false
+                          },
+                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                          "range": {
+                            "start": 2881,
+                            "end": 3006
+                          },
+                          "line": 98,
+                          "contributing_fields": [
+                            "qualified_name",
+                            "signature",
+                            "file_content"
+                          ],
+                          "match_class": "substring",
+                          "qualified_name": "Buffer::new"
+                        },
+                        {
+                          "package": {
+                            "manager": "cargo",
+                            "registry": "crates.io",
+                            "name": "itoa",
+                            "version": "1.0.18"
+                          },
+                          "symbol": {
+                            "id": "rift://symbol/cargo/crates.io/itoa/rust/itoa/private/Sealed/write",
+                            "language": "rust",
+                            "name": "write",
+                            "kind": "function",
+                            "facets": [
+                              "value",
+                              "callable"
+                            ],
+                            "origin": {
+                              "location": "dependency",
+                              "package": {
+                                "manager": "cargo",
+                                "registry": "crates.io",
+                                "name": "itoa",
+                                "version": "1.0.18"
+                              },
+                              "source_kind": "authored"
+                            },
+                            "container": "rift://symbol/cargo/crates.io/itoa/rust/itoa/private/Sealed",
+                            "modifiers": [],
+                            "visibility": "private",
+                            "types": [],
+                            "signatures": [
+                              {
+                                "display": "fn write(self, buf: &mut Self::Buffer) -> &str",
+                                "links": [],
+                                "language": "rust",
+                                "parameters": [],
+                                "returns": [],
+                                "type_parameters": [],
+                                "throws": [],
+                                "effects": []
+                              }
+                            ],
+                            "documentation": [],
+                            "document_local": false
+                          },
+                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                          "range": {
+                            "start": 4029,
+                            "end": 4076
+                          },
+                          "line": 131,
+                          "contributing_fields": [
+                            "signature",
+                            "file_content"
+                          ],
+                          "match_class": "unknown",
+                          "qualified_name": "private::Sealed::write"
+                        },
+                        {
+                          "package": {
+                            "manager": "cargo",
+                            "registry": "crates.io",
+                            "name": "itoa",
+                            "version": "1.0.18"
+                          },
+                          "symbol": {
+                            "id": "rift://symbol/cargo/crates.io/itoa/rust/itoa/Integer",
+                            "language": "rust",
+                            "name": "Integer",
+                            "kind": "trait",
+                            "facets": [
+                              "type",
+                              "public"
+                            ],
+                            "origin": {
+                              "location": "dependency",
+                              "package": {
+                                "manager": "cargo",
+                                "registry": "crates.io",
+                                "name": "itoa",
+                                "version": "1.0.18"
+                              },
+                              "source_kind": "authored"
+                            },
+                            "modifiers": [],
+                            "visibility": "pub",
+                            "types": [],
+                            "signatures": [],
+                            "documentation": [
+                              {
+                                "format": "markdown",
+                                "text": "An integer that can be written into an [`itoa::Buffer`][Buffer].\n\nThis trait is sealed and cannot be implemented for types outside of itoa."
+                              }
+                            ],
+                            "document_local": false
+                          },
+                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                          "range": {
+                            "start": 3639,
+                            "end": 3836
+                          },
+                          "line": 119,
+                          "contributing_fields": [
+                            "documentation"
+                          ],
+                          "match_class": "unknown",
+                          "qualified_name": "Integer"
+                        },
+                        {
+                          "package": {
+                            "manager": "cargo",
+                            "registry": "crates.io",
+                            "name": "itoa",
+                            "version": "1.0.18"
+                          },
+                          "symbol": {
+                            "id": "rift://symbol/cargo/crates.io/itoa/rust/itoa/private/Sealed",
+                            "language": "rust",
+                            "name": "Sealed",
+                            "kind": "trait",
+                            "facets": [
+                              "type",
+                              "public"
+                            ],
+                            "origin": {
+                              "location": "dependency",
+                              "package": {
+                                "manager": "cargo",
+                                "registry": "crates.io",
+                                "name": "itoa",
+                                "version": "1.0.18"
+                              },
+                              "source_kind": "authored"
+                            },
+                            "container": "rift://symbol/cargo/crates.io/itoa/rust/itoa/private",
+                            "modifiers": [],
+                            "visibility": "pub",
+                            "types": [],
+                            "signatures": [],
+                            "documentation": [],
+                            "document_local": false
+                          },
+                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                          "range": {
+                            "start": 3943,
+                            "end": 4082
+                          },
+                          "line": 128,
+                          "contributing_fields": [
+                            "file_content"
+                          ],
+                          "match_class": "unknown",
+                          "qualified_name": "private::Sealed"
                         }
                       ],
                       "warnings": [],
                       "publication_format": "rift-package-index-v2",
-                      "analyzer_revision": "2026-09-22",
-                      "corpus_revision": "2026-09-22",
-                      "next_cursor": "eyJwYWdlIjoyfQ",
-                      "documentation_revision": "0123abcd",
+                      "analyzer_revision": "8f3371e3",
+                      "corpus_revision": "9ed97ad7",
+                      "documentation_revision": "8f3371e3",
                       "view": {
-                        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                        "expires_at": "2026-10-10T10:05:00Z"
+                        "id": "eyJ2ZXJzaW9uIjo0LCJzbG90IjoxMTcsImRlc2NyaXB0b3JfZGlnZXN0IjoiOTA0ZmE0YzJiYWMyYjUwNjQ5OGJlYjZhMGRiYmZmZmQ2OTdhM2I3MWNjOWI5MzhiZGM4NDdhYjgzZWM3M2NjMiIsImNvbGxlY3Rpb25fY29udGV4dCI6ImQyZDgyNGIzMjA5NTczNDM4M2U4MGZmMmY3ZjRjNzQzNmRiZGM0NDFkM2RlOTZlNGMxNzlkMjljMjkzM2JlOTIiLCJleHBpcmVzX2F0IjoxNzk0OTE4NTUwfQ.l1PfACRL2gkCmojWRbbDLf6N28_dqya4hwfn5Yp2tvU",
+                        "expires_at": "2026-11-17T12:29:10Z"
                       }
                     }
                   },
@@ -726,52 +1057,199 @@
                           "target": "documentation",
                           "package": {
                             "manager": "cargo",
-                            "name": "serde",
-                            "version": "1.0.219",
-                            "registry": "crates.io"
+                            "registry": "crates.io",
+                            "name": "itoa",
+                            "version": "1.0.18"
                           },
                           "documentation": {
                             "block": {
-                              "identity": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                              "identity": "46e487b5adde3604c4215057f426a24d62fab95d73378462d7315a36a4b1ef1c",
                               "source": {
                                 "source": {
-                                  "kind": "package",
-                                  "unit": "rift://source/cargo/crates.io/serde/README.md"
+                                  "unit": "rift://source/cargo/crates.io/itoa/README.md",
+                                  "kind": "package"
                                 }
                               },
-                              "content_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                              "content_digest": "84c5a4fa3088f8ba8bfc525e77420692fd4420fca76c1cd6223b32cc09792407",
+                              "heading_path": [
+                                {
+                                  "level": 1,
+                                  "name": "itoa"
+                                }
+                              ],
                               "range": {
                                 "start": 0,
-                                "end": 13
+                                "end": 5
                               },
                               "line": 1,
-                              "kind": "prose"
+                              "kind": "prose",
+                              "chunks": [
+                                {
+                                  "identity": "rift://source/cargo/crates.io/itoa/README.md",
+                                  "range": {
+                                    "start": 0,
+                                    "end": 2299
+                                  }
+                                }
+                              ]
                             },
                             "source": {
                               "identity": {
                                 "source": {
-                                  "kind": "package",
-                                  "unit": "rift://source/cargo/crates.io/serde/README.md"
+                                  "unit": "rift://source/cargo/crates.io/itoa/README.md",
+                                  "kind": "package"
                                 }
                               },
-                              "revision": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-                              "content_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                              "revision": "1305bd79675db0194915d9bc91bd0b3cf9487bc1126e05bf46b48ab43edce44b",
+                              "content_digest": "1305bd79675db0194915d9bc91bd0b3cf9487bc1126e05bf46b48ab43edce44b",
                               "origin": {
                                 "location": "dependency",
                                 "package": {
                                   "manager": "cargo",
-                                  "name": "serde",
-                                  "version": "1.0.219",
-                                  "registry": "crates.io"
+                                  "registry": "crates.io",
+                                  "name": "itoa",
+                                  "version": "1.0.18"
                                 },
                                 "source_kind": "authored"
                               },
                               "format": "markdown",
                               "media_type": "text/markdown",
                               "selection": "package_archive",
-                              "byte_length": 13
+                              "byte_length": 2299
                             },
-                            "documentation_revision": "0123abcd"
+                            "documentation_revision": "8f3371e3"
+                          },
+                          "contributing_fields": [
+                            "content"
+                          ]
+                        },
+                        {
+                          "target": "documentation",
+                          "package": {
+                            "manager": "cargo",
+                            "registry": "crates.io",
+                            "name": "itoa",
+                            "version": "1.0.18"
+                          },
+                          "documentation": {
+                            "block": {
+                              "identity": "f663ab705633739b8337b6bf483ada4a06b675b7930fb15f704d3394fff9cfd9",
+                              "source": {
+                                "source": {
+                                  "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                                  "kind": "package"
+                                }
+                              },
+                              "content_digest": "2978679e0059ba28e4bd2ffe908cc5061de407ba86a5f29303c0485e4df2236c",
+                              "range": {
+                                "start": 3488,
+                                "end": 3557
+                              },
+                              "line": 116,
+                              "kind": "prose",
+                              "chunks": [
+                                {
+                                  "identity": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                                  "range": {
+                                    "start": 0,
+                                    "end": 16904
+                                  }
+                                }
+                              ],
+                              "symbol": "rift://symbol/cargo/crates.io/itoa/rust/itoa/Integer"
+                            },
+                            "source": {
+                              "identity": {
+                                "source": {
+                                  "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                                  "kind": "package"
+                                }
+                              },
+                              "revision": "e962338e1886873aa7c3399ec89aa5378ccbfed712b9690f043628079390a34f",
+                              "content_digest": "e962338e1886873aa7c3399ec89aa5378ccbfed712b9690f043628079390a34f",
+                              "origin": {
+                                "location": "dependency",
+                                "package": {
+                                  "manager": "cargo",
+                                  "registry": "crates.io",
+                                  "name": "itoa",
+                                  "version": "1.0.18"
+                                },
+                                "source_kind": "authored"
+                              },
+                              "format": "attached_comment",
+                              "media_type": "text/markdown",
+                              "selection": "attached_comment",
+                              "byte_length": 16904,
+                              "language": "rust"
+                            },
+                            "documentation_revision": "8f3371e3"
+                          },
+                          "contributing_fields": [
+                            "documentation"
+                          ]
+                        },
+                        {
+                          "target": "documentation",
+                          "package": {
+                            "manager": "cargo",
+                            "registry": "crates.io",
+                            "name": "itoa",
+                            "version": "1.0.18"
+                          },
+                          "documentation": {
+                            "block": {
+                              "identity": "85dfa46fdad18c2999e196ad6a0563a89b67e60a521195e1b006aefe89131331",
+                              "source": {
+                                "source": {
+                                  "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                                  "kind": "package"
+                                }
+                              },
+                              "content_digest": "639b0f72b8f659492cd5e727fbad6271312a66d066708fb53ba3e7ab042ca806",
+                              "range": {
+                                "start": 2116,
+                                "end": 2195
+                              },
+                              "line": 62,
+                              "kind": "prose",
+                              "chunks": [
+                                {
+                                  "identity": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                                  "range": {
+                                    "start": 0,
+                                    "end": 16904
+                                  }
+                                }
+                              ],
+                              "symbol": "rift://symbol/cargo/crates.io/itoa/rust/itoa/Buffer"
+                            },
+                            "source": {
+                              "identity": {
+                                "source": {
+                                  "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                                  "kind": "package"
+                                }
+                              },
+                              "revision": "e962338e1886873aa7c3399ec89aa5378ccbfed712b9690f043628079390a34f",
+                              "content_digest": "e962338e1886873aa7c3399ec89aa5378ccbfed712b9690f043628079390a34f",
+                              "origin": {
+                                "location": "dependency",
+                                "package": {
+                                  "manager": "cargo",
+                                  "registry": "crates.io",
+                                  "name": "itoa",
+                                  "version": "1.0.18"
+                                },
+                                "source_kind": "authored"
+                              },
+                              "format": "attached_comment",
+                              "media_type": "text/markdown",
+                              "selection": "attached_comment",
+                              "byte_length": 16904,
+                              "language": "rust"
+                            },
+                            "documentation_revision": "8f3371e3"
                           },
                           "contributing_fields": [
                             "documentation",
@@ -781,51 +1259,223 @@
                       ],
                       "warnings": [],
                       "publication_format": "rift-package-index-v2",
-                      "analyzer_revision": "2026-09-22",
-                      "corpus_revision": "2026-09-22",
-                      "documentation_revision": "0123abcd",
+                      "analyzer_revision": "8f3371e3",
+                      "corpus_revision": "9ed97ad7",
+                      "documentation_revision": "8f3371e3",
                       "view": {
-                        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                        "expires_at": "2026-10-10T10:05:00Z"
+                        "id": "eyJ2ZXJzaW9uIjo0LCJzbG90IjoxMTcsImRlc2NyaXB0b3JfZGlnZXN0IjoiOTA0ZmE0YzJiYWMyYjUwNjQ5OGJlYjZhMGRiYmZmZmQ2OTdhM2I3MWNjOWI5MzhiZGM4NDdhYjgzZWM3M2NjMiIsImNvbGxlY3Rpb25fY29udGV4dCI6ImQyZDgyNGIzMjA5NTczNDM4M2U4MGZmMmY3ZjRjNzQzNmRiZGM0NDFkM2RlOTZlNGMxNzlkMjljMjkzM2JlOTIiLCJleHBpcmVzX2F0IjoxNzk0OTE4NTUwfQ.l1PfACRL2gkCmojWRbbDLf6N28_dqya4hwfn5Yp2tvU",
+                        "expires_at": "2026-11-17T12:29:10Z"
                       }
                     }
                   },
-                  "empty_relationships": {
-                    "summary": "Complete empty adjacency",
+                  "relationships": {
+                    "summary": "Relationship page",
                     "value": {
                       "groups": [
                         {
-                          "seed": "rift://symbol/cargo/crates.io/demo/rust/demo/helper",
-                          "relationships": [],
+                          "seed": "rift://symbol/pypi/pypi.org/idna/python/idna/codec/Codec",
+                          "relationships": [
+                            {
+                              "id": "63d8dd9d4533c338f4f1d9953fad4eab6b92b5723a55f88b888fe9abfca1d9dd",
+                              "relationship": {
+                                "from": "rift://symbol/pypi/pypi.org/idna/python/idna/codec/Codec",
+                                "kind": "contains",
+                                "facets": [
+                                  "contains"
+                                ],
+                                "to": "rift://symbol/pypi/pypi.org/idna/python/idna/codec/Codec/decode",
+                                "derivation": "resolution",
+                                "producer": {
+                                  "name": "canonical-containment",
+                                  "revision": "1"
+                                }
+                              }
+                            },
+                            {
+                              "id": "b883e8af769222c814e984fc66de5d04385b52127d77e0953d48fdae4837048f",
+                              "relationship": {
+                                "from": "rift://symbol/pypi/pypi.org/idna/python/idna/codec/Codec",
+                                "kind": "contains",
+                                "facets": [
+                                  "contains"
+                                ],
+                                "to": "rift://symbol/pypi/pypi.org/idna/python/idna/codec/Codec/encode",
+                                "derivation": "resolution",
+                                "producer": {
+                                  "name": "canonical-containment",
+                                  "revision": "1"
+                                }
+                              }
+                            }
+                          ],
                           "complete": true
                         }
                       ],
                       "symbols": [
                         {
                           "symbol": {
-                            "id": "rift://symbol/cargo/crates.io/demo/rust/demo/helper",
-                            "name": "helper",
-                            "language": "rust",
-                            "kind": "function",
+                            "id": "rift://symbol/pypi/pypi.org/idna/python/idna/codec/Codec",
+                            "language": "python",
+                            "name": "Codec",
+                            "kind": "class",
+                            "facets": [
+                              "type"
+                            ],
                             "origin": {
                               "location": "dependency",
                               "package": {
-                                "manager": "cargo",
-                                "registry": "crates.io",
-                                "name": "demo",
-                                "version": "1.0.0"
+                                "manager": "pypi",
+                                "registry": "pypi.org",
+                                "name": "idna",
+                                "version": "3.12"
                               },
                               "source_kind": "authored"
                             }
                           },
-                          "declarations": []
+                          "declarations": [
+                            {
+                              "origin": {
+                                "location": "dependency",
+                                "package": {
+                                  "manager": "pypi",
+                                  "registry": "pypi.org",
+                                  "name": "idna",
+                                  "version": "3.12"
+                                },
+                                "source_kind": "authored"
+                              },
+                              "unit": "rift://source/pypi/pypi.org/idna/idna/codec.py",
+                              "range": {
+                                "start": 188,
+                                "end": 764
+                              },
+                              "line": 10,
+                              "signature_indices": [],
+                              "type_indices": [],
+                              "documentation_indices": []
+                            }
+                          ]
+                        },
+                        {
+                          "symbol": {
+                            "id": "rift://symbol/pypi/pypi.org/idna/python/idna/codec/Codec/decode",
+                            "language": "python",
+                            "name": "decode",
+                            "kind": "function",
+                            "facets": [
+                              "value",
+                              "callable"
+                            ],
+                            "origin": {
+                              "location": "dependency",
+                              "package": {
+                                "manager": "pypi",
+                                "registry": "pypi.org",
+                                "name": "idna",
+                                "version": "3.12"
+                              },
+                              "source_kind": "authored"
+                            },
+                            "container": "rift://symbol/pypi/pypi.org/idna/python/idna/codec/Codec",
+                            "signatures": [
+                              {
+                                "display": "def decode(self, data: bytes, errors: str = \"strict\") -> Tuple[str, int]:",
+                                "language": "python"
+                              }
+                            ]
+                          },
+                          "declarations": [
+                            {
+                              "origin": {
+                                "location": "dependency",
+                                "package": {
+                                  "manager": "pypi",
+                                  "registry": "pypi.org",
+                                  "name": "idna",
+                                  "version": "3.12"
+                                },
+                                "source_kind": "authored"
+                              },
+                              "unit": "rift://source/pypi/pypi.org/idna/idna/codec.py",
+                              "range": {
+                                "start": 495,
+                                "end": 764
+                              },
+                              "line": 20,
+                              "signature_indices": [
+                                0
+                              ],
+                              "type_indices": [],
+                              "documentation_indices": []
+                            }
+                          ]
+                        },
+                        {
+                          "symbol": {
+                            "id": "rift://symbol/pypi/pypi.org/idna/python/idna/codec/Codec/encode",
+                            "language": "python",
+                            "name": "encode",
+                            "kind": "function",
+                            "facets": [
+                              "value",
+                              "callable"
+                            ],
+                            "origin": {
+                              "location": "dependency",
+                              "package": {
+                                "manager": "pypi",
+                                "registry": "pypi.org",
+                                "name": "idna",
+                                "version": "3.12"
+                              },
+                              "source_kind": "authored"
+                            },
+                            "container": "rift://symbol/pypi/pypi.org/idna/python/idna/codec/Codec",
+                            "signatures": [
+                              {
+                                "display": "def encode(self, data: str, errors: str = \"strict\") -> Tuple[bytes, int]:",
+                                "language": "python"
+                              }
+                            ]
+                          },
+                          "declarations": [
+                            {
+                              "origin": {
+                                "location": "dependency",
+                                "package": {
+                                  "manager": "pypi",
+                                  "registry": "pypi.org",
+                                  "name": "idna",
+                                  "version": "3.12"
+                                },
+                                "source_kind": "authored"
+                              },
+                              "unit": "rift://source/pypi/pypi.org/idna/idna/codec.py",
+                              "range": {
+                                "start": 219,
+                                "end": 489
+                              },
+                              "line": 11,
+                              "signature_indices": [
+                                0
+                              ],
+                              "type_indices": [],
+                              "documentation_indices": []
+                            }
+                          ]
                         }
                       ],
-                      "analyzer_revision": "analyzer-v1",
-                      "corpus_revision": "corpus-v1",
+                      "sources": [
+                        {
+                          "unit": "rift://source/pypi/pypi.org/idna/idna/codec.py",
+                          "digest": "33648658dedcb3fe81df6426293c9337ac50199798420436c225f7fc347a9681"
+                        }
+                      ],
+                      "analyzer_revision": "8f3371e3",
+                      "corpus_revision": "9ed97ad7",
                       "view": {
-                        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                        "expires_at": "2026-11-11T15:00:00Z"
+                        "id": "eyJ2ZXJzaW9uIjo0LCJzbG90Ijo0MiwiZGVzY3JpcHRvcl9kaWdlc3QiOiI1OWMxOTFlZjJlNWNiYmFkNDQ2ZWMzODc3ZGVhYjg4ZGNkODU4MmVmZGI4ZWI4MDExMTVkYzFmN2ZiODA2MjEzIiwiY29sbGVjdGlvbl9jb250ZXh0IjoiZDJkODI0YjMyMDk1NzM0MzgzZTgwZmYyZjdmNGM3NDM2ZGJkYzQ0MWQzZGU5NmU0YzE3OWQyOWMyOTMzYmU5MiIsImV4cGlyZXNfYXQiOjE3OTQ5MTg5NzN9.zXcYE4XqU0zS0KCFfZXH4cWmq8hvIltc2uMea-5Pu8s",
+                        "expires_at": "2026-11-17T12:36:13Z"
                       }
                     }
                   }
@@ -1020,8 +1670,8 @@
               "examples": {
                 "exact": {
                   "value": {
-                    "id": "rift://symbol/cargo/crates.io/tokio/rust/tokio/Beacon",
-                    "revision": "rift://revision/cargo/crates.io/tokio@1.50.0",
+                    "id": "rift://symbol/cargo/crates.io/itoa/rust/itoa/Buffer",
+                    "revision": "rift://revision/cargo/crates.io/itoa@1.0.18",
                     "declaration_limit": 5
                   }
                 }
@@ -1042,13 +1692,58 @@
                     "value": {
                       "outcome": "found",
                       "symbol": {
-                        "id": "rift://symbol/cargo/crates.io/tokio/rust/tokio/Beacon",
+                        "id": "rift://symbol/cargo/crates.io/itoa/rust/itoa/Buffer",
                         "language": "rust",
-                        "name": "Beacon",
-                        "kind": "struct"
+                        "name": "Buffer",
+                        "kind": "struct",
+                        "facets": [
+                          "type",
+                          "public"
+                        ],
+                        "origin": {
+                          "location": "dependency",
+                          "package": {
+                            "manager": "cargo",
+                            "registry": "crates.io",
+                            "name": "itoa",
+                            "version": "1.0.18"
+                          },
+                          "source_kind": "authored"
+                        },
+                        "visibility": "pub",
+                        "documentation": [
+                          {
+                            "format": "markdown",
+                            "text": "A correctly sized stack allocation for the formatted integer to be written\ninto.\n\n# Example\n\n```\nlet mut buffer = itoa::Buffer::new();\nlet printed = buffer.format(1234);\nassert_eq!(printed, \"1234\");\n```"
+                          }
+                        ]
                       },
-                      "revision": "rift://revision/cargo/crates.io/tokio@1.50.0",
-                      "declarations": []
+                      "revision": "rift://revision/cargo/crates.io/itoa@1.0.18",
+                      "declarations": [
+                        {
+                          "origin": {
+                            "location": "dependency",
+                            "package": {
+                              "manager": "cargo",
+                              "registry": "crates.io",
+                              "name": "itoa",
+                              "version": "1.0.18"
+                            },
+                            "source_kind": "authored"
+                          },
+                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                          "range": {
+                            "start": 2357,
+                            "end": 2427
+                          },
+                          "line": 72,
+                          "signature_indices": [],
+                          "type_indices": [],
+                          "documentation_indices": [
+                            0
+                          ]
+                        }
+                      ]
                     }
                   }
                 }
@@ -1243,7 +1938,8 @@
               "examples": {
                 "symbol": {
                   "value": {
-                    "symbol": "rift://symbol/cargo/crates.io/demo/rust/demo/beacon"
+                    "symbol": "rift://symbol/cargo/crates.io/itoa/rust/itoa/Buffer",
+                    "revision": "rift://revision/cargo/crates.io/itoa@1.0.18"
                   }
                 }
               }
@@ -1261,78 +1957,226 @@
                 "examples": {
                   "symbol": {
                     "value": {
-                      "symbol": "rift://symbol/cargo/crates.io/demo/rust/demo/beacon",
+                      "symbol": "rift://symbol/cargo/crates.io/itoa/rust/itoa/Buffer",
                       "nodes": [
                         {
                           "declaration": 0,
                           "index": 0,
-                          "unit": "rift://source/cargo/crates.io/demo/src/lib.rs",
+                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
                           "language": "rust",
-                          "kind": "function_item",
+                          "kind": "struct_item",
                           "facets": [
                             "declaration",
                             "definition"
                           ],
                           "range": {
-                            "start": 26,
-                            "end": 44
+                            "start": 2357,
+                            "end": 2427
                           },
-                          "source": "pub fn beacon() {}"
+                          "source": "pub struct Buffer {\n    bytes: [MaybeUninit<u8>; i128::MAX_STR_LEN],\n}",
+                          "regions": []
                         },
                         {
                           "declaration": 0,
                           "index": 1,
-                          "unit": "rift://source/cargo/crates.io/demo/src/lib.rs",
+                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
                           "language": "rust",
                           "kind": "visibility_modifier",
+                          "facets": [],
                           "range": {
-                            "start": 26,
-                            "end": 29
+                            "start": 2357,
+                            "end": 2360
                           },
                           "source": "pub",
+                          "regions": [],
                           "parent": 0
                         },
                         {
                           "declaration": 0,
                           "index": 2,
-                          "unit": "rift://source/cargo/crates.io/demo/src/lib.rs",
+                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
                           "language": "rust",
-                          "kind": "identifier",
+                          "kind": "type_identifier",
+                          "facets": [],
                           "range": {
-                            "start": 33,
-                            "end": 39
+                            "start": 2368,
+                            "end": 2374
                           },
-                          "source": "beacon",
+                          "source": "Buffer",
+                          "regions": [],
                           "parent": 0
                         },
                         {
                           "declaration": 0,
                           "index": 3,
-                          "unit": "rift://source/cargo/crates.io/demo/src/lib.rs",
+                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
                           "language": "rust",
-                          "kind": "parameters",
+                          "kind": "field_declaration_list",
+                          "facets": [],
                           "range": {
-                            "start": 39,
-                            "end": 41
+                            "start": 2375,
+                            "end": 2427
                           },
-                          "source": "()",
+                          "source": "{\n    bytes: [MaybeUninit<u8>; i128::MAX_STR_LEN],\n}",
+                          "regions": [],
                           "parent": 0
                         },
                         {
                           "declaration": 0,
                           "index": 4,
-                          "unit": "rift://source/cargo/crates.io/demo/src/lib.rs",
+                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
                           "language": "rust",
-                          "kind": "block",
+                          "kind": "field_declaration",
+                          "facets": [
+                            "declaration",
+                            "definition"
+                          ],
                           "range": {
-                            "start": 42,
-                            "end": 44
+                            "start": 2381,
+                            "end": 2424
                           },
-                          "source": "{}",
-                          "parent": 0
+                          "source": "bytes: [MaybeUninit<u8>; i128::MAX_STR_LEN]",
+                          "regions": [],
+                          "parent": 3
+                        },
+                        {
+                          "declaration": 0,
+                          "index": 5,
+                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                          "language": "rust",
+                          "kind": "field_identifier",
+                          "facets": [],
+                          "range": {
+                            "start": 2381,
+                            "end": 2386
+                          },
+                          "source": "bytes",
+                          "regions": [],
+                          "parent": 4
+                        },
+                        {
+                          "declaration": 0,
+                          "index": 6,
+                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                          "language": "rust",
+                          "kind": "array_type",
+                          "facets": [],
+                          "range": {
+                            "start": 2388,
+                            "end": 2424
+                          },
+                          "source": "[MaybeUninit<u8>; i128::MAX_STR_LEN]",
+                          "regions": [],
+                          "parent": 4
+                        },
+                        {
+                          "declaration": 0,
+                          "index": 7,
+                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                          "language": "rust",
+                          "kind": "generic_type",
+                          "facets": [],
+                          "range": {
+                            "start": 2389,
+                            "end": 2404
+                          },
+                          "source": "MaybeUninit<u8>",
+                          "regions": [],
+                          "parent": 6
+                        },
+                        {
+                          "declaration": 0,
+                          "index": 8,
+                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                          "language": "rust",
+                          "kind": "type_identifier",
+                          "facets": [],
+                          "range": {
+                            "start": 2389,
+                            "end": 2400
+                          },
+                          "source": "MaybeUninit",
+                          "regions": [],
+                          "parent": 7
+                        },
+                        {
+                          "declaration": 0,
+                          "index": 9,
+                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                          "language": "rust",
+                          "kind": "type_arguments",
+                          "facets": [],
+                          "range": {
+                            "start": 2400,
+                            "end": 2404
+                          },
+                          "source": "<u8>",
+                          "regions": [],
+                          "parent": 7
+                        },
+                        {
+                          "declaration": 0,
+                          "index": 10,
+                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                          "language": "rust",
+                          "kind": "primitive_type",
+                          "facets": [],
+                          "range": {
+                            "start": 2401,
+                            "end": 2403
+                          },
+                          "source": "u8",
+                          "regions": [],
+                          "parent": 9
+                        },
+                        {
+                          "declaration": 0,
+                          "index": 11,
+                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                          "language": "rust",
+                          "kind": "scoped_identifier",
+                          "facets": [],
+                          "range": {
+                            "start": 2406,
+                            "end": 2423
+                          },
+                          "source": "i128::MAX_STR_LEN",
+                          "regions": [],
+                          "parent": 6
+                        },
+                        {
+                          "declaration": 0,
+                          "index": 12,
+                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                          "language": "rust",
+                          "kind": "identifier",
+                          "facets": [],
+                          "range": {
+                            "start": 2406,
+                            "end": 2410
+                          },
+                          "source": "i128",
+                          "regions": [],
+                          "parent": 11
+                        },
+                        {
+                          "declaration": 0,
+                          "index": 13,
+                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                          "language": "rust",
+                          "kind": "identifier",
+                          "facets": [],
+                          "range": {
+                            "start": 2412,
+                            "end": 2423
+                          },
+                          "source": "MAX_STR_LEN",
+                          "regions": [],
+                          "parent": 11
                         }
                       ],
-                      "revision": "rift://revision/cargo/crates.io/demo@1.0.0"
+                      "revision": "rift://revision/cargo/crates.io/itoa@1.0.18",
+                      "warnings": []
                     }
                   }
                 }
@@ -1530,12 +2374,12 @@
                 "valid": {
                   "summary": "Valid request",
                   "value": {
-                    "pattern": "fn\\s+serve",
+                    "pattern": "pub fn format",
                     "packages": [
                       {
                         "manager": "cargo",
-                        "name": "beacon",
-                        "version": "1.0.0",
+                        "name": "itoa",
+                        "version": "1.0.18",
                         "registry": "crates.io"
                       }
                     ],
@@ -1564,48 +2408,80 @@
                         {
                           "package": {
                             "manager": "cargo",
-                            "name": "beacon",
-                            "version": "1.0.0",
-                            "registry": "crates.io"
+                            "registry": "crates.io",
+                            "name": "itoa",
+                            "version": "1.0.18"
                           },
-                          "unit": "rift://source/cargo/crates.io/beacon/src/lib.rs",
+                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
                           "range": {
-                            "start": 24,
-                            "end": 32
+                            "start": 3181,
+                            "end": 3194
                           },
-                          "line": 3,
-                          "size": 88,
+                          "line": 106,
+                          "size": 16904,
                           "declaration": {
                             "symbol": {
-                              "id": "rift://symbol/rust/cargo/beacon/src/lib.rs/serve",
+                              "id": "rift://symbol/cargo/crates.io/itoa/rust/itoa/Buffer/format",
                               "language": "rust",
-                              "name": "serve",
+                              "name": "format",
                               "kind": "function",
+                              "facets": [
+                                "value",
+                                "callable",
+                                "public"
+                              ],
                               "origin": {
                                 "location": "dependency",
                                 "package": {
                                   "manager": "cargo",
-                                  "name": "beacon",
-                                  "version": "1.0.0",
-                                  "registry": "crates.io"
+                                  "registry": "crates.io",
+                                  "name": "itoa",
+                                  "version": "1.0.18"
                                 },
                                 "source_kind": "authored"
-                              }
+                              },
+                              "container": "rift://symbol/cargo/crates.io/itoa/rust/itoa/Buffer",
+                              "modifiers": [],
+                              "visibility": "pub",
+                              "types": [],
+                              "signatures": [
+                                {
+                                  "display": "pub fn format<I: Integer>(&mut self, i: I) -> &str",
+                                  "links": [],
+                                  "language": "rust",
+                                  "parameters": [],
+                                  "returns": [],
+                                  "type_parameters": [],
+                                  "throws": [],
+                                  "effects": []
+                                }
+                              ],
+                              "documentation": [
+                                {
+                                  "format": "markdown",
+                                  "text": "Print an integer into this buffer and return a reference to its string\nrepresentation within the buffer."
+                                }
+                              ],
+                              "document_local": false
                             },
                             "range": {
-                              "start": 20,
-                              "end": 87
+                              "start": 3181,
+                              "end": 3484
                             },
-                            "line": 3,
-                            "source": "pub fn serve(port: u16) -> std::io::Result<()> {\n    listen(port)\n}"
+                            "line": 106,
+                            "source": "pub fn format<I: Integer>(&mut self, i: I) -> &str {\n        let buf_ptr = self.bytes.as_mut_ptr().cast::<I::Buffer>();\n        let string = i.write(unsafe { &mut *buf_ptr });\n        if string.len() > I::MAX_STR_LEN {\n            unsafe { hint::unreachable_unchecked() };\n        }\n        string\n    }"
                           },
-                          "source": "pub fn serve(port: u16) -> std::io::Result<()> {"
+                          "source": "    pub fn format<I: Integer>(&mut self, i: I) -> &str {"
                         }
                       ],
                       "warnings": [],
                       "publication_format": "rift-package-index-v2",
-                      "analyzer_revision": "2026-09-22",
-                      "corpus_revision": "2026-09-22"
+                      "analyzer_revision": "8f3371e3",
+                      "corpus_revision": "9ed97ad7",
+                      "view": {
+                        "id": "eyJ2ZXJzaW9uIjo0LCJzbG90IjoxMTcsImRlc2NyaXB0b3JfZGlnZXN0IjoiOTA0ZmE0YzJiYWMyYjUwNjQ5OGJlYjZhMGRiYmZmZmQ2OTdhM2I3MWNjOWI5MzhiZGM4NDdhYjgzZWM3M2NjMiIsImNvbGxlY3Rpb25fY29udGV4dCI6ImQyZDgyNGIzMjA5NTczNDM4M2U4MGZmMmY3ZjRjNzQzNmRiZGM0NDFkM2RlOTZlNGMxNzlkMjljMjkzM2JlOTIiLCJleHBpcmVzX2F0IjoxNzk0OTE4NTUwfQ.l1PfACRL2gkCmojWRbbDLf6N28_dqya4hwfn5Yp2tvU",
+                        "expires_at": "2026-11-17T12:29:10Z"
+                      }
                     }
                   }
                 }
@@ -1791,16 +2667,16 @@
                     "position_encoding": "utf-16",
                     "positions": [
                       {
-                        "unit": "rift://source/cargo/crates.io/beacon/src/lib.rs",
-                        "revision": "rift://revision/cargo/crates.io/beacon@1.0.0",
-                        "line": 3,
-                        "character": 4
+                        "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                        "revision": "rift://revision/cargo/crates.io/itoa@1.0.18",
+                        "line": 71,
+                        "character": 11
                       },
                       {
-                        "unit": "rift://source/cargo/crates.io/beacon/src/lib.rs",
-                        "revision": "rift://revision/cargo/crates.io/beacon@1.0.0",
+                        "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                        "revision": "rift://revision/cargo/crates.io/itoa@1.0.18",
                         "line": 0,
-                        "character": 2
+                        "character": 0
                       }
                     ]
                   }
@@ -1823,25 +2699,25 @@
                     "value": {
                       "results": [
                         {
-                          "outcome": "found",
                           "position": {
-                            "unit": "rift://source/cargo/crates.io/beacon/src/lib.rs",
-                            "revision": "rift://revision/cargo/crates.io/beacon@1.0.0",
-                            "line": 3,
-                            "character": 4
+                            "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                            "revision": "rift://revision/cargo/crates.io/itoa@1.0.18",
+                            "line": 71,
+                            "character": 11
                           },
-                          "id": "rift://symbol/cargo/crates.io/beacon/rust/beacon/serve",
-                          "kind": "function",
-                          "revision": "rift://revision/cargo/crates.io/beacon@1.0.0"
+                          "id": "rift://symbol/cargo/crates.io/itoa/rust/itoa/Buffer",
+                          "kind": "struct",
+                          "revision": "rift://revision/cargo/crates.io/itoa@1.0.18",
+                          "outcome": "found"
                         },
                         {
-                          "outcome": "missing",
                           "position": {
-                            "unit": "rift://source/cargo/crates.io/beacon/src/lib.rs",
-                            "revision": "rift://revision/cargo/crates.io/beacon@1.0.0",
+                            "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                            "revision": "rift://revision/cargo/crates.io/itoa@1.0.18",
                             "line": 0,
-                            "character": 2
-                          }
+                            "character": 0
+                          },
+                          "outcome": "missing"
                         }
                       ]
                     }
@@ -3125,7 +4001,7 @@
             "maxLength": 4096
           },
           "terms": {
-            "description": "Ordered parsed query members.",
+            "description": "Ordered members of `query`, as Rift parses it. The server refuses a request whose members differ from the ones it parses from `query`.",
             "items": {
               "$ref": "#/components/schemas/QueryTerm"
             },
@@ -3134,7 +4010,7 @@
             "maxItems": 32
           },
           "identifiers": {
-            "description": "Ordered extracted identifiers.",
+            "description": "Identifier candidates of `query`, in the order Rift extracts them. The server refuses a request whose list differs from the candidates it extracts from `query`.",
             "items": {
               "description": "Extracted identifier.",
               "type": "string",
