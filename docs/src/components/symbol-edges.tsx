@@ -8,6 +8,7 @@ import {
   PlugsConnectedIcon,
   TreeStructureIcon,
 } from "@phosphor-icons/react/ssr";
+import Link from "fumadocs-core/link";
 
 import { IconCard } from "@/components/icon-card";
 import { Badge } from "@/components/ui/badge";
@@ -142,7 +143,7 @@ export function SymbolEdges() {
             </li>
           ))}
         </ol>
-        <a
+        <Link
           href="/docs/developer/protocol/mcp#search-flows"
           className="absolute bottom-4 left-4 flex items-center gap-2 text-sm font-medium text-foreground hover:text-fd-primary @min-[40rem]:left-6"
         >
@@ -151,7 +152,7 @@ export function SymbolEdges() {
           <span className="font-mono text-xs font-normal text-muted-foreground">
             SERVICE :flows
           </span>
-        </a>
+        </Link>
       </section>
 
       <div className="@min-[40rem]:px-6">
