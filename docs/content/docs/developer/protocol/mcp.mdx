@@ -378,6 +378,12 @@ object:
 names the requested identity and up to three actual structural alternatives. An incomplete
 selection answers `unavailable` with a typed reason.
 
+A Rust identity names a path inside a library crate. A declaration in a binary, example,
+integration test, benchmark, or build script, or in a module one of these declares, carries no
+identity, so a Cargo package with a binary still answers a miss with `missing`. A library file
+that failed analysis, or a Rust file neither the library nor another Cargo target declares,
+keeps Rust misses `unavailable` with `insufficient_coverage`.
+
 For `missing`, the server **MUST** set MCP `isError` to `true` and retain the same typed
 answer in `structuredContent` under `--output all`. The `--output text` policy removes
 `structuredContent` while retaining the error flag and compact text.
