@@ -370,6 +370,42 @@ fn every_contract_response_example_decodes_through_generated_types() -> TestResu
     Ok(())
 }
 
+#[test]
+fn search_request_examples_carry_the_terms_and_identifiers_of_their_query() -> TestResult {
+    let document = contract()?;
+    let examples = document["paths"]["/v1/search"]["post"]["requestBody"]["content"]
+        ["application/json"]["examples"]
+        .as_object()
+        .ok_or("the search operation carries request examples")?;
+    let mut checked = 0_usize;
+    for example in examples.values() {
+        let body = &example["value"];
+        let Some(text) = body["query"].as_str() else {
+            continue;
+        };
+        let query = rift_ranking::ParsedQuery::parse(text)?;
+        let terms = query
+            .members()
+            .iter()
+            .map(|member| json!({"text": member.text(), "phrase": member.is_phrase(), "prefix": false}))
+            .collect::<Vec<_>>();
+        let identifiers = query
+            .candidates()
+            .iter()
+            .map(|candidate| json!(candidate.text()))
+            .collect::<Vec<_>>();
+        assert_eq!(body["terms"], json!(terms), "terms of {text:?}");
+        assert_eq!(
+            body["identifiers"],
+            json!(identifiers),
+            "identifiers of {text:?}"
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 2, "each lexical search example is checked");
+    Ok(())
+}
+
 fn decode_examples(node: &Value, checked: &mut usize) -> TestResult {
     match node {
         Value::Object(object) => {
@@ -447,7 +483,7 @@ fn decode_generated_response_example(reference: &str, value: Value) -> TestResul
             let result =
                 serde_json::from_value::<rift_protocol::symbol_read::GetSymbolResult>(value)?;
             let identity = rift_protocol::read::SymbolId::parse(
-                "rift://symbol/cargo/crates.io/tokio/rust/tokio/Beacon",
+                "rift://symbol/cargo/crates.io/itoa/rust/itoa/Buffer",
             )?;
             assert!(result.is_valid_for(&identity));
         }

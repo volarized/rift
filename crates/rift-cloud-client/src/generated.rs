@@ -1187,10 +1187,10 @@ pub struct PackageSearchRequest {
     /// Original query text.
     #[validate(length(min = 1u64, max = 4_096u64))]
     pub query: Option<String>,
-    /// Ordered parsed query members.
+    /// Ordered members of `query`, as Rift parses it. The server refuses a request whose members differ from the ones it parses from `query`.
     #[validate(length(min = 1u64, max = 32u64), nested)]
     pub terms: Option<Vec<QueryTerm>>,
-    /// Ordered extracted identifiers.
+    /// Identifier candidates of `query`, in the order Rift extracts them. The server refuses a request whose list differs from the candidates it extracts from `query`.
     #[validate(length(max = 16u64))]
     pub identifiers: Option<Vec<String>>,
     /// Optional fields to include.
