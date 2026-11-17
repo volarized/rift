@@ -393,9 +393,11 @@ See the [nodes reference](/docs/developer/protocol/mcp#tool-nodes) for the respo
 
 ## Feedback [#tool-feedback]
 
-`feedback` sends a report from the local Rift server to a configured HTTPS intake.
-Set `RIFT_FEEDBACK_URL` to the full intake URL in the environment that starts the server.
-If a workspace server is already running, restart it from that environment for the change to apply.
+`feedback` sends a report from the local Rift server to the public Rift intake at
+`https://feedback.volar.sh/rift/feedback/v1/reports`. To use another HTTPS intake, set
+`RIFT_FEEDBACK_URL` to its full URL in the environment that starts the server; an empty value
+turns submission off. If a workspace server is already running, restart it from that environment
+for the change to apply.
 
 Describe the Rift behavior and what the caller expected. A report can include a short,
 redacted Rift error or response excerpt. Before including an exact excerpt from the

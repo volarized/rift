@@ -535,7 +535,13 @@ full syntax tree of `load_config`, the declaration holding it:
 ## Feedback [#tool-feedback]
 
 `feedback` submits one report to the HTTPS intake named by the server process's
-`RIFT_FEEDBACK_URL`. The URL carries no credentials, query, or fragment.
+`RIFT_FEEDBACK_URL`. When the variable is unset, the server submits to
+`https://feedback.volar.sh/rift/feedback/v1/reports`. The URL carries no credentials, query,
+or fragment.
+
+A set value that is empty or breaks that form refuses every call with `capability_unavailable`.
+The server never falls back to the default intake for such a value, so an empty value turns
+submission off.
 
 The server sends `text` verbatim. It MUST contain at least one non-whitespace character
 and fit within 4,096 UTF-8 bytes. The optional `include_details` array accepts `os`

@@ -1,9 +1,9 @@
 ---
 title: Privacy
-description: What Rift records when you download it or use the global API.
+description: What Rift records when you download it, use the global API, or send feedback.
 ---
 
-This notice covers download and global API request statistics.
+This notice covers download and global API request statistics, and feedback reports.
 
 ## Controller
 
@@ -61,6 +61,17 @@ Standalone installers accept `RIFT_TELEMETRY_DISABLED=true` in their environment
 not read these TOML files. Other API clients can send `DNT: 1`. Opt-out excludes future requests; previous counters
 expire under their retention policy. These
 settings control Rift's counters; Cloudflare and GitHub have separate processing described below.
+
+## Feedback reports
+
+The MCP [`feedback`](/docs/mcp#tool-feedback) tool sends a report only when your agent calls it.
+The report carries the text the agent wrote and, when the agent selects them, the operating
+system name and Rift version. Rift reads no workspace files, logs, or conversation history to
+build it.
+
+Rift sends reports to `https://feedback.volar.sh/rift/feedback/v1/reports`. Set
+`RIFT_FEEDBACK_URL` in the environment that starts the server to send them to another HTTPS
+intake, or set it to an empty value to turn submission off.
 
 ## Service providers
 
