@@ -123,12 +123,22 @@ pub struct RelationshipSelection {
     pub facets: Vec<RelationshipFacet>,
 }
 
-/// An optional projection of records in a relationship page.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RelationshipInclude {
-    /// Exact UTF-8 bytes of the selected source units.
-    Source,
+/// The optional projections of records in a relationship page. An omitted member is `false`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+#[schemars(example = serde_json::json!({"source": true}))]
+pub struct RelationshipInclude {
+    /// Attaches the exact UTF-8 bytes of the selected source units.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub source: bool,
+}
+
+impl RelationshipInclude {
+    /// Whether the caller requested no projection.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        !self.source
+    }
 }
 
 /// One physical reference or call supplied by a selected provider.
@@ -185,9 +195,8 @@ pub struct RelationshipSearchRequest {
     #[schemars(length(min = 1, max = 20000))]
     pub runtimes: Vec<RuntimeIdentity>,
     /// Requested exact projections; source bytes use the same selected publication.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 1))]
-    pub include: Vec<RelationshipInclude>,
+    #[serde(default, skip_serializing_if = "RelationshipInclude::is_empty")]
+    pub include: RelationshipInclude,
     /// Original serving context. Continuation never selects latest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<CapturedViewId>,

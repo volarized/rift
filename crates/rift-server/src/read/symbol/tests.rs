@@ -2,7 +2,7 @@ use super::*;
 use rift_core::{SourceVisibility, TextFileInclusion};
 use rift_index::WorkspaceIndexLimits;
 use rift_protocol::configuration::HistoryConfiguration;
-use rift_protocol::read::SymbolId;
+use rift_protocol::read::{GetSymbolInclude, SymbolId};
 use rift_protocol::revision::Revision;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -50,7 +50,10 @@ fn open_identity(service: &ReadService) -> TestResult<SymbolId> {
 fn request(id: SymbolId) -> GetSymbolParams {
     GetSymbolParams {
         id,
-        include: vec![GetSymbolInclude::Documentation],
+        include: GetSymbolInclude {
+            documentation: true,
+            ..GetSymbolInclude::default()
+        },
         revision: None,
         declaration_limit: 1,
         declaration_cursor: None,

@@ -154,7 +154,7 @@ async fn complete_raw_pages_require_reached_symbol_and_physical_source_projectio
     selected["sources"][0]["text"] = json!("é");
     selected["sources"][0]["digest"] = json!(full_digest("é"));
     let mut request = request();
-    request.include = vec![rift_protocol::relationship_read::RelationshipInclude::Source];
+    request.include.source = true;
     let (_server, client) = operation_client(OperationFixture::Relationships {
         pages: vec![selected],
         advertised: true,

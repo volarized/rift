@@ -388,10 +388,11 @@ bounds retain the definite miss and report incomplete alternative work.
 
 <ReadExample name="missing-symbol" />
 
-`include` selects projections: `documentation` adds bounded referring documentation, and
-`history` adds the logical symbol's history edges. An omitted or empty `include` requests none. The
-server refuses any other entry, `source` included, as an invalid request. A declaration's
-source is read by [`nodes`](#tool-nodes) with `symbol`.
+`include` is an object of boolean members that selects projections: `documentation` adds
+bounded referring documentation, and `history` adds the logical symbol's history edges. An
+omitted member is `false`, and an omitted `include` requests none. The server refuses any other
+member, `source` included, as an invalid request. A declaration's source is read by
+[`nodes`](#tool-nodes) with `symbol`.
 
 `declaration_limit` defaults to 5 and accepts 1 through 10000. `declaration_cursor` continues
 the declarations of the same symbol at the revision the answer names; the server refuses it for

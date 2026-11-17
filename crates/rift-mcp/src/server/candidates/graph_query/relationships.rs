@@ -1036,10 +1036,9 @@ impl<'request> AdjacencyWalk<'request> {
         )?;
         let needs_source =
             selected.nodes.is_some() || selected.occurrences.is_some_and(|usage| usage.source);
-        let include: Vec<_> = needs_source
-            .then_some(RelationshipInclude::Source)
-            .into_iter()
-            .collect();
+        let include = RelationshipInclude {
+            source: needs_source,
+        };
         let seeds_max = usize::try_from(bounds.max_seeds).unwrap_or(usize::MAX);
         for seeds in remote_seeds.chunks(seeds_max) {
             let remote = self.remote.as_ref().ok_or_else(coverage_failure)?;
@@ -1060,7 +1059,7 @@ impl<'request> AdjacencyWalk<'request> {
                 },
                 packages: remote.domain.packages.clone(),
                 runtimes: remote.domain.runtimes.clone(),
-                include: include.clone(),
+                include,
                 view: self.acquired.view.as_ref().map(|view| view.id.clone()),
             };
             let page = remote

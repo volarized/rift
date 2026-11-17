@@ -191,14 +191,14 @@ pub struct SearchHit {
     pub hit: SearchHitTarget,
     /// The ranking value attached to this hit and used to merge duplicate hits.
     /// Exact original identifier spelling ranks before this value under `relevance`.
-    /// Present on the wire when `include` names `score`; comparable within one answer
+    /// Present on the wire when `include.score` is `true`; comparable within one answer
     /// and nowhere else.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub score: Option<f64>,
     /// Which indexed fields produced the match. Absent when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub matched_by: Vec<MatchedField>,
-    /// The source text around the hit, requested with `include: ["source"]`. Covers the
+    /// The source text around the hit, requested with `include: {"source": true}`. Covers the
     /// hit's `range`; a caller that needs the range already has it there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
@@ -403,18 +403,27 @@ pub struct SymbolChange {
     pub head_path: Option<ProjectPath>,
 }
 
-/// Extra payload to attach to every hit. Every entry costs response bytes per hit, so the
-/// caller requests only what it will read.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum SearchInclude {
-    /// The source text around each hit.
-    Source,
-    /// The ranking value attached to each hit. Exact original identifier spelling ranks before
+/// Extra payload to attach to every hit. An omitted member is `false`. Every selected member
+/// costs response bytes per hit, so the caller requests only what it will read.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+#[schemars(example = serde_json::json!({"source": true}))]
+pub struct SearchInclude {
+    /// Attaches the source text around each hit.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub source: bool,
+    /// Attaches the ranking value of each hit. Exact original identifier spelling ranks before
     /// this value.
-    Score,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub score: bool,
+}
+
+impl SearchInclude {
+    /// Whether the caller requested no extra payload.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        !self.source && !self.score
+    }
 }
 
 /// Criteria for one search. The caller supplies a lexical `query`, a relationship
@@ -438,9 +447,9 @@ pub enum SearchInclude {
             "exclude": [],
             "force_include": []
         },
-        "include": [
-            "source"
-        ],
+        "include": {
+            "source": true
+        },
         "limit": 20,
         "page_index": 0
     },
@@ -487,9 +496,9 @@ pub enum SearchInclude {
                 "src/**"
             ]
         },
-        "include": [
-            "source"
-        ],
+        "include": {
+            "source": true
+        },
         "limit": 25
     },
     {
@@ -594,10 +603,10 @@ pub struct SearchParams {
     /// every visible file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paths: Option<PathSelector>,
-    /// Extra payload to attach to every hit. Every entry costs response bytes per hit, so
-    /// the caller requests only what it will read.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub include: Option<Vec<SearchInclude>>,
+    /// Extra payload to attach to every hit. Every selected member costs response bytes per
+    /// hit, so the caller requests only what it will read.
+    #[serde(default, skip_serializing_if = "SearchInclude::is_empty")]
+    pub include: SearchInclude,
     /// Most hits to return in one page, at most 10,000; the server refuses a larger
     /// `limit` naming the field. The server's result bound caps the set itself, and an
     /// answer whose set reached it warns `results_truncated`.
@@ -959,13 +968,14 @@ mod tests {
         );
     }
 
-    /// `include: ["body"]` names no `SearchInclude` member; a request naming it is
-    /// refused at deserialization, and the refusal names the accepted values.
+    /// `include: {"body": true}` names no `SearchInclude` member; a request naming it is
+    /// refused at deserialization, and the refusal names the accepted members.
     #[test]
-    fn search_include_rejects_an_unknown_entry_and_names_the_accepted_values() {
-        let error =
-            serde_json::from_value::<SearchParams>(json!({"query": "Beacon", "include": ["body"]}))
-                .expect_err("an unknown include entry must fail deserialization");
+    fn search_include_rejects_an_unknown_member_and_names_the_accepted_members() {
+        let error = serde_json::from_value::<SearchParams>(
+            json!({"query": "Beacon", "include": {"body": true}}),
+        )
+        .expect_err("an unknown include member must fail deserialization");
         let message = error.to_string();
         assert!(
             message.contains("source") && message.contains("score"),

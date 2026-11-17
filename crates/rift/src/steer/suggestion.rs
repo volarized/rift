@@ -383,7 +383,7 @@ pub(super) mod tests {
         assert_eq!(fields.remove("order"), Some(json!("relevance")));
         if fields["target"] == "all" {
             fields.remove("target");
-            assert_eq!(fields.remove("include"), Some(json!(["source"])));
+            assert_eq!(fields.remove("include"), Some(json!({"source": true})));
         }
         if fields["page_index"] == 0 {
             fields.remove("page_index");

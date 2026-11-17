@@ -9,9 +9,9 @@ use crate::{
     Capabilities, GlobalClient, HitLocation, PackagePatternHit, PackagePatternPage,
     PackagePatternRequest, PageMetadata, SearchPackagePatternsRequestQuery,
     active_response_body_bytes_max, advertised_page_limit, bounded_nonempty_characters, contract,
-    failure, includes_source, package_key, package_source_path, response, serialize_body,
-    smaller_bound, supports_feature, validate_body_for_capabilities, validate_canonical_hit,
-    validate_packages, validate_page, validate_read_bounds,
+    failure, package_key, package_source_path, response, serialize_body, smaller_bound,
+    supports_feature, validate_body_for_capabilities, validate_canonical_hit, validate_packages,
+    validate_page, validate_read_bounds,
 };
 
 /// Most distinct files one pattern page holds matches from. The server verifies candidate files
@@ -147,17 +147,6 @@ impl GlobalClient {
 
 pub(crate) fn validate_pattern_request(request: &PackagePatternRequest) -> Result<(), RiftError> {
     bounded_nonempty_characters(&request.pattern, SEARCH_PATTERN_CHARS_MAX, "pattern")?;
-    if request
-        .include
-        .as_ref()
-        .is_some_and(|values| values.len() > 1 || values.iter().any(|value| value != "source"))
-    {
-        return Err(failure::request_invalid(
-            "validate_pattern_request",
-            "include",
-            "field failed validation",
-        ));
-    }
     validate_packages(request.packages.as_deref().unwrap_or_default())
 }
 
@@ -293,7 +282,12 @@ impl PatternPageCheck<'_> {
             self.capabilities.bounds.source_bytes_max,
             self.source_bytes_max,
         );
-        let source_allowed = includes_source(self.request.include.as_deref());
+        let source_allowed = self
+            .request
+            .include
+            .as_ref()
+            .and_then(|include| include.source)
+            .unwrap_or_default();
         if hit
             .source
             .as_ref()

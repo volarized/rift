@@ -85,19 +85,24 @@
       "input_schema": {
         "$defs": {
           "GetSymbolInclude": {
-            "description": "One optional `get_symbol` hit field the caller may opt into through `include`.",
-            "oneOf": [
+            "additionalProperties": false,
+            "description": "The optional `get_symbol` projections the caller opts into. An omitted member is `false`.",
+            "examples": [
               {
-                "const": "history",
-                "description": "The hit's version-control timeline.",
-                "type": "string"
-              },
-              {
-                "const": "documentation",
-                "description": "Bounded documentation referring to the exact declaration.",
-                "type": "string"
+                "documentation": true
               }
-            ]
+            ],
+            "properties": {
+              "documentation": {
+                "description": "Attaches bounded documentation referring to the exact declaration.",
+                "type": "boolean"
+              },
+              "history": {
+                "description": "Attaches the symbol's version-control timeline.",
+                "type": "boolean"
+              }
+            },
+            "type": "object"
           },
           "Revision": {
             "description": "One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.",
@@ -138,9 +143,9 @@
         "examples": [
           {
             "id": "rift://symbol/local/rust/app/parser/parse",
-            "include": [
-              "documentation"
-            ]
+            "include": {
+              "documentation": true
+            }
           }
         ],
         "properties": {
@@ -163,11 +168,8 @@
             "description": "Canonical identity. Ownership and language come from this address."
           },
           "include": {
-            "description": "Requested projections. Omitted or empty requests none. A declaration's source is read\nby `nodes` with `symbol`.",
-            "items": {
-              "$ref": "#/$defs/GetSymbolInclude"
-            },
-            "type": "array"
+            "$ref": "#/$defs/GetSymbolInclude",
+            "description": "Requested projections. Omitted requests none. A declaration's source is read by\n`nodes` with `symbol`."
           },
           "revision": {
             "$ref": "#/$defs/Revision",

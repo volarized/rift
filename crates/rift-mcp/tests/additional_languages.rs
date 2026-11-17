@@ -176,7 +176,7 @@ async fn assert_workspace_search(client: &Client, case: &SourceCase) -> TestResu
         client,
         &json!({
             "pattern":"灯", "target":"file", "paths":{"include":[case.path]},
-            "include":["source"],
+            "include":{"source": true},
         }),
     )
     .await?;
@@ -198,7 +198,7 @@ async fn assert_workspace_symbol(client: &Client, case: &SourceCase, name: &str)
         client,
         &json!({
             "query":name, "target":"symbol", "paths":{"include":[case.path]},
-            "include":["source"],
+            "include":{"source": true},
         }),
     )
     .await?;

@@ -233,7 +233,7 @@ async fn a_multibyte_line_answers_byte_offsets_and_its_line_as_source() -> TestR
     let result = searched(
         &directory,
         &service,
-        json!({"pattern": "\u{65e5}\u{672c}\u{8a9e}", "include": ["source"]}),
+        json!({"pattern": "\u{65e5}\u{672c}\u{8a9e}", "include": {"source": true}}),
     )
     .await?;
     assert_eq!(
@@ -350,7 +350,7 @@ async fn target_symbol_answers_each_declaration_holding_a_match_once() -> TestRe
     let with_source = searched(
         &directory,
         &service,
-        json!({"pattern": "todo!", "target": "symbol", "include": ["source"]}),
+        json!({"pattern": "todo!", "target": "symbol", "include": {"source": true}}),
     )
     .await?;
     assert_eq!(

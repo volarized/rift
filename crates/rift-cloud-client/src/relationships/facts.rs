@@ -6,8 +6,7 @@ use rift_error::RiftError;
 use rift_protocol::identity::{SymbolIdentity, SymbolOwner, parse_source_unit_identity};
 use rift_protocol::read::{PAGE_LIMIT_MAX, SourceKind, SourceUnitId, SymbolId};
 use rift_protocol::relationship_read::{
-    QuerySource, QuerySymbol, RelationshipInclude, RelationshipSearchPage,
-    RelationshipSearchRequest,
+    QuerySource, QuerySymbol, RelationshipSearchPage, RelationshipSearchRequest,
 };
 
 use super::invalid;
@@ -90,9 +89,11 @@ pub(super) fn validate_page(
                 owner,
                 SymbolOwner::Package { .. } | SymbolOwner::Runtime { .. }
             )
-        }) || source.text.as_ref().is_some_and(|text| {
-            !request.include.contains(&RelationshipInclude::Source) || text.len() > source_bytes_max
-        }) {
+        }) || source
+            .text
+            .as_ref()
+            .is_some_and(|text| !request.include.source || text.len() > source_bytes_max)
+        {
             return Err(invalid(
                 "relationship source projections differ from their released owner or accepted byte bound",
             ));
@@ -189,7 +190,7 @@ fn require_source(
                 ));
             }
         }
-        None if request.include.contains(&RelationshipInclude::Source) => {
+        None if request.include.source => {
             return Err(invalid(
                 "complete relationship pages omitted requested source bytes",
             ));
