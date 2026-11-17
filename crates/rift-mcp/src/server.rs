@@ -4553,31 +4553,40 @@ impl ServerHandler for RiftMcp {
         answered
     }
 
-    fn list_tools(
+    /// Lists the served tools. A workspace whose `[search] default_scope` is `global` lists
+    /// examples that read a package release in place of the project examples.
+    async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<rmcp::model::ListToolsResult, ErrorData>> {
+    ) -> Result<rmcp::model::ListToolsResult, ErrorData> {
         let supports_cache_hints = context
             .protocol_version()
             .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
-        let tools;
+        let reads_global = {
+            let (published, _) = read_published(&self.published).await.snapshot();
+            published.configuration.search_configuration().default_scope == SearchScope::Global
+        };
+        let mut tools;
         let elapsed = rift_tracing::measure_elapsed!("tools/list", {
             tools = self.tool_router.list_all();
+            if reads_global {
+                crate::schema::serve_global_examples(&mut tools);
+            }
         })
         .ok()
         .map(|((), measurement)| measurement.elapsed());
         McpRequest::method(TOOLS_LIST)
             .served(context.protocol_version().as_ref())
             .record(&MCP_SERVER_OPERATION_DURATION, elapsed, Ending::Answered);
-        std::future::ready(Ok(rmcp::model::ListToolsResult {
+        Ok(rmcp::model::ListToolsResult {
             result_type: Some(rmcp::model::ResultType::COMPLETE),
             tools,
             meta: None,
             next_cursor: None,
             ttl_ms: supports_cache_hints.then_some(0),
             cache_scope: supports_cache_hints.then_some(rmcp::model::CacheScope::Public),
-        }))
+        })
     }
 
     fn list_resources(

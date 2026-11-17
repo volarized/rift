@@ -308,8 +308,11 @@ not supplied. Existing history selection and commit-search refusals remain typed
 
 `:scope "local"` selects the primary project; accepted `local@name` and `local@name:profile` contexts
 select an extra project or profile. `:scope "global"` selects dependency facts and `:scope "all"`
-combines accepted contexts. `:packages` carries requested package selections as `rdf:JSON`.
+combines accepted contexts. `:packages` carries requested package selections as an `rdf:JSON`
+literal, such as `'[{"manager":"cargo","registry":"crates.io","name":"serde_core"}]'^^rdf:JSON`.
 The producer handles dependency resolution, exact package versions, and explicit package constraints.
+The server refuses `:paths`, `:packages`, or `:change` written as a plain string, and a
+`:packages` entry that names no `registry`, with `rift.search.query_syntax_invalid`.
 
 A `SERVICE :search` that selects no `:scope` reads the scope
 [`[search] default_scope`](/docs/developer/configuration#search) names: `local` unless the

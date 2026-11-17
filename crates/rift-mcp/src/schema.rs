@@ -50,6 +50,46 @@ impl RiftMcp {
     }
 }
 
+/// The symbol the examples of a server reading the global scope by default name: a trait of a
+/// crates.io release the global index holds.
+const GLOBAL_EXAMPLE_SYMBOL: &str =
+    "rift://symbol/cargo/crates.io/serde_core/rust/serde_core/ser/Serialize";
+
+/// The release of [`GLOBAL_EXAMPLE_SYMBOL`]'s package the pinned examples read.
+const GLOBAL_EXAMPLE_REVISION: &str = "rift://revision/cargo/crates.io/serde_core@1.0.229";
+
+/// The search example of a server reading the global scope by default. Its `SERVICE :search`
+/// names no `:scope`, so the workspace's default scope selects the package it names.
+const GLOBAL_EXAMPLE_SEARCH: &str = concat!(
+    "SELECT ?symbol ?name { SERVICE :search { ?hit :query \"Serialize\"; :target \"symbol\"; ",
+    ":packages '[{\"manager\":\"cargo\",\"registry\":\"crates.io\",\"name\":\"serde_core\"}]'^^rdf:JSON; ",
+    ":symbol ?symbol; :index ?index . ?symbol :name ?name } } ORDER BY ?index LIMIT 5"
+);
+
+/// Replaces the examples of `search`, `get_symbol`, and `nodes` with ones that read a package
+/// release, for a server whose `[search] default_scope` is `global`.
+///
+/// The declared examples name a project's own symbols and files, which a server holding no
+/// project cannot answer. Every replacement reads a release the global index holds, so each
+/// example a caller lists is one the server answers. Other tools keep their examples.
+pub(crate) fn serve_global_examples(tools: &mut [rmcp::model::Tool]) {
+    for tool in tools {
+        let examples = match tool.name.as_ref() {
+            "search" => json!([{ "query": GLOBAL_EXAMPLE_SEARCH }]),
+            "get_symbol" => json!([
+                { "id": GLOBAL_EXAMPLE_SYMBOL, "include": ["documentation"] },
+                { "id": GLOBAL_EXAMPLE_SYMBOL, "revision": GLOBAL_EXAMPLE_REVISION },
+            ]),
+            "nodes" => json!([
+                { "symbol": GLOBAL_EXAMPLE_SYMBOL },
+                { "symbol": GLOBAL_EXAMPLE_SYMBOL, "revision": GLOBAL_EXAMPLE_REVISION },
+            ]),
+            _ => continue,
+        };
+        Arc::make_mut(&mut tool.input_schema).insert("examples".to_owned(), examples);
+    }
+}
+
 /// Renders the document the docs site publishes: one entry per served tool
 /// with its name, description, input schema, and output schema, sorted by
 /// name.
@@ -95,6 +135,58 @@ pub fn tool_listing() -> Vec<rmcp::model::Tool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each example a server reading the global scope by default lists is a request its tool
+    /// accepts, and the search example's service selects the package it names under the
+    /// default scope.
+    #[test]
+    fn global_examples_are_accepted_requests_naming_a_package_release() {
+        let declared = tool_listing();
+        let mut served = declared.clone();
+        serve_global_examples(&mut served);
+        for (declared, served) in declared.iter().zip(&served) {
+            let examples = served.input_schema["examples"]
+                .as_array()
+                .expect("every tool lists examples");
+            if !matches!(served.name.as_ref(), "search" | "get_symbol" | "nodes") {
+                assert_eq!(served, declared, "{} keeps its examples", served.name);
+                continue;
+            }
+            let schema = serde_json::Value::Object(served.input_schema.as_ref().clone());
+            let validator = jsonschema::validator_for(&schema).expect("input schema compiles");
+            for example in examples {
+                assert!(validator.is_valid(example), "{}: {example}", served.name);
+                let text = example.to_string();
+                assert!(
+                    !text.contains("rift://symbol/local") && !text.contains("\"path\""),
+                    "{}: {example}",
+                    served.name
+                );
+            }
+        }
+        let query = rift_search::sparql::GraphQuery::parse(
+            GLOBAL_EXAMPLE_SEARCH,
+            &rift_search::sparql::GraphLimits::default(),
+        )
+        .expect("the search example parses")
+        .with_default_scope(&rift_protocol::read::SearchScope::Global);
+        let [selection] = query.retrieval_requests() else {
+            panic!("the search example selects one producer");
+        };
+        assert_eq!(
+            selection.request.scope,
+            rift_protocol::read::SearchScope::Global
+        );
+        let [package] = selection.request.packages.as_slice() else {
+            panic!("the search example names one package");
+        };
+        assert_eq!(
+            (package.manager.as_str(), package.registry.as_deref()),
+            ("cargo", Some("crates.io"))
+        );
+        assert!(GLOBAL_EXAMPLE_SYMBOL.contains(&format!("/{}/", package.name)));
+        assert!(GLOBAL_EXAMPLE_REVISION.contains(&format!("/{}@", package.name)));
+    }
 
     #[test]
     fn feedback_advertises_a_non_idempotent_external_write() {
