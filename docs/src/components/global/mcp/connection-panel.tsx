@@ -168,7 +168,7 @@ export function ConnectionPanel({
                 ) : status === "connecting" ? (
                   "Waiting for the server to answer."
                 ) : (
-                  "The page sends no request until you connect."
+                  "The page sends no request until you connect again."
                 )}
               </p>
             )}

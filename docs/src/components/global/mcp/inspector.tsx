@@ -38,8 +38,9 @@ const FIRST_TOOL = "search";
 /**
  * A console for the global MCP server: connect over Streamable HTTP, list the
  * tools, call one, and read every message that crossed the wire. All state
- * lives in this component: nothing is stored, and no request leaves the page
- * before the visitor connects.
+ * lives in this component and nothing is stored. The connection opens when the
+ * console mounts, which is when its tab first shows; after a disconnect the
+ * page sends nothing until the visitor connects again.
  */
 export default function Inspector() {
   const [connection, setConnection] = useState<Connection>({ status: "idle" });
@@ -143,6 +144,14 @@ export default function Inspector() {
 
   const cancelConnect = useRef(disconnect);
   cancelConnect.current = disconnect;
+
+  // Declared after the effect that releases on unmount, so a development
+  // remount closes the first attempt before the second one opens.
+  const connectOnMount = useRef(connect);
+  connectOnMount.current = connect;
+  useEffect(() => {
+    void connectOnMount.current();
+  }, []);
 
   const runPing = async () => {
     const active = session.current;
