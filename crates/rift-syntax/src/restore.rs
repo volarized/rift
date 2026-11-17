@@ -482,7 +482,9 @@ fn validate_python_overload(
     let Some(state) = &symbol.python_overload else {
         return Ok(());
     };
-    if language != &ShippedLanguage::Python.language() || symbol.kind != "function" {
+    if language != &ShippedLanguage::Python.language()
+        || !matches!(symbol.kind, "function" | "method")
+    {
         return Err(errors::syntax::facts_structure_invalid().error());
     }
     let crate::PythonOverload::Overload {

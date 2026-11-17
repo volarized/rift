@@ -9,15 +9,22 @@
 //! - Qualified names join scopes with `.`, the language's own spelling:
 //!   a method files as `Widget.open`, a nested function as `outer.inner`.
 //! - An assignment declares a `variable` symbol only at module level or
-//!   directly in a class body, and only when its target is one plain
-//!   identifier. Function-local assignments, attribute targets, and
-//!   destructuring patterns declare nothing: locals would drown the
-//!   file's real surface in noise.
+//!   directly in a class body, the suites of an `if` or a `try` statement
+//!   there included. Each name a tuple or list target binds declares, and so
+//!   does each target of a chained assignment. A `type` statement declares a
+//!   `type_alias` under the same rule. Function-local assignments declare
+//!   nothing: locals would drown the file's real surface in noise.
+//! - A `def` directly in a class body declares a `method` of the class. An
+//!   attribute a method assigns through its first parameter (`self.name =
+//!   name`) declares a `variable` of the class.
 //! - A definition's docstring - the body's leading string expression - is
-//!   carried as plain-text documentation with the quotes stripped.
+//!   carried as plain-text documentation with the quotes stripped. A
+//!   module-level `name.__doc__ = "literal"` documents the module-level
+//!   definition it names instead.
 //! - Python states no authored visibility, so `visibility` stays `None`;
 //!   the leading-underscore convention is a reading habit, not syntax.
 
+use std::collections::BTreeMap;
 use std::num::NonZeroU16;
 use std::sync::OnceLock;
 
@@ -31,6 +38,9 @@ use crate::failure::RiftError;
 use crate::provider::{SyntaxLimits, SyntaxProvider, SyntaxSource};
 
 mod overload;
+
+#[cfg(test)]
+mod declaration_tests;
 
 /// Grammar spelling of a function definition, `async def` included.
 const FUNCTION_KIND: &str = "function_definition";
@@ -58,6 +68,57 @@ const NAME_FIELD: &str = "name";
 const BODY_FIELD: &str = "body";
 /// Grammar field holding an assignment's target.
 const LEFT_FIELD: &str = "left";
+/// Grammar field holding an assignment's value.
+const RIGHT_FIELD: &str = "right";
+/// Grammar field holding an attribute's object, `self` in `self.name`.
+const OBJECT_FIELD: &str = "object";
+/// Grammar field holding an attribute's name, `name` in `self.name`.
+const ATTRIBUTE_FIELD: &str = "attribute";
+/// Grammar field holding a definition's parameter list.
+const PARAMETERS_FIELD: &str = "parameters";
+/// Grammar spelling of an attribute access, `self.name`.
+const ATTRIBUTE_KIND: &str = "attribute";
+/// Grammar spelling of a `type` statement.
+const TYPE_ALIAS_STATEMENT_KIND: &str = "type_alias_statement";
+/// Grammar spelling of a type expression, the name side of a `type`
+/// statement.
+const TYPE_KIND: &str = "type";
+/// Grammar spelling of one decorator line.
+const DECORATOR_KIND: &str = "decorator";
+/// Grammar spelling of a call, `retry(2)` in `@retry(2)`.
+const CALL_KIND: &str = "call";
+/// Grammar spelling of a typed parameter, `self: Self`.
+const TYPED_PARAMETER_KIND: &str = "typed_parameter";
+/// Grammar spelling of the string's opening delimiter with its prefix.
+const STRING_START_KIND: &str = "string_start";
+/// Targets that bind every name they hold: `a, b`, `(a, b)`, `[a, *b]`.
+const TARGET_PATTERN_KINDS: [&str; 4] = [
+    "pattern_list",
+    "tuple_pattern",
+    "list_pattern",
+    "list_splat_pattern",
+];
+/// Compound statements whose suites still declare at the enclosing module
+/// or class level.
+const DECLARING_STATEMENT_KINDS: [&str; 2] = ["if_statement", "try_statement"];
+/// The clauses of a declaring compound statement holding a suite.
+const DECLARING_CLAUSE_KINDS: [&str; 4] = [
+    "elif_clause",
+    "else_clause",
+    "except_clause",
+    "finally_clause",
+];
+
+/// The method name that constructs its class.
+const CONSTRUCTOR_NAME: &str = "__init__";
+/// The attribute a `__doc__` assignment documents through.
+const DOC_ATTRIBUTE: &str = "__doc__";
+/// Decorators that bind a method to its class rather than an instance.
+const STATIC_DECORATORS: [&str; 2] = ["staticmethod", "classmethod"];
+/// Decorators that make a method read like a field.
+const PROPERTY_DECORATORS: [&str; 4] = ["property", "cached_property", "setter", "deleter"];
+/// String prefix letter that makes a literal a formatted string.
+const FORMATTED_PREFIXES: [char; 2] = ['f', 'F'];
 
 /// The kind word a Python function carries on the wire.
 const FUNCTION_KIND_WORD: &str = "function";
@@ -65,6 +126,10 @@ const FUNCTION_KIND_WORD: &str = "function";
 const CLASS_KIND_WORD: &str = "class";
 /// The kind word a Python variable carries on the wire.
 const VARIABLE_KIND_WORD: &str = "variable";
+/// The kind word a function declared in a class body carries on the wire.
+const METHOD_KIND_WORD: &str = "method";
+/// The kind word a `type` statement carries on the wire.
+const TYPE_ALIAS_KIND_WORD: &str = "type_alias";
 
 /// The separator Python qualified names join scopes with.
 const SCOPE_QUALIFICATION_SEPARATOR: &str = ".";
@@ -83,9 +148,23 @@ struct PythonKinds {
     string_content: u16,
     assignment: u16,
     identifier: u16,
+    attribute: u16,
+    type_alias_statement: u16,
+    type_expression: u16,
+    decorator: u16,
+    call: u16,
+    typed_parameter: u16,
+    string_start: u16,
+    target_patterns: Vec<u16>,
+    declaring_statements: Vec<u16>,
+    declaring_clauses: Vec<u16>,
     name: NonZeroU16,
     body: NonZeroU16,
     left: NonZeroU16,
+    right: NonZeroU16,
+    object: NonZeroU16,
+    attribute_name: NonZeroU16,
+    parameters: NonZeroU16,
 }
 
 impl PythonKinds {
@@ -108,9 +187,29 @@ impl PythonKinds {
             string_content: kind_id(language, STRING_CONTENT_KIND),
             assignment: kind_id(language, ASSIGNMENT_KIND),
             identifier: kind_id(language, IDENTIFIER_KIND),
+            attribute: kind_id(language, ATTRIBUTE_KIND),
+            type_alias_statement: kind_id(language, TYPE_ALIAS_STATEMENT_KIND),
+            type_expression: kind_id(language, TYPE_KIND),
+            decorator: kind_id(language, DECORATOR_KIND),
+            call: kind_id(language, CALL_KIND),
+            typed_parameter: kind_id(language, TYPED_PARAMETER_KIND),
+            string_start: kind_id(language, STRING_START_KIND),
+            target_patterns: TARGET_PATTERN_KINDS
+                .map(|kind| kind_id(language, kind))
+                .to_vec(),
+            declaring_statements: DECLARING_STATEMENT_KINDS
+                .map(|kind| kind_id(language, kind))
+                .to_vec(),
+            declaring_clauses: DECLARING_CLAUSE_KINDS
+                .map(|kind| kind_id(language, kind))
+                .to_vec(),
             name: field_id(language, NAME_FIELD),
             body: field_id(language, BODY_FIELD),
             left: field_id(language, LEFT_FIELD),
+            right: field_id(language, RIGHT_FIELD),
+            object: field_id(language, OBJECT_FIELD),
+            attribute_name: field_id(language, ATTRIBUTE_FIELD),
+            parameters: field_id(language, PARAMETERS_FIELD),
         }
     }
 }
@@ -136,11 +235,38 @@ fn field_id(language: &tree_sitter::Language, field: &str) -> NonZeroU16 {
     })
 }
 
+/// Where an assignment or a `type` statement declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeclarationScope {
+    /// Module level, the suites of its `if` and `try` statements included.
+    Module,
+    /// Directly in a class body, the suites of its `if` and `try`
+    /// statements included.
+    Class,
+}
+
+impl DeclarationScope {
+    /// Portable facets a variable declared in this scope carries.
+    fn variable_facets(self) -> Vec<SymbolFacet> {
+        match self {
+            Self::Module => vec![SymbolFacet::Value],
+            Self::Class => vec![SymbolFacet::Value, SymbolFacet::Member],
+        }
+    }
+}
+
+/// One literal string's content pieces and their ranges.
+type StringText = (String, Vec<crate::ByteRange>);
+
 /// The pinned grammar's decisions for the shared bounded walk.
 #[derive(Debug)]
 struct PythonRules {
     kinds: &'static PythonKinds,
     overloads: overload::OverloadContext,
+    /// Documentation module-level `name.__doc__ = "literal"` assignments
+    /// give, by the name they document; the last assignment wins, as it
+    /// does when the module runs.
+    assigned_docs: BTreeMap<String, StringText>,
 }
 
 impl PythonRules {
@@ -151,29 +277,9 @@ impl PythonRules {
         text.get(name.byte_range()).map(str::to_owned)
     }
 
-    /// The definition's docstring: its body suite's leading string
-    /// expression, quotes stripped. `None` when the body opens with
-    /// anything else.
-    fn docstring(
-        &self,
-        node: Node<'_>,
-        text: &str,
-    ) -> Result<(Vec<Documentation>, Vec<crate::ByteRange>), RiftError> {
-        let Some(body) = node.child_by_field_id(self.kinds.body.get()) else {
-            return Ok((Vec::new(), Vec::new()));
-        };
-        let Some(first) = body.named_child(0) else {
-            return Ok((Vec::new(), Vec::new()));
-        };
-        if first.kind_id() != self.kinds.expression_statement {
-            return Ok((Vec::new(), Vec::new()));
-        }
-        let Some(string) = first
-            .named_child(0)
-            .filter(|expression| expression.kind_id() == self.kinds.string)
-        else {
-            return Ok((Vec::new(), Vec::new()));
-        };
+    /// A string literal's content without its quotes, and each piece's
+    /// range; empty for a string without content.
+    fn string_text(&self, string: Node<'_>, text: &str) -> Result<StringText, RiftError> {
         let mut content = String::new();
         let mut ranges = Vec::new();
         let mut cursor = string.walk();
@@ -185,26 +291,42 @@ impl PythonRules {
                 ranges.push(extract::byte_range(child)?);
             }
         }
-        if content.is_empty() {
-            return Ok((Vec::new(), Vec::new()));
-        }
-        Ok((
-            vec![Documentation {
-                format: DocumentationFormat::Plain,
-                text: content,
-            }],
-            ranges,
-        ))
+        Ok((content, ranges))
     }
 
-    /// One definition's declaration facts, shared by `def` and `class`.
+    /// The definition's docstring: its body suite's leading string
+    /// expression, quotes stripped. `None` when the body opens with
+    /// anything else.
+    fn docstring(&self, node: Node<'_>, text: &str) -> Result<StringText, RiftError> {
+        let Some(body) = node.child_by_field_id(self.kinds.body.get()) else {
+            return Ok((String::new(), Vec::new()));
+        };
+        let Some(first) = body.named_child(0) else {
+            return Ok((String::new(), Vec::new()));
+        };
+        if first.kind_id() != self.kinds.expression_statement {
+            return Ok((String::new(), Vec::new()));
+        }
+        let Some(string) = first
+            .named_child(0)
+            .filter(|expression| expression.kind_id() == self.kinds.string)
+        else {
+            return Ok((String::new(), Vec::new()));
+        };
+        self.string_text(string, text)
+    }
+
+    /// One definition's declaration facts, shared by `def` and `class`. A
+    /// module-level definition a literal `__doc__` assignment names takes
+    /// that documentation; any other takes its docstring.
     fn definition_declaration(
         &self,
-        node: Node<'_>,
+        visited: Visited<'_, '_>,
         text: &str,
         kind: &'static str,
         facets: Vec<SymbolFacet>,
     ) -> Result<Option<Declaration>, RiftError> {
+        let node = visited.node();
         let Some(name) = self.field_name(node, text) else {
             return Ok(None);
         };
@@ -212,7 +334,25 @@ impl PythonRules {
             Some(body) => Some(extract::byte_range(body)?),
             None => None,
         };
-        let (documentation, documentation_ranges) = self.docstring(node, text)?;
+        let assigned = self
+            .at_module_level(visited)
+            .then(|| self.assigned_docs.get(&name))
+            .flatten();
+        let (content, documentation_ranges) = match assigned {
+            Some(assigned) => assigned.clone(),
+            None => self.docstring(node, text)?,
+        };
+        let (documentation, documentation_ranges) = if content.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            (
+                vec![Documentation {
+                    format: DocumentationFormat::Plain,
+                    text: content,
+                }],
+                documentation_ranges,
+            )
+        };
         Ok(Some(Declaration {
             name,
             kind,
@@ -224,50 +364,366 @@ impl PythonRules {
         }))
     }
 
-    /// The declared variable behind an assignment: its one plain-identifier
-    /// target, accepted only at module level or directly in a class body.
-    fn assignment_declaration(&self, visited: Visited<'_, '_>, text: &str) -> Option<Declaration> {
-        if !self.assignment_scope_accepted(visited) {
-            return None;
+    /// Whether a definition sits directly in the module, decorated or not.
+    fn at_module_level(&self, visited: Visited<'_, '_>) -> bool {
+        let holder = visited
+            .parent()
+            .filter(|parent| parent.node().kind_id() == self.kinds.decorated)
+            .map_or(visited.parent(), Visited::parent);
+        holder.is_some_and(|holder| holder.node().kind_id() == self.kinds.module)
+    }
+
+    /// Whether a `def` sits directly in a class body, decorated or not.
+    fn is_method(&self, function: Visited<'_, '_>) -> bool {
+        let block = function
+            .parent()
+            .filter(|parent| parent.node().kind_id() == self.kinds.decorated)
+            .map_or(function.parent(), Visited::parent);
+        block.is_some_and(|block| {
+            block.node().kind_id() == self.kinds.block
+                && block
+                    .parent()
+                    .is_some_and(|definition| definition.node().kind_id() == self.kinds.class)
+        })
+    }
+
+    /// The last name segment of each decorator on a decorated definition:
+    /// `cached_property` in `@functools.cached_property`, `retry` in
+    /// `@retry(2)`.
+    fn decorator_names<'text>(
+        &self,
+        visited: Visited<'_, '_>,
+        text: &'text str,
+    ) -> Vec<&'text str> {
+        let Some(decorated) = visited
+            .parent()
+            .filter(|parent| parent.node().kind_id() == self.kinds.decorated)
+        else {
+            return Vec::new();
+        };
+        let mut cursor = decorated.node().walk();
+        let decorators: Vec<_> = decorated
+            .node()
+            .named_children(&mut cursor)
+            .filter(|child| child.kind_id() == self.kinds.decorator)
+            .collect();
+        decorators
+            .into_iter()
+            .filter_map(|decorator| {
+                let mut expression = decorator.named_child(0)?;
+                if expression.kind_id() == self.kinds.call {
+                    expression = expression.named_child(0)?;
+                }
+                if expression.kind_id() == self.kinds.attribute {
+                    expression = expression.child_by_field_id(self.kinds.attribute_name.get())?;
+                }
+                (expression.kind_id() == self.kinds.identifier)
+                    .then(|| text.get(expression.byte_range()))
+                    .flatten()
+            })
+            .collect()
+    }
+
+    /// The categories a method carries beside `value`, `callable`, and
+    /// `member`: `constructor` for `__init__`, `static` for a static or class
+    /// method, `property` for a property accessor.
+    fn method_facets(&self, visited: Visited<'_, '_>, text: &str) -> Vec<SymbolFacet> {
+        let mut facets = vec![
+            SymbolFacet::Value,
+            SymbolFacet::Callable,
+            SymbolFacet::Member,
+        ];
+        if self.field_name(visited.node(), text).as_deref() == Some(CONSTRUCTOR_NAME) {
+            facets.push(SymbolFacet::Constructor);
         }
-        let node = visited.node();
-        let target = node.child_by_field_id(self.kinds.left.get())?;
-        if target.kind_id() != self.kinds.identifier {
-            return None;
+        let decorators = self.decorator_names(visited, text);
+        if decorators
+            .iter()
+            .any(|name| STATIC_DECORATORS.contains(name))
+        {
+            facets.push(SymbolFacet::Static);
         }
-        let name = text.get(target.byte_range())?;
-        Some(Declaration {
+        if decorators
+            .iter()
+            .any(|name| PROPERTY_DECORATORS.contains(name))
+        {
+            facets.push(SymbolFacet::Property);
+        }
+        facets
+    }
+
+    /// Where a statement declares: the module, or a class body, climbing
+    /// through the suites of `if` and `try` statements. `None` inside a
+    /// function or any other compound statement.
+    ///
+    /// Each step climbs one recorded parent, so the work is bounded by the
+    /// tree's depth.
+    fn statement_scope(&self, statement: Visited<'_, '_>) -> Option<DeclarationScope> {
+        let mut holder = statement.parent()?;
+        loop {
+            let id = holder.node().kind_id();
+            if id == self.kinds.module {
+                return Some(DeclarationScope::Module);
+            }
+            if id != self.kinds.block {
+                return None;
+            }
+            let owner = holder.parent()?;
+            let owner_id = owner.node().kind_id();
+            if owner_id == self.kinds.class {
+                return Some(DeclarationScope::Class);
+            }
+            let compound = if self.kinds.declaring_clauses.contains(&owner_id) {
+                owner.parent()?
+            } else {
+                owner
+            };
+            if !self
+                .kinds
+                .declaring_statements
+                .contains(&compound.node().kind_id())
+            {
+                return None;
+            }
+            holder = compound.parent()?;
+        }
+    }
+
+    /// The statement holding an assignment: its `expression_statement`,
+    /// reached through every assignment of a chain such as `a = b = 1`.
+    fn assignment_statement<'walk, 'tree>(
+        &self,
+        assignment: Visited<'walk, 'tree>,
+    ) -> Option<Visited<'walk, 'tree>> {
+        let mut current = assignment;
+        loop {
+            let parent = current.parent()?;
+            let id = parent.node().kind_id();
+            if id == self.kinds.expression_statement {
+                return Some(parent);
+            }
+            let is_value = id == self.kinds.assignment
+                && parent.node().child_by_field_id(self.kinds.right.get()) == Some(current.node());
+            if !is_value {
+                return None;
+            }
+            current = parent;
+        }
+    }
+
+    /// The assignment a target node binds through: the target is the
+    /// assignment's `left` side, or sits inside the tuple and list patterns
+    /// that form it. With `through_pattern`, only a target inside a pattern
+    /// counts.
+    fn target_assignment<'walk, 'tree>(
+        &self,
+        target: Visited<'walk, 'tree>,
+        through_pattern: bool,
+    ) -> Option<Visited<'walk, 'tree>> {
+        let mut child = target;
+        let mut patterned = false;
+        loop {
+            let parent = child.parent()?;
+            let id = parent.node().kind_id();
+            if id == self.kinds.assignment {
+                let binds = parent.node().child_by_field_id(self.kinds.left.get())
+                    == Some(child.node())
+                    && (patterned || !through_pattern);
+                return binds.then_some(parent);
+            }
+            if !self.kinds.target_patterns.contains(&id) {
+                return None;
+            }
+            patterned = true;
+            child = parent;
+        }
+    }
+
+    /// A variable declared by a statement in `scope`.
+    fn variable(name: &str, scope: DeclarationScope) -> Declaration {
+        Declaration {
             name: name.to_owned(),
             kind: VARIABLE_KIND_WORD,
-            facets: vec![SymbolFacet::Value],
+            facets: scope.variable_facets(),
             visibility: None,
             body_range: None,
             documentation: Vec::new(),
             documentation_ranges: Vec::new(),
-        })
+        }
     }
 
-    /// Whether an assignment sits at module level or directly in a class
-    /// body: its statement's holder is the module root, or a suite whose
-    /// definition is a class.
-    fn assignment_scope_accepted(&self, visited: Visited<'_, '_>) -> bool {
-        let Some(statement) = visited.parent() else {
-            return false;
-        };
-        if statement.node().kind_id() != self.kinds.expression_statement {
-            return false;
+    /// The declared variable behind an assignment whose target is one plain
+    /// identifier.
+    fn assignment_declaration(&self, visited: Visited<'_, '_>, text: &str) -> Option<Declaration> {
+        let target = visited.node().child_by_field_id(self.kinds.left.get())?;
+        if target.kind_id() != self.kinds.identifier {
+            return None;
         }
-        let Some(holder) = statement.parent() else {
-            return false;
-        };
-        if holder.node().kind_id() == self.kinds.module {
-            return true;
-        }
-        holder.node().kind_id() == self.kinds.block
-            && holder
-                .parent()
-                .is_some_and(|definition| definition.node().kind_id() == self.kinds.class)
+        let scope = self.statement_scope(self.assignment_statement(visited)?)?;
+        Some(Self::variable(text.get(target.byte_range())?, scope))
     }
+
+    /// The declared variable behind one name a tuple or list target binds.
+    fn pattern_declaration(&self, visited: Visited<'_, '_>, text: &str) -> Option<Declaration> {
+        let assignment = self.target_assignment(visited, true)?;
+        let scope = self.statement_scope(self.assignment_statement(assignment)?)?;
+        Some(Self::variable(
+            text.get(visited.node().byte_range())?,
+            scope,
+        ))
+    }
+
+    /// The method an instance attribute target belongs to: the visited
+    /// `attribute` is an assignment target, its object is the first
+    /// parameter of the nearest enclosing `def`, and that `def` is a method.
+    fn attribute_method<'walk, 'tree>(
+        &self,
+        visited: Visited<'walk, 'tree>,
+        text: &str,
+    ) -> Option<Visited<'walk, 'tree>> {
+        let node = visited.node();
+        if node.kind_id() != self.kinds.attribute {
+            return None;
+        }
+        let object = node.child_by_field_id(self.kinds.object.get())?;
+        let name = node.child_by_field_id(self.kinds.attribute_name.get())?;
+        if object.kind_id() != self.kinds.identifier || name.kind_id() != self.kinds.identifier {
+            return None;
+        }
+        let assignment = self.target_assignment(visited, false)?;
+        let mut current = self.assignment_statement(assignment)?;
+        let function = loop {
+            let parent = current.parent()?;
+            let id = parent.node().kind_id();
+            if id == self.kinds.function {
+                break parent;
+            }
+            if id == self.kinds.class || id == self.kinds.module {
+                return None;
+            }
+            current = parent;
+        };
+        if !self.is_method(function) {
+            return None;
+        }
+        let receiver = self.first_parameter(function.node(), text)?;
+        (text.get(object.byte_range()) == Some(receiver)).then_some(function)
+    }
+
+    /// A `def`'s first parameter name, `self` in `def open(self, path)`.
+    fn first_parameter<'text>(&self, function: Node<'_>, text: &'text str) -> Option<&'text str> {
+        let parameters = function.child_by_field_id(self.kinds.parameters.get())?;
+        let mut first = parameters.named_child(0)?;
+        if first.kind_id() == self.kinds.typed_parameter {
+            first = first.named_child(0)?;
+        }
+        (first.kind_id() == self.kinds.identifier)
+            .then(|| text.get(first.byte_range()))
+            .flatten()
+    }
+
+    /// The `type_alias` a `type` statement declares in an accepted scope.
+    fn type_alias_declaration(
+        &self,
+        visited: Visited<'_, '_>,
+        text: &str,
+    ) -> Result<Option<Declaration>, RiftError> {
+        let Some(name) = self.type_alias_name(visited.node()) else {
+            return Ok(None);
+        };
+        if self.statement_scope(visited).is_none() {
+            return Ok(None);
+        }
+        let Some(name) = text.get(name.byte_range()) else {
+            return Ok(None);
+        };
+        let body_range = visited
+            .node()
+            .child_by_field_id(self.kinds.right.get())
+            .map(extract::byte_range)
+            .transpose()?;
+        Ok(Some(Declaration {
+            name: name.to_owned(),
+            kind: TYPE_ALIAS_KIND_WORD,
+            facets: vec![SymbolFacet::Type, SymbolFacet::Alias],
+            visibility: None,
+            body_range,
+            documentation: Vec::new(),
+            documentation_ranges: Vec::new(),
+        }))
+    }
+
+    /// The identifier a `type` statement names, `Pair` in
+    /// `type Pair = tuple[int, int]`; `None` for a generic left side.
+    fn type_alias_name<'tree>(&self, statement: Node<'tree>) -> Option<Node<'tree>> {
+        if statement.kind_id() != self.kinds.type_alias_statement {
+            return None;
+        }
+        let left = statement.child_by_field_id(self.kinds.left.get())?;
+        let name = if left.kind_id() == self.kinds.type_expression {
+            left.named_child(0)?
+        } else {
+            left
+        };
+        (name.kind_id() == self.kinds.identifier).then_some(name)
+    }
+}
+
+/// Literal documentation each module-level `name.__doc__ = "..."` assigns,
+/// by name. A formatted string documents nothing, since its text depends on
+/// running the module. Reads the module's top-level statements only.
+fn assigned_docs(
+    rules: &PythonRules,
+    root: Node<'_>,
+    text: &str,
+) -> Result<BTreeMap<String, StringText>, RiftError> {
+    let kinds = rules.kinds;
+    let mut docs = BTreeMap::new();
+    let mut cursor = root.walk();
+    let statements: Vec<_> = root.named_children(&mut cursor).collect();
+    for statement in statements {
+        if statement.kind_id() != kinds.expression_statement {
+            continue;
+        }
+        let Some(assignment) = statement
+            .named_child(0)
+            .filter(|node| node.kind_id() == kinds.assignment)
+        else {
+            continue;
+        };
+        let (Some(left), Some(right)) = (
+            assignment.child_by_field_id(kinds.left.get()),
+            assignment.child_by_field_id(kinds.right.get()),
+        ) else {
+            continue;
+        };
+        let (Some(object), Some(attribute)) = (
+            left.child_by_field_id(kinds.object.get()),
+            left.child_by_field_id(kinds.attribute_name.get()),
+        ) else {
+            continue;
+        };
+        let documents = left.kind_id() == kinds.attribute
+            && object.kind_id() == kinds.identifier
+            && text.get(attribute.byte_range()) == Some(DOC_ATTRIBUTE)
+            && right.kind_id() == kinds.string;
+        if !documents {
+            continue;
+        }
+        let formatted = right
+            .named_child(0)
+            .filter(|start| start.kind_id() == kinds.string_start)
+            .and_then(|start| text.get(start.byte_range()))
+            .is_none_or(|start| start.contains(FORMATTED_PREFIXES));
+        if formatted {
+            continue;
+        }
+        let Some(name) = text.get(object.byte_range()) else {
+            continue;
+        };
+        docs.insert(name.to_owned(), rules.string_text(right, text)?);
+    }
+    Ok(docs)
 }
 
 impl GrammarRules for PythonRules {
@@ -281,10 +737,18 @@ impl GrammarRules for PythonRules {
         }
         self.overloads.state(visited.node(), text).map(Some)
     }
+
     fn name_range(&self, node: Node<'_>) -> Result<Option<crate::ByteRange>, RiftError> {
-        node.child_by_field_id(self.kinds.name.get())
-            .map(extract::byte_range)
-            .transpose()
+        let name = if node.kind_id() == self.kinds.identifier {
+            Some(node)
+        } else if node.kind_id() == self.kinds.attribute {
+            node.child_by_field_id(self.kinds.attribute_name.get())
+        } else if node.kind_id() == self.kinds.type_alias_statement {
+            self.type_alias_name(node)
+        } else {
+            node.child_by_field_id(self.kinds.name.get())
+        };
+        name.map(extract::byte_range).transpose()
     }
 
     fn declaration(
@@ -293,26 +757,84 @@ impl GrammarRules for PythonRules {
         text: &str,
     ) -> Result<Option<Declaration>, RiftError> {
         let node = visited.node();
-        if node.kind_id() == self.kinds.function {
+        let id = node.kind_id();
+        if id == self.kinds.function {
+            if self.is_method(visited) {
+                let facets = self.method_facets(visited, text);
+                return self.definition_declaration(visited, text, METHOD_KIND_WORD, facets);
+            }
             return self.definition_declaration(
-                node,
+                visited,
                 text,
                 FUNCTION_KIND_WORD,
                 vec![SymbolFacet::Value, SymbolFacet::Callable],
             );
         }
-        if node.kind_id() == self.kinds.class {
+        if id == self.kinds.class {
             return self.definition_declaration(
-                node,
+                visited,
                 text,
                 CLASS_KIND_WORD,
-                vec![SymbolFacet::Type],
+                vec![
+                    SymbolFacet::Type,
+                    SymbolFacet::MemberContainer,
+                    SymbolFacet::Constructible,
+                    SymbolFacet::Extensible,
+                ],
             );
         }
-        if node.kind_id() == self.kinds.assignment {
+        if id == self.kinds.assignment {
             return Ok(self.assignment_declaration(visited, text));
         }
+        if id == self.kinds.identifier {
+            return Ok(self.pattern_declaration(visited, text));
+        }
+        if id == self.kinds.attribute {
+            let Some(_) = self.attribute_method(visited, text) else {
+                return Ok(None);
+            };
+            let name = node
+                .child_by_field_id(self.kinds.attribute_name.get())
+                .and_then(|name| text.get(name.byte_range()));
+            return Ok(name.map(|name| Self::variable(name, DeclarationScope::Class)));
+        }
+        if id == self.kinds.type_alias_statement {
+            return self.type_alias_declaration(visited, text);
+        }
         Ok(None)
+    }
+
+    /// An instance attribute belongs to the class: it drops the scope of the
+    /// method assigning it.
+    fn declaration_qualification(
+        &self,
+        visited: Visited<'_, '_>,
+        text: &str,
+        qualification: &str,
+    ) -> Option<String> {
+        let method = self.attribute_method(visited, text)?;
+        let name = self.field_name(method.node(), text)?;
+        let class = qualification
+            .strip_suffix(name.as_str())?
+            .strip_suffix(SCOPE_QUALIFICATION_SEPARATOR)?;
+        Some(class.to_owned())
+    }
+
+    /// An instance attribute assigned alone spans its whole assignment, as
+    /// a one-name assignment does; one inside a tuple target spans itself.
+    fn declaration_node<'tree>(&self, visited: Visited<'_, 'tree>) -> Node<'tree> {
+        let node = visited.node();
+        if node.kind_id() != self.kinds.attribute {
+            return node;
+        }
+        visited
+            .parent()
+            .map(Visited::node)
+            .filter(|parent| {
+                parent.kind_id() == self.kinds.assignment
+                    && parent.child_by_field_id(self.kinds.left.get()) == Some(node)
+            })
+            .unwrap_or(node)
     }
 
     fn container_name(&self, node: Node<'_>, text: &str) -> Option<String> {
@@ -388,10 +910,12 @@ impl SyntaxProvider for PythonSyntaxProvider {
         let tree = parser
             .parse(source.text, None)
             .ok_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())?;
-        let rules = PythonRules {
+        let mut rules = PythonRules {
             kinds: python_kinds(),
             overloads: overload::OverloadContext::new(tree.root_node(), source.text, limits)?,
+            assigned_docs: BTreeMap::new(),
         };
+        rules.assigned_docs = assigned_docs(&rules, tree.root_node(), source.text)?;
         let (nodes, symbols) =
             extract::extract(tree.root_node(), source, limits, &self.language, &rules)?;
         Ok(SyntaxDocument::new(
@@ -419,14 +943,23 @@ impl SyntaxProvider for PythonSyntaxProvider {
         if kind.contains("comment") {
             facets.push(NodeFacet::Comment);
         }
+        if kind == DECORATOR_KIND {
+            facets.push(NodeFacet::Annotation);
+        }
         facets
     }
 }
 
 pub(crate) fn restored_symbol_kind(name: &str) -> Option<&'static str> {
-    [FUNCTION_KIND_WORD, CLASS_KIND_WORD, VARIABLE_KIND_WORD]
-        .into_iter()
-        .find(|word| *word == name)
+    [
+        FUNCTION_KIND_WORD,
+        CLASS_KIND_WORD,
+        VARIABLE_KIND_WORD,
+        METHOD_KIND_WORD,
+        TYPE_ALIAS_KIND_WORD,
+    ]
+    .into_iter()
+    .find(|word| *word == name)
 }
 
 #[cfg(test)]
@@ -478,7 +1011,15 @@ mod tests {
         assert_eq!(function.visibility, None);
         let class = symbol(&document, "Widget");
         assert_eq!(class.kind, "class");
-        assert_eq!(class.facets, [SymbolFacet::Type]);
+        assert_eq!(
+            class.facets,
+            [
+                SymbolFacet::Type,
+                SymbolFacet::MemberContainer,
+                SymbolFacet::Constructible,
+                SymbolFacet::Extensible,
+            ]
+        );
     }
 
     #[test]
@@ -559,7 +1100,7 @@ mod tests {
         let document = analyze(
             "class Widget:\n    def open(self):\n        def helper():\n            pass\n",
         );
-        assert_eq!(symbol(&document, "Widget.open").kind, "function");
+        assert_eq!(symbol(&document, "Widget.open").kind, "method");
         assert_eq!(symbol(&document, "Widget.open.helper").kind, "function");
     }
 
@@ -640,16 +1181,17 @@ mod tests {
     }
 
     #[test]
-    fn test_destructuring_and_attribute_targets_declare_nothing() {
+    fn test_module_level_attribute_targets_declare_nothing() {
         let document = analyze("a, b = 1, 2\nself.count = 3\n");
-        assert!(
-            document.symbols().is_empty(),
-            "only one plain identifier target declares: {:?}",
-            document
-                .symbols()
-                .iter()
-                .map(|symbol| &symbol.qualified_name)
-                .collect::<Vec<_>>()
+        let names = document
+            .symbols()
+            .iter()
+            .map(|symbol| symbol.qualified_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            ["a", "b"],
+            "an attribute outside a method declares nothing"
         );
     }
 
@@ -689,6 +1231,7 @@ mod tests {
             [NodeFacet::Statement]
         );
         assert_eq!(provider.node_facets("comment"), [NodeFacet::Comment]);
+        assert_eq!(provider.node_facets("decorator"), [NodeFacet::Annotation]);
         assert_eq!(provider.node_facets("identifier"), []);
     }
 
