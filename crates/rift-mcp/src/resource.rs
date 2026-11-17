@@ -279,6 +279,41 @@ mod tests {
     }
 
     #[test]
+    fn map_text_lists_the_dependency_context() {
+        use rift_protocol::dependencies::{
+            PackageAvailability, PackageContextEntry, PackageSelector,
+        };
+        let mut map = empty_map();
+        map.packages = vec![
+            PackageContextEntry::new(
+                "cargo",
+                "tokio",
+                PackageSelector::Requirement("^1.53.1".to_owned()),
+                PackageAvailability::Canonical,
+            ),
+            PackageContextEntry::new(
+                "cargo",
+                "local",
+                PackageSelector::Requirement("0.4".to_owned()),
+                PackageAvailability::Path,
+            ),
+            PackageContextEntry::new(
+                "stdlib",
+                "rust",
+                PackageSelector::Version("1.98.1".to_owned()),
+                PackageAvailability::Canonical,
+            ),
+        ];
+        let answer = map_answer(MAP_URI, &map).expect("the map renders");
+        let (compact, _) = contents(&answer, MAP_URI);
+        assert_eq!(
+            compact,
+            "workspace map\npackages:\n\ttokio ^1.53.1 (cargo)\n\tlocal 0.4 (cargo · path)\n\
+             \trust@1.98.1 (stdlib)\nNo indexed files.\nsource catalog · rift://workspace\n"
+        );
+    }
+
+    #[test]
     fn the_published_surface_names_workspace_and_map() {
         let resources = declared_resources();
         let templates = declared_templates();
