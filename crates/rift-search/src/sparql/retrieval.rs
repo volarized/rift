@@ -232,10 +232,38 @@ fn request(
     } else {
         ScopeChoice::Workspace
     };
-    let request = serde_json::from_value(Value::Object(fields))
+    let request: SearchParams = serde_json::from_value(Value::Object(fields))
         .map_err(|error| invalid(&error.to_string()))?;
+    refuse_unowned_packages(&request)?;
     Ok((request, scope_choice))
 }
+
+/// Refuses a `:packages` entry that names no registry. Such an entry carries no owner, so no
+/// release answers for it, and the read would end as an empty answer that names no cause.
+fn refuse_unowned_packages(request: &SearchParams) -> Result<(), RiftError> {
+    if request
+        .packages
+        .iter()
+        .any(|package| package.registry.is_none())
+    {
+        return Err(invalid(PACKAGE_REGISTRY_REQUIRED));
+    }
+    Ok(())
+}
+
+/// The refusal of a `:packages` entry that names no `registry`.
+const PACKAGE_REGISTRY_REQUIRED: &str = "every `:packages` entry names its `registry`, such as `{\"manager\":\"cargo\",\"registry\":\"crates.io\",\"name\":\"serde\"}`";
+
+/// Inputs that carry a structured value, written as an `rdf:JSON` literal, each with the
+/// value its refusal shows.
+const JSON_FIELDS: [(&str, &str); 3] = [
+    ("paths", r#"{"include":["src/**"]}"#),
+    (
+        "packages",
+        r#"[{"manager":"cargo","registry":"crates.io","name":"serde"}]"#,
+    ),
+    ("change", r#"{"base":"main"}"#),
+];
 
 fn input(key: &str, object: &TermPattern) -> Result<Value, RiftError> {
     if matches!(key, "query" | "pattern")
@@ -244,6 +272,13 @@ fn input(key: &str, object: &TermPattern) -> Result<Value, RiftError> {
         return Err(invalid(
             "retrieval query and pattern must be string literals",
         ));
+    }
+    if let Some((_, example)) = JSON_FIELDS.iter().find(|(field, _)| *field == key)
+        && !matches!(object, TermPattern::Literal(value) if value.datatype().as_str() == RDF_JSON)
+    {
+        return Err(invalid(&format!(
+            "`:{key}` takes an `rdf:JSON` literal, such as `'{example}'^^rdf:JSON`"
+        )));
     }
     match object {
         TermPattern::Literal(value) if value.datatype().as_str() == RDF_JSON => {
@@ -447,5 +482,69 @@ mod tests {
             [("beacon".to_owned(), SearchScope::All)]
         );
         Ok(())
+    }
+
+    /// The query every `:packages` test sends, with `packages` as the service's object.
+    fn package_query(packages: &str) -> String {
+        format!(
+            "SELECT ?symbol {{ SERVICE :search {{ ?hit :query 'Serialize'; :target 'symbol'; \
+             :packages {packages}; :symbol ?symbol }} }}"
+        )
+    }
+
+    #[test]
+    fn test_packages_read_an_rdf_json_literal_under_either_datatype_spelling()
+    -> Result<(), rift_error::RiftError> {
+        let entry = r#"'[{"manager":"cargo","registry":"crates.io","name":"serde"}]'"#;
+        for datatype in [
+            "rdf:JSON",
+            "<http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON>",
+        ] {
+            let query = parsed(&package_query(&format!("{entry}^^{datatype}")))?
+                .with_default_scope(&SearchScope::Global);
+            let [selection] = query.retrieval_requests() else {
+                panic!("expected one search producer");
+            };
+            assert_eq!(selection.request.scope, SearchScope::Global, "{datatype}");
+            let [package] = selection.request.packages.as_slice() else {
+                panic!("expected one requested package");
+            };
+            assert_eq!(package.registry.as_deref(), Some("crates.io"), "{datatype}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_packages_refuse_a_plain_string_naming_the_literal_they_take() {
+        let query =
+            package_query(r#"'[{"manager":"cargo","registry":"crates.io","name":"serde"}]'"#);
+        let error = parsed(&query).expect_err("a plain string carries no structured value");
+        assert_eq!(error.slug(), errors::search::query_syntax_invalid::SLUG);
+        assert!(
+            error
+                .to_string()
+                .contains("`:packages` takes an `rdf:JSON` literal"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_packages_refuse_an_entry_naming_no_registry() {
+        for entries in [
+            r#"[{"manager":"cargo","name":"serde"}]"#,
+            r#"[{"manager":"npm","registry":"npmjs.org","name":"zod"},{"manager":"cargo","name":"serde"}]"#,
+        ] {
+            let error = parsed(&package_query(&format!("'{entries}'^^rdf:JSON")))
+                .expect_err("an entry with no registry matches no release");
+            assert_eq!(
+                error.slug(),
+                errors::search::query_syntax_invalid::SLUG,
+                "{entries}"
+            );
+            assert!(
+                error.to_string().contains("names its `registry`"),
+                "{entries}: {error}"
+            );
+        }
     }
 }
