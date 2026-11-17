@@ -1705,6 +1705,11 @@ async fn test_fixture_documented_problem_statuses_decode() {
         let (server, client) = operation_client(OperationFixture::Problem(status)).await;
         let result = client.search_packages(&search_request(), 20, None).await;
         let error = result.expect_err("documented HTTP refusal");
+        if status == StatusCode::BAD_REQUEST {
+            assert_refused_request(&error, "request", "fixture problem");
+            assert_eq!(server.state.requests.load(Ordering::SeqCst), 2);
+            continue;
+        }
         let expected_slug = if status == StatusCode::FORBIDDEN {
             "rift.client.remote_permission_denied"
         } else {
@@ -1748,6 +1753,74 @@ async fn operation_failure(
             .find_declarations(&declaration::declaration_request())
             .await
             .err(),
+    }
+}
+
+/// `error` is the caller's own invalid request naming `field` and `violation`.
+fn assert_refused_request(error: &RiftError, field: &str, violation: &str) {
+    assert_eq!(
+        error.slug().as_str(),
+        "rift.client.request_invalid",
+        "{error}"
+    );
+    assert_eq!(error_text_field(error, "field"), field);
+    assert_eq!(error_text_field(error, "violation"), violation);
+}
+
+/// A 400 refusal names the request field and violation its problem details state, as
+/// members or in the registered refusal message, else its whole detail against the request.
+#[test]
+fn test_bad_request_problem_names_the_refused_field() {
+    let meta = ResponseMeta {
+        status: 400,
+        content_type: Some("application/problem+json".to_owned()),
+        etag: None,
+        cache_control: None,
+        www_authenticate: None,
+        retry_after: None,
+        rate_limit_limit: None,
+        rate_limit_remaining: None,
+        rate_limit_reset: None,
+    };
+    let problem = |detail: &str, members: serde_json::Value| {
+        let mut value = serde_json::json!({
+            "type": "about:blank",
+            "title": "Bad Request",
+            "status": 400,
+            "detail": detail,
+        });
+        if let (Some(target), Some(extra)) = (value.as_object_mut(), members.as_object()) {
+            target.extend(extra.clone());
+        }
+        serde_json::from_value::<ProblemDetails>(value).expect("problem details")
+    };
+    for (problem, field, violation) in [
+        (
+            Some(problem(
+                "the request does not match the documented form: field declaration_cursor, \
+                 violation declaration cursor failed validation",
+                serde_json::json!({}),
+            )),
+            "declaration_cursor",
+            "declaration cursor failed validation",
+        ),
+        (
+            Some(problem(
+                "refused",
+                serde_json::json!({ "field": "limit", "violation": "exceeds 200" }),
+            )),
+            "limit",
+            "exceeds 200",
+        ),
+        (
+            Some(problem("cursor expired", serde_json::json!({}))),
+            "request",
+            "cursor expired",
+        ),
+        (None, "request", "the global API refused the request"),
+    ] {
+        let error = failure::remote("get_symbol", &meta, problem.as_ref());
+        assert_refused_request(&error, field, violation);
     }
 }
 
@@ -1819,6 +1892,17 @@ async fn test_fixture_every_operation_answers_problem_statuses() {
             let actual = operation_failure(&client, endpoint)
                 .await
                 .expect("HTTP refusal");
+            if status == StatusCode::BAD_REQUEST {
+                assert_refused_request(&actual, "request", "fixture problem");
+                assert!(
+                    operation_failure(&client, Endpoint::Capabilities)
+                        .await
+                        .is_none(),
+                    "a refused request is not recorded as the endpoint's failure"
+                );
+                assert_eq!(server.state.requests.load(Ordering::SeqCst), 2);
+                continue;
+            }
             assert_remote_error(&actual, &expected);
             assert_eq!(server.state.requests.load(Ordering::SeqCst), 2);
             let cached = operation_failure(&client, Endpoint::Capabilities)
