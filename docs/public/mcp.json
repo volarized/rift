@@ -2,7 +2,7 @@
   "description": "Tools served by the Rift MCP server, with the JSON Schemas derived from the Rust wire models.",
   "tools": [
     {
-      "description": "Sends a feedback report to the configured intake over HTTPS. The server sends the\ncaller's text and any selected diagnostic fields. The caller MUST omit secrets,\npersonal data, and private source material. The caller MUST obtain the user's\napproval for any exact conversation excerpt before including it in a report.",
+      "description": "Sends a feedback report over HTTPS to the public Rift intake, or to the intake that\n`RIFT_FEEDBACK_URL` names in the server's environment. The server sends the\ncaller's text and any selected diagnostic fields. The caller MUST omit secrets,\npersonal data, and private source material. The caller MUST obtain the user's\napproval for any exact conversation excerpt before including it in a report.",
       "input_schema": {
         "$defs": {
           "FeedbackDetail": {

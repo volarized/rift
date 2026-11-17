@@ -83,11 +83,8 @@ jobs:
       # so nothing else would *block* a vulnerable JS dependency from landing.
       # Baseline is clean as of the dependency upgrade PR; `--audit-level=high`
       # keeps moderates visible in the log without failing the build.
-      #
-      # GHSA-fc5q-39xc-vjpf: picomatch through 4.0.7, the latest release, backtracks
-      # on a crafted glob pattern. Here picomatch runs at build time only, on the
-      # patterns of fumadocs-mdx, tinyglobby and unplugin, never on visitor input.
-      # Drop the ignore when a patched picomatch is published.
+      # GHSA-fc5q-39xc-vjpf: picomatch ReDoS through fumadocs' build-time globbing; no
+      # patched picomatch release exists yet. Drop the ignore once one ships.
       - run: bun audit --audit-level=high --ignore=GHSA-fc5q-39xc-vjpf
 
   # Every check that feeds no test job: formatting, generated files, crate
