@@ -1,6 +1,6 @@
 "use client";
 
-import type { KeyboardEvent } from "react";
+import { type KeyboardEvent, useRef } from "react";
 
 import {
   constraintText,
@@ -69,6 +69,10 @@ function Field({
   } as const;
   const asJson = state.asJson || spec.kind === "json";
   const setText = (text: string) => onChange({ ...state, text });
+  // A string that held several lines once, such as a query an example filled in,
+  // keeps the taller control: swapping it back mid-edit would drop the focus.
+  const multiline = useRef(false);
+  if (spec.kind === "string" && state.text.includes("\n")) multiline.current = true;
 
   let control: React.ReactNode;
   if (asJson) {
@@ -137,6 +141,20 @@ function Field({
           ))}
         </SelectContent>
       </Select>
+    );
+  } else if (multiline.current) {
+    control = (
+      <Textarea
+        {...shared}
+        value={state.text}
+        onChange={(event) => setText(event.target.value)}
+        onKeyDown={submitOnModEnter}
+        placeholder={placeholderText(spec)}
+        spellCheck={false}
+        autoComplete="off"
+        rows={Math.min(14, state.text.split("\n").length + 1)}
+        className={cn(TEXTAREA, "whitespace-pre")}
+      />
     );
   } else {
     const numeric = spec.kind !== "string";

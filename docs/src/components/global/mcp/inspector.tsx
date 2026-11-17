@@ -8,6 +8,7 @@ import {
   ConnectionPanel,
   type PingState,
 } from "@/components/global/mcp/connection-panel";
+import { GLOBAL_EXAMPLES } from "@/components/global/mcp/examples";
 import {
   clientConfiguration,
   describeFailure,
@@ -242,6 +243,7 @@ export default function Inspector() {
                 className="flex-1 border-border max-xl:border-b xl:border-r"
                 tool={tool}
                 editor={editor}
+                examples={selected ? GLOBAL_EXAMPLES[selected] : undefined}
                 pendingSince={call.status === "pending" ? call.startedAt : undefined}
                 onEditorChange={(next) => {
                   if (selected) setEditors((current) => ({ ...current, [selected]: next }));

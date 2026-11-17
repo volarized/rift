@@ -3,6 +3,7 @@
 import { CircleNotchIcon } from "@phosphor-icons/react";
 import { useMemo } from "react";
 
+import type { ToolExample } from "@/components/global/mcp/examples";
 import { Elapsed } from "@/components/global/mcp/result-view";
 import {
   type Arguments,
@@ -57,6 +58,7 @@ const OUTLINE = "bg-transparent font-mono font-normal dark:bg-transparent";
 export function RequestPanel({
   className,
   editor,
+  examples: named,
   onCall,
   onCancel,
   onEditorChange,
@@ -65,6 +67,8 @@ export function RequestPanel({
 }: {
   className?: string;
   editor: Editor;
+  /** Named calls for the selected tool; without them the examples of its schema are offered. */
+  examples?: ToolExample[];
   onCall: (args: Arguments) => void;
   onCancel: () => void;
   onEditorChange: (editor: Editor) => void;
@@ -73,7 +77,15 @@ export function RequestPanel({
   tool?: ToolInfo;
 }) {
   const specs = useMemo(() => (tool ? fieldSpecs(tool.inputSchema) : []), [tool]);
-  const examples = useMemo(() => (tool ? argumentExamples(tool.inputSchema) : []), [tool]);
+  const examples = useMemo<ToolExample[]>(() => {
+    if (named && named.length > 0) return named;
+    const fromSchema = tool ? argumentExamples(tool.inputSchema) : [];
+    return fromSchema.map((example, index) => ({
+      label: fromSchema.length > 1 ? `Use example ${index + 1}` : "Use example",
+      arguments: example,
+    }));
+  }, [named, tool]);
+  const fromPage = named !== undefined && named.length > 0;
   const pending = pendingSince !== undefined;
 
   const read = argumentsFromForm(specs, editor.form);
@@ -176,25 +188,26 @@ export function RequestPanel({
               </div>
               {examples.length > 0 ? (
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className={LABEL}>Arguments from the schema</span>
-                  {examples.map((example, index) => (
+                  <span className={LABEL}>
+                    {fromPage ? "Examples" : "Arguments from the schema"}
+                  </span>
+                  {examples.map((example) => (
                     <Button
-                      // biome-ignore lint/suspicious/noArrayIndexKey: examples have no identity but their position
-                      key={index}
+                      key={example.label}
                       type="button"
                       variant="outline"
                       size="xs"
                       onClick={() =>
                         onEditorChange({
                           ...editor,
-                          form: formFromArguments(specs, example),
-                          json: JSON.stringify(example, null, 2),
+                          form: formFromArguments(specs, example.arguments),
+                          json: JSON.stringify(example.arguments, null, 2),
                           notice: undefined,
                         })
                       }
                       className={OUTLINE}
                     >
-                      {examples.length > 1 ? `Use example ${index + 1}` : "Use example"}
+                      {example.label}
                     </Button>
                   ))}
                 </div>
