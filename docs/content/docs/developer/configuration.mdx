@@ -1201,6 +1201,9 @@ default_scope = "global"
 - the server refuses `global` and `all` beside `:rev`, `:change`, and a
   [commit search](/docs/developer/protocol/mcp#search-commits), so under either value such a
   service selects `:scope "local"` itself
+- under `global`, `tools/list` serves `search`, `get_symbol`, and `nodes` examples that read a
+  crates.io release in place of the project examples, so a server that holds no project lists
+  examples it answers
 
 <VersionBadge version="v0.0.46" />
 
