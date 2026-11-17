@@ -166,6 +166,27 @@ carry their existing structured values as `rdf:JSON` literals. `:rev` selects a 
 committed revision. The [protocol reference](/docs/developer/protocol/mcp#search-scope)
 describes selection and refusal behavior.
 
+`:packages` names releases beside the ones the workspace depends on. Each entry names its
+`manager`, `registry`, and `name`, and an optional exact `version`; without one, the newest
+collected release answers:
+
+```sparql
+SELECT ?symbol ?name {
+  SERVICE :search {
+    ?hit :query "Serialize"; :target "symbol"; :scope "global";
+         :packages '[{"manager":"cargo","registry":"crates.io","name":"serde_core"}]'^^rdf:JSON;
+         :symbol ?symbol; :index ?index .
+    ?symbol :name ?name
+  }
+}
+ORDER BY ?index
+LIMIT 5
+```
+
+The server refuses a `:packages` value written as a plain string, and an entry that names no
+`registry`. A workspace whose [`[search] default_scope`](/docs/developer/configuration#search)
+is `global` reads this service with no `:scope`.
+
 Global relationship queries read facts already collected for the selected package or runtime.
 
 ### References and calls [#search-traversal]
