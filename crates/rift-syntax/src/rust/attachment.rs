@@ -25,7 +25,7 @@ const OUTER_DOC_MARKER_FIELD: &str = "outer";
 
 /// Grammar spelling of an outer attribute, from tree-sitter-rust's
 /// `node-types.json`.
-const ATTRIBUTE_ITEM_KIND: &str = "attribute_item";
+pub(super) const ATTRIBUTE_ITEM_KIND: &str = "attribute_item";
 /// Grammar spelling of a `//` comment, from tree-sitter-rust's
 /// `node-types.json`.
 const LINE_COMMENT_KIND: &str = "line_comment";
