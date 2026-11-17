@@ -213,7 +213,7 @@ const LANGUAGES: LanguageSummary[] = [
     icon: <AsteriskIcon size={24} />,
     local: ["Text", "LSP"],
     description:
-      "Every visible UTF-8 file can participate in local text search. Any configured language identity can start an LSP process, but structured declarations and relationship traversal still require a shipped syntax provider.",
+      "Every visible UTF-8 file can participate in local text search. Any configured language identity can start an LSP process, but structured declarations and edge traversal still require a shipped syntax provider.",
     wide: true,
   },
   {
