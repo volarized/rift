@@ -4450,6 +4450,19 @@ fn file_digest_revision(digest: rift_index::FileDigest) -> String {
     revision
 }
 
+impl RiftMcp {
+    /// The `initialize` instructions this server answers: the global index's for a workspace
+    /// whose `[search] default_scope` is `global`, else the workspace's.
+    async fn served_instructions(&self) -> &'static str {
+        let (published, _) = read_published(&self.published).await.snapshot();
+        if published.configuration.search_configuration().default_scope == SearchScope::Global {
+            GLOBAL_INSTRUCTIONS
+        } else {
+            WORKSPACE_INSTRUCTIONS
+        }
+    }
+}
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for RiftMcp {
     /// Routes the call as the generated `call_tool` does, then completes a Rift operating
@@ -4656,16 +4669,21 @@ impl ServerHandler for RiftMcp {
     }
 
     /// Answers as rmcp's default does: keeps the client's parameters as the peer's and
-    /// negotiates the protocol version; records the request's duration.
-    fn initialize(
+    /// negotiates the protocol version; records the request's duration. A workspace whose
+    /// `[search] default_scope` is `global` answers instructions that read the global index.
+    async fn initialize(
         &self,
         request: rmcp::model::InitializeRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<rmcp::model::InitializeResult, ErrorData>> {
-        let answered;
+    ) -> Result<rmcp::model::InitializeResult, ErrorData> {
+        let instructions = self.served_instructions().await;
+        let mut answered;
         let elapsed = rift_tracing::measure_elapsed!("initialize", {
             context.peer.set_peer_info(request.clone());
             answered = self.negotiate_initialize(&request);
+            if let Ok(info) = &mut answered {
+                info.instructions = Some(instructions.to_owned());
+            }
         })
         .ok()
         .map(|((), measurement)| measurement.elapsed());
@@ -4676,7 +4694,7 @@ impl ServerHandler for RiftMcp {
                 elapsed,
                 Ending::of(&answered),
             );
-        std::future::ready(answered)
+        answered
     }
 
     /// Answers as rmcp's default does; records the request's duration.
@@ -4701,17 +4719,24 @@ impl ServerHandler for RiftMcp {
                 .build(),
         )
         .with_server_info(Implementation::new("rift", env!("CARGO_PKG_VERSION")))
-        .with_instructions(
-            "Read the current workspace: get_symbol and search find \
-             declarations, nodes lists syntax nodes at a byte position. \
-             The rift://workspace resource reads effective configuration \
-             and source files. `rift server logs` reads the server's recorded diagnostics, \
-             including while a tool refuses.",
-        );
+        .with_instructions(WORKSPACE_INSTRUCTIONS);
         info.meta = Some(crate::identity::identity_meta(&self.identity));
         info
     }
 }
+
+/// The `initialize` instructions of a server reading its workspace.
+const WORKSPACE_INSTRUCTIONS: &str = "Read the current workspace: get_symbol and search find \
+     declarations, nodes lists syntax nodes at a byte position. \
+     The rift://workspace resource reads effective configuration \
+     and source files. `rift server logs` reads the server's recorded diagnostics, \
+     including while a tool refuses.";
+
+/// The `initialize` instructions of a server whose `[search] default_scope` is `global`: it
+/// reads the global index of package and runtime releases, not a workspace.
+const GLOBAL_INSTRUCTIONS: &str = "Read the global index of package and runtime releases: \
+     search finds their declarations, naming releases with `:packages` in `SERVICE :search`; \
+     get_symbol reads one symbol at a release `revision`; nodes lists its syntax nodes.";
 
 /// The engine pool held across requests, replaced when accepted LSP configuration changes.
 ///
@@ -4907,6 +4932,41 @@ fn workspace_languages(
 
 #[cfg(test)]
 mod tests {
+    /// `initialize` describes the global index on a server whose `[search] default_scope`
+    /// is `global`, and the workspace on one reading it by default.
+    #[tokio::test]
+    async fn initialize_instructions_follow_the_default_scope() -> TestResult {
+        for (configuration, expected) in [
+            ("", super::WORKSPACE_INSTRUCTIONS),
+            (
+                "[global]\nenabled = false\n\n[search]\ndefault_scope = \"global\"\n",
+                super::GLOBAL_INSTRUCTIONS,
+            ),
+        ] {
+            let directory = tempfile::tempdir()?;
+            super::hermetic_workspace(directory.path(), configuration)?;
+            fs::write(directory.path().join("lib.rs"), "fn alpha() {}\n")?;
+            let root = directory.path().canonicalize()?;
+            let server = RiftMcp::build_settled(&root, WorkspaceIndexLimits::default()).await?;
+            let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+            let server_task = tokio::spawn(async move {
+                let service = server
+                    .serve(server_transport)
+                    .await
+                    .expect("server must initialize");
+                service.waiting().await.expect("server must stop cleanly");
+            });
+            let client = ().serve(client_transport).await?;
+            let instructions = client
+                .peer_info()
+                .and_then(|info| info.instructions.clone());
+            assert_eq!(instructions.as_deref(), Some(expected), "{configuration:?}");
+            client.cancel().await?;
+            server_task.await?;
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn external_create_of_a_text_file_populates_lexical_search() -> TestResult {
         let (directory, server) = fixture().await?;

@@ -282,6 +282,82 @@ async fn a_skipped_token_check_serves_a_request_the_default_refuses() -> TestRes
     stopped_within_deadline(checked).await
 }
 
+/// A transport refusal, such as a missing `Accept`, a missing `Content-Type`, or a body that
+/// is not JSON, answers `application/problem+json` carrying its status and the refusal's text
+/// as `detail`; a JSON-RPC answer keeps its own media type.
+#[tokio::test]
+async fn transport_refusals_answer_problem_details() -> TestResult {
+    let directory = workspace_with(None)?;
+    let (shutdown, server) = served_under(directory.path(), TokenCheck::Skipped).await?;
+    let http = reqwest::Client::new();
+    let both = "application/json, text/event-stream";
+    let ping = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+    for (content_type, accept, body, status, detail) in [
+        (
+            Some("application/json"),
+            None,
+            ping,
+            reqwest::StatusCode::NOT_ACCEPTABLE,
+            "text/event-stream",
+        ),
+        (
+            None,
+            Some(both),
+            ping,
+            reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Content-Type",
+        ),
+        (
+            Some("application/json"),
+            Some(both),
+            "{bad",
+            reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "deserialize",
+        ),
+    ] {
+        let mut request = http.post(mcp_url(&server)).body(body);
+        if let Some(content_type) = content_type {
+            request = request.header("Content-Type", content_type);
+        }
+        if let Some(accept) = accept {
+            request = request.header("Accept", accept);
+        }
+        let response = request.send().await?;
+        assert_eq!(response.status(), status);
+        assert_eq!(
+            response
+                .headers()
+                .get("Content-Type")
+                .and_then(|value| value.to_str().ok()),
+            Some("application/problem+json")
+        );
+        let problem: serde_json::Value = response.json().await?;
+        assert_eq!(problem["status"], json!(status.as_u16()));
+        assert_eq!(problem["type"], json!("about:blank"));
+        let text = problem["detail"].as_str().unwrap_or_default();
+        assert!(text.contains(detail), "{problem}");
+    }
+
+    let answered = http
+        .post(mcp_url(&server))
+        .header("Content-Type", "application/json")
+        .header("Accept", both)
+        .body(ping)
+        .send()
+        .await?;
+    assert_eq!(answered.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        answered
+            .headers()
+            .get("Content-Type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+
+    shutdown.cancel();
+    stopped_within_deadline(server).await
+}
+
 #[tokio::test]
 async fn authorized_stop_route_stops_the_server() -> TestResult {
     let directory = workspace_with(None)?;

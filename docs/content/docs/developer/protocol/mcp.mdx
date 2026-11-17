@@ -149,6 +149,9 @@ require those input values as stored facts on every result.
 
 `:limit` and `:page_index` select a producer page. Outer `LIMIT` and `OFFSET` apply to the
 SPARQL result after evaluation. Missing producer coverage can make the query unavailable.
+A package answered from the nearest collected release under `package_substituted` is covered.
+A global API read that fails answers `unavailable` with reason `read_failed`, and
+`rift server logs` names its `failure_class`.
 
 ### Pattern [#search-pattern]
 

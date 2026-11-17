@@ -1139,9 +1139,12 @@ impl GlobalClient {
     }
 
     /// Hands `result` back, first recording its failure as the one every request answers
-    /// for `failure_ttl`.
+    /// for `failure_ttl`. A refusal of the request itself states nothing about the endpoint,
+    /// so it answers that request alone.
     async fn observed<T>(&self, result: Result<T, RiftError>) -> Result<T, RiftError> {
-        if let Err(error) = &result {
+        if let Err(error) = &result
+            && !failure::refuses_request_alone(error)
+        {
             let mut failure = self.inner.failure.write().await;
             *failure = Some(CachedFailure {
                 error: error.clone(),
