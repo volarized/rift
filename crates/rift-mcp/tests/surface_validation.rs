@@ -407,6 +407,61 @@ async fn absent_request(
     Ok(request)
 }
 
+/// A workspace whose `[search] default_scope` is `global` lists `search`, `get_symbol`, and
+/// `nodes` examples that read a package release, each one valid against its input schema; a
+/// workspace reading `local` lists the declared project examples.
+#[tokio::test]
+async fn tools_list_examples_follow_the_default_scope() -> TestResult {
+    for global in [false, true] {
+        let fixture = surface_corpus::SurfaceFixture::start_with_configuration(Ok).await?;
+        if global {
+            let path = fixture.root().join("rift.toml");
+            let written = std::fs::read_to_string(&path)?;
+            assert!(!written.contains("[search]\n"));
+            std::fs::write(
+                path,
+                format!("{written}\n[search]\ndefault_scope = \"global\"\n"),
+            )?;
+        }
+        let server = RiftMcp::build(fixture.root(), WorkspaceIndexLimits::default()).await?;
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            let service = server
+                .serve(server_transport)
+                .await
+                .expect("server must initialize");
+            service.waiting().await.expect("server must stop cleanly");
+        });
+        let client = ().serve(client_transport).await?;
+        workspace_client::await_workspace_ready(&client).await?;
+        let tools = client.list_all_tools().await?;
+        for name in ["search", "get_symbol", "nodes"] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .ok_or_else(|| format!("{name} absent"))?;
+            let schema = Value::Object(tool.input_schema.as_ref().clone());
+            let validator = jsonschema::validator_for(&schema)?;
+            let examples = schema["examples"]
+                .as_array()
+                .ok_or_else(|| format!("{name} lists no examples"))?;
+            assert!(!examples.is_empty(), "{name}");
+            for example in examples {
+                assert_validates(&validator, example, &format!("{name} example"));
+                let text = example.to_string();
+                assert_eq!(
+                    text.contains("serde_core"),
+                    global,
+                    "{name} example under global = {global}: {text}"
+                );
+            }
+        }
+        client.cancel().await?;
+        server_task.await?;
+    }
+    Ok(())
+}
+
 /// A miss keeps the empty answer and proposes declarations the caller can retrieve (#590).
 #[tokio::test]
 async fn get_symbol_miss_proposes_three_project_alternatives() -> TestResult {
@@ -1255,7 +1310,7 @@ async fn packages_beside_the_local_scope_or_rev_refuse_naming_packages() -> Test
         json!({"query": "helper_beacon"}),
     )?)?;
     workspace_client::query_after_population(&client, &warmup).await?;
-    let packages = json!([{ "manager": "cargo", "name": "demo", "version": "1.0.0" }]);
+    let packages = json!([{ "manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0" }]);
     let id = workspace_client::captured_seed(&client, "beacon_one", "lib.rs").await?;
     let requests = [
         ("get_symbol", json!({ "id": id, "packages": packages })),
@@ -1541,7 +1596,7 @@ async fn a_revision_spelling_past_the_advertised_form_refuses_naming_the_field()
 #[tokio::test]
 async fn search_commit_refusals_name_the_field() -> TestResult {
     let (_directory, client, server_task) = served_fixture().await?;
-    let packages = json!([{ "manager": "cargo", "name": "demo", "version": "1.0.0" }]);
+    let packages = json!([{ "manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0" }]);
     let refused = [
         (json!({ "pattern": "witness" }), "pattern"),
         (json!({ "change": { "base": "baseline" } }), "change"),
