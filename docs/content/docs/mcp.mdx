@@ -241,12 +241,10 @@ The result carries `outcome: "found"`, one `symbol`, the `revision` it was read 
 `declarations` in deterministic source order. Each declaration keeps its own origin,
 source address, byte range, and indices into the symbol's signatures, types, and documentation.
 Every declaration of one qualified path, such as two `cfg` variants of one Rust function, is a binding of that one logical symbol. A source-less object can
-be found with no declarations. These runtime reads distinguish a declaration with no
-captured source from a synthetic builtin:
+be found with no declarations. A runtime symbol, such as `readFile` in Node's `fs` module, reads
+the same way, and its `revision` names the runtime release:
 
-<ReadExample name="source-less-runtime" />
-
-<ReadExample name="source-less-builtin" />
+<ReadExample name="runtime-symbol" />
 
 Use `include` to select optional projections:
 
@@ -295,7 +293,8 @@ A package or runtime identity names an owner across releases. Discover it with
 If the requested release has no complete coverage, `search` can return an unavailable
 answer. Check `rift server logs` for the release and the coverage details.
 
-Several declaration bindings share one identity. `declaration_limit` and its returned cursor
+Several declaration bindings share one identity, such as the `cfg(unix)` and `cfg(windows)`
+declarations of `data_dir` in the `sdk` project. `declaration_limit` and its returned cursor
 continue those bindings at the same revision:
 
 <ReadExample name="multi-declaration-full" />
@@ -338,9 +337,9 @@ The summary shows a source excerpt and selected syntax parts for each declaratio
 
 For a package or runtime symbol found through `SERVICE :search` with `:scope "global"`, Rift reads
 the declaration from the global API at the release `revision` names, such as
-`rift://revision/cargo/crates.io/demo@1.0.0`, or at the version your project's dependencies pin when the
+`rift://revision/cargo/crates.io/itoa@1.0.18`, or at the version your project's dependencies pin when the
 request names none. Each node's `unit` names a source unit of the package, such as
-`rift://source/cargo/crates.io/demo/src/lib.rs`.
+`rift://source/cargo/crates.io/itoa/src/lib.rs`.
 
 <Callout type="info">
 
