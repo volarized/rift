@@ -31,9 +31,17 @@
 //!   `protected`), and stays `None` everywhere else.
 //! - A `variable_declarator` under a `lexical_declaration` or
 //!   `variable_declaration` declares a `variable`; an arrow function
-//!   assigned to one is that variable, named by the declarator. A
-//!   destructuring declarator declares its names through a pattern, not a
-//!   single name, and emits no symbol.
+//!   assigned to one is that variable, named by the declarator, and carries
+//!   the `Callable` facet. A destructuring declarator declares one
+//!   `variable` per name its pattern binds, each spanning its own name.
+//! - A function, a method, and a variable named by an identifier open a
+//!   scope, as a class does: a local or a method of an object literal
+//!   qualifies under the declaration holding it (`outer.local`,
+//!   `options.open`), never at module scope.
+//! - A class field and a constructor parameter property declare a
+//!   `property` of the class; an enum member declares an `enum_member` of
+//!   the enum. The anonymous class `export default class { .. }` declares a
+//!   class named `default`, the name the module exports it under.
 //! - A computed member key names its method by the key expression's own
 //!   bytes, so a name can run to any length. A declaration whose name or
 //!   qualified name passes `PROVIDER_SYMBOL_ID_BYTES_MAX` bytes is left out
@@ -78,6 +86,51 @@ const GENERATOR_FUNCTION_DECLARATION_KIND: &str = "generator_function_declaratio
 const CLASS_DECLARATION_KIND: &str = "class_declaration";
 /// Grammar spelling of a `method_definition`.
 const METHOD_DEFINITION_KIND: &str = "method_definition";
+/// Grammar spelling of a JavaScript class field.
+const FIELD_DEFINITION_KIND: &str = "field_definition";
+/// Grammar spelling of a TypeScript class field.
+const PUBLIC_FIELD_DEFINITION_KIND: &str = "public_field_definition";
+/// Grammar spelling of an `abstract class` (TypeScript grammars only).
+const ABSTRACT_CLASS_DECLARATION_KIND: &str = "abstract_class_declaration";
+/// Grammar spelling of a bodyless `abstract` method (TypeScript grammars
+/// only).
+const ABSTRACT_METHOD_SIGNATURE_KIND: &str = "abstract_method_signature";
+/// Grammar spelling of an enum member that assigns a value (TypeScript
+/// grammars only).
+const ENUM_ASSIGNMENT_KIND: &str = "enum_assignment";
+/// Grammar spelling of an enum's body (TypeScript grammars only).
+const ENUM_BODY_KIND: &str = "enum_body";
+/// Grammar spelling of a member name, `B` in `enum Kind { B }`.
+const PROPERTY_IDENTIFIER_KIND: &str = "property_identifier";
+/// Grammar spelling of a class expression, `class { .. }` in
+/// `export default class { .. }`.
+const CLASS_KIND: &str = "class";
+/// Grammar spelling of an arrow function expression.
+const ARROW_FUNCTION_KIND: &str = "arrow_function";
+/// Grammar spelling of a `function` expression.
+const FUNCTION_EXPRESSION_KIND: &str = "function_expression";
+/// Grammar spelling of a `function*` expression.
+const GENERATOR_FUNCTION_KIND: &str = "generator_function";
+/// Grammar spelling of a constructor parameter (TypeScript grammars only).
+const REQUIRED_PARAMETER_KIND: &str = "required_parameter";
+/// Grammar spelling of an optional constructor parameter (TypeScript
+/// grammars only).
+const OPTIONAL_PARAMETER_KIND: &str = "optional_parameter";
+/// Binding patterns a destructuring declarator holds its names through:
+/// every name inside one is bound.
+const BINDING_PATTERN_KINDS: [&str; 3] = ["object_pattern", "array_pattern", "rest_pattern"];
+/// Grammar spelling of `key: value` inside an object pattern; only its value
+/// binds.
+const PAIR_PATTERN_KIND: &str = "pair_pattern";
+/// Patterns with a default, `a = b`; only their left side binds.
+const DEFAULT_PATTERN_KINDS: [&str; 2] = ["assignment_pattern", "object_assignment_pattern"];
+/// Grammar spelling of `a` in the object pattern `{ a }`.
+const SHORTHAND_PROPERTY_IDENTIFIER_PATTERN_KIND: &str = "shorthand_property_identifier_pattern";
+/// The method name a class constructor carries.
+const CONSTRUCTOR_NAME: &str = "constructor";
+/// The name a module exports its default export under, which an anonymous
+/// default class declares as.
+const DEFAULT_EXPORT_NAME: &str = "default";
 /// Grammar spelling of a `variable_declarator`.
 const VARIABLE_DECLARATOR_KIND: &str = "variable_declarator";
 /// Grammar spelling of a `let`/`const` declaration statement.
@@ -182,6 +235,12 @@ pub(crate) enum EcmaScriptSymbolKind {
     Namespace,
     /// Property signature inside an interface or class body (TypeScript).
     Property,
+    /// Class field, or a constructor parameter property (TypeScript). It
+    /// carries the `property` kind word, the same declaration a property
+    /// signature names, and belongs to its class.
+    Field,
+    /// Member of an enumeration (TypeScript).
+    EnumMember,
 }
 
 impl EcmaScriptSymbolKind {
@@ -196,7 +255,8 @@ impl EcmaScriptSymbolKind {
             Self::Enum => "enum",
             Self::TypeAlias => "type_alias",
             Self::Namespace => "namespace",
-            Self::Property => "property",
+            Self::Property | Self::Field => "property",
+            Self::EnumMember => "enum_member",
         }
     }
 
@@ -207,6 +267,8 @@ impl EcmaScriptSymbolKind {
             Self::Class | Self::Interface | Self::Enum => vec![SymbolFacet::Type],
             Self::TypeAlias => vec![SymbolFacet::Type, SymbolFacet::Alias],
             Self::Variable | Self::Property => vec![SymbolFacet::Value],
+            Self::Field => vec![SymbolFacet::Value, SymbolFacet::Member],
+            Self::EnumMember => vec![SymbolFacet::Variant],
             Self::Namespace => vec![SymbolFacet::Namespace],
         }
     }
@@ -222,13 +284,27 @@ impl EcmaScriptSymbolKind {
             | Self::Interface
             | Self::Enum
             | Self::Namespace => EcmaScriptGrammarField::Body,
-            Self::Variable | Self::TypeAlias | Self::Property => EcmaScriptGrammarField::Value,
+            Self::Variable | Self::TypeAlias | Self::Property | Self::Field | Self::EnumMember => {
+                EcmaScriptGrammarField::Value
+            }
         }
     }
 
-    /// Whether declarations inside this kind's body qualify under its name.
+    /// Whether declarations inside this kind qualify under its name. A
+    /// callable and a variable open one too, so a local or a method of an
+    /// object literal files under the declaration holding it, never at
+    /// module scope.
     const fn opens_scope(self) -> bool {
-        matches!(self, Self::Class | Self::Namespace | Self::Interface)
+        matches!(
+            self,
+            Self::Class
+                | Self::Namespace
+                | Self::Interface
+                | Self::Enum
+                | Self::Function
+                | Self::Method
+                | Self::Variable
+        )
     }
 }
 
@@ -246,13 +322,15 @@ enum EcmaScriptGrammarField {
     Source,
     /// Exported name of an aliased export specifier.
     Alias,
-    /// `left` field on an `assignment_expression`.
+    /// `left` field on an `assignment_expression`, and on a pattern with a
+    /// default.
     Left,
     /// `right` field on an `assignment_expression`.
     Right,
     /// `object` field on a `member_expression`, `module` in `module.exports`.
     Object,
-    /// `property` field on a `member_expression`, `exports` in `module.exports`.
+    /// `property` field on a `member_expression`, `exports` in `module.exports`,
+    /// and the name of a JavaScript `field_definition`.
     Property,
 }
 
@@ -320,6 +398,29 @@ pub(crate) struct EcmaScriptKinds {
     right: NonZeroU16,
     object: NonZeroU16,
     property: NonZeroU16,
+    /// `abstract_class_declaration` and `abstract_method_signature`; empty on
+    /// the JavaScript grammar.
+    abstract_declarations: Vec<u16>,
+    /// The class expression an anonymous `export default class` holds.
+    class_expression: u16,
+    /// Function expressions that make the variable holding one callable.
+    function_values: Vec<u16>,
+    /// `Some` on the TypeScript grammars.
+    enum_body: Option<u16>,
+    property_identifier: u16,
+    method_definition: u16,
+    /// Constructor parameters that can declare a property; empty on the
+    /// JavaScript grammar.
+    parameter_properties: Vec<u16>,
+    /// The `readonly` token a parameter property can carry.
+    readonly_token: Option<u16>,
+    /// `pattern` field on a parameter; `None` on the JavaScript grammar.
+    pattern: Option<NonZeroU16>,
+    variable_declarator: u16,
+    binding_patterns: Vec<u16>,
+    pair_pattern: u16,
+    default_patterns: Vec<u16>,
+    shorthand_property_identifier_pattern: u16,
 }
 
 impl EcmaScriptKinds {
@@ -331,6 +432,16 @@ impl EcmaScriptKinds {
     /// module depends on - a grammar-version error, not a reachable
     /// operating state.
     pub(crate) fn resolve_javascript(language: &tree_sitter::Language) -> Self {
+        let mut kinds = Self::resolve_core(language);
+        kinds.declarations.push((
+            kind_id(language, FIELD_DEFINITION_KIND),
+            EcmaScriptSymbolKind::Field,
+        ));
+        kinds
+    }
+
+    /// Resolves the vocabulary every pinned ECMAScript grammar shares.
+    fn resolve_core(language: &tree_sitter::Language) -> Self {
         Self {
             declarations: vec![
                 (
@@ -378,7 +489,7 @@ impl EcmaScriptKinds {
             equals_token: token_id(language, EQUALS_TOKEN),
             expression_statement: kind_id(language, EXPRESSION_STATEMENT_KIND),
             assignment_expression: kind_id(language, ASSIGNMENT_EXPRESSION_KIND),
-            function_expression: kind_id(language, "function_expression"),
+            function_expression: kind_id(language, FUNCTION_EXPRESSION_KIND),
             member_expression: kind_id(language, MEMBER_EXPRESSION_KIND),
             object_literal: kind_id(language, OBJECT_KIND),
             shorthand_property_identifier: kind_id(language, SHORTHAND_PROPERTY_IDENTIFIER_KIND),
@@ -392,6 +503,33 @@ impl EcmaScriptKinds {
             right: field_id(language, "right"),
             object: field_id(language, "object"),
             property: field_id(language, "property"),
+            abstract_declarations: Vec::new(),
+            class_expression: kind_id(language, CLASS_KIND),
+            function_values: [
+                ARROW_FUNCTION_KIND,
+                FUNCTION_EXPRESSION_KIND,
+                GENERATOR_FUNCTION_KIND,
+            ]
+            .map(|kind| kind_id(language, kind))
+            .to_vec(),
+            enum_body: None,
+            property_identifier: kind_id(language, PROPERTY_IDENTIFIER_KIND),
+            method_definition: kind_id(language, METHOD_DEFINITION_KIND),
+            parameter_properties: Vec::new(),
+            readonly_token: None,
+            pattern: None,
+            variable_declarator: kind_id(language, VARIABLE_DECLARATOR_KIND),
+            binding_patterns: BINDING_PATTERN_KINDS
+                .map(|kind| kind_id(language, kind))
+                .to_vec(),
+            pair_pattern: kind_id(language, PAIR_PATTERN_KIND),
+            default_patterns: DEFAULT_PATTERN_KINDS
+                .map(|kind| kind_id(language, kind))
+                .to_vec(),
+            shorthand_property_identifier_pattern: kind_id(
+                language,
+                SHORTHAND_PROPERTY_IDENTIFIER_PATTERN_KIND,
+            ),
         }
     }
 
@@ -404,7 +542,7 @@ impl EcmaScriptKinds {
     /// module depends on - a grammar-version error, not a reachable
     /// operating state.
     pub(crate) fn resolve_typescript(language: &tree_sitter::Language) -> Self {
-        let mut kinds = Self::resolve_javascript(language);
+        let mut kinds = Self::resolve_core(language);
         kinds.declarations.extend([
             (
                 kind_id(language, INTERFACE_DECLARATION_KIND),
@@ -430,6 +568,18 @@ impl EcmaScriptKinds {
                 kind_id(language, FUNCTION_SIGNATURE_KIND),
                 EcmaScriptSymbolKind::Function,
             ),
+            (
+                kind_id(language, PUBLIC_FIELD_DEFINITION_KIND),
+                EcmaScriptSymbolKind::Field,
+            ),
+            (
+                kind_id(language, ABSTRACT_CLASS_DECLARATION_KIND),
+                EcmaScriptSymbolKind::Class,
+            ),
+            (
+                kind_id(language, ENUM_ASSIGNMENT_KIND),
+                EcmaScriptSymbolKind::EnumMember,
+            ),
         ]);
         let member_signatures = [
             (METHOD_SIGNATURE_KIND, EcmaScriptSymbolKind::Method),
@@ -438,6 +588,20 @@ impl EcmaScriptKinds {
         .map(|(kind, symbol)| (kind_id(language, kind), symbol));
         kinds.declarations.extend(member_signatures);
         kinds.member_signatures = member_signatures.map(|(kind, _)| kind).to_vec();
+        let abstract_method = kind_id(language, ABSTRACT_METHOD_SIGNATURE_KIND);
+        kinds
+            .declarations
+            .push((abstract_method, EcmaScriptSymbolKind::Method));
+        kinds.abstract_declarations = vec![
+            kind_id(language, ABSTRACT_CLASS_DECLARATION_KIND),
+            abstract_method,
+        ];
+        kinds.enum_body = Some(kind_id(language, ENUM_BODY_KIND));
+        kinds.parameter_properties = [REQUIRED_PARAMETER_KIND, OPTIONAL_PARAMETER_KIND]
+            .map(|kind| kind_id(language, kind))
+            .to_vec();
+        kinds.readonly_token = Some(token_id(language, "readonly"));
+        kinds.pattern = Some(field_id(language, "pattern"));
         kinds.member_bodies = vec![
             kind_id(language, INTERFACE_BODY_KIND),
             kind_id(language, CLASS_BODY_KIND),
@@ -622,6 +786,111 @@ impl EcmaScriptKinds {
             .and_then(|property| text.get(property.byte_range()))
             == Some(EXPORTS_NAME);
         module_variable && exports_property
+    }
+
+    /// The declaration node's name: its `name` field, or the `property` field
+    /// a JavaScript `field_definition` spells it in.
+    fn name_node<'tree>(&self, node: Node<'tree>) -> Option<Node<'tree>> {
+        self.child(node, EcmaScriptGrammarField::Name).or_else(|| {
+            (self.symbol_kind(node) == Some(EcmaScriptSymbolKind::Field))
+                .then(|| self.child(node, EcmaScriptGrammarField::Property))
+                .flatten()
+        })
+    }
+
+    /// The `variable_declarator` a name inside a destructuring pattern binds
+    /// through: `major` in `const { major } = version`. `None` for a name
+    /// that no pattern of a declarator binds - a plain declarator name, a
+    /// pattern key, a default value, or a parameter pattern.
+    ///
+    /// Each step reads one recorded parent, so the work is bounded by the
+    /// tree's depth.
+    fn pattern_declarator<'walk, 'tree>(
+        &self,
+        visited: Visited<'walk, 'tree>,
+    ) -> Option<Visited<'walk, 'tree>> {
+        let id = visited.node().kind_id();
+        if id != self.identifier && id != self.shorthand_property_identifier_pattern {
+            return None;
+        }
+        let mut child = visited;
+        let mut through_pattern = false;
+        while let Some(parent) = child.parent() {
+            let id = parent.node().kind_id();
+            if id == self.variable_declarator {
+                let binds = through_pattern
+                    && self.child(parent.node(), EcmaScriptGrammarField::Name)
+                        == Some(child.node());
+                return binds.then_some(parent);
+            }
+            let binds = if self.binding_patterns.contains(&id) {
+                true
+            } else if id == self.pair_pattern {
+                self.child(parent.node(), EcmaScriptGrammarField::Value) == Some(child.node())
+            } else if self.default_patterns.contains(&id) {
+                self.child(parent.node(), EcmaScriptGrammarField::Left) == Some(child.node())
+            } else {
+                false
+            };
+            if !binds {
+                return None;
+            }
+            through_pattern = true;
+            child = parent;
+        }
+        None
+    }
+
+    /// The name a constructor parameter property declares: `name` in
+    /// `constructor(public readonly name: string)`. Only a parameter carrying
+    /// an accessibility modifier or `readonly` declares one.
+    fn parameter_property<'tree>(
+        &self,
+        visited: Visited<'_, 'tree>,
+        text: &str,
+    ) -> Option<Node<'tree>> {
+        let node = visited.node();
+        if !self.parameter_properties.contains(&node.kind_id()) {
+            return None;
+        }
+        let marked = named_children(node)
+            .any(|child| Some(child.kind_id()) == self.accessibility_modifier)
+            || self
+                .readonly_token
+                .is_some_and(|token| EcmaScriptRules::has_token(node, &[token]));
+        if !marked {
+            return None;
+        }
+        let method = visited.parent()?.parent()?.node();
+        let constructor = method.kind_id() == self.method_definition
+            && self
+                .child(method, EcmaScriptGrammarField::Name)
+                .and_then(|name| text.get(name.byte_range()))
+                == Some(CONSTRUCTOR_NAME);
+        if !constructor {
+            return None;
+        }
+        let name = node.child_by_field_id(self.pattern?.get())?;
+        (name.kind_id() == self.identifier).then_some(name)
+    }
+
+    /// Whether `node` is an enum member written without a value, `B` in
+    /// `enum Kind { A = 1, B }`.
+    fn is_bare_enum_member(&self, node: Node<'_>, parent: Option<Node<'_>>) -> bool {
+        node.kind_id() == self.property_identifier
+            && self.enum_body.is_some()
+            && parent.map(|parent| parent.kind_id()) == self.enum_body
+    }
+
+    /// Whether `node` is the anonymous class `export default class { .. }`
+    /// exports.
+    fn is_default_class(&self, node: Node<'_>, parent: Option<Node<'_>>) -> bool {
+        node.kind_id() == self.class_expression
+            && self.child(node, EcmaScriptGrammarField::Name).is_none()
+            && parent.is_some_and(|parent| {
+                parent.kind_id() == self.export_statement
+                    && EcmaScriptRules::has_token(parent, &[self.default_token])
+            })
     }
 
     /// The `object` of a `member_expression`; `None` for any other node.
@@ -931,11 +1200,70 @@ impl EcmaScriptRules<'_> {
         kind: EcmaScriptSymbolKind,
         text: &str,
     ) -> Option<String> {
-        let name = node.child_by_field_id(self.kinds.field(EcmaScriptGrammarField::Name).get())?;
+        let name = self.kinds.name_node(node)?;
         if kind == EcmaScriptSymbolKind::Variable && name.kind_id() != self.kinds.identifier {
             return None;
         }
         text.get(name.byte_range()).map(Into::into)
+    }
+
+    /// One declaration the walk reaches through a node outside the kind
+    /// table: a name a destructuring pattern binds, a constructor parameter
+    /// property, an enum member without a value, or the anonymous class a
+    /// module exports by default. `None` for every other node.
+    fn bound_declaration(
+        &self,
+        visited: Visited<'_, '_>,
+        text: &str,
+    ) -> Result<Option<Declaration>, RiftError> {
+        let node = visited.node();
+        let parent = visited.parent().map(Visited::node);
+        let (name, kind, facets) = if let Some(declarator) = self.kinds.pattern_declarator(visited)
+        {
+            let name = text.get(node.byte_range()).unwrap_or_default();
+            let mut facets = EcmaScriptSymbolKind::Variable.facets();
+            let named = self.exports.names.contains(name) && self.at_module_scope(declarator);
+            if self.wrapped_by_export(declarator) || named {
+                facets.push(SymbolFacet::Public);
+            }
+            (name, EcmaScriptSymbolKind::Variable, facets)
+        } else if let Some(name) = self.kinds.parameter_property(visited, text) {
+            let name = text.get(name.byte_range()).unwrap_or_default();
+            (
+                name,
+                EcmaScriptSymbolKind::Field,
+                EcmaScriptSymbolKind::Field.facets(),
+            )
+        } else if self.kinds.is_bare_enum_member(node, parent) {
+            let name = text.get(node.byte_range()).unwrap_or_default();
+            let kind = EcmaScriptSymbolKind::EnumMember;
+            (name, kind, kind.facets())
+        } else if self.kinds.is_default_class(node, parent) {
+            let mut facets = EcmaScriptSymbolKind::Class.facets();
+            facets.push(SymbolFacet::Public);
+            (DEFAULT_EXPORT_NAME, EcmaScriptSymbolKind::Class, facets)
+        } else {
+            return Ok(None);
+        };
+        if name.is_empty() {
+            return Ok(None);
+        }
+        let (documentation, documentation_ranges) =
+            self.attached_jsdoc(self.statement(visited), text)?;
+        let body_range = if kind == EcmaScriptSymbolKind::Class {
+            self.body_range(node, kind)?
+        } else {
+            None
+        };
+        Ok(Some(Declaration {
+            name: name.to_owned(),
+            kind: kind.word(),
+            facets,
+            visibility: self.accessibility(node, text),
+            body_range,
+            documentation,
+            documentation_ranges,
+        }))
     }
 
     /// Whether the module exports the declaration `node` names `name`: an
@@ -1110,14 +1438,25 @@ impl GrammarRules for EcmaScriptRules<'_> {
     }
 
     fn name_range(&self, node: Node<'_>) -> Result<Option<crate::ByteRange>, RiftError> {
-        let name = node
-            .child_by_field_id(self.kinds.field(EcmaScriptGrammarField::Name).get())
-            .or_else(|| {
-                (node.kind_id() == self.kinds.assignment_expression)
-                    .then(|| self.kinds.child(node, EcmaScriptGrammarField::Left))
-                    .flatten()
-                    .and_then(|left| self.kinds.child(left, EcmaScriptGrammarField::Property))
-            });
+        let named_by_itself = node.kind_id() == self.kinds.identifier
+            || node.kind_id() == self.kinds.shorthand_property_identifier_pattern
+            || node.kind_id() == self.kinds.property_identifier;
+        if named_by_itself {
+            return extract::byte_range(node).map(Some);
+        }
+        let parameter_name = self
+            .kinds
+            .parameter_properties
+            .contains(&node.kind_id())
+            .then_some(self.kinds.pattern)
+            .flatten()
+            .and_then(|pattern| node.child_by_field_id(pattern.get()));
+        let name = self.kinds.name_node(node).or(parameter_name).or_else(|| {
+            (node.kind_id() == self.kinds.assignment_expression)
+                .then(|| self.kinds.child(node, EcmaScriptGrammarField::Left))
+                .flatten()
+                .and_then(|left| self.kinds.child(left, EcmaScriptGrammarField::Property))
+        });
         name.map(extract::byte_range).transpose()
     }
 
@@ -1147,7 +1486,7 @@ impl GrammarRules for EcmaScriptRules<'_> {
             }));
         }
         let Some(kind) = self.kinds.symbol_kind(node) else {
-            return Ok(None);
+            return self.bound_declaration(visited, text);
         };
         if self.kinds.is_type_literal_member(visited) {
             return Ok(None);
@@ -1168,6 +1507,18 @@ impl GrammarRules for EcmaScriptRules<'_> {
             })
         {
             facets.push(SymbolFacet::Callable);
+        }
+        if kind == EcmaScriptSymbolKind::Variable
+            && !facets.contains(&SymbolFacet::Callable)
+            && self
+                .kinds
+                .child(node, EcmaScriptGrammarField::Value)
+                .is_some_and(|value| self.kinds.function_values.contains(&value.kind_id()))
+        {
+            facets.push(SymbolFacet::Callable);
+        }
+        if self.kinds.abstract_declarations.contains(&node.kind_id()) {
+            facets.push(SymbolFacet::Abstract);
         }
         if self.exported(visited, &name) {
             facets.push(SymbolFacet::Public);
@@ -1202,12 +1553,36 @@ impl GrammarRules for EcmaScriptRules<'_> {
     }
 
     fn container_name(&self, node: Node<'_>, text: &str) -> Option<String> {
-        let kind = self.kinds.symbol_kind(node)?;
+        let Some(kind) = self.kinds.symbol_kind(node) else {
+            // Only a class expression reads its parent, so the walk pays the
+            // parent lookup for the rare `export default class { .. }` alone.
+            let default_class = node.kind_id() == self.kinds.class_expression
+                && self.kinds.is_default_class(node, node.parent());
+            return default_class.then(|| DEFAULT_EXPORT_NAME.to_owned());
+        };
         if !kind.opens_scope() {
             return None;
         }
         let name = node.child_by_field_id(self.kinds.field(EcmaScriptGrammarField::Name).get())?;
+        if kind == EcmaScriptSymbolKind::Variable && name.kind_id() != self.kinds.identifier {
+            return None;
+        }
         text.get(name.byte_range()).map(Into::into)
+    }
+
+    /// A constructor parameter property belongs to the class: it drops the
+    /// `constructor` scope its parameter list sits in.
+    fn declaration_qualification(
+        &self,
+        visited: Visited<'_, '_>,
+        text: &str,
+        qualification: &str,
+    ) -> Option<String> {
+        self.kinds.parameter_property(visited, text)?;
+        let class = qualification
+            .strip_suffix(CONSTRUCTOR_NAME)?
+            .strip_suffix(self.qualification_separator())?;
+        Some(class.to_owned())
     }
 
     /// Starts the declaration at the statement carrying it, extended over the
@@ -1346,10 +1721,15 @@ pub(crate) fn node_facets(kind: &str) -> Vec<NodeFacet> {
         | ENUM_DECLARATION_KIND
         | TYPE_ALIAS_DECLARATION_KIND
         | INTERNAL_MODULE_KIND
-        | MODULE_KIND => vec![NodeFacet::Declaration, NodeFacet::Definition],
-        FUNCTION_SIGNATURE_KIND | METHOD_SIGNATURE_KIND | PROPERTY_SIGNATURE_KIND => {
-            vec![NodeFacet::Declaration]
-        }
+        | MODULE_KIND
+        | FIELD_DEFINITION_KIND
+        | PUBLIC_FIELD_DEFINITION_KIND
+        | ABSTRACT_CLASS_DECLARATION_KIND
+        | ENUM_ASSIGNMENT_KIND => vec![NodeFacet::Declaration, NodeFacet::Definition],
+        FUNCTION_SIGNATURE_KIND
+        | METHOD_SIGNATURE_KIND
+        | PROPERTY_SIGNATURE_KIND
+        | ABSTRACT_METHOD_SIGNATURE_KIND => vec![NodeFacet::Declaration],
         LEXICAL_DECLARATION_KIND | VARIABLE_DECLARATION_KIND => {
             vec![NodeFacet::Declaration, NodeFacet::Statement]
         }
@@ -1392,6 +1772,9 @@ pub(crate) fn restored_symbol_kind(kinds: &EcmaScriptKinds, name: &str) -> Optio
 }
 
 #[cfg(test)]
+mod declaration_tests;
+
+#[cfg(test)]
 mod export_tests;
 
 #[cfg(test)]
@@ -1404,7 +1787,7 @@ mod tests {
     fn test_kind_tables_resolve_on_every_pinned_grammar() {
         let javascript =
             EcmaScriptKinds::resolve_javascript(&tree_sitter_javascript::LANGUAGE.into());
-        assert_eq!(javascript.declarations.len(), 5);
+        assert_eq!(javascript.declarations.len(), 6);
         assert!(javascript.accessibility_modifier.is_none());
 
         for grammar in [
@@ -1412,7 +1795,7 @@ mod tests {
             tree_sitter_typescript::language_tsx(),
         ] {
             let typescript = EcmaScriptKinds::resolve_typescript(&grammar);
-            assert_eq!(typescript.declarations.len(), 13);
+            assert_eq!(typescript.declarations.len(), 17);
             assert_eq!(typescript.member_signatures.len(), 2);
             assert!(typescript.accessibility_modifier.is_some());
         }
@@ -1438,6 +1821,8 @@ mod tests {
             (EcmaScriptSymbolKind::TypeAlias, "type_alias"),
             (EcmaScriptSymbolKind::Namespace, "namespace"),
             (EcmaScriptSymbolKind::Property, "property"),
+            (EcmaScriptSymbolKind::Field, "property"),
+            (EcmaScriptSymbolKind::EnumMember, "enum_member"),
         ];
         for (kind, word) in words {
             assert_eq!(kind.word(), word);
@@ -1462,6 +1847,11 @@ mod tests {
             FUNCTION_SIGNATURE_KIND,
             METHOD_SIGNATURE_KIND,
             PROPERTY_SIGNATURE_KIND,
+            FIELD_DEFINITION_KIND,
+            PUBLIC_FIELD_DEFINITION_KIND,
+            ABSTRACT_CLASS_DECLARATION_KIND,
+            ABSTRACT_METHOD_SIGNATURE_KIND,
+            ENUM_ASSIGNMENT_KIND,
             LEXICAL_DECLARATION_KIND,
             VARIABLE_DECLARATION_KIND,
         ] {

@@ -155,6 +155,7 @@ mod tests {
                 ("Route", "interface"),
                 ("path", "property"),
                 ("Mode", "enum"),
+                ("Fast", "enum_member"),
                 ("Alias", "type_alias"),
                 ("Registry", "namespace"),
                 ("ambient", "function"),
@@ -301,6 +302,7 @@ mod tests {
                 vec![SymbolFacet::Type, SymbolFacet::Public],
                 vec![SymbolFacet::Value],
                 vec![SymbolFacet::Type, SymbolFacet::Public],
+                vec![SymbolFacet::Variant],
                 vec![SymbolFacet::Type, SymbolFacet::Alias, SymbolFacet::Public],
                 vec![SymbolFacet::Namespace, SymbolFacet::Public],
                 vec![SymbolFacet::Type],
@@ -331,6 +333,7 @@ mod tests {
                 ("Route.path", false),
                 ("Alias", true),
                 ("Mode", true),
+                ("Mode.Fast", false),
                 ("Hidden", false),
             ]
         );
@@ -391,6 +394,7 @@ mod tests {
                 ("Route", true),
                 ("path", false),
                 ("Mode", true),
+                ("Fast", false),
                 ("Alias", true),
                 ("Registry", true),
                 ("limit", true),
@@ -400,7 +404,7 @@ mod tests {
                 ("open", true),
             ]
         );
-        let alias = &document.symbols()[3];
+        let alias = &document.symbols()[4];
         let value = alias.body_range.expect("the alias holds a value");
         let start = usize::try_from(value.start).expect("fixture span fits usize");
         let end = usize::try_from(value.end).expect("fixture span fits usize");
