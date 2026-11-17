@@ -539,7 +539,7 @@ fn local_exports(
     for (namespace, (path, range, name, target)) in requested {
         // Captured conditional declarations do not establish export completeness.
         prepared.unresolved_exports = true;
-        let target = if let Some(target_path) = requested_path(namespace, target) {
+        let local = requested_path(namespace, target).and_then(|target_path| {
             local_target(
                 input,
                 selected,
@@ -555,8 +555,11 @@ fn local_exports(
                     symbol.qualified_name.clone(),
                 )
             })
-        } else {
-            external_target(input, target, &mut work, work_max)
+        });
+        let target = match local {
+            Some(local) => Some(local),
+            None if is_path_keyword(target) => None,
+            None => external_target(input, target, &mut work, work_max),
         };
         let Some((target, target_path, target_qualified_name)) = target else {
             continue;
@@ -638,16 +641,34 @@ fn external_target(
     found
 }
 
+/// The crate-local path a `use` target names from the module at
+/// `namespace`: `crate::`, `self::`, and `super::` read as written, and a
+/// path starting at any other name starts in the current module, where a
+/// child module or an item of that name resolves it before an external
+/// crate does.
 fn requested_path(namespace: &[String], target: &[String]) -> Option<Vec<String>> {
     let (head, tail) = target.split_first()?;
     let mut path = match head.as_str() {
         "crate" => vec![namespace.first()?.clone()],
         "self" => namespace.to_vec(),
         "super" if namespace.len() > 1 => namespace[..namespace.len() - 1].to_vec(),
-        _ => return None,
+        "super" => return None,
+        _ => {
+            let mut path = namespace.to_vec();
+            path.push(head.clone());
+            path
+        }
     };
     path.extend(tail.iter().cloned());
     Some(path)
+}
+
+/// Whether a `use` target starts with a path keyword, which never names an
+/// external crate.
+fn is_path_keyword(target: &[String]) -> bool {
+    target
+        .first()
+        .is_some_and(|head| matches!(head.as_str(), "crate" | "self" | "super"))
 }
 
 fn local_target<'input>(

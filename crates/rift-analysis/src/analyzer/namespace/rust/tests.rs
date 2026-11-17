@@ -2842,6 +2842,36 @@ fn external_public_reexports_keep_original_alias_chain_and_defining_owner() {
     );
 }
 
+/// A `pub use` path that starts at a child module, without `crate::` or
+/// `self::`, names that module's item, and an `as` rename gives the alias
+/// its own name.
+#[test]
+fn relative_public_reexports_alias_the_child_module_item() {
+    let target = local_alias_analysis(
+        &[
+            (
+                "src/lib.rs",
+                "mod shapes;\npub use shapes::Circle as Round;\npub use shapes::Square;\n",
+            ),
+            ("src/shapes.rs", "pub struct Circle;\npub struct Square;\n"),
+        ],
+        "[package]\nname='serde_core'\nversion='1.0.228'\n[lib]\npath='src/lib.rs'\n",
+    );
+    for (alias, item) in [
+        ("/serde_core/Round", "/serde_core/shapes/Circle"),
+        ("/serde_core/Square", "/serde_core/shapes/Square"),
+    ] {
+        assert!(
+            target.publication().relationships.iter().any(|edge| edge
+                .from
+                .as_str()
+                .ends_with(alias)
+                && edge.to.as_str().ends_with(item)),
+            "alias {alias} must target {item}"
+        );
+    }
+}
+
 #[test]
 fn external_public_reexports_without_admitted_target_remain_unresolved() {
     let target = local_alias_analysis(
