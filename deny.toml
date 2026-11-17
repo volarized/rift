@@ -8,6 +8,9 @@ ignore = [
   # gemm, candle-core's CPU matrix kernel, uses paste for its macro expansion. No candle
   # release drops it, and the crate is a build-time proc macro with no runtime surface.
   { id = "RUSTSEC-2024-0436", reason = "paste is a build-time proc macro reached only through gemm <- candle-core" },
+  # chrono is reached through rmcp, schemars and serde_with as well as Rift's own crates. The
+  # advisory flags maintenance status, not a vulnerability; revisit when a maintained successor lands.
+  { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained, not vulnerable; required by rmcp, schemars and serde_with" },
 ]
 
 [licenses]
