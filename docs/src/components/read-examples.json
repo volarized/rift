@@ -570,7 +570,7 @@
     "tool": "get_symbol",
     "arguments": {
       "id": "rift://symbol/cargo/crates.io/demo/rust/demo/beacon",
-      "include": {"documentation": true}
+      "include": { "documentation": true }
     },
     "text": "\tfunction beacon\n\trift://source/cargo/crates.io/demo/src/lib.rs:2 \u00b7 bytes 26..44\n\trift://symbol/cargo/crates.io/demo/rust/demo/beacon\n\tdependency rift://revision/cargo/crates.io/demo@1.0.0\n\n\tdocumentation:\n\t\trift://source/cargo/crates.io/demo/README.md:1\n\t\t\tguide\nrelease 1.0.0\n",
     "json": {
