@@ -1,0 +1,235 @@
+//! Stored Rust edges from captured source without a language engine.
+
+use rift_core::{SourceVisibility, TextFileInclusion};
+use rift_index::{WorkspaceIndex, WorkspaceIndexLimits};
+use rift_protocol::read::EdgeKind;
+
+#[test]
+fn test_rust_static_edges_keep_declared_types_and_members() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let root = directory.path();
+    std::fs::create_dir(root.join("src")).expect("source directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='fixture'\nversion='0.1.0'\n",
+    )
+    .expect("manifest");
+    std::fs::write(root.join("src/lib.rs"), "mod jobs; use crate::jobs::{Task, leaf as run}; trait Run { fn execute(&self); } fn root(task: &Task) { run(); Task::new(); task.execute(); }").expect("root source");
+    std::fs::write(root.join("src/jobs.rs"), "use crate::Run; pub struct Value; impl Value { fn open(&self) {} } pub struct Task { value: Value } pub fn leaf() {} impl Task { pub fn new() -> Self { Self { value: Value } } fn read(&mut self, value: Value) { self.value = value; let value = &self.value; self.value.open(); } } impl Run for Task { fn execute(&self) {} }").expect("module source");
+    let index = WorkspaceIndex::build(
+        root,
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &TextFileInclusion::default(),
+    )
+    .expect("index");
+    let view = index.symbol_view().expect("symbols");
+    let mut kinds = std::collections::BTreeSet::new();
+    for record in view.normalized_graph().records() {
+        if let Some(id) = record.identity() {
+            kinds.extend(
+                index
+                    .edges()
+                    .outgoing(id)
+                    .iter()
+                    .map(rift_index::Edge::kind),
+            );
+        }
+    }
+    for kind in [
+        EdgeKind::Calls,
+        EdgeKind::Contains,
+        EdgeKind::Implements,
+        EdgeKind::Overrides,
+        EdgeKind::Imports,
+        EdgeKind::HasType,
+        EdgeKind::Reads,
+        EdgeKind::Writes,
+    ] {
+        assert!(kinds.contains(&kind), "missing {kind:?}: {kinds:?}");
+    }
+    assert!(
+        view.normalized_graph()
+            .records()
+            .iter()
+            .filter_map(|record| record.identity())
+            .flat_map(|id| index.edges().outgoing(id))
+            .any(|edge| edge.kind() == EdgeKind::Calls
+                && edge.from().as_str().ends_with("/Task/read")
+                && edge.to().as_str().ends_with("/Value/open"))
+    );
+    assert!(index.edges().is_complete());
+    assert_eq!(index.edges().dropped_edges(), 0);
+}
+
+#[test]
+fn test_rust_impl_only_module_keeps_imported_calls_and_type_members() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let root = directory.path();
+    std::fs::create_dir(root.join("src")).expect("source directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='fixture'\nversion='0.1.0'\n",
+    )
+    .expect("manifest");
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "mod jobs; pub struct Task; pub fn leaf() {}",
+    )
+    .expect("root source");
+    std::fs::write(
+        root.join("src/jobs.rs"),
+        "use crate::{Task, leaf}; impl Task { fn run(&self) { leaf(); } }",
+    )
+    .expect("module source");
+    let index = WorkspaceIndex::build(
+        root,
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &TextFileInclusion::default(),
+    )
+    .expect("index");
+    assert!(index.edges().edges().any(
+        |edge| edge.kind() == EdgeKind::Calls && edge.to().as_str().ends_with("/fixture/leaf")
+    ));
+    assert!(
+        index
+            .edges()
+            .edges()
+            .any(|edge| edge.kind() == EdgeKind::Contains
+                && edge.from().as_str().ends_with("/fixture/Task")
+                && edge.to().as_str().ends_with("/Task/run"))
+    );
+}
+
+#[test]
+fn test_rust_binding_does_not_shadow_its_own_initializer() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let root = directory.path();
+    std::fs::create_dir(root.join("src")).expect("source directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='fixture'\nversion='0.1.0'\n",
+    )
+    .expect("manifest");
+    std::fs::write(root.join("src/lib.rs"), "fn leaf() -> (u8, u8) { (0, 0) } fn run() { let (leaf, other) = leaf(); } fn plain() { let leaf = leaf(); }").expect("source");
+    let index = WorkspaceIndex::build(
+        root,
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &TextFileInclusion::default(),
+    )
+    .expect("index");
+    assert_eq!(
+        index
+            .edges()
+            .edges()
+            .filter(|edge| edge.kind() == EdgeKind::Calls
+                && edge.to().as_str().ends_with("/fixture/leaf"))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn test_rust_assignment_keeps_the_declared_receiver_type() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let root = directory.path();
+    std::fs::create_dir(root.join("src")).expect("source directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='fixture'\nversion='0.1.0'\n",
+    )
+    .expect("manifest");
+    std::fs::write(root.join("src/lib.rs"), "struct Task; impl Task { fn open(&self) {} } fn root(mut value: Task) { value = Task; value.open(); }").expect("source");
+    let index = WorkspaceIndex::build(
+        root,
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &TextFileInclusion::default(),
+    )
+    .expect("index");
+    assert_eq!(
+        index
+            .edges()
+            .edges()
+            .filter(
+                |edge| edge.kind() == EdgeKind::Calls && edge.to().as_str().ends_with("/Task/open")
+            )
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn test_rust_local_type_keeps_its_members_and_nested_callables() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let root = directory.path();
+    std::fs::create_dir(root.join("src")).expect("source directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='fixture'\nversion='0.1.0'\n",
+    )
+    .expect("manifest");
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "fn root() { struct Task; trait Run { fn open(&self); } impl Task { fn open(&self) { let next = || 1; next(); } } impl Run for Task { fn open(&self) {} } }",
+    )
+    .expect("source");
+    let index = WorkspaceIndex::build(
+        root,
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &TextFileInclusion::default(),
+    )
+    .expect("index");
+    for (from, to) in [("/root/Task", "/Task/open"), ("/Task/open", "/open/next")] {
+        assert!(
+            index
+                .edges()
+                .edges()
+                .any(|edge| edge.kind() == EdgeKind::Contains
+                    && edge.from().as_str().ends_with(from)
+                    && edge.to().as_str().ends_with(to)),
+            "missing {from} -> {to}"
+        );
+    }
+    assert!(
+        index.edges().edges().any(
+            |edge| edge.kind() == EdgeKind::Calls && edge.to().as_str().ends_with("/open/next")
+        )
+    );
+}
+
+#[test]
+fn test_rust_associated_type_use_keeps_its_declared_member() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let root = directory.path();
+    std::fs::create_dir(root.join("src")).expect("source directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='fixture'\nversion='0.1.0'\n",
+    )
+    .expect("manifest");
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "mod jobs; struct Task; trait Run { type Output; fn run(&self) -> Self::Output; }",
+    )
+    .expect("source");
+    std::fs::write(root.join("src/jobs.rs"), "use crate::{Task, Run}; impl Run for Task { type Output = u8; fn run(&self) -> Self::Output { 0 } }").expect("module source");
+    let index = WorkspaceIndex::build(
+        root,
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &TextFileInclusion::default(),
+    )
+    .expect("index");
+    for target in ["/Task/Output", "/Run/Output"] {
+        assert!(
+            index.edges().edges().any(
+                |edge| edge.kind() == EdgeKind::HasType && edge.to().as_str().ends_with(target)
+            ),
+            "missing {target}"
+        );
+    }
+}

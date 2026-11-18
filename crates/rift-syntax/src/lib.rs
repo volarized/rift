@@ -52,7 +52,7 @@ pub use python::PythonSyntaxProvider;
 pub use rust::{RustQuery, RustQueryCapture, RustSyntaxProvider};
 pub use static_analysis::{
     HeritageEdge, StaticBinding, StaticBindingKind, StaticCall, StaticCallee, StaticFacts,
-    StaticFactsParts, StaticInherentImpl, StaticReexport,
+    StaticFactsParts, StaticInherentImpl, StaticReexport, StaticReference, StaticRustUse,
 };
 pub use toml::TomlSyntaxProvider;
 pub use typescript::{TypeScriptDialect, TypeScriptSyntaxProvider};

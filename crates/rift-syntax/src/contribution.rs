@@ -548,7 +548,7 @@ mod tests {
                 .expect("portable facts")
                 .container_reference()
                 .map(|reference| reference.symbol().as_str()),
-            Some("rift://symbol/rust/src/lib.rs/Beacon")
+            Some("rift://symbol/rust/src/lib.rs/Beacon#1")
         );
         assert_eq!(
             run.facts().expect("portable facts").visibility_spelling(),
@@ -755,7 +755,7 @@ mod tests {
                 .expect("portable facts")
                 .container_reference()
                 .map(|reference| reference.symbol().as_str()),
-            Some("rift://symbol/rust/cargo/tokio@1.53.1/src/lib.rs/Runtime")
+            Some("rift://symbol/rust/cargo/tokio@1.53.1/src/lib.rs/Runtime#1")
         );
     }
 }

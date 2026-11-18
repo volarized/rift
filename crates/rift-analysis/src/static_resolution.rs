@@ -7,6 +7,7 @@ mod rust;
 mod tests;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 
 use rift_core::{
     ContributionReference, DeclarationBinding, FileDigest, LoopBudget, ProjectPath, ProviderId,
@@ -19,7 +20,10 @@ use rift_syntax::{
     StaticFacts, SyntaxFacts, SyntaxSymbol,
 };
 
-use crate::NamespaceInput;
+use crate::{EnclosingDefinitions, NamespaceInput};
+
+// Containment can use retained declarations without captured call facts.
+static EMPTY_STATIC_FACTS: OnceLock<StaticFacts> = OnceLock::new();
 
 /// One file from the same selection as the normalized graph.
 #[derive(Debug)]
@@ -160,6 +164,7 @@ struct File<'source> {
     by_name: Bindings<'source>,
     by_range: BTreeMap<ByteRange, Option<&'source SyntaxSymbol>>,
     by_qualified_name: BTreeMap<&'source str, Option<&'source SyntaxSymbol>>,
+    callables: EnclosingDefinitions<&'source SyntaxSymbol>,
     assignments: AssignmentTargets<'source>,
 }
 
@@ -215,6 +220,7 @@ impl<'source> File<'source> {
             by_name: BTreeMap::new(),
             by_range: BTreeMap::new(),
             by_qualified_name: BTreeMap::new(),
+            callables: EnclosingDefinitions::new([]),
             assignments: AssignmentTargets::default(),
         };
         file.index_bindings(work)?;
@@ -240,14 +246,27 @@ impl<'source> File<'source> {
     }
 
     fn index_symbols(&mut self, work: &mut Work) -> Option<()> {
+        let mut callables = Vec::new();
         for symbol in self.document.facts.symbols() {
             if !work.charge() {
                 return None;
             }
             self.by_qualified_name
                 .entry(&symbol.qualified_name)
-                .and_modify(|entry| *entry = None)
+                .and_modify(|entry| {
+                    if self.document.facts.language().name == "rust"
+                        && symbol.kind != "impl_item"
+                        && entry.is_some_and(|previous| previous.kind == "impl_item")
+                    {
+                        *entry = Some(symbol);
+                    } else if symbol.kind != "impl_item" {
+                        *entry = None;
+                    }
+                })
                 .or_insert(Some(symbol));
+            if symbol.kinds.contains(&SymbolKind::Callable) {
+                callables.push((symbol.range.start, symbol.range.end, symbol));
+            }
             if let Some(range) = symbol.name_range {
                 self.by_range
                     .entry(range)
@@ -255,7 +274,23 @@ impl<'source> File<'source> {
                     .or_insert(Some(symbol));
             }
         }
+        self.callables = EnclosingDefinitions::new(callables);
         Some(())
+    }
+
+    fn enclosing_callable(&self, range: ByteRange) -> Option<Target<'source>> {
+        Some(Target {
+            file: self.document,
+            symbol: *self.callables.resolve(range.start, range.end)?,
+        })
+    }
+
+    fn parent_callable(&self, symbol: &SyntaxSymbol) -> Option<Target<'source>> {
+        self.enclosing_callable(ByteRange {
+            start: symbol.range.start.checked_sub(1)?,
+            end: symbol.range.end,
+        })
+        .filter(|parent| Some(parent.symbol.qualified_name.as_str()) == symbol.container.as_deref())
     }
 
     fn text(&self, range: ByteRange) -> Option<&'source str> {
@@ -302,7 +337,23 @@ impl<'source> File<'source> {
             if !binding.scope.contains(position) || !accepts(binding.kind) {
                 continue;
             }
+            let rust = self.document.facts.language().name == "rust";
+            if rust && binding.available_from > position {
+                continue;
+            }
             match best {
+                Some(current)
+                    if rust
+                        && current.scope == binding.scope
+                        && binding.available_from > current.available_from =>
+                {
+                    best = Some(binding);
+                    ambiguous = false;
+                }
+                Some(current)
+                    if rust
+                        && current.scope == binding.scope
+                        && binding.available_from < current.available_from => {}
                 Some(current) if current.scope == binding.scope => ambiguous = true,
                 Some(current) if !current.scope.encloses(binding.scope) => {}
                 _ => {
@@ -360,9 +411,16 @@ impl<'source> Index<'source> {
             if !supported_language(document.facts) {
                 continue;
             }
-            let Some(facts) = admitted_facts(document) else {
+            let facts = if let Some(facts) = admitted_facts(document) {
+                facts
+            } else {
                 unavailable_sources += 1;
-                continue;
+                if document.facts.language().name != "rust"
+                    || document.facts.source_digest().is_none()
+                {
+                    continue;
+                }
+                EMPTY_STATIC_FACTS.get_or_init(StaticFacts::default)
             };
             let file = File::new(document, facts, work)?;
             if files.insert(document.path.as_str(), file).is_some() {
@@ -436,6 +494,9 @@ impl<'source> Index<'source> {
                 result.record(occurrence);
             }
         }
+        if file.document.facts.language().name == "rust" {
+            self.rust_references(file, work, result);
+        }
         if !work.exhausted {
             result.analyzed_sources += 1;
         }
@@ -448,9 +509,12 @@ impl<'source> Index<'source> {
         work: &mut Work,
     ) -> Option<StaticOccurrence> {
         let target = self.edge_type_target(file, edge.target, work)?;
-        let from = file
-            .target_at(edge.from)
-            .or_else(|| self.edge_type_target(file, edge.from, work))?;
+        let from = if file.document.facts.language().name == "rust" {
+            self.edge_type_target(file, edge.from, work)?
+        } else {
+            file.target_at(edge.from)
+                .or_else(|| self.edge_type_target(file, edge.from, work))?
+        };
         let mut occurrence =
             self.occurrence(file, edge.target, edge.target, ReferenceRole::Type, target)?;
         let from = self.occurrence(file, edge.from, edge.from, ReferenceRole::Type, from)?;
@@ -578,9 +642,7 @@ impl StaticResolution {
 fn admitted_facts<'source>(
     document: &'source StaticSource<'source>,
 ) -> Option<&'source StaticFacts> {
-    if document.facts.has_errors()
-        || document.facts.source_digest() != Some(&FileDigest::of(document.source.as_bytes()))
-    {
+    if document.facts.has_errors() || document.facts.source_digest().is_none() {
         return None;
     }
     document.facts.static_facts()
