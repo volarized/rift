@@ -67,14 +67,13 @@ fn test_advertised_page_limit_cuts_the_caller_limit() {
     assert_eq!(advertised_page_limit(20, &capabilities), 20);
 }
 
-/// The first page stopped at the response body bound, marked `result_truncated`, and the page
-/// that follows it.
+/// Returns the requested fixture page; the first carries `result_truncated` at the body bound.
 pub(super) fn body_bound_page(
     mut first: serde_json::Value,
     second: serde_json::Value,
-    selected_page: Option<&str>,
+    page: Option<&str>,
 ) -> serde_json::Value {
-    if selected_page.is_some() {
+    if page.is_some() {
         return second;
     }
     first["warnings"] = serde_json::json!([

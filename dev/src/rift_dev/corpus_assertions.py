@@ -67,7 +67,6 @@ INDEX_PUBLISHED = "index snapshot published"
 def map_paths(answer: JsonObject) -> set[str]:
     """Read exact paths from the map's named fields and escaped symbol identities."""
     string_value(answer.get("revision"), "map revision")
-    object_value(answer.get("pagination"), "map pagination")
     found = {
         string_value(value, "map documentation path")
         for value in array_value(answer.get("docs", []), "map documentation")

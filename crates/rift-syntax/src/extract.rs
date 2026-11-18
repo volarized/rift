@@ -136,7 +136,18 @@ pub(crate) trait GrammarRules {
         text: &str,
     ) -> Result<Option<Declaration>, RiftError>;
 
-    /// The name child declarations nest under; `None` when `syntax element` opens no
+    /// The qualification the visited declaration takes when it differs from
+    /// the one its enclosing scopes hand down; `None` keeps `qualification`.
+    fn declaration_qualification(
+        &self,
+        _visited: Visited<'_, '_>,
+        _text: &str,
+        _qualification: &str,
+    ) -> Option<String> {
+        None
+    }
+
+    /// The name child declarations nest under; `None` when `syntax_element` opens no
     /// scope.
     fn container_name(&self, syntax_element: Node<'_>, text: &str) -> Option<String>;
 
@@ -325,11 +336,12 @@ pub(crate) fn extract_with_capture(
             export_bindings.push(binding);
         }
         if let Some(declaration) = rules.declaration(visited, text)? {
+            let own_qualification = rules.declaration_qualification(visited, text, &qualification);
             symbols.push(qualified_symbol(
                 declaration,
                 visited,
                 text,
-                &qualification,
+                own_qualification.as_deref().unwrap_or(&qualification),
                 language,
                 rules,
                 grammar,

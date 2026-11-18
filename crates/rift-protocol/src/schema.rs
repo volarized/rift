@@ -2125,7 +2125,7 @@ mod tests {
                 },
                 "Page": {
                     "type": "array",
-                    "items": {"properties": {"cursor": {"type": ["string", "null"]}}}
+                    "items": {"properties": {"value": {"type": ["string", "null"]}}}
                 }
             }
         }));
@@ -2138,7 +2138,7 @@ mod tests {
             json!({"type": "string"})
         );
         assert_eq!(
-            schema["$defs"]["Page"]["items"]["properties"]["cursor"],
+            schema["$defs"]["Page"]["items"]["properties"]["value"],
             json!({"type": "string"})
         );
     }
@@ -2215,10 +2215,10 @@ mod tests {
             "properties": {
                 "rev": {"anyOf": [{"$ref": "#/$defs/RevisionId"}, {"type": "null"}]},
                 "limit": {"type": ["integer", "null"]},
-                "cursor": {"type": ["string", "null"]},
+                "value": {"type": ["string", "null"]},
                 "name": {"type": "string"}
             },
-            "required": ["cursor"]
+            "required": ["value"]
         });
         let mut found = Vec::new();
         optional_null_properties(&document, "", &mut found);

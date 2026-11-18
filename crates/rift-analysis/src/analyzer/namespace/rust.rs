@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, VecDeque};
 use rift_core::{FileDigest, ProjectPath, SymbolId};
 use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
 use rift_protocol::index::python_identifier_is_valid;
-use rift_syntax::SyntaxFacts;
+use rift_syntax::{ShippedLanguage, SyntaxFacts};
 use serde::Deserialize;
 use unicode_normalization::UnicodeNormalization;
 
@@ -71,9 +71,10 @@ pub(super) fn prepare(
                 .into_iter()
                 .map(|export| (namespace.clone(), export)),
         );
+        let declared = file_anchors(input, file.syntax, &namespace, &admitted);
         anchors.insert(
             path.clone(),
-            file_anchors(input, file.syntax, &namespace, &admitted),
+            super::retain_valid_declarations(input, file, declared),
         );
         for (child, local, child_scope) in children {
             let mut child_namespace = namespace.clone();
@@ -147,6 +148,7 @@ fn target_paths(
         };
         if !reached.insert(path.clone())
             || originals.get(path.as_str()).copied() != Some(file.source)
+            || file.syntax.has_errors()
             || !source_is_valid(file.syntax, file.source)
         {
             continue;
@@ -247,7 +249,7 @@ fn library_root(
     let namespace = vec![name];
     if SymbolIdentity::new(
         input.owner().clone(),
-        input.language().clone(),
+        ShippedLanguage::Rust.language(),
         namespace.clone(),
     )
     .is_err()
@@ -290,7 +292,6 @@ fn selected_libraries(
 fn source_is_valid(syntax: &SyntaxFacts, source: &str) -> bool {
     syntax.language().name == "rust"
         && syntax.language().dialect.is_none()
-        && !syntax.has_errors()
         && syntax.source_digest() == Some(&FileDigest::of(source.as_bytes()))
 }
 
@@ -662,7 +663,7 @@ fn local_exports(
     for (namespace, (path, range, name, target)) in requested {
         // Captured conditional declarations do not establish export completeness.
         prepared.unresolved_exports = true;
-        let target = if let Some(target_path) = requested_path(namespace, target) {
+        let local = requested_path(namespace, target).and_then(|target_path| {
             local_target(
                 input,
                 selected,
@@ -678,19 +679,24 @@ fn local_exports(
                     symbol.qualified_name.clone(),
                 )
             })
-        } else {
-            external_target(input, target, &mut work, work_max)
+        });
+        let target = match local {
+            Some(local) => Some(local),
+            None if is_path_keyword(target) => None,
+            None => external_target(input, target, &mut work, work_max),
         };
         let Some((target, target_path, target_qualified_name)) = target else {
             continue;
         };
         let mut alias_path = namespace.clone();
         alias_path.push(name.clone());
-        let Some(identity) =
-            SymbolIdentity::new(input.owner().clone(), input.language().clone(), alias_path)
-                .ok()
-                .and_then(|identity| SymbolId::new(identity.wire_identity()).ok())
-        else {
+        let Some(identity) = SymbolIdentity::new(
+            input.owner().clone(),
+            ShippedLanguage::Rust.language(),
+            alias_path,
+        )
+        .ok()
+        .and_then(|identity| SymbolId::new(identity.wire_identity()).ok()) else {
             continue;
         };
         if identity == target {
@@ -744,7 +750,7 @@ fn external_target(
             continue;
         }
         let (identity, declaration, unit) =
-            dependency.target(path, input.language(), work, work_max)?;
+            dependency.target(path, &ShippedLanguage::Rust.language(), work, work_max)?;
         let name = SymbolIdentity::parse(identity.as_str())
             .ok()?
             .qualified_path()
@@ -761,16 +767,34 @@ fn external_target(
     found
 }
 
+/// The crate-local path a `use` target names from the module at
+/// `namespace`: `crate::`, `self::`, and `super::` read as written, and a
+/// path starting at any other name starts in the current module, where a
+/// child module or an item of that name resolves it before an external
+/// crate does.
 fn requested_path(namespace: &[String], target: &[String]) -> Option<Vec<String>> {
     let (head, tail) = target.split_first()?;
     let mut path = match head.as_str() {
         "crate" => vec![namespace.first()?.clone()],
         "self" => namespace.to_vec(),
         "super" if namespace.len() > 1 => namespace[..namespace.len() - 1].to_vec(),
-        _ => return None,
+        "super" => return None,
+        _ => {
+            let mut path = namespace.to_vec();
+            path.push(head.clone());
+            path
+        }
     };
     path.extend(tail.iter().cloned());
     Some(path)
+}
+
+/// Whether a `use` target starts with a path keyword, which never names an
+/// external crate.
+fn is_path_keyword(target: &[String]) -> bool {
+    target
+        .first()
+        .is_some_and(|head| matches!(head.as_str(), "crate" | "self" | "super"))
 }
 
 fn local_target<'input>(
@@ -787,7 +811,7 @@ fn local_target<'input>(
 )> {
     let requested = SymbolIdentity::new(
         input.owner().clone(),
-        input.language().clone(),
+        ShippedLanguage::Rust.language(),
         path.to_vec(),
     )
     .ok()?

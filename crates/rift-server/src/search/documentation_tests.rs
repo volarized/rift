@@ -503,10 +503,6 @@ async fn assert_document_question(
             .iter()
             .map(|hit| match &hit.hit {
                 SearchHitTarget::Symbol { symbol } => {
-                    assert!(
-                        symbol.id.is_none(),
-                        "a heading has no established semantic identity"
-                    );
                     assert_eq!(hit.path.as_ref().map(|path| path.0.as_str()), Some(path));
                     let range = hit.range.as_ref().expect("a heading retains its range");
                     let file = service
@@ -524,6 +520,16 @@ async fn assert_document_question(
                         })
                         .expect("the hit retains its exact physical declaration range");
                     assert_eq!(symbol.name, declaration.name);
+                    assert_eq!(
+                        symbol.id.as_ref().map(|id| id.0.as_str()),
+                        Some(
+                            crate::read::tests::local_identity(
+                                "markdown",
+                                &[path, declaration.qualified_name.as_str()]
+                            )
+                            .as_str()
+                        )
+                    );
                     declaration.qualified_name.as_str()
                 }
                 _ => panic!("baseline must retain a physical heading declaration"),

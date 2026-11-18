@@ -21,6 +21,7 @@ use crate::located_syntax_element::SyntaxAddress;
 const SOURCE: &str =
     "def echo(value):\n    return value\n\ndef shout(value):\n    return echo(value)\n";
 const ECHO: &str = "rift://symbol/pypi/pypi.org/click/python/click/core/echo";
+const MODULE: &str = "rift://symbol/pypi/pypi.org/click/python/click/core";
 const SHOUT: &str = "rift://symbol/pypi/pypi.org/click/python/click/core/shout";
 /// A plain-text unit, which no syntax provider parses.
 const NOTES: &str = "echo returns its value\n";
@@ -93,6 +94,7 @@ fn facts(publication: &PackagePublication, body: Value) -> ProducerFacts {
     }
     let text = facts
         .to_string()
+        .replace("TEXT_UNIT", publication.units[1].unit.0.as_str())
         .replace("UNIT", publication.units[0].unit.0.as_str());
     serde_json::from_str(&text).expect("producer facts")
 }
@@ -172,7 +174,7 @@ fn a_range_resolves_to_its_place_inside_the_enclosing_declaration() {
         )
         .expect("resolved module");
     assert!(
-        matches!(between.address, SyntaxAddress::Unit { .. }),
+        matches!(&between.address, SyntaxAddress::Declaration { symbol, index: 0, .. } if symbol.as_str() == MODULE),
         "{between:?}"
     );
     let text_unit = publication
@@ -373,7 +375,7 @@ fn producer_facts_outside_their_coverage_or_address_are_refused() {
         (
             json!({"edges": [{
                 "kind": "call", "kinds": ["calls"], "to": ECHO, "derivation": "resolution",
-                "occurrence": {"unit": "UNIT", "range": {"start": 34, "end": 35}},
+                "occurrence": {"unit": "TEXT_UNIT", "range": {"start": 0, "end": 4}},
             }]}),
             "field edges.occurrence, violation outside_declaration",
         ),

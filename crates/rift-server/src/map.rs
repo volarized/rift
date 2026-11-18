@@ -1036,7 +1036,7 @@ mod tests {
         .workspace_map();
 
         assert!(map.entry_points.is_empty());
-        assert_eq!(map.hubs.len(), 2);
+        assert_eq!(map.hubs.len(), 5);
         assert!(map.hubs.iter().all(|hub| hub.references == 0));
         assert!(
             map.hubs
@@ -1055,7 +1055,17 @@ mod tests {
                 Ok(identity.qualified_path().last().cloned())
             })
             .collect::<TestResult<Vec<_>>>()?;
-        assert_eq!(names, [Some("alpha".to_owned()), Some("beta".to_owned())]);
+        assert_eq!(
+            names,
+            [
+                "alpha",
+                "beta",
+                "package",
+                "package > name",
+                "package > version"
+            ]
+            .map(|name| Some(name.to_owned()))
+        );
         Ok(())
     }
 

@@ -230,6 +230,8 @@ NEXTJS_SAMPLE_PATHS = (
 )
 CORPUS_COLUMNS = ("symbol", "name", "kind", "language", "path", "unit", "start", "end")
 PATH_HIT_LIMIT = 1000
+# Source units one `rift://workspace` page may hold (`WORKSPACE_SOURCE_UNITS_MAX`).
+WORKSPACE_SOURCE_UNITS_MAX = 50
 # A sampled declaration without a canonical identity is checked against its hit's source.
 SAMPLE_COLUMNS = (*CORPUS_COLUMNS, "source")
 
@@ -256,6 +258,15 @@ def catalog_paths(workspace: JsonObject) -> dict[str, list[str]]:
         if path.isascii() and all(c.isalnum() or c in "/_.-" for c in path):
             paths.setdefault(language, []).append(path)
     return paths
+
+
+def workspace_page_uri(page: int) -> str:
+    """Select one full page of the workspace source catalog.
+
+    >>> workspace_page_uri(2)
+    'rift://workspace?page=2&max_results=50'
+    """
+    return f"rift://workspace?page={page}&max_results={WORKSPACE_SOURCE_UNITS_MAX}"
 
 
 def corpus_request(parameters: JsonObject) -> JsonObject:
@@ -699,8 +710,12 @@ class Corpus:
     async def source_catalog(
         self, client: Client
     ) -> tuple[JsonObject, dict[str, list[str]]]:
-        """Read typed source paths through the existing resource page contract."""
-        first = await client.resource("rift://workspace")
+        """Read typed source paths through the existing resource page contract.
+
+        Each page asks for the most source units one page holds, not the default
+        ten, which would multiply the reads of a large catalog by five.
+        """
+        first = await client.resource(workspace_page_uri(1))
         revision = string_value(
             first.get("configuration_revision"), "configuration revision"
         )
@@ -712,9 +727,7 @@ class Corpus:
             page = (
                 first
                 if index == 0
-                else await client.resource(
-                    f"rift://workspace?page={index + 1}&max_results={pagination['max_results']}"
-                )
+                else await client.resource(workspace_page_uri(index + 1))
             )
             require(
                 page.get("configuration_revision") == revision,

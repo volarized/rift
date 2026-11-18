@@ -1040,7 +1040,9 @@ impl Context<'_> {
         scope: &mut Scope,
         exports: &mut Vec<Export>,
     ) {
-        if let Some(tokens) = tokens.filter(|tokens| tokens.complete && scope.complete)
+        // Original public imports remain declarations when macro effects are unknown.
+        // Their own attributes and paths are checked before recording an alias.
+        if let Some(tokens) = tokens
             && let Some(item) = tokens.range(range)
         {
             let mut requested = Vec::new();

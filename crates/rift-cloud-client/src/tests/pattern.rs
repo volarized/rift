@@ -37,9 +37,9 @@ fn pattern_symbol_identity(package: &str, registry: &str, language: &str) -> Str
     .wire_identity()
 }
 
-/// The fixture's pattern pages each carry one match.
-pub(super) fn pattern_page_json(selected_page: Option<&str>) -> Value {
-    let start = if selected_page.is_none() { 10 } else { 20 };
+/// The fixture's pattern page: one match per requested page.
+pub(super) fn pattern_page_json(page: Option<&str>) -> Value {
+    let start = if page.is_none() { 10 } else { 20 };
     json!({
         "items": [pattern_hit_json(UNIT, start)], "warnings": [],
         "publication_format": "rift-package-index-v2",
@@ -119,21 +119,21 @@ fn check(
     request: &PackagePatternRequest,
     capabilities: &Capabilities,
     page: Value,
-    selected_page: Option<&str>,
+    requested_page: Option<&str>,
 ) -> Result<(), RiftError> {
     let page: PackagePatternPage = serde_json::from_value(page).expect("pattern page fixture");
     PatternPageCheck {
         request,
         capabilities,
         limit: 20,
-        page: if selected_page.is_some() { 2 } else { 1 },
+        page: if requested_page.is_some() { 2 } else { 1 },
         source_bytes_max: SOURCE_BYTES_MAX,
     }
     .validate(&page)
 }
 
 #[tokio::test]
-async fn test_fixture_pattern_pages_carry_matches_at_the_requested_page() {
+async fn test_fixture_pattern_pages_carry_matches_and_follow_the_callers_page() {
     let (server, client) = operation_client(OperationFixture::Patterns).await;
     let page = client
         .search_package_patterns(&pattern_request(), 1, 1)
