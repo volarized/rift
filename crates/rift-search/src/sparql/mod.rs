@@ -43,7 +43,6 @@ mod evaluation;
 mod expression;
 mod inventory;
 mod limits;
-mod page;
 mod presentation;
 mod query;
 mod query_thread;
@@ -70,7 +69,6 @@ pub use limits::{
     EXPRESSION_BYTES_MAX, GraphLimits, GraphLimitsBuilder, LITERAL_BYTES_MAX, OPERATORS_MAX,
     PATTERNS_MAX, QUERY_BYTES_MAX, SOLUTIONS_MAX, TRIPLES_MAX,
 };
-pub use page::{PageForm, PageSelection, continuation_query};
 pub use presentation::{QueryField, QueryPresentation};
 pub use query::GraphQuery;
 pub use requirements::{

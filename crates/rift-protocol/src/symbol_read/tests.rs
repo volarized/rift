@@ -37,8 +37,8 @@ fn exact_requests_validate_identity_and_reject_removed_fields() {
         serde_json::from_value(json!({"id": ID})).expect("valid fixture");
     assert_eq!(request.id.as_str(), ID);
     assert!(request.include.is_empty());
-    assert_eq!(request.declaration_limit, 5);
-    assert_eq!(request.declaration_cursor, None);
+    assert_eq!(request.max_results, 10);
+    assert_eq!(request.page, 1);
     assert_eq!(request.revision, None);
     let empty: GetSymbolParams =
         serde_json::from_value(json!({"id": ID, "include": {}})).expect("valid fixture");
@@ -63,15 +63,7 @@ fn exact_requests_validate_identity_and_reject_removed_fields() {
     serde_json::from_value::<GetSymbolParams>(json!({"id": ID, "include": ["history"]}))
         .expect_err("`include` is an object, never an array");
 
-    for field in [
-        "name",
-        "scope",
-        "packages",
-        "language",
-        "limit",
-        "page_index",
-        "view",
-    ] {
+    for field in ["name", "scope", "packages", "language", "limit", "view"] {
         let mut value = json!({"id": ID});
         value[field] = json!("removed");
         assert!(
@@ -226,7 +218,7 @@ fn source_less_success_stays_distinct_from_missing_and_unavailable() {
         "outcome": "found",
         "symbol": symbol(),
         "revision": COMMIT_REVISION,
-        "declarations": []
+        "declarations": [], "pagination":{"page":1,"pages":0,"max_results":10,"total":0}
     });
     let result: GetSymbolResult = serde_json::from_value(found.clone()).expect("valid fixture");
     assert!(result.is_valid_for(&requested));
@@ -303,8 +295,8 @@ fn exact_request_schema_advertises_codec_owners_and_declaration_bounds() {
     }
     for value in [
         json!({"id": "rift://symbol/rust/src/lib.rs/parse"}),
-        json!({"id": ID, "declaration_limit": 0}),
-        json!({"id": ID, "declaration_limit": 10001}),
+        json!({"id": ID, "max_results": 0}),
+        json!({"id": ID, "max_results": 10001}),
         json!({"id": ID, "declaration_cursor": ""}),
         json!({"id": ID, "name": "parse"}),
     ] {

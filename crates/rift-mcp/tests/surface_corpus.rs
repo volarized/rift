@@ -17,7 +17,7 @@ retry = { attempts = 2, delay = \"1ms\", delay_limit = \"1ms\" }\n";
 pub(crate) fn corpus() -> Vec<(&'static str, Value)> {
     let mut requests = vec![
         ("get_symbol", json!({ "name": "beacon_one" })),
-        ("search", json!({ "query": "beacon", "limit": 1 })),
+        ("search", json!({ "query": "beacon", "max_results": 1 })),
         ("search", json!({ "query": "beacon", "include": {} })),
         // The fixture global API's collected package answers these: a package hit
         // carries `unit` in place of `path`.
@@ -45,17 +45,17 @@ pub(crate) fn corpus() -> Vec<(&'static str, Value)> {
             "search",
             json!({
                 "query": "beacon",
-                "limit": 1,
+                "max_results": 1,
                 "paths": { "include": ["lib.rs"] }
             }),
         ),
         (
             "search",
-            json!({ "query": "beacon", "limit": 1, "page_index": 100 }),
+            json!({ "query": "beacon", "max_results": 1, "page": 100 }),
         ),
         (
             "search",
-            json!({ "query": "beacon", "limit": 1, "page_index": 50 }),
+            json!({ "query": "beacon", "max_results": 1, "page": 50 }),
         ),
         (
             "search",
@@ -91,7 +91,7 @@ pub(crate) fn corpus() -> Vec<(&'static str, Value)> {
         ("search", json!({"language":"sparql", "query":"ASK { ?symbol a :Symbol; :name 'beacon_one' }"})),
         ("search", json!({"language":"sparql", "query":"CONSTRUCT { ?symbol :name 'beacon_one' } WHERE { ?symbol a :Symbol; :name 'beacon_one' }"})),
         ("search", json!({"language":"sparql", "query":"SELECT (BNODE() AS ?blank) (<urn:fixture:term> AS ?iri) (1 AS ?number) ('hello'@en AS ?language) WHERE {}"})),
-        ("search", json!({"language":"sparql", "query":format!("SELECT ?index {{ VALUES ?index {{ {} }} }} ORDER BY ?index", (0..=rift_protocol::query::QueryConfiguration::default().page_size).map(|index| index.to_string()).collect::<Vec<_>>().join(" "))})),
+        ("search", json!({"language":"sparql", "query":format!("SELECT ?index {{ VALUES ?index {{ {} }} }} ORDER BY ?index", (0..=rift_protocol::read::MAX_RESULTS_DEFAULT).map(|index| index.to_string()).collect::<Vec<_>>().join(" "))})),
     ]);
     requests
         .into_iter()
@@ -122,7 +122,7 @@ pub(crate) async fn prepared_corpus(
                 .as_str()
                 .ok_or("corpus declaration name")?
                 .to_owned();
-            let mut discovery = json!({"query": name, "target": "symbol", "include": {"source": true}, "limit": 1000});
+            let mut discovery = json!({"query": name, "target": "symbol", "include": {"source": true}, "max_results": 1000});
             for field in ["scope", "packages", "revision"] {
                 if let Some(value) = request.get(field) {
                     discovery[field] = value.clone();
@@ -241,7 +241,7 @@ fn commit_search_corpus() -> Vec<(&'static str, Value)> {
         ("search", json!({ "target": "commit", "query": "witness" })),
         (
             "search",
-            json!({ "target": "commit", "query": "fixture change", "limit": 1 }),
+            json!({ "target": "commit", "query": "fixture change", "max_results": 1 }),
         ),
     ]
 }

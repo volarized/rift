@@ -73,8 +73,7 @@
                         "packages_max": 64,
                         "page_limit_min": 1,
                         "page_limit_max": 200,
-                        "page_limit_default": 100,
-                        "cursor_bytes_max": 4096,
+                        "page_limit_default": 10,
                         "candidate_pool_max": 1000,
                         "warnings_max": 32,
                         "source_bytes_max": 33554432
@@ -572,7 +571,7 @@
       "post": {
         "operationId": "searchPackages",
         "summary": "Search package declarations.",
-        "description": "Returns one ranked declaration page from selected exact package versions.",
+        "description": "Returns one page of results from the selected exact package versions. The caller pins later pages with the returned `revision`.",
         "security": [
           {},
           {
@@ -581,10 +580,10 @@
         ],
         "parameters": [
           {
-            "$ref": "#/components/parameters/Limit"
+            "$ref": "#/components/parameters/Page"
           },
           {
-            "$ref": "#/components/parameters/Cursor"
+            "$ref": "#/components/parameters/MaxResults"
           }
         ],
         "requestBody": {
@@ -1046,7 +1045,14 @@
                       "view": {
                         "id": "eyJ2ZXJzaW9uIjo0LCJzbG90IjoxMTcsImRlc2NyaXB0b3JfZGlnZXN0IjoiOTA0ZmE0YzJiYWMyYjUwNjQ5OGJlYjZhMGRiYmZmZmQ2OTdhM2I3MWNjOWI5MzhiZGM4NDdhYjgzZWM3M2NjMiIsImNvbGxlY3Rpb25fY29udGV4dCI6ImQyZDgyNGIzMjA5NTczNDM4M2U4MGZmMmY3ZjRjNzQzNmRiZGM0NDFkM2RlOTZlNGMxNzlkMjljMjkzM2JlOTIiLCJleHBpcmVzX2F0IjoxNzk0OTE4NTUwfQ.l1PfACRL2gkCmojWRbbDLf6N28_dqya4hwfn5Yp2tvU",
                         "expires_at": "2026-11-17T12:29:10Z"
-                      }
+                      },
+                      "pagination": {
+                        "page": 1,
+                        "pages": 1,
+                        "max_results": 10,
+                        "total": 6
+                      },
+                      "revision": "9ed97ad7"
                     }
                   },
                   "documentation": {
@@ -1265,7 +1271,14 @@
                       "view": {
                         "id": "eyJ2ZXJzaW9uIjo0LCJzbG90IjoxMTcsImRlc2NyaXB0b3JfZGlnZXN0IjoiOTA0ZmE0YzJiYWMyYjUwNjQ5OGJlYjZhMGRiYmZmZmQ2OTdhM2I3MWNjOWI5MzhiZGM4NDdhYjgzZWM3M2NjMiIsImNvbGxlY3Rpb25fY29udGV4dCI6ImQyZDgyNGIzMjA5NTczNDM4M2U4MGZmMmY3ZjRjNzQzNmRiZGM0NDFkM2RlOTZlNGMxNzlkMjljMjkzM2JlOTIiLCJleHBpcmVzX2F0IjoxNzk0OTE4NTUwfQ.l1PfACRL2gkCmojWRbbDLf6N28_dqya4hwfn5Yp2tvU",
                         "expires_at": "2026-11-17T12:29:10Z"
-                      }
+                      },
+                      "pagination": {
+                        "page": 1,
+                        "pages": 1,
+                        "max_results": 10,
+                        "total": 3
+                      },
+                      "revision": "9ed97ad7"
                     }
                   },
                   "relationships": {
@@ -1652,7 +1665,7 @@
       "post": {
         "operationId": "get_symbol",
         "summary": "Read one logical symbol.",
-        "description": "Reads one exact logical symbol obtained from discovery or another read.",
+        "description": "Reads one exact logical symbol obtained from discovery or another read. The caller selects declarations with `page` and `max_results`, and pins later pages with `revision`.",
         "security": [
           {},
           {
@@ -1672,7 +1685,7 @@
                   "value": {
                     "id": "rift://symbol/cargo/crates.io/itoa/rust/itoa/Buffer",
                     "revision": "rift://revision/cargo/crates.io/itoa@1.0.18",
-                    "declaration_limit": 5
+                    "max_results": 5
                   }
                 }
               }
@@ -1743,7 +1756,13 @@
                             0
                           ]
                         }
-                      ]
+                      ],
+                      "pagination": {
+                        "page": 1,
+                        "pages": 1,
+                        "max_results": 10,
+                        "total": 1
+                      }
                     }
                   }
                 }
@@ -1920,7 +1939,7 @@
       "post": {
         "operationId": "facets",
         "summary": "Read every declaration of one package or runtime symbol.",
-        "description": "Reads every declaration of one package or runtime symbol with its location, exact source, and syntax structure. The request carries `symbol` and MAY carry `facet_cursor` and `revision`. Each declaration carries its syntax tree. The answer names the release it read. A page holds at most `page_limit_max` declarations and at least one whole declaration; beyond its first declaration, the syntax source stays within `x-rift-page-source-bytes-max`. The caller MUST return `facet_cursor` with the same symbol and revision. A symbol the release does not declare answers 404.",
+        "description": "Reads every declaration of one package or runtime symbol with its location, exact source, and syntax structure. The caller selects declarations with `page` and `max_results`, and pins later pages with `revision`.",
         "security": [
           {},
           {
@@ -2197,7 +2216,13 @@
                           ],
                           "regions": []
                         }
-                      ]
+                      ],
+                      "pagination": {
+                        "page": 1,
+                        "pages": 1,
+                        "max_results": 10,
+                        "total": 1
+                      }
                     }
                   }
                 }
@@ -2368,7 +2393,7 @@
       "post": {
         "operationId": "searchPackagePatterns",
         "summary": "Search package source for a pattern.",
-        "description": "Returns the matches of one regular expression over the source files of selected exact package versions, in package order as the request lists them, then file path order, then match offset. The server verifies candidate files in that order and stops a page at `limit` hits, at `x-rift-page-files-max` files, or at `x-rift-page-text-bytes-max` bytes of verified text, whichever comes first; `next_cursor` continues where the page stopped, and a `result_truncated` warning names the bound.",
+        "description": "Returns one page of results from the selected exact package versions. The caller pins later pages with the returned `revision`.",
         "security": [
           {},
           {
@@ -2377,10 +2402,10 @@
         ],
         "parameters": [
           {
-            "$ref": "#/components/parameters/Limit"
+            "$ref": "#/components/parameters/Page"
           },
           {
-            "$ref": "#/components/parameters/Cursor"
+            "$ref": "#/components/parameters/MaxResults"
           }
         ],
         "requestBody": {
@@ -2502,7 +2527,14 @@
                       "view": {
                         "id": "eyJ2ZXJzaW9uIjo0LCJzbG90IjoxMTcsImRlc2NyaXB0b3JfZGlnZXN0IjoiOTA0ZmE0YzJiYWMyYjUwNjQ5OGJlYjZhMGRiYmZmZmQ2OTdhM2I3MWNjOWI5MzhiZGM4NDdhYjgzZWM3M2NjMiIsImNvbGxlY3Rpb25fY29udGV4dCI6ImQyZDgyNGIzMjA5NTczNDM4M2U4MGZmMmY3ZjRjNzQzNmRiZGM0NDFkM2RlOTZlNGMxNzlkMjljMjkzM2JlOTIiLCJleHBpcmVzX2F0IjoxNzk0OTE4NTUwfQ.l1PfACRL2gkCmojWRbbDLf6N28_dqya4hwfn5Yp2tvU",
                         "expires_at": "2026-11-17T12:29:10Z"
-                      }
+                      },
+                      "pagination": {
+                        "page": 1,
+                        "pages": 1,
+                        "max_results": 10,
+                        "total": 1
+                      },
+                      "revision": "9ed97ad7"
                     }
                   }
                 }
@@ -2908,26 +2940,28 @@
       }
     },
     "parameters": {
-      "Limit": {
-        "name": "limit",
+      "Page": {
+        "name": "page",
         "in": "query",
         "required": false,
-        "description": "Maximum entries in one page, at most the `page_limit_max` the capabilities advertise; the server refuses a larger one.",
+        "description": "The 1-based page to read.",
+        "schema": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1,
+          "default": 1
+        }
+      },
+      "MaxResults": {
+        "name": "max_results",
+        "in": "query",
+        "required": false,
+        "description": "Results per page. The server refuses a value above the advertised maximum.",
         "schema": {
           "type": "integer",
           "minimum": 1,
           "maximum": 1000,
-          "default": 100
-        }
-      },
-      "Cursor": {
-        "name": "cursor",
-        "in": "query",
-        "required": false,
-        "description": "Opaque cursor for the next page.",
-        "schema": {
-          "type": "string",
-          "maxLength": 4096
+          "default": 10
         }
       }
     },
@@ -3777,11 +3811,6 @@
             "minimum": 1,
             "maximum": 1000
           },
-          "cursor_bytes_max": {
-            "type": "integer",
-            "minimum": 1,
-            "maximum": 4096
-          },
           "candidate_pool_max": {
             "type": "integer",
             "minimum": 1,
@@ -3811,7 +3840,6 @@
           "page_limit_min",
           "page_limit_max",
           "page_limit_default",
-          "cursor_bytes_max",
           "candidate_pool_max",
           "warnings_max",
           "source_bytes_max"
@@ -4084,6 +4112,12 @@
           "view": {
             "description": "A view returned by a preceding read. Expiry never selects latest implicitly.",
             "$ref": "#/components/schemas/CapturedViewId"
+          },
+          "revision": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "description": "The indexed revision to read. Omitted reads the served revision."
           }
         },
         "type": "object",
@@ -4231,7 +4265,7 @@
       },
       "PackageSearchPage": {
         "additionalProperties": true,
-        "description": "One ranked page of package declarations. A page **MUST NOT** take the response past `response_body_bytes_max`: the server stops it before the first item that would, and the page carries the items that fit, `next_cursor` at the first item left out, and a `result_truncated` warning. The server **MUST** retain the captured view and its original expiry on every page, including an empty page.",
+        "description": "One page of package declarations. The response carries pagination for the selected declarations. A page above response_body_bytes_max is refused.",
         "properties": {
           "items": {
             "description": "Ranked package declarations.",
@@ -4240,11 +4274,6 @@
             },
             "type": "array",
             "maxItems": 1000
-          },
-          "next_cursor": {
-            "description": "Opaque cursor for the next page.",
-            "type": "string",
-            "maxLength": 4096
           },
           "warnings": {
             "description": "Warnings attached to this page.",
@@ -4278,6 +4307,15 @@
           },
           "view": {
             "$ref": "#/components/schemas/CapturedView"
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/Pagination"
+          },
+          "revision": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "description": "The indexed revision this answer read."
           }
         },
         "required": [
@@ -4286,153 +4324,9 @@
           "publication_format",
           "analyzer_revision",
           "corpus_revision",
-          "view"
-        ],
-        "type": "object"
-      },
-      "PackageSymbolRequest": {
-        "additionalProperties": false,
-        "description": "Package declaration lookup query.",
-        "properties": {
-          "name": {
-            "description": "Declaration name to look up.",
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 4096
-          },
-          "language": {
-            "$ref": "#/components/schemas/Language",
-            "description": "Optional language filter."
-          },
-          "include": {
-            "description": "Optional fields to include. An omitted member is `false`.",
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-              "source": {
-                "description": "Attaches each declaration's source.",
-                "type": "boolean"
-              },
-              "documentation": {
-                "description": "Attaches each declaration's documentation.",
-                "type": "boolean"
-              }
-            }
-          },
-          "packages": {
-            "description": "Selected exact package versions.",
-            "items": {
-              "$ref": "#/components/schemas/PackageIdentity"
-            },
-            "type": "array",
-            "maxItems": 20000
-          }
-        },
-        "required": [
-          "name",
-          "packages"
-        ],
-        "type": "object"
-      },
-      "PackageSymbol": {
-        "additionalProperties": true,
-        "description": "One package declaration returned by symbol lookup.",
-        "properties": {
-          "package": {
-            "$ref": "#/components/schemas/PackageIdentity"
-          },
-          "symbol": {
-            "$ref": "#/components/schemas/Symbol"
-          },
-          "unit": {
-            "$ref": "#/components/schemas/SourceUnitId"
-          },
-          "range": {
-            "$ref": "#/components/schemas/TextRange"
-          },
-          "line": {
-            "description": "One-based source line containing the declaration.",
-            "type": "integer",
-            "minimum": 1,
-            "maximum": 9007199254740991
-          },
-          "match_class": {
-            "$ref": "#/components/schemas/IdentifierMatchClass"
-          },
-          "source": {
-            "description": "Optional declaration source excerpt.",
-            "type": "string",
-            "maxLength": 67108864
-          },
-          "documentation": {
-            "$ref": "#/components/schemas/DocumentationContext",
-            "description": "Exact documentation references, when requested."
-          }
-        },
-        "required": [
-          "package",
-          "symbol",
-          "unit",
-          "range",
-          "line",
-          "match_class"
-        ],
-        "type": "object"
-      },
-      "PackageSymbolPage": {
-        "additionalProperties": true,
-        "description": "One page of package declarations. A page **MUST NOT** take the response past `response_body_bytes_max`: the server stops it before the first item that would, and the page carries the items that fit, `next_cursor` at the first item left out, and a `result_truncated` warning.",
-        "properties": {
-          "items": {
-            "description": "Package declarations.",
-            "items": {
-              "$ref": "#/components/schemas/PackageSymbol"
-            },
-            "type": "array",
-            "maxItems": 1000
-          },
-          "next_cursor": {
-            "description": "Opaque cursor for the next page.",
-            "type": "string",
-            "maxLength": 4096
-          },
-          "warnings": {
-            "description": "Warnings attached to this page.",
-            "items": {
-              "$ref": "#/components/schemas/Warning"
-            },
-            "type": "array",
-            "maxItems": 32
-          },
-          "publication_format": {
-            "$ref": "#/components/schemas/PublicationFormat"
-          },
-          "analyzer_revision": {
-            "description": "Analyzer revision used for this page.",
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 128
-          },
-          "corpus_revision": {
-            "description": "Corpus revision used for this page.",
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 128
-          },
-          "documentation_revision": {
-            "type": "string",
-            "minLength": 8,
-            "maxLength": 8,
-            "pattern": "^[0-9a-f]{8}$",
-            "description": "Documentation revision used for this page."
-          }
-        },
-        "required": [
-          "items",
-          "warnings",
-          "publication_format",
-          "analyzer_revision",
-          "corpus_revision"
+          "view",
+          "pagination",
+          "revision"
         ],
         "type": "object"
       },
@@ -4464,6 +4358,12 @@
                 "type": "boolean"
               }
             }
+          },
+          "revision": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "description": "The indexed revision to read. Omitted reads the served revision."
           }
         },
         "required": [
@@ -4545,7 +4445,7 @@
       },
       "PackagePatternPage": {
         "additionalProperties": true,
-        "description": "One page of pattern matches. A page that stops before the last match carries `next_cursor` at the first match left out and a `result_truncated` warning naming the bound it stopped at. A page **MUST NOT** take the response past `response_body_bytes_max`: the server stops it before the first match that would.",
+        "description": "One page of results at the named revision. A page past the last returns an empty list with the same pagination. The server refuses a page that exceeds the response byte bound.",
         "properties": {
           "items": {
             "description": "Matches in package, file path, and offset order.",
@@ -4554,11 +4454,6 @@
             },
             "type": "array",
             "maxItems": 1000
-          },
-          "next_cursor": {
-            "description": "Opaque cursor for the next page.",
-            "type": "string",
-            "maxLength": 4096
           },
           "warnings": {
             "description": "Warnings attached to this page.",
@@ -4586,6 +4481,15 @@
           "view": {
             "$ref": "#/components/schemas/CapturedView",
             "description": "The original immutable serving view and expiry. Older responses can omit it; reads requiring captured source context return unavailable."
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/Pagination"
+          },
+          "revision": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "description": "The indexed revision this answer read."
           }
         },
         "required": [
@@ -4593,7 +4497,9 @@
           "warnings",
           "publication_format",
           "analyzer_revision",
-          "corpus_revision"
+          "corpus_revision",
+          "pagination",
+          "revision"
         ],
         "type": "object"
       },
@@ -6089,19 +5995,20 @@
             "description": "The revision to read. A git revision reads that commit of a project, a tree\nrevision reads the served working tree, and a release revision selects the release\nof a package or runtime `id`'s owner. Omitted reads the served working tree, or for\na package the version the workspace's dependencies pin, else the newest collected\nrelease. The server refuses a tree revision once the index serves another tree.",
             "$ref": "#/components/schemas/Revision"
           },
-          "declaration_limit": {
+          "max_results": {
             "type": "integer",
             "format": "uint64",
             "minimum": 1,
-            "description": "Most declarations returned in this read. Omitted uses the existing five-item bound.",
+            "description": "Results per page, at most 10,000.",
             "maximum": 10000,
-            "default": 5
+            "default": 10
           },
-          "declaration_cursor": {
-            "type": "string",
-            "description": "Continuation a preceding read returned, bound to this symbol and the revision it read.\nThe server refuses it for another symbol and once that revision is no longer served.",
-            "minLength": 1,
-            "maxLength": 4096
+          "page": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1,
+            "description": "The 1-based page to read.",
+            "default": 1
           }
         },
         "required": [
@@ -6144,11 +6051,9 @@
                 "description": "Declaration bindings in deterministic source order.",
                 "maxItems": 10000
               },
-              "declaration_cursor": {
-                "type": "string",
-                "description": "Continuation for the remaining declarations at `revision`.",
-                "minLength": 1,
-                "maxLength": 4096
+              "pagination": {
+                "$ref": "#/components/schemas/Pagination",
+                "description": "The requested page and complete declaration count."
               },
               "history": {
                 "description": "Requested timeline for the logical symbol.",
@@ -6170,7 +6075,8 @@
               "outcome",
               "symbol",
               "revision",
-              "declarations"
+              "declarations",
+              "pagination"
             ],
             "description": "The exact identity was established, even when it has no source declarations."
           },
@@ -6668,7 +6574,7 @@
               "code",
               "results_max"
             ],
-            "description": "The server reached `results_max`, its result bound, before ordering and paging:\nwhat the bound cut never reaches any page, and `total_pages` counts only what fit.\nThe bound cuts the ranked candidates and the hit set alike. The warning means the\nbound was reached; a set of exactly `results_max` hits carries it too. Narrow\n`query` or `paths`."
+            "description": "The server reached `results_max`, its result bound, before ordering and paging:\nwhat the bound cut never reaches any page, and `pages` counts only what fit.\nThe bound cuts the ranked candidates and the hit set alike. The warning means the\nbound was reached; a set of exactly `results_max` hits carries it too. Narrow\n`query` or `paths`."
           },
           {
             "type": "object",
@@ -7964,230 +7870,6 @@
           "Tailwind directives and classes under a known major version."
         ]
       },
-      "SearchParams": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "view": {
-            "description": "The captured serving context returned by an earlier search. The server retains\nquery, filters, ranking policy, selected projects and releases under this view.\nAn expired or mismatched view is unavailable; the server never substitutes latest.",
-            "$ref": "#/components/schemas/CapturedViewId"
-          },
-          "target": {
-            "$ref": "#/components/schemas/SearchParamsTarget",
-            "description": "Which entity kinds may be returned - a kind selector, never the text to search for;\nthat is `query`. Omitted, `all`: declarations, tree entries, and documentation\nblocks. `commit` matches `query` against the messages of the commits the history\nstore holds - under `[providers.history] strategy = \"selective\"`, the selected\nreleases alone - and answers the commits carrying every term before the ones\ncarrying some, each group newest first, whatever `order` names. While the store\nfills, a commit it has not analyzed yet answers nothing. The server refuses `commit`\nbeside `pattern`, `traversal`, `change`, `rev`, `packages`, and `paths`, and with a\n`scope` past `local`, since each of them selects declarations, text, or another\ntree, and the global index holds no project history.",
-            "default": "all"
-          },
-          "order": {
-            "$ref": "#/components/schemas/ResultOrder",
-            "description": "Which total order the page comes back in. Omitted, relevance.",
-            "default": "relevance"
-          },
-          "query": {
-            "type": "string",
-            "description": "Text to match against declaration names, qualified names, signatures, attached\ndocumentation, and file contents. A declaration whose body alone holds the terms\nanswers through its file's contents, tagged `content`, when that file ranks among\nthe first 20 files. Matching is case-insensitive and identifier-aware: the query and\nthe indexed names split on case, acronym, and separator boundaries, so `loadConfig`\nfinds `load_config`. Under `relevance`, the server ranks an identifier matching the\noriginal declaration name or qualified name before case-insensitive fallback.\nDouble quotes keep a phrase together, and an identifier written\ninside a question reaches its declaration without being quoted. A query naming\nseveral terms ranks the remaining declarations carrying all of them before the ones\ncarrying some. Scoring is server-defined and comparable within one answer. With\n`target: \"commit\"`, the text matches commit messages instead."
-          },
-          "pattern": {
-            "type": "string",
-            "description": "A regex matched against the text of every indexed file, in the syntax of the Rust\n`regex` crate that ripgrep reads. Matching runs line by line: `^` and `$` match at\nline boundaries, a `\\r` before a line feed belongs to its line, and no class matches\na line feed, so only a literal `\\n` crosses a line; `(?i)` makes the match\ncase-insensitive. Every match becomes one file hit whose `range` is the match's\nbytes, and every declaration holding a match one symbol hit at its first match;\neach hit is tagged `content` and carries no score, and `relevance` orders the hits\nby path, then offset. With a `scope` past `local`, the global index matches the\npattern over the dependency packages' source too, and those hits carry `unit` in\nplace of `path`. The server refuses `pattern` beside `query`, `traversal`,\n`change`, and `rev`, and with `target: \"documentation\"`, and it refuses a pattern\nwhose compiled size, candidate rows, or verified bytes pass the `[search]` bounds,\nnaming the bound.",
-            "minLength": 1,
-            "maxLength": 1024
-          },
-          "scope": {
-            "$ref": "#/components/schemas/SearchScope",
-            "description": "Which sources `query` and `pattern` search: the project tree, the dependency\npackages, or both. Omitted, `local`. A package contributes symbol hits alone to\n`query`, and file and symbol hits to `pattern`. The server refuses a scope beyond\n`local` together with `rev`, since package facts are served for the current tree\nalone, and `global` together with `traversal`, since a walk runs over the project\nalone.",
-            "default": "local"
-          },
-          "packages": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/RequestedPackage"
-            },
-            "description": "Packages `query` and `pattern` search beside the ones the workspace's manifests and\nlockfiles name, at most 64. An entry naming a package the workspace depends on replaces that\npackage's versions for this search, and an entry naming another package adds it.\nThe server refuses `packages` beside the `local` scope, since a project search\nconsults no package, and beside `rev`, since package facts are served for the\ncurrent tree alone.",
-            "maxItems": 64
-          },
-          "paths": {
-            "description": "Files eligible for the search, selected by project-relative globs. Omitted selects\nevery visible file.",
-            "$ref": "#/components/schemas/PathSelector"
-          },
-          "include": {
-            "$ref": "#/components/schemas/SearchInclude",
-            "description": "Extra payload to attach to every hit. Every selected member costs response bytes per\nhit, so the caller requests only what it will read."
-          },
-          "limit": {
-            "type": "integer",
-            "format": "uint64",
-            "minimum": 1,
-            "description": "Most hits to return in one page, at most 10,000; the server refuses a larger\n`limit` naming the field. The server's result bound caps the set itself, and an\nanswer whose set reached it warns `results_truncated`.",
-            "maximum": 10000
-          },
-          "page_index": {
-            "type": "integer",
-            "format": "uint64",
-            "minimum": 0,
-            "description": "Zero-based page of the result set to serve, sized by `limit`. A `page_index` past\nthe last page returns an empty page whose `pagination` carries the requested\n`page_index` and the true `total_pages`.",
-            "default": 0
-          },
-          "revision": {
-            "description": "The revision to search: a git revision searches that commit, a tree revision the\nserved working tree. Omitted searches the served working tree. The server refuses a\ngit revision when the workspace has no version-control repository, a tree revision\nonce the index serves another tree, and a release revision, since `packages` names\nthe releases a search reads.",
-            "$ref": "#/components/schemas/Revision"
-          },
-          "traversal": {
-            "description": "A bounded relationship walk from `seed`, standing alone or beside `query`. A symbol\nthe walk reaches becomes a hit tagged `relationship`; one also matched lexically\nkeeps its own score and payload and gains the walk's path. `target: \"file\"` never\ncarries a walked hit, since a traversal only reaches symbols. With no `query`,\n`relevance` orders hits by ascending `distance`, then identity. A configured\nlanguage engine resolves the references the walk follows, and an engine session\nserves the current tree, so the server refuses `traversal` beside `rev` and beside\n`change`.",
-            "$ref": "#/components/schemas/SearchTraversal"
-          },
-          "change": {
-            "description": "A committed revision compared against another revision or the working tree,\nstanding alone. Every declaration the two sides hold differently becomes a hit\ntagged `change`, carrying a `change` block that names what differs and where the\ndeclaration lives on each side. `target: \"file\"` never carries a change hit, since\nthe comparison reaches declarations alone, and `relevance` orders the hits by path,\nthen name. `paths` narrows which changed paths are compared. The server refuses\n`change` beside `rev`, since `change` names its own revisions; beside `query`, since\nthe two select different result sets; beside `traversal`, which no comparison\nserves; and beside a `scope` past `local`.",
-            "$ref": "#/components/schemas/SearchChange"
-          }
-        },
-        "description": "Criteria for one search. The caller supplies a lexical `query`, a relationship\n`traversal`, or both, a regex `pattern`, or a `change` comparing a committed revision\nagainst another revision or the working tree; `paths` narrows the files eligible for any\nof them.",
-        "rift:since": "v0.0.6",
-        "examples": [
-          {
-            "target": "all",
-            "order": "relevance",
-            "query": "load_config",
-            "paths": {
-              "include": [
-                "src/**"
-              ],
-              "exclude": [],
-              "force_include": []
-            },
-            "include": {
-              "source": true
-            },
-            "limit": 20,
-            "page_index": 0
-          },
-          {
-            "target": "symbol",
-            "query": "load_config",
-            "order": "path",
-            "limit": 10
-          },
-          {
-            "target": "symbol",
-            "traversal": {
-              "seed": "rift://symbol/local/rust/rift_server/read/ReadService",
-              "direction": "incoming",
-              "depth": 2,
-              "facets": [
-                "references"
-              ]
-            },
-            "limit": 25
-          },
-          {
-            "target": "symbol",
-            "traversal": {
-              "seed": "rift://symbol/local/rust/rift_server/engine_read/resolve_symbol_callees",
-              "direction": "outgoing",
-              "facets": [
-                "calls"
-              ]
-            },
-            "limit": 25
-          },
-          {
-            "target": "symbol",
-            "query": "spawn_blocking",
-            "scope": "global",
-            "limit": 10
-          },
-          {
-            "target": "file",
-            "pattern": "fn\\s+load_\\w+\\(",
-            "paths": {
-              "include": [
-                "src/**"
-              ]
-            },
-            "include": {
-              "source": true
-            },
-            "limit": 25
-          },
-          {
-            "target": "symbol",
-            "query": "spawn_blocking",
-            "scope": "all",
-            "packages": [
-              {
-                "manager": "cargo",
-                "name": "tokio",
-                "version": "1.47.1"
-              }
-            ],
-            "limit": 10
-          },
-          {
-            "target": "symbol",
-            "change": {
-              "base": "main",
-              "head": "HEAD"
-            },
-            "limit": 25
-          },
-          {
-            "target": "commit",
-            "query": "change path bound",
-            "limit": 10
-          }
-        ],
-        "allOf": [
-          {
-            "anyOf": [
-              {
-                "required": [
-                  "query"
-                ]
-              },
-              {
-                "required": [
-                  "pattern"
-                ]
-              },
-              {
-                "required": [
-                  "traversal"
-                ]
-              },
-              {
-                "required": [
-                  "change"
-                ]
-              }
-            ],
-            "description": "a search selects its result set with query, pattern, traversal, or change"
-          },
-          {
-            "properties": {
-              "traversal": {
-                "required": [
-                  "seed"
-                ]
-              }
-            },
-            "description": "a traversal starts at seed"
-          },
-          {
-            "if": {
-              "required": [
-                "change"
-              ]
-            },
-            "then": {
-              "not": {
-                "required": [
-                  "traversal"
-                ]
-              }
-            },
-            "description": "a traversal never rides beside change"
-          }
-        ]
-      },
       "SearchParamsTarget": {
         "description": "Which entity kinds may be returned.",
         "type": "string",
@@ -8400,223 +8082,42 @@
         ],
         "description": "A comparison side that names a tree rather than a revision, spelled\n`{\"kind\": \"working_tree\"}`: no revision spelling can collide with it."
       },
-      "SearchResult": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "view": {
-            "description": "The captured serving context for this result, including an empty page. Each hit\ncarries the original view of its selected project or released owner.\nAbsent when the caller selected latest facts without retained serving context.",
-            "$ref": "#/components/schemas/CapturedView"
-          },
-          "revision": {
-            "description": "The revision of the project tree this answer read: a commit or a working tree.\nAbsent when the answer merged several project trees, read packages alone, or\nanswered from a captured view.",
-            "$ref": "#/components/schemas/Revision"
-          },
-          "results": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/SearchHit"
-            },
-            "description": "The hits on this page, in the order the request asked for."
-          },
-          "pagination": {
-            "$ref": "#/components/schemas/Pagination",
-            "description": "Where this page sits in the full result set under the request's `limit`."
-          },
-          "warnings": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ReadWarning"
-            },
-            "description": "Warnings attached to this result. Absent when there is nothing to warn about.",
-            "default": []
-          }
-        },
-        "required": [
-          "results",
-          "pagination"
-        ],
-        "description": "One page of search hits from one captured tree.",
-        "examples": [
-          {
-            "results": [
-              {
-                "hit": {
-                  "target": "symbol",
-                  "symbol": {
-                    "id": "rift://symbol/local/rust/app/config/load_config",
-                    "language": "rust",
-                    "name": "load_config",
-                    "kind": "function",
-                    "facets": [
-                      "value",
-                      "callable",
-                      "public"
-                    ],
-                    "visibility": "pub",
-                    "types": [
-                      {
-                        "role": "return",
-                        "origin": "declared",
-                        "type": {
-                          "language": "rust",
-                          "source": "Result<Config, ConfigError>"
-                        }
-                      }
-                    ],
-                    "signatures": [
-                      {
-                        "display": "pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
-                        "links": [
-                          {
-                            "range": {
-                              "start": 42,
-                              "end": 48
-                            },
-                            "symbol": "rift://symbol/local/rust/app/config/Config"
-                          }
-                        ],
-                        "language": "rust",
-                        "parameters": [
-                          {
-                            "name": "path",
-                            "types": [
-                              {
-                                "role": "parameter",
-                                "origin": "declared",
-                                "type": {
-                                  "language": "rust",
-                                  "source": "&Path"
-                                }
-                              }
-                            ],
-                            "optional": false,
-                            "variadic": false
-                          }
-                        ],
-                        "returns": [
-                          {
-                            "role": "return",
-                            "origin": "declared",
-                            "type": {
-                              "language": "rust",
-                              "source": "Result<Config, ConfigError>"
-                            }
-                          }
-                        ]
-                      }
-                    ],
-                    "documentation": [
-                      {
-                        "format": "markdown",
-                        "text": "Loads the workspace configuration from `rift.toml`."
-                      }
-                    ]
-                  }
-                },
-                "matched_by": [
-                  "name"
-                ],
-                "source": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
-                "range": {
-                  "start": 162,
-                  "end": 355
-                },
-                "line": 10,
-                "path": "src/config.rs"
-              },
-              {
-                "hit": {
-                  "target": "file",
-                  "size": 241,
-                  "languages": [
-                    "rust"
-                  ]
-                },
-                "matched_by": [
-                  "content"
-                ],
-                "source": "    let config = load_config(&arguments.path)?;",
-                "range": {
-                  "start": 121,
-                  "end": 168
-                },
-                "line": 7,
-                "path": "src/lib.rs"
-              }
-            ],
-            "pagination": {
-              "page_index": 0,
-              "total_pages": 3
-            }
-          },
-          {
-            "results": [
-              {
-                "hit": {
-                  "target": "commit",
-                  "commit": {
-                    "revision": "9c1d4e7a2b8f03d5e6a1c4b7d9e2f0a3b5c8d1e4",
-                    "message": "Bound comparisons at 512 changed paths\n\nA comparison that reaches the bound answers from the paths that fit and warns change_truncated.\n",
-                    "message_truncated": false,
-                    "author": {
-                      "name": "Alice",
-                      "email": "alice@example.com"
-                    },
-                    "timestamp": "2026-09-22T14:03:11+02:00",
-                    "paths": [
-                      "crates/rift-protocol/src/search.rs",
-                      "crates/rift-server/src/change.rs"
-                    ],
-                    "paths_truncated": false
-                  }
-                }
-              }
-            ],
-            "pagination": {
-              "page_index": 0,
-              "total_pages": 1
-            }
-          }
-        ]
-      },
       "Pagination": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "page_index": {
+          "page": {
             "type": "integer",
             "format": "uint64",
-            "minimum": 0,
-            "description": "The zero-based page this answer serves.",
-            "maximum": 9007199254740991
+            "minimum": 1,
+            "description": "The 1-based page this answer serves."
           },
-          "total_pages": {
+          "pages": {
             "type": "integer",
             "format": "uint64",
             "minimum": 0,
-            "description": "The page count of the full result set under the request's `limit`, computed within\nthe server's result bound. Zero when the result set is empty.",
-            "maximum": 9007199254740991
+            "description": "Page count, zero when the result set is empty."
+          },
+          "max_results": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1,
+            "description": "Results per page."
+          },
+          "total": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "description": "Total results within the server's result bound."
           }
         },
         "required": [
-          "page_index",
-          "total_pages"
+          "page",
+          "pages",
+          "max_results",
+          "total"
         ],
-        "description": "Where one page sits in the full result set the request's `limit` divides."
-      },
-      "SearchReadResult": {
-        "anyOf": [
-          {
-            "$ref": "#/components/schemas/SearchResult",
-            "description": "Search hits and the captured serving context, including an empty page."
-          },
-          {
-            "$ref": "#/components/schemas/SearchUnavailable",
-            "description": "The captured selection cannot serve this request."
-          }
-        ],
-        "description": "One page of search hits, or the typed cause of selection unavailability."
+        "description": "The requested page and the size of its complete result set."
       },
       "SearchUnavailable": {
         "oneOf": [
@@ -8661,11 +8162,20 @@
             "$ref": "#/components/schemas/SymbolId",
             "description": "The symbol whose declarations the server reads. A package or runtime symbol is read\nthrough the global API."
           },
-          "facet_cursor": {
-            "type": "string",
-            "description": "Continuation returned by a preceding read of this symbol at the same revision.",
-            "minLength": 1,
-            "maxLength": 4096
+          "max_results": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1,
+            "description": "Results per page, at most 100.",
+            "maximum": 100,
+            "default": 10
+          },
+          "page": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1,
+            "description": "The 1-based page to read.",
+            "default": 1
           },
           "revision": {
             "description": "The revision to read. Omitted reads the served working tree, or the selected package\nor runtime release. The server refuses a tree revision once the index serves another tree.",
@@ -8698,9 +8208,9 @@
             },
             "description": "Declarations in symbol order, with each declaration's syntax elements in pre-order."
           },
-          "facet_cursor": {
-            "type": "string",
-            "description": "Continues the declarations of this symbol at this revision."
+          "pagination": {
+            "$ref": "#/components/schemas/Pagination",
+            "description": "The requested page and complete declaration count."
           },
           "revision": {
             "$ref": "#/components/schemas/Revision",
@@ -8718,6 +8228,7 @@
         "required": [
           "symbol",
           "declarations",
+          "pagination",
           "revision"
         ],
         "description": "Declarations of one symbol, each with its location, source, and syntax structure.",
@@ -8909,7 +8420,13 @@
                 ]
               }
             ],
-            "revision": "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11"
+            "revision": "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11",
+            "pagination": {
+              "page": 1,
+              "pages": 1,
+              "max_results": 10,
+              "total": 1
+            }
           }
         ]
       },
@@ -9390,11 +8907,6 @@
               "$ref": "#/components/schemas/QuerySource"
             },
             "description": "Physical source catalog and requested bytes for reached declarations and occurrences.\nIdentical captured records may repeat across pages; conflicting records are refused."
-          },
-          "next_cursor": {
-            "type": "string",
-            "description": "Opaque continuation bound to subjects, direction, facets and selected domain.",
-            "maxLength": 4096
           },
           "warnings": {
             "type": "array",

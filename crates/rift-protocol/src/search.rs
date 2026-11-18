@@ -4,9 +4,9 @@
 
 use crate::dependencies::RequestedPackage;
 use crate::read::{
-    CommitAuthor, Language, PAGE_INDEX_DEFAULT, PAGE_LIMIT_MAX, Pagination, ProjectPath,
-    ReadWarning, Relationship, RelationshipFacet, RevisionId, SearchScope, SourceUnitId, Symbol,
-    SymbolId, SymbolVersionKind, TextRange,
+    CommitAuthor, Language, PAGE_DEFAULT, PAGE_LIMIT_MAX, Pagination, ProjectPath, ReadWarning,
+    Relationship, RelationshipFacet, RevisionId, SearchScope, SourceUnitId, Symbol, SymbolId,
+    SymbolVersionKind, TextRange,
 };
 use crate::schema;
 use schemars::JsonSchema;
@@ -144,8 +144,12 @@ pub const FORCE_INCLUDE_FIELD: &str = "paths.force_include";
 #[serde(deny_unknown_fields)]
 #[schemars(extend("examples" = [
     {
-        "include": ["src/**"],
-        "exclude": ["src/generated/**"]
+        "include": [
+            "src/**"
+        ],
+        "exclude": [
+            "src/generated/**"
+        ]
     }
 ]))]
 pub struct PathSelector {
@@ -337,7 +341,9 @@ pub const SEARCH_CHANGE_PATHS_MAX: u64 = 512;
     },
     {
         "base": "HEAD",
-        "head": {"kind": "working_tree"}
+        "head": {
+            "kind": "working_tree"
+        }
     }
 ]))]
 pub struct SearchChange {
@@ -450,14 +456,14 @@ impl SearchInclude {
         "include": {
             "source": true
         },
-        "limit": 20,
-        "page_index": 0
+        "max_results": 20,
+        "page": 1
     },
     {
         "target": "symbol",
         "query": "load_config",
         "order": "path",
-        "limit": 10
+        "max_results": 10
     },
     {
         "target": "symbol",
@@ -469,7 +475,7 @@ impl SearchInclude {
                 "references"
             ]
         },
-        "limit": 25
+        "max_results": 25
     },
     {
         "target": "symbol",
@@ -480,13 +486,13 @@ impl SearchInclude {
                 "calls"
             ]
         },
-        "limit": 25
+        "max_results": 25
     },
     {
         "target": "symbol",
         "query": "spawn_blocking",
         "scope": "global",
-        "limit": 10
+        "max_results": 10
     },
     {
         "target": "file",
@@ -499,7 +505,7 @@ impl SearchInclude {
         "include": {
             "source": true
         },
-        "limit": 25
+        "max_results": 25
     },
     {
         "target": "symbol",
@@ -512,7 +518,7 @@ impl SearchInclude {
                 "version": "1.47.1"
             }
         ],
-        "limit": 10
+        "max_results": 10
     },
     {
         "target": "symbol",
@@ -520,12 +526,12 @@ impl SearchInclude {
             "base": "main",
             "head": "HEAD"
         },
-        "limit": 25
+        "max_results": 25
     },
     {
         "target": "commit",
         "query": "change path bound",
-        "limit": 10
+        "max_results": 10
     }
 ]))]
 pub struct SearchParams {
@@ -608,16 +614,17 @@ pub struct SearchParams {
     #[serde(default, skip_serializing_if = "SearchInclude::is_empty")]
     pub include: SearchInclude,
     /// Most hits to return in one page, at most 10,000; the server refuses a larger
-    /// `limit` naming the field. The server's result bound caps the set itself, and an
+    /// `max_results` naming the field. The server's result bound caps the set itself, and an
     /// answer whose set reached it warns `results_truncated`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1_u64, max = PAGE_LIMIT_MAX))]
-    pub limit: Option<u64>,
-    /// Zero-based page of the result set to serve, sized by `limit`. A `page_index` past
+    pub max_results: Option<u64>,
+    /// 1-based page of the result set to serve, sized by `max_results`. A `page` past
     /// the last page returns an empty page whose `pagination` carries the requested
-    /// `page_index` and the true `total_pages`.
-    #[serde(default = "default_search_params_page_index")]
-    pub page_index: u64,
+    /// `page` and the true `pages`.
+    #[serde(default = "default_search_params_page")]
+    #[schemars(range(min = 1_u64))]
+    pub page: u64,
     /// The revision to search: a git revision searches that commit, a tree revision the
     /// served working tree. Omitted searches the served working tree. The server refuses a
     /// git revision when the workspace has no version-control repository, a tree revision
@@ -656,8 +663,8 @@ fn default_search_params_order() -> ResultOrder {
     ResultOrder::Relevance
 }
 
-fn default_search_params_page_index() -> u64 {
-    PAGE_INDEX_DEFAULT
+fn default_search_params_page() -> u64 {
+    PAGE_DEFAULT
 }
 
 /// Which entity kinds may be returned.
@@ -791,8 +798,10 @@ pub enum SearchParamsTarget {
             }
         ],
         "pagination": {
-            "page_index": 0,
-            "total_pages": 3
+            "page": 1,
+            "pages": 1,
+            "max_results": 10,
+            "total": 2
         }
     },
     {
@@ -819,8 +828,10 @@ pub enum SearchParamsTarget {
             }
         ],
         "pagination": {
-            "page_index": 0,
-            "total_pages": 1
+            "page": 1,
+            "pages": 1,
+            "max_results": 10,
+            "total": 1
         }
     }
 ]))]
@@ -837,7 +848,7 @@ pub struct SearchResult {
     pub revision: Option<crate::revision::Revision>,
     /// The hits on this page, in the order the request asked for.
     pub results: Vec<SearchHit>,
-    /// Where this page sits in the full result set under the request's `limit`.
+    /// Where this page sits in the full result set under the request's `max_results`.
     pub pagination: Pagination,
     /// Warnings attached to this result. Absent when there is nothing to warn about.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -924,8 +935,8 @@ pub enum TraversalDirection {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChangeHead, ChangeTree, PAGE_INDEX_DEFAULT, PAGE_LIMIT_MAX, PathPattern,
-        PathPatternViolation, RevisionId, SEARCH_CHANGE_HEAD_DEFAULT, SEARCH_PATTERN_CHARS_MAX,
+        ChangeHead, ChangeTree, PAGE_DEFAULT, PAGE_LIMIT_MAX, PathPattern, PathPatternViolation,
+        RevisionId, SEARCH_CHANGE_HEAD_DEFAULT, SEARCH_PATTERN_CHARS_MAX,
         SEARCH_TRAVERSAL_DEPTH_DEFAULT, SEARCH_TRAVERSAL_DEPTH_MAX, SEARCH_TRAVERSAL_DEPTH_MIN,
         SEARCH_TRAVERSAL_FACETS_MAX, SearchChange, SearchHit, SearchParams, SearchScope,
         SearchTraversal, TraversalDirection,
@@ -936,21 +947,18 @@ mod tests {
     /// from the schema; this pins the advertised default to the constant the field's
     /// default function returns.
     #[test]
-    fn search_params_schema_page_index_default_equals_the_enforced_constant() {
+    fn search_params_schema_page_default_equals_the_enforced_constant() {
         let schema = serde_json::to_value(schemars::schema_for!(SearchParams)).expect("schema");
-        assert_eq!(
-            schema["properties"]["page_index"]["default"],
-            json!(PAGE_INDEX_DEFAULT)
-        );
+        assert_eq!(schema["properties"]["page"]["default"], json!(PAGE_DEFAULT));
     }
 
-    /// The schema's `maximum` on `limit` and `accepted_limit`'s refusal both read
+    /// The schema's `maximum` on `max_results` and `accepted_limit`'s refusal both read
     /// `PAGE_LIMIT_MAX`; this pins the advertised maximum to that one constant.
     #[test]
     fn search_params_schema_limit_maximum_equals_the_enforced_constant() {
         let schema = serde_json::to_value(schemars::schema_for!(SearchParams)).expect("schema");
         assert_eq!(
-            schema["properties"]["limit"]["maximum"],
+            schema["properties"]["max_results"]["maximum"],
             json!(PAGE_LIMIT_MAX)
         );
     }

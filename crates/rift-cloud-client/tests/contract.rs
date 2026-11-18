@@ -184,12 +184,12 @@ fn request_and_response_changes_fail_validation() -> TestResult {
 #[test]
 fn bound_and_shared_schema_changes_fail_validation() -> TestResult {
     let mut document = contract()?;
-    document["components"]["parameters"]["Limit"]["schema"]["maximum"] = json!(201);
-    assert_invalid(&document, "Limit/schema/maximum")?;
+    document["components"]["parameters"]["MaxResults"]["schema"]["maximum"] = json!(201);
+    assert_invalid(&document, "MaxResults/schema/maximum")?;
 
     let mut document = contract()?;
-    document["components"]["parameters"]["Limit"]["schema"]["default"] = json!(101);
-    assert_invalid(&document, "Limit/schema/default")?;
+    document["components"]["parameters"]["MaxResults"]["schema"]["default"] = json!(101);
+    assert_invalid(&document, "MaxResults/schema/default")?;
 
     let mut document = contract()?;
     document["components"]["schemas"]["CapabilityBounds"]["properties"]["page_limit_max"]["maximum"] =
@@ -205,26 +205,9 @@ fn bound_and_shared_schema_changes_fail_validation() -> TestResult {
     assert_invalid(&document, "GetSymbolResult/found/declarations/maxItems")?;
 
     let mut document = contract()?;
-    document["components"]["schemas"]["GetSymbolParams"]["properties"]["declaration_limit"]["maximum"] =
+    document["components"]["schemas"]["GetSymbolParams"]["properties"]["max_results"]["maximum"] =
         json!(200);
-    assert_invalid(&document, "GetSymbolParams/declaration_limit/maximum")?;
-
-    let mut document = contract()?;
-    document["components"]["schemas"]["GetSymbolParams"]["properties"]["declaration_cursor"]["maxLength"] =
-        json!(4095);
-    assert_invalid(&document, "GetSymbolParams/declaration_cursor/maxLength")?;
-
-    let mut document = contract()?;
-    document["components"]["schemas"]["GetSymbolResult"]["oneOf"][0]["properties"]["declaration_cursor"]
-        ["maxLength"] = json!(4095);
-    assert_invalid(
-        &document,
-        "GetSymbolResult/found/declaration_cursor/maxLength",
-    )?;
-
-    let mut document = contract()?;
-    document["components"]["parameters"]["Cursor"]["schema"]["maxLength"] = json!(4095);
-    assert_invalid(&document, "Cursor/schema/maxLength")?;
+    assert_invalid(&document, "GetSymbolParams/max_results/maximum")?;
 
     let mut document = contract()?;
     document["components"]["schemas"]["PackagePatternRequest"]["properties"]["pattern"]["maxLength"] =
@@ -293,9 +276,9 @@ fn the_facets_page_bounds_are_the_ones_the_client_enforces() -> TestResult {
     assert_invalid(&document, "x-rift-page-source-bytes-max")?;
 
     let mut document = contract()?;
-    document["components"]["schemas"]["FacetsParams"]["properties"]["facet_cursor"]["maxLength"] =
-        json!(8192);
-    assert_invalid(&document, "FacetsParams/facet_cursor/maxLength")?;
+    document["components"]["schemas"]["FacetsParams"]["properties"]["max_results"]["maximum"] =
+        json!(99);
+    assert_invalid(&document, "FacetsParams/max_results/maximum")?;
 
     let mut document = contract()?;
     document["paths"]["/v1/facets"]["post"]["requestBody"]["content"]["application/json"]["schema"] =
@@ -324,8 +307,8 @@ fn the_facets_page_bounds_are_the_ones_the_client_enforces() -> TestResult {
 #[test]
 fn an_optional_property_accepting_null_fails_validation() -> TestResult {
     let mut document = contract()?;
-    document["components"]["schemas"]["PackageSearchPage"]["properties"]["next_cursor"]["type"] =
-        json!(["string", "null"]);
+    document["components"]["schemas"]["PackageSearchPage"]["properties"]["documentation_revision"]
+        ["type"] = json!(["string", "null"]);
     assert_invalid(&document, "schema `PackageSearchPage` accepts `null`")?;
 
     let mut document = contract()?;

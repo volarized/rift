@@ -26,7 +26,7 @@ async fn beacons(
 ) -> TestResult<BTreeMap<String, (String, Option<String>)>> {
     let parameters = serde_json::from_value(json!({
         "query":"beacon", "target":"symbol", "scope":scope,
-        "paths":{"include":["lib.rs"]}, "include":{"source": true}, "limit":10,
+        "paths":{"include":["lib.rs"]}, "include":{"source": true}, "max_results":10,
     }))?;
     let arguments = query::retrieval(&parameters)?;
     let answer = crate::workspace_client::query_after_population(client, &arguments).await?;
@@ -123,6 +123,7 @@ async fn extra_project_profiles_serve_distinct_scopes_through_one_connection() -
     let all = crate::workspace_client::query_after_population(&client, &rift_protocol::query::QueryParams {
         query: "SELECT (COUNT(?hit) AS ?count) { SERVICE :search { ?hit :query 'beacon'; :target 'file'; :scope 'all' } }".to_owned(),
         language: rift_protocol::query::QueryLanguage::Sparql,
+    ..Default::default()
     }).await?;
     let [count] = query::rows(&all)? else {
         return Err(format!("one all-scope count: {all}").into());

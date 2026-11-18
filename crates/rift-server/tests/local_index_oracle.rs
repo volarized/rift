@@ -160,7 +160,7 @@ fn symbol_pages(
     current_names: &BTreeSet<String>,
 ) -> TestResult<Vec<serde_json::Value>> {
     let mut pages = Vec::new();
-    let mut page_index = 0;
+    let mut page = 1;
     loop {
         let result = service.get_symbol(&GetSymbolParams {
             name: name.to_owned(),
@@ -168,18 +168,18 @@ fn symbol_pages(
             scope: SearchScope::Local,
             packages: Vec::new(),
             include: GetSymbolInclude::default(),
-            limit: 1,
-            page_index,
+            max_results: 1,
+            page,
             revision: None,
         })?;
-        let total_pages = result.pagination.total_pages;
-        if total_pages > SYMBOL_PAGES_MAX {
+        let page_count = result.pagination.pages;
+        if page_count > SYMBOL_PAGES_MAX {
             return Err(format!("symbol lookup exceeded {SYMBOL_PAGES_MAX} pages: {name}").into());
         }
         validate_symbol_page(&result, name, current_ids, current_names)?;
         pages.push(serde_json::to_value(&result)?);
-        page_index += 1;
-        if page_index >= total_pages {
+        page += 1;
+        if page > page_count {
             return Ok(pages);
         }
     }
@@ -194,7 +194,7 @@ fn validate_symbol_page(
     current_names: &BTreeSet<String>,
 ) -> TestResult {
     match result.warnings.as_slice() {
-        [] if !result.hits.is_empty() || result.pagination.total_pages > 0 => Ok(()),
+        [] if !result.hits.is_empty() || result.pagination.pages > 0 => Ok(()),
         [
             ReadWarning::SymbolNotFound {
                 name: requested,
@@ -204,8 +204,8 @@ fn validate_symbol_page(
         ] if requested == name
             && !current_names.contains(name)
             && result.hits.is_empty()
-            && result.pagination.total_pages == 0
-            && result.pagination.page_index == 0
+            && result.pagination.pages == 0
+            && result.pagination.page == 1
             && detail.is_none() =>
         {
             let distinct = alternatives
@@ -308,7 +308,7 @@ fn symbol_page_validation_rejects_incomplete_or_invalid_misses() -> TestResult {
     let existing: GetSymbolResult = serde_json::from_value(existing)?;
     assert!(validate_symbol_page(&existing, "Beacon", &current_ids, &current_names).is_err());
     let mut continuation = miss;
-    continuation.pagination.page_index = 1;
+    continuation.pagination.page = 2;
     assert!(validate_symbol_page(&continuation, "Absent", &current_ids, &current_names).is_err());
     Ok(())
 }

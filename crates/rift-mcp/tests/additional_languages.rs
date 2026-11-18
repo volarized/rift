@@ -236,15 +236,18 @@ async fn syntax_elements_summaries_continue_over_declarations_and_refuse_another
     )
     .await?;
     let symbol = "rift://symbol/local/javascript/beacon/open";
-    let default =
-        call_retrying_acceptance(&client, tool_request("facets", &json!({"symbol":symbol})))
-            .await?;
-    let cursor = default["facet_cursor"]
-        .as_str()
-        .ok_or("declaration continuation")?;
+    let default = call_retrying_acceptance(
+        &client,
+        tool_request("facets", &json!({"symbol":symbol,"max_results":4})),
+    )
+    .await?;
+    let revision = &default["revision"];
     let next = call_retrying_acceptance(
         &client,
-        tool_request("facets", &json!({"symbol":symbol, "facet_cursor":cursor})),
+        tool_request(
+            "facets",
+            &json!({"symbol":symbol, "page":2,"max_results":4,"revision":revision}),
+        ),
     )
     .await?;
     let declarations = |value: Value| -> TestResult<Vec<u64>> {
@@ -259,20 +262,23 @@ async fn syntax_elements_summaries_continue_over_declarations_and_refuse_another
             })
             .collect()
     };
-    assert!(next.get("facet_cursor").is_none(), "{next}");
+    assert_eq!(
+        next["pagination"],
+        json!({"page":2,"pages":2,"max_results":4,"total":6})
+    );
     assert_eq!(declarations(default.clone())?, [0, 1, 2, 3]);
     assert_eq!(declarations(next)?, [4, 5]);
     let refused = client
         .call_tool(tool_request(
             "facets",
-            &json!({"symbol":symbol, "facet_cursor":cursor, "syntax":true}),
+            &json!({"symbol":symbol, "page":2,"max_results":4,"revision":revision, "syntax":true}),
         ))
         .await?;
     assert_eq!(refused.is_error, Some(true), "{refused:?}");
     let refused = client
         .call_tool(tool_request(
             "facets",
-            &json!({"path":"index.js", "position":17, "facet_cursor":cursor}),
+            &json!({"path":"index.js", "position":17, "page":2,"max_results":4,"revision":revision}),
         ))
         .await?;
     assert_eq!(refused.is_error, Some(true), "{refused:?}");

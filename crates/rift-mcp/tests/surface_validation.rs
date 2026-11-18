@@ -722,7 +722,7 @@ async fn get_symbol_miss_uses_requested_revision_and_remote_matches_clear_the_wa
     for request in [
         json!({"query":"helper_beacon","scope":"global","include":{}}),
         json!({"query":"helper_beacon","scope":"all","include":{}}),
-        json!({"query":"helper_beacon","scope":"all","include":{},"limit":1,"page_index":100}),
+        json!({"query":"helper_beacon","scope":"all","include":{},"max_results":1,"page":100}),
     ] {
         let request = serde_json::to_value(workspace_client::query::retrieval(
             &serde_json::from_value(request.clone())?,
@@ -946,9 +946,9 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
         let (input, output) = validators.get(name).ok_or("advertised corpus tool")?;
         let mut request = request;
         let mut followed = 0usize;
-        let mut expected_page = 0u64;
+        let mut expected_page = request["page"].as_u64().unwrap_or(1);
         let mut past_end = false;
-        let mut original = None;
+
         loop {
             assert!(
                 followed <= FOLLOWED_PAGES_MAX,
@@ -967,40 +967,27 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
             let Some(page) = structured.get("pagination") else {
                 break;
             };
-            let page_index = page["page_index"].as_u64().ok_or("page index")?;
-            let total_pages = page["total_pages"].as_u64().ok_or("page count")?;
-            assert_eq!(page_index, expected_page, "original retained page index");
-            if total_pages > 1 {
+            let page_number = page["page"].as_u64().ok_or("page number")?;
+            let pages = page["pages"].as_u64().ok_or("page count")?;
+            assert_eq!(page_number, expected_page, "requested page number");
+            if pages > 1 {
                 arms.multi_page_results += 1;
-                if original.is_none() {
-                    let answer: rift_protocol::query::QueryAnswer =
-                        serde_json::from_value(structured["answer"].clone())?;
-                    let view: rift_protocol::symbol_read::CapturedViewId =
-                        serde_json::from_value(structured["view"]["id"].clone())?;
-                    original = Some((answer, view, total_pages));
-                }
             }
-            if page_index >= total_pages {
-                assert!(
-                    paged_rows(name, &structured)
-                        .ok_or("query rows")?
-                        .is_empty(),
-                    "past-end retained page is empty: {structured}"
-                );
+            if page_number > pages {
+                if let Some(rows) = paged_rows(name, &structured) {
+                    assert!(rows.is_empty(), "past-end page is empty: {structured}");
+                }
                 arms.past_end_pages += 1;
                 break;
             }
-            if let Some(query) = page["next_query"].as_str() {
+            if page_number < pages || (!past_end && pages > 1) {
                 followed += 1;
-                expected_page = page_index + 1;
-                request = json!({"query":query, "language":"sparql"});
-                continue;
-            }
-            if !past_end && let Some((answer, view, pages)) = &original {
-                followed += 1;
-                expected_page = *pages;
-                past_end = true;
-                request = json!({"query":rift_search::sparql::continuation_query(answer, view, *pages)?, "language":"sparql"});
+                expected_page = page_number + 1;
+                past_end = page_number == pages;
+                request["page"] = json!(expected_page);
+                if let Some(revision) = structured.get("revision") {
+                    request["revision"] = revision.clone();
+                }
                 continue;
             }
             break;
@@ -1366,7 +1353,7 @@ async fn packages_beside_the_local_scope_or_rev_refuse_naming_packages() -> Test
         if name == "get_symbol" {
             assert!(
                 failure.message.contains("tool get_symbol")
-                    && failure.message.contains("accepted declaration_cursor")
+                    && failure.message.contains("accepted id")
                     && !failure.message.contains("accepted packages"),
                 "the schema refusal lists exact retrieval fields: {request}: {}",
                 failure.message
@@ -1746,6 +1733,102 @@ async fn no_advertised_optional_property_accepts_null() -> TestResult {
         found.is_empty(),
         "tools/list advertises optional properties that accept null: {found:#?}"
     );
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// Every selected answer list uses the same page counts and typed input refusals.
+#[tokio::test]
+async fn paging_lists_validate_at_boundaries_and_refuse_invalid_counts() -> TestResult {
+    let (_fixture, client, server_task) = served_fixture().await?;
+    let tools = client.list_all_tools().await?;
+    let validators = tool_validators(&tools)?;
+    let id = workspace_client::captured_seed(&client, "beacon_one", "lib.rs").await?;
+    let query = "SELECT ?value { VALUES ?value { 1 2 } } ORDER BY ?value";
+    for (name, mut request, total, maximum) in [
+        (
+            "search",
+            json!({"query": query}),
+            2,
+            rift_protocol::query::QUERY_MAX_RESULTS,
+        ),
+        (
+            "get_symbol",
+            json!({"id": id}),
+            1,
+            rift_protocol::symbol_read::GET_SYMBOL_MAX_RESULTS,
+        ),
+        (
+            "facets",
+            json!({"symbol": id}),
+            1,
+            rift_protocol::read::FACETS_MAX_RESULTS,
+        ),
+    ] {
+        let (input, output) = validators.get(name).ok_or("paged tool validator")?;
+        for page in 1..=total + 1 {
+            request["page"] = json!(page);
+            request["max_results"] = json!(1);
+            assert_validates(input, &request, "paged request");
+            let answer = structured_answer(&client, name, &request).await?;
+            assert_validates(output, &answer, "paged answer");
+            assert_eq!(
+                answer["pagination"],
+                json!({"page":page,"pages":total,"max_results":1,"total":total})
+            );
+            let rows = if name == "search" {
+                &answer["answer"]["bindings"]
+            } else {
+                &answer["declarations"]
+            };
+            assert_eq!(
+                rows.as_array().ok_or("answer rows")?.len(),
+                usize::from(page <= total)
+            );
+            request["revision"] = answer["revision"].clone();
+        }
+        for (field, value) in [
+            ("page", 0),
+            ("max_results", 0),
+            ("max_results", maximum + 1),
+        ] {
+            request["page"] = json!(1);
+            request["max_results"] = json!(1);
+            request[field] = json!(value);
+            assert!(!input.is_valid(&request));
+            let failure = workspace_client::failed_call(
+                client.call_tool(tools_call_request(name, &request)?).await,
+            )?;
+            assert_eq!(
+                failure.code,
+                ErrorCode::InvalidRequest,
+                "{name}: {failure:?}"
+            );
+        }
+    }
+    for query in [
+        "SELECT ?value { VALUES ?value {} }",
+        "CONSTRUCT { <urn:fixture:subject> <urn:fixture:predicate> ?value } WHERE { VALUES ?value {} }",
+        "SELECT ?value { VALUES ?value { 1 2 3 } } ORDER BY ?value LIMIT 2 OFFSET 1",
+        "DESCRIBE <urn:fixture:absent>",
+        "ASK { VALUES ?value { 1 } }",
+    ] {
+        let request = json!({"query":query,"max_results":2});
+        let answer = structured_answer(&client, "search", &request).await?;
+        let (input, output) = validators.get("search").ok_or("query validator")?;
+        assert_validates(input, &request, "query request");
+        assert_validates(output, &answer, "query answer");
+        if answer["answer"]["result"] == "boolean" {
+            assert!(answer.get("pagination").is_none());
+        } else {
+            let total = u64::from(query.contains("LIMIT 2")) * 2;
+            assert_eq!(
+                answer["pagination"],
+                json!({"page":1,"pages":u64::from(total > 0),"max_results":2,"total":total})
+            );
+        }
+    }
     client.cancel().await?;
     server_task.await?;
     Ok(())

@@ -2,8 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::sync::Arc;
 
 use rift_error::{RiftError, errors};
 use rift_protocol::identity::SymbolIdentity;
@@ -11,18 +10,15 @@ use rift_protocol::query::{QueryAnswer, QueryParams, QueryReadResult, RdfTerm};
 use rift_protocol::read::{SearchParams, SearchParamsTarget, SearchResult, SearchScope, SymbolId};
 use rift_protocol::search_read::{SearchReadResult, SearchUnavailable};
 use rift_protocol::symbol_read::{CapturedView, CapturedViewId, SymbolUnavailableReason};
-use rift_search::sparql::{
-    GraphDataset, GraphLimits, GraphQuery, PageSelection, QueryCancellation,
-};
+use rift_search::sparql::{GraphDataset, GraphLimits, GraphQuery, QueryCancellation};
 use rmcp::handler::server::tool::IntoCallToolResult as _;
 use rmcp::model::{CallToolRequestParams, CallToolResponse};
 
-use super::{RiftProxy, candidates, identity};
+use super::{RiftProxy, identity};
 use crate::output::{QueryDisplay, QueryOutput};
-use crate::server::candidates::{CandidateResponses, QueryPageOptions, collect_retrieval};
+use crate::server::candidates::{QueryPageOptions, collect_retrieval, query_page};
 use crate::validation::ConfigurationState;
 
-const ROUTES_MAX: usize = 256;
 const QUERY_WORKERS: usize = 2;
 const VIEW_PREFIX: &str = "proxy.";
 
@@ -30,22 +26,12 @@ type Response = Result<CallToolResponse, rmcp::ErrorData>;
 
 #[derive(Debug)]
 pub(super) struct QueryRoutes {
-    forwarded: Mutex<BTreeMap<String, ForwardedView>>,
-    evaluated: Arc<CandidateResponses>,
     blocking: Arc<tokio::sync::Semaphore>,
-}
-
-#[derive(Debug)]
-struct ForwardedView {
-    backend: String,
-    expires: SystemTime,
 }
 
 impl Default for QueryRoutes {
     fn default() -> Self {
         Self {
-            forwarded: Mutex::default(),
-            evaluated: Arc::default(),
             blocking: Arc::new(tokio::sync::Semaphore::new(QUERY_WORKERS)),
         }
     }
@@ -66,42 +52,6 @@ impl QueryRoutes {
         })
         .await
         .map_err(worker_failure)?
-    }
-
-    fn remember(&self, view: &CapturedView, backend: &str) -> Result<(), RiftError> {
-        let expires = candidates::captured_expiry(view)?;
-        let now = SystemTime::now();
-        let mut routes = self
-            .forwarded
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        routes.retain(|_, route| route.expires > now);
-        if let Some(previous) = routes.get(view.id.as_str()) {
-            return if previous.backend == backend && previous.expires == expires {
-                Ok(())
-            } else {
-                Err(query_failure("the captured query owner changed"))
-            };
-        }
-        if expires <= now || routes.len() >= ROUTES_MAX {
-            return Err(query_failure("the proxy cannot retain another query route"));
-        }
-        routes.insert(
-            view.id.as_str().to_owned(),
-            ForwardedView {
-                backend: backend.to_owned(),
-                expires,
-            },
-        );
-        Ok(())
-    }
-
-    fn backend(&self, view: &CapturedViewId) -> Option<String> {
-        self.forwarded
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(view.as_str())
-            .map(|route| route.backend.clone())
     }
 }
 
@@ -129,6 +79,11 @@ impl RiftProxy {
                 Ok(parameters) => parameters,
                 Err(_) => return self.forward_read(request.clone()).await,
             };
+        rift_server::accept_page(parameters.page)?;
+        rift_server::accepted_max_results(
+            parameters.max_results,
+            rift_protocol::query::QUERY_MAX_RESULTS,
+        )?;
         let limits = GraphLimits::default();
         let deadline = tokio::time::Instant::now() + self.forward_budget;
         let root = Arc::clone(&self.root);
@@ -156,9 +111,6 @@ impl RiftProxy {
         limits: GraphLimits,
         deadline: tokio::time::Instant,
     ) -> Result<Response, RiftError> {
-        if let Some(selection) = query.page_selection() {
-            return self.query_page(request, &selection, deadline).await;
-        }
         if let Some(adjacency) = query.adjacency_selection() {
             let owner = SymbolIdentity::parse(adjacency.seed.as_str())?
                 .owner()
@@ -192,35 +144,9 @@ impl RiftProxy {
                 SymbolUnavailableReason::InsufficientCoverage,
             )));
         }
-        tokio::time::timeout_at(deadline, self.evaluate_retrieval(query, limits))
+        tokio::time::timeout_at(deadline, self.evaluate_retrieval(request, query, limits))
             .await
             .map_err(|_| query_failure("combined retrieval exceeded its request deadline"))?
-    }
-
-    async fn query_page(
-        &self,
-        request: &CallToolRequestParams,
-        selection: &PageSelection,
-        deadline: tokio::time::Instant,
-    ) -> Result<Response, RiftError> {
-        if selection.view.as_str().starts_with(VIEW_PREFIX) {
-            let store = Arc::clone(&self.query_routes.evaluated);
-            let root = Arc::clone(&self.root);
-            let owner = self.owner.clone();
-            let selection = selection.clone();
-            let answer = tokio::time::timeout_at(
-                deadline,
-                self.query_routes
-                    .work(move || store.retained_proxy_query(&selection, &root, &owner)),
-            )
-            .await
-            .map_err(|_| query_failure("query replay exceeded its request deadline"))??;
-            return Ok(render(answer));
-        }
-        if let Some(backend) = self.query_routes.backend(&selection.view) {
-            return self.forward_query_to(&backend, request.clone()).await;
-        }
-        self.forward_read(request.clone()).await
     }
 
     async fn forward_query_to(
@@ -242,9 +168,6 @@ impl RiftProxy {
         let mut answer: QueryReadResult = decode(result)?;
         match &mut answer {
             QueryReadResult::Results(result) => {
-                if let Some(view) = &result.view {
-                    self.query_routes.remember(view, backend)?;
-                }
                 qualify_answer(&mut result.answer, backend)?;
                 identity::qualify_warnings(&mut result.warnings, backend)?;
             }
@@ -263,9 +186,18 @@ impl RiftProxy {
 
     async fn evaluate_retrieval(
         &self,
+        request: &CallToolRequestParams,
         query: GraphQuery,
         limits: GraphLimits,
     ) -> Result<Response, RiftError> {
+        let params: QueryParams =
+            serde_json::from_value(request.arguments.clone().unwrap_or_default().into())
+                .map_err(|error| query_failure(&error.to_string()))?;
+        rift_server::accept_page(params.page)?;
+        rift_server::accepted_max_results(
+            params.max_results,
+            rift_protocol::query::QUERY_MAX_RESULTS,
+        )?;
         let mut selected = Vec::new();
         let mut bytes_left = limits.literal_bytes_max();
         for service in query.retrieval_requests() {
@@ -291,9 +223,7 @@ impl RiftProxy {
         }
         let cancellation = QueryCancellation::new();
         let _guard = CancelQuery(cancellation.clone());
-        let store = Arc::clone(&self.query_routes.evaluated);
         let root = Arc::clone(&self.root);
-        let owner = self.owner.clone();
         let answer = self
             .query_routes
             .work(move || {
@@ -315,13 +245,13 @@ impl RiftProxy {
                 if cancellation.is_cancelled() {
                     return errors::search::query_cancelled().fail();
                 }
-                store.store_query(
-                    &root,
-                    &owner,
+                query_page(
                     &view,
                     &answer,
                     QueryPageOptions {
                         configuration: &configuration,
+                        page: params.page,
+                        max_results: params.max_results,
                         warnings,
                         display: QueryDisplay::selected(&answer, query.presentation()),
                     },
@@ -345,8 +275,8 @@ impl RiftProxy {
         let mut bytes_left = limits.literal_bytes_max();
         for (name, backend) in self.candidate_backends(request)? {
             let mut dispatched = request.clone();
-            dispatched.limit = None;
-            dispatched.page_index = 0;
+            dispatched.max_results = None;
+            dispatched.page = 1;
             if name != "local" {
                 dispatched.scope = SearchScope::Local;
                 dispatched.packages.clear();
@@ -376,12 +306,12 @@ impl RiftProxy {
             views.extend(result.view);
         }
         crate::global::order_search_hits(&mut results, request.order);
-        let limit = if request.limit.is_some() || request.page_index != 0 {
+        let limit = if request.max_results.is_some() || request.page != 1 {
             rift_server::search_page_limit(request)?
         } else {
             results.len().max(1)
         };
-        let (results, pagination) = crate::global::page_window(results, request.page_index, limit);
+        let (results, pagination) = crate::global::page_window(results, request.page, limit);
         Ok(Ok(Box::new(SearchResult {
             view: Some(proxy_view(views.iter())?),
             revision: None,

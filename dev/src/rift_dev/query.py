@@ -26,8 +26,8 @@ _INPUT_FIELDS = frozenset(
         "packages",
         "paths",
         "include",
-        "limit",
-        "page_index",
+        "max_results",
+        "page",
         "rev",
         "revision",
         "change",
@@ -94,7 +94,9 @@ def retrieval_request(
     """Invoke existing retrieval through standard SERVICE syntax and explicit projection."""
     projection = " ".join(f"?{column}" for column in columns)
     return {
-        "query": f"SELECT {projection} {{ {_retrieval_service(parameters, columns)} }} ORDER BY ?index"
+        "query": f"SELECT {projection} {{ {_retrieval_service(parameters, columns)} }} ORDER BY ?index",
+        "page": parameters.get("page", 1),
+        "max_results": parameters.get("max_results", 10),
     }
 
 
@@ -124,7 +126,7 @@ def _retrieval_service(parameters: Mapping[str, Json], columns: Sequence[str]) -
     clauses = [
         f"?hit :{'rev' if key == 'revision' else key} {_input(value)} ."
         for key, value in parameters.items()
-        if value is not None
+        if value is not None and key not in {"page", "max_results"}
     ]
     clauses.append("?hit :index ?index .")
     symbol_columns = {"name", "kind", "language"}.intersection(columns)

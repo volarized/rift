@@ -6,7 +6,7 @@ use rift_error::RiftError;
 use rift_protocol::identity::{SymbolIdentity, SymbolOwner, parse_source_unit_identity};
 use rift_protocol::read::{PAGE_LIMIT_MAX, SourceKind, SourceUnitId, SymbolId};
 use rift_protocol::relationship_read::{
-    QuerySource, QuerySymbol, RelationshipSearchPage, RelationshipSearchRequest,
+    QuerySource, RelationshipSearchPage, RelationshipSearchRequest,
 };
 
 use super::invalid;
@@ -198,66 +198,4 @@ fn require_source(
         None => {}
     }
     Ok(())
-}
-
-#[derive(Default)]
-pub(super) struct Catalog {
-    symbols: BTreeMap<SymbolId, QuerySymbol>,
-    sources: BTreeMap<SourceUnitId, QuerySource>,
-}
-
-impl Catalog {
-    pub(super) fn merge(&mut self, page: &mut RelationshipSearchPage) -> Result<(), RiftError> {
-        use std::collections::btree_map::Entry;
-
-        for symbol in std::mem::take(&mut page.symbols) {
-            let id = symbol
-                .symbol
-                .id
-                .clone()
-                .ok_or_else(|| invalid("relationship symbol identity is absent"))?;
-            match self.symbols.entry(id) {
-                Entry::Occupied(mut entry) => {
-                    let held = entry.get_mut();
-                    if held.symbol != symbol.symbol {
-                        return Err(invalid("relationship symbol changed between pages"));
-                    }
-                    for declaration in symbol.declarations {
-                        if !held.declarations.contains(&declaration) {
-                            held.declarations.push(declaration);
-                        }
-                    }
-                }
-                Entry::Vacant(entry) => {
-                    entry.insert(symbol);
-                }
-            }
-        }
-        for source in std::mem::take(&mut page.sources) {
-            match self.sources.entry(source.unit.clone()) {
-                Entry::Occupied(mut entry) => {
-                    let held = entry.get_mut();
-                    if held.digest != source.digest {
-                        return Err(invalid("relationship source digest changed between pages"));
-                    }
-                    match (&held.text, source.text) {
-                        (Some(previous), Some(next)) if previous != &next => {
-                            return Err(invalid("relationship source changed between pages"));
-                        }
-                        (None, Some(text)) => held.text = Some(text),
-                        _ => {}
-                    }
-                }
-                Entry::Vacant(entry) => {
-                    entry.insert(source);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub(super) fn finish(self, page: &mut RelationshipSearchPage) {
-        page.symbols = self.symbols.into_values().collect();
-        page.sources = self.sources.into_values().collect();
-    }
 }

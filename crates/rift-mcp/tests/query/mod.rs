@@ -24,6 +24,7 @@ pub(crate) fn declaration(name: &str, path: &str) -> QueryParams {
             "SELECT ?symbol ?name ?kind ?language ?unit ?source ?start ?end {{ ?symbol a :Symbol; :name {name}; :name ?name; :kind ?kind; :language ?language . ?syntax_element :of ?symbol; :index 0; :source ?source; :range [ :unit <rift://source/project/{unit}>; :unit ?unit; :start ?start; :end ?end ] }}"
         ),
         language: QueryLanguage::Sparql,
+        ..Default::default()
     }
 }
 
@@ -47,7 +48,10 @@ pub(crate) fn projected_retrieval(
         .ok_or("retrieval parameters must serialize as an object")?;
     let mut group = String::new();
     for (key, value) in fields {
-        if value.is_null() || omitted_default(key, value) {
+        if value.is_null()
+            || matches!(key.as_str(), "page" | "max_results")
+            || omitted_default(key, value)
+        {
             continue;
         }
         let key = if key == "revision" { "rev" } else { key };
@@ -79,16 +83,27 @@ pub(crate) fn projected_retrieval(
     Ok(QueryParams {
         query,
         language: QueryLanguage::Sparql,
+        page: parameters.page,
+        max_results: parameters
+            .max_results
+            .unwrap_or(rift_protocol::read::MAX_RESULTS_DEFAULT),
+        revision: None,
     })
 }
 
-/// Selects a page of an existing execution without querying current facts.
-pub(crate) fn retained_page(answer: &Value, page: u64) -> TestResult<String> {
-    let view = serde_json::from_value(answer["view"]["id"].clone())?;
-    let result = serde_json::from_value(answer["answer"].clone())?;
-    Ok(rift_search::sparql::continuation_query(
-        &result, &view, page,
-    )?)
+/// Selects another page of the same query and revision.
+pub(crate) fn result_page(
+    parameters: &QueryParams,
+    answer: &Value,
+    page: u64,
+) -> TestResult<QueryParams> {
+    let mut parameters = parameters.clone();
+    parameters.page = page;
+    parameters.revision = answer
+        .get("revision")
+        .map(|revision| serde_json::from_value(revision.clone()))
+        .transpose()?;
+    Ok(parameters)
 }
 
 /// Projects endpoints of a path from one canonical symbol.
@@ -99,6 +114,7 @@ pub(crate) fn path(seed: &str, expression: &str) -> TestResult<QueryParams> {
             "SELECT DISTINCT ?symbol {{ {seed} {expression} ?symbol }} ORDER BY ?symbol"
         ),
         language: QueryLanguage::Sparql,
+        ..Default::default()
     })
 }
 
@@ -156,5 +172,5 @@ fn omitted_default(key: &str, value: &Value) -> bool {
     matches!((key, value), ("target", Value::String(value)) if value == "all")
         || matches!((key, value), ("order", Value::String(value)) if value == "relevance")
         || matches!((key, value), ("scope", Value::String(value)) if value == "local")
-        || (key == "page_index" && value.as_u64() == Some(0))
+        || (key == "page" && value.as_u64() == Some(1))
 }

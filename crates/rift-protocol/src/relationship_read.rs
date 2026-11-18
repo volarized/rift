@@ -235,10 +235,6 @@ pub struct RelationshipSearchPage {
     /// Identical captured records may repeat across pages; conflicting records are refused.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<QuerySource>,
-    /// Opaque continuation bound to subjects, direction, facets and selected domain.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(length(max = 4096))]
-    pub next_cursor: Option<String>,
     /// Existing warnings retained without treating missing facts as complete empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 32))]
@@ -260,7 +256,7 @@ pub struct RelationshipSearchPage {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum RelationshipSearchResult {
-    /// Complete required domain was selected; follow every required cursor before evaluation.
+    /// Complete required domain was selected; all requested subjects are answered within the accepted bounds.
     Page(RelationshipSearchPage),
     /// Required relationship facts cannot be established.
     Unavailable(crate::search_read::SearchUnavailable),

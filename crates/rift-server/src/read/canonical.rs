@@ -239,15 +239,11 @@ impl LocalSymbolViewInput {
                         selection.source,
                     )?;
                 }
-                let Some(cursor) = page.facet_cursor else {
+                if request.page >= page.pagination.pages {
                     break;
-                };
-                if request.facet_cursor.as_ref() == Some(&cursor) {
-                    return errors::server::search_coverage_unavailable()
-                        .operation("graph syntax facets")
-                        .fail();
                 }
-                request.facet_cursor = Some(cursor);
+                request.revision = Some(page.revision);
+                request.page += 1;
             }
         }
         Ok(())

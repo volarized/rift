@@ -275,7 +275,7 @@ def sample_path_request(path: str, query: str = "test") -> JsonObject:
         "query": query,
         "target": "symbol",
         "paths": {"include": [path]},
-        "limit": PATH_HIT_LIMIT,
+        "max_results": PATH_HIT_LIMIT,
         "order": "identity",
     }
 
@@ -327,9 +327,8 @@ async def _read_sample_query(
     answer = await settled_local(client, "search", request)
     warnings(answer)
     rows = bindings(answer)
-    view = answer.get("view")
     pagination = object_value(answer.get("pagination"), "sample pagination")
-    count = number(pagination.get("total_pages"), "sample page count")
+    count = number(pagination.get("pages"), "sample page count")
     require(
         0 <= count <= len(paths) * PATH_HIT_LIMIT, "sample page count exceeds hit bound"
     )
@@ -337,19 +336,19 @@ async def _read_sample_query(
     previous = -1
     for page in range(max(count, 1)):
         if page:
-            next_query = string_value(
-                pagination.get("next_query"), "sample continuation"
-            )
-            answer = await client.call("search", {"query": next_query})
+            request["page"] = page + 1
+            if answer.get("revision") is not None:
+                request["revision"] = answer["revision"]
+            answer = await client.call("search", request)
             warnings(answer)
             rows = bindings(answer)
             require(
-                view is not None and answer.get("view") == view, "sample view changed"
+                answer.get("revision") == request.get("revision"),
+                "sample revision changed",
             )
             pagination = object_value(answer.get("pagination"), "sample pagination")
         require(
-            pagination.get("page_index") == page
-            and pagination.get("total_pages") == count,
+            pagination.get("page") == page + 1 and pagination.get("pages") == count,
             "sample pagination changed",
         )
         require(count > 0 or not rows, "sample returned rows without pages")
@@ -369,9 +368,6 @@ async def _read_sample_query(
                 {key: value for key, value in row.items() if key != "slot"}
             )
             previous = slot
-    require(
-        pagination.get("next_query") is None, "sample returned an unadvertised page"
-    )
     return grouped
 
 
@@ -709,14 +705,16 @@ class Corpus:
             first.get("configuration_revision"), "configuration revision"
         )
         pagination = object_value(first.get("pagination"), "catalog pagination")
-        pages = number(pagination.get("total_pages"), "catalog total pages")
+        pages = number(pagination.get("pages"), "catalog total pages")
         groups: dict[str, list[str]] = {}
         previous = ""
         for index in range(pages):
             page = (
                 first
                 if index == 0
-                else await client.resource(f"rift://workspace?page_index={index}")
+                else await client.resource(
+                    f"rift://workspace?page={index + 1}&max_results={pagination['max_results']}"
+                )
             )
             require(
                 page.get("configuration_revision") == revision,
@@ -728,8 +726,7 @@ class Corpus:
             )
             position = object_value(page.get("pagination"), "catalog pagination")
             require(
-                position.get("page_index") == index
-                and position.get("total_pages") == pages,
+                position.get("page") == index + 1 and position.get("pages") == pages,
                 "catalog page changed",
             )
             require(not warnings(page), "source catalog is still preparing")
@@ -756,13 +753,13 @@ class Corpus:
         >>> def term(value, datatype="string"):
         ...     return {"type": "literal", "value": str(value), "datatype": "http://www.w3.org/2001/XMLSchema#" + datatype}
         >>> rows = [{**{key: term(value) for key, value in {"name": f"entry{index}", "kind": "function", "language": "typescript", "path": "src/test.ts"}.items()}, "start": term(index * 2, "integer"), "end": term(index * 2 + 1, "integer"), "symbol": {"type": "iri", "value": f"urn:fixture:sample:{index}"}} for index in range(SYMBOL_COUNT)]
-        >>> def answer(bindings, index, **continuation):
-        ...     return {"answer": {"result": "bindings", "variables": ["slot", *rows[0]], "bindings": [{**row, "slot": term(0, "integer")} for row in bindings]}, "view": {"id": "retained"}, "pagination": {"page_index": index, "total_pages": 2, **continuation}}
+        >>> def answer(bindings, page):
+        ...     return {"answer": {"result": "bindings", "variables": ["slot", *rows[0]], "bindings": [{**row, "slot": term(0, "integer")} for row in bindings]}, "revision": "rift://revision/tree/" + "0" * 64, "pagination": {"page": page, "pages": 2, "max_results": 100, "total": 200}}
         >>> languages = [{"language": language, "enabled": True, "syntax": True, "include": ["**"]} for language in ("rust", "typescript", "typescript:tsx", "markdown")]
         >>> common = {"configuration_revision": "0123abcd", "languages": languages}
-        >>> first = {**common, "pagination": {"page_index": 0, "total_pages": 2}, "source": [{"path": f"docs/a{index:04}.md", "digest": "0123abcd", "language": "markdown"} for index in range(1000)]}
-        >>> second = {**common, "pagination": {"page_index": 1, "total_pages": 2}, "source": [{"path": path, "digest": "0123abcd", "language": language} for path, language in [("src/test.ts", "typescript"), ("src/ztest.tsx", "typescript:tsx")]]}
-        >>> client = SimpleNamespace(resource=AsyncMock(side_effect=[first, second]), call=AsyncMock(side_effect=[answer(rows[:100], 0, next_query="retained next page"), answer(rows[100:], 1)]))
+        >>> first = {**common, "pagination": {"page": 1, "pages": 2, "max_results": 10, "total": 12}, "source": [{"path": f"docs/a{index:04}.md", "digest": "0123abcd", "language": "markdown"} for index in range(10)]}
+        >>> second = {**common, "pagination": {"page": 2, "pages": 2, "max_results": 10, "total": 12}, "source": [{"path": path, "digest": "0123abcd", "language": language} for path, language in [("src/test.ts", "typescript"), ("src/ztest.tsx", "typescript:tsx")]]}
+        >>> client = SimpleNamespace(resource=AsyncMock(side_effect=[first, second]), call=AsyncMock(side_effect=[answer(rows[:100], 1), answer(rows[100:], 2)]))
         >>> sample = Corpus(cast(Pin, SimpleNamespace(name="nextjs")), Path("rift"), Path("report"))
         >>> selected = asyncio.run(sample.symbol_candidates(cast(Client, client)))
         >>> len(selected), client.call.await_count, client.resource.await_count
@@ -771,7 +768,7 @@ class Corpus:
         True
         >>> client.call.await_args_list[0].args[1]["query"].count("SERVICE :search")
         2
-        >>> client.call.await_args_list[1].args[1] == {"query": "retained next page"}
+        >>> client.call.await_args_list[1].args[1]["page"] == 2
         True
         """
         languages = SAMPLE_LANGUAGES[self.pin.name]
@@ -1065,7 +1062,7 @@ class Corpus:
                 "pattern": token,
                 "target": "file",
                 "paths": {"include": [path]},
-                "limit": 1,
+                "max_results": 1,
             },
         )
         ended = datetime.now(UTC)
@@ -1127,7 +1124,7 @@ class Corpus:
                 "pattern": pattern,
                 "target": "file",
                 "paths": {"include": [path]},
-                "limit": 1,
+                "max_results": 1,
             },
         )
         ended = datetime.now(UTC)
@@ -1241,8 +1238,14 @@ class Corpus:
             for row in rows:
                 source_start = int(literal(row, "start"))
                 source_end = int(literal(row, "end"))
-                require(0 <= source_start <= source_end <= len(content), "declaration range exceeds source")
-                require(literal(row, "source").encode() == content[source_start:source_end], f"search source disagrees at {path}")
+                require(
+                    0 <= source_start <= source_end <= len(content),
+                    "declaration range exceeds source",
+                )
+                require(
+                    literal(row, "source").encode() == content[source_start:source_end],
+                    f"search source disagrees at {path}",
+                )
             require(path.read_bytes() == content, f"read changed {path}")
             return 0
 
@@ -1308,14 +1311,18 @@ class Corpus:
             if any(
                 element.get("index") == 0
                 and unit_path(element) == unit
-                and object_value(element.get("range"), "element range").get("end") == end
+                and object_value(element.get("range"), "element range").get("end")
+                == end
                 for element in elements
             ):
                 return
-            cursor = answer.get("facet_cursor")
-            if cursor is None:
+            pagination = object_value(answer.get("pagination"), "facets pagination")
+            page = number(pagination.get("page"), "facets page")
+            pages = number(pagination.get("pages"), "facets pages")
+            if page >= pages:
                 break
-            arguments["facet_cursor"] = cursor
+            arguments["page"] = page + 1
+            arguments["revision"] = answer["revision"]
         require(
             False,
             f"elements omitted sampled declaration: {identity} ending at {path}:{end}",
@@ -1332,7 +1339,7 @@ class Corpus:
                 "target": "symbol",
                 "paths": {"include": [PROBE_PATH]},
                 "include": {"source": True},
-                "limit": 5,
+                "max_results": 5,
             }
         )
         with self.server(link) as server:
@@ -1400,7 +1407,7 @@ class Corpus:
                 {
                     "query": "next",
                     "paths": {"include": ["package.json"], "exclude": ["*/**"]},
-                    "limit": 100,
+                    "max_results": 100,
                 }
             ),
         )
@@ -1691,7 +1698,7 @@ class Corpus:
                             "query": "FastAPI",
                             "target": "symbol",
                             "paths": {"include": [application]},
-                            "limit": 1000,
+                            "max_results": 1000,
                         }
                     ),
                 )
@@ -1836,7 +1843,7 @@ class Corpus:
                 )
                 count = lexical_breach(failure_records, 20000)
                 answer = await client.call(
-                    "search", corpus_request({"query": "test", "limit": 1})
+                    "search", corpus_request({"query": "test", "max_results": 1})
                 )
                 require(
                     answer.get("outcome") == "unavailable"
@@ -1873,7 +1880,7 @@ class Corpus:
             async with server.connect() as client:
                 await await_startup_publication(server)
                 await client.call(
-                    "search", corpus_request({"query": "test", "limit": 1})
+                    "search", corpus_request({"query": "test", "max_results": 1})
                 )
                 no_failed_builds(await logged(server, "index"))
             self.stop(server)

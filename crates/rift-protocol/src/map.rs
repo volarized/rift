@@ -5,7 +5,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::dependencies::PackageContextEntry;
-use crate::read::{Digest, ExactKind, Language, Pagination, ProjectPath, ReadWarning, SymbolId};
+use crate::read::{Digest, ExactKind, Language, ProjectPath, ReadWarning, SymbolId};
 use crate::schema;
 
 /// Directory depth a [`MapModule`] tree carries, at most. A directory deeper than this folds
@@ -90,8 +90,6 @@ pub struct WorkspaceMap {
     /// Conditions that qualify this map. Absent when empty.
     #[serde(default, skip_serializing)]
     pub warnings: Vec<ReadWarning>,
-    /// Always the whole map on one page.
-    pub pagination: Pagination,
 }
 
 /// Files and symbols indexed for one exact language.
@@ -224,10 +222,6 @@ mod tests {
             }],
             recommendations: Vec::new(),
             warnings: Vec::new(),
-            pagination: Pagination {
-                page_index: 0,
-                total_pages: 1,
-            },
         }
     }
 
@@ -301,7 +295,7 @@ mod tests {
             }),
             "a pinned entry omits the requirement it does not state"
         );
-        assert_eq!(value["pagination"]["total_pages"], json!(1));
+        assert!(value.get("pagination").is_none());
     }
 
     #[test]

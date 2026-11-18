@@ -22,8 +22,8 @@ use std::{fs, time::Duration};
 
 use axum::http::StatusCode;
 use global_api::{
-    BODY_BOUND_CURSOR, BODY_MATCH_QUERY, COLLECTED_UNIT, FixtureOptions, GlobalFixture, Hold,
-    SymbolFixture, UNSATISFIED_REQUIREMENT,
+    BODY_MATCH_QUERY, COLLECTED_UNIT, FixtureOptions, GlobalFixture, Hold, SymbolFixture,
+    UNSATISFIED_REQUIREMENT,
 };
 use rift_protocol::error::ErrorCode;
 use rmcp::model::ReadResourceRequestParams;
@@ -959,7 +959,7 @@ async fn test_global_prose_search_preserves_broad_full_text_order() -> TestResul
         let request = json!({
             "query": global_api::BROAD_BODY_MATCH_QUERY,
             "scope": "global",
-            "limit": limit,
+            "max_results": limit,
             "include": {"source": true, "score": true}
         });
         let answer = call_tool(&client, "search", request).await?;
@@ -1007,7 +1007,10 @@ async fn search_requests(fixture: &GlobalFixture) -> Vec<global_api::ObservedReq
 /// advertising 1,000, and one request per phase either way.
 #[tokio::test]
 async fn a_search_asks_one_page_per_phase_at_the_advertised_limit() -> TestResult {
-    for (advertised, limit) in [(200, "limit=200"), (1_000, "limit=1000")] {
+    for (advertised, limit) in [
+        (200, "page=1&max_results=200"),
+        (1_000, "page=1&max_results=1000"),
+    ] {
         let fixture = GlobalFixture::start_with(FixtureOptions {
             page_limit_max: advertised,
             ..FixtureOptions::default()
@@ -1049,10 +1052,10 @@ async fn a_search_asks_one_page_per_phase_at_the_advertised_limit() -> TestResul
 }
 
 /// A search page the service stopped at its response body bound answers what fit, with the
-/// page's `result_truncated` as a `global_page_warning`, and its cursor is not followed: the
+/// page's `result_truncated` as a `global_page_warning`:
 /// search stays at one request per phase.
 #[tokio::test]
-async fn a_page_stopped_at_the_body_bound_answers_without_following_its_cursor() -> TestResult {
+async fn a_page_warning_preserves_the_answer() -> TestResult {
     let fixture = GlobalFixture::start_with(FixtureOptions {
         stopped_at_body_bound: true,
         ..FixtureOptions::default()
@@ -1097,12 +1100,6 @@ async fn a_page_stopped_at_the_body_bound_answers_without_following_its_cursor()
     );
     let searches = search_requests(&fixture).await;
     assert_eq!(searches.len(), 2, "{searches:#?}");
-    assert!(
-        searches
-            .iter()
-            .all(|request| !request.uri.contains(BODY_BOUND_CURSOR)),
-        "the stopped page's cursor is never followed: {searches:#?}"
-    );
     drop(directory);
     client.cancel().await?;
     server_task.await?;
@@ -1249,7 +1246,7 @@ async fn a_package_scoped_pattern_answers_package_matches_from_one_request() -> 
     assert!(
         requests
             .iter()
-            .all(|request| request.uri.ends_with("limit=200")),
+            .all(|request| request.uri.ends_with("page=1&max_results=200")),
         "{requests:#?}"
     );
     drop(directory);
@@ -1964,8 +1961,8 @@ async fn a_refused_package_scoped_read_makes_no_global_request() -> TestResult {
         ),
         (
             "search",
-            json!({"query": "SELECT ?hit { SERVICE :search { ?hit :query 'beacon'; :scope 'all'; :limit 0; :index ?index } }"}),
-            "field limit",
+            json!({"query": "SELECT ?hit { SERVICE :search { ?hit :query 'beacon'; :scope 'all'; :max_results 0; :index ?index } }"}),
+            "field max_results",
         ),
         (
             "search",
@@ -1974,13 +1971,13 @@ async fn a_refused_package_scoped_read_makes_no_global_request() -> TestResult {
         ),
         (
             "search",
-            json!({"query": "SELECT ?hit { SERVICE :search { ?hit :pattern 'beacon'; :scope 'all'; :limit 0; :index ?index } }"}),
-            "field limit",
+            json!({"query": "SELECT ?hit { SERVICE :search { ?hit :pattern 'beacon'; :scope 'all'; :max_results 0; :index ?index } }"}),
+            "field max_results",
         ),
         (
             "get_symbol",
-            json!({"id": id, "declaration_limit": 0}),
-            "field limit",
+            json!({"id": id, "max_results": 0}),
+            "field max_results",
         ),
     ];
     for (tool, request, diagnostic) in refused {
@@ -2494,7 +2491,7 @@ async fn test_identifier_case_precedes_documentation_frequency() -> TestResult {
     let source = "/// searchHit searchHit searchHit searchHit\npub fn SearchHit() {}\npub fn searchHit() {}\n";
     let (_directory, client, server_task) =
         served_workspace(&[("src/lib.rs", source)], None).await?;
-    let request = json!({"query": "searchHit", "limit": 1, "include": {"source": true}});
+    let request = json!({"query": "searchHit", "max_results": 1, "include": {"source": true}});
     let answer = workspace_client::search_after_population(&client, &request).await?;
     assert_eq!(
         answer["results"][0]["hit"]["symbol"]["name"], "searchHit",
@@ -2507,7 +2504,7 @@ async fn test_identifier_case_precedes_documentation_frequency() -> TestResult {
     let answer = call_tool(
         &client,
         "search",
-        json!({"query": "searchHit", "limit": 10}),
+        json!({"query": "searchHit", "max_results": 10}),
     )
     .await?;
     let wrong_case = answer["results"]
@@ -2561,8 +2558,7 @@ async fn test_identifier_case_pairs_rank_exact_spelling_through_mcp() -> TestRes
         ] {
             assert_original_identifier(&client, scope, name).await?;
         }
-        let args =
-            json!({"query": "SEARCHHIT", "scope": scope, "limit": 10, "include": {"source": true}});
+        let args = json!({"query": "SEARCHHIT", "scope": scope, "max_results": 10, "include": {"source": true}});
         let answer = call_tool(&client, "search", args).await?;
         let hits = answer["results"]
             .as_array()
@@ -2595,7 +2591,7 @@ async fn assert_identifier_request(
     query: &str,
     expected: [&str; 2],
 ) -> TestResult {
-    let args = json!({"query": query, "scope": "global", "limit": 10});
+    let args = json!({"query": query, "scope": "global", "max_results": 10});
     let answer = call_tool(client, "search", args).await?;
     assert_eq!(
         answer["results"]
@@ -2621,7 +2617,8 @@ async fn assert_original_identifier(
     scope: &str,
     name: &str,
 ) -> TestResult {
-    let args = json!({"query": name, "scope": scope, "limit": 1, "include": {"source": true}});
+    let args =
+        json!({"query": name, "scope": scope, "max_results": 1, "include": {"source": true}});
     let answer = call_tool(client, "search", args).await?;
     let hits = answer["results"]
         .as_array()
@@ -2656,7 +2653,7 @@ async fn test_native_client_accepts_original_identifier_candidates() -> TestResu
         ..Config::default()
     })?;
     let mut request = case_search_request("SearchHit and searchHit")?;
-    let page = client.search_packages(&request, 10, None).await?;
+    let page = client.search_packages(&request, 10, 1).await?;
     assert_eq!(page.items.len(), 2);
     for name in ["SearchHit", "searchHit", "createProgram", "load_config"] {
         request.query = Some(name.to_owned());
@@ -2666,7 +2663,7 @@ async fn test_native_client_accepts_original_identifier_candidates() -> TestResu
             prefix: false,
         }]);
         request.identifiers = Some(vec![name.to_owned()]);
-        let page = client.search_packages(&request, 1, None).await?;
+        let page = client.search_packages(&request, 1, 1).await?;
         let hit = rift_cloud_client::PackageSearchCandidate::try_from(page.items[0].clone())?;
         let rift_protocol::read::SearchHitTarget::Symbol { symbol } = &hit.hit.hit else {
             return Err("search returns a declaration".into());
@@ -2685,6 +2682,7 @@ fn case_search_request(query: &str) -> TestResult<rift_cloud_client::PackageSear
     use rift_cloud_client::{PackageSearchRequest, PackageSearchRequestPhase, QueryTerm};
     let parsed = rift_ranking::ParsedQuery::parse(query)?;
     Ok(PackageSearchRequest {
+        revision: None,
         query: Some(query.to_owned()),
         terms: Some(
             parsed
@@ -2726,8 +2724,7 @@ async fn test_qualified_identifier_case_ranks_original_spelling() -> TestResult 
     let (_directory, client, server_task) =
         served_workspace(&[("src/lib.rs", source)], None).await?;
     for name in ["createProgram", "createprogram"] {
-        let args =
-            json!({"query": format!("Vault::{name}"), "limit": 1, "include": {"source": true}});
+        let args = json!({"query": format!("Vault::{name}"), "max_results": 1, "include": {"source": true}});
         let answer = call_tool(&client, "search", args).await?;
         assert_eq!(
             answer["results"][0]["hit"]["symbol"]["name"], name,

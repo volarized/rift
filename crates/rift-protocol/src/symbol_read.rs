@@ -115,7 +115,12 @@ pub struct CapturedView {
 #[serde(deny_unknown_fields)]
 #[schemars(extend("rift:since" = "v0.0.4"))]
 #[schemars(extend("examples" = [
-    {"id": "rift://symbol/local/rust/app/parser/parse", "include": {"documentation": true}}
+    {
+        "id": "rift://symbol/local/rust/app/parser/parse",
+        "include": {
+            "documentation": true
+        }
+    }
 ]))]
 pub struct GetSymbolParams {
     /// Canonical identity. Ownership and language come from this address.
@@ -133,15 +138,14 @@ pub struct GetSymbolParams {
     /// release. The server refuses a tree revision once the index serves another tree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<Revision>,
-    /// Most declarations returned in this read. Omitted uses the existing five-item bound.
-    #[serde(default = "default_declaration_limit")]
-    #[schemars(range(min = 1_u64, max = PAGE_LIMIT_MAX))]
-    pub declaration_limit: u64,
-    /// Continuation a preceding read returned, bound to this symbol and the revision it read.
-    /// The server refuses it for another symbol and once that revision is no longer served.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(length(min = 1, max = 4096))]
-    pub declaration_cursor: Option<String>,
+    /// Results per page, at most 10,000.
+    #[serde(default = "default_max_results")]
+    #[schemars(range(min = 1_u64, max = GET_SYMBOL_MAX_RESULTS))]
+    pub max_results: u64,
+    /// The 1-based page to read.
+    #[serde(default = "default_page")]
+    #[schemars(range(min = 1_u64))]
+    pub page: u64,
 }
 
 pub(crate) fn deserialize_symbol_id<'de, D>(deserializer: D) -> Result<SymbolId, D::Error>
@@ -152,8 +156,13 @@ where
     SymbolId::parse(&value).map_err(serde::de::Error::custom)
 }
 
-fn default_declaration_limit() -> u64 {
-    5
+/// Most declarations returned in one exact symbol page.
+pub const GET_SYMBOL_MAX_RESULTS: u64 = 10_000;
+fn default_max_results() -> u64 {
+    crate::read::MAX_RESULTS_DEFAULT
+}
+fn default_page() -> u64 {
+    crate::read::PAGE_DEFAULT
 }
 
 /// One source binding for a logical object. Source-less objects have no bindings.
@@ -276,11 +285,13 @@ pub enum SymbolUnavailableReason {
 /// Exactly one logical object, definite absence, or explicit selection unavailability.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
-#[schemars(extend("examples" = [{
-    "outcome": "unavailable",
-    "id": "rift://symbol/local/rust/app/parser/parse",
-    "reason": "insufficient_coverage"
-}]))]
+#[schemars(extend("examples" = [
+    {
+        "outcome": "unavailable",
+        "id": "rift://symbol/local/rust/app/parser/parse",
+        "reason": "insufficient_coverage"
+    }
+]))]
 pub enum GetSymbolResult {
     /// The exact identity was established, even when it has no source declarations.
     Found {
@@ -291,10 +302,8 @@ pub enum GetSymbolResult {
         /// Declaration bindings in deterministic source order.
         #[schemars(length(max = PAGE_LIMIT_MAX))]
         declarations: Vec<SymbolDeclaration>,
-        /// Continuation for the remaining declarations at `revision`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[schemars(length(min = 1, max = 4096))]
-        declaration_cursor: Option<String>,
+        /// The requested page and complete declaration count.
+        pagination: crate::read::Pagination,
         /// Requested timeline for the logical symbol.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         history: Option<SymbolHistory>,

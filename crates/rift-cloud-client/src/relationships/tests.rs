@@ -62,11 +62,11 @@ async fn missing_relationship_coverage_keeps_its_typed_reason() {
     );
 }
 
-fn page(start: u64, complete: bool, next: Option<&str>) -> Value {
+fn page(start: u64, complete: bool, _next: Option<&str>) -> Value {
     json!({"groups":[{"seed":SEED,"complete":complete,"relationships":[{"id":format!("{start:064x}"),"relationship":{"from":SEED,"to":TARGET,"kind":"call","facets":["calls"],"derivation":"resolution","occurrence":{"unit":"rift://source/cargo/crates.io/demo/src/lib.rs","range":{"start":start,"end":start+1}}}}]}],
         "symbols":[symbol(SEED,"entry"),symbol(TARGET,"helper")],
         "sources":[{"unit":"rift://source/cargo/crates.io/demo/src/lib.rs","digest":full_digest("...")}],
-        "next_cursor":next,"analyzer_revision":"analyzer-v1","corpus_revision":"corpus-v1","view":{"id":"a".repeat(64),"expires_at":"2099-01-01T00:00:00Z"}})
+        "analyzer_revision":"analyzer-v1","corpus_revision":"corpus-v1","view":{"id":"a".repeat(64),"expires_at":"2099-01-01T00:00:00Z"}})
 }
 
 fn full_digest(text: &str) -> String {
@@ -109,18 +109,15 @@ async fn raw_relationship_pages_preserve_parallel_records_and_original_selection
         .iter()
         .filter(|request| request.path.ends_with("/search"))
         .collect::<Vec<_>>();
-    assert_eq!(pages.len(), 2);
+    assert_eq!(pages.len(), 1);
     assert!(
         requests
             .iter()
             .all(|request| request.api_version.as_deref() == Some("2"))
     );
     let first: Value = serde_json::from_slice(&pages[0].body).expect("request");
-    let second: Value = serde_json::from_slice(&pages[1].body).expect("request");
-    assert_eq!(first["relationships"], second["relationships"]);
     assert!(first.get("query").is_none());
     assert!(first.get("traversal").is_none());
-    assert_eq!(second["view"], "a".repeat(64));
     assert!(
         !requests
             .iter()
@@ -168,9 +165,8 @@ async fn complete_raw_pages_require_reached_symbol_and_physical_source_projectio
 
 #[tokio::test]
 async fn raw_relationship_failure_never_exposes_a_partial_batch() {
-    let original = page(0, false, Some("1"));
     let mut changed_view = page(2, true, None);
-    changed_view["view"]["id"] = json!("b".repeat(64));
+    changed_view["view"]["expires_at"] = json!("2000-01-01T00:00:00Z");
     let mut omitted = page(2, true, None);
     omitted["groups"] = json!([]);
     let mut incomplete = page(2, true, None);
@@ -178,8 +174,13 @@ async fn raw_relationship_failure_never_exposes_a_partial_batch() {
     let mut wrong_subject = page(2, true, None);
     wrong_subject["groups"][0]["relationships"][0]["relationship"]["from"] = json!(TARGET);
     let mut changed_revision = page(2, true, None);
-    changed_revision["corpus_revision"] = json!("corpus-v2");
-    let duplicate = page(0, true, None);
+    changed_revision["corpus_revision"] = json!("");
+    let mut duplicate = page(0, true, None);
+    let record = duplicate["groups"][0]["relationships"][0].clone();
+    duplicate["groups"][0]["relationships"]
+        .as_array_mut()
+        .expect("records")
+        .push(record);
     let mut partial_warning = page(2, true, None);
     partial_warning["warnings"] = json!([{
         "code": "global_page_warning",
@@ -195,7 +196,7 @@ async fn raw_relationship_failure_never_exposes_a_partial_batch() {
         partial_warning,
     ] {
         let (_server, client) = operation_client(OperationFixture::Relationships {
-            pages: vec![original.clone(), second],
+            pages: vec![second],
             advertised: true,
         })
         .await;
@@ -371,7 +372,7 @@ async fn assert_relationship_page_window(
     let RelationshipSearchResult::Page(result) = result else {
         panic!("raw pages");
     };
-    assert_eq!(admissions, 2);
+    assert_eq!(admissions, 1);
     assert_eq!(result.groups[0].relationships.len(), 2);
     assert_eq!(
         result.groups[0].occurrences.len(),
@@ -384,22 +385,22 @@ async fn assert_relationship_page_window(
         .iter()
         .filter(|request| request.path.ends_with("/search"))
         .collect::<Vec<_>>();
-    assert_eq!(pages.len(), 2);
+    assert_eq!(pages.len(), 1);
     for page in &pages {
         assert!(
             page.query
                 .as_deref()
                 .expect("page query")
                 .split('&')
-                .any(|field| field == format!("limit={expected}"))
+                .any(|field| field == format!("max_results={expected}"))
         );
     }
-    let first: Value = serde_json::from_slice(&pages[0].body).expect("first selected request");
-    let second: Value = serde_json::from_slice(&pages[1].body).expect("continued selected request");
-    assert_eq!(first["relationships"], second["relationships"]);
-    assert_eq!(second["view"], "a".repeat(64));
+    let first: Value = serde_json::from_slice(&pages[0].body).expect("selected request");
+    assert_eq!(
+        first["relationships"],
+        serde_json::to_value(request().relationships).expect("selection")
+    );
     assert!(first["view"].is_null());
-    assert_eq!(second["packages"], first["packages"]);
 }
 
 fn located_projection(identity: u64, relationship: Option<u64>, start: u64) -> Value {

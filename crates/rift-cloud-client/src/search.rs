@@ -51,8 +51,10 @@ impl<'de> Deserialize<'de> for PackageSearchItem {
 pub struct PackageSearchPage {
     /// Ordered symbol and documentation results.
     pub items: Vec<PackageSearchItem>,
-    /// Opaque continuation bound to this view and the original request.
-    pub next_cursor: Option<String>,
+    /// Page counts for the selected answer list.
+    pub pagination: rift_protocol::read::Pagination,
+    /// The indexed revision this answer read.
+    pub revision: String,
     /// Warnings attached to this page.
     pub warnings: Vec<Warning>,
     /// Publication format used by the package index.
@@ -182,7 +184,7 @@ mod tests {
 
     #[test]
     fn empty_page_requires_original_captured_view() {
-        let mut value = json!({"items": [], "warnings": [],
+        let mut value = json!({"items": [], "warnings": [], "pagination":{"page":1,"pages":0,"max_results":10,"total":0}, "revision":"corpus",
             "publication_format": "rift-package-index-v2",
             "analyzer_revision": "analyzer", "corpus_revision": "corpus"});
         assert!(serde_json::from_value::<PackageSearchPage>(value.clone()).is_err());

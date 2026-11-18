@@ -742,7 +742,7 @@ async fn live_seed(
         client,
         tool_request(
             "search_retrieval",
-            &json!({"query": name, "target": "symbol", "include": {"source": true}, "limit": 1000}),
+            &json!({"query": name, "target": "symbol", "include": {"source": true}, "max_results": 1000}),
         ),
     )
     .await?;
@@ -1951,7 +1951,7 @@ async fn search_traversal_outgoing_names_a_dependency_callee_and_counts_one_answ
     let (_directory, client, _server_task) =
         served_workspace(INSTALLED_FILES, Some(configuration)).await?;
 
-    let request = json!({"include":{"source": true}, "limit":1,
+    let request = json!({"include":{"source": true}, "max_results":1,
         "traversal": { "seed": captured_seed(&client, "hello", "app.py").await?, "direction": "outgoing" }
     });
     let hello =

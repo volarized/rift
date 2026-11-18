@@ -231,7 +231,7 @@ pub(super) fn canonical(
             symbol,
             revision,
             declarations,
-            declaration_cursor,
+            pagination,
             history,
             documentation,
             ..
@@ -259,11 +259,8 @@ pub(super) fn canonical(
                         .and_then(|declaration| declaration.path.as_ref()),
                 )?;
             }
-            if let Some(cursor) = declaration_cursor {
-                lines.line(
-                    0,
-                    &format!("next declarations · declaration_cursor {cursor}"),
-                )?;
+            if let Some(page) = layout::page_fact(pagination) {
+                lines.line(0, &page)?;
             }
             Some(revision)
         }

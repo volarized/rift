@@ -68,9 +68,9 @@ async fn collect_with_coverage<E, F>(
 where
     F: std::future::Future<Output = Result<SearchReadResult, E>>,
 {
-    let one_page = request.limit.is_some() || request.page_index != 0;
+    let one_page = request.max_results.is_some() || request.page != 1;
     if !one_page {
-        request.limit = Some(PAGE_LIMIT_MAX);
+        request.max_results = Some(PAGE_LIMIT_MAX);
     }
     let mut held: Option<Box<SearchResult>> = None;
     let mut bytes_left = limits.literal_bytes_max();
@@ -80,9 +80,9 @@ where
             SearchReadResult::Results(page) => page,
             SearchReadResult::Unavailable(reason) => return Ok(Err(reason)),
         };
-        let failure = if page.pagination.page_index != request.page_index
+        let failure = if page.pagination.page != request.page
             || held.as_ref().is_some_and(|held| {
-                page.view != held.view || page.pagination.total_pages != held.pagination.total_pages
+                page.view != held.view || page.pagination.pages != held.pagination.pages
             }) {
             Some(SymbolUnavailableReason::ViewContext)
         } else {
@@ -106,10 +106,10 @@ where
             .map_err(|_| map_error(coverage_failure()))?;
         bytes_left -= bytes.len();
         let next = request
-            .page_index
+            .page
             .checked_add(1)
             .ok_or_else(|| map_error(coverage_failure()))?;
-        let more = !one_page && next < page.pagination.total_pages;
+        let more = !one_page && next <= page.pagination.pages;
         if more && (page.view.is_none() || page.results.is_empty()) {
             return Ok(Err(unavailable(
                 SymbolUnavailableReason::InsufficientCoverage,
@@ -136,7 +136,7 @@ where
         if !more {
             return held.map(Ok).ok_or_else(|| map_error(coverage_failure()));
         }
-        request.page_index = next;
+        request.page = next;
     }
     Err(map_error(coverage_failure()))
 }

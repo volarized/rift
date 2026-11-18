@@ -98,13 +98,7 @@ async fn proxy_keeps_dependency_call_paths_and_original_source_bytes() -> TestRe
     let selected_bytes = SOURCE.get(start..end).ok_or("admitted package range")?;
     assert!(selected_bytes.starts_with("def _inner"));
     assert_eq!(query::literal(projected, "source")?, selected_bytes);
-    let view = serde_json::from_value(answer["view"]["id"].clone())?;
-    let original = serde_json::from_value(answer["answer"].clone())?;
-    let replay = rift_search::sparql::continuation_query(&original, &view, 0)?;
     std::fs::write(root.join(SOURCE_PATH), SOURCE.replace("_inner", "_changed"))?;
-    let held = proxied_call(&client, "search", &json!({"query":replay})).await?;
-    assert_eq!(held["answer"], answer["answer"]);
-    assert_eq!(held["view"], answer["view"]);
     let changed = proxied_call(&client, "search", &json!({"query":statement})).await?;
     assert_eq!(row(&changed)?["name"]["value"], "_changed");
     client.cancel().await?;
@@ -116,9 +110,6 @@ async fn proxy_keeps_dependency_call_paths_and_original_source_bytes() -> TestRe
     assert!(root.join(SOURCE_PATH).is_file(), "source remains installed");
     let client = proxy_client(root).await?;
     await_workspace_ready(&client).await?;
-    let expired = proxied_call(&client, "search", &json!({"query":replay})).await?;
-    assert_eq!(expired["outcome"], "unavailable", "{expired}");
-    assert_eq!(expired["reason"], "view_expired", "{expired}");
     let unadmitted = proxied_call(&client, "search", &json!({"query":statement})).await?;
     assert_eq!(unadmitted["outcome"], "unavailable", "{unadmitted}");
     assert_eq!(

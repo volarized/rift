@@ -140,9 +140,6 @@ fn canonical_text_states(text: &str, structured: &serde_json::Value) -> Result<(
                 token(text, &serde_json::json!(spaced), "$.history.edges.edge")?;
             }
         }
-        if let Some(cursor) = structured.get("declaration_cursor") {
-            token(text, cursor, "$.declaration_cursor")?;
-        }
     } else if outcome == "missing" {
         token(
             text,
@@ -191,13 +188,12 @@ fn source_lines(text: &str, value: &serde_json::Value, indent: &str) -> Result<(
     Ok(())
 }
 
-fn query_continuation_text(text: &str, structured: &serde_json::Value) -> Result<(), String> {
+fn query_continuation_text(text: &str, _structured: &serde_json::Value) -> Result<(), String> {
     let continuations: Vec<_> = text
         .lines()
         .filter_map(|line| line.strip_prefix("next query · "))
         .collect();
-    let expected = structured["pagination"]["next_query"].as_str();
-    if continuations != expected.into_iter().collect::<Vec<_>>() {
+    if !continuations.is_empty() {
         return Err("query continuation differs".into());
     }
     Ok(())
@@ -280,17 +276,16 @@ fn query_text_states(text: &str, structured: &serde_json::Value) -> Result<(), S
     } else {
         let answer = &structured["answer"];
         let pagination = &structured["pagination"];
-        let total = pagination["total_pages"]
-            .as_u64()
-            .ok_or("query total pages")?;
+        let total = if answer["result"] == "boolean" {
+            0
+        } else {
+            pagination["pages"].as_u64().ok_or("query total pages")?
+        };
         if total > 1 {
-            let page = pagination["page_index"]
-                .as_u64()
-                .ok_or("query page index")?
-                .saturating_add(1);
+            let page = pagination["page"].as_u64().ok_or("query page")?;
             if !text
                 .lines()
-                .any(|line| line == format!("page {page}/{total}"))
+                .any(|line| line.starts_with(&format!("page {page}/{total}, total ")))
             {
                 return Err("query page differs".into());
             }
@@ -373,7 +368,7 @@ mod tests {
             "0 results\n",
             json!({
                 "results": [],
-                "pagination": { "page_index": 0, "total_pages": 0 }
+                "pagination": {"page": 1, "pages": 0, "max_results": 10, "total": 0}
             }),
         );
         assert_eq!(text_states(SEARCH_TOOL, &search), Ok(()));
@@ -393,7 +388,7 @@ mod tests {
             "true\n",
             json!({
                 "answer": { "result": "boolean", "value": true },
-                "pagination": { "page_index": 0, "total_pages": 1 },
+                "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 10},
                 "warnings": []
             }),
         );
@@ -405,7 +400,7 @@ mod tests {
     fn query_text_omits_routine_view_metadata() {
         let structured = json!({
             "answer": { "result": "boolean", "value": true },
-            "pagination": { "page_index": 0, "total_pages": 1 },
+            "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 10},
             "view": { "id": "claims.syntax_elements", "expires_at": "2030-01-01T00:15:00Z" }
         });
         assert_eq!(
@@ -420,7 +415,7 @@ mod tests {
     fn query_text_keeps_discovery_warnings() {
         let structured = json!({
             "answer": { "result": "boolean", "value": true },
-            "pagination": { "page_index": 0, "total_pages": 1 },
+            "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 10},
             "warnings": [{ "code": "traversal_truncated", "detail": "flow discovery reached the provider request bound" }]
         });
         assert!(text_states(SEARCH_TOOL, &result_of("true\n", structured.clone())).is_err());

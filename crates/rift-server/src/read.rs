@@ -32,7 +32,6 @@ use rift_syntax::{ByteRange, SyntaxProvider, registry};
 use crate::history::{StoredHistory, SymbolTimelines};
 
 mod canonical;
-mod cursor;
 mod facets;
 mod symbol;
 pub use canonical::{LocalSymbolViewInput, LocalSymbolViews};
@@ -1031,25 +1030,18 @@ impl ReadService {
         self.accept_revision(params.revision.as_ref())?;
         let id = &params.symbol;
         let key = rift_core::SymbolId::new(id.as_str())?;
-        let offset = params.facet_cursor.as_deref().map_or(Ok(0), |cursor| {
-            facets::cursor_offset(cursor, id.as_str(), &self.revisions.index_tree_revision)
-        })?;
-        self.symbol_facets(id, &key, offset)
-    }
-
-    /// One page of `id`'s facets, over every declaration the index binds to it.
-    fn symbol_facets(
-        &self,
-        id: &SymbolId,
-        key: &rift_core::SymbolId,
-        offset: usize,
-    ) -> Result<FacetsResult, RiftError> {
-        let results_max = self.index.limits().results_max();
+        accept_page(params.page)?;
+        let limit =
+            accepted_max_results(params.max_results, rift_protocol::read::FACETS_MAX_RESULTS)?;
+        let pagination = Pagination::new(params.page, params.max_results, 0);
         let Some(page) = facets::symbol_page(
             &self.index,
-            (id, key),
-            (offset, &self.revisions.index_tree_revision),
-            facets::PageBounds::served(results_max),
+            (id, &key),
+            pagination.offset(),
+            facets::PageBounds {
+                facets_max: limit,
+                source_bytes_max: rift_protocol::read::FACETS_SOURCE_BYTES_MAX,
+            },
         )?
         else {
             return errors::server::read_symbol_not_found()
@@ -1060,6 +1052,8 @@ impl ReadService {
             page,
             self.served_revision()?,
             self.revisions.warnings(),
+            params.page,
+            params.max_results,
         ))
     }
 
@@ -1076,14 +1070,15 @@ impl ReadService {
     /// argument the read cannot send, and symbol history the workspace's version control
     /// cannot serve.
     pub fn get_symbol(&self, params: &GetSymbolParams) -> Result<GetSymbolResult, RiftError> {
+        accept_page(params.page)?;
         accepted_symbol_name(&params.name)?;
-        let limit = accepted_limit(params.limit)?;
+        let limit = accepted_limit(params.max_results)?;
         let git = is_git_revision(params.revision.as_ref());
         validate_requested_packages(&params.scope, git, &params.packages)?;
         self.validate_dependency_scope(&params.scope, git)?;
         self.accept_revision(params.revision.as_ref())?;
         // The whole ranked match set is collected up to the project index's own
-        // `results_max` bound, so `pagination.total_pages` counts the full result set the
+        // `results_max` bound, so `pagination.pages` counts the full result set the
         // pages divide.
         let results_max = self.index.results_max();
         let mut candidates = if params.scope == SearchScope::Global {
@@ -1112,7 +1107,7 @@ impl ReadService {
             }
         }
         let absent = public_candidates.is_empty() && object_warnings.is_empty();
-        let (window, pagination) = page(public_candidates, params.page_index, limit);
+        let (window, pagination) = page(public_candidates, params.page, limit);
         let include_history = params.include.history;
         let include_documentation = params.include.documentation;
         let mut documentation_bytes_left =
@@ -1278,22 +1273,35 @@ fn accepted_symbol_name(name: &str) -> Result<(), RiftError> {
 ///
 /// Returns `invalid_request` naming `limit` when the size is outside its bounds.
 pub fn accepted_limit(requested: u64) -> Result<usize, RiftError> {
-    if requested == 0 {
+    accepted_max_results(requested, PAGE_LIMIT_MAX)
+}
+
+/// Accepts a result count within its surface bound.
+///
+/// # Errors
+/// Returns a typed invalid request for an out-of-range count.
+pub fn accepted_max_results(requested: u64, maximum: u64) -> Result<usize, RiftError> {
+    if requested == 0 || requested > maximum {
         return errors::server::read_invalid()
-            .field("limit")
-            .violation("zero")
+            .field("max_results")
+            .violation(format!("expected 1..={maximum}, received {requested}"))
             .fail();
     }
-    if requested > PAGE_LIMIT_MAX {
+    Ok(usize::try_from(requested).unwrap_or(usize::MAX))
+}
+
+/// Accepts a 1-based page.
+///
+/// # Errors
+/// Returns a typed invalid request for page zero.
+pub fn accept_page(page: u64) -> Result<(), RiftError> {
+    if page == 0 {
         return errors::server::read_invalid()
-            .field("limit")
-            .violation(format!("{requested} exceeds the maximum {PAGE_LIMIT_MAX}"))
+            .field("page")
+            .violation("expected a 1-based page")
             .fail();
     }
-    let Ok(limit) = usize::try_from(requested) else {
-        unreachable!("a limit at or under PAGE_LIMIT_MAX fits usize: requested={requested}")
-    };
-    Ok(limit)
+    Ok(())
 }
 
 const _: () = assert!(PAGE_LIMIT_MAX <= usize::MAX as u64);
@@ -1362,23 +1370,17 @@ fn requested_packages_violation(
 ///
 /// Work is bounded upstream: every caller collects at most the index's `results_max`
 /// results before paging. `limit` is positive - `accepted_limit` refuses zero - so
-/// `total_pages` is `results.len().div_ceil(limit)`, zero for an empty set. A
-/// `page_index` past the last page yields an empty page carrying the requested index
+/// `pages` is `results.len().div_ceil(limit)`, zero for an empty set. A
+/// `page` past the last page yields an empty page carrying the requested index
 /// and the true page count.
-pub(crate) fn page<T>(results: Vec<T>, page_index: u64, limit: usize) -> (Vec<T>, Pagination) {
+pub(crate) fn page<T>(results: Vec<T>, page: u64, limit: usize) -> (Vec<T>, Pagination) {
     assert!(
         limit > 0,
         "page limit must be positive after acceptance: limit={limit}"
     );
     let total = results.len();
-    let total_pages = u64::try_from(total.div_ceil(limit)).unwrap_or(u64::MAX);
-    let pagination = Pagination {
-        page_index,
-        total_pages,
-    };
-    let start = usize::try_from(page_index)
-        .ok()
-        .and_then(|index| index.checked_mul(limit));
+    let pagination = Pagination::new(page, limit as u64, total as u64);
+    let start = Some(pagination.offset());
     let window = match start {
         Some(start) if start < total => results.into_iter().skip(start).take(limit).collect(),
         _ => Vec::new(),
@@ -1401,11 +1403,13 @@ fn facets_result(
     page: facets::FacetsPage,
     revision: Revision,
     warnings: Vec<ReadWarning>,
+    requested_page: u64,
+    max_results: u64,
 ) -> FacetsResult {
     FacetsResult {
         symbol: page.symbol,
         declarations: page.declarations,
-        facet_cursor: page.facet_cursor,
+        pagination: Pagination::new(requested_page, max_results, page.total as u64),
         revision,
         warnings,
     }
@@ -2470,7 +2474,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             value["pagination"],
-            json!({ "page_index": 0, "total_pages": 1 })
+            json!({"page": 1, "pages": 1, "max_results": 10, "total": 2})
         );
         Ok(())
     }
@@ -2494,7 +2498,7 @@ pub(crate) mod tests {
             HistoryConfiguration::default(),
         )?;
         let params: GetSymbolParams =
-            serde_json::from_value(json!({"name": "helper", "limit": 10}))?;
+            serde_json::from_value(json!({"name": "helper", "max_results": 10}))?;
         let result = service.get_symbol(&params)?;
         let names: Vec<&str> = result
             .hits
@@ -3013,7 +3017,7 @@ pub(crate) mod tests {
     }
 
     fn scoped(name: &str, scope: &str) -> TestResult<GetSymbolParams> {
-        let request = json!({"name": name, "scope": scope, "limit": 10});
+        let request = json!({"name": name, "scope": scope, "max_results": 10});
         Ok(serde_json::from_value(request)?)
     }
 
@@ -3050,13 +3054,7 @@ pub(crate) mod tests {
         let all = service.get_symbol(&scoped("beacon", "all")?)?;
 
         assert!(global.hits.is_empty(), "{global:?}");
-        assert_eq!(
-            global.pagination,
-            Pagination {
-                page_index: 0,
-                total_pages: 0
-            }
-        );
+        assert_eq!(global.pagination, Pagination::new(1, 10, 0));
         assert_eq!(
             global.warnings,
             vec![ReadWarning::SymbolNotFound {
@@ -3473,7 +3471,7 @@ pub(crate) mod tests {
         assert_eq!(value["hits"][0]["symbol"]["language"], json!("rust"));
         assert_eq!(
             value["pagination"],
-            json!({"page_index": 0, "total_pages": 1})
+            json!({"page": 1, "pages": 1, "max_results": 10, "total": 1})
         );
         let dialect_filtered: GetSymbolParams = serde_json::from_value(json!({
             "name": "beacon",
@@ -4100,68 +4098,69 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn page_of_an_empty_set_reports_zero_total_pages() {
-        let (window, pagination) = super::page(Vec::<u8>::new(), 0, 5);
+    fn page_of_an_empty_set_reports_zero_pages() {
+        let (window, pagination) = super::page(Vec::<u8>::new(), 1, 5);
         assert_eq!(window, Vec::<u8>::new());
-        assert_eq!(pagination.page_index, 0);
-        assert_eq!(pagination.total_pages, 0);
+        assert_eq!(pagination.page, 1);
+        assert_eq!(pagination.pages, 0);
     }
 
     #[test]
-    fn page_zero_serves_the_first_window_by_default() {
-        let (window, pagination) = super::page(vec![1, 2, 3, 4, 5], 0, 2);
+    fn page_one_serves_the_first_window_by_default() {
+        let (window, pagination) = super::page(vec![1, 2, 3, 4, 5], 1, 2);
         assert_eq!(window, vec![1, 2]);
-        assert_eq!(pagination.page_index, 0);
-        assert_eq!(pagination.total_pages, 3);
+        assert_eq!(pagination.page, 1);
+        assert_eq!(pagination.pages, 3);
     }
 
     #[test]
     fn page_count_is_exact_for_a_set_that_divides_evenly() {
-        let (window, pagination) = super::page(vec![1, 2, 3, 4, 5, 6], 1, 3);
+        let (window, pagination) = super::page(vec![1, 2, 3, 4, 5, 6], 2, 3);
         assert_eq!(window, vec![4, 5, 6]);
-        assert_eq!(pagination.total_pages, 2);
+        assert_eq!(pagination.pages, 2);
     }
 
     #[test]
     fn page_count_rounds_up_and_the_last_page_carries_the_remainder() {
-        let (window, pagination) = super::page(vec![1, 2, 3, 4, 5, 6, 7], 2, 3);
+        let (window, pagination) = super::page(vec![1, 2, 3, 4, 5, 6, 7], 3, 3);
         assert_eq!(window, vec![7]);
-        assert_eq!(pagination.total_pages, 3);
+        assert_eq!(pagination.pages, 3);
     }
 
     #[test]
     fn page_past_the_end_is_empty_and_keeps_the_true_page_count() {
         let (window, pagination) = super::page(vec![1, 2, 3], 9, 2);
         assert_eq!(window, Vec::<i32>::new());
-        assert_eq!(pagination.page_index, 9);
-        assert_eq!(pagination.total_pages, 2);
+        assert_eq!(pagination.page, 9);
+        assert_eq!(pagination.pages, 2);
     }
 
-    /// The window offset is `page_index * limit` at checked boundaries: an index whose
+    /// The window offset is `page * limit` at checked boundaries: an index whose
     /// offset cannot be represented is past every collectable page, never a panic.
     #[test]
-    fn page_index_beyond_arithmetic_range_is_an_empty_page() {
+    fn page_beyond_arithmetic_range_is_an_empty_page() {
         let (window, pagination) = super::page(vec![1, 2, 3], u64::MAX, usize::MAX);
         assert_eq!(window, Vec::<i32>::new());
-        assert_eq!(pagination.page_index, u64::MAX);
-        assert_eq!(pagination.total_pages, 1);
+        assert_eq!(pagination.page, u64::MAX);
+        assert_eq!(pagination.pages, 1);
     }
 
     #[test]
     fn get_symbol_pages_walk_the_full_match_set_without_overlap() -> TestResult {
         let (_directory, service) = fixture()?;
-        let first: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon", "limit": 1}))?;
+        let first: GetSymbolParams =
+            serde_json::from_value(json!({"name": "Beacon", "max_results": 1}))?;
         let first_value = serde_json::to_value(service.get_symbol(&first)?)?;
         assert_eq!(
             first_value["pagination"],
-            json!({ "page_index": 0, "total_pages": 2 })
+            json!({"page": 1, "pages": 2, "max_results": 1, "total": 2})
         );
         let second: GetSymbolParams =
-            serde_json::from_value(json!({"name": "Beacon", "limit": 1, "page_index": 1}))?;
+            serde_json::from_value(json!({"name": "Beacon", "max_results": 1, "page": 2}))?;
         let second_value = serde_json::to_value(service.get_symbol(&second)?)?;
         assert_eq!(
             second_value["pagination"],
-            json!({ "page_index": 1, "total_pages": 2 })
+            json!({"page": 2, "pages": 2, "max_results": 1, "total": 2})
         );
         assert_eq!(second_value["hits"].as_array().map(Vec::len), Some(1));
         assert_ne!(
@@ -4175,12 +4174,12 @@ pub(crate) mod tests {
     fn get_symbol_page_past_the_end_is_empty_with_the_true_page_count() -> TestResult {
         let (_directory, service) = fixture()?;
         let params: GetSymbolParams =
-            serde_json::from_value(json!({"name": "Beacon", "limit": 1, "page_index": 40}))?;
+            serde_json::from_value(json!({"name": "Beacon", "max_results": 1, "page": 40}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         assert_eq!(value["hits"], json!([]));
         assert_eq!(
             value["pagination"],
-            json!({ "page_index": 40, "total_pages": 2 })
+            json!({"page": 40, "pages": 2, "max_results": 1, "total": 2})
         );
         Ok(())
     }
@@ -4198,13 +4197,12 @@ pub(crate) mod tests {
         assert_eq!(error.slug(), rift_error::errors::server::read_invalid::SLUG);
         assert_eq!(
             error.to_string(),
-            "the request does not match the documented form: field limit, violation 10001 \
-             exceeds the maximum 10000; correct the reported field and resend the request"
+            "the request does not match the documented form: field max_results, violation expected 1..=10000, received 10001; correct the reported field and resend the request"
         );
     }
 
     /// Each index's match set is collected up to `results_max`; a set that reached it warns
-    /// `results_truncated` naming the bound, and `total_pages` counts only what fit.
+    /// `results_truncated` naming the bound, and `pages` counts only what fit.
     #[test]
     fn get_symbol_at_the_result_bound_warns_results_truncated() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -4221,12 +4219,12 @@ pub(crate) mod tests {
             HistoryConfiguration::default(),
         )?;
         let params: GetSymbolParams =
-            serde_json::from_value(json!({"name": "Beacon", "limit": 5}))?;
+            serde_json::from_value(json!({"name": "Beacon", "max_results": 5}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         assert_eq!(value["hits"].as_array().map(Vec::len), Some(1));
         assert_eq!(
             value["pagination"],
-            json!({ "page_index": 0, "total_pages": 1 })
+            json!({"page": 1, "pages": 1, "max_results": 5, "total": 1})
         );
         assert!(
             value["warnings"].as_array().is_some_and(|warnings| {

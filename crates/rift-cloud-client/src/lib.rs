@@ -139,8 +139,6 @@ pub const IDENTIFIERS_MAX: usize = 16;
 pub const IDENTIFIER_BYTES_MAX: usize = 4_096;
 /// Most packages one read carries.
 pub const PACKAGES_MAX: usize = 20_000;
-/// Most UTF-8 bytes one cursor carries.
-pub const CURSOR_BYTES_MAX: usize = 4_096;
 /// Fewest entries one requested page carries.
 pub const PAGE_LIMIT_MIN: i64 = 1;
 /// Most entries one requested page carries.
@@ -148,7 +146,7 @@ pub const PAGE_LIMIT_MIN: i64 = 1;
 /// A paged read asks for the smaller of its limit and the advertised `page_limit_max`, so one
 /// client pages against a server advertising 200 and reads one page per search phase against a
 /// server advertising 1,000.
-pub const PAGE_LIMIT_MAX: i64 = 1_000;
+pub const PAGE_LIMIT_MAX: i64 = rift_protocol::read::GLOBAL_MAX_RESULTS.cast_signed();
 /// Most warnings one page assembly retains.
 pub const WARNINGS_MAX: usize = 32;
 /// Most characters one warning's `detail` carries, on a page or a resolution: room for the
@@ -444,9 +442,6 @@ pub struct PackageSearchPages {
     pub documentation_revision: Option<String>,
     /// Original captured view and expiry shared by every page.
     pub view: rift_protocol::symbol_read::CapturedView,
-    /// Cursor of the last page when the server stopped it at the response body bound. The
-    /// assembly does not follow it; a caller **MAY** pass it to `search_packages`.
-    pub next_cursor: Option<String>,
 }
 
 impl GlobalClient {
@@ -750,7 +745,7 @@ impl GlobalClient {
         &self,
         request: &PackageSearchRequest,
         limit: i64,
-        cursor: Option<&str>,
+        page: u64,
     ) -> Result<PackageSearchPage, RiftError> {
         rift_tracing::traced!(component = "global", operation = "search_packages", async {
             if !self.inner.enabled {
@@ -760,14 +755,14 @@ impl GlobalClient {
                 ));
             }
             validate_search_request(request)?;
-            validate_page(limit, cursor)?;
+            validate_numbered_page(limit, page)?;
             let capabilities = self.get_capabilities().await?;
-            validate_search_request_for_capabilities(request, limit, cursor, &capabilities)?;
+            validate_search_request_for_capabilities(request, limit, &capabilities)?;
             let body = serialize_body(request, self.inner.config.max_request)?;
             validate_body_for_capabilities(&body, &capabilities, self.inner.config.max_request)?;
-            let query = SearchPackagesRequestQuery {
-                limit: Some(limit),
-                cursor: cursor.map(str::to_owned),
+            let query = rift_protocol::read::GlobalPageParams {
+                page,
+                max_results: limit.cast_unsigned(),
             };
             let raw = match self
                 .request_with_query(
@@ -789,14 +784,28 @@ impl GlobalClient {
                     return self.observed(Err(error)).await;
                 }
             };
-            if let Err(error) = validate_search_page(
-                request,
-                &capabilities,
-                &page,
-                cursor,
-                self.inner.config.max_source,
-            ) {
+            if let Err(error) =
+                validate_search_page(request, &capabilities, &page, self.inner.config.max_source)
+            {
                 return self.observed(Err(error)).await;
+            }
+            validate_pagination(
+                &page.pagination,
+                limit.cast_unsigned(),
+                query.page,
+                page.items.len(),
+            )?;
+            if request
+                .revision
+                .as_ref()
+                .is_some_and(|revision| revision != &page.revision)
+            {
+                return Err(failure::response_invalid(
+                    "search_packages",
+                    "revision",
+                    "indexed revision changed",
+                    None,
+                ));
             }
             Ok(page)
         })
@@ -806,13 +815,10 @@ impl GlobalClient {
     /// Reads package search pages through the active candidate bound, asking each page for the
     /// smaller of `limit` and the advertised `page_limit_max`.
     ///
-    /// A page the server stopped at the response body bound ends the assembly, and its cursor
-    /// lands in [`PackageSearchPages::next_cursor`] unfollowed.
-    ///
     /// # Errors
     ///
     /// Returns [`RiftError`] when any page is unavailable, changes revision, repeats an identity,
-    /// or repeats a cursor.
+    /// or reports invalid pagination.
     pub async fn search_packages_pages(
         &self,
         request: &PackageSearchRequest,
@@ -823,22 +829,21 @@ impl GlobalClient {
             operation = "search_packages_pages",
             async {
                 validate_search_request(request)?;
-                validate_page(limit, None)?;
+                validate_numbered_page(limit, 1)?;
                 let capabilities = self.get_capabilities().await?;
                 let limit = advertised_page_limit(limit, &capabilities);
-                validate_search_request_for_capabilities(request, limit, None, &capabilities)?;
+                validate_search_request_for_capabilities(request, limit, &capabilities)?;
                 let candidate_max = bounded_candidate_pool(&capabilities);
-                let mut cursor = None;
+                let mut page_number = 1;
                 let mut hits = Vec::new();
                 let mut warnings = Vec::new();
                 let mut revisions = None;
                 let mut captured_view = None;
                 let mut captured_request = request.clone();
                 let mut seen_identities = HashSet::new();
-                let mut seen_cursors = HashSet::new();
                 loop {
                     let page = self
-                        .search_packages(&captured_request, limit, cursor.as_deref())
+                        .search_packages(&captured_request, limit, page_number)
                         .await?;
                     if let Some(view) = &captured_view {
                         if view != &page.view {
@@ -853,6 +858,7 @@ impl GlobalClient {
                         }
                     } else {
                         captured_request.view = Some(page.view.id.as_str().to_owned());
+                        captured_request.revision = Some(page.revision.clone());
                         captured_view = Some(page.view.clone());
                     }
                     if let Err(error) = validate_assembled_revision(
@@ -863,7 +869,7 @@ impl GlobalClient {
                     ) {
                         return self.observed(Err(error)).await;
                     }
-                    let stopped = stopped_at_body_bound(&page.warnings, page.items.len(), limit);
+                    let pages = page.pagination.pages;
                     extend_warnings(&mut warnings, page.warnings);
                     for hit in page.items {
                         let identity = search_hit_identity(&hit)?;
@@ -879,26 +885,13 @@ impl GlobalClient {
                         }
                         hits.push(hit);
                         if hits.len() >= candidate_max {
-                            return search_pages(hits, warnings, revisions, captured_view, None);
+                            return search_pages(hits, warnings, revisions, captured_view);
                         }
                     }
-                    let Some(next) = page.next_cursor else {
-                        return search_pages(hits, warnings, revisions, captured_view, None);
-                    };
-                    if stopped {
-                        return search_pages(hits, warnings, revisions, captured_view, Some(next));
+                    if page_number >= pages {
+                        return search_pages(hits, warnings, revisions, captured_view);
                     }
-                    if !seen_cursors.insert(next.clone()) {
-                        return self
-                            .observed(Err(failure::response_invalid(
-                                "search_packages_pages",
-                                "cursor_progress",
-                                "field failed validation",
-                                None,
-                            )))
-                            .await;
-                    }
-                    cursor = Some(next);
+                    page_number += 1;
                 }
             }
         )
@@ -1218,7 +1211,6 @@ fn capabilities_bounds_valid(value: &Capabilities) -> bool {
         && (PAGE_LIMIT_MIN..=PAGE_LIMIT_MAX).contains(&bounds.page_limit_min)
         && (PAGE_LIMIT_MIN..=PAGE_LIMIT_MAX).contains(&bounds.page_limit_max)
         && (PAGE_LIMIT_MIN..=PAGE_LIMIT_MAX).contains(&bounds.page_limit_default)
-        && positive_within(bounds.cursor_bytes_max, CURSOR_BYTES_MAX)
         && positive_within(bounds.candidate_pool_max, CANDIDATE_POOL_MAX)
         && positive_within(bounds.warnings_max, WARNINGS_MAX)
         && usize::try_from(rift_protocol::configuration::GLOBAL_SOURCE_BYTES_MAX)
@@ -1355,7 +1347,6 @@ fn validate_resolution_request_for_capabilities(
 fn validate_search_request_for_capabilities(
     request: &PackageSearchRequest,
     limit: i64,
-    cursor: Option<&str>,
     capabilities: &Capabilities,
 ) -> Result<(), RiftError> {
     let target = request
@@ -1411,7 +1402,6 @@ fn validate_search_request_for_capabilities(
     validate_read_bounds(
         request.packages.as_ref().map_or(0, Vec::len),
         limit,
-        cursor,
         capabilities,
     )
 }
@@ -1419,7 +1409,6 @@ fn validate_search_request_for_capabilities(
 fn validate_read_bounds(
     packages: usize,
     limit: i64,
-    cursor: Option<&str>,
     capabilities: &Capabilities,
 ) -> Result<(), RiftError> {
     let bounds = &capabilities.bounds;
@@ -1433,16 +1422,7 @@ fn validate_read_bounds(
     if limit < bounds.page_limit_min || limit > bounds.page_limit_max {
         return Err(failure::request_invalid(
             "validate_read_bounds",
-            "limit",
-            "field failed validation",
-        ));
-    }
-    if cursor
-        .is_some_and(|value| value.len() > smaller_bound(bounds.cursor_bytes_max, CURSOR_BYTES_MAX))
-    {
-        return Err(failure::request_invalid(
-            "validate_read_bounds",
-            "cursor",
+            "max_results",
             "field failed validation",
         ));
     }
@@ -1957,24 +1937,6 @@ fn advertised_page_limit(limit: i64, capabilities: &Capabilities) -> i64 {
     limit.min(capabilities.bounds.page_limit_max)
 }
 
-fn validate_page(limit: i64, cursor: Option<&str>) -> Result<(), RiftError> {
-    if !(PAGE_LIMIT_MIN..=PAGE_LIMIT_MAX).contains(&limit) {
-        return Err(failure::request_invalid(
-            "validate_page",
-            "limit",
-            "field failed validation",
-        ));
-    }
-    if cursor.is_some_and(|value| value.is_empty() || value.len() > CURSOR_BYTES_MAX) {
-        return Err(failure::request_invalid(
-            "validate_page",
-            "cursor",
-            "field failed validation",
-        ));
-    }
-    Ok(())
-}
-
 fn validate_search_page_metadata(
     request: &PackageSearchRequest,
     capabilities: &Capabilities,
@@ -2014,7 +1976,6 @@ fn validate_search_page_metadata(
         analyzer_revision: &page.analyzer_revision,
         corpus_revision: &page.corpus_revision,
         documentation_revision: page.documentation_revision.as_deref(),
-        next_cursor: page.next_cursor.as_deref(),
         warnings: &page.warnings,
     }
     .validate(capabilities, documentation_requested)?;
@@ -2080,7 +2041,6 @@ fn validate_search_page(
     request: &PackageSearchRequest,
     capabilities: &Capabilities,
     page: &PackageSearchPage,
-    cursor: Option<&str>,
     source_bytes_max: usize,
 ) -> Result<(), RiftError> {
     let documentation_requested = validate_search_page_metadata(request, capabilities, page)?;
@@ -2159,14 +2119,6 @@ fn validate_search_page(
                 None,
             ));
         }
-    }
-    if cursor.is_some() && page.items.is_empty() && page.next_cursor.as_deref() == cursor {
-        return Err(failure::response_invalid(
-            "validate_search_page",
-            "cursor_progress",
-            "field failed validation",
-            None,
-        ));
     }
     Ok(())
 }
@@ -2289,7 +2241,6 @@ struct PageMetadata<'a> {
     analyzer_revision: &'a str,
     corpus_revision: &'a str,
     documentation_revision: Option<&'a str>,
-    next_cursor: Option<&'a str>,
     warnings: &'a [Warning],
 }
 
@@ -2332,18 +2283,6 @@ impl PageMetadata<'_> {
                     None,
                 ));
             }
-        }
-        if self.next_cursor.is_some_and(|value| {
-            value.is_empty()
-                || value.len()
-                    > smaller_bound(capabilities.bounds.cursor_bytes_max, CURSOR_BYTES_MAX)
-        }) {
-            return Err(failure::response_invalid(
-                "validate",
-                "cursor",
-                "field failed validation",
-                None,
-            ));
         }
         if self.warnings.len() > smaller_bound(capabilities.bounds.warnings_max, WARNINGS_MAX)
             || !warning_details_within_bound(self.warnings)
@@ -2697,23 +2636,11 @@ fn assembled_revisions(
     revisions.unwrap_or_default()
 }
 
-/// Whether a page ended short of `limit` at the response body bound. The server marks such a
-/// page with `result_truncated` beside a cursor at its first left-out item; a page carrying
-/// `limit` items ended at `limit`, whatever it warns.
-fn stopped_at_body_bound(warnings: &[Warning], item_count: usize, limit: i64) -> bool {
-    let short = i64::try_from(item_count).is_ok_and(|count| count < limit);
-    let marked = warnings
-        .iter()
-        .any(|warning| warning.code == WarningCode::ResultTruncated);
-    short && marked
-}
-
 fn search_pages(
     items: Vec<PackageSearchItem>,
     warnings: Vec<Warning>,
     revisions: Option<(String, String, Option<String>)>,
     view: Option<rift_protocol::symbol_read::CapturedView>,
-    next_cursor: Option<String>,
 ) -> Result<PackageSearchPages, RiftError> {
     let (analyzer_revision, corpus_revision, documentation_revision) =
         assembled_revisions(revisions);
@@ -2726,7 +2653,6 @@ fn search_pages(
         view: view.ok_or_else(|| {
             failure::response_invalid("search_pages", "view", "captured view is absent", None)
         })?,
-        next_cursor,
     })
 }
 
@@ -3075,3 +3001,40 @@ fn active_response_body_bytes_max(
 
 #[cfg(test)]
 mod tests;
+
+fn validate_numbered_page(max_results: i64, page: u64) -> Result<(), RiftError> {
+    if page == 0 {
+        return Err(failure::request_invalid(
+            "validate_page",
+            "page",
+            "expected an integer of at least 1",
+        ));
+    }
+    if !(PAGE_LIMIT_MIN..=PAGE_LIMIT_MAX).contains(&max_results) {
+        return Err(failure::request_invalid(
+            "validate_page",
+            "max_results",
+            "field failed validation",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_pagination(
+    pagination: &rift_protocol::read::Pagination,
+    max_results: u64,
+    page: u64,
+    count: usize,
+) -> Result<(), RiftError> {
+    let expected = rift_protocol::read::Pagination::new(page, max_results, pagination.total);
+    let remaining = pagination.total.saturating_sub(expected.offset() as u64);
+    if pagination != &expected || count as u64 != remaining.min(max_results) {
+        return Err(failure::response_invalid(
+            "validate_page",
+            "pagination",
+            "field failed validation",
+            None,
+        ));
+    }
+    Ok(())
+}

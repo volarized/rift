@@ -131,33 +131,31 @@ fn nested_declarations_keep_their_own_syntax_structure() -> TestResult {
 }
 
 #[test]
-fn declaration_continuation_keeps_syntax_and_refuses_another_symbol_or_revision() -> TestResult {
+fn declaration_page_keeps_syntax_and_refuses_a_source_byte_breach() -> TestResult {
     let (_directory, service) = rust_service()?;
     let id = identity(&service, "dim")?;
     let key = rift_core::SymbolId::new(id.as_str())?;
-    let revision = service.served_revision()?.to_string();
-    let bounds = PageBounds {
-        facets_max: 1,
-        source_bytes_max: 1,
-    };
-    let page =
-        symbol_page(service.index(), (&id, &key), (0, &revision), bounds)?.ok_or("symbol page")?;
-    assert_eq!(page.declarations.len(), 1);
-    assert!(page.declarations[0].syntax.len() > 1);
-    let cursor = super::super::cursor::mint(1, id.as_str(), &service.revisions.index_tree_revision);
+    let error = symbol_page(
+        service.index(),
+        (&id, &key),
+        0,
+        PageBounds {
+            facets_max: 1,
+            source_bytes_max: 1,
+        },
+    )
+    .expect_err("source byte bound");
+    assert_eq!(error.slug(), errors::server::read_unavailable::SLUG);
     let rest = service.facets(&FacetsParams {
-        facet_cursor: Some(cursor.clone()),
+        page: 2,
+        max_results: 1,
         ..FacetsParams::of(id)
     })?;
     assert!(rest.declarations.is_empty());
-    let other = identity(&service, "light")?;
-    let error = service
-        .facets(&FacetsParams {
-            facet_cursor: Some(cursor),
-            ..FacetsParams::of(other)
-        })
-        .expect_err("another symbol refuses");
-    assert_eq!(error.slug(), errors::server::read_invalid::SLUG);
+    assert_eq!(
+        rest.pagination,
+        rift_protocol::read::Pagination::new(2, 1, 1)
+    );
     Ok(())
 }
 
@@ -174,7 +172,7 @@ fn missing_symbol_refuses() -> TestResult {
 }
 
 #[test]
-fn declaration_pages_emit_a_continuation_and_keep_every_syntax_tree() -> TestResult {
+fn declaration_pages_keep_every_syntax_tree() -> TestResult {
     let directory = tempfile::tempdir()?;
     fs::write(
         directory.path().join("Cargo.toml"),
@@ -189,19 +187,22 @@ fn declaration_pages_emit_a_continuation_and_keep_every_syntax_tree() -> TestRes
     let limits = WorkspaceIndexLimits::default().with_read_bounds(32, 4)?;
     let service = service_with_limits(directory.path(), limits)?;
     let id = identity(&service, "tick")?;
-    let first = service.facets(&FacetsParams::of(id.clone()))?;
+    let first = service.facets(&FacetsParams {
+        max_results: 4,
+        ..FacetsParams::of(id.clone())
+    })?;
     assert_eq!(first.declarations.len(), 4);
-    let cursor = first
-        .facet_cursor
-        .clone()
-        .ok_or("declaration continuation")?;
     let second = service.facets(&FacetsParams {
-        facet_cursor: Some(cursor),
+        page: 2,
+        max_results: 4,
         revision: Some(first.revision.clone()),
         ..FacetsParams::of(id)
     })?;
     assert_eq!(second.declarations.len(), 2);
-    assert!(second.facet_cursor.is_none());
+    assert_eq!(
+        second.pagination,
+        rift_protocol::read::Pagination::new(2, 4, 6)
+    );
     assert_eq!(first.revision, second.revision);
     let listed = first
         .declarations

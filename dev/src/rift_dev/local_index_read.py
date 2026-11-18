@@ -170,7 +170,7 @@ async def settled_local(
     >>> answer, count = asyncio.run(read([pending], selection="current", request={"view": "0" * 64}))
     >>> answer is pending, count
     (True, 1)
-    >>> answer, count = asyncio.run(read([pending], request={"query": "SELECT ?symbol { SERVICE <urn:rift:result:" + "0" * 64 + "> {} }"}))
+    >>> answer, count = asyncio.run(read([pending], request={"query": "SELECT ?symbol { ?symbol a :Symbol }", "page": 2}))
     >>> answer is pending, count
     (True, 1)
     >>> refused = {"outcome": "unavailable", "reason": "insufficient_coverage"}

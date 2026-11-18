@@ -216,7 +216,7 @@ fn saved_backends(bytes: &[u8]) -> Result<Vec<SavedCandidateBackend>, RiftError>
 pub(crate) fn normalized_params(params: &SearchParams) -> SearchParams {
     let mut normalized = params.clone();
     normalized.view = None;
-    normalized.page_index = 0;
+    normalized.page = 1;
     normalized
 }
 
@@ -441,7 +441,7 @@ impl RiftProxy {
             }
             let mut selected = params.clone();
             selected.view = None;
-            selected.page_index = 0;
+            selected.page = 1;
             selected.scope = if name == "local" {
                 params.scope.clone()
             } else {
@@ -672,7 +672,8 @@ mod tests {
     use std::error::Error as _;
 
     fn params() -> SearchParams {
-        serde_json::from_value(json!({"query":"beacon","scope":"all","limit":2})).expect("search")
+        serde_json::from_value(json!({"query":"beacon","scope":"all","max_results":2}))
+            .expect("search")
     }
 
     #[test]
@@ -918,7 +919,7 @@ mod tests {
         assert_eq!(view.expires_at, captured.pools[1].view.expires_at);
         let mut request = params();
         request.view = Some(view.id.clone());
-        request.page_index = 20;
+        request.page = 20;
         let saved = store
             .selected(&request, now)
             .expect("lookup")
@@ -939,9 +940,9 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH;
         let view = store.save(&params(), &captured(), now).expect("capture");
         for changed in [
-            json!({"query":"other","scope":"all","limit":2}),
-            json!({"query":"beacon","scope":"local","limit":2}),
-            json!({"query":"beacon","scope":"all","limit":3}),
+            json!({"query":"other","scope":"all","max_results":2}),
+            json!({"query":"beacon","scope":"local","max_results":2}),
+            json!({"query":"beacon","scope":"all","max_results":3}),
         ] {
             let mut request: SearchParams = serde_json::from_value(changed).expect("search");
             request.view = Some(view.id.clone());

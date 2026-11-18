@@ -13,20 +13,15 @@ use rift_syntax::{ByteRange, SyntaxDocument, SyntaxHolder, SyntaxPlace};
 /// symbol it binds and its ordinal among that symbol's declarations.
 pub(crate) type DeclarationAddresses = [Option<(rift_core::SymbolId, usize)>];
 
-/// The offset `cursor` resumes at, refused when it was minted for another answer or tree.
-pub(crate) fn cursor_offset(cursor: &str, key: &str, revision: &str) -> Result<usize, RiftError> {
-    super::cursor::offset(cursor, "facet_cursor", key, revision)
-}
-
-/// One page of an answer's facets, and the cursor resuming it when facets remain.
+/// One page of an answer's facets and its complete result count.
 #[derive(Debug)]
 pub(crate) struct FacetsPage {
     /// The symbol whose declarations hold the facets.
     pub(crate) symbol: SymbolId,
     /// Declarations of this page, in binding order.
     pub(crate) declarations: Vec<rift_protocol::facets_read::FacetDeclaration>,
-    /// Continuation for the facets past this page.
-    pub(crate) facet_cursor: Option<String>,
+    /// Total declarations of this symbol.
+    pub(crate) total: usize,
 }
 
 /// Bounds one page of a read: its declaration count and its source bytes.
@@ -36,21 +31,6 @@ pub(crate) struct PageBounds {
     pub(crate) facets_max: usize,
     /// Most source bytes the facets of one page carry together.
     pub(crate) source_bytes_max: u64,
-}
-
-impl PageBounds {
-    /// The bounds a served read applies: `results_max` facets, [`FACETS_SOURCE_BYTES_MAX`]
-    /// source bytes.
-    pub(crate) const fn served(results_max: usize) -> Self {
-        Self {
-            facets_max: if results_max < rift_protocol::read::FACETS_DECLARATIONS_MAX {
-                results_max
-            } else {
-                rift_protocol::read::FACETS_DECLARATIONS_MAX
-            },
-            source_bytes_max: FACETS_SOURCE_BYTES_MAX,
-        }
-    }
 }
 
 /// The index a `facets` read numbers facets against: the current publication or a captured
@@ -208,24 +188,28 @@ impl PlacedDocument {
 pub(crate) fn symbol_page(
     index: &impl FacetIndex,
     (id, key): (&SymbolId, &rift_core::SymbolId),
-    (offset, revision): (usize, &str),
+    offset: usize,
     bounds: PageBounds,
 ) -> Result<Option<FacetsPage>, RiftError> {
-    let (bindings, total) = index.bindings(key, offset)?;
+    let (mut bindings, total) = index.bindings(key, offset)?;
+    for _ in 0..bounds.facets_max {
+        if bindings.len() >= bounds.facets_max || offset.saturating_add(bindings.len()) >= total {
+            break;
+        }
+        let (next, _) = index.bindings(key, offset.saturating_add(bindings.len()))?;
+        if next.is_empty() {
+            break;
+        }
+        bindings.extend(next);
+    }
     if total == 0 {
         return Ok(None);
     }
     let mut documents: BTreeMap<&CoreProjectPath, PlacedDocument> = BTreeMap::new();
     let mut declarations = Vec::new();
     let mut source_bytes = 0_u64;
-    let next = offset.saturating_add(bindings.len());
-    let mut facet_cursor = (next < total).then(|| super::cursor::mint(next, id.as_str(), revision));
-    for (position, matched) in bindings.iter().enumerate() {
+    for (position, matched) in bindings.iter().take(bounds.facets_max).enumerate() {
         let ordinal = offset.saturating_add(position);
-        if declarations.len() >= bounds.facets_max && !declarations.is_empty() {
-            facet_cursor = Some(super::cursor::mint(ordinal, id.as_str(), revision));
-            break;
-        }
         let path = matched.file.path();
         let placed = match documents.entry(path) {
             Entry::Occupied(parsed) => parsed.into_mut(),
@@ -241,11 +225,9 @@ pub(crate) fn symbol_page(
             continue;
         };
         let bytes = placed.source_bytes(position);
-        let crosses = declarations.len() >= bounds.facets_max
-            || source_bytes.saturating_add(bytes) > bounds.source_bytes_max;
-        if crosses && !declarations.is_empty() {
-            facet_cursor = Some(super::cursor::mint(ordinal, id.as_str(), revision));
-            break;
+        if source_bytes.saturating_add(bytes) > bounds.source_bytes_max {
+            return errors::server::read_unavailable().operation("facets")
+                .detail("the page's syntax source exceeds the accepted source byte bound; reduce max_results").fail();
         }
         if bytes > FACETS_SOURCE_BYTES_MAX {
             return errors::server::read_unavailable()
@@ -261,7 +243,7 @@ pub(crate) fn symbol_page(
     Ok(Some(FacetsPage {
         symbol: id.clone(),
         declarations,
-        facet_cursor,
+        total,
     }))
 }
 

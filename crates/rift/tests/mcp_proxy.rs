@@ -1110,10 +1110,15 @@ async fn both_proxies_write_the_same_text_and_continue_retained_pages() -> TestR
                 .as_ref()
                 .ok_or("all proxy must return structured content")?;
             assert_proxy_texts(&all, &text, &request, &all_result, &text_result).await?;
-            let Some(next_query) = reference["pagination"]["next_query"].as_str() else {
+            let page = reference["pagination"]["page"].as_u64().unwrap_or(1);
+            let pages = reference["pagination"]["pages"].as_u64().unwrap_or(0);
+            if page >= pages {
                 break;
-            };
-            request = json!({"query": next_query});
+            }
+            request["page"] = json!(page + 1);
+            if let Some(revision) = reference.get("revision") {
+                request["revision"] = revision.clone();
+            }
         }
     }
 
@@ -1151,41 +1156,35 @@ async fn assert_paged_index_text(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     result: &CallToolResult,
 ) -> TestResult {
-    use rift_protocol::query::{QueryConfiguration, QueryReadResult};
-    use rift_search::sparql::{GraphLimits, GraphQuery};
-
-    let (body, next_query) = text_of(result)?
-        .split_once("next query · ")
-        .ok_or("paged query text needs a continuation")?;
-    let next_query = next_query.trim_end();
-    let page_size = QueryConfiguration::default().page_size;
+    let max_results = rift_protocol::read::MAX_RESULTS_DEFAULT;
     let mut expected = String::from("?index\n");
-    for index in 0..page_size {
+    for index in 0..max_results {
         writeln!(expected, "{index}")?;
     }
-    expected.push_str("page 1/2\n");
-    assert_eq!(body, expected);
-
-    let selection = GraphQuery::parse(next_query, &GraphLimits::default())?
-        .page_selection()
-        .ok_or("next query selects a retained page")?;
-    assert_eq!(selection.page, 1);
-    let held = proxied_result(client, "search", &json!({"query": next_query})).await?;
-    assert_ne!(held.is_error, Some(true), "{held:?}");
-    assert_eq!(text_of(&held)?, format!("?index\n{page_size}\npage 2/2\n"));
-
-    if let Some(structured) = &result.structured_content {
-        let QueryReadResult::Results(own) = serde_json::from_value(structured.clone())? else {
-            return Err("paged index query returns structured bindings".into());
-        };
-        let view = own.view.ok_or("the first page retains a view")?;
-        assert_eq!(view.id, selection.view);
-        assert_eq!(own.pagination.next_query.as_deref(), Some(next_query));
-        let retained = held
-            .structured_content
-            .ok_or("the second page has structured content")?;
-        assert_eq!(retained["view"], serde_json::to_value(view)?);
+    let total = max_results + 1;
+    writeln!(expected, "page 1/2, total {total} results")?;
+    assert_eq!(text_of(result)?, expected);
+    let query = format!(
+        "SELECT ?index {{ VALUES ?index {{ {} }} }} ORDER BY ?index",
+        (0..=max_results)
+            .map(|index| index.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let mut request = json!({"query":query,"page":2,"max_results":max_results});
+    if let Some(revision) = result
+        .structured_content
+        .as_ref()
+        .and_then(|answer| answer.get("revision"))
+    {
+        request["revision"] = revision.clone();
     }
+    let held = proxied_result(client, "search", &request).await?;
+    assert_ne!(held.is_error, Some(true), "{held:?}");
+    assert_eq!(
+        text_of(&held)?,
+        format!("?index\n{max_results}\npage 2/2, total {total} results\n")
+    );
     Ok(())
 }
 
@@ -1978,8 +1977,7 @@ async fn live_proxied_read_resolves_incoming_references() -> TestResult {
 }
 
 #[tokio::test]
-async fn proxy_query_syntax_elements_and_source_keep_recorded_bytes_after_index_removal()
--> TestResult {
+async fn proxy_query_refuses_a_revision_after_index_removal() -> TestResult {
     use workspace_client::query;
     let directory = laid_out_workspace(
         &[
@@ -2018,7 +2016,7 @@ async fn proxy_query_syntax_elements_and_source_keep_recorded_bytes_after_index_
     )
     .await?;
     assert_eq!(syntax_elements["declarations"][0]["source"]["text"], source);
-    let replay = query::retained_page(&original, 0)?;
+    let pinned = serde_json::to_value(query::result_page(&request, &original, 1)?)?;
     for removed in [false, true] {
         if removed {
             fs::remove_file(root.join("lib.rs"))?;
@@ -2043,12 +2041,18 @@ async fn proxy_query_syntax_elements_and_source_keep_recorded_bytes_after_index_
             observed,
             "current index must observe the edit or removal before the held read"
         );
-        let held = proxied_call(&client, "search", &json!({"query":replay})).await?;
+        let failure = workspace_client::failed_call(
+            client
+                .call_tool(
+                    CallToolRequestParams::new("search")
+                        .with_arguments(pinned.as_object().cloned().ok_or("pinned request")?),
+                )
+                .await,
+        )?;
         assert_eq!(
-            held["answer"], original["answer"],
-            "retained syntax element source and range"
+            failure.code,
+            rift_protocol::error::ErrorCode::ResourceNotFound
         );
-        assert_eq!(held["view"], original["view"], "retained view and expiry");
     }
     client.cancel().await?;
     failure_window.passed();

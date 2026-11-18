@@ -186,7 +186,7 @@ fn render_result(
     result: &QueryResult,
     display: &QueryDisplay,
 ) -> Result<(), TextError> {
-    let page = &result.pagination.page;
+    let page = result.pagination.as_ref();
     let terms = Terms {
         blank_prefix: display.blank_prefix.max(BLANK_PREFIX_MIN),
     };
@@ -204,22 +204,23 @@ fn render_result(
             QueryPresentation::Flows(fields) => {
                 let page = FlowPage {
                     multiple_flows: display.multiple_flows,
-                    linked_pages: page.total_pages > 1,
+                    linked_pages: page.is_some_and(|page| page.pages > 1),
                 };
                 flows(out, &terms, variables, bindings, fields, page)?;
             }
             QueryPresentation::Raw => bindings_table(out, &terms, variables, bindings)?,
         },
         QueryAnswer::Graph { triples } => {
-            graph(out, &terms, triples, page.total_pages == 1)?;
+            graph(
+                out,
+                &terms,
+                triples,
+                page.is_none_or(|page| page.pages == 1),
+            )?;
         }
     }
-    if page.total_pages > 1 {
-        let page_number = page.page_index.saturating_add(1);
-        out.raw_line(0, &format!("page {page_number}/{}", page.total_pages))?;
-    }
-    if let Some(next) = &result.pagination.next_query {
-        out.raw_line(0, &format!("next query · {next}"))?;
+    if let Some(page) = page.and_then(super::layout::page_fact) {
+        out.raw_line(0, &page)?;
     }
     write_query_warnings(out, &result.warnings)
 }
@@ -603,7 +604,7 @@ mod tests {
                     { "blank": { "type": "blank_node", "value": "first-retained-label" } }
                 ]
             },
-            "pagination": { "page_index": 0, "total_pages": 1 },
+            "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 10},
             "view": { "id": "retained.answer", "expires_at": "2030-01-01T00:15:00Z" }
         }))?;
         assert_eq!(
@@ -616,10 +617,10 @@ mod tests {
     #[test]
     fn graph_text_omits_only_an_isolated_blank_subject_label()
     -> Result<(), Box<dyn std::error::Error>> {
-        let query = |triples, total_pages| {
+        let query = |triples, pages| {
             raw_answer(serde_json::json!({
                 "answer": { "result": "graph", "triples": triples },
-                "pagination": { "page_index": 0, "total_pages": total_pages }
+                "pagination": { "page": 1, "pages": pages, "max_results": 1, "total": pages }
             }))
         };
         let blank = serde_json::json!({ "type": "blank_node", "value": "anonymous" });
@@ -640,7 +641,7 @@ mod tests {
         );
         assert_eq!(
             query(vec![triple.clone(), count], 2)?,
-            "_:anonymous :name \"Rift\" .\n_:anonymous :count 7 .\npage 1/2\n"
+            "_:anonymous :name \"Rift\" .\n_:anonymous :count 7 .\npage 1/2, total 2 results\n"
         );
         let reference = serde_json::json!({
             "subject": { "type": "blank_node", "value": "other" },
@@ -711,16 +712,19 @@ mod tests {
                 .to_vec(),
             bindings,
         };
-        let page = |bindings, retained, page_index, total_pages| {
+        let page = |bindings, retained, page: u64, pages: u64| {
             let result = QueryOutput::new(
                 QueryReadResult::Results(Box::new(QueryResult {
                     answer: answer(bindings),
                     pagination: rift_protocol::read::Pagination {
-                        page_index,
-                        total_pages,
+                        page: page + 1,
+                        pages,
+                        max_results: 1,
+                        total: pages,
                     }
                     .into(),
                     view: None,
+                    revision: None,
                     warnings: Vec::new(),
                 })),
                 QueryDisplay::selected(&answer(retained), presentation.clone()),
@@ -734,7 +738,7 @@ mod tests {
                 1,
                 2
             )?,
-            "Call path | score 1\n\t2 → retry | rift://symbol/local/rust/app/retry\npage 2/2\n"
+            "Call path | score 1\n\t2 → retry | rift://symbol/local/rust/app/retry\npage 2/2, total 2 results\n"
         );
         let retained = vec![first.clone(), second, later.clone()];
         let multiple = page(retained.clone(), retained.clone(), 0, 1)?;
@@ -772,7 +776,7 @@ mod tests {
             bindings: vec![row(first.clone()), row(second.clone()), row(first.clone())],
         };
         let display = QueryDisplay::selected(&full, QueryPresentation::Raw);
-        let page = |page_index, value| {
+        let page = |page, value| {
             QueryOutput::new(
                 QueryReadResult::Results(Box::new(QueryResult {
                     answer: QueryAnswer::Bindings {
@@ -780,11 +784,14 @@ mod tests {
                         bindings: vec![row(value)],
                     },
                     pagination: rift_protocol::read::Pagination {
-                        page_index,
-                        total_pages: 3,
+                        page,
+                        pages: 3,
+                        max_results: 10,
+                        total: 0,
                     }
                     .into(),
                     view: None,
+                    revision: None,
                     warnings: Vec::new(),
                 })),
                 display.clone(),

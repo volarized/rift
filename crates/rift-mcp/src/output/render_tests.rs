@@ -91,10 +91,12 @@ fn rust() -> Language {
     }
 }
 
-fn pagination(page_index: u64, total_pages: u64) -> Pagination {
+fn pagination(page: u64, pages: u64) -> Pagination {
     Pagination {
-        page_index,
-        total_pages,
+        page: page.saturating_add(1),
+        pages,
+        max_results: 10,
+        total: pages.saturating_mul(10),
     }
 }
 
@@ -375,7 +377,7 @@ fn the_owner_search_example_with_two_hits_on_the_first_of_three_pages() {
     golden(
         &owner_search_page(),
         &[
-            "2 results · page 1/3",
+            "2 results",
             "\t[1] pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
             "\t\tsrc/config.rs:10 · name",
             "\t\trift://symbol/local/rust/app/config/load_config",
@@ -414,7 +416,7 @@ fn the_authored_search_examples_render_as_the_layout_shows() {
     golden(
         &example::<SearchResult>(0),
         &[
-            "2 results · page 1/3",
+            "2 results",
             "\t[1] pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
             "\t\tsrc/config.rs:10 · name",
             "\t\trift://symbol/local/rust/app/config/load_config",
@@ -499,7 +501,7 @@ fn several_results_on_one_page_have_markers_and_indent_and_no_page() {
 }
 
 #[test]
-fn the_page_follows_the_page_index() {
+fn the_page_follows_the_page() {
     let item = || placed_symbol_hit(symbol(Some(A_ID), "A"));
     let body = [
         "\tstruct A",
@@ -513,9 +515,18 @@ fn the_page_follows_the_page_index() {
         lines.extend(body);
         lines
     };
-    golden(&page(0, 3), &expect("1 result · page 1/3"));
-    golden(&page(1, 3), &expect("1 result · page 2/3"));
-    golden(&page(2, 3), &expect("1 result · page 3/3"));
+    golden(
+        &page(0, 3),
+        &expect("1 result · page 1/3, total 30 results"),
+    );
+    golden(
+        &page(1, 3),
+        &expect("1 result · page 2/3, total 30 results"),
+    );
+    golden(
+        &page(2, 3),
+        &expect("1 result · page 3/3, total 30 results"),
+    );
     golden(&page(0, 1), &expect("1 result"));
 }
 
@@ -523,24 +534,29 @@ fn the_page_follows_the_page_index() {
 fn a_page_past_the_end_names_the_page() {
     golden(
         &search_result(Vec::new(), pagination(5, 3), Vec::new()),
-        &["0 results · page 6/3"],
+        &["0 results · page 6/3, total 30 results"],
     );
     golden(
         &search_result(Vec::new(), pagination(3, 3), Vec::new()),
-        &["0 results · page 4/3"],
+        &["0 results · page 4/3, total 30 results"],
     );
     golden(
         &search_result(Vec::new(), pagination(4, 0), Vec::new()),
-        &["0 results"],
+        &["0 results · page 5/0, total 0 results"],
     );
 }
 
 #[test]
-fn the_largest_page_index_renders_without_overflow() {
+fn the_largest_page_renders_without_overflow() {
     let answer = search_result(Vec::new(), pagination(u64::MAX, u64::MAX), Vec::new());
     assert_eq!(
         rendered(&answer),
-        format!("0 results · page {}/{}\n", u64::MAX, u64::MAX)
+        format!(
+            "0 results · page {}/{}, total {} results\n",
+            u64::MAX,
+            u64::MAX,
+            u64::MAX
+        )
     );
 }
 
@@ -2455,7 +2471,7 @@ fn warnings_leave_symbol_page_text_unchanged() {
     golden(
         &answer,
         &[
-            "1 result · page 2/4",
+            "1 result · page 2/4, total 40 results",
             "\tstruct A",
             "\ta.rs:1",
             "\trift://symbol/local/rust/app/a/A",
@@ -2758,7 +2774,7 @@ fn a_workspace_value_holding_a_delimiter_is_quoted_and_others_stay_bare() {
             {"path": "x: y.py", "digest": "8a4d20bc"},
             {"path": "a:b·c.py", "digest": "8a4d20bc"}
         ],
-        "pagination": {"page_index": 0, "total_pages": 1}
+        "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 10}
     }))
     .expect("the workspace fixture deserializes");
     golden(
@@ -3027,10 +3043,10 @@ fn facets_render_declaration_location_source_and_syntax() {
 fn facets_render_empty_declarations_and_continuation() {
     let mut answer = example::<FacetsResult>(0);
     answer.declarations.clear();
-    answer.facet_cursor = Some("cursor".to_owned());
+    answer.pagination = Pagination::new(2, 10, 20);
     let text = rendered(&answer);
     assert!(text.contains("No declaration source available."));
-    assert!(text.contains("facet_cursor cursor"));
+    assert!(text.contains("page 2/2, total 20 results"));
 }
 
 #[test]
@@ -3532,7 +3548,7 @@ fn canonical_symbol_render_keeps_source_less_object_without_physical_bindings() 
         symbol: Box::new(symbol(Some(id.as_str()), "A")),
         revision: tree_revision(),
         declarations: Vec::new(),
-        declaration_cursor: None,
+        pagination: Pagination::new(1, 10, 0),
         history: None,
         documentation: None,
         warnings: Vec::new(),
@@ -3563,7 +3579,7 @@ fn canonical_symbol_render_keeps_binding_location_and_declaration_continuation()
         }],
         symbol: Box::new(logical),
         revision: tree_revision(),
-        declaration_cursor: Some("opaque-continuation".to_owned()),
+        pagination: Pagination::new(1, 1, 2),
         history: None,
         documentation: None,
         warnings: Vec::new(),
@@ -3571,7 +3587,7 @@ fn canonical_symbol_render_keeps_binding_location_and_declaration_continuation()
     let text = rendered(&answer);
     assert!(text.contains("a.rs:1"));
     assert!(text.contains(&format!("0..{}", source.len())));
-    assert!(text.contains("declaration_cursor opaque-continuation"));
+    assert!(text.contains("page 1/2, total 2 results"));
 }
 
 #[test]

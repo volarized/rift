@@ -199,13 +199,13 @@ pub(super) fn counted<N: Copy + Display + PartialEq + From<u8>>(count: N, noun: 
 
 /// `page P/T` when the answer has several pages or lies past the last, else nothing.
 pub(super) fn page_fact(pagination: &Pagination) -> Option<String> {
-    let Pagination {
-        page_index,
-        total_pages,
-    } = pagination;
-    let past_the_end = *total_pages > 0 && page_index >= total_pages;
-    (*total_pages > 1 || past_the_end)
-        .then(|| format!("page {}/{total_pages}", page_index.saturating_add(1)))
+    if pagination.pages <= 1 && pagination.page == 1 {
+        return None;
+    }
+    Some(format!(
+        "page {}/{}, total {} results",
+        pagination.page, pagination.pages, pagination.total
+    ))
 }
 
 /// The named sections of a resource, directly under its header line.

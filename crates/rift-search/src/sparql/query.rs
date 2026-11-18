@@ -140,11 +140,7 @@ impl GraphQuery {
         let parser = predeclared_parser();
         match parser.parse_query(text) {
             Ok(mut query) => {
-                let admission = if super::page::selection(&query).is_some() {
-                    Admission::default()
-                } else {
-                    admit(&mut query, limits)?
-                };
+                let admission = admit(&mut query, limits)?;
                 Ok(Self { query, admission })
             }
             Err(_)

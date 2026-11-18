@@ -363,9 +363,9 @@ async fn target_symbol_answers_each_declaration_holding_a_match_once() -> TestRe
 #[tokio::test]
 async fn orders_other_than_relevance_sort_the_hits() -> TestResult {
     let (_directory, service) = fixture()?;
-    let request = params(json!({"pattern": "(?i)todo", "order": "path", "limit": 2}))?;
+    let request = params(json!({"pattern": "(?i)todo", "order": "path", "max_results": 2}))?;
     let first = service.search(&request, &StoreAnswer::identifier_only())?;
-    assert_eq!(first.pagination.total_pages, 2);
+    assert_eq!(first.pagination.pages, 2);
     assert_eq!(first.results.len(), 2);
     let request = params(json!({"pattern": "(?i)todo", "order": "identity"}))?;
     let identity = service.search(&request, &StoreAnswer::identifier_only())?;
@@ -490,7 +490,7 @@ fn a_package_scope_answers_the_project_side_of_a_pattern() -> TestResult {
     assert_eq!(search("all")?.results, local.results);
     let global = search("global")?;
     assert!(global.results.is_empty(), "{global:#?}");
-    assert_eq!(global.pagination.total_pages, 0);
+    assert_eq!(global.pagination.pages, 0);
     Ok(())
 }
 
@@ -682,15 +682,12 @@ fn a_file_past_the_matches_bound_is_cut_and_warned_apart_from_the_result_bound()
     fs::write(directory.path().join("once.txt"), "x;\n")?;
     let service = service_over(directory.path())?;
     let bounds = bounds_with(|search| search.pattern_matches_per_file = 20);
-    let request = params(json!({"pattern": "x;", "limit": 10}))?;
+    let request = params(json!({"pattern": "x;", "max_results": 10}))?;
     let result = service.search(
         &request,
         &StoreAnswer::identifier_only().with_pattern_bounds(bounds),
     )?;
-    assert_eq!(
-        result.pagination.total_pages, 3,
-        "20 cut matches and one whole"
-    );
+    assert_eq!(result.pagination.pages, 3, "20 cut matches and one whole");
     assert_eq!(
         result.warnings,
         [ReadWarning::PatternMatchesTruncated {
@@ -719,7 +716,7 @@ fn verification_stops_at_the_result_bound_and_warns() -> TestResult {
         &TextFileInclusion::new(include, CHUNK_BYTES),
         HistoryConfiguration::default(),
     )?;
-    let request = params(json!({"pattern": "x;", "limit": 10}))?;
+    let request = params(json!({"pattern": "x;", "max_results": 10}))?;
     let result = service.search(&request, &StoreAnswer::identifier_only())?;
     let paths: Vec<String> = located(&result)
         .into_iter()

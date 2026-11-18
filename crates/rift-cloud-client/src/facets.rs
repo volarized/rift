@@ -7,9 +7,8 @@ use rift_protocol::{
 };
 
 use crate::{
-    CURSOR_BYTES_MAX, GlobalClient, PAGE_LIMIT_MAX, active_response_body_bytes_max, contract,
-    failure, response, serialize_body, smaller_bound, supports_feature,
-    validate_body_for_capabilities,
+    GlobalClient, PAGE_LIMIT_MAX, active_response_body_bytes_max, contract, failure, response,
+    serialize_body, smaller_bound, supports_feature, validate_body_for_capabilities,
 };
 
 /// The capability feature a global API advertises when it serves `/v1/facets`.
@@ -50,15 +49,6 @@ impl GlobalClient {
                 return Err(failure::configuration_invalid(
                     "feature",
                     &format!("global API does not advertise feature: {FACETS_FEATURE}"),
-                ));
-            }
-            if request.facet_cursor.as_ref().is_some_and(|cursor| {
-                cursor.len() > smaller_bound(capabilities.bounds.cursor_bytes_max, CURSOR_BYTES_MAX)
-            }) {
-                return Err(failure::request_invalid(
-                    "facets",
-                    "facet_cursor",
-                    "field failed validation",
                 ));
             }
             let body = serialize_body(request, self.inner.config.max_request)?;
@@ -117,12 +107,11 @@ fn validate_request(request: &FacetsParams) -> Result<RequestedSymbol<'_>, RiftE
     if let Some((field, _)) = unserved.into_iter().find(|(_, present)| *present) {
         return Err(invalid(field));
     }
-    if request
-        .facet_cursor
-        .as_ref()
-        .is_some_and(|cursor| cursor.is_empty() || cursor.len() > CURSOR_BYTES_MAX)
-    {
-        return Err(invalid("facet_cursor"));
+    if request.page == 0 {
+        return Err(invalid("page"));
+    }
+    if !(1..=rift_protocol::read::FACETS_MAX_RESULTS).contains(&request.max_results) {
+        return Err(invalid("max_results"));
     }
     Ok(RequestedSymbol { id, identity })
 }
@@ -141,7 +130,8 @@ fn valid_result(
     result: &FacetsResult,
     bounds: &FacetsPageBounds,
 ) -> bool {
-    let within_page = result.declarations.len() <= bounds.facets_max;
+    let within_page = result.declarations.len() <= bounds.facets_max
+        && result.declarations.len() as u64 <= request.max_results;
     let ordered = result
         .declarations
         .windows(2)
@@ -179,9 +169,21 @@ fn valid_result(
         });
     let within_source = result.declarations.len() <= 1
         || source_bytes.is_some_and(|total| total <= FACETS_SOURCE_BYTES_MAX);
-    let cursor_valid = result.facet_cursor.as_ref().is_none_or(|cursor| {
-        !result.declarations.is_empty() && !cursor.is_empty() && cursor.len() <= CURSOR_BYTES_MAX
-    });
+    let pagination_valid = super::validate_pagination(
+        &result.pagination,
+        request.max_results,
+        request.page,
+        result.declarations.len(),
+    )
+    .is_ok()
+        && result.pagination.page == request.page
+        && result.pagination.max_results == request.max_results
+        && result.pagination
+            == rift_protocol::read::Pagination::new(
+                request.page,
+                request.max_results,
+                result.pagination.total,
+            );
     let revision_valid = result.revision.answers_for(symbol.identity.owner())
         && request
             .revision
@@ -191,7 +193,7 @@ fn valid_result(
         && ordered
         && declarations_valid
         && within_source
-        && cursor_valid
+        && pagination_valid
         && revision_valid
         && result.symbol == *symbol.id
 }

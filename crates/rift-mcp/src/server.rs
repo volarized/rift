@@ -2357,7 +2357,7 @@ impl RiftMcp {
     }
 
     /// Reads one logical symbol by its canonical `id` at one `revision`; the answer names the
-    /// revision it read, and `declaration_cursor` continues its declarations at that revision.
+    /// revision it read, and `page` selects its declarations at that revision.
     /// A complete exact miss returns `symbol_not_found` and up to three alternatives.
     /// An unavailable selection returns its typed cause. A found symbol carries its facts and
     /// each declaration's location; `facets` with `symbol` reads a declaration's source. Use
@@ -2712,8 +2712,8 @@ impl RiftMcp {
             .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))?;
 
         let mut collected = params.clone();
-        collected.limit = Some(rift_protocol::read::PAGE_LIMIT_MAX);
-        collected.page_index = 0;
+        collected.max_results = Some(rift_protocol::read::PAGE_LIMIT_MAX);
+        collected.page = 1;
         let mut local = self
             .current_tree_search_selected(&resolved, collected, answer, references)
             .await?
@@ -2764,8 +2764,8 @@ impl RiftMcp {
         let limit = rift_server::search_page_limit(&params)
             .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))?;
         let mut collected = params.clone();
-        collected.limit = Some(rift_protocol::read::PAGE_LIMIT_MAX);
-        collected.page_index = 0;
+        collected.max_results = Some(rift_protocol::read::PAGE_LIMIT_MAX);
+        collected.page = 1;
         let mut local = self
             .current_tree_search_selected(&resolved, collected, answer, references)
             .await?
@@ -3358,7 +3358,7 @@ impl RiftMcp {
 
     /// Reads every declaration of `symbol` with its location, source, and syntax structure.
     /// The result includes each declaration's syntax tree.
-    /// Use `facet_cursor` with the same symbol and revision to continue declarations.
+    /// Use `page` with the same symbol and revision to continue declarations.
     /// Use `revision` to read a commit or release, or to pin the served working tree.
     #[tool]
     async fn facets(
@@ -4120,7 +4120,7 @@ impl RiftMcp {
 impl RiftMcp {
     /// Answers one `rift://workspace` read from the current publication.
     async fn read_workspace(&self, uri: &str) -> Result<ReadResourceResult, ErrorData> {
-        let page_index = resource::workspace_page_index(uri)?;
+        let (page, max_results) = resource::workspace_page(uri)?;
         self.ensure_workspace_root().await?;
         let current = Arc::clone(&read_published(&self.published).await.current);
         let configuration = current
@@ -4132,12 +4132,9 @@ impl RiftMcp {
         let pool = self.engine_pool_for(&current).await;
         let languages = workspace_languages(&current, &configuration, &pool)?;
         let source_digests = &current.visible_digests;
-        let page_size = rift_protocol::workspace::WORKSPACE_SOURCE_UNITS_MAX;
-        let total_pages = source_digests.len().div_ceil(page_size);
-        let start = usize::try_from(page_index)
-            .ok()
-            .and_then(|page| page.checked_mul(page_size))
-            .unwrap_or(source_digests.len());
+        let pagination = Pagination::new(page, max_results, source_digests.len() as u64);
+        let page_size = usize::try_from(max_results).expect("accepted workspace count fits usize");
+        let start = pagination.offset();
         let page_source = source_digests
             .iter()
             .skip(start)
@@ -4173,10 +4170,7 @@ impl RiftMcp {
                 .and_then(super::validation::LocalIndexPreparation::warning)
                 .into_iter()
                 .collect(),
-            pagination: Pagination {
-                page_index,
-                total_pages: u64::try_from(total_pages).unwrap_or(u64::MAX),
-            },
+            pagination,
         };
         resource::rendered_workspace(uri, &page)
     }
@@ -7019,7 +7013,6 @@ done
             declarations[0]["range"],
             json!({"start": 0, "end": "pub fn beacon() {}".len()})
         );
-        assert!(structured.get("declaration_cursor").is_none());
         assert!(structured.get("view").is_none());
         assert!(structured["revision"].as_str().is_some());
 
@@ -7425,7 +7418,7 @@ done
         let result = client
             .call_tool(
                 CallToolRequestParams::new("get_symbol")
-                    .with_arguments(arguments(&json!({"id": id, "declaration_limit": 0}))?),
+                    .with_arguments(arguments(&json!({"id": id, "max_results": 0}))?),
             )
             .await?;
         client.cancel().await?;
@@ -7434,8 +7427,8 @@ done
         assert_eq!(
             text,
             "1 error\n\tinvalid_request · retry never\n\
-             \t\tthe request does not match the documented form: field limit, \
-             violation zero; \
+             \t\tthe request does not match the documented form: field max_results, \
+             violation expected 1..=10000, received 0; \
              correct the reported field and resend the request\n\
              \t\trift.server.read_invalid\n"
         );
@@ -7462,7 +7455,10 @@ done
         let result =
             failing_call(&json!({"query": "ASK {}", "path": "src/lib.rs"}), "search").await?;
         let text = assert_error_result(&result, "invalid_request")?;
-        assert!(text.contains("accepted language, query"), "{text}");
+        assert!(
+            text.contains("accepted language, max_results, page, query, revision"),
+            "{text}"
+        );
         assert!(text.contains("tool search"), "{text}");
         assert!(text.contains("example {"), "{text}");
         assert!(
@@ -10034,7 +10030,7 @@ done
         );
         assert_eq!(
             body["pagination"],
-            serde_json::json!({ "page_index": 0, "total_pages": 1 })
+            serde_json::json!({"page": 1, "pages": 1, "max_results": 10, "total": 2})
         );
         Ok(())
     }
@@ -10634,8 +10630,8 @@ done
             .await?;
         assert_ne!(response.is_error, Some(true));
         for parameters in [
-            json!({"id": id, "declaration_limit": 0}),
-            json!({"id": id, "declaration_limit": false}),
+            json!({"id": id, "max_results": 0}),
+            json!({"id": id, "max_results": false}),
         ] {
             let refused = client
                 .call_tool(
@@ -11584,8 +11580,9 @@ done
         query: &str,
         limit: u64,
     ) -> TestResult<SearchResult> {
-        let params: SearchParams = serde_json::from_value(json!({"query": query, "limit": limit}))
-            .expect("test search parameters must deserialize");
+        let params: SearchParams =
+            serde_json::from_value(json!({"query": query, "max_results": limit}))
+                .expect("test search parameters must deserialize");
         let mut answer = server.answered_search(Parameters(params.clone())).await?.0;
         for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
             if store_ranked(&answer) {
@@ -11757,6 +11754,7 @@ done
         let query = |terms: &str, selector: &str| {
             server.search_query(Parameters(QueryParams {
                 language: QueryLanguage::Sparql,
+                page: 1, max_results: 10, revision: None,
                 query: format!(
                     "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> \
                      SELECT ?path {{ SERVICE :search {{ ?hit :query '{terms}'; :target 'symbol'; {selector} :path ?path }} }}"
@@ -11806,12 +11804,12 @@ done
         Ok(())
     }
 
-    /// `fetch_limit` reads `results_max` whatever the requested `limit`, so `total_pages`
+    /// `fetch_limit` reads `results_max` whatever the requested `limit`, so `pages`
     /// reflects the same candidate pool whatever page size the caller asks for: a `limit: 1` request
     /// reports as many pages as the pool a `limit` wide enough to fit it all serves on one
     /// page.
     #[tokio::test]
-    async fn search_total_pages_reflects_the_pool_whatever_the_requested_limit() -> TestResult {
+    async fn search_pages_reflects_the_pool_whatever_the_requested_limit() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(
             directory.path().join("lib.rs"),
@@ -11831,7 +11829,7 @@ done
 
         let narrow = search_at_limit_after_population(&server, "helper", 1).await?;
         assert_eq!(
-            usize::try_from(narrow.pagination.total_pages).unwrap_or(usize::MAX),
+            usize::try_from(narrow.pagination.pages).unwrap_or(usize::MAX),
             pool_size,
             "a limit of 1 must report as many pages as the pool a limit of 50 served on one \
              page: narrow={narrow:#?} wide={wide:#?}"

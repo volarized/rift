@@ -2952,7 +2952,7 @@ mod tests {
         for invalid in [
             json!({"scope":"global"}),
             json!({"query":""}),
-            json!({"limit":0}),
+            json!({"max_results":0}),
             json!({"paths":{"include":["["]}}),
         ] {
             let mut value = serde_json::to_value(&base)?;

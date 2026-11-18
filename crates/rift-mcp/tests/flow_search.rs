@@ -12,8 +12,6 @@ mod typescript_install;
 )]
 mod workspace_client;
 
-use std::fs;
-
 use rift_protocol::query::{QueryLanguage, QueryParams};
 use serde_json::Value;
 use workspace_client::query::{iri, literal, rows};
@@ -67,12 +65,14 @@ const PYTHON_MANIFEST: &str = "[build-system]\nrequires=['setuptools==80.9.0']\n
 const PYTHON_ENGINE: &str = "[languages.python.lsp]\nembedded = 'ty'\n";
 const RUST_ENGINE: &str =
     "[languages.rust.lsp]\ncommand = ['rustup', 'run', '1.98', 'rust-analyzer']\n";
-const QUERY_CONFIGURATION: &str = "[search.query]\npage_size = 2\n";
+const QUERY_CONFIGURATION: &str = "[search.query]\n";
 
 fn sparql(query: String) -> QueryParams {
     QueryParams {
+        max_results: 10,
         query,
         language: QueryLanguage::Sparql,
+        ..Default::default()
     }
 }
 
@@ -80,7 +80,7 @@ fn flows(slice: &str) -> QueryParams {
     sparql(format!(
         "SELECT ?flow ?score ?index ?symbol {{
            SERVICE :flows {{
-             ?flow :query '{SEED}'; :limit 1; :score ?score; :steps ?step .
+             ?flow :query '{SEED}'; :max_results 1; :score ?score; :steps ?step .
              ?step :index ?index; :value ?symbol
            }}
          }} ORDER BY DESC(?score) ?flow ?index {slice}"
@@ -115,7 +115,7 @@ async fn static_javascript_finds_a_path_around_the_ranked_middle_step() -> TestR
     let finish = captured_seed(&client, "finish", JAVASCRIPT_PATH).await?;
     let ranked = sparql(format!(
         "SELECT ?symbol ?score {{ SERVICE :search {{
-           ?hit :query '{SEED}'; :target 'symbol'; :limit 32; :symbol ?symbol; :score ?score
+           ?hit :query '{SEED}'; :target 'symbol'; :max_results 32; :symbol ?symbol; :score ?score
          }} }}"
     ));
     let ranked = query_after_population(&client, &ranked).await?;
@@ -154,7 +154,7 @@ async fn assert_javascript_evidence(
     let query = sparql(format!(
         "SELECT ?index ?name ?unit ?start ?end {{
            SERVICE :flows {{
-             ?flow :query '{SEED}'; :limit 1; :steps ?step .
+             ?flow :query '{SEED}'; :max_results 1; :steps ?step .
              ?step :index ?index; :value ?symbol;
                    :evidence [ :range [ :unit ?unit; :start ?start; :end ?end ] ]
            }}
@@ -199,8 +199,8 @@ async fn assert_repeated_flow_service_join(
 ) -> TestResult {
     let query = sparql(format!(
         "SELECT ?flow ?left ?right {{
-           SERVICE :flows {{ ?flow :query '{SEED}'; :limit 1; :score ?left }}
-           SERVICE :flows {{ ?flow :query '{SEED}'; :limit 1; :score ?right }}
+           SERVICE :flows {{ ?flow :query '{SEED}'; :max_results 1; :score ?left }}
+           SERVICE :flows {{ ?flow :query '{SEED}'; :max_results 1; :score ?right }}
          }}"
     ));
     let answer = query_after_population(client, &query).await?;
@@ -213,24 +213,21 @@ async fn assert_repeated_flow_service_join(
 }
 
 #[tokio::test]
-async fn static_rust_replays_steps_from_before_a_source_edit() -> TestResult {
+async fn static_rust_reads_steps_across_pages() -> TestResult {
     let files = rust_files(RUST_SOURCE);
-    let (fixture, client, task) =
+    let (_fixture, client, task) =
         served_workspace(&files, Some(QUERY_CONFIGURATION.to_owned())).await?;
     let entry = captured_seed(&client, "entry", RUST_PATH).await?;
     let middle = captured_seed(&client, "middle", RUST_PATH).await?;
     let finish = captured_seed(&client, "finish", RUST_PATH).await?;
-    let first = query_after_population(&client, &flows("")).await?;
+    let parameters = QueryParams {
+        max_results: 2,
+        ..flows("")
+    };
+    let first = query_after_population(&client, &parameters).await?;
     assert_steps(&first, &[(0, entry.as_str()), (1, middle.as_str())])?;
-    let continuation = first["pagination"]["next_query"]
-        .as_str()
-        .ok_or("expected a continuation for the final flow step")?
-        .to_owned();
-
-    fs::write(fixture.path().join(RUST_PATH), "pub fn new_revision() {}\n")?;
-    captured_seed(&client, "new_revision", RUST_PATH).await?;
-
-    let next = query_after_population(&client, &sparql(continuation)).await?;
+    let request = workspace_client::query::result_page(&parameters, &first, 2)?;
+    let next = query_after_population(&client, &request).await?;
     assert_steps(&next, &[(2, finish.as_str())])?;
     assert_eq!(rows(&first)?[0]["flow"], rows(&next)?[0]["flow"]);
     assert_eq!(rows(&first)?[0]["score"], rows(&next)?[0]["score"]);

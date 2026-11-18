@@ -1627,8 +1627,8 @@ mod tests {
                 ..rift_protocol::read::GetSymbolInclude::default()
             },
             revision: None,
-            declaration_limit: 2,
-            declaration_cursor: None,
+            max_results: 2,
+            page: 1,
         };
         let GetSymbolResult::Found {
             history: Some(history),
@@ -1671,8 +1671,8 @@ mod tests {
                 ..rift_protocol::read::GetSymbolInclude::default()
             },
             revision: None,
-            declaration_limit: 1,
-            declaration_cursor: None,
+            max_results: 1,
+            page: 1,
         };
         let GetSymbolResult::Found {
             history: Some(history),

@@ -17,8 +17,8 @@ pub(super) fn answer(out: &mut TextWriter, result: &FacetsResult) -> Result<(), 
     if result.declarations.is_empty() {
         out.raw_line(0, "No declaration source available.")?;
     }
-    if let Some(cursor) = &result.facet_cursor {
-        out.raw_line(0, &format!("next declarations | facet_cursor {cursor}"))?;
+    if let Some(page) = layout::page_fact(&result.pagination) {
+        out.raw_line(0, &page)?;
     }
     layout::selected_revision(out, Some(&result.revision))
 }

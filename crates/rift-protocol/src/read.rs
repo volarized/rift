@@ -315,19 +315,21 @@ impl GetSymbolInclude {
     {
         "name": "ReadService",
         "language": "rust",
-        "include": {"history": true},
-        "limit": 5,
-        "page_index": 0
+        "include": {
+            "history": true
+        },
+        "max_results": 5,
+        "page": 1
     },
     {
         "name": "Deserialize",
-        "limit": 10,
-        "page_index": 1
+        "max_results": 10,
+        "page": 1
     },
     {
         "name": "spawn",
         "scope": "all",
-        "limit": 5
+        "max_results": 5
     },
     {
         "name": "spawn",
@@ -339,7 +341,7 @@ impl GetSymbolInclude {
                 "version": "1.47.1"
             }
         ],
-        "limit": 5
+        "max_results": 5
     }
 ]))]
 pub struct GetSymbolParams {
@@ -373,16 +375,17 @@ pub struct GetSymbolParams {
     #[serde(default, skip_serializing_if = "GetSymbolInclude::is_empty")]
     pub include: GetSymbolInclude,
     /// Most hits to return in one page, at most 10,000; the server refuses a larger
-    /// `limit` naming the field. The server's result bound caps the set itself, and an
+    /// `max_results` naming the field. The server's result bound caps the set itself, and an
     /// answer whose set reached it warns `results_truncated`.
-    #[serde(default = "default_get_symbol_params_limit")]
+    #[serde(default = "default_max_results")]
     #[schemars(range(min = 1_u64, max = PAGE_LIMIT_MAX))]
-    pub limit: u64,
-    /// Zero-based page of the result set to serve, sized by `limit`. A `page_index` past
+    pub max_results: u64,
+    /// 1-based page of the result set to serve, sized by `max_results`. A `page` past
     /// the last page returns an empty page whose `pagination` carries the requested
-    /// `page_index` and the true `total_pages`.
-    #[serde(default = "default_get_symbol_params_page_index")]
-    pub page_index: u64,
+    /// `page` and the true `pages`.
+    #[serde(default = "default_get_symbol_params_page")]
+    #[schemars(range(min = 1_u64))]
+    pub page: u64,
     /// The revision to read: a git revision reads that commit, a tree revision the served
     /// working tree. Omitted reads the served working tree. The server refuses a git
     /// revision when the workspace has no version-control repository, and a tree revision
@@ -391,12 +394,8 @@ pub struct GetSymbolParams {
     pub revision: Option<crate::revision::Revision>,
 }
 
-fn default_get_symbol_params_limit() -> u64 {
-    5
-}
-
-fn default_get_symbol_params_page_index() -> u64 {
-    PAGE_INDEX_DEFAULT
+fn default_get_symbol_params_page() -> u64 {
+    PAGE_DEFAULT
 }
 
 /// One page of declarations matching a name.
@@ -524,15 +523,17 @@ fn default_get_symbol_params_page_index() -> u64 {
             }
         ],
         "pagination": {
-            "page_index": 0,
-            "total_pages": 1
+            "page": 1,
+            "pages": 1,
+            "max_results": 10,
+            "total": 1
         }
     }
 ]))]
 pub struct GetSymbolResult {
     /// The declarations on this page, best match first.
     pub hits: Vec<GetSymbolHit>,
-    /// Where this page sits in the full result set under the request's `limit`.
+    /// Where this page sits in the full result set under the request's `max_results`.
     pub pagination: Pagination,
     /// Warnings attached to this result. Absent when there is nothing to warn about.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -798,15 +799,23 @@ pub struct FacetRegion {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(extend("rift:since" = "v0.0.4"))]
-#[schemars(extend("examples" = [{"symbol": "rift://symbol/local/rust/app/config/load_config"}]))]
+#[schemars(extend("examples" = [
+    {
+        "symbol": "rift://symbol/local/rust/app/config/load_config"
+    }
+]))]
 pub struct FacetsParams {
     /// The symbol whose declarations the server reads. A package or runtime symbol is read
     /// through the global API.
     pub symbol: SymbolId,
-    /// Continuation returned by a preceding read of this symbol at the same revision.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(length(min = 1, max = 4096))]
-    pub facet_cursor: Option<String>,
+    /// Results per page, at most 100.
+    #[serde(default = "default_max_results")]
+    #[schemars(range(min = 1_u64, max = FACETS_MAX_RESULTS))]
+    pub max_results: u64,
+    /// The 1-based page to read.
+    #[serde(default = "default_page")]
+    #[schemars(range(min = 1_u64))]
+    pub page: u64,
     /// The revision to read. Omitted reads the served working tree, or the selected package
     /// or runtime release. The server refuses a tree revision once the index serves another tree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -819,17 +828,26 @@ impl FacetsParams {
     pub fn of(symbol: SymbolId) -> Self {
         Self {
             symbol,
-            facet_cursor: None,
+            page: PAGE_DEFAULT,
+            max_results: MAX_RESULTS_DEFAULT,
             revision: None,
         }
     }
 }
 
-/// Most source bytes in one facets page. A page always holds at least one declaration.
+/// Most source bytes in one facets page.
 pub const FACETS_SOURCE_BYTES_MAX: u64 = 1_048_576;
 
 /// Most declarations returned by one facets read.
-pub const FACETS_DECLARATIONS_MAX: usize = 4;
+pub const FACETS_DECLARATIONS_MAX: usize = 100;
+/// Most declarations returned in one facets page.
+pub const FACETS_MAX_RESULTS: u64 = FACETS_DECLARATIONS_MAX as u64;
+fn default_max_results() -> u64 {
+    MAX_RESULTS_DEFAULT
+}
+fn default_page() -> u64 {
+    PAGE_DEFAULT
+}
 
 /// Declarations of one symbol, each with its location, source, and syntax structure.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -1023,7 +1041,13 @@ pub const FACETS_DECLARATIONS_MAX: usize = 4;
                 ]
             }
         ],
-        "revision": "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11"
+        "revision": "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11",
+        "pagination": {
+            "page": 1,
+            "pages": 1,
+            "max_results": 10,
+            "total": 1
+        }
     }
 ]))]
 pub struct FacetsResult {
@@ -1031,9 +1055,8 @@ pub struct FacetsResult {
     pub symbol: SymbolId,
     /// Declarations in symbol order, with each declaration's syntax elements in pre-order.
     pub declarations: Vec<crate::facets_read::FacetDeclaration>,
-    /// Continues the declarations of this symbol at this revision.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub facet_cursor: Option<String>,
+    /// The requested page and complete declaration count.
+    pub pagination: Pagination,
     /// The revision this answer was read at.
     pub revision: crate::revision::Revision,
     /// Conditions affecting this answer. Absent when empty.
@@ -1161,23 +1184,54 @@ impl RuntimeIdentity {
     }
 }
 
-/// Default `page_index` for a paginated request: the first page.
-pub const PAGE_INDEX_DEFAULT: u64 = 0;
-
-/// Largest `limit` a paginated request may name; the server refuses a larger one.
+/// Default page for a paginated request.
+pub const PAGE_DEFAULT: u64 = 1;
+/// Default number of results in one page.
+pub const MAX_RESULTS_DEFAULT: u64 = 10;
+/// Most results in one declaration lookup page.
 pub const PAGE_LIMIT_MAX: u64 = 10_000;
 
-/// Where one page sits in the full result set the request's `limit` divides.
+/// The requested page and the size of its complete result set.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Pagination {
-    /// The zero-based page this answer serves.
-    #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
-    pub page_index: u64,
-    /// The page count of the full result set under the request's `limit`, computed within
-    /// the server's result bound. Zero when the result set is empty.
-    #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
-    pub total_pages: u64,
+    /// The 1-based page this answer serves.
+    #[schemars(range(min = 1_u64))]
+    pub page: u64,
+    /// Page count, zero when the result set is empty.
+    pub pages: u64,
+    /// Results per page.
+    #[schemars(range(min = 1_u64))]
+    pub max_results: u64,
+    /// Total results within the server's result bound.
+    pub total: u64,
+}
+
+impl Pagination {
+    /// Computes the page count from the complete result count.
+    ///
+    /// # Panics
+    /// Panics when `max_results` is zero.
+    #[must_use]
+    pub fn new(page: u64, max_results: u64, total: u64) -> Self {
+        assert!(max_results > 0, "accepted max_results must be positive");
+        Self {
+            page,
+            pages: total.div_ceil(max_results),
+            max_results,
+            total,
+        }
+    }
+
+    /// The first result of this page, or the largest offset on overflow.
+    #[must_use]
+    pub fn offset(&self) -> usize {
+        self.page
+            .checked_sub(1)
+            .and_then(|page| page.checked_mul(self.max_results))
+            .and_then(|offset| usize::try_from(offset).ok())
+            .unwrap_or(usize::MAX)
+    }
 }
 
 /// One parameter of a `Signature`: what it is called, the types bound to it, and how a call
@@ -1455,7 +1509,7 @@ pub enum ReadWarning {
         matches_max: u64,
     },
     /// The server reached `results_max`, its result bound, before ordering and paging:
-    /// what the bound cut never reaches any page, and `total_pages` counts only what fit.
+    /// what the bound cut never reaches any page, and `pages` counts only what fit.
     /// The bound cuts the ranked candidates and the hit set alike. The warning means the
     /// bound was reached; a set of exactly `results_max` hits carries it too. Narrow
     /// `query` or `paths`.
@@ -2853,7 +2907,12 @@ pub enum SymbolVersionKind {
 /// another, so that `end` is never below `start` is asserted by the surface
 /// validation tests instead.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[schemars(extend("examples" = [{"start": 0, "end": 0}]))]
+#[schemars(extend("examples" = [
+    {
+        "start": 0,
+        "end": 0
+    }
+]))]
 pub struct TextRange {
     /// First byte of the range, counted from the start of the file.
     #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
@@ -2948,10 +3007,9 @@ mod tests {
 
     use super::{
         Digest, Duration, GLOBAL_WARNING_DETAIL_CHARS_MAX, GetSymbolParams, GlobalFailureClass,
-        GlobalPageWarningCode, LANGUAGE_IDENTITY_PATTERN, Language, PAGE_INDEX_DEFAULT,
-        PAGE_LIMIT_MAX, PackageIdentity, REVISION_ID_BYTES_MAX, ReadWarning, RelationshipFacet,
-        RevisionId, RevisionIdViolation, SOURCE_WARNINGS_MAX, SearchScope, SourceUnitId, Symbol,
-        SymbolId,
+        GlobalPageWarningCode, LANGUAGE_IDENTITY_PATTERN, Language, PAGE_DEFAULT, PAGE_LIMIT_MAX,
+        PackageIdentity, REVISION_ID_BYTES_MAX, ReadWarning, RelationshipFacet, RevisionId,
+        RevisionIdViolation, SOURCE_WARNINGS_MAX, SearchScope, SourceUnitId, Symbol, SymbolId,
     };
     use schemars::schema_for;
     use serde_json::json;
@@ -3333,12 +3391,9 @@ mod tests {
     /// from the schema; this pins the advertised default to the constant the field's
     /// default function returns.
     #[test]
-    fn get_symbol_params_schema_page_index_default_equals_the_enforced_constant() {
+    fn get_symbol_params_schema_page_default_equals_the_enforced_constant() {
         let schema = serde_json::to_value(schema_for!(GetSymbolParams)).expect("schema");
-        assert_eq!(
-            schema["properties"]["page_index"]["default"],
-            json!(PAGE_INDEX_DEFAULT)
-        );
+        assert_eq!(schema["properties"]["page"]["default"], json!(PAGE_DEFAULT));
     }
 
     /// A `global_page_warning` carries the global API's `detail` as it arrived, so its
@@ -3358,13 +3413,13 @@ mod tests {
         );
     }
 
-    /// The schema's `maximum` on `limit` and `accepted_limit`'s refusal both read
+    /// The schema's `maximum` on `max_results` and `accepted_limit`'s refusal both read
     /// `PAGE_LIMIT_MAX`; this pins the advertised maximum to that one constant.
     #[test]
     fn get_symbol_params_schema_limit_maximum_equals_the_enforced_constant() {
         let schema = serde_json::to_value(schema_for!(GetSymbolParams)).expect("schema");
         assert_eq!(
-            schema["properties"]["limit"]["maximum"],
+            schema["properties"]["max_results"]["maximum"],
             json!(PAGE_LIMIT_MAX)
         );
     }
@@ -4304,4 +4359,21 @@ mod retained_name_tests {
             assert!(!symbol_name_is_retained(name, usize::MAX));
         }
     }
+}
+
+/// Most results returned in one global search or pattern page.
+pub const GLOBAL_MAX_RESULTS: u64 = 1000;
+
+/// The selected page of global search or pattern results.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GlobalPageParams {
+    /// The 1-based page to read.
+    #[serde(default = "default_page")]
+    #[schemars(range(min = 1_u64))]
+    pub page: u64,
+    /// Results per page, at most 1000.
+    #[serde(default = "default_max_results")]
+    #[schemars(range(min = 1_u64, max = GLOBAL_MAX_RESULTS))]
+    pub max_results: u64,
 }

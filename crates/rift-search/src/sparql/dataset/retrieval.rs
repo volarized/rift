@@ -20,8 +20,8 @@ impl GraphDatasetBuilder {
     ) -> Result<(), RiftError> {
         let offset = selection
             .request
-            .page_index
-            .checked_mul(selection.request.limit.unwrap_or(0))
+            .page
+            .checked_mul(selection.request.max_results.unwrap_or(0))
             .ok_or_else(projection_failure)?;
         for (index, hit) in result.results.iter().enumerate() {
             let index = offset

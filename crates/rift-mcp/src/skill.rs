@@ -121,9 +121,7 @@ const DECISION_TABLE: &[DecisionRow] = &[
     DecisionRow {
         situation: "The source and syntax structure of a symbol's declarations are needed.",
         tools: &["facets"],
-        note: Some(
-            "with `symbol`; return `facet_cursor` with the same symbol and revision to continue",
-        ),
+        note: Some("with `symbol`; send `page` with the same symbol and revision to continue"),
     },
     DecisionRow {
         situation: "The declarations that reference a symbol, its impact (what changes when \
@@ -234,7 +232,7 @@ fn skill_markdown(form: SkillForm) -> String {
          - Third-level callees: `SELECT ?s {<symbol-id> :calls/:calls/:calls ?s}`\n\
          - Regex: `SELECT ?p {SERVICE :search {?h :pattern \"TODO|FIXME\"; :target \"file\"; :path ?p}}`\n\
          - Count: `SELECT (COUNT(?u) AS ?n) {<symbol-id> :usages ?u}`\n\n\
-         Follow `pagination.next_query` unchanged for transport pages. Read exact symbols and facets \
+         Pass `page` and `max_results` to read another page at the same `revision`. Read exact symbols and facets \
          with the selected `revision`. Missing required facts return a typed unavailable outcome.\n\n",
     );
     rendered.push_str("## When a call refuses\n\n");

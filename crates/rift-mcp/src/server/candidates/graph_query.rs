@@ -11,12 +11,10 @@ use rift_protocol::read::{Pagination, ReadWarning, SearchResult};
 use rift_protocol::search_read::SearchUnavailable;
 use rift_protocol::symbol_read::{CapturedView, SymbolUnavailableReason};
 use rift_search::sparql::{
-    AdjacencySelection, GraphDataset, GraphLimits, GraphQuery, PageForm, PageSelection,
-    QueryCancellation, SemanticInventory, continuation_query,
+    AdjacencySelection, GraphDataset, GraphLimits, GraphQuery, QueryCancellation, SemanticInventory,
 };
-use serde::{Deserialize, Serialize};
 
-use super::{BYTES_MAX, CandidateResponses, RiftMcp, read_failure};
+use super::{RiftMcp, read_failure};
 use crate::output::{Json, QueryDisplay, QueryOutput, ToolFailure};
 
 mod exact;
@@ -27,28 +25,11 @@ pub(crate) mod retrieval;
 use super::super::RequestDeadline;
 use relationships::AcquiredAdjacency;
 
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct SavedQuery {
-    root: std::path::PathBuf,
-    owner: rift_protocol::identity::SymbolOwner,
-    view: CapturedView,
-    template_end: usize,
-    pages: Vec<QueryPage>,
-    warnings: Vec<ReadWarning>,
-    #[serde(default)]
-    display: QueryDisplay,
-}
-
-#[derive(Deserialize, Serialize)]
-struct QueryPage {
-    start: usize,
-    end: usize,
-}
-
 /// Settings and presentation retained with one query execution.
 pub(crate) struct QueryPageOptions<'a> {
     pub(crate) configuration: &'a QueryConfiguration,
+    pub(crate) page: u64,
+    pub(crate) max_results: u64,
     pub(crate) warnings: Vec<ReadWarning>,
     pub(crate) display: QueryDisplay,
 }
@@ -66,6 +47,13 @@ impl RiftMcp {
         &self,
         params: QueryParams,
     ) -> Result<Json<QueryOutput>, ToolFailure> {
+        rift_server::accept_page(params.page).map_err(read_failure)?;
+        rift_server::accepted_max_results(
+            params.max_results,
+            rift_protocol::query::QUERY_MAX_RESULTS,
+        )
+        .map_err(read_failure)?;
+        let paging = (params.page, params.max_results);
         let deadline = self.request_deadline().await;
         let limits = GraphLimits::default();
         let query = tokio::time::timeout_at(
@@ -77,12 +65,19 @@ impl RiftMcp {
         .await
         .map_err(|_| read_failure(deadline_failure(deadline.budget())))?
         .map_err(read_failure)?;
-        if let Some(selection) = query.page_selection() {
-            return self.replay_graph_query(selection).await.map(Json);
-        }
         let resolved = self
             .published_workspace(super::super::wire::ErrorPhase::Read, deadline)
             .await?;
+        resolved
+            .published
+            .reads
+            .accept_revision(params.revision.as_ref())
+            .map_err(read_failure)?;
+        let revision = resolved
+            .published
+            .reads
+            .served_revision()
+            .map_err(read_failure)?;
         let default_scope = resolved
             .published
             .configuration
@@ -97,43 +92,23 @@ impl RiftMcp {
             Err(unavailable) => return Ok(Json(QueryReadResult::Unavailable(unavailable).into())),
         };
         let views = Arc::clone(&self.local_views);
-        let responses = Arc::clone(&self.candidate_responses);
         let cancellation = QueryCancellation::new();
         let _guard = QueryGuard(cancellation.clone());
         tokio::time::timeout_at(
             deadline.at(),
             self.blocking.run("graph query", move || {
-                graph.evaluate(&query, limits, deadline, &cancellation, &views, &responses)
+                graph.evaluate(&query, deadline, &cancellation, &views, paging)
             }),
         )
         .await
         .map_err(|_| read_failure(deadline_failure(deadline.budget())))?
-        .map(Json)
+        .map(|mut output| {
+            if let QueryReadResult::Results(answer) = &mut output.result {
+                answer.revision = Some(revision);
+            }
+            Json(output)
+        })
         .map_err(read_failure)
-    }
-
-    async fn replay_graph_query(
-        &self,
-        selection: PageSelection,
-    ) -> Result<QueryOutput, ToolFailure> {
-        let responses = Arc::clone(&self.candidate_responses);
-        let views = Arc::clone(&self.local_views);
-        self.blocking
-            .run("retained graph query", move || {
-                let (saved, answer) = match responses.replay_query(&selection)? {
-                    Ok(result) => result,
-                    Err(reason) => return Ok(query_unavailable(reason).into()),
-                };
-                let views = views.get().ok_or_else(retention_failure)?;
-                if let Err(reason) =
-                    views.captured_view(selection.view.as_str(), &saved.root, &saved.owner)?
-                {
-                    return Ok(query_unavailable(reason).into());
-                }
-                saved.response(answer, selection.page)
-            })
-            .await
-            .map_err(read_failure)
     }
 
     /// Acquires what `query` reads from `resolved`, the publication whose accepted
@@ -219,6 +194,7 @@ impl RiftMcp {
             }
         }
         Ok(Ok(AcquiredGraph {
+            limits,
             reads,
             selected,
             local_semantics,
@@ -314,6 +290,7 @@ impl RiftMcp {
 }
 
 struct AcquiredGraph {
+    limits: GraphLimits,
     reads: Arc<rift_server::ReadService>,
     selected: Option<AdjacencySelection>,
     local_semantics: Option<SemanticInventory>,
@@ -440,13 +417,13 @@ impl AcquiredGraph {
     fn evaluate(
         self,
         query: &GraphQuery,
-        limits: GraphLimits,
         deadline: RequestDeadline,
         cancellation: &QueryCancellation,
         views: &std::sync::OnceLock<rift_server::LocalSymbolViews>,
-        responses: &CandidateResponses,
+        paging: (u64, u64),
     ) -> Result<QueryOutput, RiftError> {
         let Self {
+            limits,
             reads,
             selected,
             local_semantics,
@@ -527,27 +504,23 @@ impl AcquiredGraph {
             return Ok(incomplete_flows(warnings).into());
         }
         let views = views.get().ok_or_else(retention_failure)?;
-        let root = input.root().to_owned();
-        let owner = input.owner().clone();
         let retention = QueryRetention {
-            root: &root,
-            owner: &owner,
             answer: &answer,
             configuration: &configuration,
+            paging,
             warnings,
             display: QueryDisplay::selected(&answer, query.presentation()),
             acquired: &acquired,
             retrieved: &retrieved,
         };
-        retention.store(views, input, responses, cancellation)
+        retention.store(views, input, cancellation)
     }
 }
 
 struct QueryRetention<'answer> {
-    root: &'answer std::path::Path,
-    owner: &'answer rift_protocol::identity::SymbolOwner,
     answer: &'answer QueryAnswer,
     configuration: &'answer QueryConfiguration,
+    paging: (u64, u64),
     warnings: Vec<ReadWarning>,
     display: QueryDisplay,
     acquired: &'answer AcquiredAdjacency,
@@ -559,7 +532,6 @@ impl QueryRetention<'_> {
         self,
         views: &rift_server::LocalSymbolViews,
         input: rift_server::LocalSymbolViewInput,
-        responses: &CandidateResponses,
         cancellation: &QueryCancellation,
     ) -> Result<QueryOutput, RiftError> {
         let mut response = None;
@@ -577,18 +549,18 @@ impl QueryRetention<'_> {
             if cancellation.is_cancelled() {
                 return errors::search::query_cancelled().fail();
             }
-            response = Some(responses.store_query(
-                self.root,
-                self.owner,
+            response = Some(query_page(
                 &view,
                 self.answer,
                 QueryPageOptions {
                     configuration: self.configuration,
+                    page: self.paging.0,
+                    max_results: self.paging.1,
                     warnings: self.warnings,
                     display: self.display,
                 },
             )?);
-            Ok(true)
+            Ok(false)
         })?;
         response.ok_or_else(retention_failure)
     }
@@ -607,340 +579,61 @@ fn evaluate_acquired_query(
     )
 }
 
-impl CandidateResponses {
-    /// Retains one evaluated query and returns its first transport page.
-    pub(crate) fn store_query(
-        &self,
-        root: &std::path::Path,
-        owner: &rift_protocol::identity::SymbolOwner,
-        view: &CapturedView,
-        answer: &QueryAnswer,
-        options: QueryPageOptions<'_>,
-    ) -> Result<QueryOutput, RiftError> {
-        let maximum = usize::try_from(options.configuration.page_limit.bytes())
-            .map_err(|_| page_failure())?;
-        let (saved, bytes, first) = SavedQuery::encoded(root, owner, view, answer, options)?;
-        if encoded_size(&first)? > maximum {
-            return Err(page_failure());
-        }
-        self.save_query(&saved, &bytes)?;
-        Ok(first)
-    }
-
-    /// Replays a query owned by the original proxy connection without reacquiring facts.
-    pub(crate) fn retained_proxy_query(
-        &self,
-        selection: &PageSelection,
-        root: &std::path::Path,
-        owner: &rift_protocol::identity::SymbolOwner,
-    ) -> Result<QueryOutput, RiftError> {
-        let (saved, answer) = match self.replay_query(selection)? {
-            Ok(found) => found,
-            Err(reason) => return Ok(query_unavailable(reason).into()),
-        };
-        if saved.root != root || &saved.owner != owner {
-            return Ok(query_unavailable(SymbolUnavailableReason::ViewContext).into());
-        }
-        saved.response(answer, selection.page)
-    }
-
-    fn save_query(&self, saved: &SavedQuery, bytes: &[u8]) -> Result<(), RiftError> {
-        let mut encoded =
-            crate::proxy::encode_bounded(saved, BYTES_MAX).map_err(encoding_failure)?;
-        let additional = bytes.len().checked_add(1).ok_or_else(retention_failure)?;
-        if encoded
-            .len()
-            .checked_add(additional)
-            .is_none_or(|len| len > BYTES_MAX)
-        {
-            return Err(retention_failure());
-        }
-        encoded
-            .try_reserve_exact(additional)
-            .map_err(|_| retention_failure())?;
-        encoded.push(b'\n');
-        encoded.extend_from_slice(bytes);
-        let expires = crate::proxy::captured_expiry(&saved.view)?;
-        let retained_bytes = encoded.len();
-        self.save_bytes(saved.view.id.as_str().to_owned(), expires, encoded)?;
-        rift_tracing::debug!(
-            component = "search",
-            retained_bytes,
-            "query answer retained"
-        );
-        Ok(())
-    }
-
-    fn replay_query(
-        &self,
-        selection: &PageSelection,
-    ) -> Result<Result<(SavedQuery, QueryAnswer), SymbolUnavailableReason>, RiftError> {
-        let rows = self
-            .bytes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(row) = rows.iter().find(|row| row.id == selection.view.as_str()) else {
-            return Ok(Err(SymbolUnavailableReason::ViewExpired));
-        };
-        if row.expires <= SystemTime::now() {
-            return Ok(Err(SymbolUnavailableReason::ViewExpired));
-        }
-        let Some(separator) = row.bytes.iter().position(|byte| *byte == b'\n') else {
-            return Ok(Err(SymbolUnavailableReason::ViewContext));
-        };
-        let saved: SavedQuery =
-            serde_json::from_slice(&row.bytes[..separator]).map_err(encoding_failure)?;
-        let answer = saved.decode_bytes(&row.bytes[separator + 1..], Some(selection.page))?;
-        let matches = match (&selection.form, &answer) {
-            (
-                PageForm::Bindings {
-                    variables: selected,
-                },
-                QueryAnswer::Bindings { variables, .. },
-            ) => selected == variables,
-            (PageForm::Graph, QueryAnswer::Graph { .. }) => true,
-            _ => false,
-        };
-        if matches {
-            Ok(Ok((saved, answer)))
-        } else {
-            Ok(Err(SymbolUnavailableReason::ViewContext))
-        }
-    }
+/// Selects one fixed-size answer page within the accepted response byte bound.
+pub(crate) fn query_page(
+    view: &CapturedView,
+    answer: &QueryAnswer,
+    options: QueryPageOptions<'_>,
+) -> Result<QueryOutput, RiftError> {
+    let total = match answer {
+        QueryAnswer::Bindings { bindings, .. } => bindings.len(),
+        QueryAnswer::Graph { triples } => triples.len(),
+        QueryAnswer::Boolean { .. } => 1,
+    };
+    let pagination = Pagination::new(options.page, options.max_results, total as u64);
+    let paged = !matches!(answer, QueryAnswer::Boolean { .. });
+    let start = pagination.offset().min(total);
+    let end = start
+        .saturating_add(usize::try_from(options.max_results).unwrap_or(usize::MAX))
+        .min(total);
+    let answer = match answer {
+        QueryAnswer::Bindings {
+            variables,
+            bindings,
+        } => QueryAnswer::Bindings {
+            variables: variables.clone(),
+            bindings: bindings[start..end].to_vec(),
+        },
+        QueryAnswer::Graph { triples } => QueryAnswer::Graph {
+            triples: triples[start..end].to_vec(),
+        },
+        QueryAnswer::Boolean { value } => QueryAnswer::Boolean { value: *value },
+    };
+    let output = QueryOutput::new(
+        QueryReadResult::Results(Box::new(QueryResult {
+            answer,
+            view: Some(view.clone()),
+            revision: None,
+            pagination: paged.then_some(pagination),
+            warnings: options.warnings,
+        })),
+        options.display,
+    );
+    let maximum =
+        usize::try_from(options.configuration.page_limit.bytes()).map_err(|_| page_failure())?;
+    crate::proxy::encode_bounded(&output, maximum).map_err(|_| page_failure())?;
+    Ok(output)
 }
-
 fn deadline_failure(budget: std::time::Duration) -> RiftError {
     errors::search::query_deadline_exceeded()
         .timeout_ms(u64::try_from(budget.as_millis()).unwrap_or(u64::MAX))
         .error()
 }
 
-fn empty_answer(answer: &QueryAnswer) -> QueryAnswer {
-    match answer {
-        QueryAnswer::Bindings { variables, .. } => QueryAnswer::Bindings {
-            variables: variables.clone(),
-            bindings: Vec::new(),
-        },
-        QueryAnswer::Graph { .. } => QueryAnswer::Graph {
-            triples: Vec::new(),
-        },
-        QueryAnswer::Boolean { value } => QueryAnswer::Boolean { value: *value },
-    }
-}
-
-fn encode_records(
-    answer: &QueryAnswer,
-    maximum: usize,
-) -> Result<(Vec<u8>, usize, Vec<usize>), RiftError> {
-    let mut bytes = crate::proxy::encode_bounded(&empty_answer(answer), maximum)
-        .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
-    let template_end = bytes.len();
-    let mut offsets = vec![template_end];
-    match answer {
-        QueryAnswer::Bindings { bindings, .. } => {
-            for row in bindings {
-                append_record(&mut bytes, row, maximum)?;
-                offsets.push(bytes.len());
-            }
-        }
-        QueryAnswer::Graph { triples } => {
-            for row in triples {
-                append_record(&mut bytes, row, maximum)?;
-                offsets.push(bytes.len());
-            }
-        }
-        QueryAnswer::Boolean { .. } => {}
-    }
-    Ok((bytes, template_end, offsets))
-}
-
-fn append_record(
-    bytes: &mut Vec<u8>,
-    row: &impl Serialize,
-    maximum: usize,
-) -> Result<(), RiftError> {
-    let remaining = maximum
-        .checked_sub(bytes.len())
-        .ok_or_else(retention_failure)?;
-    let encoded = crate::proxy::encode_bounded(row, remaining).map_err(encoding_failure)?;
-    if bytes
-        .len()
-        .checked_add(encoded.len())
-        .is_none_or(|size| size > maximum)
-    {
-        return Err(retention_failure());
-    }
-    bytes.try_reserve_exact(encoded.len()).map_err(|source| {
-        retention_failure().with(rift_error::ErrorContext::new(
-            "source",
-            rift_error::ErrorValue::source(source),
-        ))
-    })?;
-    bytes.extend_from_slice(&encoded);
-    Ok(())
-}
-
-fn encoded_size(value: &impl Serialize) -> Result<usize, RiftError> {
-    serde_json::to_vec(value)
-        .map(|bytes| bytes.len())
-        .map_err(encoding_failure)
-}
-
-fn plan_pages(
-    answer: &QueryAnswer,
-    offsets: &[usize],
-    saved: &SavedQuery,
-    configuration: &QueryConfiguration,
-) -> Result<Vec<QueryPage>, RiftError> {
-    let count = offsets.len().saturating_sub(1);
-    if matches!(answer, QueryAnswer::Boolean { .. }) {
-        return Ok(vec![QueryPage {
-            start: saved.template_end,
-            end: saved.template_end,
-        }]);
-    }
-    let mut envelope = QueryResult {
-        answer: empty_answer(answer),
-        view: Some(saved.view.clone()),
-        pagination: Pagination {
-            page_index: u64::MAX,
-            total_pages: u64::MAX,
-        }
-        .into(),
-        warnings: saved.warnings.clone(),
-    };
-    envelope.pagination.next_query = Some(continuation_query(answer, &saved.view.id, u64::MAX)?);
-    let base = encoded_size(&envelope)?;
-    let limit = usize::try_from(configuration.page_limit.bytes()).map_err(|_| page_failure())?;
-    let mut pages = Vec::new();
-    let mut start = 0;
-    let mut bytes = base;
-    for index in 0..count {
-        let size = offsets[index + 1]
-            .checked_sub(offsets[index])
-            .and_then(|size| size.checked_add(1))
-            .ok_or_else(page_failure)?;
-        if base.checked_add(size).is_none_or(|size| size > limit) {
-            return Err(page_failure());
-        }
-        let rows = u64::try_from(index - start).map_err(|_| page_failure())?;
-        if rows == configuration.page_size
-            || bytes.checked_add(size).is_none_or(|size| size > limit)
-        {
-            pages.push(QueryPage {
-                start: offsets[start],
-                end: offsets[index],
-            });
-            start = index;
-            bytes = base;
-        }
-        bytes = bytes.checked_add(size).ok_or_else(page_failure)?;
-    }
-    if start < count {
-        pages.push(QueryPage {
-            start: offsets[start],
-            end: offsets[count],
-        });
-    }
-    Ok(pages)
-}
-
-fn first_page(answer: &QueryAnswer, page: Option<&QueryPage>, offsets: &[usize]) -> QueryAnswer {
-    let count = page.map_or(0, |page| {
-        offsets.partition_point(|offset| *offset < page.end)
-    });
-    match answer {
-        QueryAnswer::Bindings {
-            variables,
-            bindings,
-        } => QueryAnswer::Bindings {
-            variables: variables.clone(),
-            bindings: bindings[..count].to_vec(),
-        },
-        QueryAnswer::Graph { triples } => QueryAnswer::Graph {
-            triples: triples[..count].to_vec(),
-        },
-        QueryAnswer::Boolean { value } => QueryAnswer::Boolean { value: *value },
-    }
-}
-
-impl SavedQuery {
-    fn encoded(
-        root: &std::path::Path,
-        owner: &rift_protocol::identity::SymbolOwner,
-        view: &CapturedView,
-        answer: &QueryAnswer,
-        options: QueryPageOptions<'_>,
-    ) -> Result<(Self, Vec<u8>, QueryOutput), RiftError> {
-        let (bytes, template_end, offsets) = encode_records(answer, BYTES_MAX)?;
-        let mut saved = Self {
-            root: root.to_owned(),
-            owner: owner.clone(),
-            view: view.clone(),
-            template_end,
-            pages: Vec::new(),
-            warnings: options.warnings,
-            display: options.display,
-        };
-        saved.pages = plan_pages(answer, &offsets, &saved, options.configuration)?;
-        let response = saved.response(first_page(answer, saved.pages.first(), &offsets), 0)?;
-        Ok((saved, bytes, response))
-    }
-
-    fn decode_bytes(&self, bytes: &[u8], page: Option<u64>) -> Result<QueryAnswer, RiftError> {
-        let template = bytes
-            .get(..self.template_end)
-            .ok_or_else(retention_failure)?;
-        let mut answer: QueryAnswer = serde_json::from_slice(template).map_err(encoding_failure)?;
-        let range = match page {
-            Some(page) => usize::try_from(page)
-                .ok()
-                .and_then(|page| self.pages.get(page))
-                .map(|page| page.start..page.end)
-                .unwrap_or(self.template_end..self.template_end),
-            None => self.template_end..bytes.len(),
-        };
-        let rows = bytes.get(range).ok_or_else(retention_failure)?;
-        match &mut answer {
-            QueryAnswer::Bindings { bindings, .. } => *bindings = decode_records(rows)?,
-            QueryAnswer::Graph { triples } => *triples = decode_records(rows)?,
-            QueryAnswer::Boolean { .. } => {}
-        }
-        Ok(answer)
-    }
-
-    fn response(&self, answer: QueryAnswer, page_index: u64) -> Result<QueryOutput, RiftError> {
-        let total_pages = u64::try_from(self.pages.len()).map_err(|_| page_failure())?;
-        let next = page_index.checked_add(1).filter(|next| *next < total_pages);
-        let mut pagination = rift_protocol::query::QueryPagination::from(Pagination {
-            page_index,
-            total_pages,
-        });
-        pagination.next_query = next
-            .map(|next| continuation_query(&answer, &self.view.id, next))
-            .transpose()?;
-        Ok(QueryOutput::new(
-            QueryReadResult::Results(Box::new(QueryResult {
-                answer,
-                view: Some(self.view.clone()),
-                pagination,
-                warnings: self.warnings.clone(),
-            })),
-            self.display.clone(),
-        ))
-    }
-}
-
-fn decode_records<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<Vec<T>, RiftError> {
-    serde_json::Deserializer::from_slice(bytes)
-        .into_iter()
-        .collect::<Result<Vec<T>, _>>()
-        .map_err(encoding_failure)
-}
-
 fn encoding_failure(source: serde_json::Error) -> RiftError {
     errors::mcp::forward_failed().source(source).error()
 }
+
 fn page_failure() -> RiftError {
     errors::server::read_invalid()
         .field("search.query.page_limit")
@@ -989,58 +682,74 @@ mod tests {
     type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     #[tokio::test]
-    async fn retained_query_pages_keep_the_original_bindings_after_changes() -> TestResult {
+    async fn query_pages_select_bindings_at_the_requested_revision() -> TestResult {
         let directory = tempfile::tempdir()?;
-        crate::server::hermetic_workspace(directory.path(), "[search.query]\npage_size = 1\n")?;
+        crate::server::hermetic_workspace(directory.path(), "")?;
         std::fs::write(
             directory.path().join("Cargo.toml"),
             "[package]\nname='graph_fixture'\nversion='1.0.0'\n[lib]\npath='lib.rs'\n",
         )?;
-        let path = directory.path().join("lib.rs");
-        std::fs::write(&path, "pub fn alpha() {}\npub fn beta() {}\n")?;
+        std::fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn alpha() {}\npub fn beta() {}\n",
+        )?;
         let root = directory.path().canonicalize()?;
         let server =
             RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
-        let QueryReadResult::Results(first) = server
-            .graph_query(QueryParams {
-                query: "SELECT ?name { ?symbol a :Symbol; :name ?name; :kind 'function' } ORDER BY ?name".to_owned(),
-                language: QueryLanguage::Sparql,
-            })
-            .await
-            .map_err(|failure| format!("{failure:?}"))?
-            .0.result
-        else {
-            return Err("expected a query result".into());
+        let mut params = QueryParams {
+            query:
+                "SELECT ?name { ?symbol a :Symbol; :name ?name; :kind 'function' } ORDER BY ?name"
+                    .to_owned(),
+            max_results: 1,
+            ..Default::default()
         };
-        assert_eq!(first.pagination.page.total_pages, 2, "{first:?}");
-        let next_query = first
-            .pagination
-            .next_query
-            .clone()
-            .ok_or("expected continuation")?;
-        std::fs::write(path, "pub fn replacement() {}\n")?;
-        let QueryReadResult::Results(next) = server
-            .graph_query(QueryParams {
-                query: next_query,
-                language: QueryLanguage::Sparql,
-            })
-            .await
-            .map_err(|failure| format!("{failure:?}"))?
-            .0
-            .result
-        else {
-            return Err("expected retained query result".into());
+        for page in 1..=3 {
+            params.page = page;
+            let QueryReadResult::Results(answer) = server
+                .graph_query(params.clone())
+                .await
+                .map_err(|error| format!("{error:?}"))?
+                .0
+                .result
+            else {
+                return Err("query result".into());
+            };
+            assert_eq!(answer.pagination, Some(Pagination::new(page, 1, 2)));
+            params.revision = answer.revision.clone();
+            let QueryAnswer::Bindings { bindings, .. } = answer.answer else {
+                return Err("bindings".into());
+            };
+            assert_eq!(bindings.len(), usize::from(page <= 2));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repeated_query_pages_do_not_exhaust_retained_views() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        crate::server::hermetic_workspace(directory.path(), "")?;
+        std::fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let root = directory.path().canonicalize()?;
+        let server =
+            RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
+        let mut request = QueryParams {
+            query: "SELECT ?value { VALUES ?value { 1 2 } } ORDER BY ?value".to_owned(),
+            max_results: 1,
+            ..Default::default()
         };
-        assert_eq!(first.view, next.view);
-        assert_eq!(next.pagination.page.page_index, 1);
-        assert_eq!(next.pagination.page.total_pages, 2);
-        assert!(next.pagination.next_query.is_none());
-        let QueryAnswer::Bindings { bindings, .. } = next.answer else {
-            return Err("expected retained bindings".into());
-        };
-        assert!(
-            matches!(&bindings[0]["name"], rift_protocol::query::RdfTerm::Literal { value, .. } if value == "beta")
-        );
+        for page in 0..300 {
+            request.page = page % 2 + 1;
+            let output = server
+                .graph_query(request.clone())
+                .await
+                .map_err(|error| format!("{error:?}"))?
+                .0;
+            let QueryReadResult::Results(answer) = output.result else {
+                return Err("query result".into());
+            };
+            assert_eq!(answer.pagination, Some(Pagination::new(request.page, 1, 2)));
+            request.revision = answer.revision.clone();
+        }
         Ok(())
     }
 
@@ -1073,6 +782,7 @@ mod tests {
                         } GROUP BY ?name"
                     .to_owned(),
                 language: QueryLanguage::Sparql,
+                ..Default::default()
             })
             .await
             .map_err(|failure| format!("{failure:?}"))?
@@ -1092,6 +802,7 @@ mod tests {
                         FILTER NOT EXISTS { ?caller :references ?target . ?target :name 'other' } }"
                     .to_owned(),
                 language: QueryLanguage::Sparql,
+                ..Default::default()
             })
             .await
             .map_err(|failure| format!("{failure:?}"))?
@@ -1107,6 +818,7 @@ mod tests {
                 query: "SELECT DISTINCT ?name { ?start :calls/:references ?end; :name 'caller' . ?end :name ?name }"
                     .to_owned(),
                 language: QueryLanguage::Sparql,
+            ..Default::default()
             })
             .await
             .map_err(|failure| format!("{failure:?}"))?
@@ -1157,7 +869,7 @@ mod tests {
                 "SELECT ?start ?text {{ <{}> :usages ?usage . ?usage :range/:start ?start ; :source ?text . FILTER (?text = 'beacon') }} ORDER BY DESC(?start + 1)",
                 id.as_str()
             ),
-            language: QueryLanguage::Sparql,
+            ..Default::default()
         };
         let result = server
             .graph_query(params)
@@ -1181,7 +893,7 @@ mod tests {
                     "SELECT (COUNT(?usage) AS ?n) {{ <{}> :usages ?usage }}",
                     id.as_str()
                 ),
-                language: QueryLanguage::Sparql,
+                ..Default::default()
             })
             .await
             .map_err(|failure| format!("{failure:?}"))?
@@ -1200,7 +912,7 @@ mod tests {
                     "SELECT DISTINCT ?name {{ ?caller :references <{}>; :name ?name }}",
                     id.as_str()
                 ),
-                language: QueryLanguage::Sparql,
+                ..Default::default()
             })
             .await
             .map_err(|failure| format!("{failure:?}"))?
@@ -1214,7 +926,7 @@ mod tests {
         );
         let evidence = server.graph_query(QueryParams {
             query: format!("SELECT ?source ?unit {{ ?syntax_element :of <{}> ; :index 0 ; :source ?source ; :range [ :unit ?unit ; :start ?start ; :end ?end ] }}", id.as_str()),
-            language: QueryLanguage::Sparql,
+        ..Default::default()
         }).await.map_err(|failure| format!("{failure:?}"))?.0.result;
         assert!(
             matches!(evidence, QueryReadResult::Results(ref result)
@@ -1249,7 +961,7 @@ mod tests {
                         "dependency_entries_max": 100, "query_bytes_max": 4096, "query_terms_max": 32,
                         "query_term_bytes_max": 256, "identifiers_max": 16, "identifier_bytes_max": 4096,
                         "packages_max": 100, "page_limit_min": 1, "page_limit_max": 100,
-                        "page_limit_default": 20, "cursor_bytes_max": 4096, "candidate_pool_max": 100,
+                        "page_limit_default": 10, "candidate_pool_max": 100,
                         "warnings_max": 32, "source_bytes_max": 1_048_576
                     },
                     "relationship_capabilities": relationships
@@ -1470,12 +1182,14 @@ mod tests {
         let query = QueryParams {
             query: format!("SELECT DISTINCT ?caller {{ ?caller :calls <{PACKAGE_GREETING}> }}"),
             language: QueryLanguage::Sparql,
+            ..Default::default()
         };
         let inverse = QueryParams {
             query: format!(
                 "SELECT DISTINCT ?caller {{ <{PACKAGE_BRIDGE}> ^:calls/^:calls ?caller }}"
             ),
             language: QueryLanguage::Sparql,
+            ..Default::default()
         };
         for (query, expected) in [
             (
@@ -1512,6 +1226,7 @@ mod tests {
             .graph_query(QueryParams {
                 query: format!("ASK {{ <{PACKAGE_GREETING}> ^:calls/^:calls ?caller }}"),
                 language: QueryLanguage::Sparql,
+                ..Default::default()
             })
             .await
             .map_err(|failure| format!("{failure:?}"))?
@@ -1591,6 +1306,7 @@ mod tests {
             .graph_query(QueryParams {
                 query,
                 language: QueryLanguage::Sparql,
+                ..Default::default()
             })
             .await
             .map_err(|failure| format!("{failure:?}"))?
@@ -1662,6 +1378,7 @@ mod tests {
             .graph_query(QueryParams {
                 query: statement,
                 language: QueryLanguage::Sparql,
+                ..Default::default()
             })
             .await
             .map_err(|failure| format!("{failure:?}"))?
@@ -1688,6 +1405,7 @@ mod tests {
         let metadata = server.graph_query(QueryParams {
             query: format!("SELECT ?kind {{ <{ROOT}> :calls ?target . ?syntax_element :of ?target; :index 0; :kind ?kind }}"),
             language: QueryLanguage::Sparql,
+        ..Default::default()
         }).await.map_err(|failure| format!("{failure:?}"))?.0.result;
         assert!(
             matches!(
@@ -1725,7 +1443,7 @@ mod tests {
                 "package":{"manager":"cargo","registry":"crates.io","name":"demo","version":"1.0.0"}
             });
             json_response(&json!({
-                "outcome":"found", "revision":RELEASE,
+                "outcome":"found", "revision":RELEASE, "pagination":{"page":1,"pages":1,"max_results":1,"total":1},
                 "symbol":{"id":ROOT,"name":"root","language":"rust","kind":"function","origin":origin},
                 "declarations":[{"origin":origin,"unit":UNIT,"range":{"start":0,"end":12},"line":1,
                     "signature_indices":[],"type_indices":[],"documentation_indices":[]}]
@@ -1738,19 +1456,23 @@ mod tests {
                 assert_eq!(request["symbol"], ROOT);
                 assert_eq!(request["revision"], RELEASE);
                 observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let (ordinal, start) = if let Some(cursor) = request["facet_cursor"].as_str() {
-                    assert_eq!(cursor, "next-facet"); (1, 13)
-                } else { (0, 0) };
+                let page_number = request["page"].as_u64().expect("page");
+                let max_results = request["max_results"].as_u64().expect("max_results");
+                let declarations = (0..2).map(|ordinal| {
+                let start = ordinal * 13;
                 let source = "fn root() {}";
-                let mut page = json!({"symbol":ROOT,"revision":RELEASE,"declarations":[{
+                json!({
                     "declaration":ordinal,"kind":"function_item","range":{"start":start,"end":start+12},
                     "source":{"span":{"unit":UNIT,"range":{"start":start,"end":start+12}},"text":source},
                     "syntax":[
                         {"declaration":ordinal,"index":0,"unit":UNIT,"language":"rust","kind":"function_item","range":{"start":start,"end":start+12},"source":source},
                         {"declaration":ordinal,"index":1,"unit":UNIT,"language":"rust","kind":"identifier","range":{"start":start+3,"end":start+7},"source":"root","parent":0}
                     ]
-                }]});
-                if ordinal == 0 { page["facet_cursor"] = json!("next-facet"); }
+                })
+                }).collect::<Vec<_>>();
+                let pagination = rift_protocol::read::Pagination::new(page_number, max_results, 2);
+                let selected = declarations.into_iter().skip(pagination.offset()).take(usize::try_from(max_results).expect("fixture count")).collect::<Vec<_>>();
+                let page = json!({"symbol":ROOT,"revision":RELEASE,"declarations":selected,"pagination":pagination});
                 json_response(&page)
             }
         }));
@@ -1774,6 +1496,7 @@ mod tests {
                     "SELECT ?i ?text {{ ?syntax_element :of <{ROOT}>; :index ?i; :source ?text }} ORDER BY ?i"
                 ),
                 language: QueryLanguage::Sparql,
+            ..Default::default()
             })
             .await
             .map_err(|failure| format!("{failure:?}"))?
@@ -1786,7 +1509,7 @@ mod tests {
         let QueryAnswer::Bindings { bindings, .. } = result.answer else {
             return Err("expected exact syntax element bindings".into());
         };
-        assert_eq!(pages.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(pages.load(std::sync::atomic::Ordering::Relaxed), 1);
         let sources = bindings
             .iter()
             .map(|row| match &row["text"] {
@@ -1816,6 +1539,7 @@ mod tests {
         let params = QueryParams {
             query: "SELECT (COUNT(?symbol) AS ?n) FROM NAMED <urn:rift:graph:local> { GRAPH <urn:rift:graph:local> { ?symbol a :Symbol ; :name ?name FILTER(?name IN ('alpha', 'beta')) } }".to_owned(),
             language: QueryLanguage::Sparql,
+        ..Default::default()
         };
         let result = server
             .graph_query(params)
@@ -1846,6 +1570,7 @@ mod tests {
         let params = QueryParams {
             query: "SELECT ?start ?path { SERVICE :search { ?hit :pattern 'signal'; :target 'file'; :path ?path; :start ?start; :matched_by/:value 'content' } } ORDER BY ?start".to_owned(),
             language: QueryLanguage::Sparql,
+        ..Default::default()
         };
         let result = server
             .graph_query(params)
@@ -1882,6 +1607,7 @@ mod tests {
                 "SELECT ?start {{ SERVICE :search {{ ?hit :pattern 'signal'; {scope_input} :target 'file'; :start ?start }} }}"
             ),
             language: QueryLanguage::Sparql,
+            ..Default::default()
         };
         let result = server
             .graph_query(params)
@@ -1949,6 +1675,7 @@ mod tests {
                 .graph_query(QueryParams {
                     query: query.to_owned(),
                     language: QueryLanguage::Sparql,
+                    ..Default::default()
                 })
                 .await
                 .map_err(|failure| format!("{failure:?}"))?
@@ -1996,6 +1723,7 @@ mod tests {
                 .graph_query(QueryParams {
                     query: query.clone(),
                     language: QueryLanguage::Sparql,
+                    ..Default::default()
                 })
                 .await
                 .map_err(|failure| format!("{failure:?}"))?
@@ -2017,6 +1745,7 @@ mod tests {
                 .graph_query(QueryParams {
                     query: query.clone(),
                     language: QueryLanguage::Sparql,
+                    ..Default::default()
                 })
                 .await
                 .map_err(|failure| format!("{failure:?}"))?
@@ -2045,6 +1774,7 @@ mod tests {
             .graph_query(QueryParams {
                 query: format!("SELECT ?symbol {{ ?symbol a :Symbol; :name {name_literal} }}"),
                 language: QueryLanguage::Sparql,
+                ..Default::default()
             })
             .await
             .map_err(|failure| format!("{failure:?}"))?

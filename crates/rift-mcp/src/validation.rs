@@ -12635,14 +12635,14 @@ pub(crate) mod tests {
         let mut symbol_reads = BTreeMap::new();
         for name in &names {
             let mut pages = Vec::new();
-            let mut page_index = 0;
+            let mut page = 1;
             loop {
                 let params = serde_json::from_value(serde_json::json!({
                     "name": name,
                     "scope": "local",
                     "include": {"documentation": true},
-                    "limit": 64,
-                    "page_index": page_index,
+                    "max_results": 64,
+                    "page": page,
                 }))?;
                 let result = reads.get_symbol(&params)?;
                 if !result.warnings.is_empty() {
@@ -12652,16 +12652,16 @@ pub(crate) mod tests {
                     )
                     .into());
                 }
-                let total_pages = result.pagination.total_pages;
-                if total_pages > 32 {
+                let page_count = result.pagination.pages;
+                if page_count > 32 {
                     return Err(format!("symbol read exceeded 32 pages: {name}").into());
                 }
                 pages.push(serde_json::to_value(&result)?);
-                page_index += 1;
-                if page_index >= total_pages {
+                page += 1;
+                if page > page_count {
                     break;
                 }
-                if page_index > 32 {
+                if page > 32 {
                     return Err(format!("symbol read exceeded 32 pages: {name}").into());
                 }
             }

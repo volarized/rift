@@ -445,29 +445,18 @@ fn validate_symbol_contract(document: &Value) -> Result<(), String> {
         }
     }
     let schemas = &document["components"]["schemas"];
-    let declaration_limit_max = rift_protocol::read::PAGE_LIMIT_MAX;
+    let max_results_max = rift_protocol::read::PAGE_LIMIT_MAX;
     for (path, actual, expected) in [
         (
             "GetSymbolResult/found/declarations/maxItems",
             schemas["GetSymbolResult"]["oneOf"][0]["properties"]["declarations"]["maxItems"]
                 .as_u64(),
-            declaration_limit_max,
+            max_results_max,
         ),
         (
-            "GetSymbolParams/declaration_limit/maximum",
-            schemas["GetSymbolParams"]["properties"]["declaration_limit"]["maximum"].as_u64(),
-            declaration_limit_max,
-        ),
-        (
-            "GetSymbolParams/declaration_cursor/maxLength",
-            schemas["GetSymbolParams"]["properties"]["declaration_cursor"]["maxLength"].as_u64(),
-            4096,
-        ),
-        (
-            "GetSymbolResult/found/declaration_cursor/maxLength",
-            schemas["GetSymbolResult"]["oneOf"][0]["properties"]["declaration_cursor"]["maxLength"]
-                .as_u64(),
-            4096,
+            "GetSymbolParams/max_results/maximum",
+            schemas["GetSymbolParams"]["properties"]["max_results"]["maximum"].as_u64(),
+            max_results_max,
         ),
     ] {
         expect_bound(path, actual, expected)?;
@@ -495,10 +484,10 @@ fn validate_facets_contract(document: &Value) -> Result<(), String> {
         rift_protocol::read::FACETS_SOURCE_BYTES_MAX,
     )?;
     expect_bound(
-        "FacetsParams/facet_cursor/maxLength",
-        document["components"]["schemas"]["FacetsParams"]["properties"]["facet_cursor"]["maxLength"]
+        "FacetsParams/max_results/maximum",
+        document["components"]["schemas"]["FacetsParams"]["properties"]["max_results"]["maximum"]
             .as_u64(),
-        u64::try_from(crate::CURSOR_BYTES_MAX).map_err(|error| error.to_string())?,
+        rift_protocol::read::FACETS_MAX_RESULTS,
     )
 }
 
@@ -548,10 +537,14 @@ fn validate_bounds(spec: &Spec) -> Result<(), String> {
     }
     validate_max_lengths(spec)?;
 
-    let limit = parameter_schema(spec, "Limit")?;
-    expect_bound("Limit/schema/default", limit.default, json!(100))?;
+    let limit = parameter_schema(spec, "MaxResults")?;
     expect_bound(
-        "Limit/schema/maximum",
+        "MaxResults/schema/default",
+        limit.default,
+        json!(rift_protocol::read::MAX_RESULTS_DEFAULT),
+    )?;
+    expect_bound(
+        "MaxResults/schema/maximum",
         limit.maximum,
         serde_json::Number::from(crate::PAGE_LIMIT_MAX),
     )?;
@@ -584,8 +577,12 @@ fn validate_bounds(spec: &Spec) -> Result<(), String> {
             serde_json::Number::from(maximum),
         )?;
     }
-    let cursor = parameter_schema(spec, "Cursor")?;
-    expect_bound("Cursor/schema/maxLength", cursor.max_length, 4096)?;
+    let page = parameter_schema(spec, "Page")?;
+    expect_bound(
+        "Page/schema/default",
+        page.default,
+        json!(rift_protocol::read::PAGE_DEFAULT),
+    )?;
     for property in ["line", "character"] {
         let schema = property_schema(spec, "SourcePosition", property)?;
         expect_bound(

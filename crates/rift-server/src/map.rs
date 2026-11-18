@@ -17,7 +17,7 @@ use rift_protocol::map::{
     MAP_MODULE_RELATIONSHIPS_MAX, MAP_MODULES_MAX, MAP_PACKAGES_MAX, MapHub, MapLanguage,
     MapModule, MapModuleRelationship, WorkspaceMap,
 };
-use rift_protocol::read::{Digest, Language, Pagination, ProjectPath, SymbolFacet, SymbolId};
+use rift_protocol::read::{Digest, Language, ProjectPath, SymbolFacet, SymbolId};
 use rift_protocol::workspace::WORKSPACE_LANGUAGE_SUMMARIES_MAX;
 use rift_provider::{NormalizedGraph, NormalizedTarget, SymbolAssembler};
 use rift_syntax::ShippedLanguage;
@@ -112,10 +112,6 @@ pub(crate) fn build_workspace_map(
         packages,
         recommendations: Vec::new(),
         warnings: Vec::new(),
-        pagination: Pagination {
-            page_index: 0,
-            total_pages: 1,
-        },
     }
 }
 
@@ -162,10 +158,6 @@ pub(crate) fn build_preparation_map(
         packages: Vec::new(),
         recommendations: Vec::new(),
         warnings: Vec::new(),
-        pagination: Pagination {
-            page_index: 0,
-            total_pages: 1,
-        },
     }
 }
 

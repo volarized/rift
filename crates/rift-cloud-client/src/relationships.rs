@@ -11,7 +11,7 @@ use rift_protocol::relationship_read::{
     RelationshipSelection,
 };
 
-use crate::{GlobalClient, SearchPackagesRequestQuery, contract, failure, response};
+use crate::{GlobalClient, contract, failure, response};
 
 mod facts;
 
@@ -135,7 +135,7 @@ impl GlobalClient {
         })
     }
 
-    /// Reads one raw adjacency page without ranking, endpoint deduplication or shortest paths.
+    /// Reads one complete raw adjacency batch without ranking, endpoint deduplication or shortest paths.
     ///
     /// # Errors
     /// Returns request, capability, transport or strict response validation failure.
@@ -143,10 +143,9 @@ impl GlobalClient {
         &self,
         request: &RelationshipSearchRequest,
         limit: i64,
-        cursor: Option<&str>,
     ) -> Result<RelationshipSearchResult, RiftError> {
         validate_request(request, &self.inner.config)?;
-        crate::validate_page(limit, cursor)?;
+        crate::validate_numbered_page(limit, 1)?;
         let capabilities = self.get_capabilities().await?;
         let bounds = self.relationship_bounds(
             &capabilities,
@@ -166,13 +165,13 @@ impl GlobalClient {
             .packages
             .len()
             .saturating_add(request.runtimes.len());
-        crate::validate_read_bounds(packages, limit, cursor, &capabilities)?;
+        crate::validate_read_bounds(packages, limit, &capabilities)?;
         // Larger counts cannot lower the accepted i64 transport page limit.
         let limit = limit
             .min(i64::try_from(bounds.max_relationships).unwrap_or(i64::MAX))
             .min(i64::try_from(bounds.max_occurrences).unwrap_or(i64::MAX))
             .max(capabilities.bounds.page_limit_min);
-        crate::validate_read_bounds(packages, limit, cursor, &capabilities)?;
+        crate::validate_read_bounds(packages, limit, &capabilities)?;
         let body = serialize_request(
             request,
             crate::smaller_bound(
@@ -180,9 +179,9 @@ impl GlobalClient {
                 self.inner.config.max_request,
             ),
         )?;
-        let query = SearchPackagesRequestQuery {
-            limit: Some(limit),
-            cursor: cursor.map(str::to_owned),
+        let query = rift_protocol::read::GlobalPageParams {
+            page: 1,
+            max_results: limit.cast_unsigned(),
         };
         let raw = match self
             .request_with_query(
@@ -236,7 +235,7 @@ impl GlobalClient {
         Ok(parsed.value)
     }
 
-    /// Acquires every required cursor page under original context and explicit work bounds.
+    /// Acquires the complete batch under the original context and explicit work bounds.
     ///
     /// # Errors
     /// Returns unavailable or validation failure without exposing a partial adjacency.
@@ -249,7 +248,7 @@ impl GlobalClient {
             .await
     }
 
-    /// Acquires every cursor page after admission by the request's shared work owner.
+    /// Acquires the complete batch after admission by the request's shared work owner.
     ///
     /// # Errors
     /// Returns admission, unavailable or strict response validation failure.
@@ -260,87 +259,27 @@ impl GlobalClient {
         mut admit: impl FnMut() -> Result<(), RiftError>,
     ) -> Result<RelationshipSearchResult, RiftError> {
         validate_request(request, &self.inner.config)?;
+        if limits.requests_max == 0 {
+            return Err(invalid(
+                "relationship acquisition exceeds the accepted request bound",
+            ));
+        }
         let capabilities = self.get_capabilities().await?;
         let limit = crate::advertised_page_limit(crate::PAGE_LIMIT_MAX, &capabilities);
-        let mut continuation_request = None;
-        let mut catalog = facts::Catalog::default();
-        let mut result: Option<RelationshipSearchPage> = None;
-        let mut cursor = None;
-        let mut cursors = HashSet::new();
-        let mut records = 0_u64;
-        let mut record_ids = HashSet::new();
-        let mut bytes = 0_u64;
-        for _ in 0..limits.requests_max {
-            admit()?;
-            let mut page = match self
-                .relationship_page(
-                    continuation_request.as_ref().unwrap_or(request),
-                    limit,
-                    cursor.as_deref(),
-                )
-                .await?
-            {
-                RelationshipSearchResult::Page(page) => page,
-                unavailable @ RelationshipSearchResult::Unavailable(_) => return Ok(unavailable),
-            };
-            let count = page
-                .groups
-                .iter()
-                .map(|group| group.relationships.len() + group.occurrences.len())
-                .sum::<usize>();
-            let completion_progress = completion_progress(result.as_ref(), &page);
-            let identities = page_record_ids(&page)?;
-            records =
-                records
-                    .checked_add(u64::try_from(identities.len()).map_err(|_| {
-                        invalid("relationship record count exceeds the platform bound")
-                    })?)
-                    .filter(|count| *count <= limits.records_max)
-                    .ok_or_else(|| {
-                        invalid("relationship acquisition exceeds the accepted record bound")
-                    })?;
-            for identity in identities {
-                if !record_ids.insert(identity.to_owned()) {
-                    return Err(invalid(
-                        "relationship record identity repeats across cursor pages",
-                    ));
-                }
+        admit()?;
+        let result = self.relationship_page(request, limit).await?;
+        if let RelationshipSearchResult::Page(page) = &result {
+            let records = page_record_ids(page)?.len() as u64;
+            if records > limits.records_max {
+                return Err(invalid(
+                    "relationship acquisition exceeds the accepted record bound",
+                ));
             }
-            admit_page_bytes(&page, &mut bytes, limits.bytes_max)?;
-            let next = page.next_cursor.clone();
-            catalog.merge(&mut page)?;
-            if let Some(selected) = &mut result {
-                merge_page(selected, page)?;
-            } else {
-                result = Some(page);
-            }
-            let Some(next) = next else {
-                let mut selected = result.ok_or_else(|| invalid("relationship page is absent"))?;
-                if selected.groups.iter().any(|group| !group.complete) {
-                    return Err(invalid(
-                        "final relationship page did not complete every requested subject",
-                    ));
-                }
-                catalog.finish(&mut selected);
-                facts::validate_complete(request, &selected)?;
-                return Ok(RelationshipSearchResult::Page(selected));
-            };
-            if (count == 0 && !completion_progress) || !cursors.insert(next.clone()) {
-                return Err(invalid("relationship cursor made no progress"));
-            }
-            if continuation_request.is_none() {
-                let selected = result
-                    .as_ref()
-                    .ok_or_else(|| invalid("relationship page is absent"))?;
-                let mut continued = request.clone();
-                continued.view = Some(selected.view.id.clone());
-                continuation_request = Some(continued);
-            }
-            cursor = Some(next);
+            let mut bytes = 0;
+            admit_page_bytes(page, &mut bytes, limits.bytes_max)?;
+            facts::validate_complete(request, page)?;
         }
-        Err(invalid(
-            "relationship acquisition exceeds the accepted request bound",
-        ))
+        Ok(result)
     }
 }
 
@@ -403,20 +342,6 @@ fn admit_page_bytes(
         }
     }
     Ok(())
-}
-
-fn completion_progress(
-    selected: Option<&RelationshipSearchPage>,
-    page: &RelationshipSearchPage,
-) -> bool {
-    match selected {
-        Some(selected) => selected
-            .groups
-            .iter()
-            .zip(&page.groups)
-            .any(|(previous, group)| !previous.complete && group.complete),
-        None => page.groups.iter().any(|group| group.complete),
-    }
 }
 
 fn validate_request(
@@ -573,7 +498,7 @@ fn validate_page(
         validate_group(group, &request.relationships)?;
     }
     if i64::try_from(count).map_or(true, |count| count > limit)
-        || (page.next_cursor.is_none() && page.groups.iter().any(|group| !group.complete))
+        || page.groups.iter().any(|group| !group.complete)
     {
         return Err(invalid(
             "relationship page did not establish bounded complete adjacency",
@@ -585,9 +510,6 @@ fn validate_page(
         .is_some_and(|view| view != &page.view.id)
     {
         return Err(invalid("relationship page changed the selected view"));
-    }
-    if let Some(cursor) = &page.next_cursor {
-        crate::validate_page(limit, Some(cursor))?;
     }
     let expiry = chrono::DateTime::parse_from_rfc3339(&page.view.expires_at)
         .map_err(|_| invalid("relationship view expiry is invalid"))?;
@@ -678,40 +600,6 @@ fn page_record_ids(page: &RelationshipSearchPage) -> Result<HashSet<&str>, RiftE
     }
     ids.extend(usages.into_keys());
     Ok(ids)
-}
-
-fn merge_page(
-    selected: &mut RelationshipSearchPage,
-    page: RelationshipSearchPage,
-) -> Result<(), RiftError> {
-    if selected.view != page.view
-        || selected.analyzer_revision != page.analyzer_revision
-        || selected.corpus_revision != page.corpus_revision
-    {
-        return Err(invalid("relationship publication changed between pages"));
-    }
-    for (held, group) in selected.groups.iter_mut().zip(page.groups) {
-        if held.complete
-            && (!group.complete || !group.relationships.is_empty() || !group.occurrences.is_empty())
-        {
-            return Err(invalid(
-                "completed relationship subject changed on a later page",
-            ));
-        }
-        held.relationships.extend(group.relationships);
-        held.occurrences.extend(group.occurrences);
-        held.complete = group.complete;
-    }
-    selected.next_cursor = page.next_cursor;
-    for warning in page.warnings {
-        if !selected.warnings.contains(&warning) {
-            selected.warnings.push(warning);
-        }
-    }
-    if selected.warnings.len() > crate::WARNINGS_MAX {
-        return Err(invalid("relationship warnings exceed the accepted bound"));
-    }
-    Ok(())
 }
 
 fn invalid(detail: &str) -> RiftError {

@@ -78,7 +78,7 @@ pub fn search_change(
     )?;
     order_change_hits(&mut results, params.order);
     let results_max_reached = bound_hits(&mut results, compared.head().results_max());
-    let (results, pagination) = page(results, params.page_index, limit);
+    let (results, pagination) = page(results, params.page, limit);
     let mut warnings = compared.warnings(results_max_reached);
     warnings.extend(object_warnings);
     Ok(SearchResult {
@@ -1157,7 +1157,7 @@ mod tests {
 
         let answer = fixture.search(&json!({
             "change": {"base": "baseline", "head": {"kind": "working_tree"}},
-            "limit": 1
+            "max_results": 1
         }))?;
 
         let [ReadWarning::ChangeTruncated { detail, .. }, ..] = answer.warnings.as_slice() else {

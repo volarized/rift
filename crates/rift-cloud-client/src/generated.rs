@@ -1086,7 +1086,6 @@ pub struct CapabilityBounds {
     pub page_limit_min: i64,
     pub page_limit_max: i64,
     pub page_limit_default: i64,
-    pub cursor_bytes_max: i64,
     pub candidate_pool_max: i64,
     pub warnings_max: i64,
     pub source_bytes_max: i64,
@@ -1208,6 +1207,9 @@ pub struct PackageSearchRequest {
         regex(path = "REGEX_PACKAGE_SEARCH_REQUEST_VIEW")
     )]
     pub view: Option<String>,
+    /// The indexed revision to read. Omitted reads the served revision.
+    #[validate(length(min = 1u64, max = 128u64))]
+    pub revision: Option<String>,
 }
 /// Match class established for one declaration identifier. A search hit that matches none of the requested identifiers reports `unknown`; a symbol lookup hit never does.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
@@ -1301,13 +1303,11 @@ pub struct PackageSearchHit {
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
 }
-/// One ranked page of package declarations. A page **MUST NOT** take the response past `response_body_bytes_max`: the server stops it before the first item that would, and the page carries the items that fit, `next_cursor` at the first item left out, and a `result_truncated` warning. The server **MUST** retain the captured view and its original expiry on every page, including an empty page.
+/// One page of package declarations. The response carries pagination for the selected declarations. A page above response_body_bytes_max is refused.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 pub struct PackageSearchPage {
     /// Ranked package declarations.
     pub items: Vec<PackageSearchItem>,
-    /// Opaque cursor for the next page.
-    pub next_cursor: Option<String>,
     /// Warnings attached to this page.
     pub warnings: Vec<Warning>,
     /// Publication format used by the package index.
@@ -1320,6 +1320,10 @@ pub struct PackageSearchPage {
     pub documentation_revision: Option<String>,
     /// The immutable serving view and the expiry promised by its owner.
     pub view: CapturedView,
+    /// The requested page and the size of its complete result set.
+    pub pagination: Pagination,
+    /// The indexed revision this answer read.
+    pub revision: String,
     /// Additional properties not defined in the schema.
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
@@ -1344,6 +1348,9 @@ pub struct PackagePatternRequest {
     pub packages: Option<Vec<PackageIdentity>>,
     /// Optional fields to include. An omitted member is `false`.
     pub include: Option<PackagePatternRequestInclude>,
+    /// The indexed revision to read. Omitted reads the served revision.
+    #[validate(length(min = 1u64, max = 128u64))]
+    pub revision: Option<String>,
 }
 /// The smallest declaration whose range holds a match. A match no declaration holds carries none.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
@@ -1390,13 +1397,11 @@ pub struct PackagePatternHit {
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
 }
-/// One page of pattern matches. A page that stops before the last match carries `next_cursor` at the first match left out and a `result_truncated` warning naming the bound it stopped at. A page **MUST NOT** take the response past `response_body_bytes_max`: the server stops it before the first match that would.
+/// One page of results at the named revision. A page past the last returns an empty list with the same pagination. The server refuses a page that exceeds the response byte bound.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 pub struct PackagePatternPage {
     /// Matches in package, file path, and offset order.
     pub items: Vec<PackagePatternHit>,
-    /// Opaque cursor for the next page.
-    pub next_cursor: Option<String>,
     /// Warnings attached to this page.
     pub warnings: Vec<Warning>,
     /// Publication format used by the package index.
@@ -1407,6 +1412,10 @@ pub struct PackagePatternPage {
     pub corpus_revision: String,
     /// The immutable serving view and the expiry promised by its owner.
     pub view: Option<CapturedView>,
+    /// The requested page and the size of its complete result set.
+    pub pagination: Pagination,
+    /// The indexed revision this answer read.
+    pub revision: String,
     /// Additional properties not defined in the schema.
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
@@ -2791,14 +2800,14 @@ pub struct GetSymbolParams {
         regex(path = "REGEX_GET_SYMBOL_PARAMS_REVISION")
     )]
     pub revision: Option<String>,
-    /// Most declarations returned in this read. Omitted uses the existing five-item bound.
+    /// Results per page, at most 10,000.
     #[validate(range(min = 1, max = 10000))]
-    #[default(Some(5u64))]
-    pub declaration_limit: Option<u64>,
-    /// Continuation a preceding read returned, bound to this symbol and the revision it read.
-    /// The server refuses it for another symbol and once that revision is no longer served.
-    #[validate(length(min = 1u64, max = 4_096u64))]
-    pub declaration_cursor: Option<String>,
+    #[default(Some(10u64))]
+    pub max_results: Option<u64>,
+    /// The 1-based page to read.
+    #[validate(range(min = 1))]
+    #[default(Some(1u64))]
+    pub page: Option<u64>,
 }
 /// Exactly one logical object, definite absence, or explicit selection unavailability.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
@@ -3768,6 +3777,19 @@ impl<'de> serde::Deserialize<'de> for SyntaxFramework {
         }
     }
 }
+/// The requested page and the size of its complete result set.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct Pagination {
+    /// The 1-based page this answer serves.
+    pub page: u64,
+    /// Page count, zero when the result set is empty.
+    pub pages: u64,
+    /// Results per page.
+    pub max_results: u64,
+    /// Total results within the server's result bound.
+    pub total: u64,
+}
 /// The captured selection cannot serve this search or pattern request.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(untagged)]
@@ -3795,14 +3817,19 @@ impl SearchUnavailable {
     validator::Validate,
     oas3_gen_support::Default
 )]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, default)]
 pub struct FacetsParams {
     /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub symbol: String,
-    /// Continuation returned by a preceding read of this symbol at the same revision.
-    #[validate(length(min = 1u64, max = 4_096u64))]
-    pub facet_cursor: Option<String>,
+    /// Results per page, at most 100.
+    #[validate(range(min = 1, max = 100))]
+    #[default(Some(10u64))]
+    pub max_results: Option<u64>,
+    /// The 1-based page to read.
+    #[validate(range(min = 1))]
+    #[default(Some(1u64))]
+    pub page: Option<u64>,
     /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
     #[validate(
         length(min = 1u64, max = 8_192u64),
@@ -3818,8 +3845,8 @@ pub struct FacetsResult {
     pub symbol: String,
     /// Declarations in symbol order, with each declaration's syntax elements in pre-order.
     pub declarations: Vec<FacetDeclaration>,
-    /// Continues the declarations of this symbol at this revision.
-    pub facet_cursor: Option<String>,
+    /// The requested page and the size of its complete result set.
+    pub pagination: Pagination,
     /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
     pub revision: String,
     /// Conditions affecting this answer. Absent when empty.
@@ -4227,8 +4254,6 @@ pub struct RelationshipSearchPage {
     /// Physical source catalog and requested bytes for reached declarations and occurrences.
     /// Identical captured records may repeat across pages; conflicting records are refused.
     pub sources: Option<Vec<QuerySource>>,
-    /// Opaque continuation bound to subjects, direction, facets and selected domain.
-    pub next_cursor: Option<String>,
     /// Existing warnings retained without treating missing facts as complete empty.
     pub warnings: Option<Vec<ReadWarning>>,
     /// Analyzer revision shared by every page and exact read.
@@ -4592,15 +4617,16 @@ impl SearchRequestBody {
     oas3_gen_support::Default
 )]
 pub struct SearchPackagesRequestQuery {
-    /// Maximum entries in one page, at most the `page_limit_max` the capabilities advertise; the server refuses a larger one.
+    /// The 1-based page to read.
+    #[validate(range(min = 1))]
+    #[default(Some(1u64))]
+    pub page: Option<u64>,
+    /// Results per page. The server refuses a value above the advertised maximum.
     #[validate(range(min = 1i64, max = 1_000i64))]
-    #[default(Some(100i64))]
-    pub limit: Option<i64>,
-    /// Opaque cursor for the next page.
-    #[validate(length(max = 4_096u64))]
-    pub cursor: Option<String>,
+    #[default(Some(10i64))]
+    pub max_results: Option<i64>,
 }
-/// Returns one ranked declaration page from selected exact package versions.
+/// Returns one page of results from the selected exact package versions. The caller pins later pages with the returned `revision`.
 #[derive(Debug, Clone, validator::Validate, oas3_gen_support::Default)]
 pub struct SearchPackagesRequest {
     #[validate(nested)]
@@ -4752,7 +4778,7 @@ pub enum SearchPackagesResponse {
     ///default: Unknown response
     Unknown,
 }
-/// Reads one exact logical symbol obtained from discovery or another read.
+/// Reads one exact logical symbol obtained from discovery or another read. The caller selects declarations with `page` and `max_results`, and pins later pages with `revision`.
 #[derive(Debug, Clone, validator::Validate, oas3_gen_support::Default)]
 pub struct GetSymbolRequest {
     /// Reads one exact logical symbol obtained from discovery or another read.
@@ -4908,7 +4934,7 @@ pub enum GetSymbolResponse {
     ///default: Unknown response
     Unknown,
 }
-/// Reads every declaration of one package or runtime symbol with its location, exact source, and syntax structure. The request carries `symbol` and MAY carry `facet_cursor` and `revision`. Each declaration carries its syntax tree. The answer names the release it read. A page holds at most `page_limit_max` declarations and at least one whole declaration; beyond its first declaration, the syntax source stays within `x-rift-page-source-bytes-max`. The caller MUST return `facet_cursor` with the same symbol and revision. A symbol the release does not declare answers 404.
+/// Reads every declaration of one package or runtime symbol with its location, exact source, and syntax structure. The caller selects declarations with `page` and `max_results`, and pins later pages with `revision`.
 #[derive(Debug, Clone, validator::Validate, oas3_gen_support::Default)]
 pub struct FacetsRequest {
     /// The package or runtime symbol whose facets the request reads.
@@ -5058,15 +5084,16 @@ pub enum FacetsResponse {
     oas3_gen_support::Default
 )]
 pub struct SearchPackagePatternsRequestQuery {
-    /// Maximum entries in one page, at most the `page_limit_max` the capabilities advertise; the server refuses a larger one.
+    /// The 1-based page to read.
+    #[validate(range(min = 1))]
+    #[default(Some(1u64))]
+    pub page: Option<u64>,
+    /// Results per page. The server refuses a value above the advertised maximum.
     #[validate(range(min = 1i64, max = 1_000i64))]
-    #[default(Some(100i64))]
-    pub limit: Option<i64>,
-    /// Opaque cursor for the next page.
-    #[validate(length(max = 4_096u64))]
-    pub cursor: Option<String>,
+    #[default(Some(10i64))]
+    pub max_results: Option<i64>,
 }
-/// Returns the matches of one regular expression over the source files of selected exact package versions, in package order as the request lists them, then file path order, then match offset. The server verifies candidate files in that order and stops a page at `limit` hits, at `x-rift-page-files-max` files, or at `x-rift-page-text-bytes-max` bytes of verified text, whichever comes first; `next_cursor` continues where the page stopped, and a `result_truncated` warning names the bound.
+/// Returns one page of results from the selected exact package versions. The caller pins later pages with the returned `revision`.
 #[derive(Debug, Clone, validator::Validate, oas3_gen_support::Default)]
 pub struct SearchPackagePatternsRequest {
     #[validate(nested)]
@@ -5843,8 +5870,8 @@ pub struct GetSymbolResultObject {
     pub revision: String,
     /// Declaration bindings in deterministic source order.
     pub declarations: Vec<SymbolDeclaration>,
-    /// Continuation for the remaining declarations at `revision`.
-    pub declaration_cursor: Option<String>,
+    /// The requested page and the size of its complete result set.
+    pub pagination: Pagination,
     /// One symbol's history as edges from the symbol to the commits that touched it and to the
     /// symbols changed beside it. The history follows first parents from the served revision,
     /// or the selected releases in version order, through the commits the history store holds,
@@ -5960,7 +5987,7 @@ pub struct SearchUnavailableObject {
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(untagged)]
 pub enum Search200Response {
-    /// One ranked page of package declarations. A page **MUST NOT** take the response past `response_body_bytes_max`: the server stops it before the first item that would, and the page carries the items that fit, `next_cursor` at the first item left out, and a `result_truncated` warning. The server **MUST** retain the captured view and its original expiry on every page, including an empty page.
+    /// One page of package declarations. The response carries pagination for the selected declarations. A page above response_body_bytes_max is refused.
     #[default]
     Package(PackageSearchPage),
     /// One raw relationship page from an immutable selected publication.

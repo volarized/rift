@@ -10,8 +10,8 @@
 use std::fmt::Write as _;
 
 use ignore::types::TypesBuilder;
-use rift_protocol::query::{QueryLanguage, QueryParams};
-use rift_protocol::read::{PAGE_LIMIT_MAX, PathPattern};
+use rift_protocol::query::{QUERY_MAX_RESULTS, QueryLanguage, QueryParams};
+use rift_protocol::read::PathPattern;
 use serde_json::Value;
 
 /// UTF-8 bytes of the caller's own regex a deny reason carries. A longer `Grep` pattern
@@ -191,7 +191,7 @@ impl GrepRequest {
             return None;
         }
         let include = included(&self.selected_globs()?, paths)?;
-        let (limit, page_index) = paging(self.head_limit, self.offset)?;
+        let (limit, page) = paging(self.head_limit, self.offset)?;
         let pattern = serde_json::to_string(&pattern).ok()?;
         let mut selection = format!("?hit :pattern {pattern}; :index ?index; :path ?path");
         if !include.is_empty() {
@@ -202,12 +202,6 @@ impl GrepRequest {
                 "; :paths '{paths}'^^<http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON>"
             )
             .ok()?;
-        }
-        if let Some(limit) = limit {
-            write!(selection, "; :limit {limit}").ok()?;
-        }
-        if let Some(page_index) = page_index {
-            write!(selection, "; :page_index {page_index}").ok()?;
         }
         let projection = if self.files_only {
             selection.push_str("; :target 'file' .");
@@ -221,11 +215,22 @@ impl GrepRequest {
         };
         let query =
             format!("SELECT {projection} {{ SERVICE :search {{ {selection} }} }} ORDER BY ?index");
-        let rendered = serde_json::to_string(&QueryParams {
+        let mut arguments = serde_json::to_value(QueryParams {
             query,
             language: QueryLanguage::Sparql,
+            max_results: limit.unwrap_or(rift_protocol::read::MAX_RESULTS_DEFAULT),
+            page: page.unwrap_or(rift_protocol::read::PAGE_DEFAULT),
+            revision: None,
         })
         .ok()?;
+        let fields = arguments.as_object_mut()?;
+        if limit.is_none() {
+            fields.remove("max_results");
+        }
+        if page.is_none() {
+            fields.remove("page");
+        }
+        let rendered = serde_json::to_string(&arguments).ok()?;
         (rendered.len() <= SUGGESTION_BYTES_MAX).then_some(rendered)
     }
 
@@ -272,20 +277,20 @@ fn included(globs: &[String], paths: &[GrepPath]) -> Option<Vec<PathPattern>> {
     Some(include)
 }
 
-/// `head_limit` and `offset` as `limit` and `page_index`, `head_limit` capped at
-/// [`PAGE_LIMIT_MAX`]. `None` when the offset falls inside a page or pages an unlimited
+/// `head_limit` and `offset` as `limit` and `page`, `head_limit` capped at
+/// [`QUERY_MAX_RESULTS`]. `None` when the offset falls inside a page or pages an unlimited
 /// answer.
 fn paging(head_limit: Option<u64>, offset: Option<u64>) -> Option<(Option<u64>, Option<u64>)> {
     let limit = match head_limit {
         Some(0) | None => None,
-        Some(entries) => Some(entries.min(PAGE_LIMIT_MAX)),
+        Some(entries) => Some(entries.min(QUERY_MAX_RESULTS)),
     };
     match offset {
         None | Some(0) => Some((limit, None)),
         Some(_) if head_limit == Some(0) => None,
         Some(skipped) => {
             let size = limit.unwrap_or(GREP_HEAD_LIMIT_DEFAULT);
-            (skipped % size == 0).then_some((Some(size), Some(skipped / size)))
+            (skipped % size == 0).then_some((Some(size), Some(skipped / size + 1)))
         }
     }
 }
@@ -379,14 +384,20 @@ pub(super) mod tests {
         };
         let mut producer = serde_json::to_value(&selected.request).expect("producer serializes");
         let fields = producer.as_object_mut().expect("producer is an object");
+        if arguments.get("max_results").is_some() {
+            fields.insert("max_results".to_owned(), json!(parameters.max_results));
+        }
+        if parameters.page > 1 {
+            fields.insert("page".to_owned(), json!(parameters.page));
+        }
         assert_eq!(fields.remove("scope"), Some(json!("local")));
         assert_eq!(fields.remove("order"), Some(json!("relevance")));
         if fields["target"] == "all" {
             fields.remove("target");
             assert_eq!(fields.remove("include"), Some(json!({"source": true})));
         }
-        if fields["page_index"] == 0 {
-            fields.remove("page_index");
+        if fields["page"] == 1 {
+            fields.remove("page");
         }
         if let Some(paths) = fields.get_mut("paths").and_then(Value::as_object_mut) {
             assert_eq!(paths.remove("exclude"), Some(json!([])));
@@ -560,19 +571,19 @@ pub(super) mod tests {
     #[test]
     fn head_limit_and_offset_map_to_paging() {
         let cases = [
-            (json!({"head_limit": 50}), Some(json!({"limit": 50}))),
+            (json!({"head_limit": 50}), Some(json!({"max_results": 50}))),
             (
                 json!({"head_limit": 50, "offset": 100}),
-                Some(json!({"limit": 50, "page_index": 2})),
+                Some(json!({"max_results": 50, "page": 3})),
             ),
             (
                 json!({"offset": 250}),
-                Some(json!({"limit": 250, "page_index": 1})),
+                Some(json!({"max_results": 250, "page": 2})),
             ),
             (json!({"head_limit": 0}), Some(json!({}))),
             (
                 json!({"head_limit": 20_000}),
-                Some(json!({"limit": 10_000})),
+                Some(json!({"max_results": 1_000})),
             ),
             (json!({"head_limit": 50, "offset": 30}), None),
             (json!({"head_limit": 0, "offset": 10}), None),
@@ -679,7 +690,10 @@ pub(super) mod tests {
             (json!({"pattern": ""}), GrepPath::Root),
             (json!({"pattern": 7}), GrepPath::Root),
             (json!({"path": "src"}), GrepPath::Root),
-            (json!({"pattern": "*.rs", "limit": 10}), GrepPath::Root),
+            (
+                json!({"pattern": "*.rs", "max_results": 10}),
+                GrepPath::Root,
+            ),
             (
                 json!({"pattern": "lib/*.rs"}),
                 GrepPath::Directory("src".to_owned()),

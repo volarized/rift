@@ -7,14 +7,12 @@ use rmcp::model::{ReadResourceResult, Resource, ResourceContents, ResourceTempla
 
 use crate::output::{log_warnings, resource_text};
 
-use crate::failure::McpErrorFailExt as _;
-
 /// The workspace orientation snapshot.
 pub(crate) const MAP_URI: &str = "rift://map";
 /// The first workspace resource page.
 pub(crate) const WORKSPACE_URI: &str = "rift://workspace";
 /// The template a client expands to reach one workspace resource page.
-pub(crate) const WORKSPACE_TEMPLATE: &str = "rift://workspace{?page_index}";
+pub(crate) const WORKSPACE_TEMPLATE: &str = "rift://workspace{?page,max_results}";
 /// The query prefix selecting one workspace resource page.
 const WORKSPACE_QUERY_PREFIX: &str = "rift://workspace?";
 /// The media type of the JSON content of a resource read, and of every listed resource.
@@ -49,7 +47,7 @@ pub(crate) fn declared_templates() -> Vec<ResourceTemplate> {
         ResourceTemplate::new(WORKSPACE_TEMPLATE, "workspace-page")
             .with_title("Workspace page")
             .with_description(
-                "One page of the workspace resource, selected by zero-based `page_index`.",
+                "One page of the workspace resource, selected by 1-based `page` and `max_results`.",
             )
             .with_mime_type(RESOURCE_MEDIA_TYPE),
     ]
@@ -61,28 +59,49 @@ pub(crate) fn is_workspace_uri(uri: &str) -> bool {
     uri == WORKSPACE_URI || uri.starts_with(WORKSPACE_QUERY_PREFIX)
 }
 
-/// The zero-based page one workspace resource URI selects.
-pub(crate) fn workspace_page_index(uri: &str) -> Result<u64, ErrorData> {
+/// The requested page and result count of one workspace resource read.
+pub(crate) fn workspace_page(uri: &str) -> Result<(u64, u64), ErrorData> {
+    let mut page = rift_protocol::read::PAGE_DEFAULT;
+    let mut max_results = rift_protocol::read::MAX_RESULTS_DEFAULT;
     if uri == WORKSPACE_URI {
-        return Ok(0);
+        return Ok((page, max_results));
     }
-    let Some(query) = uri.strip_prefix(WORKSPACE_QUERY_PREFIX) else {
-        return ErrorData::resource_not_found(format!("no resource is published at {uri:?}"), None)
-            .fail();
-    };
-    let Some(value) = query.strip_prefix("page_index=") else {
-        return ErrorData::invalid_params(
-            format!("`page_index` must be a zero-based integer, such as 0, not {query:?}"),
-            None,
-        )
-        .fail();
-    };
-    value.parse::<u64>().map_err(|_| {
-        ErrorData::invalid_params(
-            format!("`page_index` must be a zero-based integer, such as 0, not {value:?}"),
-            None,
-        )
-    })
+    let query = uri.strip_prefix(WORKSPACE_QUERY_PREFIX).ok_or_else(|| {
+        ErrorData::resource_not_found(format!("no resource is published at {uri:?}"), None)
+    })?;
+    let mut fields = std::collections::BTreeSet::new();
+    for entry in query.split('&') {
+        let (field, value) = entry
+            .split_once('=')
+            .ok_or_else(|| ErrorData::invalid_params("expected page=1&max_results=10", None))?;
+        if !fields.insert(field) {
+            return Err(ErrorData::invalid_params(
+                "page fields must occur once",
+                None,
+            ));
+        }
+        let value = value.parse::<u64>().map_err(|_| {
+            ErrorData::invalid_params("page and max_results must be positive integers", None)
+        })?;
+        match field {
+            "page" => page = value,
+            "max_results" => max_results = value,
+            _ => {
+                return Err(ErrorData::invalid_params(
+                    "expected page or max_results",
+                    None,
+                ));
+            }
+        }
+    }
+    rift_server::accept_page(page)
+        .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
+    rift_server::accepted_max_results(
+        max_results,
+        rift_protocol::workspace::WORKSPACE_SOURCE_UNITS_MAX as u64,
+    )
+    .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
+    Ok((page, max_results))
 }
 
 /// The typed answer one workspace resource read returns.
@@ -120,7 +139,7 @@ fn answer(uri: &str, text: String, json: String) -> ReadResourceResult {
 mod tests {
     use super::{
         MAP_URI, WORKSPACE_TEMPLATE, WORKSPACE_URI, declared_resources, declared_templates,
-        is_workspace_uri, map_answer, rendered_workspace, workspace_page_index,
+        is_workspace_uri, map_answer, rendered_workspace, workspace_page,
     };
     use crate::output::resource_text;
     use rift_protocol::map::WorkspaceMap;
@@ -157,55 +176,52 @@ mod tests {
     }
 
     /// Empty first workspace page under one accepted configuration revision.
-    fn workspace_page() -> WorkspaceResourcePage {
+    fn sample_workspace_page() -> WorkspaceResourcePage {
         WorkspaceResourcePage {
             configuration_revision: Digest("3f9a1c2e".to_owned()),
             languages: Vec::new(),
             source: Vec::new(),
             warnings: Vec::new(),
-            pagination: Pagination {
-                page_index: 0,
-                total_pages: 0,
-            },
+            pagination: Pagination::new(1, 10, 0),
         }
     }
 
     #[test]
     fn workspace_bare_uri_selects_the_first_page() {
-        let page = workspace_page_index(WORKSPACE_URI).expect("bare workspace URI is published");
-        assert_eq!(page, 0);
+        let page = workspace_page(WORKSPACE_URI).expect("bare workspace URI is published");
+        assert_eq!(page, (1, 10));
         assert!(is_workspace_uri(WORKSPACE_URI));
     }
 
     #[test]
     fn workspace_query_selects_its_zero_based_page() {
-        let uri = "rift://workspace?page_index=17";
+        let uri = "rift://workspace?page=17";
 
-        let page = workspace_page_index(uri).expect("workspace page URI is published");
-        assert_eq!(page, 17);
+        let page = workspace_page(uri).expect("workspace page URI is published");
+        assert_eq!(page, (17, 10));
         assert!(is_workspace_uri(uri));
     }
 
     #[test]
-    fn workspace_query_refuses_missing_or_invalid_page_index() {
+    fn workspace_query_refuses_missing_or_invalid_page() {
         for uri in [
             "rift://workspace?",
-            "rift://workspace?page=1",
-            "rift://workspace?page_index=",
-            "rift://workspace?page_index=one",
-            "rift://workspace?page_index=1&extra=2",
-            "rift://workspace?page_index=18446744073709551616",
+            "rift://workspace?page=0",
+            "rift://workspace?page=",
+            "rift://workspace?page=one",
+            "rift://workspace?page=1&extra=2",
+            "rift://workspace?page=18446744073709551616",
         ] {
-            let refusal = workspace_page_index(uri).expect_err("invalid page must be refused");
+            let refusal = workspace_page(uri).expect_err("invalid page must be refused");
             assert_eq!(refusal.code, rmcp::model::ErrorCode::INVALID_PARAMS);
-            assert!(refusal.message.contains("page_index"), "{refusal:?}");
+            assert!(refusal.message.contains("page"), "{refusal:?}");
         }
     }
 
     #[test]
     fn workspace_path_is_not_a_workspace_resource_uri() {
         let uri = "rift://workspace/1";
-        let refusal = workspace_page_index(uri).expect_err("workspace paths are not published");
+        let refusal = workspace_page(uri).expect_err("workspace paths are not published");
 
         assert!(!is_workspace_uri(uri));
         assert_eq!(refusal.code, rmcp::model::ErrorCode::RESOURCE_NOT_FOUND);
@@ -213,7 +229,7 @@ mod tests {
 
     #[test]
     fn rendered_workspace_answer_carries_compact_text_then_typed_json() {
-        let page = workspace_page();
+        let page = sample_workspace_page();
         let rendered = rendered_workspace(WORKSPACE_URI, &page).expect("the text renders");
 
         let (compact, json_body) = contents(&rendered, WORKSPACE_URI);
@@ -231,18 +247,20 @@ mod tests {
 
     #[test]
     fn a_workspace_page_read_names_its_uri_in_both_contents() {
-        let uri = "rift://workspace?page_index=2";
-        let mut page = workspace_page();
+        let uri = "rift://workspace?page=2";
+        let mut page = sample_workspace_page();
         page.pagination = Pagination {
-            page_index: 2,
-            total_pages: 4,
+            page: 2,
+            pages: 4,
+            max_results: 10,
+            total: 40,
         };
 
         let rendered = rendered_workspace(uri, &page).expect("the text renders");
 
         assert_eq!(
             contents(&rendered, uri).0,
-            "workspace · page 3/4\nnext · rift://workspace?page_index=3\n"
+            "workspace · page 2/4, total 40 results\nnext · rift://workspace?page=3&max_results=10\n"
         );
     }
 
@@ -259,10 +277,6 @@ mod tests {
             packages: Vec::new(),
             recommendations: Vec::new(),
             warnings: Vec::new(),
-            pagination: Pagination {
-                page_index: 0,
-                total_pages: 1,
-            },
         }
     }
 

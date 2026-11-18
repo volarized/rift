@@ -132,7 +132,6 @@ impl RiftMcp {
     ) -> Result<Option<SearchUnavailable>, RiftError> {
         let mut request = FacetsParams::of(id.clone());
         request.revision = Some(revision.clone());
-        let mut cursors = BTreeSet::new();
         let mut remaining_bytes = limits.literal_bytes_max();
         for _ in 0..SYNTAX_ELEMENT_PAGES_MAX {
             let page = self.global.symbol_facets(configuration, &request).await?;
@@ -167,13 +166,11 @@ impl RiftMcp {
                     result.warnings.push(warning);
                 }
             }
-            let Some(cursor) = page.facet_cursor else {
+            if request.page >= page.pagination.pages {
                 return Ok(None);
-            };
-            if !cursors.insert(cursor.clone()) {
-                return Err(coverage_failure());
             }
-            request.facet_cursor = Some(cursor);
+            request.revision = Some(page.revision);
+            request.page += 1;
         }
         Err(coverage_failure())
     }
@@ -184,8 +181,8 @@ pub(super) fn exact_request(id: &SymbolId, revision: &Revision) -> GetSymbolPara
         id: id.clone(),
         include: rift_protocol::read::GetSymbolInclude::default(),
         revision: Some(revision.clone()),
-        declaration_limit: 1,
-        declaration_cursor: None,
+        max_results: 1,
+        page: 1,
     }
 }
 

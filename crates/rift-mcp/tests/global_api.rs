@@ -69,9 +69,6 @@ pub(crate) const PAGE_LIMIT_ADVERTISED: u64 = 200;
 /// another: the client's own bound.
 const DEPENDENCY_ENTRIES_ADVERTISED: u64 = 20_000;
 
-/// The cursor a search page stopped at the response body bound names.
-pub(crate) const BODY_BOUND_CURSOR: &str = "after-body-bound";
-
 /// The query the fixture answers with `beacon` matched inside its body: a word no
 /// declaration name holds, so the hit claims the `unknown` class and `file_content`.
 pub(crate) const BODY_MATCH_QUERY: &str = "handshake";
@@ -325,18 +322,20 @@ async fn global_handler(
         .is_some_and(|value| value == "1");
     let uri = request.uri().to_string();
     let path = request.uri().path().to_owned();
-    let limit = request
-        .uri()
-        .query()
-        .and_then(|query| {
-            query
-                .split('&')
-                .find_map(|member| member.strip_prefix("limit="))
-        })
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or_else(|| {
-            usize::try_from(PAGE_LIMIT_ADVERTISED).expect("advertised page bound fits usize")
-        });
+    let query = request.uri().query().map(str::to_owned);
+    let number = |field: &str, default: u64| {
+        query
+            .as_deref()
+            .and_then(|query| {
+                query
+                    .split('&')
+                    .find_map(|member| member.strip_prefix(field))
+            })
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(default)
+    };
+    let page_number = number("page=", 1);
+    let max_results = number("max_results=", 10);
     let Ok(bytes) = to_bytes(request.into_body(), REQUEST_BODY_BYTES_MAX).await else {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     };
@@ -377,24 +376,36 @@ async fn global_handler(
             options.stopped_at_body_bound,
             options.query_narrowed,
         );
-        bound_case_page(&mut page, options.symbol, limit);
+        page = numbered_result(page, "items", page_number, max_results);
         return state.response(page);
     }
     if path.ends_with("/symbols") {
         state.hold_read().await;
-        return state.response(symbols(options.symbol, &body));
+        return state.response(numbered_result(
+            symbols(options.symbol, &body),
+            "declarations",
+            body["page"].as_u64().unwrap_or(1),
+            body["max_results"].as_u64().unwrap_or(10),
+        ));
     }
     if path.ends_with("/facets") {
         state.hold_read().await;
         return symbol_facets(&body).map_or_else(
             || problem_response(StatusCode::NOT_FOUND),
-            |syntax_elements| state.response(syntax_elements),
+            |syntax_elements| {
+                state.response(numbered_result(
+                    syntax_elements,
+                    "declarations",
+                    body["page"].as_u64().unwrap_or(1),
+                    body["max_results"].as_u64().unwrap_or(10),
+                ))
+            },
         );
     }
     if path.ends_with("/patterns") {
         return pattern_page(&body).map_or_else(
             || StatusCode::BAD_REQUEST.into_response(),
-            |page| state.response(page),
+            |page| state.response(numbered_result(page, "items", page_number, max_results)),
         );
     }
     StatusCode::NOT_FOUND.into_response()
@@ -426,15 +437,6 @@ fn problem_response(status: StatusCode) -> Response {
 }
 
 /// Applies the requested page bound to the case regression's already ranked declarations.
-fn bound_case_page(page: &mut Value, fixture: SymbolFixture, limit: usize) {
-    if matches!(fixture, SymbolFixture::CasePairs) {
-        page["items"]
-            .as_array_mut()
-            .expect("a page carries items")
-            .truncate(limit);
-    }
-}
-
 /// The capabilities the fixture advertises under `options`, every feature it serves but
 /// the withheld ones.
 fn capabilities(options: &FixtureOptions) -> Value {
@@ -474,8 +476,7 @@ fn capabilities(options: &FixtureOptions) -> Value {
             "packages_max": 20000,
             "page_limit_min": 1,
             "page_limit_max": options.page_limit_max,
-            "page_limit_default": 20,
-            "cursor_bytes_max": 4096,
+            "page_limit_default": 10,
             "candidate_pool_max": 1000,
             "warnings_max": 32,
             "source_bytes_max": 1_048_576
@@ -895,9 +896,7 @@ fn search_page(
         "detail": "the page stopped at response_body_bytes_max"
     });
     warnings.push(truncated);
-    let mut stopped = page(&items, &json!(warnings));
-    stopped["next_cursor"] = json!(BODY_BOUND_CURSOR);
-    stopped
+    page(&items, &json!(warnings))
 }
 
 /// One body match retaining the declaration's original identity and source.
@@ -1096,4 +1095,23 @@ fn collected_hit(fixture: SymbolFixture, declaration: &str, with_source: bool) -
         hit["source"] = json!(&source[range]);
     }
     hit
+}
+
+fn numbered_result(mut value: Value, key: &str, page: u64, max_results: u64) -> Value {
+    let Some(items) = value[key].as_array() else {
+        return value;
+    };
+    let pagination = rift_protocol::read::Pagination::new(page, max_results, items.len() as u64);
+    let selected: Vec<_> = items
+        .iter()
+        .skip(pagination.offset())
+        .take(usize::try_from(max_results).expect("fixture count fits usize"))
+        .cloned()
+        .collect();
+    value[key] = json!(selected);
+    value["pagination"] = serde_json::to_value(pagination).expect("pagination");
+    if key == "items" {
+        value["revision"] = value["corpus_revision"].clone();
+    }
+    value
 }

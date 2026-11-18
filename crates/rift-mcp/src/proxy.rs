@@ -3443,7 +3443,7 @@ mod tests {
                         "results": [{"hit":{"target":"symbol", "symbol":{
                             "id":"rift://symbol/local/rust/app/beacon", "language":"rust", "name":"beacon", "kind":"function"
                         }}, "path":"lib.rs", "source":"fn beacon() {}", "range":{"start":0,"end":14}, "line":1}],
-                        "pagination":{"page_index":0,"total_pages":1}
+                        "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 10}
                     })).expect("typed latest search result");
                     let mut meta = rmcp::model::MetaObject::new();
                     meta.insert("traceparent".to_owned(), json!("selected-search"));
@@ -3456,7 +3456,7 @@ mod tests {
                 "search" => Ok(CallToolResult::structured(json!({
                     "answer": {"result":"bindings", "variables":["symbol"], "bindings":[]},
                     "view": {"id":"claims.primary", "expires_at":"2099-01-01T00:00:00Z"},
-                    "pagination": {"page_index":0, "total_pages":0}
+                    "pagination": {"page": 1, "pages": 0, "max_results": 10, "total": 0}
                 }))
                 .into()),
                 "failing" => Ok(CallToolResult::structured_error(json!({"code": "failed"})).into()),
@@ -3770,8 +3770,8 @@ mod tests {
                 bindings: Vec::new()
             }
         );
-        assert_eq!(primary.pagination.page.page_index, 0);
-        assert_eq!(primary.pagination.page.total_pages, 0);
+        assert_eq!(primary.pagination.as_ref().expect("pagination").page, 1);
+        assert_eq!(primary.pagination.as_ref().expect("pagination").pages, 0);
         let view = primary
             .view
             .ok_or("primary search retains its captured view")?;
@@ -4022,7 +4022,7 @@ mod tests {
             "rift://symbol/stdlib/cpython/python/builtins/len",
         ] {
             let request = CallToolRequestParams::new("facets").with_arguments(
-                serde_json::from_value(json!({"symbol": id, "facet_cursor": "1.ab"}))?,
+                serde_json::from_value(json!({"symbol": id, "page": 1, "max_results": 10}))?,
             );
             assert!(std::ptr::eq(
                 proxy.call_backend(&request)?,
@@ -4043,7 +4043,7 @@ mod tests {
         let proxy = extra_profile_proxy(primary.path(), extra.path())?;
         let id = "rift://symbol/local@cloud:docs/rust/app/beacon";
         let request = CallToolRequestParams::new("facets").with_arguments(serde_json::from_value(
-            json!({"symbol": id, "facet_cursor": "2.ab"}),
+            json!({"symbol": id, "page": 2, "max_results": 10}),
         )?);
 
         let backend = proxy.call_backend(&request)?;
@@ -4058,7 +4058,8 @@ mod tests {
             arguments.get("symbol"),
             Some(&json!("rift://symbol/local/rust/app/beacon"))
         );
-        assert_eq!(arguments.get("facet_cursor"), Some(&json!("2.ab")));
+        assert_eq!(arguments.get("page"), Some(&json!(2)));
+        assert_eq!(arguments.get("max_results"), Some(&json!(10)));
         let primary_request = CallToolRequestParams::new("facets").with_arguments(
             serde_json::from_value(json!({"symbol": "rift://symbol/local/rust/app/beacon"}))?,
         );
@@ -4335,7 +4336,7 @@ mod tests {
                 assert_eq!(request["params"]["arguments"]["revision"], HEAD);
                 let answer = json!({"content":[],"structuredContent":{
                     "outcome":"found", "symbol":{"id":"rift://symbol/local/rust/app/load", "language":"rust", "name":"load", "kind":"function"},
-                    "revision":COMMIT_REVISION,
+                    "revision":COMMIT_REVISION,"pagination":{"page":1,"pages":1,"max_results":10,"total":1},
                     "declarations":[{"origin":{"location":"project","source_kind":"authored"},"path":"lib.rs","range":{"start":0,"end":12},"line":1,"signature_indices":[],"type_indices":[],"documentation_indices":[]}]
                 }});
                 let response = json!({"jsonrpc":"2.0","id":request["id"],"result":answer});
@@ -4417,7 +4418,7 @@ mod tests {
         let answering = tokio::spawn(async move {
             let (reading, mut writing) = tokio::io::split(upstream);
             let mut lines = tokio::io::BufReader::new(reading).lines();
-            for page in 0..2 {
+            for _ in 0..2 {
                 let line = lines
                     .next_line()
                     .await?
@@ -4426,25 +4427,18 @@ mod tests {
                 let query = request["params"]["arguments"]["query"]
                     .as_str()
                     .expect("forwarded SPARQL");
-                if page == 0 {
-                    assert!(
-                        query.contains("<rift://symbol/local/rust/app/load>"),
-                        "{query}"
-                    );
-                    assert!(!query.contains("local@cloud"), "{query}");
-                } else {
-                    assert!(
-                        query.contains("urn:rift:result:claims.walk?page=0"),
-                        "{query}"
-                    );
-                }
+                assert!(
+                    query.contains("<rift://symbol/local/rust/app/load>"),
+                    "{query}"
+                );
+                assert!(!query.contains("local@cloud"), "{query}");
                 let rows: Vec<_> = ["zulu", "alpha"].into_iter().map(|name| json!({
                     "symbol":{"type":"iri", "value":format!("rift://symbol/local/rust/app/{name}")}
                 })).collect();
                 let answer = json!({"content":[], "structuredContent":{
                     "answer":{"result":"bindings", "variables":["symbol"], "bindings":rows},
                     "view":{"id":"claims.walk", "expires_at":"2099-01-01T00:00:00Z"},
-                    "pagination":{"page_index":0, "total_pages":1}
+                    "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 2}
                 }});
                 let response = json!({"jsonrpc":"2.0", "id":request["id"], "result":answer});
                 writing
@@ -4470,7 +4464,7 @@ mod tests {
         symlink(second.path(), &registration_path)?;
         let held =
             CallToolRequestParams::new("search").with_arguments(serde_json::from_value(json!({
-                "query":"SELECT ?symbol { SERVICE <urn:rift:result:claims.walk?page=0> {} }"
+                "query":"SELECT ?symbol { ?symbol :references <rift://symbol/local@cloud/rust/app/load> } ORDER BY DESC(?symbol)","page":1
             }))?);
         let CallToolResponse::Complete(continued) =
             proxy.routed_read(&held).await?.ok_or("held walk")??

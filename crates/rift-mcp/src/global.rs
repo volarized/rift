@@ -839,11 +839,8 @@ pub(crate) struct GlobalSearchCandidates {
     pub(crate) warnings: Vec<ReadWarning>,
 }
 
-/// Reads the package matches of one accepted `pattern` search: one page, asked for through
-/// the advertised page limit.
-///
-/// A page that stopped before the last match carries `result_truncated`, which reaches the
-/// caller as a `global_page_warning`, and its cursor is not followed.
+/// Reads one bounded page of package matches for an accepted `pattern` search.
+/// The request uses the advertised maximum result count.
 pub(crate) async fn package_patterns(
     client: &GlobalClient,
     params: &SearchParams,
@@ -853,13 +850,19 @@ pub(crate) async fn package_patterns(
         return Ok(GlobalPatternMatches::default());
     };
     let request = PackagePatternRequest {
+        revision: None,
         pattern,
         packages: Some(packages.to_vec()),
         include: includes_source(params)
             .then_some(PackagePatternRequestInclude { source: Some(true) }),
     };
     let page = client
-        .search_package_patterns(&request, rift_cloud_client::PAGE_LIMIT_MAX, None)
+        .search_package_patterns(
+            &request,
+            rift_cloud_client::PAGE_LIMIT_MAX
+                .min(client.get_capabilities().await?.bounds.page_limit_max),
+            1,
+        )
         .await?;
     let warnings = page_warnings(page.warnings);
     let matches = page
@@ -918,6 +921,7 @@ fn search_request(
     phase: QueryPhase,
 ) -> PackageSearchRequest {
     PackageSearchRequest {
+        revision: None,
         query: Some(query.source().to_owned()),
         terms: Some(
             query
@@ -1095,7 +1099,7 @@ pub(crate) fn merge_search(
         })
         .collect::<Vec<_>>();
     order_search_hits(&mut ordered, params.order);
-    let (results, pagination) = page_window(ordered, params.page_index, limit);
+    let (results, pagination) = page_window(ordered, params.page, limit);
     Ok(SearchResult {
         view: None,
         revision: project_revision(params, local.revision),
@@ -1160,7 +1164,7 @@ pub(crate) fn merge_patterns(
         }
     }
     order_search_hits(&mut hits, params.order);
-    let (results, pagination) = page_window(hits, params.page_index, limit);
+    let (results, pagination) = page_window(hits, params.page, limit);
     let mut warnings = local.warnings;
     warnings.extend(remote.warnings);
     SearchResult {
@@ -1307,24 +1311,11 @@ fn search_hit_key(hit: &SearchHit) -> &str {
     }
 }
 
-pub(crate) fn page_window<T>(items: Vec<T>, page_index: u64, limit: usize) -> (Vec<T>, Pagination) {
-    let total_pages = u64::try_from(items.len().div_ceil(limit)).unwrap_or(u64::MAX);
-    let start = usize::try_from(page_index)
-        .ok()
-        .and_then(|page| page.checked_mul(limit))
-        .unwrap_or(usize::MAX);
-    let page = if start >= items.len() {
-        Vec::new()
-    } else {
-        items.into_iter().skip(start).take(limit).collect()
-    };
-    (
-        page,
-        Pagination {
-            page_index,
-            total_pages,
-        },
-    )
+pub(crate) fn page_window<T>(items: Vec<T>, page: u64, limit: usize) -> (Vec<T>, Pagination) {
+    let pagination = Pagination::new(page, limit as u64, items.len() as u64);
+    let start = pagination.offset();
+    let results = items.into_iter().skip(start).take(limit).collect();
+    (results, pagination)
 }
 
 impl GlobalRoute {
@@ -2025,7 +2016,7 @@ mod tests {
             keys.contains(&revision),
             "a commit hit orders by its revision"
         );
-        let request = serde_json::json!({"query": "load_config", "limit": 10});
+        let request = serde_json::json!({"query": "load_config", "max_results": 10});
         let params: SearchParams = serde_json::from_value(request).expect("a search");
         let limit = rift_server::search_page_limit(&params).expect("an accepted limit");
         let local = SearchResult {
@@ -2424,8 +2415,8 @@ mod tests {
     fn page_window_reports_empty_page_after_last_page() {
         let (page, pagination) = page_window(vec![1, 2, 3], 4, 2);
         assert!(page.is_empty());
-        assert_eq!(pagination.page_index, 4);
-        assert_eq!(pagination.total_pages, 2);
+        assert_eq!(pagination.page, 4);
+        assert_eq!(pagination.pages, 2);
     }
 
     #[test]
@@ -3045,10 +3036,7 @@ mod tests {
                 view: None,
                 revision: None,
                 results: vec![project.clone()],
-                pagination: Pagination {
-                    page_index: 0,
-                    total_pages: 1,
-                },
+                pagination: Pagination::new(1, 10, 1),
                 warnings: vec![ReadWarning::GlobalAccessDisabled],
             };
             let remote = super::GlobalPatternMatches {
@@ -3074,10 +3062,10 @@ mod tests {
         let files = merged(json!({"pattern": "beacon", "scope": "all", "target": "file"}));
         assert_eq!(files.results, [project.clone(), file(4), file(14)]);
         let second_page = merged(json!({
-            "pattern": "beacon", "scope": "all", "target": "all", "limit": 2, "page_index": 1
+            "pattern": "beacon", "scope": "all", "target": "all", "max_results": 2, "page": 2
         }));
         assert_eq!(second_page.results, [file(4), file(14)]);
-        assert_eq!(second_page.pagination.total_pages, 2);
+        assert_eq!(second_page.pagination.pages, 2);
     }
 
     /// The package warnings stop at `DEPENDENCY_WARNINGS_MAX`; the global warning rides
@@ -3133,7 +3121,7 @@ mod captured_runtime_tests {
     fn answer(symbol: Option<&str>, facets: &[serde_json::Value]) -> FacetsResult {
         let revision = "rift://revision/stdlib/cpython@3.12.3";
         let root = &facets[0];
-        let answer = serde_json::json!({"symbol":symbol.unwrap_or("rift://symbol/stdlib/cpython/python/builtins/other"),"revision":revision,"declarations":[{
+        let answer = serde_json::json!({"symbol":symbol.unwrap_or("rift://symbol/stdlib/cpython/python/builtins/other"),"revision":revision,"pagination":{"page":1,"pages":1,"max_results":10,"total":1},"declarations":[{
             "declaration":root["declaration"],"kind":root["kind"],"range":root["range"],
             "source":{"span":{"unit":root["unit"],"range":root["range"]},"text":root["source"]},"syntax":facets
         }]});

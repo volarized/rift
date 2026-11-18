@@ -28,7 +28,7 @@ fn symbol_response() -> Value {
     });
     let external = json!({"location":"external", "source_kind":"authored"});
     json!({
-        "outcome":"found", "revision":RELEASE,
+        "outcome":"found", "revision":RELEASE, "pagination":{"page":1,"pages":1,"max_results":10,"total":2},
         "symbol":{"id":ID,"name":"dumps","kind":"function","language":"python","origin":runtime},
         "declarations":[declaration(&runtime, IMPLEMENTATION), declaration(&external, STUB)],
     })
@@ -99,7 +99,7 @@ fn syntax_element_response(unit: &str) -> Value {
 async fn runtime_syntax_element_continuation_accepts_the_pinned_typeshed_stub() {
     let request = FacetsParams {
         revision: Some(Revision::parse(RELEASE).expect("exact runtime revision")),
-        facet_cursor: Some("continue".to_owned()),
+        page: 1,
         ..FacetsParams::of(SymbolId(ID.to_owned()))
     };
     let (_server, client) = operation_client(OperationFixture::Facets(

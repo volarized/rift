@@ -124,7 +124,6 @@ pub(super) fn text_states(tool: Tool, text: &str, structured: &Value) -> Result<
         rest
     };
     let rest = revision_states(rest, structured.get("revision"))?;
-    let rest = cursor_states(rest, structured.get("facet_cursor"))?;
     require(rest.is_empty(), "$.layout", || {
         format!("unexpected section: {}", rest[0].title)
     })?;
@@ -249,15 +248,17 @@ fn title_states(title: &str, count: usize, tool: Tool, structured: &Value) -> Re
             .and_then(Value::as_u64)
             .ok_or_else(|| format!("$.pagination.{name}: must be an integer"))
     };
-    let (page_index, total_pages) = (number("page_index")?, number("total_pages")?);
-    let past_the_end = total_pages > 0 && page_index >= total_pages;
-    if total_pages <= 1 && !past_the_end {
+    let (page, pages) = (number("page")?, number("pages")?);
+    let past_the_end = pages > 0 && page > pages;
+    if pages <= 1 && !past_the_end {
         return Ok(());
     }
-    let page = format!("page {}/{total_pages}", page_index + 1);
-    require(facts.any(|fact| fact == page), "$.pagination", || {
-        format!("the title must state `{page}`, got `{title}`")
-    })
+    let page = format!("page {page}/{pages}");
+    require(
+        facts.any(|fact| fact.starts_with(&page)),
+        "$.pagination",
+        || format!("the title must state `{page}`, got `{title}`"),
+    )
 }
 
 /// The lines of one item, indent removed.
@@ -721,8 +722,6 @@ fn edge_states(entry: Option<&str>, edge: &Value, at: &str) -> Result<(), String
     Ok(())
 }
 
-/// Checks the `facet_cursor CURSOR` line that opens the sections after the items when the answer
-/// carries a cursor, and returns the sections after it.
 /// Checks the `revision` line that ends an answer reporting the revision it was read at,
 /// before any captured view.
 fn revision_states<'text, 'sections>(
@@ -740,24 +739,6 @@ fn revision_states<'text, 'sections>(
             Ok(preceding)
         }
         _ => Err("$.revision: the text must state the revision the answer was read at".to_owned()),
-    }
-}
-
-fn cursor_states<'text, 'sections>(
-    sections: &'sections [Section<'text>],
-    cursor: Option<&Value>,
-) -> Result<&'sections [Section<'text>], String> {
-    let Some(cursor) = cursor else {
-        return Ok(sections);
-    };
-    let cursor = cursor.as_str().ok_or("$.facet_cursor: must be a string")?;
-    match sections.split_first() {
-        Some((first, rest))
-            if first.title == format!("facet_cursor {cursor}") && first.entries.is_empty() =>
-        {
-            Ok(rest)
-        }
-        _ => Err("$.facet_cursor: the text must state the cursor after the items".to_owned()),
     }
 }
 
@@ -832,7 +813,7 @@ mod tests {
                     ]
                 }
             ],
-            "pagination": { "page_index": 1, "total_pages": 3 }
+            "pagination": {"page": 2, "pages": 3, "max_results": 10, "total": 30}
         })
     }
 
@@ -913,7 +894,7 @@ mod tests {
                     ]
                 }
             }],
-            "pagination": { "page_index": 0, "total_pages": 1 }
+            "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 10}
         })
     }
 
@@ -982,7 +963,7 @@ mod tests {
     fn an_empty_answer_needs_only_its_header() {
         let answer = json!({
             "results": [],
-            "pagination": { "page_index": 0, "total_pages": 0 }
+            "pagination": {"page": 1, "pages": 0, "max_results": 10, "total": 0}
         });
         assert_eq!(text_states(Tool::Search, "0 results\n", &answer), Ok(()));
         assert!(text_states(Tool::Search, "0 results\n\t[1] a\n", &answer).is_err());
@@ -992,7 +973,7 @@ mod tests {
     fn a_page_past_the_end_states_its_page() -> Result<(), String> {
         let answer = json!({
             "results": [],
-            "pagination": { "page_index": 4, "total_pages": 2 }
+            "pagination": {"page": 5, "pages": 2, "max_results": 10, "total": 20}
         });
         assert_eq!(
             text_states(Tool::Search, "0 results · page 5/2\n", &answer),
@@ -1144,7 +1125,7 @@ mod tests {
 
     /// An answer of one page that holds all of `results`.
     fn page_of(results: &[Value]) -> Value {
-        json!({ "results": results, "pagination": { "page_index": 0, "total_pages": 1 } })
+        json!({ "results": results, "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 10} })
     }
 
     /// A `search` answer with one item, a file hit, and two trees. `load_config` is a hit outside
@@ -1908,7 +1889,7 @@ mod tests {
                 },
                 { "hit": { "target": "file", "size": 3 }, "unit": "rift://source/p/a.rs" }
             ],
-            "pagination": { "page_index": 0, "total_pages": 1 }
+            "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 10}
         });
         let text = "\
 2 results

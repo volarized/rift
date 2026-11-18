@@ -51,7 +51,7 @@ fn facet_response(syntax: &[Value]) -> Value {
         "source": {"span": {"unit": root["unit"], "range": root["range"]}, "text": root["source"]},
         "syntax": syntax,
     })).into_iter().collect::<Vec<_>>();
-    json!({"symbol": SYMBOL, "revision": RELEASE, "declarations": declarations})
+    json!({"symbol": SYMBOL, "revision": RELEASE, "pagination": {"page":1,"pages":u64::from(!declarations.is_empty()),"max_results":10,"total":declarations.len()}, "declarations": declarations})
 }
 
 /// Sets the declaration's ordinal and every syntax element's owner together.
@@ -106,7 +106,7 @@ async fn test_fixture_facets_list_a_package_symbol_from_its_symbol_alone() {
         .map(|request| request.body.clone())
         .expect("facets request");
     let sent = serde_json::from_slice::<Value>(&body).expect("request JSON");
-    assert_eq!(sent, json!({"symbol": SYMBOL}));
+    assert_eq!(sent, json!({"symbol": SYMBOL,"page":1,"max_results":10}));
 }
 
 /// The global API serves the facets of one package or runtime symbol: a request in any other
@@ -133,16 +133,16 @@ async fn facets_requests_outside_the_served_form_refuse_before_any_request() {
             },
         ),
         (
-            "facet_cursor",
+            "page",
             FacetsParams {
-                facet_cursor: Some(String::new()),
+                page: 0,
                 ..facets_request()
             },
         ),
         (
-            "facet_cursor",
+            "max_results",
             FacetsParams {
-                facet_cursor: Some("c".repeat(CURSOR_BYTES_MAX + 1)),
+                max_results: rift_protocol::read::FACETS_MAX_RESULTS + 1,
                 ..facets_request()
             },
         ),
@@ -184,18 +184,15 @@ async fn a_cursor_past_the_advertised_bound_and_a_disabled_client_refuse() {
     ))
     .await;
     let request = FacetsParams {
-        facet_cursor: Some("c".repeat(FACETS_CURSOR_BYTES_ADVERTISED + 1)),
+        max_results: rift_protocol::read::FACETS_MAX_RESULTS + 1,
         ..facets_request()
     };
     let error = client
         .facets(&request)
         .await
         .expect_err("cursor past the bound");
-    assert_registered_field(&error, "rift.client.request_invalid", "facet_cursor");
-    assert_eq!(
-        server.state.last_path.lock().await.as_deref(),
-        Some("/rift/rest/v1/capabilities")
-    );
+    assert_registered_field(&error, "rift.client.request_invalid", "max_results");
+    assert_eq!(server.state.last_path.lock().await.as_deref(), None);
     let disabled = GlobalClient::new(Config {
         enabled: false,
         ..Config::default()
@@ -242,10 +239,10 @@ async fn facets_breaking_the_contract_refuse_as_invalid_responses() {
             answer["declarations"][0]["syntax"][1]["source"] = json!("BEACON");
         }),
         ("cursor beside no facets", |answer| {
-            *answer = json!({"symbol": SYMBOL, "revision": RELEASE, "declarations": [], "facet_cursor": "1.ab"});
+            *answer = json!({"symbol": SYMBOL, "revision": RELEASE, "declarations": [], "max_results": "1.ab"});
         }),
         ("empty cursor", |answer| {
-            answer["facet_cursor"] = json!("");
+            answer["max_results"] = json!("");
         }),
         ("page over the source bound", |answer| {
             let half = usize::try_from(FACETS_SOURCE_BYTES_MAX / 2 + 1).expect("bound fits usize");
@@ -296,7 +293,7 @@ async fn a_page_over_the_advertised_declaration_bound_refuses() {
         })
         .collect::<Vec<_>>();
     let error =
-        facets_answer(json!({"symbol": SYMBOL, "revision": RELEASE, "declarations": declarations}))
+        facets_answer(json!({"symbol": SYMBOL, "revision": RELEASE, "pagination": {"page":1,"pages":u64::from(!declarations.is_empty()),"max_results":10,"total":declarations.len()}, "declarations": declarations}))
             .await
             .expect_err("page over the declaration bound");
     assert_registered_field(&error, "rift.client.response_invalid", "body");
