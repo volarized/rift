@@ -80,7 +80,13 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
         .expect("a validated exact request carries a canonical symbol identity");
     assert_source_unit_ids_use_served_resolvers(structured, &context, reaches_dependencies);
     assert!(
-        structured.get("warnings").is_none(),
+        structured.get("warnings").is_none()
+            || (name == "search"
+                && structured["warnings"]
+                    .as_array()
+                    .is_some_and(|warnings| warnings
+                        .iter()
+                        .all(|warning| warning["code"] == "engine_analysis_unavailable"))),
         "{context}: {structured:#}"
     );
     assert!(

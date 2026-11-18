@@ -41,6 +41,15 @@ pub enum StaticCallee {
     Unsupported,
 }
 
+/// One authored use of a name or member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticReference {
+    /// Authored name or member path.
+    pub range: ByteRange,
+    /// Access or type use at that range.
+    pub role: rift_core::ReferenceRole,
+}
+
 /// One name binding and the source interval in which it takes precedence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StaticBinding {
@@ -94,6 +103,20 @@ pub enum StaticBindingKind {
         /// Imported name, absent for a module binding.
         export: Option<ByteRange>,
     },
+    /// First receiver parameter of a Python method.
+    PythonReceiver {
+        /// Name of the enclosing class.
+        class_name: ByteRange,
+    },
+    /// Dotted Python module import without a local alias.
+    PythonModule {
+        /// Complete imported module path.
+        module: ByteRange,
+    },
+    /// A Python name declared in the module scope.
+    PythonGlobal,
+    /// A Python name declared in an enclosing function scope.
+    PythonNonlocal,
     /// Explicit Rust use path.
     RustUse {
         /// Imported path before a local alias.
@@ -133,6 +156,8 @@ pub struct StaticFactsParts {
     pub heritage_edges: Vec<HeritageEdge>,
     /// Authored calls.
     pub calls: Vec<StaticCall>,
+    /// Authored member accesses and type uses.
+    pub references: Vec<StaticReference>,
     /// Lexical bindings.
     pub bindings: Vec<StaticBinding>,
     /// Explicit re-exports.
@@ -179,6 +204,12 @@ impl StaticFacts {
         &self.0.calls
     }
 
+    /// Captured member accesses and type uses.
+    #[must_use]
+    pub fn references(&self) -> &[StaticReference] {
+        &self.0.references
+    }
+
     /// Captured lexical bindings.
     #[must_use]
     pub fn bindings(&self) -> &[StaticBinding] {
@@ -219,6 +250,7 @@ impl StaticFacts {
         [
             vector_capacity(&self.0.heritage_edges),
             vector_capacity(&self.0.calls),
+            vector_capacity(&self.0.references),
             vector_capacity(&self.0.bindings),
             vector_capacity(&self.0.reexports),
             vector_capacity(&self.0.assignments),
@@ -234,6 +266,7 @@ impl StaticFacts {
         let lengths = [
             self.heritage_edges().len(),
             self.calls().len(),
+            self.references().len(),
             self.bindings().len(),
             self.reexports().len(),
             self.assignments().len(),
@@ -264,6 +297,15 @@ impl StaticFacts {
                 )
         });
         let calls = self.calls().iter().all(|call| call.valid(valid));
+        let references = self.references().iter().all(|reference| {
+            valid(reference.range)
+                && matches!(
+                    reference.role,
+                    rift_core::ReferenceRole::Read
+                        | rift_core::ReferenceRole::Write
+                        | rift_core::ReferenceRole::Type
+                )
+        });
         let bindings = self.bindings().iter().all(|binding| binding.valid(valid));
         let reexports = self
             .reexports()
@@ -277,6 +319,7 @@ impl StaticFacts {
         let conditional = self.conditional_items().iter().copied().all(valid);
         if !(edges
             && calls
+            && references
             && bindings
             && reexports
             && assignments
@@ -316,11 +359,16 @@ impl StaticBinding {
                 export,
                 require,
             } => valid(module) && export.is_none_or(&valid) && valid(require),
-            StaticBindingKind::JavaScriptEdgeNamespace { module } => valid(module),
+            StaticBindingKind::JavaScriptEdgeNamespace { module }
+            | StaticBindingKind::PythonModule { module } => valid(module),
             StaticBindingKind::JavaScriptInstance { constructor } => valid(constructor),
+            StaticBindingKind::PythonReceiver { class_name } => valid(class_name),
             StaticBindingKind::RustUse { path } => valid(path),
             StaticBindingKind::RustReceiver { type_path } => valid(type_path),
-            StaticBindingKind::Local | StaticBindingKind::Shadow => true,
+            StaticBindingKind::Local
+            | StaticBindingKind::Shadow
+            | StaticBindingKind::PythonGlobal
+            | StaticBindingKind::PythonNonlocal => true,
         };
         valid(self.name)
             && valid(self.scope)
@@ -402,7 +450,7 @@ impl<'source> Capture<'source> {
         }
         self.edge_heritage.record_edge(visited, &mut self.facts.0)?;
         match self.grammar {
-            Grammar::Python(kinds) => kinds.record_edge(visited, &mut self.facts.0),
+            Grammar::Python(kinds) => kinds.record_edge(visited, self.source, &mut self.facts.0),
             Grammar::JavaScript(kinds) => {
                 kinds.record(syntax_element, self.source, &mut self.facts.0)
             }

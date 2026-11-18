@@ -161,6 +161,7 @@ struct File<'source> {
     by_range: BTreeMap<ByteRange, Option<&'source SyntaxSymbol>>,
     by_qualified_name: BTreeMap<&'source str, Option<&'source SyntaxSymbol>>,
     callables: EnclosingDefinitions<&'source SyntaxSymbol>,
+    class_scopes: BTreeSet<ByteRange>,
     assignments: AssignmentTargets<'source>,
 }
 
@@ -217,6 +218,7 @@ impl<'source> File<'source> {
             by_range: BTreeMap::new(),
             by_qualified_name: BTreeMap::new(),
             callables: EnclosingDefinitions::new([]),
+            class_scopes: BTreeSet::new(),
             assignments: AssignmentTargets::default(),
         };
         file.index_bindings(work)?;
@@ -250,8 +252,15 @@ impl<'source> File<'source> {
             }
             self.by_qualified_name
                 .entry(&symbol.qualified_name)
-                .and_modify(|entry| *entry = None)
+                .and_modify(|entry| {
+                    if !python {
+                        *entry = None;
+                    }
+                })
                 .or_insert(Some(symbol));
+            if python && symbol.kinds.contains(&SymbolKind::Constructible) {
+                self.class_scopes.insert(symbol.item_range);
+            }
             if python && symbol.kinds.contains(&SymbolKind::Callable) {
                 callables.push((symbol.range.start, symbol.range.end, symbol));
             }
@@ -355,6 +364,7 @@ struct Index<'source> {
     rust: rust::Namespaces<'source>,
     javascript: javascript::PackageModes,
     edge_python: python_edges::EdgePythonModules,
+    edge_python_classes: python_edges::ClassOrders<'source>,
     syntax_publication: rift_core::ProviderRevision,
     unavailable_sources: usize,
 }
@@ -389,16 +399,19 @@ impl<'source> Index<'source> {
         let javascript = javascript::PackageModes::new(namespace, work)?;
         let provider = ProviderId::new(SYNTAX_PROVIDER_ID).ok()?;
         let syntax_publication = graph.publications().provider(&provider)?.revision();
-        Some(Self {
+        let mut index = Self {
             graph,
             provider,
             files,
             rust,
             javascript,
             edge_python,
+            edge_python_classes: python_edges::ClassOrders::default(),
             syntax_publication,
             unavailable_sources,
-        })
+        };
+        index.edge_python_classes = index.python_class_orders(work)?;
+        Some(index)
     }
 
     fn resolve_file(&self, file: &File<'source>, work: &mut Work, result: &mut StaticResolution) {
@@ -441,6 +454,9 @@ impl<'source> Index<'source> {
                 });
                 result.record(occurrence);
             }
+        }
+        if file.document.facts.language().name == "python" {
+            self.python_references(file, work, result);
         }
         if !work.exhausted {
             result.analyzed_sources += 1;
@@ -542,12 +558,12 @@ impl<'source> Index<'source> {
                 Some((binding.name, self.javascript_import(file, binding, work)))
             }
             StaticBindingKind::RustUse { path } => Some((path, self.rust.import(file, path, work))),
-            StaticBindingKind::PythonImport {
-                export: Some(_), ..
-            } => Some((
-                binding.name,
-                self.edge_python_binding_target(file, binding, work),
-            )),
+            StaticBindingKind::PythonImport { .. } | StaticBindingKind::PythonModule { .. } => {
+                Some((
+                    binding.name,
+                    self.edge_python_binding_target(file, binding, work),
+                ))
+            }
             _ => None,
         }
     }
@@ -616,9 +632,7 @@ impl StaticResolution {
 fn admitted_facts<'source>(
     document: &'source StaticSource<'source>,
 ) -> Option<&'source StaticFacts> {
-    if document.facts.has_errors()
-        || document.facts.source_digest() != Some(&FileDigest::of(document.source.as_bytes()))
-    {
+    if document.facts.has_errors() || document.facts.source_digest().is_none() {
         return None;
     }
     document.facts.static_facts()

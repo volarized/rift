@@ -265,7 +265,7 @@ impl RiftMcp {
                     .await
             } else if let Some(required) = local_semantics {
                 Ok(Ok(self
-                    .acquire_semantic_inventory(resolved, required, deadline)
+                    .acquire_semantic_inventory(resolved, required, limits, deadline)
                     .await?))
             } else if query.symbol_selection().is_some()
                 || query.syntax_element_selection().is_some()
@@ -1661,7 +1661,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn graph_ask_refuses_uncovered_edges() -> TestResult {
+    async fn graph_ask_reads_captured_edges_and_refuses_uncovered_usages() -> TestResult {
         let directory = tempfile::tempdir()?;
         crate::server::hermetic_workspace(directory.path(), "")?;
         std::fs::write(directory.path().join("lib.rs"), "fn alpha() {}\n")?;
@@ -1682,6 +1682,13 @@ mod tests {
                 .map_err(|failure| format!("{failure:?}"))?
                 .0
                 .result;
+            if query == "ASK { ?a :calls ?b }" {
+                assert!(
+                    matches!(&result, QueryReadResult::Results(result) if matches!(&result.answer, QueryAnswer::Boolean { value: false })),
+                    "{result:?}"
+                );
+                continue;
+            }
             assert!(
                 matches!(
                     result,
@@ -1752,6 +1759,13 @@ mod tests {
                 .map_err(|failure| format!("{failure:?}"))?
                 .0
                 .result;
+            if query.contains("FILTER NOT EXISTS") {
+                assert!(
+                    matches!(&result, QueryReadResult::Results(result) if matches!(&result.answer, QueryAnswer::Boolean { value: true })),
+                    "{result:?}"
+                );
+                continue;
+            }
             assert!(
                 matches!(
                     result,

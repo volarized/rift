@@ -146,6 +146,155 @@ fn test_edge_python_imports_keep_relative_bindings_and_reject_dotted_module_shad
     assert_eq!(calls(&result, "other.py").count(), 0);
 }
 
+#[test]
+fn test_python_static_calls_resolve_receivers_constructors_and_reexports() {
+    let source = "from pkg import Derived\nimport pkg.models as models\ndef root():\n    Derived()\n    models.Derived()\n    Derived.create()\nclass Child(Derived):\n    def run(self):\n        self.base()\n        self.run()\n";
+    let result = resolution(
+        "python",
+        &[
+            ("main.py", source),
+            (
+                "pkg/__init__.py",
+                "from .models import Derived as Derived\n",
+            ),
+            (
+                "pkg/models.py",
+                "class Base(External):\n    def base(self): pass\nclass Derived(Base):\n    @staticmethod\n    def create(): pass\n",
+            ),
+        ],
+        &[],
+        WORK_MAX,
+    );
+    assert_eq!(calls(&result, "main.py").count(), 5, "{result:?}");
+}
+
+#[test]
+fn test_python_static_contains_accesses_overrides_and_type_usage() {
+    use rift_protocol::read::EdgeKind;
+    let source = "import models\nclass Base:\n    value: int = 0\n    def run(self): pass\nclass Child(Base):\n    def run(self, value: models.Value) -> models.Value:\n        self.value = value\n        self.value += 1\n        return models.current\n";
+    let result = resolution(
+        "python",
+        &[
+            ("main.py", source),
+            ("models.py", "class Value: pass\ncurrent: Value\n"),
+        ],
+        &[],
+        WORK_MAX,
+    );
+    for (kind, minimum) in [
+        (EdgeKind::Contains, 7),
+        (EdgeKind::Reads, 2),
+        (EdgeKind::Writes, 2),
+        (EdgeKind::Overrides, 1),
+        (EdgeKind::HasType, 3),
+        (EdgeKind::Imports, 1),
+    ] {
+        let count = result
+            .occurrences
+            .iter()
+            .filter(|occurrence| {
+                occurrence.edge_kind.unwrap_or(match occurrence.role {
+                    ReferenceRole::Read => EdgeKind::Reads,
+                    ReferenceRole::Write => EdgeKind::Writes,
+                    ReferenceRole::Type => EdgeKind::HasType,
+                    ReferenceRole::Import => EdgeKind::Imports,
+                    _ => EdgeKind::References,
+                }) == kind
+            })
+            .count();
+        assert!(count >= minimum, "{kind:?}: {count}; {result:?}");
+    }
+}
+
+#[test]
+fn test_python_static_bindings_keep_lexical_scopes_and_class_order() {
+    let source = "def leaf(): pass\ndef run():\n    first, second = (1, 2)\n    values = [leaf() for item in []]\n    leaf()\nclass Root:\n    def run(self): pass\nclass Left(Root): pass\nclass Right(Root):\n    def run(self): pass\nclass Child(Left, Right):\n    def run(  # type: ignore\n        self): self.run(); self.other()\n    def other(self): leaf()\n    @staticmethod\n    def static(self): self.run()\n";
+    let result = resolution("python", &[("main.py", source)], &[], WORK_MAX);
+    let targets = calls(&result, "main.py").map(target).collect::<Vec<_>>();
+    assert_eq!(
+        targets,
+        [
+            "rift://symbol/local/python/main/leaf",
+            "rift://symbol/local/python/main/leaf",
+            "rift://symbol/local/python/main/Child/run",
+            "rift://symbol/local/python/main/Child/other",
+            "rift://symbol/local/python/main/leaf",
+        ],
+        "{result:?}"
+    );
+    let overridden = result
+        .occurrences
+        .iter()
+        .filter(|edge| edge.edge_kind == Some(rift_protocol::read::EdgeKind::Overrides))
+        .map(target)
+        .collect::<Vec<_>>();
+    assert!(
+        overridden.contains(&"rift://symbol/local/python/main/Right/run"),
+        "{overridden:?}"
+    );
+}
+
+#[test]
+fn test_python_static_namespace_packages_and_forward_type_arguments() {
+    let source = "import pkg.models\nfrom pkg import models\nclass Child(pkg.models.Base[models.Value]):\n    def run(self, value: list['pkg.models.Value']) -> 'models.Value': pass\n";
+    let result = resolution(
+        "python",
+        &[
+            ("main.py", source),
+            ("pkg/models.py", "class Base: pass\nclass Value: pass\n"),
+        ],
+        &[],
+        WORK_MAX,
+    );
+    let types = result
+        .occurrences
+        .iter()
+        .filter(|edge| edge.role == ReferenceRole::Type && edge.edge_kind.is_none())
+        .map(target)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        types
+            .iter()
+            .filter(|id| **id == "rift://symbol/local/python/pkg/models/Value")
+            .count(),
+        3,
+        "{result:?}"
+    );
+    assert!(
+        result
+            .occurrences
+            .iter()
+            .any(|edge| edge.edge_kind == Some(rift_protocol::read::EdgeKind::Extends)),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn test_python_global_and_nonlocal_names_do_not_block_other_bindings() {
+    let source = "from jobs import leaf\ndef root():\n    active = False\n    def finish():\n        nonlocal active\n        active = True\n        leaf()\n    def send():\n        nonlocal active\n        finish()\n    def global_call():\n        global leaf\n        leaf()\n";
+    let result = resolution(
+        "python",
+        &[("main.py", source), ("jobs.py", "def leaf(): pass\n")],
+        &[],
+        WORK_MAX,
+    );
+    assert_eq!(calls(&result, "main.py").count(), 3, "{result:?}");
+}
+
+#[test]
+fn test_python_static_incomplete_bases_keep_only_the_first_base_member() {
+    let source = "class Root:\n    def inherited(self): pass\nclass Left(Root):\n    def own(self): pass\nclass Right(External): pass\nclass Child(Left, Right):\n    def run(self):\n        self.own()\n        self.inherited()\n";
+    let result = resolution("python", &[("main.py", source)], &[], WORK_MAX);
+    assert_eq!(
+        calls(&result, "main.py").map(target).collect::<Vec<_>>(),
+        ["rift://symbol/local/python/main/Left/own"]
+    );
+    assert!(!result.exhausted);
+    let exhausted = resolution("python", &[("main.py", source)], &[], 1);
+    assert!(exhausted.exhausted);
+    assert!(exhausted.occurrences.is_empty());
+}
+
 fn syntax(path: &str, text: &str) -> SyntaxDocument {
     let path = ProjectPath::new(path).expect("fixture path");
     let extension = path.as_str().rsplit_once('.').expect("fixture extension").1;

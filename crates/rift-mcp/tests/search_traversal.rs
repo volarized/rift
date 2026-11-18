@@ -84,7 +84,7 @@ async fn search_traversal_neighbors_depth_one_reaches_the_direct_callers() -> Te
         &client,
         tool_request(
             "search_retrieval",
-            &json!({ "traversal": { "seed": captured_seed(&client, "leaf", "graph.py").await? } }),
+            &json!({ "traversal": { "seed": captured_seed(&client, "leaf", "graph.py").await?, "kinds": ["calls"] } }),
         ),
     )
     .await?;
@@ -127,6 +127,7 @@ async fn search_traversal_impact_incoming_depth_two_reaches_every_caller() -> Te
                 "traversal": {
                     "seed": captured_seed(&client, "leaf", "graph.py").await?,
                     "direction": "incoming",
+                    "kinds": ["calls"],
                     "depth": 2
                 }
             }),
@@ -1241,7 +1242,7 @@ async fn search_traversal_outgoing_drops_a_standard_library_callee_and_walks_a_c
             "search_retrieval",
             &json!({
                 "traversal": {
-                    "seed": captured_seed(&client, "Holder", "extra.py").await?, "direction": "outgoing"
+                    "seed": captured_seed(&client, "Holder", "extra.py").await?, "direction": "outgoing", "kinds": ["calls"]
                 }
             }),
         ),

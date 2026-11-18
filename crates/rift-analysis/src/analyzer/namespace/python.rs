@@ -1,5 +1,6 @@
 pub(super) mod exports;
 pub(super) use exports::prepare as prepare_exports;
+pub(crate) use exports::python_import_target;
 
 use crate::ArchiveMemberKind;
 use std::collections::{BTreeMap, BTreeSet};

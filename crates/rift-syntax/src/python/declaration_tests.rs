@@ -380,3 +380,30 @@ fn test_module_declaration_retains_documentation_and_distinct_bound_names() {
         assert!(module.documentation.is_empty());
     }
 }
+
+#[test]
+fn test_python_member_accesses_keep_assignment_roles() {
+    use rift_core::ReferenceRole;
+    let text = "class Task:\n    def run(self):\n        self.first, self.second = (1, 2)\n        self.first += 1\n        self.declared: int\n        self.child.value = 2\n";
+    let document = analyze(text);
+    let accesses = document
+        .facts()
+        .static_facts()
+        .expect("captured facts")
+        .references()
+        .iter()
+        .filter(|reference| reference.role != ReferenceRole::Type)
+        .map(|reference| (spelled(text, reference.range), reference.role))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        accesses,
+        [
+            ("self.first", ReferenceRole::Write),
+            ("self.second", ReferenceRole::Write),
+            ("self.first", ReferenceRole::Read),
+            ("self.first", ReferenceRole::Write),
+            ("self.child.value", ReferenceRole::Write),
+            ("self.child", ReferenceRole::Read),
+        ]
+    );
+}

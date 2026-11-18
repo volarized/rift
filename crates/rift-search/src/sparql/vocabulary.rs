@@ -70,6 +70,10 @@ pub enum VocabularyProperty {
     Extends,
     /// The source fulfils the target's interface.
     Implements,
+    /// The source contains the target declaration.
+    Contains,
+    /// The source overrides the target member.
+    Overrides,
     /// The source declares the target.
     Declares,
     /// The source reads the target's value.
@@ -276,6 +280,16 @@ impl VocabularyProperty {
                 &[SYMBOL],
                 Resource(SYMBOL),
                 "The source fulfils the target's interface.",
+            ),
+            Self::Contains => (
+                &[SYMBOL],
+                Resource(SYMBOL),
+                "The source contains the target declaration.",
+            ),
+            Self::Overrides => (
+                &[SYMBOL],
+                Resource(SYMBOL),
+                "The source overrides the target member.",
             ),
             Self::Declares => (
                 &[SYMBOL],

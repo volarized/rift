@@ -8,9 +8,66 @@ mod workspace_client;
 
 mod hermetic_search;
 
+use std::fmt::Write as _;
+
 use rift_protocol::query::{QueryLanguage, QueryParams};
 use serde_json::json;
 use workspace_client::{TestResult, captured_seed, query_after_population, served_workspace};
+
+#[tokio::test]
+async fn test_python_static_member_edges_are_read_through_sparql() -> TestResult {
+    let source = "import models\nclass Base:\n    value: int = 0\n    def run(self): pass\nclass Child(Base):\n    def run(self, value: models.Value) -> models.Value:\n        self.value = value\n        self.value += 1\n        return models.current\n";
+    let files = [
+        ("main.py", source),
+        ("models.py", "class Value: pass\ncurrent: Value\n"),
+    ];
+    let (_directory, client, task) = served_workspace(&files, None).await?;
+    captured_seed(&client, "Child", "main.py").await?;
+    for query in [
+        "ASK { <rift://symbol/local/python/main> :contains <rift://symbol/local/python/main/Child> }",
+        "ASK { <rift://symbol/local/python/main/Child> :contains <rift://symbol/local/python/main/Child/run> }",
+        "ASK { <rift://symbol/local/python/main/Child/run> :overrides <rift://symbol/local/python/main/Base/run> }",
+        "ASK { <rift://symbol/local/python/main/Child/run> :reads <rift://symbol/local/python/models/current> }",
+        "ASK { <rift://symbol/local/python/main/Child/run> :writes <rift://symbol/local/python/main/Child/value> }",
+        "ASK { <rift://symbol/local/python/main/Child/run> :hasType <rift://symbol/local/python/models/Value> }",
+        "ASK { <rift://symbol/local/python/main> :imports <rift://symbol/local/python/models> }",
+    ] {
+        let params = QueryParams {
+            query: query.to_owned(),
+            language: QueryLanguage::Sparql,
+            ..Default::default()
+        };
+        let answer = query_after_population(&client, &params).await?;
+        assert_eq!(
+            answer["answer"],
+            json!({"result":"boolean", "value":true}),
+            "{query}: {answer}"
+        );
+    }
+    client.cancel().await?;
+    task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_python_static_inventory_survives_dependency_context_and_many_symbols() -> TestResult {
+    let mut source = "def leaf(): pass\n".to_owned();
+    for index in 0..70 {
+        writeln!(source, "def root{index}(): leaf()")?;
+    }
+    for context in [None, Some("[[dependencies.packages]]\nmanager = 'pypi'\nregistry = 'pypi.org'\nname = 'httpx'\nversion = '0.28.1'\n".to_owned())] {
+        let (_directory, client, task) = served_workspace(&[("main.py", &source)], context).await?;
+        captured_seed(&client, "leaf", "main.py").await?;
+        for predicate in ["calls", "references"] {
+            let params = QueryParams { query: format!("SELECT ?from ?to {{ ?from :{predicate} ?to }}"), language: QueryLanguage::Sparql, ..Default::default() };
+            let answer = query_after_population(&client, &params).await?;
+            assert_eq!(answer["pagination"]["total"], json!(70), "{predicate}: {answer}");
+        }
+        client.cancel().await?;
+        task.await?;
+    }
+    Ok(())
+}
 
 #[tokio::test]
 async fn test_python_declarations_include_locals_empty_modules_and_project_files() -> TestResult {

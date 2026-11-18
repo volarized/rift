@@ -7,7 +7,7 @@ use rift_protocol::identity::SymbolIdentity;
 use rift_protocol::index::python_identifier_is_valid;
 use rift_syntax::{ShippedLanguage, SyntaxExportBinding, SyntaxExportKind};
 
-use super::super::{ExportBinding, PreparedNamespace, SelectedFile, python_module, typescript};
+use super::super::{ExportBinding, PreparedNamespace, SelectedFile, typescript};
 use crate::{NamespaceInput, PackageImportRoot, PackageSource};
 
 type Target<'source> = (&'source [String], &'source str);
@@ -24,24 +24,22 @@ struct PythonReexport<'source> {
 
 fn established_module(
     file: &SelectedFile<'_>,
-    captured: &BTreeMap<&str, PackageSource<'_>>,
-    roots: &[PackageImportRoot],
+    prepared: &PreparedNamespace,
 ) -> Option<Vec<String>> {
-    let syntax = file.syntax;
-    let source = captured
-        .get(file.path.as_str())
-        .filter(|source| source.text() == file.source)?;
-    if syntax.language() != &ShippedLanguage::Python.language()
-        || syntax.has_errors()
-        || syntax.source_digest() != Some(&source.source_digest())
-    {
+    if file.syntax.language() != &ShippedLanguage::Python.language() {
         return None;
     }
-    python_module(file.path.as_str(), roots)
+    let identity = prepared.anchors.get(file.path.as_str())?.get(".")?;
+    Some(
+        SymbolIdentity::parse(identity.as_str())
+            .ok()?
+            .qualified_path()
+            .to_vec(),
+    )
 }
 
 /// Leading dots climb from the importing package without passing its top level.
-pub(in crate::analyzer::namespace) fn python_import_target(
+pub(crate) fn python_import_target(
     module: &[String],
     is_package: bool,
     written: &str,
@@ -194,14 +192,14 @@ fn export(
 pub(in crate::analyzer::namespace) fn prepare(
     input: &NamespaceInput<'_>,
     selected: &[SelectedFile<'_>],
-    captured: &BTreeMap<&str, PackageSource<'_>>,
-    roots: &[PackageImportRoot],
+    _captured: &BTreeMap<&str, PackageSource<'_>>,
+    _roots: &[PackageImportRoot],
     prepared: &mut PreparedNamespace,
 ) {
     let mut modules = BTreeMap::new();
     let mut imports = Vec::new();
     for file in selected {
-        let Some(module) = established_module(file, captured, roots) else {
+        let Some(module) = established_module(file, prepared) else {
             continue;
         };
         imports.extend(requests(file, &module, &mut prepared.unresolved_exports));

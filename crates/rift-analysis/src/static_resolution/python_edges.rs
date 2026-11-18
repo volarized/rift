@@ -1,10 +1,17 @@
-//! Resolves Python calls through captured lexical names and module imports.
+//! Resolves Python names through captured declarations, imports, and receivers.
+
+mod classes;
+mod references;
+
+pub(super) use classes::ClassOrders;
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use rift_protocol::read::SymbolKind;
 use rift_syntax::{ByteRange, StaticBinding, StaticBindingKind, StaticCall, StaticCallee};
 
-use super::{Binding, File, Index, Target, Work};
+use super::{File, Index, Target, Work};
+use crate::analyzer::namespace::python::python_import_target;
 
 pub(super) struct EdgePythonModules(BTreeMap<String, Option<String>>);
 
@@ -18,52 +25,38 @@ impl EdgePythonModules {
             if !work.charge() {
                 return None;
             }
-            let path = file.document.path.as_str();
-            let Some(stem) = path
-                .strip_suffix(".py")
-                .or_else(|| path.strip_suffix(".pyi"))
-            else {
+            let Some(module) = file.qualified_target(".").and_then(Target::admitted_path) else {
                 continue;
             };
-            let module = stem.strip_suffix("/__init__").unwrap_or(stem);
-            for name in [Some(module), module.strip_prefix("src/")]
-                .into_iter()
-                .flatten()
-            {
-                modules
-                    .entry(name.replace('/', "."))
-                    .and_modify(|entry| *entry = None)
-                    .or_insert_with(|| Some(path.to_owned()));
-            }
+            let path = file.document.path.as_str();
+            modules
+                .entry(module.join("."))
+                .and_modify(|entry| *entry = None)
+                .or_insert_with(|| Some(path.to_owned()));
         }
         Some(Self(modules))
     }
 
-    fn edge_path(&self, from: &str, module: &str, work: &mut Work) -> Option<&str> {
-        let dots = module.bytes().take_while(|byte| *byte == b'.').count();
-        let name = if dots == 0 {
-            module.to_owned()
-        } else {
-            let mut directory = from.rsplit_once('/').map_or("", |(directory, _)| directory);
-            for _ in 1..dots {
-                if !work.charge() {
-                    return None;
-                }
-                directory = directory.rsplit_once('/')?.0;
-            }
-            let directory = directory
-                .strip_prefix("src/")
-                .unwrap_or(directory)
-                .replace('/', ".");
-            let suffix = module.get(dots..)?;
-            if suffix.is_empty() {
-                directory
-            } else {
-                format!("{directory}.{suffix}")
-            }
-        };
-        self.0.get(&name)?.as_deref()
+    fn path(&self, name: &str) -> Option<&str> {
+        self.0.get(name)?.as_deref()
     }
+
+    fn name(from: &File<'_>, module: &str) -> Option<String> {
+        let anchor = from.qualified_target(".")?.admitted_path()?;
+        let package = from
+            .document
+            .path
+            .as_str()
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| matches!(name, "__init__.py" | "__init__.pyi"));
+        Some(python_import_target(&anchor, package, module)?.join("."))
+    }
+}
+
+enum Value<'source> {
+    Symbol(Target<'source>),
+    Module(String),
 }
 
 impl<'source> Index<'source> {
@@ -73,26 +66,13 @@ impl<'source> Index<'source> {
         call: &StaticCall,
         work: &mut Work,
     ) -> Option<Target<'source>> {
-        match call.callee {
-            StaticCallee::Direct => self
-                .edge_python_name(file, call.callee_range, work)?
-                .callable(),
-            StaticCallee::Member { receiver, member } => {
-                let binding =
-                    edge_python_binding(file, file.text(receiver)?, call.range.start, work)?;
-                let StaticBindingKind::PythonImport {
-                    module,
-                    export: None,
-                } = binding.kind
-                else {
-                    return None;
-                };
-                let imported = self.edge_python_module(file, module, work)?;
-                self.edge_python_export(imported, file.text(member)?, work)?
-                    .callable()
-            }
-            _ => None,
+        if matches!(call.callee, StaticCallee::Unsupported) {
+            return None;
         }
+        let target = self.edge_python_name(file, call.callee_range, work)?;
+        (target.symbol.kinds.contains(&SymbolKind::Callable)
+            || target.symbol.kinds.contains(&SymbolKind::Constructible))
+        .then_some(target)
     }
 
     pub(super) fn edge_python_name(
@@ -101,21 +81,27 @@ impl<'source> Index<'source> {
         range: ByteRange,
         work: &mut Work,
     ) -> Option<Target<'source>> {
-        let name = file.text(range)?;
-        if let Some((receiver, member)) = name.split_once('.') {
-            let binding = edge_python_binding(file, receiver, range.start, work)?;
-            let StaticBindingKind::PythonImport {
-                module,
-                export: None,
-            } = binding.kind
-            else {
-                return None;
-            };
-            let imported = self.edge_python_module(file, module, work)?;
-            return self.edge_python_export(imported, member, work);
-        }
+        let mut names = file.text(range)?.split('.').map(str::trim);
+        let name = names.next()?;
         let binding = edge_python_binding(file, name, range.start, work)?;
-        self.edge_python_binding_target(file, binding, work)
+        let mut value = self.binding_value(file, binding, work)?;
+        for member in names {
+            if !work.charge() {
+                return None;
+            }
+            value = match value {
+                Value::Module(name) => match self
+                    .edge_python
+                    .path(&name)
+                    .and_then(|path| self.files.get(path))
+                {
+                    Some(file) => self.export_value(file, member, work)?,
+                    None => self.module_value(&format!("{name}.{member}"))?,
+                },
+                Value::Symbol(target) => Value::Symbol(self.python_member(target, member, work)?),
+            };
+        }
+        self.value_target(value)
     }
 
     pub(super) fn edge_python_binding_target(
@@ -124,43 +110,84 @@ impl<'source> Index<'source> {
         binding: &StaticBinding,
         work: &mut Work,
     ) -> Option<Target<'source>> {
+        if let StaticBindingKind::PythonModule { module } = binding.kind {
+            return self.value_target(self.module_value(file.text(module)?)?);
+        }
+        self.value_target(self.binding_value(file, binding, work)?)
+    }
+
+    fn value_target(&self, value: Value<'source>) -> Option<Target<'source>> {
+        match value {
+            Value::Symbol(target) => Some(target),
+            Value::Module(name) => self
+                .files
+                .get(self.edge_python.path(&name)?)?
+                .qualified_target("."),
+        }
+    }
+
+    fn binding_value(
+        &self,
+        file: &File<'source>,
+        binding: &StaticBinding,
+        work: &mut Work,
+    ) -> Option<Value<'source>> {
         match binding.kind {
-            StaticBindingKind::Local => file.target_at(binding.name),
-            StaticBindingKind::PythonImport {
-                module,
-                export: Some(export),
-            } => {
-                let imported = self.edge_python_module(file, module, work)?;
-                self.edge_python_export(imported, file.text(export)?, work)
+            StaticBindingKind::Local | StaticBindingKind::Shadow => {
+                file.target_at(binding.name).map(Value::Symbol)
+            }
+            StaticBindingKind::PythonReceiver { class_name } => {
+                file.target_at(class_name).map(Value::Symbol)
+            }
+            StaticBindingKind::PythonImport { module, export } => {
+                let name = EdgePythonModules::name(file, file.text(module)?)?;
+                if let Some(export) = export {
+                    let exported = file.text(export)?;
+                    if let Some(path) = self.edge_python.path(&name) {
+                        self.export_value(self.files.get(path)?, exported, work)
+                    } else {
+                        self.module_value(&format!("{name}.{exported}"))
+                    }
+                } else {
+                    self.module_value(&name)
+                }
+            }
+            StaticBindingKind::PythonModule { module } => {
+                // Importing a dotted path binds its first component.
+                let name = file.text(module)?.split('.').next()?;
+                self.module_value(name)
             }
             _ => None,
         }
     }
 
-    fn edge_python_module<'index>(
-        &'index self,
-        file: &File<'source>,
-        module: ByteRange,
-        work: &mut Work,
-    ) -> Option<&'index File<'source>> {
-        let path =
-            self.edge_python
-                .edge_path(file.document.path.as_str(), file.text(module)?, work)?;
-        self.files.get(path)
+    fn module_value(&self, name: &str) -> Option<Value<'source>> {
+        let prefix = format!("{name}.");
+        (self.edge_python.path(name).is_some()
+            || self
+                .edge_python
+                .0
+                .range(prefix.clone()..)
+                .next()
+                .is_some_and(|(module, _)| module.starts_with(&prefix)))
+        .then(|| Value::Module(name.to_owned()))
     }
 
-    fn edge_python_export<'index>(
+    fn export_value<'index>(
         &'index self,
         mut file: &'index File<'source>,
         mut name: &'source str,
         work: &mut Work,
-    ) -> Option<Target<'source>> {
+    ) -> Option<Value<'source>> {
         let mut visited = BTreeSet::new();
         loop {
             if !work.charge() || !visited.insert((file.document.path.as_str(), name)) {
                 return None;
             }
-            let bindings = file.by_name.get(name)?;
+            let module = file.qualified_target(".")?.admitted_path()?.join(".");
+            let Some(bindings) = file.by_name.get(name) else {
+                return self.module_value(&format!("{module}.{name}"));
+            };
             let mut root = bindings.iter().filter(|binding| {
                 binding.scope.start == 0 && binding.scope.end == file.document.source.len() as u64
             });
@@ -168,20 +195,27 @@ impl<'source> Index<'source> {
             if root.next().is_some() {
                 return None;
             }
-            if let Some(target) = file.qualified_target(name) {
-                let declared = binding.kind == StaticBindingKind::Local
-                    && target.symbol.name_range == Some(binding.name);
-                return (declared && !file.reassigned(name, None)).then_some(target);
+            match binding.kind {
+                StaticBindingKind::Local => return file.target_at(binding.name).map(Value::Symbol),
+                StaticBindingKind::Shadow => {
+                    return file.target_at(binding.name).map(Value::Symbol);
+                }
+                StaticBindingKind::PythonImport { module, export } => {
+                    let module = EdgePythonModules::name(file, file.text(module)?)?;
+                    let Some(export) = export else {
+                        return self.module_value(&module);
+                    };
+                    name = file.text(export)?;
+                    let Some(path) = self.edge_python.path(&module) else {
+                        return self.module_value(&format!("{module}.{name}"));
+                    };
+                    file = self.files.get(path)?;
+                }
+                StaticBindingKind::PythonModule { module } => {
+                    return self.module_value(file.text(module)?.split('.').next()?);
+                }
+                _ => return None,
             }
-            let StaticBindingKind::PythonImport {
-                module,
-                export: Some(export),
-            } = binding.kind
-            else {
-                return None;
-            };
-            name = file.text(export)?;
-            file = self.edge_python_module(file, module, work)?;
         }
     }
 }
@@ -192,11 +226,76 @@ fn edge_python_binding<'source>(
     position: u64,
     work: &mut Work,
 ) -> Option<&'source StaticBinding> {
-    if file.blocked(position, work) || file.reassigned(name, None) {
+    if file.blocked(position, work) {
         return None;
     }
-    match file.binding(name, position, |_| true, work) {
-        Binding::Found(binding) => Some(binding),
-        Binding::Missing | Binding::Blocked => None,
+    let in_body = file
+        .enclosing_callable(ByteRange {
+            start: position,
+            end: position.saturating_add(1),
+        })
+        .is_some_and(|callable| {
+            callable
+                .symbol
+                .body_range
+                .is_some_and(|body| body.contains(position))
+        });
+    let bindings = file.by_name.get(name)?;
+    let module = ByteRange {
+        start: 0,
+        end: file.document.source.len() as u64,
+    };
+    let mut excluded = BTreeSet::new();
+    let mut global = false;
+    let mut nonlocal = false;
+    loop {
+        let mut best: Option<ByteRange> = None;
+        for &binding in bindings {
+            if !work.charge() {
+                return None;
+            }
+            let scope = binding.scope;
+            if !scope.contains(position)
+                || excluded.contains(&scope)
+                || (global && scope != module)
+                || (nonlocal && scope == module)
+                || (in_body && file.class_scopes.contains(&scope))
+            {
+                continue;
+            }
+            if best.is_none_or(|best| best.encloses(scope)) {
+                best = Some(scope);
+            }
+        }
+        let scope = best?;
+        let mut declaration = None;
+        let mut selected = None;
+        let mut ambiguous = false;
+        for &binding in bindings {
+            if !work.charge() {
+                return None;
+            }
+            if binding.scope != scope {
+                continue;
+            }
+            match binding.kind {
+                StaticBindingKind::PythonGlobal => declaration = Some(true),
+                StaticBindingKind::PythonNonlocal => declaration = Some(false),
+                _ => {
+                    ambiguous |= selected.is_some();
+                    selected = Some(binding);
+                }
+            }
+        }
+        if let Some(is_global) = declaration {
+            if selected.is_some() || global || (nonlocal && is_global) {
+                return None;
+            }
+            excluded.insert(scope);
+            global = is_global;
+            nonlocal = !is_global;
+        } else {
+            return selected.filter(|binding| !ambiguous && binding.available_from <= position);
+        }
     }
 }
