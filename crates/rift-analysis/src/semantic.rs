@@ -562,6 +562,33 @@ impl WorkspaceSemantics {
         )
     }
 
+    /// Position of the normalized record that holds a syntax provider-local identity.
+    ///
+    /// Declarations merged into one record share its position, so a pass over every
+    /// declaration answers [`Self::readable_identity_at`] once per record.
+    #[must_use]
+    pub fn record_position(&self, provider_symbol: &str) -> Option<usize> {
+        let reference = ContributionReference::new(
+            self.syntax_provider.clone(),
+            ProviderSymbolId::for_symbol(provider_symbol).ok()?,
+        );
+        self.graph.record_position_for(&reference)
+    }
+
+    /// Established identity of the record at `position` when that record assembles into a
+    /// readable symbol.
+    ///
+    /// Answers what [`Self::assembled`] followed by its portable facts and identity answers,
+    /// without assembling the record's references, edges, and presentation.
+    #[must_use]
+    pub fn readable_identity_at(&self, position: usize) -> Option<&rift_core::SymbolId> {
+        let record = self.graph.records().get(position)?;
+        if !SymbolAssembler::assembles_facts(&self.graph, record) {
+            return None;
+        }
+        record.identity()
+    }
+
     /// Assembles one captured record, including records with no source declaration.
     #[must_use]
     pub fn assembled_record(&self, record: &rift_core::SymbolRecord) -> Option<AssembledSymbol> {

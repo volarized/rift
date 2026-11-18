@@ -66,32 +66,65 @@ pub(crate) fn declarations(
 ) -> (Vec<DeclarationFacts>, Vec<rift_core::SymbolId>) {
     let mut declarations = Vec::new();
     let mut examples = Vec::new();
+    // Declarations sharing one identity share one record. Assembling the record once per
+    // declaration cost the record's Contribution count each time, plus a scan of every
+    // reference and edge in the graph: quadratic in the number of colliding declarations.
+    // Each record's readable identity is answered once and reused.
+    let mut records = BTreeMap::<usize, Option<ReadableIdentity>>::new();
     for file in files.values() {
         let language = file.syntax().language();
         for symbol in file.syntax().symbols() {
             let identity =
                 symbol.provider_address(&language.identity_segment(), file.path().as_str());
-            if let Some(canonical) =
-                crate::workspace::ReadableSymbol::assembled_by(semantics, &identity)
-                    .and_then(|readable| readable.identity().cloned())
-                && let Ok(identity) =
-                    rift_protocol::identity::SymbolIdentity::parse(canonical.as_str())
+            let Some(position) = semantics.record_position(&identity) else {
+                continue;
+            };
+            let Some(readable) = records
+                .entry(position)
+                .or_insert_with(|| ReadableIdentity::at(semantics, position, owner))
+            else {
+                continue;
+            };
+            if readable.owned
+                && examples.len() < crate::workspace::CANONICAL_EXAMPLES_MAX
+                && !examples.contains(&readable.canonical)
             {
-                if identity.owner() == owner
-                    && examples.len() < crate::workspace::CANONICAL_EXAMPLES_MAX
-                    && !examples.contains(&canonical)
-                {
-                    examples.push(canonical);
-                }
-                let mut declaration =
-                    DeclarationFacts::new(file, symbol, SymbolId(identity.wire_identity()));
-                declaration.language = identity.language().clone();
-                declarations.push(declaration);
+                examples.push(readable.canonical.clone());
             }
+            let mut declaration = DeclarationFacts::new(file, symbol, readable.wire.clone());
+            declaration.language = readable.language.clone();
+            declarations.push(declaration);
         }
     }
     examples.sort_by(|left, right| left.as_str().cmp(right.as_str()));
     (declarations, examples)
+}
+
+/// One record's established identity, parsed once for every declaration the record holds.
+struct ReadableIdentity {
+    canonical: rift_core::SymbolId,
+    wire: SymbolId,
+    language: Language,
+    /// Whether the identity's owner is the workspace owner.
+    owned: bool,
+}
+
+impl ReadableIdentity {
+    fn at(
+        semantics: &WorkspaceSemantics,
+        position: usize,
+        owner: &rift_protocol::identity::SymbolOwner,
+    ) -> Option<Self> {
+        let canonical = semantics.readable_identity_at(position)?;
+        let identity = rift_protocol::identity::SymbolIdentity::parse(canonical.as_str()).ok()?;
+        // `parse` accepts only the canonical spelling, so the wire identity is `canonical`.
+        Some(Self {
+            canonical: canonical.clone(),
+            wire: SymbolId(canonical.as_str().to_owned()),
+            language: identity.language().clone(),
+            owned: identity.owner() == owner,
+        })
+    }
 }
 
 /// Builds a validated documentation collection and decoded notebook cells from the text
