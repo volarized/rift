@@ -28,12 +28,17 @@ fn established_module(
     roots: &[PackageImportRoot],
 ) -> Option<Vec<String>> {
     let syntax = file.syntax;
-    let source = captured
-        .get(file.path.as_str())
-        .filter(|source| source.text() == file.source)?;
-    if syntax.language() != &ShippedLanguage::Python.language()
-        || syntax.has_errors()
-        || syntax.source_digest() != Some(&source.source_digest())
+    if syntax.language() != &ShippedLanguage::Python.language() || syntax.has_errors() {
+        return None;
+    }
+    // Selection pairs each file's syntax facts with the bytes they were parsed from, and
+    // the provider recorded the digest of those bytes. Membership by path, the byte
+    // length, and that recorded digest identify the captured source; comparing or
+    // hashing the content again ran over every selected file on every index pass.
+    if syntax.source_digest().is_none()
+        || captured
+            .get(file.path.as_str())
+            .is_none_or(|source| source.text().len() != file.source.len())
     {
         return None;
     }

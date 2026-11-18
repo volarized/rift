@@ -2928,6 +2928,54 @@ fn rust_public_reexports_keep_rust_identity_in_a_mixed_workspace() {
 }
 
 #[test]
+fn public_reexports_resolve_only_one_public_declaration_per_target() {
+    let path = ProjectPath::new("src/lib.rs").expect("source path");
+    let text = "mod shapes { pub struct Circle; pub struct Square; struct Hidden; pub fn twice() {} pub fn twice() {} }\npub use shapes::Circle as Round;\npub use shapes::Square;\npub use shapes::Hidden;\npub use shapes::twice;\npub use shapes::Circle as Disc;\n";
+    let files = [PackageSource::new(&path, text)];
+    let manifest_path = ProjectPath::new("Cargo.toml").expect("manifest path");
+    let metadata = [PackageSource::new(&manifest_path, MANIFEST)];
+    let owner = SymbolOwner::Local;
+    let language = rift_syntax::ShippedLanguage::Rust.language();
+    let limits = rift_syntax::SyntaxLimits::default();
+    let input =
+        NamespaceInput::workspace(&owner, &language, &files, &metadata, &[], (2, 4096, limits))
+            .expect("workspace");
+    let syntax = RustSyntaxProvider::default()
+        .analyze(SyntaxSource { path: &path, text }, limits)
+        .expect("Rust syntax")
+        .into_facts();
+    let selected = [super::super::SelectedFile {
+        path: &path,
+        source: text,
+        syntax: &syntax,
+    }];
+    let prepared = super::prepare(&input, &selected);
+    let exports = prepared
+        .exports
+        .iter()
+        .map(|export| (export.identity.as_str(), export.target.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        exports,
+        [
+            (
+                "rift://symbol/local/rust/crate_root/Round",
+                "rift://symbol/local/rust/crate_root/shapes/Circle"
+            ),
+            (
+                "rift://symbol/local/rust/crate_root/Square",
+                "rift://symbol/local/rust/crate_root/shapes/Square"
+            ),
+            (
+                "rift://symbol/local/rust/crate_root/Disc",
+                "rift://symbol/local/rust/crate_root/shapes/Circle"
+            ),
+        ],
+        "a private target and a target two declarations share stay unresolved"
+    );
+}
+
+#[test]
 fn public_reexports_remain_when_an_external_crate_is_declared() {
     let target = local_alias_analysis(
         &[
