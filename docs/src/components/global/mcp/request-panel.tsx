@@ -3,7 +3,7 @@
 import { CircleNotchIcon } from "@phosphor-icons/react";
 import { useMemo } from "react";
 
-import type { ToolExample } from "@/components/global/mcp/examples";
+import { argumentsFor, type ToolExample } from "@/components/global/mcp/examples";
 import { Elapsed } from "@/components/global/mcp/result-view";
 import {
   type Arguments,
@@ -197,14 +197,15 @@ export function RequestPanel({
                       type="button"
                       variant="outline"
                       size="xs"
-                      onClick={() =>
+                      onClick={() => {
+                        const args = argumentsFor(example, specs);
                         onEditorChange({
                           ...editor,
-                          form: formFromArguments(specs, example.arguments),
-                          json: JSON.stringify(example.arguments, null, 2),
+                          form: formFromArguments(specs, args),
+                          json: JSON.stringify(args, null, 2),
                           notice: undefined,
-                        })
-                      }
+                        });
+                      }}
                       className={OUTLINE}
                     >
                       {example.label}
