@@ -2878,6 +2878,44 @@ fn history_lists_edges_and_marks_an_incomplete_history() {
 }
 
 #[test]
+fn a_release_history_lists_each_release_version_with_its_edge() {
+    let release = |version: &str| {
+        Revision::parse(&format!("rift://revision/cargo/crates.io/demo@{version}"))
+            .expect("a release revision")
+    };
+    let mut hit = symbol_hit();
+    hit.history = Some(history(
+        vec![
+            HistoryEdge::RemovedInRelease {
+                revision: release("2.0.0"),
+            },
+            HistoryEdge::ChangedInRelease {
+                revision: release("1.1.0"),
+                change: HistoryChange::SignatureChanged,
+            },
+            HistoryEdge::IntroducedInRelease {
+                revision: release("1.0.0"),
+            },
+        ],
+        false,
+    ));
+    golden(
+        &symbol_result(vec![hit], pagination(0, 1)),
+        &[
+            "1 result",
+            "\tstruct A",
+            "\ta.rs:1",
+            "\trift://symbol/local/rust/app/a/A",
+            "",
+            "\thistory (incomplete):",
+            "\t\t2.0.0 · removed in release",
+            "\t\t1.1.0 · changed in release · signature changed",
+            "\t\t1.0.0 · introduced in release",
+        ],
+    );
+}
+
+#[test]
 fn a_truncated_co_change_count_writes_one_line_after_the_edges() {
     let mut hit = symbol_hit();
     let mut truncated = history(
