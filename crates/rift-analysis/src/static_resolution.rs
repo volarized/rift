@@ -12,7 +12,7 @@ use rift_core::{
     ContributionReference, DeclarationBinding, FileDigest, LoopBudget, ProjectPath, ProviderId,
     ProviderSymbolId, ReferenceRole, SourceRange,
 };
-use rift_protocol::read::SymbolFacet;
+use rift_protocol::read::SymbolKind;
 use rift_provider::{NormalizedGraph, NormalizedTarget};
 use rift_syntax::{
     ByteRange, DocumentPlacement, SYNTAX_PROVIDER_ID, StaticBinding, StaticBindingKind, StaticCall,
@@ -40,7 +40,7 @@ pub(crate) struct StaticOccurrence {
     pub(crate) callee_range: ByteRange,
     pub(crate) role: ReferenceRole,
     pub(crate) edge_from: Option<rift_core::SymbolId>,
-    pub(crate) edge_kind: Option<rift_protocol::read::RelationshipFacet>,
+    pub(crate) edge_kind: Option<rift_protocol::read::EdgeKind>,
 }
 
 /// Observations with the coverage of the bounded pass that produced them.
@@ -137,8 +137,8 @@ struct Target<'source> {
 impl Target<'_> {
     fn callable(self) -> Option<Self> {
         self.symbol
-            .facets
-            .contains(&SymbolFacet::Callable)
+            .kinds
+            .contains(&SymbolKind::Callable)
             .then_some(self)
     }
 

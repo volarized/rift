@@ -1,8 +1,8 @@
 //! JSON syntax facts from the pinned tree-sitter-json grammar.
 //!
-//! Each object member - the grammar's `pair` node - declares one `member`
+//! Each object member - the grammar's `pair` syntax element - declares one `member`
 //! symbol. Values declare nothing on their own: a document holding a bare
-//! scalar or array emits no symbols, and its nodes still serve.
+//! scalar or array emits no symbols, and its syntax elements still serve.
 //!
 //! Decisions this module fixes:
 //! - A symbol's `name` is the key's bytes between its quotes, escapes kept
@@ -22,10 +22,10 @@
 //!   `servers > host`, sharing one qualified name with distinct spans, the
 //!   same policy duplicate keys get.
 //! - Nothing attaches in front of a pair, so `range` equals `item_range`.
-//!   `body_range` is the value node's span, absent when the tree is
+//!   `body_range` is the value syntax element's span, absent when the tree is
 //!   missing the value.
-//! - Members carry no visibility and no portable symbol facet:
-//!   `visibility` stays `None` and `facets` stays empty.
+//! - Members carry no visibility and no portable symbol kind:
+//!   `visibility` stays `None` and `kinds` stays empty.
 //! - `signatures` and `documentation` stay empty for every member: JSON has
 //!   no callable form and, with nothing attached in front of a pair, no
 //!   comment for a member to carry either.
@@ -34,7 +34,7 @@ use std::num::NonZeroU16;
 use std::sync::OnceLock;
 
 use rift_error::errors;
-use rift_protocol::read::{Language, NodeFacet};
+use rift_protocol::read::{Language, SyntaxKind};
 use tree_sitter::{Node, Parser};
 
 use crate::document::SyntaxDocument;
@@ -88,12 +88,12 @@ impl JsonKinds {
     }
 }
 
-/// Resolves one node kind id, proving the pinned grammar defines it.
+/// Resolves one syntax element kind id, proving the pinned grammar defines it.
 fn kind_id(language: &tree_sitter::Language, kind: &str) -> u16 {
     let id = language.id_for_node_kind(kind, true);
     assert!(
         id != 0,
-        "pinned JSON grammar must define node kind used by symbol \
+        "pinned JSON grammar must define syntax_element kind used by symbol \
          extraction: kind={kind}"
     );
     id
@@ -136,21 +136,21 @@ impl GrammarRules for JsonRules {
         visited: Visited<'_, '_>,
         text: &str,
     ) -> Result<Option<Declaration>, RiftError> {
-        let node = visited.node();
-        if node.kind_id() != self.kinds.pair {
+        let syntax_element = visited.syntax_element();
+        if syntax_element.kind_id() != self.kinds.pair {
             return Ok(None);
         }
-        let Some(name) = self.member_name(node, text) else {
+        let Some(name) = self.member_name(syntax_element, text) else {
             return Ok(None);
         };
-        let body_range = match node.child_by_field_id(self.kinds.value.get()) {
+        let body_range = match syntax_element.child_by_field_id(self.kinds.value.get()) {
             Some(value) => Some(extract::byte_range(value)?),
             None => None,
         };
         Ok(Some(Declaration {
             name,
             kind: MEMBER_KIND_WORD,
-            facets: Vec::new(),
+            kinds: Vec::new(),
             visibility: None,
             body_range,
             documentation: Vec::new(),
@@ -158,16 +158,16 @@ impl GrammarRules for JsonRules {
         }))
     }
 
-    fn container_name(&self, node: Node<'_>, text: &str) -> Option<String> {
-        if node.kind_id() != self.kinds.pair {
+    fn container_name(&self, syntax_element: Node<'_>, text: &str) -> Option<String> {
+        if syntax_element.kind_id() != self.kinds.pair {
             return None;
         }
-        self.member_name(node, text)
+        self.member_name(syntax_element, text)
     }
 
-    /// A declaration starts at its own node: nothing attaches in front.
+    /// A declaration starts at its own syntax element: nothing attaches in front.
     fn declaration_start(&self, visited: Visited<'_, '_>, _text: &str) -> usize {
-        visited.node().start_byte()
+        visited.syntax_element().start_byte()
     }
 
     fn qualification_separator(&self) -> &'static str {
@@ -224,12 +224,12 @@ impl SyntaxProvider for JsonSyntaxProvider {
         let rules = JsonRules {
             kinds: json_kinds(),
         };
-        let (nodes, symbols) =
+        let (syntax_elements, symbols) =
             extract::extract(tree.root_node(), source, limits, &self.language, &rules)?;
         Ok(SyntaxDocument::new(
             self.language.clone(),
             source.path.clone(),
-            nodes,
+            syntax_elements,
             symbols,
             tree.root_node().has_error(),
         )
@@ -237,17 +237,17 @@ impl SyntaxProvider for JsonSyntaxProvider {
         .with_syntax_limits(limits))
     }
 
-    /// Portable structural facets for one JSON grammar node kind. The
+    /// Portable structural kinds for one JSON grammar syntax element kind. The
     /// structural kinds - `document`, `object`, `array` - carry none.
-    fn node_facets(&self, kind: &str) -> Vec<NodeFacet> {
+    fn syntax_element_kinds(&self, kind: &str) -> Vec<SyntaxKind> {
         match kind {
             // The pair declares its key's name.
-            PAIR_KIND => vec![NodeFacet::Declaration],
+            PAIR_KIND => vec![SyntaxKind::Declaration],
             // A value written out directly.
-            STRING_KIND | "number" | "true" | "false" | "null" => vec![NodeFacet::Literal],
+            STRING_KIND | "number" | "true" | "false" | "null" => vec![SyntaxKind::Literal],
             // The grammar accepts comments so an agent-read JSONC file still
             // parses; strict JSON never carries one.
-            "comment" => vec![NodeFacet::Comment],
+            "comment" => vec![SyntaxKind::Comment],
             _ => Vec::new(),
         }
     }
@@ -299,8 +299,10 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "must define node kind used by symbol extraction: \
-                               kind=no_such_kind")]
+    #[should_panic(
+        expected = "must define syntax_element kind used by symbol extraction: \
+                               kind=no_such_kind"
+    )]
     fn test_kind_resolution_refuses_a_kind_the_grammar_lacks() {
         let _ = kind_id(&json_grammar(), "no_such_kind");
     }
@@ -320,7 +322,7 @@ mod tests {
     }
 
     /// Nested members qualify through their key path with byte-exact spans:
-    /// the whole pair for `range` and `item_range`, the value node for
+    /// the whole pair for `range` and `item_range`, the value syntax element for
     /// `body_range`.
     #[test]
     fn test_nested_members_qualify_through_the_key_path_with_exact_spans() {
@@ -365,10 +367,10 @@ mod tests {
                 .iter()
                 .all(|symbol| symbol.kind == "member"
                     && symbol.range == symbol.item_range
-                    && symbol.facets.is_empty()
+                    && symbol.kinds.is_empty()
                     && symbol.visibility.is_none()),
             "every member files under the one JSON kind, spans its own pair, \
-             and carries no facets and no visibility"
+             and carries no kinds and no visibility"
         );
         assert!(!document.has_errors());
     }
@@ -401,7 +403,7 @@ mod tests {
     }
 
     /// A document holding a bare array or scalar emits no symbols; its
-    /// nodes still serve.
+    /// syntax elements still serve.
     #[test]
     fn test_bare_array_and_scalar_documents_emit_no_symbols() {
         for text in ["[1, 2, 3]", "42", "\"prose\"", "true", "null"] {
@@ -411,7 +413,7 @@ mod tests {
                 "a keyless document must emit no symbols: {text}"
             );
             assert!(!document.has_errors());
-            assert!(!document.nodes().is_empty());
+            assert!(!document.syntax_elements().is_empty());
         }
     }
 
@@ -461,12 +463,12 @@ mod tests {
     fn test_provider_reports_malformed_tree_without_dropping_facts() {
         let document = analyze("{\"broken\": }");
         assert!(document.has_errors());
-        assert!(!document.nodes().is_empty());
+        assert!(!document.syntax_elements().is_empty());
         assert_eq!(document.symbols()[0].name, "broken");
     }
 
     #[test]
-    fn test_provider_enforces_source_node_and_depth_limits() {
+    fn test_provider_enforces_source_syntax_element_and_depth_limits() {
         let bounded = |limits: SyntaxLimits, text: &str| {
             JsonSyntaxProvider::default().analyze(
                 SyntaxSource {
@@ -486,14 +488,14 @@ mod tests {
             rift_error::errors::syntax::source_too_large::SLUG
         );
 
-        let node_error = bounded(
+        let syntax_element_error = bounded(
             SyntaxLimits::new(100, 1, 10).expect("positive limits"),
             "{\"a\": 1}",
         )
-        .expect_err("node bound");
+        .expect_err("syntax element bound");
         assert_eq!(
-            node_error.slug(),
-            rift_error::errors::syntax::too_many_nodes::SLUG
+            syntax_element_error.slug(),
+            rift_error::errors::syntax::too_many_syntax_elements::SLUG
         );
 
         let depth_error = bounded(
@@ -530,25 +532,31 @@ mod tests {
         assert!(!document.has_errors());
     }
 
-    /// The pair carries the `Declaration` facet, scalar values read as
+    /// The pair carries the `Declaration` kind, scalar values read as
     /// `Literal`, a comment as `Comment`, and structure carries none.
     #[test]
-    fn test_node_facets_classify_the_interpreted_kinds() {
+    fn test_syntax_element_kinds_classify_the_interpreted_kinds() {
         let provider = JsonSyntaxProvider::default();
-        assert_eq!(provider.node_facets(PAIR_KIND), [NodeFacet::Declaration]);
+        assert_eq!(
+            provider.syntax_element_kinds(PAIR_KIND),
+            [SyntaxKind::Declaration]
+        );
         for kind in [STRING_KIND, "number", "true", "false", "null"] {
             assert_eq!(
-                provider.node_facets(kind),
-                [NodeFacet::Literal],
+                provider.syntax_element_kinds(kind),
+                [SyntaxKind::Literal],
                 "kind {kind} must classify as a literal value"
             );
         }
-        assert_eq!(provider.node_facets("comment"), [NodeFacet::Comment]);
+        assert_eq!(
+            provider.syntax_element_kinds("comment"),
+            [SyntaxKind::Comment]
+        );
         for kind in ["document", "object", "array", "string_content"] {
             assert_eq!(
-                provider.node_facets(kind),
+                provider.syntax_element_kinds(kind),
                 [],
-                "structural kind {kind} carries no portable facet"
+                "structural kind {kind} carries no portable kind"
             );
         }
     }

@@ -42,10 +42,13 @@ fn angular_latest_grammar_rules_remain_available_and_restore() {
             .expect("Angular template");
         assert!(!document.has_errors(), "{kind}: {text}");
         assert!(
-            document.nodes().iter().any(|node| node.kind == kind),
+            document
+                .syntax_elements()
+                .iter()
+                .any(|syntax_element| syntax_element.kind == kind),
             "{kind}: {text}"
         );
         let names = SyntaxNames::new(document.language()).expect("Angular vocabulary");
-        assert!(names.node_kind(kind).is_some(), "{kind} restores");
+        assert!(names.syntax_element_kind(kind).is_some(), "{kind} restores");
     }
 }

@@ -17,7 +17,7 @@ pub enum VocabularyClass {
     /// A logical, timeless unit of code.
     Symbol,
     /// A physical part of a symbol, addressed by its content.
-    Node,
+    SyntaxElement,
     /// One physical usage of a symbol.
     Occurrence,
     /// A point on the history axis.
@@ -40,23 +40,23 @@ pub enum VocabularyProperty {
     Kind,
     /// The language identity segment.
     Language,
-    /// The symbol whose declaration holds a node.
+    /// The symbol whose declaration holds a syntax element.
     Of,
-    /// The position of a node's declaration among its symbol's declarations.
+    /// The position of a syntax element's declaration among its symbol's declarations.
     Declaration,
-    /// The preorder position of a node in its declaration or source unit.
+    /// The preorder position of a syntax element in its declaration or source unit.
     Index,
-    /// The node enclosing a node.
+    /// The syntax element enclosing a syntax element.
     Parent,
-    /// The place a node is written.
+    /// The place a syntax element is written.
     Range,
-    /// The source unit a range lies in, or that holds a node outside every declaration.
+    /// The source unit a range lies in, or that holds a syntax element outside every declaration.
     Unit,
     /// The first byte of a range.
     Start,
     /// One past the last byte of a range.
     End,
-    /// The exact source text of a node.
+    /// The exact source text of a syntax element.
     Source,
     /// A symbol invokes a symbol.
     Calls,
@@ -78,7 +78,7 @@ pub enum VocabularyProperty {
     Writes,
     /// The source is typed by the target.
     HasType,
-    /// A node that uses a symbol.
+    /// A syntax element that uses a symbol.
     Usages,
     /// The revision that added a symbol.
     IntroducedIn,
@@ -101,7 +101,7 @@ pub enum VocabularyProperty {
 pub enum VocabularyResource {
     /// An IRI typed with this class.
     Class(VocabularyClass),
-    /// The blank node a node's `range` names.
+    /// The blank node a syntax element's `range` names.
     Range,
     /// An `rdf:Statement` blank node reifying one `coChanges` triple.
     Statement,
@@ -132,7 +132,8 @@ pub struct PropertyDefinition {
 }
 
 const SYMBOL: VocabularyResource = VocabularyResource::Class(VocabularyClass::Symbol);
-const NODE: VocabularyResource = VocabularyResource::Class(VocabularyClass::Node);
+const SYNTAX_ELEMENT: VocabularyResource =
+    VocabularyResource::Class(VocabularyClass::SyntaxElement);
 const OCCURRENCE: VocabularyResource = VocabularyResource::Class(VocabularyClass::Occurrence);
 const REVISION: VocabularyResource = VocabularyResource::Class(VocabularyClass::Revision);
 const SOURCE_UNIT: VocabularyResource = VocabularyResource::Class(VocabularyClass::SourceUnit);
@@ -150,10 +151,10 @@ impl VocabularyClass {
     pub const fn description(self) -> &'static str {
         match self {
             Self::Symbol => {
-                "A logical, timeless unit of code: `rift://symbol/<owner>/<language>/<qualified path>`. Several declarations of one path are several nodes of one symbol."
+                "A logical, timeless unit of code: `rift://symbol/<owner>/<language>/<qualified path>`. Several declarations of one path are several facets of one symbol."
             }
-            Self::Node => {
-                "A syntax node, written as a blank node: inside a declaration it carries `of`, `declaration` and `index`, outside every declaration `unit` and `index`. It has one `range` at the read's revision."
+            Self::SyntaxElement => {
+                "A syntax element, written as a blank node: inside a declaration it carries `of`, `declaration` and `index`, outside every declaration `unit` and `index`. It has one `range` at the read's revision."
             }
             Self::Occurrence => {
                 "One physical usage of a symbol. An occurrence names its source range and, when known, its enclosing symbol."
@@ -200,45 +201,49 @@ impl VocabularyProperty {
                 "The revision at which the server read the symbol's facts.",
             ),
             Self::Kind => (
-                &[SYMBOL, NODE, OCCURRENCE],
+                &[SYMBOL, SYNTAX_ELEMENT, OCCURRENCE],
                 String,
-                "The declaration kind of a symbol, or the syntax kind of a node, as its language's provider names it.",
+                "The declaration kind of a symbol, or the syntax kind of a syntax element, as its language's provider names it.",
             ),
             Self::Language => (
-                &[SYMBOL, NODE],
+                &[SYMBOL, SYNTAX_ELEMENT],
                 String,
                 "The language identity segment, such as `rust`.",
             ),
             Self::Of => (
-                &[NODE, OCCURRENCE],
+                &[SYNTAX_ELEMENT, OCCURRENCE],
                 Resource(SYMBOL),
-                "The symbol whose declaration holds the node.",
+                "The symbol whose declaration holds the syntax element.",
             ),
             Self::Declaration => (
-                &[NODE],
+                &[SYNTAX_ELEMENT],
                 Integer,
-                "The position of the node's declaration among its symbol's declarations.",
+                "The position of the syntax element's declaration among its symbol's declarations.",
             ),
             Self::Index => (
-                &[NODE],
+                &[SYNTAX_ELEMENT],
                 Integer,
-                "The preorder position of the node in its declaration, the declaration's own node at 0, or among its unit's nodes outside every declaration.",
+                "The preorder position of the syntax element in its declaration, the declaration's own syntax element at 0, or among its unit's syntax elements outside every declaration.",
             ),
-            Self::Parent => (&[NODE], Resource(NODE), "The node enclosing this node."),
+            Self::Parent => (
+                &[SYNTAX_ELEMENT],
+                Resource(SYNTAX_ELEMENT),
+                "The syntax element enclosing this syntax element.",
+            ),
             Self::Range => (
-                &[NODE, OCCURRENCE],
+                &[SYNTAX_ELEMENT, OCCURRENCE],
                 Resource(Range),
-                "The place the node is written at the read's revision.",
+                "The place the syntax element is written at the read's revision.",
             ),
             Self::Unit => (
-                &[Range, NODE],
+                &[Range, SYNTAX_ELEMENT],
                 Resource(SOURCE_UNIT),
-                "The source unit the range lies in, or that holds a node outside every declaration.",
+                "The source unit the range lies in, or that holds a syntax element outside every declaration.",
             ),
             Self::Start => (&[Range], Integer, "The first UTF-8 byte of the range."),
             Self::End => (&[Range], Integer, "One past the last byte of the range."),
             Self::Source => (
-                &[NODE, OCCURRENCE],
+                &[SYNTAX_ELEMENT, OCCURRENCE],
                 String,
                 "The exact source text at the selected range.",
             ),
@@ -294,8 +299,8 @@ impl VocabularyProperty {
             ),
             Self::Usages => (
                 &[SYMBOL],
-                OneOf(&[NODE, OCCURRENCE]),
-                "A node or occurrence that uses the symbol, the evidence an incoming `calls` or `references` edge was read from; its `of` names the using symbol and its `range` the place.",
+                OneOf(&[SYNTAX_ELEMENT, OCCURRENCE]),
+                "A syntax element or occurrence that uses the symbol, the evidence an incoming `calls` or `references` edge was read from; its `of` names the using symbol and its `range` the place.",
             ),
             Self::IntroducedIn => (&[SYMBOL], Resource(REVISION), "The revision that added it."),
             Self::ChangedIn => (&[SYMBOL], Resource(REVISION), "A revision that changed it."),

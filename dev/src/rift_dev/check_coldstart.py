@@ -153,7 +153,11 @@ async def check_first_use(client: Client, name: str) -> None:
         client,
         "search",
         retrieval_request(
-            {"pattern": r"\bbeacon_cold\b", "target": "symbol", "include": ["source"]},
+            {
+                "pattern": r"\bbeacon_cold\b",
+                "target": "symbol",
+                "include": {"source": True},
+            },
             ("name", "language", "source"),
         ),
         seconds=COLDSTART_SECONDS,

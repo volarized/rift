@@ -1,7 +1,7 @@
 //! Projection proofs for the facts a graph query needs.
 
 use oxrdf::vocab::rdf;
-use rift_protocol::read::{RelationshipFacet, SymbolId, TraversalDirection};
+use rift_protocol::read::{EdgeKind, SymbolId, TraversalDirection};
 use spargebra::Query;
 use spargebra::algebra::{Expression, PropertyPathExpression, QueryExpression};
 use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
@@ -19,30 +19,30 @@ pub enum SymbolSelection<'query> {
     Identified(&'query str),
 }
 
-/// Captured syntax nodes for the selected physical declarations.
+/// Captured syntax elements for the selected physical declarations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct NodeSelection<'query> {
-    /// The logical symbols whose declarations supply the nodes.
+pub struct SyntaxSelection<'query> {
+    /// The logical symbols whose declarations supply the syntax elements.
     pub symbols: SymbolSelection<'query>,
-    /// Whether the pattern requests exact node source text.
+    /// Whether the pattern requests exact syntax element source text.
     pub source: bool,
 }
 
-/// One direction and facet acquired at a path position.
+/// One direction and kind acquired at a path position.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct AdjacencyStep {
     /// Required adjacency relative to the current symbol.
     pub direction: TraversalDirection,
-    /// Required relationship facet.
-    pub facet: RelationshipFacet,
+    /// Required edge kind.
+    pub kind: EdgeKind,
 }
 
 /// The declaration item facts required by a reached-symbol pattern.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ReachedNodes {
+pub struct ReachedFacets {
     /// The query can inspect the exact declaration excerpt.
     pub source: bool,
-    /// The query can inspect grammar facts or the exact node declaration ordinal.
+    /// The query can inspect grammar facts or the exact syntax element declaration ordinal.
     pub syntax_metadata: bool,
 }
 
@@ -58,7 +58,7 @@ pub struct AdjacencySelection {
     /// Whether the pattern projects logical facts about reached symbols.
     pub symbol_details: bool,
     /// Declaration item facts selected for reached symbols.
-    pub nodes: Option<ReachedNodes>,
+    pub syntax_elements: Option<ReachedFacets>,
     /// Whether physical usage records and their evidence must also be projected.
     pub occurrences: Option<OccurrenceSelection>,
 }
@@ -136,9 +136,9 @@ impl GraphQuery {
         selection.or_else(|| self.symbol_only().then_some(SymbolSelection::All))
     }
 
-    /// Proves that a graph pattern needs only the syntax nodes of selected declarations.
+    /// Proves that a graph pattern needs only the syntax elements of selected declarations.
     #[must_use]
-    pub fn node_selection(&self) -> Option<NodeSelection<'_>> {
+    pub fn syntax_element_selection(&self) -> Option<SyntaxSelection<'_>> {
         let QueryExpression::Bgp { patterns } = query_pattern(self) else {
             return None;
         };
@@ -147,7 +147,7 @@ impl GraphQuery {
             .find(|triple| property(triple) == Some("of"))?;
         if !patterns.iter().any(|triple| {
             triple.subject == owner.subject
-                && (property(triple) == Some("index") || is_class(triple, "Node"))
+                && (property(triple) == Some("index") || is_class(triple, "SyntaxElement"))
         }) {
             return None;
         }
@@ -165,7 +165,7 @@ impl GraphQuery {
                     Some("of") if triple == owner => {}
                     Some("source") => source = true,
                     Some("range" | "index" | "declaration" | "kind" | "language") => {}
-                    _ if is_class(triple, "Node") => {}
+                    _ if is_class(triple, "SyntaxElement") => {}
                     _ => return None,
                 }
             } else if triple.subject == owner.object {
@@ -185,15 +185,15 @@ impl GraphQuery {
                 return None;
             }
         }
-        let symbols = if let TermPattern::NamedNode(node) = &owner.object {
-            rift_protocol::identity::SymbolIdentity::parse(node.as_str()).ok()?;
-            SymbolSelection::Identified(node.as_str())
+        let symbols = if let TermPattern::NamedNode(syntax_element) = &owner.object {
+            rift_protocol::identity::SymbolIdentity::parse(syntax_element.as_str()).ok()?;
+            SymbolSelection::Identified(syntax_element.as_str())
         } else if let Some(name) = name {
             SymbolSelection::Named(name)
         } else {
             SymbolSelection::All
         };
-        Some(NodeSelection { symbols, source })
+        Some(SyntaxSelection { symbols, source })
     }
 
     /// Finds a statically anchored path or physical usage selection.
@@ -206,8 +206,8 @@ impl GraphQuery {
             object,
         } = pattern
         {
-            if let Some((facet, reversed, depth)) = uniform_path(path) {
-                return adjacency(subject, object, facet, reversed, depth);
+            if let Some((kind, reversed, depth)) = uniform_path(path) {
+                return adjacency(subject, object, kind, reversed, depth);
             }
             let mut steps = fixed_path(path)?;
             if let Some(seed) = symbol(subject) {
@@ -240,11 +240,11 @@ impl GraphQuery {
         }
         let (edges, details): (Vec<_>, Vec<_>) = triples
             .into_iter()
-            .partition(|edge| property(edge).and_then(facet).is_some());
-        let (symbol_details, nodes) = endpoint_details(&edges, &details)?;
+            .partition(|edge| property(edge).and_then(kind).is_some());
+        let (symbol_details, syntax_elements) = endpoint_details(&edges, &details)?;
         let mut selected = adjacency_patterns(&edges).or_else(|| layered_patterns(&edges))?;
         selected.symbol_details = symbol_details;
-        selected.nodes = nodes;
+        selected.syntax_elements = syntax_elements;
         Some(selected)
     }
 }
@@ -283,17 +283,17 @@ fn query_pattern(query: &GraphQuery) -> &QueryExpression {
 fn endpoint_details(
     edges: &[&TriplePattern],
     details: &[&TriplePattern],
-) -> Option<(bool, Option<ReachedNodes>)> {
+) -> Option<(bool, Option<ReachedFacets>)> {
     let endpoint = |term: &TermPattern| {
         edges
             .iter()
             .any(|edge| &edge.subject == term || &edge.object == term)
     };
-    let mut node_owner = details
+    let mut syntax_owner = details
         .iter()
         .filter(|detail| property(detail) == Some("of") && endpoint(&detail.object));
-    let owner = node_owner.next().copied();
-    if node_owner.next().is_some() {
+    let owner = syntax_owner.next().copied();
+    if syntax_owner.next().is_some() {
         return None;
     }
     let mut ranges = Vec::new();
@@ -315,7 +315,7 @@ fn endpoint_details(
         );
     }
     let mut symbols = false;
-    let mut nodes = ReachedNodes::default();
+    let mut syntax_elements = ReachedFacets::default();
     for &detail in details {
         let predicate = property(detail);
         if endpoint(&detail.subject)
@@ -326,10 +326,10 @@ fn endpoint_details(
         } else if let Some(owner) = owner.filter(|owner| detail.subject == owner.subject) {
             match predicate {
                 Some("of") if detail == owner => {}
-                Some("source") => nodes.source = true,
-                Some("declaration" | "kind" | "language") => nodes.syntax_metadata = true,
+                Some("source") => syntax_elements.source = true,
+                Some("declaration" | "kind" | "language") => syntax_elements.syntax_metadata = true,
                 Some("range" | "index") => {}
-                _ if is_class(detail, "Node") => {}
+                _ if is_class(detail, "SyntaxElement") => {}
                 _ => return None,
             }
         } else if !ranges.contains(&&detail.subject)
@@ -338,7 +338,7 @@ fn endpoint_details(
             return None;
         }
     }
-    Some((symbols, owner.map(|_| nodes)))
+    Some((symbols, owner.map(|_| syntax_elements)))
 }
 
 fn property(pattern: &TriplePattern) -> Option<&str> {
@@ -348,18 +348,18 @@ fn property(pattern: &TriplePattern) -> Option<&str> {
     predicate.as_str().strip_prefix(VOCABULARY_NAMESPACE)
 }
 
-fn facet(name: &str) -> Option<RelationshipFacet> {
+fn kind(name: &str) -> Option<EdgeKind> {
     match name {
-        "calls" => Some(RelationshipFacet::Calls),
-        "references" => Some(RelationshipFacet::References),
-        "imports" => Some(RelationshipFacet::Imports),
-        "aliases" => Some(RelationshipFacet::Aliases),
-        "extends" => Some(RelationshipFacet::Extends),
-        "implements" => Some(RelationshipFacet::Implements),
-        "declares" => Some(RelationshipFacet::Declares),
-        "reads" => Some(RelationshipFacet::Reads),
-        "writes" => Some(RelationshipFacet::Writes),
-        "hasType" => Some(RelationshipFacet::HasType),
+        "calls" => Some(EdgeKind::Calls),
+        "references" => Some(EdgeKind::References),
+        "imports" => Some(EdgeKind::Imports),
+        "aliases" => Some(EdgeKind::Aliases),
+        "extends" => Some(EdgeKind::Extends),
+        "implements" => Some(EdgeKind::Implements),
+        "declares" => Some(EdgeKind::Declares),
+        "reads" => Some(EdgeKind::Reads),
+        "writes" => Some(EdgeKind::Writes),
+        "hasType" => Some(EdgeKind::HasType),
 
         _ => None,
     }
@@ -375,7 +375,7 @@ fn symbol(term: &TermPattern) -> Option<SymbolId> {
 fn adjacency(
     subject: &TermPattern,
     object: &TermPattern,
-    facet: RelationshipFacet,
+    kind: EdgeKind,
     reversed: bool,
     depth: Option<u32>,
 ) -> Option<AdjacencySelection> {
@@ -386,34 +386,32 @@ fn adjacency(
     };
     let incoming = symbol(target).map(|seed| (seed, TraversalDirection::Incoming));
     let outgoing = symbol(source).map(|seed| (seed, TraversalDirection::Outgoing));
-    let (seed, direction) = match facet {
-        RelationshipFacet::References => incoming.or(outgoing)?,
+    let (seed, direction) = match kind {
+        EdgeKind::References => incoming.or(outgoing)?,
         _ => outgoing.or(incoming)?,
     };
     Some(AdjacencySelection {
         seed,
-        first_step: AdjacencyStep { direction, facet },
+        first_step: AdjacencyStep { direction, kind },
         steps: Vec::new(),
         depth,
         symbol_details: false,
-        nodes: None,
+        syntax_elements: None,
         occurrences: None,
     })
 }
 
 fn adjacency_patterns(triples: &[&TriplePattern]) -> Option<AdjacencySelection> {
     let first = triples.first()?;
-    let facet = property(first).and_then(facet)?;
+    let kind = property(first).and_then(kind)?;
     if triples
         .iter()
-        .any(|edge| property(edge).and_then(self::facet) != Some(facet))
+        .any(|edge| property(edge).and_then(self::kind) != Some(kind))
     {
         return None;
     }
-    let directions = match facet {
-        RelationshipFacet::References => {
-            [TraversalDirection::Incoming, TraversalDirection::Outgoing]
-        }
+    let directions = match kind {
+        EdgeKind::References => [TraversalDirection::Incoming, TraversalDirection::Outgoing],
         _ => [TraversalDirection::Outgoing, TraversalDirection::Incoming],
     };
     let depth = u32::try_from(triples.len()).ok()?;
@@ -452,11 +450,11 @@ fn adjacency_patterns(triples: &[&TriplePattern]) -> Option<AdjacencySelection> 
             if remaining.is_empty() {
                 return Some(AdjacencySelection {
                     seed,
-                    first_step: AdjacencyStep { direction, facet },
+                    first_step: AdjacencyStep { direction, kind },
                     steps: Vec::new(),
                     depth: Some(depth),
                     symbol_details: false,
-                    nodes: None,
+                    syntax_elements: None,
                     occurrences: None,
                 });
             }
@@ -472,7 +470,7 @@ fn layered_adjacency(seed: SymbolId, steps: Vec<AdjacencyStep>) -> Option<Adjace
         depth: Some(u32::try_from(steps.len()).ok()?),
         steps,
         symbol_details: false,
-        nodes: None,
+        syntax_elements: None,
         occurrences: None,
     })
 }
@@ -490,8 +488,8 @@ fn fixed_path(path: &PropertyPathExpression) -> Option<Vec<AdjacencyStep>> {
     while let Some((path, direction)) = pending.pop() {
         match path {
             PropertyPathExpression::Link(predicate) => {
-                let facet = facet(predicate.as_str().strip_prefix(VOCABULARY_NAMESPACE)?)?;
-                steps.push(AdjacencyStep { direction, facet });
+                let kind = kind(predicate.as_str().strip_prefix(VOCABULARY_NAMESPACE)?)?;
+                steps.push(AdjacencyStep { direction, kind });
             }
             PropertyPathExpression::Inv(path) => pending.push((path, opposite(direction))),
             PropertyPathExpression::Seq(left, right) => {
@@ -521,14 +519,14 @@ fn layered_patterns(triples: &[&TriplePattern]) -> Option<AdjacencySelection> {
         let mut steps = Vec::new();
         while !remaining.is_empty() {
             let mut next = remaining.iter().enumerate().filter_map(|(index, edge)| {
-                let facet = property(edge).and_then(facet)?;
+                let kind = property(edge).and_then(kind)?;
                 if &edge.subject == current {
                     Some((
                         index,
                         &edge.object,
                         AdjacencyStep {
                             direction: TraversalDirection::Outgoing,
-                            facet,
+                            kind,
                         },
                     ))
                 } else if &edge.object == current {
@@ -537,7 +535,7 @@ fn layered_patterns(triples: &[&TriplePattern]) -> Option<AdjacencySelection> {
                         &edge.subject,
                         AdjacencyStep {
                             direction: TraversalDirection::Incoming,
-                            facet,
+                            kind,
                         },
                     ))
                 } else {
@@ -610,12 +608,12 @@ fn usage_selection(
         seed,
         first_step: AdjacencyStep {
             direction: TraversalDirection::Incoming,
-            facet: RelationshipFacet::References,
+            kind: EdgeKind::References,
         },
         steps: Vec::new(),
         depth: Some(1),
         symbol_details: false,
-        nodes: None,
+        syntax_elements: None,
         occurrences: Some(OccurrenceSelection {
             source,
             enclosing: usage_enclosing,
@@ -628,20 +626,20 @@ fn is_occurrence_class(pattern: &TriplePattern) -> bool {
         && matches!(&pattern.object, TermPattern::NamedNode(class) if class.as_str().strip_prefix(VOCABULARY_NAMESPACE) == Some("Occurrence"))
 }
 
-fn uniform_path(path: &PropertyPathExpression) -> Option<(RelationshipFacet, bool, Option<u32>)> {
+fn uniform_path(path: &PropertyPathExpression) -> Option<(EdgeKind, bool, Option<u32>)> {
     enum Work<'path> {
         Visit(&'path PropertyPathExpression, bool),
         Combine { sequence: bool },
         Closure,
     }
     let mut work = vec![Work::Visit(path, false)];
-    let mut results: Vec<(RelationshipFacet, bool, Option<u32>)> = Vec::new();
+    let mut results: Vec<(EdgeKind, bool, Option<u32>)> = Vec::new();
     while let Some(next) = work.pop() {
         match next {
             Work::Visit(path, reversed) => match path {
                 PropertyPathExpression::Link(name) => {
-                    let facet = facet(name.as_str().strip_prefix(VOCABULARY_NAMESPACE)?)?;
-                    results.push((facet, reversed, Some(1)));
+                    let kind = kind(name.as_str().strip_prefix(VOCABULARY_NAMESPACE)?)?;
+                    results.push((kind, reversed, Some(1)));
                 }
                 PropertyPathExpression::Inv(path) => work.push(Work::Visit(path, !reversed)),
                 PropertyPathExpression::Seq(left, right)

@@ -1,5 +1,5 @@
 mod graph_query;
-pub(crate) use graph_query::{QueryPageOptions, retrieval::collect_retrieval};
+pub(crate) use graph_query::{QueryPageOptions, query_page, retrieval::collect_retrieval};
 mod symbol;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -541,7 +541,7 @@ mod captured_search_startup_tests {
         let server =
             RiftMcp::build_settled(&root, super::super::WorkspaceIndexLimits::default()).await?;
         let mut params: SearchParams = serde_json::from_value(serde_json::json!({
-            "query": "beacon", "scope": "local", "include": ["source"]
+            "query": "beacon", "scope": "local", "include": {"source": true}
         }))?;
         let initial = server
             .search(super::super::Parameters(params.clone()))
@@ -567,7 +567,7 @@ mod captured_search_startup_tests {
             return Err("held search must return original results".into());
         };
         assert_eq!(later, initial);
-        params.page_index = 1;
+        params.page = 2;
         let page = server
             .search(super::super::Parameters(params.clone()))
             .await

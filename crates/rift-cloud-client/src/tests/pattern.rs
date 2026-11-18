@@ -37,17 +37,14 @@ fn pattern_symbol_identity(package: &str, registry: &str, language: &str) -> Str
     .wire_identity()
 }
 
-/// The fixture's pattern page: one match, then a second page behind the `next` cursor.
-pub(super) fn pattern_page_json(cursor: Option<&str>) -> Value {
-    let (start, next) = if cursor.is_none() {
-        (10, json!("next"))
-    } else {
-        (20, Value::Null)
-    };
+/// The fixture's pattern pages each carry one match.
+pub(super) fn pattern_page_json(selected_page: Option<&str>) -> Value {
+    let start = if selected_page.is_none() { 10 } else { 20 };
     json!({
-        "items": [pattern_hit_json(UNIT, start)], "next_cursor": next, "warnings": [],
+        "items": [pattern_hit_json(UNIT, start)], "warnings": [],
         "publication_format": "rift-package-index-v2",
-        "analyzer_revision": "analyzer-v1", "corpus_revision": "corpus-v1"
+        "analyzer_revision": "analyzer-v1", "corpus_revision": "corpus-v1",
+        "revision":"corpus-v1", "pagination":{"page":1,"pages":1,"max_results":20,"total":1}
     })
 }
 
@@ -55,7 +52,6 @@ pub(super) fn pattern_page_json(cursor: Option<&str>) -> Value {
 fn pattern_pages_preserve_optional_original_views_including_complete_empty() {
     let mut value = pattern_page_json(None);
     value["items"] = serde_json::json!([]);
-    value["next_cursor"] = serde_json::Value::Null;
     let older: crate::PackagePatternPage =
         serde_json::from_value(value.clone()).expect("older page");
     assert!(older.captured_view(None).expect("optional view").is_none());
@@ -105,6 +101,7 @@ fn pattern_pages_preserve_optional_original_views_including_complete_empty() {
 
 pub(super) fn pattern_request() -> PackagePatternRequest {
     PackagePatternRequest {
+        revision: None,
         pattern: r"fn\s+demo".to_owned(),
         packages: Some(vec![package_request()]),
         include: None,
@@ -122,28 +119,28 @@ fn check(
     request: &PackagePatternRequest,
     capabilities: &Capabilities,
     page: Value,
-    cursor: Option<&str>,
+    selected_page: Option<&str>,
 ) -> Result<(), RiftError> {
     let page: PackagePatternPage = serde_json::from_value(page).expect("pattern page fixture");
     PatternPageCheck {
         request,
         capabilities,
         limit: 20,
-        cursor,
+        page: if selected_page.is_some() { 2 } else { 1 },
         source_bytes_max: SOURCE_BYTES_MAX,
     }
     .validate(&page)
 }
 
 #[tokio::test]
-async fn test_fixture_pattern_pages_carry_matches_and_follow_the_callers_cursor() {
+async fn test_fixture_pattern_pages_carry_matches_at_the_requested_page() {
     let (server, client) = operation_client(OperationFixture::Patterns).await;
     let page = client
-        .search_package_patterns(&pattern_request(), 20, None)
+        .search_package_patterns(&pattern_request(), 1, 1)
         .await
         .unwrap_or_else(|error| panic!("pattern page: {error:?}"));
     assert_eq!(page.items.len(), 1);
-    assert_eq!(page.next_cursor.as_deref(), Some("next"));
+    assert_eq!(page.pagination.page, 1);
     let declaration = page.items[0]
         .declaration
         .as_ref()
@@ -155,7 +152,7 @@ async fn test_fixture_pattern_pages_carry_matches_and_follow_the_callers_cursor(
     );
     assert_eq!(
         server.state.last_query.lock().await.as_deref(),
-        Some("limit=20")
+        Some("page=1&max_results=1")
     );
     let body = server
         .state
@@ -171,13 +168,13 @@ async fn test_fixture_pattern_pages_carry_matches_and_follow_the_callers_cursor(
     );
 
     let page = client
-        .search_package_patterns(&pattern_request(), 20, Some("next"))
+        .search_package_patterns(&pattern_request(), 1, 2)
         .await
         .unwrap_or_else(|error| panic!("second pattern page: {error:?}"));
-    assert_eq!(page.next_cursor, None);
+    assert_eq!(page.pagination.page, 2);
     assert_eq!(
         server.state.last_query.lock().await.as_deref(),
-        Some("limit=20&cursor=next")
+        Some("page=2&max_results=1")
     );
 }
 
@@ -186,13 +183,18 @@ async fn test_fixture_pattern_pages_carry_matches_and_follow_the_callers_cursor(
 #[tokio::test]
 async fn test_fixture_pattern_pages_ask_for_the_advertised_page_limit() {
     let (server, client) = operation_client(OperationFixture::Patterns).await;
-    let page = client
-        .search_package_patterns(&pattern_request(), PAGE_LIMIT_MAX, None)
-        .await;
-    assert!(page.is_ok(), "{page:?}");
+    let error = client
+        .search_package_patterns(&pattern_request(), PAGE_LIMIT_MAX, 1)
+        .await
+        .expect_err("above advertised bound");
+    assert_registered_field(&error, "rift.client.request_invalid", "max_results");
+    client
+        .search_package_patterns(&pattern_request(), PATTERN_PAGE_LIMIT_ADVERTISED, 1)
+        .await
+        .expect("advertised count");
     assert_eq!(
         server.state.last_query.lock().await.as_deref(),
-        Some("limit=200")
+        Some("page=1&max_results=200")
     );
 }
 
@@ -201,7 +203,7 @@ async fn test_fixture_pattern_search_requires_the_advertised_capability() {
     let (server, client) = operation_client(OperationFixture::Valid).await;
     assert_registered_field(
         &client
-            .search_package_patterns(&pattern_request(), 20, None)
+            .search_package_patterns(&pattern_request(), 1, 1)
             .await
             .expect_err("pattern feature refusal"),
         "rift.client.configuration_invalid",
@@ -220,7 +222,7 @@ async fn test_fixture_pattern_search_requires_the_advertised_capability() {
     .expect("disabled client");
     assert_registered_field(
         &client
-            .search_package_patterns(&pattern_request(), 20, None)
+            .search_package_patterns(&pattern_request(), 1, 1)
             .await
             .expect_err("disabled pattern client"),
         "rift.client.configuration_invalid",
@@ -235,7 +237,7 @@ async fn test_fixture_pattern_failure_marks_the_endpoint_unavailable() {
     request.packages.as_mut().expect("selected packages")[0].name = "other".to_owned();
     assert_registered_field(
         &client
-            .search_package_patterns(&request, 20, None)
+            .search_package_patterns(&request, 20, 1)
             .await
             .expect_err("registered refusal"),
         "rift.client.response_invalid",
@@ -243,7 +245,7 @@ async fn test_fixture_pattern_failure_marks_the_endpoint_unavailable() {
     );
     assert_registered_field(
         &client
-            .search_package_patterns(&pattern_request(), 20, None)
+            .search_package_patterns(&pattern_request(), 1, 1)
             .await
             .expect_err("registered refusal"),
         "rift.client.response_invalid",
@@ -288,18 +290,6 @@ fn test_pattern_requests_refuse_bounds_before_transport() {
     request.pattern = "x".repeat(SEARCH_PATTERN_CHARS_MAX);
     validate_pattern_request(&request).expect("validation accepted");
 
-    for include in [
-        vec!["score".to_owned()],
-        vec!["source".to_owned(), "source".to_owned()],
-    ] {
-        let mut request = pattern_request();
-        request.include = Some(include);
-        assert_registered_field(
-            &validate_pattern_request(&request).expect_err("registered refusal"),
-            "rift.client.request_invalid",
-            "include",
-        );
-    }
     let mut request = pattern_request();
     request.packages = Some(vec![package_request(), package_request()]);
     assert_registered_field(
@@ -309,10 +299,10 @@ fn test_pattern_requests_refuse_bounds_before_transport() {
     );
     let capabilities = pattern_capabilities();
     assert_registered_field(
-        &validate_pattern_request_for_capabilities(&pattern_request(), 0, None, &capabilities)
+        &validate_pattern_request_for_capabilities(&pattern_request(), 0, 1, &capabilities)
             .expect_err("registered refusal"),
         "rift.client.request_invalid",
-        "limit",
+        "max_results",
     );
 }
 
@@ -476,7 +466,7 @@ fn test_pattern_declarations_validate_canonical_owner_and_language() {
 fn test_pattern_pages_refuse_past_their_bounds() {
     let capabilities = pattern_capabilities();
     let mut request = pattern_request();
-    request.include = Some(vec!["source".to_owned()]);
+    request.include = Some(crate::PackagePatternRequestInclude { source: Some(true) });
     let mut sourced = pattern_page_json(None);
     sourced["items"][0]["source"] = json!("fn demo");
     sourced["items"][0]["declaration"]["source"] = json!("pub fn demo");
@@ -524,7 +514,7 @@ fn test_pattern_pages_refuse_past_their_bounds() {
         request: &request,
         capabilities: &capabilities,
         limit: PAGE_LIMIT_MAX,
-        cursor: None,
+        page: 1,
         source_bytes_max: SOURCE_BYTES_MAX,
     };
     for (count, accepted) in [
@@ -532,6 +522,15 @@ fn test_pattern_pages_refuse_past_their_bounds() {
         (PATTERN_PAGE_FILES_MAX + 1, false),
     ] {
         let mut page = files(count);
+        page.pagination = serde_json::from_value(
+            serde_json::to_value(rift_protocol::read::Pagination::new(
+                1,
+                PAGE_LIMIT_MAX.cast_unsigned(),
+                count as u64,
+            ))
+            .expect("pagination"),
+        )
+        .expect("generated pagination");
         for hit in &mut page.items {
             hit.declaration = None;
         }
@@ -552,7 +551,7 @@ fn test_pattern_pages_refuse_past_their_bounds() {
     assert_registered_field(
         &check(&request, &capabilities, stalled, Some("next")).expect_err("registered refusal"),
         "rift.client.response_invalid",
-        "cursor_progress",
+        "pagination",
     );
 }
 

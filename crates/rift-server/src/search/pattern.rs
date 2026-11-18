@@ -81,7 +81,7 @@ pub(super) fn pattern_conflict(params: &SearchParams) -> Option<RiftError> {
         ),
         (
             params.traversal.is_some(),
-            "a walk answers relationships from one seed, and `pattern` answers text",
+            "a walk answers edges from one seed, and `pattern` answers text",
         ),
         (
             params.change.is_some(),
@@ -426,7 +426,7 @@ impl ReadService {
         if let Some(bound) = bound_hits(&mut results, results_max) {
             warnings.push(results_truncation_warning(bound));
         }
-        let (mut results, pagination) = page(results, params.page_index, limit);
+        let (mut results, pagination) = page(results, params.page, limit);
         populate_symbol_lines(&mut results, self.index(), selected.force_include.as_ref())?;
         Ok(SearchResult {
             view: None,

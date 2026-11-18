@@ -43,7 +43,7 @@ use rift_protocol::index::{
 };
 use rift_protocol::producer::{FactCoverage, FactKind};
 use rift_protocol::read::{
-    Digest, Language, ProjectPath, SourceLocationKind, SourceUnitId, Symbol, SymbolFacet, SymbolId,
+    Digest, Language, ProjectPath, SourceLocationKind, SourceUnitId, Symbol, SymbolId, SymbolKind,
     SymbolOrigin, TextRange,
 };
 use rift_syntax::{DocumentPlacement, ShippedLanguage, SyntaxFacts, SyntaxSymbol};
@@ -107,7 +107,7 @@ impl AnalyzedFile {
         &self.file
     }
 
-    /// The grammar kind of the item node of the declaration bound at `range`; absent when
+    /// The grammar kind of the item syntax element of the declaration bound at `range`; absent when
     /// the syntax provider names none.
     fn item_kind(&self, range: rift_core::SourceRange) -> Option<String> {
         let key = (range.start(), range.end());
@@ -263,14 +263,14 @@ fn analyzed_file(
     })
 }
 
-/// The grammar kind of each declaration's item node, keyed by the item range a declaration
+/// The grammar kind of each declaration's item syntax element, keyed by the item range a declaration
 /// binding spans. One pass over the file's declarations, so a binding's lookup is
 /// logarithmic.
 fn item_kinds(symbols: &[rift_syntax::SyntaxSymbol]) -> BTreeMap<(u64, u64), &'static str> {
     symbols
         .iter()
         .filter_map(|symbol| {
-            let kind = symbol.node_kind?;
+            let kind = symbol.syntax_element_kind?;
             Some(((symbol.item_range.start, symbol.item_range.end), kind))
         })
         .collect()
@@ -282,7 +282,7 @@ fn external_work_limits(input: &ExactPackageInput<'_>) -> (std::cell::Cell<usize
         input
             .limits()
             .syntax()
-            .syntax_nodes_max()
+            .syntax_elements_max()
             .checked_mul(input.limits().syntax().syntax_depth_max())
             .unwrap_or(0),
     )
@@ -324,7 +324,7 @@ impl PackageAnalyzer {
     /// file work before a later failure; parser calls remain included in `syntax_work()`.
     ///
     /// Every call rebuilds current placement, module joins, semantics, documentation
-    /// relationships, and publication. Retention, encoding, and lookup remain caller-owned.
+    /// edges, and publication. Retention, encoding, and lookup remain caller-owned.
     /// The work is proportional to selected bytes and declarations plus caller hook work.
     ///
     /// # Errors
@@ -375,7 +375,7 @@ impl PackageAnalyzer {
         let mut built = WorkspaceSemantics::build_facts_placed_with_external(
             &placed,
             input.limits().declarations_max(),
-            input.limits().relationships_max(),
+            input.limits().edges_max(),
             revision,
             &|reference| {
                 if reference.provider().as_str() != rift_syntax::SYNTAX_PROVIDER_ID {
@@ -449,25 +449,17 @@ fn resolve_package_static(
     semantics.add_static_resolution(
         &sources,
         &input.namespace_input(),
-        input.limits().relationships_max(),
+        input.limits().edges_max(),
     );
 }
 
-pub(crate) fn relationship_facet(
-    kind: rift_core::RelationshipKind,
-) -> rift_protocol::read::RelationshipFacet {
+pub(crate) fn edge_kind(kind: rift_core::EdgeKind) -> rift_protocol::read::EdgeKind {
     match kind {
-        rift_core::RelationshipKind::Reference => {
-            rift_protocol::read::RelationshipFacet::References
-        }
-        rift_core::RelationshipKind::Definition => rift_protocol::read::RelationshipFacet::Declares,
-        rift_core::RelationshipKind::Implementation => {
-            rift_protocol::read::RelationshipFacet::Implements
-        }
-        rift_core::RelationshipKind::TypeDefinition => {
-            rift_protocol::read::RelationshipFacet::HasType
-        }
-        rift_core::RelationshipKind::Alias => rift_protocol::read::RelationshipFacet::Aliases,
+        rift_core::EdgeKind::Reference => rift_protocol::read::EdgeKind::References,
+        rift_core::EdgeKind::Definition => rift_protocol::read::EdgeKind::Declares,
+        rift_core::EdgeKind::Implementation => rift_protocol::read::EdgeKind::Implements,
+        rift_core::EdgeKind::TypeDefinition => rift_protocol::read::EdgeKind::HasType,
+        rift_core::EdgeKind::Alias => rift_protocol::read::EdgeKind::Aliases,
     }
 }
 
@@ -562,8 +554,8 @@ fn publish(
     }
     records.graph(package, &origin, semantics, analyzed)?;
     let retained_syntax_complete = records.retained_syntax(analyzed);
-    records.relationships(package, semantics, analyzed, limits.relationships_max())?;
-    records.static_occurrences(semantics, analyzed, limits.relationships_max());
+    records.edges(package, semantics, analyzed, limits.edges_max())?;
+    records.static_occurrences(semantics, analyzed, limits.edges_max());
     let (documentation, notebook_cells) = package_documentation(
         package,
         package_language,
@@ -624,7 +616,7 @@ fn publish(
             coverage,
             objects: records.objects,
             declarations: records.declarations,
-            relationships: records.relationships,
+            edges: records.edges,
             artifact: input.artifact().cloned(),
             documents: records.documents,
             documentation,
@@ -713,7 +705,7 @@ fn publication_coverage(
                     && held.file.syntax().left_out_declaration_count() == 0;
             }
             let mut facts = vec![FactCoverage {
-                kind: FactKind::Relationships,
+                kind: FactKind::Edges,
                 producer: None,
             }];
             if records
@@ -739,7 +731,7 @@ fn publication_coverage(
                     && !unresolved_exports,
                 language,
                 applicability_complete: false,
-                relationships: Vec::new(),
+                edges: Vec::new(),
             }
         })
         .collect::<Vec<_>>()
@@ -1421,7 +1413,7 @@ struct Records {
     units: Vec<PackageSourceUnit>,
     objects: Vec<Symbol>,
     declarations: Vec<PackageSymbol>,
-    relationships: Vec<rift_protocol::read::Relationship>,
+    edges: Vec<rift_protocol::read::Edge>,
     occurrences: Vec<PackageOccurrence>,
     occurrence_languages: BTreeSet<String>,
     documents: Vec<PackageDocument>,
@@ -1572,7 +1564,7 @@ impl Records {
     }
 
     /// Retains separate reference occurrences from the captured adjacency.
-    fn relationships(
+    fn edges(
         &mut self,
         owner: &SymbolOwner,
         semantics: &WorkspaceSemantics,
@@ -1594,20 +1586,20 @@ impl Records {
             .iter()
             .map(|held| (held.placement.unit().to_string(), held.file.source()))
             .collect::<BTreeMap<_, _>>();
-        if self.outgoing_relationships(owner, semantics, &objects, &units, &sources, limit)? {
+        if self.outgoing_edges(owner, semantics, &objects, &units, &sources, limit)? {
             return Ok(());
         }
-        self.graph_relationships(owner, semantics, &objects, &units, &sources, limit)?;
-        if semantics.relationships().dropped_edges() > 0 {
+        self.graph_edges(owner, semantics, &objects, &units, &sources, limit)?;
+        if semantics.edges().dropped_edges() > 0 {
             self.warn(truncation(
-                "relationships",
+                "edges",
                 u64::try_from(limit).unwrap_or(u64::MAX),
             ));
         }
         Ok(())
     }
 
-    fn outgoing_relationships(
+    fn outgoing_edges(
         &mut self,
         owner: &SymbolOwner,
         semantics: &WorkspaceSemantics,
@@ -1621,26 +1613,24 @@ impl Records {
                 continue;
             };
             for edge in semantics
-                .relationships()
+                .edges()
                 .outgoing(id)
                 .iter()
                 .filter(|edge| !edge.is_graph_edge())
             {
-                if self.relationships.len() >= limit {
+                if self.edges.len() >= limit {
                     self.warn(truncation(
-                        "relationships",
+                        "edges",
                         u64::try_from(limit).unwrap_or(u64::MAX),
                     ));
                     return Ok(true);
                 }
-                let relationship = edge.to_protocol();
-                if SymbolId::parse(&relationship.from.0).is_err()
-                    || SymbolId::parse(&relationship.to.0).is_err()
-                {
+                let edge = edge.to_protocol();
+                if SymbolId::parse(&edge.from.0).is_err() || SymbolId::parse(&edge.to.0).is_err() {
                     self.identity_incomplete = true;
                     continue;
                 }
-                if let Some(span) = relationship.occurrence.as_ref() {
+                if let Some(span) = edge.occurrence.as_ref() {
                     let valid = usize::try_from(span.range.start)
                         .ok()
                         .zip(usize::try_from(span.range.end).ok())
@@ -1657,13 +1647,13 @@ impl Records {
                             .error());
                     }
                 }
-                self.relationships.push(relationship);
+                self.edges.push(edge);
             }
         }
         Ok(false)
     }
 
-    fn graph_relationships(
+    fn graph_edges(
         &mut self,
         owner: &SymbolOwner,
         semantics: &WorkspaceSemantics,
@@ -1672,7 +1662,7 @@ impl Records {
         sources: &BTreeMap<String, &str>,
         limit: usize,
     ) -> Result<(), RiftError> {
-        for edge in semantics.graph().relationships() {
+        for edge in semantics.graph().edges() {
             let Some(from) = semantics
                 .graph()
                 .record_for(edge.source().reference())
@@ -1686,14 +1676,15 @@ impl Records {
                 self.identity_incomplete = true;
                 continue;
             };
-            let Some(derivation) = edge.derivation().filter(|derivation| {
-                *derivation != rift_protocol::read::RelationshipDerivation::Heuristic
-            }) else {
+            let Some(derivation) = edge
+                .derivation()
+                .filter(|derivation| *derivation != rift_protocol::read::EdgeDerivation::Heuristic)
+            else {
                 continue;
             };
-            if self.relationships.len() >= limit {
+            if self.edges.len() >= limit {
                 self.warn(truncation(
-                    "relationships",
+                    "edges",
                     u64::try_from(limit).unwrap_or(u64::MAX),
                 ));
                 break;
@@ -1724,8 +1715,8 @@ impl Records {
                         .fail();
                 }
             }
-            let facet = relationship_facet(edge.kind());
-            self.relationships.push(rift_protocol::read::Relationship {
+            let kind = edge_kind(edge.kind());
+            self.edges.push(rift_protocol::read::Edge {
                 producer: None,
                 from: SymbolId::parse(from.as_str()).map_err(|_| {
                     errors::analysis::package_provider_failed()
@@ -1737,8 +1728,8 @@ impl Records {
                         .package(package_label(owner))
                         .error()
                 })?,
-                kind: rift_protocol::read::ExactKind(facet.as_ref().to_owned()),
-                facets: vec![facet],
+                kind: rift_protocol::read::ExactKind(kind.as_ref().to_owned()),
+                kinds: vec![kind],
                 occurrence,
                 derivation,
                 confidence: None,
@@ -2004,11 +1995,11 @@ impl Records {
         let path = wire_path(held.file.path());
         let public = held.is_public(facts.qualified_name())
             || (facts
-                .symbol_facets()
-                .contains(&rift_protocol::read::SymbolFacet::Alias)
+                .symbol_kinds()
+                .contains(&rift_protocol::read::SymbolKind::Alias)
                 && facts
-                    .symbol_facets()
-                    .contains(&rift_protocol::read::SymbolFacet::Public));
+                    .symbol_kinds()
+                    .contains(&rift_protocol::read::SymbolKind::Public));
         let publishes_document = public
             && object.name_is_public()
             && self.document_capacity()
@@ -2022,7 +2013,7 @@ impl Records {
                 start: binding.range().start(),
                 end: binding.range().end(),
             },
-            node_kind: held.item_kind(binding.range()),
+            syntax_element_kind: held.item_kind(binding.range()),
             line: line_of(starts, binding.range().start()),
             signature_indices: fact_indices(owner, &object.signatures, facts.signatures_slice())?,
             type_indices: fact_indices(owner, &object.types, facts.type_bindings())?,
@@ -2567,7 +2558,7 @@ fn is_javascript_export(symbol: &SyntaxSymbol, by_name: &BTreeMap<&str, &SyntaxS
 
 /// Whether the provider marks `symbol` public, as an export of it does.
 fn is_exported(symbol: &SyntaxSymbol) -> bool {
-    symbol.facets.contains(&SymbolFacet::Public)
+    symbol.kinds.contains(&SymbolKind::Public)
 }
 
 /// Qualified names of declarations a package file exposes under its language's export
@@ -2804,7 +2795,7 @@ mod tests {
         let generated = format!("values = [{}]\n", "1, ".repeat(300_000));
         let files = vec![("pkg/generated.py", generated.as_str())];
         let Err(declared) = package_result(ShippedLanguage::Python, files.clone(), None) else {
-            panic!("a source past the declared node bound must be refused");
+            panic!("a source past the declared syntax element bound must be refused");
         };
         assert!(declared.slug().as_str().starts_with("rift.syntax."));
 
@@ -2891,12 +2882,12 @@ mod tests {
         let kinds = publication
             .declarations
             .iter()
-            .map(|declaration| declaration.node_kind.as_deref())
+            .map(|declaration| declaration.syntax_element_kind.as_deref())
             .collect::<Vec<_>>();
         assert_eq!(
             kinds,
             [Some("function_item"), Some("function_item")],
-            "each declaration names its item node's grammar kind"
+            "each declaration names its item syntax element's grammar kind"
         );
     }
 

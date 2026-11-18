@@ -103,6 +103,7 @@ async fn served_search(client: &RunningService<RoleClient, ()>) -> TestResult {
     let query = QueryParams {
         query: BEACON_QUERY.to_owned(),
         language: QueryLanguage::Sparql,
+        ..Default::default()
     };
     let answer = query_after_population(client, &query).await?;
     assert_eq!(

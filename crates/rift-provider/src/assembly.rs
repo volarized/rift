@@ -61,7 +61,7 @@ pub struct AssembledSymbol {
     origin: ContributionOrigin,
     container: Option<SymbolId>,
     references: Vec<crate::NormalizedReference>,
-    relationships: Vec<crate::NormalizedRelationship>,
+    edges: Vec<crate::NormalizedEdge>,
     namespaced: Vec<(ProviderId, Extensions)>,
     namespaced_material_bytes: usize,
     disagreements: Vec<PresentationDisagreement>,
@@ -77,7 +77,7 @@ impl PartialEq for AssembledSymbol {
             && self.origin == other.origin
             && self.container == other.container
             && self.references == other.references
-            && self.relationships == other.relationships
+            && self.edges == other.edges
             && self.namespaced == other.namespaced
             && self.disagreements == other.disagreements
     }
@@ -132,10 +132,10 @@ impl AssembledSymbol {
         &self.references
     }
 
-    /// Returns normalized Relationships.
+    /// Returns normalized Edges.
     #[must_use]
-    pub fn relationships(&self) -> &[crate::NormalizedRelationship] {
-        &self.relationships
+    pub fn edges(&self) -> &[crate::NormalizedEdge] {
+        &self.edges
     }
 
     /// Returns every provider-specific fact collection.
@@ -183,7 +183,7 @@ impl AssembledSymbol {
             language: facts.language().clone(),
             name: facts.name().to_owned(),
             kind: facts.kind().clone(),
-            facets: facts.symbol_facets().to_vec(),
+            kinds: facts.symbol_kinds().to_vec(),
             origin: wire_symbol_origin(origin),
             container: None,
             modifiers: facts.modifier_words().to_vec(),
@@ -305,10 +305,10 @@ impl SymbolAssembler {
             .filter(|reference| record.contributions().contains(reference.source()))
             .cloned()
             .collect();
-        let relationships = graph
-            .relationships()
+        let edges = graph
+            .edges()
             .iter()
-            .filter(|relationship| record.contributions().contains(relationship.source()))
+            .filter(|edge| record.contributions().contains(edge.source()))
             .cloned()
             .collect();
         Some(AssembledSymbol {
@@ -320,7 +320,7 @@ impl SymbolAssembler {
             origin: primary.origin().clone(),
             container,
             references,
-            relationships,
+            edges,
             namespaced,
             namespaced_material_bytes,
             disagreements,
@@ -351,7 +351,7 @@ fn combined_facts(
         primary.qualified_name(),
         primary.kind().clone(),
     )
-    .facets(unique_values(contributions, |facts| facts.symbol_facets()))
+    .kinds(unique_values(contributions, |facts| facts.symbol_kinds()))
     .modifiers(unique_values(contributions, |facts| facts.modifier_words()))
     .types(unique_values(contributions, |facts| facts.type_bindings()))
     .signatures(unique_values(contributions, |facts| {
@@ -527,8 +527,7 @@ impl get_size2::GetSize for AssembledSymbol {
             get_size2::GetSize::get_heap_size_with_tracker(&self.references, tracker);
         bytes = bytes.saturating_add(field);
         tracker = next;
-        let (field, next) =
-            get_size2::GetSize::get_heap_size_with_tracker(&self.relationships, tracker);
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.edges, tracker);
         bytes = bytes.saturating_add(field);
         tracker = next;
         bytes = bytes
@@ -560,7 +559,7 @@ mod tests {
         Contribution, ContributionKey, ContributionOrigin, ContributionReference, ExactKind,
         IndexRevision, PortableSymbolFacts, ProviderId, ProviderRevision, ProviderSymbolId,
         SourceApplicability, SourceKind, SourceLocation, SourceRange, SourceRevision, SourceUnitId,
-        SymbolFacet, SymbolId, TreeRevision,
+        SymbolId, SymbolKind, TreeRevision,
     };
     use rift_core::{Documentation, DocumentationFormat, Extensions, Language};
 
@@ -596,7 +595,7 @@ mod tests {
             format!("crate::{name}"),
             ExactKind("function".to_owned()),
         )
-        .facets(vec![SymbolFacet::Value])
+        .kinds(vec![SymbolKind::Value])
         .documentation(vec![Documentation {
             format: DocumentationFormat::Markdown,
             text: format!("{provider_id} docs"),

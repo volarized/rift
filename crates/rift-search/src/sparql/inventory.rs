@@ -20,9 +20,9 @@ pub struct OccurrenceSelection {
 pub struct SemanticInventory {
     /// The query can inspect captured edge kinds.
     pub edges: bool,
-    /// The query can inspect call relationships.
+    /// The query can inspect call edges.
     pub calls: bool,
-    /// The query can inspect caller-to-target reference relationships.
+    /// The query can inspect caller-to-target reference edges.
     pub references: bool,
     /// The query can inspect physical occurrences.
     pub occurrences: Option<OccurrenceSelection>,
@@ -30,7 +30,7 @@ pub struct SemanticInventory {
 
 impl GraphQuery {
     /// Finds semantic requirements of general SPARQL algebra when every code fact it
-    /// can inspect is a symbol, an established relationship, or a physical reference.
+    /// can inspect is a symbol, an established edge, or a physical reference.
     #[must_use]
     pub fn semantic_inventory(&self) -> Option<SemanticInventory> {
         self.admission().semantics.filter(|requirements| {

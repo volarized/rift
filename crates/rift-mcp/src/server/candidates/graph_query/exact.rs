@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use rift_error::RiftError;
 use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
-use rift_protocol::read::{Node, NodesParams, ReadWarning, Symbol, SymbolId};
+use rift_protocol::read::{FacetsParams, ReadWarning, Symbol, SymbolId, SyntaxElement};
 use rift_protocol::revision::Revision;
 use rift_protocol::search_read::SearchUnavailable;
 use rift_protocol::symbol_read::{GetSymbolParams, GetSymbolResult, SymbolUnavailableReason};
@@ -14,14 +14,14 @@ use rift_search::sparql::{
 };
 
 use super::super::super::ResolvedWorkspace;
-use super::{RiftMcp, relationships::coverage_failure, unavailable};
+use super::{RiftMcp, edges::coverage_failure, unavailable};
 
-const NODE_PAGES_MAX: usize = 64;
+const SYNTAX_ELEMENT_PAGES_MAX: usize = 64;
 
 pub(super) struct ExactFacts {
     revision: RevisionIri,
     symbol: Option<Box<Symbol>>,
-    nodes: Vec<Node>,
+    kinds: Vec<SyntaxElement>,
     source: bool,
     warnings: Vec<ReadWarning>,
 }
@@ -43,8 +43,8 @@ impl ExactFacts {
             language: &symbol.language,
             revision: &self.revision,
         })?;
-        for node in &self.nodes {
-            dataset.insert_declared_node(id, node, self.source)?;
+        for syntax_element in &self.kinds {
+            dataset.insert_declared_syntax_element(id, syntax_element, self.source)?;
         }
         Ok(())
     }
@@ -57,8 +57,8 @@ impl RiftMcp {
         query: &GraphQuery,
         limits: GraphLimits,
     ) -> Result<Result<Option<ExactFacts>, SearchUnavailable>, RiftError> {
-        let nodes = query.node_selection();
-        let selection = nodes
+        let facets = query.syntax_element_selection();
+        let selection = facets
             .map(|selected| selected.symbols)
             .or_else(|| query.symbol_selection());
         let Some(SymbolSelection::Identified(id)) = selection else {
@@ -88,8 +88,8 @@ impl RiftMcp {
         let mut result = ExactFacts {
             revision: RevisionIri::parse(&revision.to_string())?,
             symbol: None,
-            nodes: Vec::new(),
-            source: nodes.is_some_and(|selected| selected.source),
+            kinds: Vec::new(),
+            source: facets.is_some_and(|selected| selected.source),
             warnings: Vec::new(),
         };
         match answer {
@@ -113,16 +113,16 @@ impl RiftMcp {
                 }));
             }
         }
-        if nodes.is_some()
+        if facets.is_some()
             && let Some(reason) = self
-                .acquire_remote_nodes(&configuration, &id, &revision, limits, &mut result)
+                .acquire_remote_facets(&configuration, &id, &revision, limits, &mut result)
                 .await?
         {
             return Ok(Err(reason));
         }
         Ok(Ok(Some(result)))
     }
-    async fn acquire_remote_nodes(
+    async fn acquire_remote_facets(
         &self,
         configuration: &rift_protocol::configuration::GlobalConfiguration,
         id: &SymbolId,
@@ -130,13 +130,12 @@ impl RiftMcp {
         limits: GraphLimits,
         result: &mut ExactFacts,
     ) -> Result<Option<SearchUnavailable>, RiftError> {
-        let mut request = NodesParams::of(id.clone());
+        let mut request = FacetsParams::of(id.clone());
         request.revision = Some(revision.clone());
-        let mut cursors = BTreeSet::new();
         let mut remaining_bytes = limits.literal_bytes_max();
-        for _ in 0..NODE_PAGES_MAX {
-            let page = self.global.symbol_nodes(configuration, &request).await?;
-            if &page.revision != revision || page.symbol.as_ref() != Some(id) {
+        for _ in 0..SYNTAX_ELEMENT_PAGES_MAX {
+            let page = self.global.symbol_kinds(configuration, &request).await?;
+            if &page.revision != revision || &page.symbol != id {
                 return Ok(Some(unavailable(SymbolUnavailableReason::ViewContext)));
             }
             if page.warnings.iter().any(|warning| {
@@ -157,19 +156,21 @@ impl RiftMcp {
                 .map_err(|_| coverage_failure())?
                 .len();
             remaining_bytes -= charge;
-            result.nodes.extend(page.nodes);
+            result.kinds.extend(
+                page.declarations
+                    .into_iter()
+                    .flat_map(|declaration| declaration.syntax),
+            );
             for warning in page.warnings {
                 if !result.warnings.contains(&warning) {
                     result.warnings.push(warning);
                 }
             }
-            let Some(cursor) = page.node_cursor else {
+            if request.page >= page.pagination.pages {
                 return Ok(None);
-            };
-            if !cursors.insert(cursor.clone()) {
-                return Err(coverage_failure());
             }
-            request.node_cursor = Some(cursor);
+            request.revision = Some(page.revision);
+            request.page += 1;
         }
         Err(coverage_failure())
     }
@@ -178,10 +179,10 @@ impl RiftMcp {
 pub(super) fn exact_request(id: &SymbolId, revision: &Revision) -> GetSymbolParams {
     GetSymbolParams {
         id: id.clone(),
-        include: Vec::new(),
+        include: rift_protocol::read::GetSymbolInclude::default(),
         revision: Some(revision.clone()),
-        declaration_limit: 1,
-        declaration_cursor: None,
+        max_results: 1,
+        page: 1,
     }
 }
 

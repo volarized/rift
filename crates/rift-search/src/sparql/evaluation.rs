@@ -373,7 +373,7 @@ impl From<&Term> for GraphTerm {
     fn from(term: &Term) -> Self {
         match term {
             Term::NamedNode(iri) => Self::Iri(iri.as_str().to_owned()),
-            Term::BlankNode(node) => Self::BlankNode(node.as_str().to_owned()),
+            Term::BlankNode(syntax_element) => Self::BlankNode(syntax_element.as_str().to_owned()),
             Term::Literal(literal) => Self::Literal {
                 value: literal.value().to_owned(),
                 datatype: literal.datatype().as_str().to_owned(),
@@ -387,7 +387,7 @@ impl From<&Term> for GraphTerm {
 fn term_bytes(term: TermRef<'_>) -> usize {
     match term {
         TermRef::NamedNode(iri) => iri.as_str().len(),
-        TermRef::BlankNode(node) => node.as_str().len(),
+        TermRef::BlankNode(syntax_element) => syntax_element.as_str().len(),
         TermRef::Literal(literal) => literal
             .value()
             .len()

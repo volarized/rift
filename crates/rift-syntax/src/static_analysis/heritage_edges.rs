@@ -3,7 +3,7 @@
 use std::sync::OnceLock;
 
 use rift_error::RiftError;
-use rift_protocol::read::RelationshipFacet;
+use rift_protocol::read::EdgeKind;
 use tree_sitter::{Language, Node};
 
 use super::{StaticFactsParts, field, kind};
@@ -17,7 +17,7 @@ pub struct HeritageEdge {
     /// Name or type path on the heritage header.
     pub target: crate::ByteRange,
     /// Portable edge kind established by the header.
-    pub kind: RelationshipFacet,
+    pub kind: EdgeKind,
 }
 
 pub(super) struct EdgeHeritageKinds {
@@ -106,30 +106,30 @@ impl EdgeHeritageKinds {
         visited: Visited<'_, '_>,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
-        let node = visited.node();
-        if node.kind_id() != self.header {
+        let syntax_element = visited.syntax_element();
+        if syntax_element.kind_id() != self.header {
             return Ok(());
         }
         if let Some(trait_field) = self.trait_field {
             let from = self
                 .value_type
-                .and_then(|field| node.child_by_field_id(field));
-            if let Some((from, target)) = from.zip(node.child_by_field_id(trait_field)) {
-                self.edge_push(from, target, RelationshipFacet::Implements, facts)?;
+                .and_then(|field| syntax_element.child_by_field_id(field));
+            if let Some((from, target)) = from.zip(syntax_element.child_by_field_id(trait_field)) {
+                self.edge_push(from, target, EdgeKind::Implements, facts)?;
             }
             return Ok(());
         }
         let owner = if self.bases.is_some() {
-            Some(node)
+            Some(syntax_element)
         } else {
-            visited.parent().map(Visited::node)
+            visited.parent().map(Visited::syntax_element)
         };
         let Some(from) = owner.and_then(|owner| owner.child_by_field_id(self.name)) else {
             return Ok(());
         };
         let bases = match self.bases {
-            Some(field) => node.child_by_field_id(field),
-            None => Some(node),
+            Some(field) => syntax_element.child_by_field_id(field),
+            None => Some(syntax_element),
         };
         let Some(bases) = bases else {
             return Ok(());
@@ -139,7 +139,7 @@ impl EdgeHeritageKinds {
             if self.extends == Some(base.kind_id()) || self.implements == Some(base.kind_id()) {
                 self.edge_clause(from, base, facts)?;
             } else {
-                self.edge_push(from, base, RelationshipFacet::Extends, facts)?;
+                self.edge_push(from, base, EdgeKind::Extends, facts)?;
             }
         }
         Ok(())
@@ -152,9 +152,9 @@ impl EdgeHeritageKinds {
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
         let kind = if self.implements == Some(clause.kind_id()) {
-            RelationshipFacet::Implements
+            EdgeKind::Implements
         } else {
-            RelationshipFacet::Extends
+            EdgeKind::Extends
         };
         let mut cursor = clause.walk();
         for target in clause.named_children(&mut cursor) {
@@ -167,7 +167,7 @@ impl EdgeHeritageKinds {
         &self,
         from: Node<'_>,
         target: Node<'_>,
-        kind: RelationshipFacet,
+        kind: EdgeKind,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
         let from = self.edge_type(from);
@@ -182,15 +182,15 @@ impl EdgeHeritageKinds {
         Ok(())
     }
 
-    fn edge_type<'tree>(&self, node: Node<'tree>) -> Option<Node<'tree>> {
-        if node.is_missing() {
+    fn edge_type<'tree>(&self, syntax_element: Node<'tree>) -> Option<Node<'tree>> {
+        if syntax_element.is_missing() {
             return None;
         }
-        if self.generic == Some(node.kind_id()) {
-            return node
+        if self.generic == Some(syntax_element.kind_id()) {
+            return syntax_element
                 .child_by_field_id(self.value_type.unwrap_or(self.name))
-                .or_else(|| node.named_child(0));
+                .or_else(|| syntax_element.named_child(0));
         }
-        Some(node)
+        Some(syntax_element)
     }
 }

@@ -53,51 +53,51 @@ impl RevisionIri {
     }
 }
 
-/// Where one syntax node sits in the model. A node has no identity of its own: its address
+/// Where one syntax element sits in the model. A syntax element has no identity of its own: its address
 /// names it, and the dataset writes it as a blank node labeled by that address.
 #[derive(Clone, Copy, Debug)]
-pub enum NodeAddress<'a> {
-    /// A node inside one declaration of a symbol.
+pub enum SyntaxAddress<'a> {
+    /// A syntax element inside one declaration of a symbol.
     Declaration {
         /// The symbol the declaration belongs to.
         symbol: &'a SymbolId,
         /// The declaration's position among the symbol's declarations.
         declaration: u64,
-        /// The node's preorder position inside the declaration, its own node at 0.
+        /// The syntax element's preorder position inside the declaration, its own syntax element at 0.
         index: u64,
     },
-    /// A node outside every declaration, such as a file's outermost node.
+    /// A syntax element outside every declaration, such as a file's outermost syntax element.
     Unit {
         /// The source unit holding it.
         unit: &'a SourceUnitId,
-        /// The node's preorder position among the unit's nodes outside every declaration.
+        /// The syntax element's preorder position among the unit's syntax elements outside every declaration.
         index: u64,
     },
 }
 
-/// The place a node is written at the read's revision.
+/// The place a syntax element is written at the read's revision.
 #[derive(Clone, Copy, Debug)]
-pub struct NodeLocation<'a> {
-    /// The source unit holding the node.
+pub struct SyntaxLocation<'a> {
+    /// The source unit holding the syntax element.
     pub unit: &'a SourceUnitId,
-    /// The node's bytes in that unit.
+    /// The syntax element's bytes in that unit.
     pub range: &'a TextRange,
 }
 
-/// The facts one syntax node carries.
+/// The facts one syntax element carries.
 #[derive(Clone, Copy, Debug)]
-pub struct NodeFact<'a> {
-    /// Where the node sits.
-    pub address: NodeAddress<'a>,
+pub struct SyntaxFact<'a> {
+    /// Where the syntax element sits.
+    pub address: SyntaxAddress<'a>,
     /// The syntax kind.
     pub kind: &'a str,
-    /// The node's language.
+    /// The syntax element's language.
     pub language: &'a Language,
-    /// The enclosing node, absent for a file's outermost node.
-    pub parent: Option<NodeAddress<'a>>,
-    /// Where the node is written at the read's revision.
-    pub location: Option<NodeLocation<'a>>,
-    /// The node's exact source text.
+    /// The enclosing syntax element, absent for a file's outermost syntax element.
+    pub parent: Option<SyntaxAddress<'a>>,
+    /// Where the syntax element is written at the read's revision.
+    pub location: Option<SyntaxLocation<'a>>,
+    /// The syntax element's exact source text.
     pub source: Option<&'a str>,
 }
 
@@ -174,8 +174,8 @@ pub enum GraphFact<'a> {
         /// The original selected revision.
         revision: &'a RevisionIri,
     },
-    /// A syntax node.
-    Node(NodeFact<'a>),
+    /// A syntax element.
+    SyntaxElement(SyntaxFact<'a>),
     /// An edge between two symbols.
     Relation {
         /// The edge's source symbol.
@@ -185,19 +185,19 @@ pub enum GraphFact<'a> {
         /// The edge's target symbol.
         target: &'a SymbolId,
     },
-    /// A node that uses a symbol.
+    /// A syntax element that uses a symbol.
     Usage {
         /// The used symbol.
         symbol: &'a SymbolId,
-        /// The node using it.
-        node: NodeAddress<'a>,
+        /// The syntax element using it.
+        syntax_element: SyntaxAddress<'a>,
     },
     /// One physical usage, preserving the identity the provider gave this occurrence.
     Occurrence {
         /// The original record key within the selected provider and revision.
         key: &'a str,
         /// Target, enclosing symbol and source span.
-        occurrence: &'a rift_protocol::relationship_read::QueryOccurrence,
+        occurrence: &'a rift_protocol::edge_read::QueryOccurrence,
         /// Exact source bytes at this occurrence, when acquired.
         source: Option<&'a str>,
     },
@@ -325,34 +325,34 @@ impl GraphDatasetBuilder {
         Ok(())
     }
 
-    /// Adds one node from the existing revision-pinned syntax read.
+    /// Adds one syntax element from the existing revision-pinned syntax read.
     ///
     /// # Errors
-    /// Returns a graph admission refusal for an invalid or oversized node.
-    pub fn insert_declared_node(
+    /// Returns a graph admission refusal for an invalid or oversized syntax element.
+    pub fn insert_declared_syntax_element(
         &mut self,
         symbol: &SymbolId,
-        node: &rift_protocol::read::Node,
+        syntax_element: &rift_protocol::read::SyntaxElement,
         include_source: bool,
     ) -> Result<(), RiftError> {
-        let Some(declaration) = node.declaration else {
+        let Some(declaration) = syntax_element.declaration else {
             return Ok(());
         };
-        let address = |index| NodeAddress::Declaration {
+        let address = |index| SyntaxAddress::Declaration {
             symbol,
             declaration,
             index,
         };
-        self.insert(GraphFact::Node(NodeFact {
-            address: address(node.index),
-            kind: &node.kind.0,
-            language: &node.language,
-            parent: node.parent.map(address),
-            location: Some(NodeLocation {
-                unit: &node.unit,
-                range: &node.range,
+        self.insert(GraphFact::SyntaxElement(SyntaxFact {
+            address: address(syntax_element.index),
+            kind: &syntax_element.kind.0,
+            language: &syntax_element.language,
+            parent: syntax_element.parent.map(address),
+            location: Some(SyntaxLocation {
+                unit: &syntax_element.unit,
+                range: &syntax_element.range,
             }),
-            source: include_source.then_some(node.source.as_str()),
+            source: include_source.then_some(syntax_element.source.as_str()),
         }))
     }
 
@@ -366,7 +366,7 @@ impl GraphDatasetBuilder {
         &mut self,
         id: &SymbolId,
         position: usize,
-        location: NodeLocation<'_>,
+        location: SyntaxLocation<'_>,
         source: Option<&str>,
     ) -> Result<(), RiftError> {
         use VocabularyProperty as Property;
@@ -374,15 +374,15 @@ impl GraphDatasetBuilder {
         let mut out = TripleWriter::default();
         let symbol = out.symbol(id)?;
         let position = position.to_string();
-        let node = out.typed(
+        let syntax_element = out.typed(
             content_blank_node(&[symbol.as_str(), "captured-declaration", &position]),
-            VocabularyClass::Node,
+            VocabularyClass::SyntaxElement,
         );
-        out.link(&node, Property::Of, symbol);
-        out.link(&node, Property::Index, Literal::from(0_u64));
-        out.location(&node, location.unit, location.range)?;
+        out.link(&syntax_element, Property::Of, symbol);
+        out.link(&syntax_element, Property::Index, Literal::from(0_u64));
+        out.location(&syntax_element, location.unit, location.range)?;
         if let Some(source) = source {
-            out.literal(&node, Property::Source, source);
+            out.literal(&syntax_element, Property::Source, source);
         }
         self.insert_triples(out.0, GraphNameRef::DefaultGraph)
     }
@@ -476,7 +476,7 @@ impl GraphFact<'_> {
                 let revision = out.revision(revision);
                 out.link(&subject, Property::Revision, revision);
             }
-            Self::Node(node) => node.write_triples(out)?,
+            Self::SyntaxElement(syntax_element) => syntax_element.write_triples(out)?,
             Self::Relation {
                 source,
                 relation,
@@ -485,9 +485,13 @@ impl GraphFact<'_> {
                 let (source, target) = (out.symbol(source)?, out.symbol(target)?);
                 out.link(&source, relation.property(), target);
             }
-            Self::Usage { symbol, node } => {
-                let (symbol, node) = (out.symbol(symbol)?, out.node(node)?);
-                out.link(&symbol, Property::Usages, node);
+            Self::Usage {
+                symbol,
+                syntax_element,
+            } => {
+                let (symbol, syntax_element) =
+                    (out.symbol(symbol)?, out.syntax_element(syntax_element)?);
+                out.link(&symbol, Property::Usages, syntax_element);
             }
             Self::Occurrence {
                 key,
@@ -500,7 +504,7 @@ impl GraphFact<'_> {
                     VocabularyClass::Occurrence,
                 );
                 out.link(&target, Property::Usages, usage.clone());
-                out.literal(&usage, Property::Kind, occurrence.facet.as_ref());
+                out.literal(&usage, Property::Kind, occurrence.kind.as_ref());
                 out.location(&usage, &occurrence.source.unit, &occurrence.source.range)?;
                 if let Some(source) = source {
                     out.literal(&usage, Property::Source, source);
@@ -538,22 +542,26 @@ impl GraphFact<'_> {
     }
 }
 
-impl NodeFact<'_> {
-    /// Writes the node's triples, its range as a blank node labeled by its node and bytes.
+impl SyntaxFact<'_> {
+    /// Writes the syntax element's triples, its range as a blank node labeled by its syntax element and bytes.
     fn write_triples(&self, out: &mut TripleWriter) -> Result<(), RiftError> {
         use VocabularyProperty as Property;
-        let node = out.node(self.address)?;
-        out.literal(&node, Property::Kind, self.kind);
-        out.literal(&node, Property::Language, &self.language.identity_segment());
+        let syntax_element = out.syntax_element(self.address)?;
+        out.literal(&syntax_element, Property::Kind, self.kind);
+        out.literal(
+            &syntax_element,
+            Property::Language,
+            &self.language.identity_segment(),
+        );
         if let Some(parent) = self.parent {
-            let parent = out.node(parent)?;
-            out.link(&node, Property::Parent, parent);
+            let parent = out.syntax_element(parent)?;
+            out.link(&syntax_element, Property::Parent, parent);
         }
         if let Some(source) = self.source {
-            out.literal(&node, Property::Source, source);
+            out.literal(&syntax_element, Property::Source, source);
         }
-        if let Some(NodeLocation { unit, range }) = self.location {
-            out.location(&node, unit, range)?;
+        if let Some(SyntaxLocation { unit, range }) = self.location {
+            out.location(&syntax_element, unit, range)?;
         }
         Ok(())
     }
@@ -613,34 +621,38 @@ impl TripleWriter {
         Ok(self.typed(iri, VocabularyClass::Symbol))
     }
 
-    /// Writes the node at `address` as a blank node labeled by the address, with the triples
+    /// Writes the syntax element at `address` as a blank node labeled by the address, with the triples
     /// that place it: `of`, `declaration` and `index` inside a declaration, `unit` and `index`
     /// outside every declaration.
-    fn node(&mut self, address: NodeAddress<'_>) -> Result<BlankNode, RiftError> {
+    fn syntax_element(&mut self, address: SyntaxAddress<'_>) -> Result<BlankNode, RiftError> {
         use VocabularyProperty as Property;
         let (owner, declaration, index) = match address {
-            NodeAddress::Declaration {
+            SyntaxAddress::Declaration {
                 symbol,
                 declaration,
                 index,
             } => (self.symbol(symbol)?, Some(declaration), index),
-            NodeAddress::Unit { unit, index } => (self.unit(unit)?, None, index),
+            SyntaxAddress::Unit { unit, index } => (self.unit(unit)?, None, index),
         };
         let (declared, indexed) = (
             declaration.map(|value| value.to_string()),
             index.to_string(),
         );
         let label = [owner.as_str(), declared.as_deref().unwrap_or("-"), &indexed];
-        let node = self.typed(content_blank_node(&label), VocabularyClass::Node);
+        let syntax_element = self.typed(content_blank_node(&label), VocabularyClass::SyntaxElement);
         match declaration {
             Some(declaration) => {
-                self.link(&node, Property::Of, owner);
-                self.link(&node, Property::Declaration, Literal::from(declaration));
+                self.link(&syntax_element, Property::Of, owner);
+                self.link(
+                    &syntax_element,
+                    Property::Declaration,
+                    Literal::from(declaration),
+                );
             }
-            None => self.link(&node, Property::Unit, owner),
+            None => self.link(&syntax_element, Property::Unit, owner),
         }
-        self.link(&node, Property::Index, Literal::from(index));
-        Ok(node)
+        self.link(&syntax_element, Property::Index, Literal::from(index));
+        Ok(syntax_element)
     }
 
     fn location(

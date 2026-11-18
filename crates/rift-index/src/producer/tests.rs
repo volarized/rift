@@ -6,16 +6,17 @@ use rift_core::{ContributionOrigin, ProjectPath, SourceKind, SourceLocation};
 use std::cell::Cell;
 
 use rift_error::RiftError;
-use rift_protocol::index::{PackagePublication, RelationshipCoverage};
+use rift_protocol::index::{EdgeCoverage, PackagePublication};
 use rift_protocol::producer::{FactKind, FactProducer, ProducerFacts};
-use rift_protocol::read::{Language, PackageIdentity, RelationshipFacet, SourceUnitId};
-use rift_syntax::{ByteRange, NodeMatch, SyntaxLimits};
+use rift_protocol::read::{EdgeKind, Language, PackageIdentity, SourceUnitId};
+use rift_syntax::{ByteRange, SyntaxLimits, SyntaxMatch};
 use serde_json::{Value, json};
 
 use super::{
-    ExtractionInput, FactExtractor, PublicationNodes, accept_extracted_facts, accept_producer_facts,
+    ExtractionInput, FactExtractor, PublicationSyntax, accept_extracted_facts,
+    accept_producer_facts,
 };
-use crate::located_node::NodeAddress;
+use crate::located_syntax_element::SyntaxAddress;
 
 const SOURCE: &str =
     "def echo(value):\n    return value\n\ndef shout(value):\n    return echo(value)\n";
@@ -82,7 +83,7 @@ fn facts(publication: &PackagePublication, body: Value) -> ProducerFacts {
         "format": 1,
         "producer": {"name": "demo-indexer", "revision": "0.6.1"},
         "language": "python",
-        "kinds": ["relationships", "occurrences"],
+        "kinds": ["edges", "occurrences"],
     });
     let Value::Object(lists) = body else {
         panic!("fact lists must be an object: {body}");
@@ -100,16 +101,16 @@ fn call_facts(publication: &PackagePublication) -> ProducerFacts {
     facts(
         publication,
         json!({
-            "relationships": [{
+            "edges": [{
                 "kind": "call",
-                "facets": ["calls"],
+                "kinds": ["calls"],
                 "to": ECHO,
                 "occurrence": {"unit": "UNIT", "range": {"start": CALL.0, "end": CALL.1}},
                 "derivation": "resolution",
             }, {
                 "from": SHOUT,
                 "kind": "reference",
-                "facets": ["references"],
+                "kinds": ["references"],
                 "to": ECHO,
                 "derivation": "heuristic",
                 "confidence": 0.5,
@@ -136,42 +137,42 @@ fn refusal(publication: PackagePublication, facts: ProducerFacts) -> String {
 #[test]
 fn a_range_resolves_to_its_place_inside_the_enclosing_declaration() {
     let publication = click();
-    let mut nodes = PublicationNodes::new(&publication, SyntaxLimits::default());
+    let mut syntax_elements = PublicationSyntax::new(&publication, SyntaxLimits::default());
     let call = ByteRange {
         start: CALL.0,
         end: CALL.1,
     };
-    let located = nodes
-        .node_at(&unit(&publication), call, NodeMatch::Exact)
+    let located = syntax_elements
+        .syntax_element_at(&unit(&publication), call, SyntaxMatch::Exact)
         .expect("resolved call");
     assert_eq!(located.range, call);
     assert!(
         matches!(
             &located.address,
-            NodeAddress::Declaration { symbol, declaration: 0, index } if symbol.as_str() == SHOUT && *index > 0
+            SyntaxAddress::Declaration { symbol, declaration: 0, index } if symbol.as_str() == SHOUT && *index > 0
         ),
         "{located:?}"
     );
-    let echo = nodes
-        .node_at(
+    let echo = syntax_elements
+        .syntax_element_at(
             &unit(&publication),
             ByteRange { start: 0, end: 16 },
-            NodeMatch::Enclosing,
+            SyntaxMatch::Enclosing,
         )
         .expect("resolved declaration");
     assert!(
-        matches!(&echo.address, NodeAddress::Declaration { symbol, index: 0, .. } if symbol.as_str() == ECHO),
+        matches!(&echo.address, SyntaxAddress::Declaration { symbol, index: 0, .. } if symbol.as_str() == ECHO),
         "{echo:?}"
     );
-    let between = nodes
-        .node_at(
+    let between = syntax_elements
+        .syntax_element_at(
             &unit(&publication),
             ByteRange { start: 34, end: 35 },
-            NodeMatch::Enclosing,
+            SyntaxMatch::Enclosing,
         )
         .expect("resolved module");
     assert!(
-        matches!(between.address, NodeAddress::Unit { .. }),
+        matches!(between.address, SyntaxAddress::Unit { .. }),
         "{between:?}"
     );
     let text_unit = publication
@@ -180,59 +181,59 @@ fn a_range_resolves_to_its_place_inside_the_enclosing_declaration() {
         .find(|record| record.unit.0.ends_with("notes.txt"))
         .map(|record| record.unit.clone())
         .expect("notes unit");
-    let file = nodes
-        .node_at(
+    let file = syntax_elements
+        .syntax_element_at(
             &text_unit,
             ByteRange { start: 0, end: 4 },
-            NodeMatch::Enclosing,
+            SyntaxMatch::Enclosing,
         )
-        .expect("a text unit answers its file node");
-    assert_eq!(file.address, NodeAddress::Unit { index: 0 });
+        .expect("a text unit answers its file syntax element");
+    assert_eq!(file.address, SyntaxAddress::Unit { index: 0 });
     assert!(
-        format!("{nodes:?}").contains("units_parsed: 2"),
-        "{nodes:?}"
+        format!("{syntax_elements:?}").contains("units_parsed: 2"),
+        "{syntax_elements:?}"
     );
 }
 
 #[test]
 fn a_range_that_resolves_to_nothing_is_refused() {
     let publication = click();
-    let mut nodes = PublicationNodes::new(&publication, SyntaxLimits::default());
+    let mut syntax_elements = PublicationSyntax::new(&publication, SyntaxLimits::default());
     let past = u64::try_from(SOURCE.len()).expect("length") + 1;
-    let outside = nodes
-        .node_at(
+    let outside = syntax_elements
+        .syntax_element_at(
             &unit(&publication),
             ByteRange {
                 start: 0,
                 end: past,
             },
-            NodeMatch::Enclosing,
+            SyntaxMatch::Enclosing,
         )
         .expect_err("range past the unit");
     assert!(
         outside
             .to_string()
-            .contains("resolves to no node of its source unit"),
+            .contains("resolves to no syntax element of its source unit"),
         "{outside}"
     );
     let missing = SourceUnitId(format!("{}.missing", unit(&publication).0));
-    let absent = nodes
-        .node_at(
+    let absent = syntax_elements
+        .syntax_element_at(
             &missing,
             ByteRange { start: 0, end: 1 },
-            NodeMatch::Enclosing,
+            SyntaxMatch::Enclosing,
         )
         .expect_err("unit the publication does not carry");
     assert!(absent.to_string().contains(".missing"), "{absent}");
     let mut cut = publication.clone();
     cut.units[0].source_complete = false;
-    let mut nodes = PublicationNodes::new(&cut, SyntaxLimits::default());
+    let mut syntax_elements = PublicationSyntax::new(&cut, SyntaxLimits::default());
     assert!(
-        nodes
-            .node_at(
+        syntax_elements
+            .syntax_element_at(
                 &unit(&cut),
                 ByteRange { start: 0, end: 1 },
-                NodeMatch::Enclosing
+                SyntaxMatch::Enclosing
             )
             .is_err(),
         "a cut source resolves nothing"
@@ -242,12 +243,12 @@ fn a_range_that_resolves_to_nothing_is_refused() {
 #[test]
 fn producer_facts_enter_the_publication_under_their_producer() {
     let publication = click();
-    let before = publication.relationships.len();
+    let before = publication.edges.len();
     let facts = call_facts(&publication);
     let producer = facts.producer.clone();
     let accepted =
         accept_producer_facts(publication, facts, SyntaxLimits::default()).expect("accepted");
-    let added = &accepted.relationships[before..];
+    let added = &accepted.edges[before..];
     assert_eq!(added.len(), 2);
     assert_eq!(
         added[0].from.as_str(),
@@ -279,8 +280,8 @@ fn producer_facts_enter_the_publication_under_their_producer() {
             .all(|occurrence| occurrence.producer.as_ref() == Some(&producer))
     );
     let coverage = &accepted.coverage[0];
-    assert!(coverage.covers(FactKind::Relationships, None));
-    assert!(coverage.covers(FactKind::Relationships, Some(&producer)));
+    assert!(coverage.covers(FactKind::Edges, None));
+    assert!(coverage.covers(FactKind::Edges, Some(&producer)));
     assert!(coverage.covers(FactKind::Occurrences, Some(&producer)));
     accepted.validate_facts().expect("facts agree");
     let wire = serde_json::to_string(&accepted).expect("serialize");
@@ -316,18 +317,18 @@ fn producer_facts_naming_a_symbol_keep_it_and_still_resolve_their_range() {
     let facts = facts(
         &publication,
         json!({
-            "kinds": ["relationships"],
-            "relationships": [{
+            "kinds": ["edges"],
+            "edges": [{
                 "from": SHOUT,
                 "kind": "call",
-                "facets": ["calls"],
+                "kinds": ["calls"],
                 "to": ECHO,
                 "occurrence": {"unit": "UNIT", "range": {"start": 0, "end": 200}},
                 "derivation": "resolution",
             }],
         }),
     );
-    assert!(refusal(publication, facts).contains("resolves to no node"));
+    assert!(refusal(publication, facts).contains("resolves to no syntax element"));
     let publication = click();
     let edge_occurrences = publication.occurrences.clone();
     let covered_only = facts_with_kinds(&publication, &["occurrences"]);
@@ -353,8 +354,8 @@ fn producer_facts_outside_their_coverage_or_address_are_refused() {
             "field language, violation uncovered",
         ),
         (
-            json!({"kinds": ["occurrences"], "relationships": [{
-                "from": SHOUT, "kind": "call", "facets": ["calls"], "to": ECHO,
+            json!({"kinds": ["occurrences"], "edges": [{
+                "from": SHOUT, "kind": "call", "kinds": ["calls"], "to": ECHO,
                 "derivation": "resolution",
             }]}),
             "field kinds, violation uncovered",
@@ -364,17 +365,17 @@ fn producer_facts_outside_their_coverage_or_address_are_refused() {
             "field kinds, violation duplicate",
         ),
         (
-            json!({"relationships": [{
-                "kind": "call", "facets": ["calls"], "to": ECHO, "derivation": "resolution",
+            json!({"edges": [{
+                "kind": "call", "kinds": ["calls"], "to": ECHO, "derivation": "resolution",
             }]}),
-            "field relationships.from, violation missing",
+            "field edges.from, violation missing",
         ),
         (
-            json!({"relationships": [{
-                "kind": "call", "facets": ["calls"], "to": ECHO, "derivation": "resolution",
+            json!({"edges": [{
+                "kind": "call", "kinds": ["calls"], "to": ECHO, "derivation": "resolution",
                 "occurrence": {"unit": "UNIT", "range": {"start": 34, "end": 35}},
             }]}),
-            "field relationships.occurrence, violation outside_declaration",
+            "field edges.occurrence, violation outside_declaration",
         ),
     ];
     for (body, expected) in cases {
@@ -415,30 +416,30 @@ fn accept_producer_facts_refuses_another_format() {
 }
 
 #[test]
-fn accept_producer_facts_leaves_relationship_coverage_unchanged() {
+fn accept_producer_facts_leaves_edge_coverage_unchanged() {
     let mut publication = click();
-    publication.coverage[0].relationships = vec![
-        RelationshipCoverage {
-            facet: RelationshipFacet::Calls,
+    publication.coverage[0].edges = vec![
+        EdgeCoverage {
+            kind: EdgeKind::Calls,
             complete: true,
         },
-        RelationshipCoverage {
-            facet: RelationshipFacet::References,
+        EdgeCoverage {
+            kind: EdgeKind::References,
             complete: false,
         },
     ];
-    let before = serde_json::to_string(&publication.coverage[0].relationships).expect("before");
+    let before = serde_json::to_string(&publication.coverage[0].edges).expect("before");
     let facts = call_facts(&publication);
     let accepted =
         accept_producer_facts(publication, facts, SyntaxLimits::default()).expect("accepted");
-    let after = serde_json::to_string(&accepted.coverage[0].relationships).expect("after");
+    let after = serde_json::to_string(&accepted.coverage[0].edges).expect("after");
     assert_eq!(after, before);
 }
 
 #[test]
-fn producer_extensions_reach_the_stored_relationship() {
+fn producer_extensions_reach_the_stored_edge() {
     let publication = click();
-    let before = publication.relationships.len();
+    let before = publication.edges.len();
     let extension = json!({"dev.demo-indexer.precision": {
         "version": 1,
         "data": {"class": "compiler binding", "observation": 17},
@@ -446,16 +447,16 @@ fn producer_extensions_reach_the_stored_relationship() {
     let facts = facts(
         &publication,
         json!({
-            "kinds": ["relationships"],
-            "relationships": [{
-                "from": SHOUT, "kind": "call", "facets": ["calls"], "to": ECHO,
+            "kinds": ["edges"],
+            "edges": [{
+                "from": SHOUT, "kind": "call", "kinds": ["calls"], "to": ECHO,
                 "derivation": "resolution", "extensions": extension,
             }],
         }),
     );
     let accepted =
         accept_producer_facts(publication, facts, SyntaxLimits::default()).expect("accepted");
-    let stored = &accepted.relationships[before];
+    let stored = &accepted.edges[before];
     assert_eq!(
         serde_json::to_value(&stored.extensions).expect("extensions"),
         extension
@@ -463,15 +464,15 @@ fn producer_extensions_reach_the_stored_relationship() {
     accepted.validate_facts().expect("facts agree");
     let wire = serde_json::to_string(&accepted).expect("serialize");
     let read: PackagePublication = serde_json::from_str(&wire).expect("deserialize");
-    assert_eq!(read.relationships[before].extensions, stored.extensions);
+    assert_eq!(read.edges[before].extensions, stored.extensions);
 }
 
 #[test]
-fn imported_relationships_do_not_depend_on_emission_order() {
+fn imported_edges_do_not_depend_on_emission_order() {
     let publication = click();
     let forward = call_facts(&publication);
     let mut reversed = forward.clone();
-    reversed.relationships.reverse();
+    reversed.edges.reverse();
     let first = accept_producer_facts(publication.clone(), forward, SyntaxLimits::default())
         .expect("forward");
     let second = accept_producer_facts(publication.clone(), reversed, SyntaxLimits::default())
@@ -480,11 +481,11 @@ fn imported_relationships_do_not_depend_on_emission_order() {
         rift_protocol::canonical::canonical_json(accepted).expect("canonical publication")
     };
     assert_eq!(canonical(&first), canonical(&second));
-    let built_in = publication.relationships.len();
+    let built_in = publication.edges.len();
     assert_eq!(
-        first.relationships[..built_in],
-        publication.relationships[..],
-        "built-in relationships keep their order"
+        first.edges[..built_in],
+        publication.edges[..],
+        "built-in edges keep their order"
     );
 }
 

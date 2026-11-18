@@ -107,7 +107,7 @@ impl ReadService {
         let matched = rift_tracing::traced!(component = "search", operation = "search.commits", {
             matched_commits(&reads, &parsed, results_max)
         })?;
-        let (ids, pagination) = page(matched.ids, params.page_index, limit);
+        let (ids, pagination) = page(matched.ids, params.page, limit);
         let mut results = Vec::with_capacity(ids.len());
         for id in &ids {
             results.extend(commit_hit(&reads, id)?);

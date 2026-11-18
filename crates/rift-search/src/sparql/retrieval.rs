@@ -1,7 +1,5 @@
 //! Selects existing retrieval producers from explicit local SERVICE patterns.
 
-use std::collections::BTreeSet;
-
 use oxrdf::{
     NamedNode,
     vocab::{rdf, xsd},
@@ -34,8 +32,8 @@ const INPUT_FIELDS: &[&str] = &[
     "packages",
     "paths",
     "include",
-    "limit",
-    "page_index",
+    "max_results",
+    "page",
     "rev",
     "change",
 ];
@@ -122,14 +120,17 @@ fn prepare_flow_request(request: &mut SearchParams) -> Result<usize, RiftError> 
     {
         return Err(invalid("flow search requires a nonempty constant query"));
     }
-    let limit = request.limit.unwrap_or(FLOW_LIMIT_DEFAULT);
+    let limit = request.max_results.unwrap_or(FLOW_LIMIT_DEFAULT);
     if !(1..=FLOW_LIMIT_MAX).contains(&limit) {
         return Err(invalid("flow limit must be between 1 and 32"));
     }
     request.scope = SearchScope::Local;
     request.target = SearchParamsTarget::Symbol;
-    request.limit = Some(FLOW_RANKED_ROWS_MAX);
-    request.include = Some(vec![SearchInclude::Score]);
+    request.max_results = Some(FLOW_RANKED_ROWS_MAX);
+    request.include = SearchInclude {
+        score: true,
+        ..SearchInclude::default()
+    };
     usize::try_from(limit).map_err(|error| invalid(&error.to_string()))
 }
 
@@ -138,7 +139,7 @@ fn request(
     flows: bool,
 ) -> Result<(SearchParams, ScopeChoice), RiftError> {
     let mut fields = Map::new();
-    let mut include = BTreeSet::new();
+    let mut include = Map::new();
     let mut pending = vec![(inner, true)];
     while let Some((pattern, required)) = pending.pop() {
         match pattern {
@@ -151,7 +152,7 @@ fn request(
                         continue;
                     };
                     if matches!(key, "source" | "score") {
-                        include.insert(key.to_owned());
+                        include.insert(key.to_owned(), Value::Bool(true));
                     }
                     if flows
                         && INPUT_FIELDS.contains(&key)
@@ -164,13 +165,13 @@ fn request(
                     {
                         continue;
                     }
-                    if flows && !matches!(key, "query" | "limit") {
+                    if flows && !matches!(key, "query" | "max_results") {
                         return Err(invalid(
                             "flow search accepts constant query and limit inputs",
                         ));
                     }
                     if flows
-                        && key == "limit"
+                        && key == "max_results"
                         && !matches!(&triple.object, TermPattern::Literal(value) if *value.datatype() == xsd::INTEGER)
                     {
                         return Err(invalid("flow limit must be an integer literal"));
@@ -222,10 +223,7 @@ fn request(
         }
     }
     if !include.is_empty() && !fields.contains_key("include") {
-        fields.insert(
-            "include".to_owned(),
-            Value::Array(include.into_iter().map(Value::String).collect()),
-        );
+        fields.insert("include".to_owned(), Value::Object(include));
     }
     let scope_choice = if flows || fields.contains_key(SCOPE_FIELD) {
         ScopeChoice::Service
@@ -284,7 +282,7 @@ fn input(key: &str, object: &TermPattern) -> Result<Value, RiftError> {
         TermPattern::Literal(value) if value.datatype().as_str() == RDF_JSON => {
             serde_json::from_str(value.value()).map_err(|error| invalid(&error.to_string()))
         }
-        TermPattern::Literal(value) if matches!(key, "limit" | "page_index") => value
+        TermPattern::Literal(value) if matches!(key, "max_results" | "page") => value
             .value()
             .parse::<u64>()
             .map(Value::from)
@@ -317,7 +315,7 @@ mod tests {
     -> Result<(), rift_error::RiftError> {
         let limits = GraphLimits::default();
         let query = GraphQuery::parse(
-            "SELECT ?flow { SERVICE :flows { ?flow :query 'middleware'; :limit 2 } }",
+            "SELECT ?flow { SERVICE :flows { ?flow :query 'middleware'; :max_results 2 } }",
             &limits,
         )?;
         let [selection] = query.retrieval_requests() else {
@@ -328,8 +326,11 @@ mod tests {
         assert_eq!(selection.request.target, SearchParamsTarget::Symbol);
         assert_eq!(selection.request.query.as_deref(), Some("middleware"));
         assert_eq!(
-            selection.request.include.as_deref(),
-            Some([SearchInclude::Score].as_slice())
+            selection.request.include,
+            SearchInclude {
+                score: true,
+                ..SearchInclude::default()
+            }
         );
         Ok(())
     }
@@ -341,13 +342,13 @@ mod tests {
             "?flow :query ?query",
             "?flow :query 'a', 'b'",
             "?flow :query 'a'; :scope :all",
-            "?flow :query 'a'; :limit 0",
-            "?flow :query 'a'; :limit 33",
-            "?flow :query 'a'; :limit '5'",
-            "?flow :query 'a'; :limit ?limit",
+            "?flow :query 'a'; :max_results 0",
+            "?flow :query 'a'; :max_results 33",
+            "?flow :query 'a'; :max_results '5'",
+            "?flow :query 'a'; :max_results ?limit",
             "?flow :query ''",
-            "?flow :limit 5",
-            "?flow :query 'a' OPTIONAL { ?flow :limit 3 }",
+            "?flow :max_results 5",
+            "?flow :query 'a' OPTIONAL { ?flow :max_results 3 }",
         ] {
             let query = format!("SELECT ?flow {{ SERVICE :flows {{ {input} }} }}");
             let error = GraphQuery::parse(&query, &limits).expect_err(input);
@@ -442,7 +443,7 @@ mod tests {
 
     #[test]
     fn test_default_scope_leaves_a_flow_service_local() -> Result<(), rift_error::RiftError> {
-        let text = "SELECT ?flow { SERVICE :flows { ?flow :query 'middleware'; :limit 2 } }";
+        let text = "SELECT ?flow { SERVICE :flows { ?flow :query 'middleware'; :max_results 2 } }";
         for default_scope in [SearchScope::Global, SearchScope::All] {
             let query = parsed(text)?.with_default_scope(&default_scope);
             assert_eq!(

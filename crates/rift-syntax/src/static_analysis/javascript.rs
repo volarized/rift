@@ -163,70 +163,70 @@ impl Kinds {
 impl Kinds {
     pub(super) fn record(
         &self,
-        node: Node<'_>,
+        syntax_element: Node<'_>,
         source: &str,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
-        let id = node.kind_id();
+        let id = syntax_element.kind_id();
         if id == self.call {
-            self.record_call(node, source, facts)?;
+            self.record_call(syntax_element, source, facts)?;
         } else if id == self.new {
-            if let Some(callee) = node.child_by_field_id(self.constructor) {
+            if let Some(callee) = syntax_element.child_by_field_id(self.constructor) {
                 facts
                     .calls
-                    .push(call(node, callee, StaticCallee::Unsupported)?);
+                    .push(call(syntax_element, callee, StaticCallee::Unsupported)?);
             }
         } else if id == self.variable {
-            self.record_variable(node, source, facts)?;
+            self.record_variable(syntax_element, source, facts)?;
         } else if self.function.contains(&id) || id == self.class || self.edge_types.contains(&id) {
-            self.record_declaration(node, facts)?;
-        } else if id == self.import_specifier || self.is_default_import(node) {
-            self.record_import(node, source, facts)?;
+            self.record_declaration(syntax_element, facts)?;
+        } else if id == self.import_specifier || self.is_default_import(syntax_element) {
+            self.record_import(syntax_element, source, facts)?;
         } else if id == self.namespace_import {
-            self.record_namespace_import(node, source, facts)?;
+            self.record_namespace_import(syntax_element, source, facts)?;
         } else if id == self.export_specifier {
-            self.record_reexport(node, source, facts)?;
+            self.record_reexport(syntax_element, source, facts)?;
         } else {
-            self.record_shadow_or_mutation(node, facts)?;
+            self.record_shadow_or_mutation(syntax_element, facts)?;
         }
         Ok(())
     }
 
     fn record_call(
         &self,
-        node: Node<'_>,
+        syntax_element: Node<'_>,
         source: &str,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
-        let Some(callee) = node
+        let Some(callee) = syntax_element
             .child_by_field_id(self.callee)
-            .filter(|node| !node.is_missing())
+            .filter(|syntax_element| !syntax_element.is_missing())
         else {
             return Ok(());
         };
         let shape = if callee.kind_id() == self.identifier {
             if text(callee, source) == Some("eval") {
-                let root = enclosing(node, &self.scopes[..1]).unwrap_or(node);
+                let root = enclosing(syntax_element, &self.scopes[..1]).unwrap_or(syntax_element);
                 facts.unsupported_bindings.push(byte_range(root)?);
             }
             StaticCallee::Direct
         } else {
             self.member(callee)?
         };
-        facts.calls.push(call(node, callee, shape)?);
+        facts.calls.push(call(syntax_element, callee, shape)?);
         Ok(())
     }
 
-    fn member(&self, node: Node<'_>) -> Result<StaticCallee, RiftError> {
-        if node.kind_id() != self.member {
+    fn member(&self, syntax_element: Node<'_>) -> Result<StaticCallee, RiftError> {
+        if syntax_element.kind_id() != self.member {
             return Ok(StaticCallee::Unsupported);
         }
-        let receiver = node
+        let receiver = syntax_element
             .child_by_field_id(self.object)
-            .and_then(|node| identifier(node, self.identifier));
-        let member = node
+            .and_then(|syntax_element| identifier(syntax_element, self.identifier));
+        let member = syntax_element
             .child_by_field_id(self.property)
-            .and_then(|node| identifier(node, self.property_identifier));
+            .and_then(|syntax_element| identifier(syntax_element, self.property_identifier));
         match receiver.zip(member) {
             Some((receiver, member)) => Ok(StaticCallee::Member {
                 receiver: byte_range(receiver)?,
@@ -238,16 +238,16 @@ impl Kinds {
 
     fn record_declaration(
         &self,
-        node: Node<'_>,
+        syntax_element: Node<'_>,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
-        let scope = enclosing(node, &self.scopes);
-        let name = node
+        let scope = enclosing(syntax_element, &self.scopes);
+        let name = syntax_element
             .child_by_field_id(self.name)
-            .filter(|node| !node.is_missing());
+            .filter(|syntax_element| !syntax_element.is_missing());
         if let Some((name, scope)) = name.zip(scope) {
-            let available = if node.kind_id() == self.class {
-                byte_range(node)?.end
+            let available = if syntax_element.kind_id() == self.class {
+                byte_range(syntax_element)?.end
             } else {
                 byte_range(scope)?.start
             };
@@ -260,11 +260,11 @@ impl Kinds {
 
     fn record_variable(
         &self,
-        node: Node<'_>,
+        syntax_element: Node<'_>,
         source: &str,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
-        let Some(parent) = node.parent() else {
+        let Some(parent) = syntax_element.parent() else {
             return Ok(());
         };
         let is_var = parent.kind_id() == self.var;
@@ -273,23 +273,23 @@ impl Kinds {
         } else {
             &self.scopes
         };
-        let Some(scope) = enclosing(node, scopes) else {
+        let Some(scope) = enclosing(syntax_element, scopes) else {
             return Ok(());
         };
-        let Some(name) = node
+        let Some(name) = syntax_element
             .child_by_field_id(self.name)
-            .and_then(|node| identifier(node, self.identifier))
+            .and_then(|syntax_element| identifier(syntax_element, self.identifier))
         else {
             facts.unsupported_bindings.push(byte_range(scope)?);
             return Ok(());
         };
-        let kind = match node.child_by_field_id(self.value) {
+        let kind = match syntax_element.child_by_field_id(self.value) {
             Some(value) if !is_var => self.initializer(value, source)?,
             _ => StaticBindingKind::Shadow,
         };
         facts
             .bindings
-            .push(binding(name, scope, byte_range(node)?.end, kind)?);
+            .push(binding(name, scope, byte_range(syntax_element)?.end, kind)?);
         Ok(())
     }
 
@@ -297,7 +297,7 @@ impl Kinds {
         if value.kind_id() == self.new
             && let Some(constructor) = value
                 .child_by_field_id(self.constructor)
-                .and_then(|node| identifier(node, self.identifier))
+                .and_then(|syntax_element| identifier(syntax_element, self.identifier))
         {
             return Ok(StaticBindingKind::JavaScriptInstance {
                 constructor: byte_range(constructor)?,
@@ -311,7 +311,7 @@ impl Kinds {
             && arguments.named_child_count() == 1
             && let Some(module) = arguments
                 .named_child(0)
-                .map(|node| self.literal(node, source))
+                .map(|syntax_element| self.literal(syntax_element, source))
                 .transpose()?
                 .flatten()
         {
@@ -326,24 +326,30 @@ impl Kinds {
 
     fn require_shape<'tree>(
         &self,
-        node: Node<'tree>,
+        syntax_element: Node<'tree>,
     ) -> Option<(Node<'tree>, Option<Node<'tree>>)> {
-        if node.kind_id() == self.call {
-            return Some((node.child_by_field_id(self.callee)?, None));
+        if syntax_element.kind_id() == self.call {
+            return Some((syntax_element.child_by_field_id(self.callee)?, None));
         }
-        if node.kind_id() != self.member {
+        if syntax_element.kind_id() != self.member {
             return None;
         }
-        let object = node.child_by_field_id(self.object)?;
-        let export = node
+        let object = syntax_element.child_by_field_id(self.object)?;
+        let export = syntax_element
             .child_by_field_id(self.property)
-            .and_then(|node| identifier(node, self.property_identifier))?;
+            .and_then(|syntax_element| identifier(syntax_element, self.property_identifier))?;
         (object.kind_id() == self.call).then_some(())?;
         Some((object.child_by_field_id(self.callee)?, Some(export)))
     }
 
-    fn literal(&self, node: Node<'_>, source: &str) -> Result<Option<ByteRange>, RiftError> {
-        let Some(value) = text(node, source).filter(|_| node.kind_id() == self.string) else {
+    fn literal(
+        &self,
+        syntax_element: Node<'_>,
+        source: &str,
+    ) -> Result<Option<ByteRange>, RiftError> {
+        let Some(value) =
+            text(syntax_element, source).filter(|_| syntax_element.kind_id() == self.string)
+        else {
             return Ok(None);
         };
         let bytes = value.as_bytes();
@@ -360,44 +366,46 @@ impl Kinds {
         {
             return Ok(None);
         }
-        let range = byte_range(node)?;
+        let range = byte_range(syntax_element)?;
         Ok(Some(ByteRange {
             start: range.start + 1,
             end: range.end - 1,
         }))
     }
 
-    fn is_default_import(&self, node: Node<'_>) -> bool {
-        node.kind_id() == self.identifier
-            && node
+    fn is_default_import(&self, syntax_element: Node<'_>) -> bool {
+        syntax_element.kind_id() == self.identifier
+            && syntax_element
                 .parent()
                 .is_some_and(|parent| parent.kind_id() == self.import_clause)
     }
 
     fn record_import(
         &self,
-        node: Node<'_>,
+        syntax_element: Node<'_>,
         source: &str,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
-        let Some(statement) = enclosing(node, &[self.import]) else {
+        let Some(statement) = enclosing(syntax_element, &[self.import]) else {
             return Ok(());
         };
         let Some(scope) = enclosing(statement, &self.scopes[..1]) else {
             return Ok(());
         };
-        let export = node.child_by_field_id(self.name);
-        let local = if self.is_default_import(node) {
-            Some(node)
+        let export = syntax_element.child_by_field_id(self.name);
+        let local = if self.is_default_import(syntax_element) {
+            Some(syntax_element)
         } else {
-            node.child_by_field_id(self.alias).or(export)
+            syntax_element.child_by_field_id(self.alias).or(export)
         };
-        let Some(name) = local.and_then(|node| identifier(node, self.identifier)) else {
+        let Some(name) =
+            local.and_then(|syntax_element| identifier(syntax_element, self.identifier))
+        else {
             return Ok(());
         };
         let module = statement
             .child_by_field_id(self.source)
-            .map(|node| self.literal(node, source))
+            .map(|syntax_element| self.literal(syntax_element, source))
             .transpose()?
             .flatten();
         let kind = match module {
@@ -415,18 +423,18 @@ impl Kinds {
 
     fn record_namespace_import(
         &self,
-        node: Node<'_>,
+        syntax_element: Node<'_>,
         source: &str,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
-        let scope = enclosing(node, &self.scopes[..1]);
-        let name = node
+        let scope = enclosing(syntax_element, &self.scopes[..1]);
+        let name = syntax_element
             .named_child(0)
-            .and_then(|node| identifier(node, self.identifier));
-        let statement = enclosing(node, &[self.import]);
+            .and_then(|syntax_element| identifier(syntax_element, self.identifier));
+        let statement = enclosing(syntax_element, &[self.import]);
         let module = statement
             .and_then(|statement| statement.child_by_field_id(self.source))
-            .map(|node| self.literal(node, source))
+            .map(|syntax_element| self.literal(syntax_element, source))
             .transpose()?
             .flatten();
         if let Some(((name, scope), module)) = name.zip(scope).zip(module) {
@@ -442,28 +450,30 @@ impl Kinds {
 
     fn record_reexport(
         &self,
-        node: Node<'_>,
+        syntax_element: Node<'_>,
         source: &str,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
-        let Some(statement) = enclosing(node, &[self.export]) else {
+        let Some(statement) = enclosing(syntax_element, &[self.export]) else {
             return Ok(());
         };
         let Some(module) = statement
             .child_by_field_id(self.source)
-            .map(|node| self.literal(node, source))
+            .map(|syntax_element| self.literal(syntax_element, source))
             .transpose()?
             .flatten()
         else {
             return Ok(());
         };
-        let Some(export) = node
+        let Some(export) = syntax_element
             .child_by_field_id(self.name)
-            .and_then(|node| identifier(node, self.identifier))
+            .and_then(|syntax_element| identifier(syntax_element, self.identifier))
         else {
             return Ok(());
         };
-        let name = node.child_by_field_id(self.alias).unwrap_or(export);
+        let name = syntax_element
+            .child_by_field_id(self.alias)
+            .unwrap_or(export);
         facts.reexports.push(StaticReexport {
             name: byte_range(name)?,
             module,
@@ -474,44 +484,44 @@ impl Kinds {
 
     fn record_shadow_or_mutation(
         &self,
-        node: Node<'_>,
+        syntax_element: Node<'_>,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
-        let id = node.kind_id();
+        let id = syntax_element.kind_id();
         if self.assignment.contains(&id) {
-            self.record_mutation(node, self.left, facts)?;
+            self.record_mutation(syntax_element, self.left, facts)?;
         } else if id == self.update {
-            self.record_mutation(node, self.argument, facts)?;
+            self.record_mutation(syntax_element, self.argument, facts)?;
         } else if id == self.parameters {
-            self.record_parameters(node, facts)?;
+            self.record_parameters(syntax_element, facts)?;
         } else if id == self.with {
-            facts.unsupported_bindings.push(byte_range(node)?);
+            facts.unsupported_bindings.push(byte_range(syntax_element)?);
         } else if id == self.catch
             || self.named_expression.contains(&id)
             || self.function_scopes.last() == Some(&id)
         {
-            self.record_named_shadow(node, facts)?;
+            self.record_named_shadow(syntax_element, facts)?;
         } else if id == self.arrow
-            && let Some(parameter) = node.child_by_field_id(self.parameter)
+            && let Some(parameter) = syntax_element.child_by_field_id(self.parameter)
         {
-            self.record_parameter(parameter, node, facts)?;
+            self.record_parameter(parameter, syntax_element, facts)?;
         }
         Ok(())
     }
 
     fn record_mutation(
         &self,
-        node: Node<'_>,
+        syntax_element: Node<'_>,
         target: u16,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
-        if let Some(target) = node
+        if let Some(target) = syntax_element
             .child_by_field_id(target)
-            .filter(|node| !node.is_missing())
+            .filter(|syntax_element| !syntax_element.is_missing())
         {
             if target.kind_id() == self.identifier || target.kind_id() == self.member {
                 facts.assignments.push(byte_range(target)?);
-            } else if let Some(root) = enclosing(node, &self.scopes[..1]) {
+            } else if let Some(root) = enclosing(syntax_element, &self.scopes[..1]) {
                 facts.unsupported_bindings.push(byte_range(root)?);
             }
         }
@@ -520,16 +530,16 @@ impl Kinds {
 
     fn record_parameters(
         &self,
-        node: Node<'_>,
+        syntax_element: Node<'_>,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
-        let Some(scope) = node.parent() else {
+        let Some(scope) = syntax_element.parent() else {
             return Ok(());
         };
-        let mut cursor = node.walk();
-        for parameter in node
+        let mut cursor = syntax_element.walk();
+        for parameter in syntax_element
             .named_children(&mut cursor)
-            .filter(|node| !node.is_extra())
+            .filter(|syntax_element| !syntax_element.is_extra())
         {
             self.record_parameter(parameter, scope, facts)?;
         }
@@ -557,21 +567,21 @@ impl Kinds {
 
     fn record_named_shadow(
         &self,
-        node: Node<'_>,
+        syntax_element: Node<'_>,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
-        let field = if node.kind_id() == self.catch {
+        let field = if syntax_element.kind_id() == self.catch {
             self.parameter
         } else {
             self.name
         };
-        if let Some(name) = node.child_by_field_id(field) {
-            self.record_parameter(name, node, facts)?;
+        if let Some(name) = syntax_element.child_by_field_id(field) {
+            self.record_parameter(name, syntax_element, facts)?;
         }
         Ok(())
     }
 }
 
-fn text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
-    source.get(node.byte_range())
+fn text<'a>(syntax_element: Node<'_>, source: &'a str) -> Option<&'a str> {
+    source.get(syntax_element.byte_range())
 }

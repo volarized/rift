@@ -23,8 +23,8 @@ use rift_core::constants::{
     WORKSPACE_DECLARATIONS_MAX_DEFAULT, WORKSPACE_FILES_MAX_DEFAULT, WORKSPACE_IGNORED_DIRECTORIES,
 };
 use rift_core::{
-    CompositionId, Contribution, LanguageFileSelections, PortableSymbolFacts, ProjectPath,
-    ProviderId, SourceVisibility, SymbolId, TextFileInclusion,
+    CompositionId, LanguageFileSelections, PortableSymbolFacts, ProjectPath, ProviderId,
+    SourceVisibility, SymbolId, TextFileInclusion,
 };
 use rift_error::{ErrorSlug, RiftError, ctx, errors};
 use rift_protocol::configuration::{LargeFileStrategy, SyntaxConfiguration};
@@ -45,19 +45,19 @@ use rift_ranking::{
     identifier_terms,
 };
 use rift_syntax::{
-    ByteRange, NodeMatch, SyntaxDocument, SyntaxLimits, SyntaxProvider, SyntaxSource, SyntaxSymbol,
-    registry,
+    ByteRange, SyntaxDocument, SyntaxLimits, SyntaxMatch, SyntaxProvider, SyntaxSource,
+    SyntaxSymbol, registry,
 };
 use sha2::{Digest as _, Sha256};
 
-use crate::LocatedNode;
+use crate::LocatedSyntax;
 use crate::capture::{CaptureBoundary, CapturedPath, LastCapture, capture_path, root_identity};
 use crate::change_set::{FileDigest, FileRecord, PathChanges, WorkspaceDigests, tree_revision_of};
 use crate::chunk::text_chunks;
 use crate::content_cache::WorkspaceContentCache;
 use crate::documentation::NotebookFiles;
+use crate::edge::EdgeStore;
 use crate::language::{ClassifiedPath, WorkspaceLanguagePolicy};
-use crate::relationship::RelationshipStore;
 use crate::semantic::{BuiltSemantics, WorkspaceSemantics};
 use rift_analysis::{DocumentationSelection, ForceIncludeReach, PathMatcher, PathVerdict};
 
@@ -76,7 +76,7 @@ pub struct WorkspaceIndexLimits {
     file_bytes_max: usize,
     workspace_bytes_max: usize,
     declarations_max: usize,
-    relationships_max: usize,
+    edges_max: usize,
     revision_tree_entries_max: usize,
     directory_depth_max: usize,
     results_max: usize,
@@ -108,7 +108,7 @@ impl WorkspaceIndexLimits {
             file_bytes_max,
             workspace_bytes_max,
             declarations_max: WORKSPACE_DECLARATIONS_MAX_DEFAULT,
-            relationships_max: usize::try_from(rift_protocol::source::SOURCE_RELATIONSHIPS_DEFAULT)
+            edges_max: usize::try_from(rift_protocol::source::SOURCE_EDGES_DEFAULT)
                 .unwrap_or(usize::MAX),
             revision_tree_entries_max: usize::try_from(
                 rift_protocol::configuration::HISTORY_TREE_ENTRIES_DEFAULT,
@@ -178,7 +178,7 @@ impl WorkspaceIndexLimits {
             self.file_bytes_max,
             self.workspace_bytes_max,
             self.declarations_max,
-            self.relationships_max,
+            self.edges_max,
             self.revision_tree_entries_max,
             self.directory_depth_max,
             self.results_max,
@@ -303,22 +303,18 @@ impl WorkspaceIndexLimits {
         self.declarations_max
     }
 
-    /// Returns maximum relationship edges held by the adjacency index.
+    /// Returns maximum edges held by the adjacency index.
     #[must_use]
-    pub const fn relationships_max(self) -> usize {
-        self.relationships_max
+    pub const fn edges_max(self) -> usize {
+        self.edges_max
     }
 
-    /// Applies caller-selected relationship capacity.
+    /// Applies caller-selected edge capacity.
     ///
     /// # Errors
     /// Returns a registered error for zero capacity.
-    pub fn with_relationships(self, relationships_max: usize) -> Result<Self, RiftError> {
-        Self {
-            relationships_max,
-            ..self
-        }
-        .validated()
+    pub fn with_edges(self, edges_max: usize) -> Result<Self, RiftError> {
+        Self { edges_max, ..self }.validated()
     }
 
     /// Returns maximum bytes accepted for one source file.
@@ -409,7 +405,7 @@ impl Default for WorkspaceIndexLimits {
             file_bytes_max: registry::file_bytes_max_default(),
             workspace_bytes_max: WORKSPACE_BYTES_MAX_DEFAULT,
             declarations_max: WORKSPACE_DECLARATIONS_MAX_DEFAULT,
-            relationships_max: usize::try_from(rift_protocol::source::SOURCE_RELATIONSHIPS_DEFAULT)
+            edges_max: usize::try_from(rift_protocol::source::SOURCE_EDGES_DEFAULT)
                 .unwrap_or(usize::MAX),
             revision_tree_entries_max: usize::try_from(
                 rift_protocol::configuration::HISTORY_TREE_ENTRIES_DEFAULT,
@@ -1228,7 +1224,7 @@ fn is_syntax_bound(slug: ErrorSlug) -> bool {
     matches!(
         slug,
         errors::syntax::source_too_large::SLUG
-            | errors::syntax::too_many_nodes::SLUG
+            | errors::syntax::too_many_syntax_elements::SLUG
             | errors::syntax::too_deep::SLUG
             | errors::syntax::too_many_captures::SLUG
             | errors::syntax::too_many_markdown_inline_ranges::SLUG
@@ -1238,11 +1234,11 @@ fn is_syntax_bound(slug: ErrorSlug) -> bool {
 
 /// Indexed file and its parse, read for one unpublished source path.
 #[derive(Debug)]
-pub struct IndexedFileNodes {
+pub struct IndexedFileSyntax {
     /// Parsed file used to validate source identity and position.
     pub file: IndexedFile,
-    /// The parse with its complete node table. The file is not published, so no declaration
-    /// of it has an established identity and its unit holds every node.
+    /// The parse with its complete syntax element table. The file is not published, so no declaration
+    /// of it has an established identity and its unit holds every syntax element.
     pub document: SyntaxDocument,
     /// Framework context unresolved for these captured source bytes.
     pub warnings: Vec<rift_protocol::read::ReadWarning>,
@@ -1602,9 +1598,9 @@ pub struct WorkspaceIndexPreparation {
     contents: IndexContents,
     content_cache: WorkspaceContentCache,
     workspace_bytes: usize,
-    source_cursor: usize,
-    text_cursor: usize,
-    lockfile_cursor: usize,
+    source_position: usize,
+    text_position: usize,
+    lockfile_position: usize,
 }
 
 impl fmt::Debug for WorkspaceIndexPreparation {
@@ -1665,9 +1661,9 @@ impl WorkspaceIndexPreparation {
             contents: IndexContents::default(),
             content_cache: WorkspaceContentCache::default(),
             workspace_bytes: 0,
-            source_cursor: 0,
-            text_cursor: 0,
-            lockfile_cursor: 0,
+            source_position: 0,
+            text_position: 0,
+            lockfile_position: 0,
         })
     }
 
@@ -1769,9 +1765,9 @@ impl WorkspaceIndexPreparation {
     /// Number of selected files whose capture and analysis have finished.
     #[must_use]
     pub const fn prepared(&self) -> usize {
-        self.source_cursor
-            .saturating_add(self.text_cursor)
-            .saturating_add(self.lockfile_cursor)
+        self.source_position
+            .saturating_add(self.text_position)
+            .saturating_add(self.lockfile_position)
     }
 
     /// Project-relative paths whose capture and analysis have finished.
@@ -2031,9 +2027,9 @@ impl WorkspaceIndexPreparation {
         let advanced = (|| {
             while self.prepared() < target {
                 check_cancelled(cancelled)?;
-                if self.source_cursor < paths.source.len() {
+                if self.source_position < paths.source.len() {
                     self.advance_sources(&paths, target, cancelled)?;
-                } else if self.text_cursor < paths.text.len() {
+                } else if self.text_position < paths.text.len() {
                     self.advance_text(&paths, target, cancelled)?;
                 } else {
                     self.advance_lockfiles(&paths, target, cancelled)?;
@@ -2051,17 +2047,17 @@ impl WorkspaceIndexPreparation {
         target: usize,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<(), RiftError> {
-        let end = self.batch_end(self.source_cursor, paths.source.len(), target);
+        let end = self.batch_end(self.source_position, paths.source.len(), target);
         let completed = self.contents.hold_parsed_sources_progress(
             &self.root,
-            &paths.source[self.source_cursor..end],
+            &paths.source[self.source_position..end],
             self.limits,
             &mut self.workspace_bytes,
             None,
             &self.content_cache,
             cancelled,
         );
-        self.source_cursor += batch_completed(&completed);
+        self.source_position += batch_completed(&completed);
         completed.map(|_| ()).map_err(|(_, error)| error)
     }
 
@@ -2071,15 +2067,15 @@ impl WorkspaceIndexPreparation {
         target: usize,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<(), RiftError> {
-        let end = self.batch_end(self.text_cursor, paths.text.len(), target);
+        let end = self.batch_end(self.text_position, paths.text.len(), target);
         let completed = self.contents.hold_read_texts_progress(
             &self.root,
-            &paths.text[self.text_cursor..end],
+            &paths.text[self.text_position..end],
             self.limits,
             &mut self.workspace_bytes,
             cancelled,
         );
-        self.text_cursor += batch_completed(&completed);
+        self.text_position += batch_completed(&completed);
         completed.map(|_| ()).map_err(|(_, error)| error)
     }
 
@@ -2089,15 +2085,15 @@ impl WorkspaceIndexPreparation {
         target: usize,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<(), RiftError> {
-        let end = self.batch_end(self.lockfile_cursor, paths.lockfiles.len(), target);
+        let end = self.batch_end(self.lockfile_position, paths.lockfiles.len(), target);
         let completed = self.contents.hold_read_lockfiles_progress(
             &self.root,
-            &paths.lockfiles[self.lockfile_cursor..end],
+            &paths.lockfiles[self.lockfile_position..end],
             self.limits,
             &mut self.workspace_bytes,
             cancelled,
         );
-        self.lockfile_cursor += batch_completed(&completed);
+        self.lockfile_position += batch_completed(&completed);
         completed.map(|_| ()).map_err(|(_, error)| error)
     }
 
@@ -2702,7 +2698,7 @@ struct SymbolDocumentKey {
     digest: FileDigest,
     language: String,
     source_bytes_max: usize,
-    syntax_nodes_max: usize,
+    syntax_elements_max: usize,
     syntax_depth_max: usize,
 }
 
@@ -3776,8 +3772,8 @@ impl WorkspaceIndex {
 
     /// Returns the symbol reference adjacency built from this index's normalized graph.
     #[must_use]
-    pub fn relationships(&self) -> &RelationshipStore {
-        self.semantics.relationships()
+    pub fn edges(&self) -> &EdgeStore {
+        self.semantics.edges()
     }
 
     /// Whether captured static calls cover the selected declaration or incoming language set.
@@ -4113,12 +4109,18 @@ impl WorkspaceIndex {
         for record in self.semantics.graph().records() {
             if record.identity().is_none() {
                 for key in record.contributions() {
-                    if let Some(facts) = self
-                        .semantics
-                        .graph()
-                        .contribution(key)
-                        .and_then(Contribution::facts)
+                    let Some(contribution) = self.semantics.graph().contribution(key) else {
+                        continue;
+                    };
+                    // A declaration no namespace reaches has no identity to establish, so
+                    // it leaves exact absence decidable.
+                    if contribution
+                        .source()
+                        .is_some_and(|source| self.semantics.outside_namespaces(source.unit()))
                     {
+                        continue;
+                    }
+                    if let Some(facts) = contribution.facts() {
                         declarations
                             .incomplete_languages
                             .insert(facts.language().identity_segment());
@@ -4232,7 +4234,7 @@ impl WorkspaceIndex {
         self.files.get(path).map(AsRef::as_ref)
     }
 
-    /// Parses one selected source path for a read, keeping its complete node table.
+    /// Parses one selected source path for a read, keeping its complete syntax element table.
     ///
     /// Returns `None` when no provider selects `path`, `Skipped` when a catalog or syntax
     /// bound leaves it out, and `Included` when parsing succeeds.
@@ -4241,10 +4243,10 @@ impl WorkspaceIndex {
     ///
     /// Returns [`RiftError`] when reading, path validation, or syntax analysis
     /// fails for a reason that does not leave the file out of the index.
-    pub fn parse_source_file_with_nodes(
+    pub fn parse_source_file_with_syntax_elements(
         &self,
         path: &ProjectPath,
-    ) -> Result<Option<IndexRead<IndexedFileNodes>>, RiftError> {
+    ) -> Result<Option<IndexRead<IndexedFileSyntax>>, RiftError> {
         let absolute = self.root.join(path.as_str());
         let Some(ClassifiedPath::Source(provider)) = self.language.classifies(&absolute)? else {
             return Ok(None);
@@ -4298,7 +4300,7 @@ impl WorkspaceIndex {
             text_file.executable(),
             syntax,
         );
-        Ok(Some(IndexRead::Included(IndexedFileNodes {
+        Ok(Some(IndexRead::Included(IndexedFileSyntax {
             file,
             document,
             warnings,
@@ -4372,7 +4374,7 @@ impl WorkspaceIndex {
         checked_chunk_bytes_max(self.text_chunk_bytes_max())
     }
 
-    /// Parses one held source file again and returns its document with the complete node
+    /// Parses one held source file again and returns its document with the complete syntax element
     /// table, which the index itself does not keep.
     ///
     /// The selected provider, framework context, and syntax bounds belong to this index.
@@ -4416,29 +4418,29 @@ impl WorkspaceIndex {
         Ok(Some(syntax))
     }
 
-    /// Resolves the node at one location: the innermost node spanning `range` exactly, or
-    /// under [`NodeMatch::Enclosing`] the innermost one containing it, addressed by its place
+    /// Resolves the syntax element at one location: the innermost syntax element spanning `range` exactly, or
+    /// under [`SyntaxMatch::Enclosing`] the innermost one containing it, addressed by its place
     /// inside its symbol or unit.
     ///
-    /// A held file without a syntax provider answers its file node, which spans the whole
-    /// file, alone. `None` when the index holds no file at `path` or no node matches.
+    /// A held file without a syntax provider answers its file syntax element, which spans the whole
+    /// file, alone. `None` when the index holds no file at `path` or no syntax element matches.
     ///
     /// # Errors
     ///
     /// Returns [`RiftError`] when the held file no longer parses under this index's provider
     /// and bounds, or the canonical declaration directory cannot be built.
-    pub fn node_at(
+    pub fn syntax_element_at(
         &self,
         path: &ProjectPath,
         range: ByteRange,
-        matching: NodeMatch,
-    ) -> Result<Option<LocatedNode>, RiftError> {
+        matching: SyntaxMatch,
+    ) -> Result<Option<LocatedSyntax>, RiftError> {
         if let Some(document) = self.syntax(path)? {
             let source = self.file(path).map_or("", IndexedFile::source);
             let declarations = (0..document.symbols().len())
                 .map(|position| self.declaration_address(path, position))
                 .collect::<Result<Vec<_>, _>>()?;
-            return Ok(LocatedNode::in_document(
+            return Ok(LocatedSyntax::in_document(
                 &document,
                 source,
                 &declarations,
@@ -4448,7 +4450,7 @@ impl WorkspaceIndex {
         }
         Ok(self
             .text_file(path)
-            .and_then(|file| LocatedNode::file(file.content(), range, matching)))
+            .and_then(|file| LocatedSyntax::file(file.content(), range, matching)))
     }
 
     /// Walks the workspace on demand for `.rs` files matching `force_include`'s globs that are
@@ -4832,10 +4834,10 @@ fn captured_project_semantics(
             phase = "WorkspaceSemantics::build_project_facts",
             files = 0,
             {
-                WorkspaceSemantics::build_project_facts_with_relationships(
+                WorkspaceSemantics::build_project_facts_with_edges(
                     std::iter::empty(),
                     limits.declarations_max(),
-                    limits.relationships_max(),
+                    limits.edges_max(),
                     revision,
                     previous,
                 )
@@ -4887,7 +4889,7 @@ fn captured_project_semantics(
         operation = "WorkspaceSemantics::build_project_facts",
         phase = "WorkspaceSemantics::build_project_facts",
         files = documents.len(),
-        { prepared.build(limits.relationships_max(), previous) }
+        { prepared.build(limits.edges_max(), previous) }
     )
     .map(|built| ProjectSemanticsAdmission::Built(Box::new(built)))
 }
@@ -6893,7 +6895,7 @@ fn symbol_document_key(file: &IndexedFile, limits: SyntaxLimits) -> SymbolDocume
         digest: file.digest(),
         language: file.syntax().language().identity_segment(),
         source_bytes_max: limits.source_bytes_max(),
-        syntax_nodes_max: limits.syntax_nodes_max(),
+        syntax_elements_max: limits.syntax_elements_max(),
         syntax_depth_max: limits.syntax_depth_max(),
     }
 }
@@ -7434,7 +7436,7 @@ mod tests {
         let syntax = limits.syntax();
         let changed_syntax = SyntaxLimits::new(
             syntax.source_bytes_max() - 1,
-            syntax.syntax_nodes_max(),
+            syntax.syntax_elements_max(),
             syntax.syntax_depth_max(),
         )
         .expect("changed syntax bound");
@@ -7636,7 +7638,7 @@ mod tests {
 
         let limits_changed = SyntaxLimits::new(
             limits.syntax().source_bytes_max(),
-            limits.syntax().syntax_nodes_max() - 1,
+            limits.syntax().syntax_elements_max() - 1,
             limits.syntax().syntax_depth_max(),
         )
         .expect("changed syntax bounds");
@@ -9056,7 +9058,7 @@ mod tests {
             )
             .expect("complete syntax parse");
         let expected = complete
-            .nodes_at(4)
+            .syntax_elements_at(4)
             .into_iter()
             .cloned()
             .collect::<Vec<_>>();
@@ -9064,13 +9066,13 @@ mod tests {
             index
                 .syntax(&path)
                 .map(|document| document.map(|document| document
-                    .nodes_at(4)
+                    .syntax_elements_at(4)
                     .into_iter()
                     .cloned()
                     .collect::<Vec<_>>()))
-                .expect("node parse"),
+                .expect("syntax element parse"),
             Some(expected),
-            "reparsed nodes preserve complete provider rows and order"
+            "reparsed syntax elements preserve complete provider rows and order"
         );
     }
 
@@ -10367,11 +10369,11 @@ mod tests {
             index
                 .syntax(&missing)
                 .map(|document| document.map(|document| document
-                    .nodes_at(0)
+                    .syntax_elements_at(0)
                     .into_iter()
                     .cloned()
                     .collect::<Vec<_>>()))
-                .expect("missing path has no node parse")
+                .expect("missing path has no syntax element parse")
                 .is_none()
         );
     }
@@ -11888,7 +11890,7 @@ mod tests {
             errors::index::workspace_provider().fail()
         }
 
-        fn node_facets(&self, _kind: &str) -> Vec<rift_protocol::read::NodeFacet> {
+        fn syntax_element_kinds(&self, _kind: &str) -> Vec<rift_protocol::read::SyntaxKind> {
             Vec::new()
         }
     }
@@ -14112,7 +14114,7 @@ mod tests {
             index.normalized_graph().references().is_empty(),
             "the syntax publication carries declarations alone"
         );
-        assert!(index.relationships().is_empty());
+        assert!(index.edges().is_empty());
     }
 
     #[test]

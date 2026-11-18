@@ -1,4 +1,4 @@
-//! Discover and rank simple directed paths around ranked symbols.
+//! Discover and rank paths of call edges around ranked symbols.
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -96,10 +96,11 @@ pub enum FlowCut {
     Steps,
 }
 
-/// One simple directed path and its aggregate ranking score.
+/// One path of directed call edges and its aggregate ranking score.
 #[derive(Debug, PartialEq)]
 pub struct FlowPath<Subject> {
     /// Ordered identities from the earliest reached caller to the final callee.
+    /// Each adjacent pair is a directed call edge.
     pub steps: Vec<Subject>,
     /// The strongest seed score plus one quarter of the second distinct seed score.
     pub score: f64,

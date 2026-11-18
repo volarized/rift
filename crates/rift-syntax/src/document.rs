@@ -4,14 +4,14 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use rift_core::{FileDigest, ProjectPath, is_portable_name};
-use rift_protocol::read::{Documentation, Language, Signature, SymbolFacet};
+use rift_protocol::read::{Documentation, Language, Signature, SymbolKind};
 
 use crate::markdown::MarkdownFacts;
 
-mod node_places;
 mod retained_size;
+mod syntax_element_places;
 
-pub use node_places::{NodeHolder, NodePlace};
+pub use syntax_element_places::{SyntaxHolder, SyntaxPlace};
 pub(crate) mod rust_macros;
 
 /// Half-open UTF-8 byte range.
@@ -37,25 +37,25 @@ impl ByteRange {
     }
 }
 
-/// How [`SyntaxDocument::node_at`] matches a byte range against the node table.
+/// How [`SyntaxDocument::syntax_element_at`] matches a byte range against the syntax element table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NodeMatch {
-    /// The node spans exactly the range.
+pub enum SyntaxMatch {
+    /// The syntax element spans exactly the range.
     Exact,
-    /// The node's span contains the range.
+    /// The syntax element's span contains the range.
     Enclosing,
 }
 
-/// One named syntax-tree node.
+/// One named syntax-tree syntax element.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SyntaxNode {
-    /// Grammar node kind, borrowed from the provider's static grammar names.
+pub struct SyntaxElement {
+    /// Grammar syntax element kind, borrowed from the provider's static grammar names.
     pub kind: &'static str,
-    /// Node byte range.
+    /// Syntax element byte range.
     pub range: ByteRange,
-    /// Parent index in the document node vector; `None` for the root.
+    /// Parent index in the document syntax element vector; `None` for the root.
     pub parent: Option<usize>,
-    /// Whether the parser marked the node erroneous or missing.
+    /// Whether the parser marked the syntax element erroneous or missing.
     pub has_error: bool,
 }
 
@@ -102,18 +102,18 @@ pub struct SyntaxSymbol {
     /// The provider's kind word, such as `function`, carried on the wire
     /// unchanged.
     pub kind: &'static str,
-    /// Grammar node kind for the exact declaration range, when one matches.
-    pub node_kind: Option<&'static str>,
+    /// Grammar syntax element kind for the exact declaration range, when one matches.
+    pub syntax_element_kind: Option<&'static str>,
     /// Portable categories this declaration falls into, in the provider's
     /// declared order.
-    pub facets: Vec<SymbolFacet>,
+    pub kinds: Vec<SymbolKind>,
     /// Authored visibility spelling, such as `pub(crate)`; `None` when the
     /// language states no visibility.
     pub visibility: Option<String>,
     /// Complete declaration byte range, extended over attached outer
     /// attributes and outer doc comments.
     pub range: ByteRange,
-    /// The item node's own byte range, excluding any attached outer
+    /// The item syntax element's own byte range, excluding any attached outer
     /// attributes and doc comments. Equal to `range` when nothing attaches.
     pub item_range: ByteRange,
     /// The grammar field naming this declaration, when the provider exposes one.
@@ -199,20 +199,20 @@ pub type MacroInvocation = (ByteRange, Vec<ByteRange>, Option<Vec<ByteRange>>);
 /// Original Rust scope range and optional complete direct child ranges.
 pub type Scope = (ByteRange, Option<Vec<ByteRange>>);
 
-/// Immutable syntax facts and complete named nodes shared by documents at different paths.
+/// Immutable syntax facts and complete named syntax elements shared by documents at different paths.
 ///
-/// The node table is present while the facts come straight from a parse and absent once an
+/// The syntax element table is present while the facts come straight from a parse and absent once an
 /// owner that keeps facts for long released it ([`SyntaxDocument::into_facts`]) or restored
 /// facts from storage.
 ///
-/// Equality leaves the node table out: the source digest and syntax bounds the facts carry
+/// Equality leaves the syntax element table out: the source digest and syntax bounds the facts carry
 /// decide it, so released or restored facts equal the parse they came from. `Eq` is not
 /// derived: [`SyntaxSymbol`] is not `Eq`.
 #[derive(Debug, Clone)]
 pub struct SyntaxFacts {
     origin: SyntaxOrigin,
     language: Language,
-    nodes: Option<Arc<[SyntaxNode]>>,
+    syntax_elements: Option<Arc<[SyntaxElement]>>,
     symbols: Vec<SyntaxSymbol>,
     left_out_symbols: Vec<SyntaxSymbol>,
     export_bindings: Option<Vec<SyntaxExportBinding>>,
@@ -231,7 +231,7 @@ impl PartialEq for SyntaxFacts {
         let Self {
             origin,
             language,
-            nodes: _,
+            syntax_elements: _,
             symbols,
             left_out_symbols,
             export_bindings,
@@ -263,7 +263,7 @@ impl PartialEq for SyntaxFacts {
 /// Immutable syntax facts for one source file and its project path.
 ///
 /// Cloning a document or placing its facts at another path shares its syntax facts.
-/// Equality compares the path, the facts, and the node tables.
+/// Equality compares the path, the facts, and the syntax element tables.
 #[derive(Debug, Clone)]
 pub struct SyntaxDocument {
     path: ProjectPath,
@@ -272,7 +272,9 @@ pub struct SyntaxDocument {
 
 impl PartialEq for SyntaxDocument {
     fn eq(&self, other: &Self) -> bool {
-        self.path == other.path && self.facts == other.facts && self.nodes() == other.nodes()
+        self.path == other.path
+            && self.facts == other.facts
+            && self.syntax_elements() == other.syntax_elements()
     }
 }
 
@@ -283,7 +285,7 @@ impl PartialEq for SyntaxDocument {
 /// [`SyntaxDocument::new`], so the rule holds for every language, and a document
 /// assembled again from numbered declarations numbers them the same way.
 ///
-/// One pass with one map lookup per declaration: the provider's node bound already
+/// One pass with one map lookup per declaration: the provider's syntax element bound already
 /// fixed how many declarations reach here, and no count passes the slice's length.
 fn number_declarations(symbols: &mut [SyntaxSymbol]) {
     let mut counts: HashMap<&str, usize> = HashMap::with_capacity(symbols.len());
@@ -299,7 +301,7 @@ fn number_declarations(symbols: &mut [SyntaxSymbol]) {
 }
 
 /// Keeps Contribution-admitted declarations in `symbols` and retains the full omitted facts.
-/// The provider's source and node bounds apply to both collections.
+/// The provider's source and syntax element bounds apply to both collections.
 fn leave_out_refused_names(symbols: &mut Vec<SyntaxSymbol>) -> Vec<SyntaxSymbol> {
     let mut left_out = Vec::new();
     for symbol in std::mem::take(symbols) {
@@ -329,11 +331,11 @@ impl SyntaxDocument {
     pub(crate) fn new(
         language: Language,
         path: ProjectPath,
-        nodes: Vec<SyntaxNode>,
+        syntax_elements: Vec<SyntaxElement>,
         symbols: Vec<SyntaxSymbol>,
         has_errors: bool,
     ) -> Self {
-        Self::assemble(language, path, nodes, symbols, has_errors, None)
+        Self::assemble(language, path, syntax_elements, symbols, has_errors, None)
     }
 
     /// Checks literal Rust function header tokens within the token and source byte bounds.
@@ -354,15 +356,15 @@ impl SyntaxDocument {
         language: Language,
         source: crate::SyntaxSource<'_>,
         limits: crate::SyntaxLimits,
-        nodes: Vec<SyntaxNode>,
+        syntax_elements: Vec<SyntaxElement>,
         mut symbols: Vec<SyntaxSymbol>,
         has_errors: bool,
     ) -> Self {
-        let mut invocations = Self::invocations(&language, &nodes);
+        let mut invocations = Self::invocations(&language, &syntax_elements);
         if let Some(invocations) = &mut invocations {
             rust_macros::capture(
                 source.text,
-                &nodes,
+                &syntax_elements,
                 invocations,
                 Some((&language, limits, &mut symbols)),
             );
@@ -371,7 +373,7 @@ impl SyntaxDocument {
         let mut document = Self::assemble(
             language,
             source.path.clone(),
-            nodes,
+            syntax_elements,
             symbols,
             has_errors,
             invocations,
@@ -380,34 +382,37 @@ impl SyntaxDocument {
         facts.source_digest = Some(FileDigest::of(source.text.as_bytes()));
         facts.scope = rust_macros::capture_scope(
             source.text,
-            facts.nodes.as_deref().unwrap_or_default(),
+            facts.syntax_elements.as_deref().unwrap_or_default(),
             has_errors,
         );
         facts.syntax_limits = Some(limits);
         document
     }
 
-    fn invocations(language: &Language, nodes: &[SyntaxNode]) -> Option<Vec<MacroInvocation>> {
+    fn invocations(
+        language: &Language,
+        syntax_elements: &[SyntaxElement],
+    ) -> Option<Vec<MacroInvocation>> {
         (language.name == "rust" && language.dialect.is_none()).then(|| {
-            nodes
+            syntax_elements
                 .iter()
-                .filter(|node| {
-                    node.kind == "macro_invocation"
-                        && node
+                .filter(|syntax_element| {
+                    syntax_element.kind == "macro_invocation"
+                        && syntax_element
                             .parent
-                            .and_then(|parent| nodes.get(parent))
+                            .and_then(|parent| syntax_elements.get(parent))
                             .is_some_and(|parent| {
                                 (parent.kind == "source_file" && parent.parent.is_none())
                                     || (parent.kind == "expression_statement"
                                         && parent
                                             .parent
-                                            .and_then(|root| nodes.get(root))
+                                            .and_then(|root| syntax_elements.get(root))
                                             .is_some_and(|root| {
                                                 root.kind == "source_file" && root.parent.is_none()
                                             }))
                             })
                 })
-                .map(|node| (node.range, Vec::new(), None))
+                .map(|syntax_element| (syntax_element.range, Vec::new(), None))
                 .collect()
         })
     }
@@ -415,19 +420,21 @@ impl SyntaxDocument {
     fn assemble(
         language: Language,
         path: ProjectPath,
-        nodes: Vec<SyntaxNode>,
+        syntax_elements: Vec<SyntaxElement>,
         mut symbols: Vec<SyntaxSymbol>,
         has_errors: bool,
         captured: Option<Vec<MacroInvocation>>,
     ) -> Self {
         number_declarations(&mut symbols);
-        let declaration_nodes = declaration_node_kinds(&nodes, &symbols);
+        let declaration_syntax_elements =
+            declaration_syntax_element_kinds(&syntax_elements, &symbols);
         for symbol in &mut symbols {
-            if symbol.node_kind.is_none() {
-                symbol.node_kind = declaration_nodes.get(&symbol.range).copied();
+            if symbol.syntax_element_kind.is_none() {
+                symbol.syntax_element_kind =
+                    declaration_syntax_elements.get(&symbol.range).copied();
             }
         }
-        let macro_invocations = captured.or_else(|| Self::invocations(&language, &nodes));
+        let macro_invocations = captured.or_else(|| Self::invocations(&language, &syntax_elements));
         let left_out_symbols = leave_out_refused_names(&mut symbols);
         let left_out_declarations = left_out_symbols.len();
         Self {
@@ -435,7 +442,7 @@ impl SyntaxDocument {
             facts: Arc::new(SyntaxFacts {
                 origin: SyntaxOrigin::Provider,
                 language,
-                nodes: Some(Arc::from(nodes)),
+                syntax_elements: Some(Arc::from(syntax_elements)),
                 symbols,
                 left_out_symbols,
                 export_bindings: None,
@@ -509,20 +516,20 @@ impl SyntaxDocument {
     pub(crate) fn with_source_witness(mut self, source: &str) -> Self {
         let facts = Arc::make_mut(&mut self.facts);
         facts.source_digest = Some(FileDigest::of(source.as_bytes()));
-        let nodes = facts.nodes.clone().unwrap_or_default();
+        let syntax_elements = facts.syntax_elements.clone().unwrap_or_default();
         if facts.language.name == "rust" && facts.language.dialect.is_none() {
-            facts.scope = rust_macros::capture_scope(source, &nodes, facts.has_errors);
+            facts.scope = rust_macros::capture_scope(source, &syntax_elements, facts.has_errors);
         }
         if let Some(invocations) = &mut facts.macro_invocations {
-            rust_macros::capture(source, &nodes, invocations, None);
+            rust_macros::capture(source, &syntax_elements, invocations, None);
         }
         self
     }
 
-    /// Returns every named syntax node in pre-order.
+    /// Returns every named syntax element in pre-order.
     #[must_use]
-    pub fn nodes(&self) -> &[SyntaxNode] {
-        self.facts.nodes().unwrap_or_default()
+    pub fn syntax_elements(&self) -> &[SyntaxElement] {
+        self.facts.syntax_elements().unwrap_or_default()
     }
 
     /// Returns extracted declarations in source order.
@@ -552,25 +559,32 @@ impl SyntaxDocument {
         self.facts.markdown_facts()
     }
 
-    /// Returns nodes covering byte position, outermost first.
+    /// Returns syntax elements covering byte position, outermost first.
     #[must_use]
-    pub fn nodes_at(&self, position: u64) -> Vec<&SyntaxNode> {
-        self.nodes()
+    pub fn syntax_elements_at(&self, position: u64) -> Vec<&SyntaxElement> {
+        self.syntax_elements()
             .iter()
-            .filter(|node| node.range.contains(position))
+            .filter(|syntax_element| syntax_element.range.contains(position))
             .collect()
     }
 
-    /// Returns the innermost node at `range`: the one spanning it exactly, or under
-    /// [`NodeMatch::Enclosing`] the one whose span contains it. `None` when no node matches.
+    /// Returns the innermost syntax element at `range`: the one spanning it exactly, or under
+    /// [`SyntaxMatch::Enclosing`] the one whose span contains it. `None` when no syntax element matches.
     ///
-    /// Pre-order lists every node after its ancestors, so the last match is the innermost.
+    /// Pre-order lists every syntax element after its ancestors, so the last match is the innermost.
     #[must_use]
-    pub fn node_at(&self, range: ByteRange, matching: NodeMatch) -> Option<&SyntaxNode> {
-        self.nodes().iter().rev().find(|node| match matching {
-            NodeMatch::Exact => node.range == range,
-            NodeMatch::Enclosing => node.range.encloses(range),
-        })
+    pub fn syntax_element_at(
+        &self,
+        range: ByteRange,
+        matching: SyntaxMatch,
+    ) -> Option<&SyntaxElement> {
+        self.syntax_elements()
+            .iter()
+            .rev()
+            .find(|syntax_element| match matching {
+                SyntaxMatch::Exact => syntax_element.range == range,
+                SyntaxMatch::Enclosing => syntax_element.range.encloses(range),
+            })
     }
 
     /// Clones the shared path-independent facts.
@@ -579,14 +593,14 @@ impl SyntaxDocument {
         Arc::clone(&self.facts)
     }
 
-    /// Returns shared path-independent facts with the complete node table released.
+    /// Returns shared path-independent facts with the complete syntax element table released.
     ///
-    /// An owner that keeps facts for long, such as an index, holds no node rows: a read that
+    /// An owner that keeps facts for long, such as an index, holds no syntax element rows: a read that
     /// needs them parses the captured bytes again under the same bounds.
     #[must_use]
     pub fn into_facts(mut self) -> Arc<SyntaxFacts> {
-        if self.facts.nodes.is_some() {
-            Arc::make_mut(&mut self.facts).nodes = None;
+        if self.facts.syntax_elements.is_some() {
+            Arc::make_mut(&mut self.facts).syntax_elements = None;
         }
         self.facts
     }
@@ -601,8 +615,8 @@ impl SyntaxFacts {
 
     /// Returns the complete named tree in pre-order, or `None` when these facts hold none.
     #[must_use]
-    pub fn nodes(&self) -> Option<&[SyntaxNode]> {
-        self.nodes.as_deref()
+    pub fn syntax_elements(&self) -> Option<&[SyntaxElement]> {
+        self.syntax_elements.as_deref()
     }
 
     /// Returns recorded export bindings, or `None` for unrecorded facts.
@@ -671,21 +685,21 @@ impl SyntaxFacts {
     }
 }
 
-fn declaration_node_kinds(
-    nodes: &[SyntaxNode],
+fn declaration_syntax_element_kinds(
+    syntax_elements: &[SyntaxElement],
     symbols: &[SyntaxSymbol],
 ) -> BTreeMap<ByteRange, &'static str> {
     let mut ranges = symbols
         .iter()
         .map(|symbol| symbol.range)
         .collect::<HashSet<_>>();
-    let mut declaration_nodes = BTreeMap::new();
-    for node in nodes {
-        if ranges.remove(&node.range) {
-            declaration_nodes.insert(node.range, node.kind);
+    let mut declaration_syntax_elements = BTreeMap::new();
+    for syntax_element in syntax_elements {
+        if ranges.remove(&syntax_element.range) {
+            declaration_syntax_elements.insert(syntax_element.range, syntax_element.kind);
         }
     }
-    declaration_nodes
+    declaration_syntax_elements
 }
 
 impl SyntaxDocument {
@@ -721,7 +735,7 @@ impl SyntaxFacts {
         Self {
             origin: parts.origin,
             language: parts.language,
-            nodes: None,
+            syntax_elements: None,
             symbols: parts.symbols,
             left_out_symbols: parts.left_out_symbols,
             export_bindings: parts.export_bindings,
@@ -776,8 +790,8 @@ mod tests {
             declaration_ordinal: 0,
             container: None,
             kind: "mapping_entry",
-            node_kind: None,
-            facets: Vec::new(),
+            syntax_element_kind: None,
+            kinds: Vec::new(),
             visibility: None,
             range,
             item_range: range,
@@ -813,7 +827,7 @@ mod tests {
 
         assert_eq!(document.language(), &language);
         assert_eq!(document.path(), &path);
-        assert!(document.nodes().is_empty());
+        assert!(document.syntax_elements().is_empty());
         assert!(document.symbols().is_empty());
         assert!(!document.has_errors());
     }
@@ -832,7 +846,7 @@ mod tests {
         assert!(Arc::ptr_eq(&first.facts, &second.facts));
         assert_eq!(second.language(), first.language());
         assert_eq!(second.source_digest(), first.source_digest());
-        assert_eq!(second.nodes(), first.nodes());
+        assert_eq!(second.syntax_elements(), first.syntax_elements());
         assert_eq!(second.symbols(), first.symbols());
         assert_eq!(second.has_errors(), first.has_errors());
         assert_eq!(
@@ -890,24 +904,24 @@ mod tests {
         assert_eq!(typescript.language().name, "typescript");
         assert_eq!(typescript.language().dialect, None);
         assert_ne!(placed.language(), typescript.language());
-        assert_eq!(placed.nodes(), tsx.nodes());
+        assert_eq!(placed.syntax_elements(), tsx.syntax_elements());
         assert_eq!(placed.symbols(), tsx.symbols());
     }
 
     #[test]
-    fn indexed_facts_release_node_table_and_keep_first_declaration_match() {
+    fn indexed_facts_release_syntax_element_table_and_keep_first_declaration_match() {
         let range = ByteRange { start: 7, end: 8 };
         let document = SyntaxDocument::new(
             language(),
             path(),
             vec![
-                SyntaxNode {
+                SyntaxElement {
                     kind: "first_kind",
                     range,
                     parent: None,
                     has_error: false,
                 },
-                SyntaxNode {
+                SyntaxElement {
                     kind: "second_kind",
                     range,
                     parent: Some(0),
@@ -917,19 +931,19 @@ mod tests {
             vec![symbol("entry", range.start)],
             false,
         );
-        let node_table = Arc::downgrade(
+        let syntax_element_table = Arc::downgrade(
             document
                 .facts
-                .nodes
+                .syntax_elements
                 .as_ref()
-                .expect("a parsed document holds its node table"),
+                .expect("a parsed document holds its syntax element table"),
         );
         assert_eq!(
             document
-                .nodes()
+                .syntax_elements()
                 .iter()
-                .find(|node| node.range == range)
-                .map(|node| node.kind),
+                .find(|syntax_element| syntax_element.range == range)
+                .map(|syntax_element| syntax_element.kind),
             Some("first_kind")
         );
 
@@ -937,10 +951,14 @@ mod tests {
         let facts = document.into_facts();
         assert_eq!(
             *facts, parsed,
-            "releasing the node table keeps the facts equal"
+            "releasing the syntax element table keeps the facts equal"
         );
-        assert!(parsed.nodes().is_some_and(|nodes| nodes.len() == 2));
-        assert_eq!(facts.nodes(), None);
+        assert!(
+            parsed
+                .syntax_elements()
+                .is_some_and(|syntax_elements| syntax_elements.len() == 2)
+        );
+        assert_eq!(facts.syntax_elements(), None);
         let heap = |facts: &SyntaxFacts| {
             get_size2::GetSize::get_heap_size_with_tracker(
                 facts,
@@ -948,16 +966,16 @@ mod tests {
             )
             .0
         };
-        let mut without_nodes = parsed.clone();
-        without_nodes.nodes = None;
+        let mut without_syntax_elements = parsed.clone();
+        without_syntax_elements.syntax_elements = None;
         assert_eq!(
             heap(&parsed),
-            heap(&without_nodes) + 2 * std::mem::size_of::<SyntaxNode>(),
-            "a held node table counts toward the retained bytes"
+            heap(&without_syntax_elements) + 2 * std::mem::size_of::<SyntaxElement>(),
+            "a held syntax element table counts toward the retained bytes"
         );
         drop(parsed);
-        assert!(node_table.upgrade().is_none());
-        assert_eq!(facts.symbols()[0].node_kind, Some("first_kind"));
+        assert!(syntax_element_table.upgrade().is_none());
+        assert_eq!(facts.symbols()[0].syntax_element_kind, Some("first_kind"));
     }
 
     /// A Rust document with a module nesting a function, beside a free function.
@@ -980,7 +998,7 @@ mod tests {
     }
 
     #[test]
-    fn documents_are_equal_when_path_facts_and_node_tables_agree() {
+    fn documents_are_equal_when_path_facts_and_syntax_element_tables_agree() {
         let path = ProjectPath::new("src/lib.rs").expect("valid path");
         let document = rust_document(&path, NESTED_SOURCE);
 
@@ -992,12 +1010,12 @@ mod tests {
 
         assert_eq!(document, rust_document(&path, NESTED_SOURCE));
         assert_ne!(document, moved, "the path differs");
-        assert_ne!(document, released, "the node table differs");
+        assert_ne!(document, released, "the syntax element table differs");
         assert_eq!(*document.facts(), *released.facts());
     }
 
     #[test]
-    fn node_at_answers_the_innermost_exact_or_enclosing_node() {
+    fn syntax_element_at_answers_the_innermost_exact_or_enclosing_syntax_element() {
         let path = ProjectPath::new("src/lib.rs").expect("valid path");
         let document = rust_document(&path, NESTED_SOURCE);
         let literal = range_of("1\n");
@@ -1007,19 +1025,19 @@ mod tests {
         };
 
         let exact = document
-            .node_at(literal, NodeMatch::Exact)
-            .expect("the literal node");
+            .syntax_element_at(literal, SyntaxMatch::Exact)
+            .expect("the literal syntax element");
         assert_eq!(exact.range, literal);
         assert_eq!(exact.kind, "integer_literal");
         let inside = ByteRange {
             start: literal.start,
             end: literal.start,
         };
-        assert_eq!(document.node_at(inside, NodeMatch::Exact), None);
+        assert_eq!(document.syntax_element_at(inside, SyntaxMatch::Exact), None);
         assert_eq!(
             document
-                .node_at(inside, NodeMatch::Enclosing)
-                .map(|node| node.kind),
+                .syntax_element_at(inside, SyntaxMatch::Enclosing)
+                .map(|syntax_element| syntax_element.kind),
             Some("integer_literal")
         );
         let function = declared(&document, "light").item_range;
@@ -1029,29 +1047,32 @@ mod tests {
         };
         assert_eq!(
             document
-                .node_at(across, NodeMatch::Enclosing)
-                .map(|node| node.range),
+                .syntax_element_at(across, SyntaxMatch::Enclosing)
+                .map(|syntax_element| syntax_element.range),
             Some(function)
         );
         let past = ByteRange {
             start: 0,
             end: NESTED_SOURCE.len() as u64 + 1,
         };
-        assert_eq!(document.node_at(past, NodeMatch::Enclosing), None);
+        assert_eq!(
+            document.syntax_element_at(past, SyntaxMatch::Enclosing),
+            None
+        );
     }
 
     #[test]
-    fn a_released_node_table_answers_no_node() {
+    fn a_released_syntax_element_table_answers_no_syntax_element() {
         let path = ProjectPath::new("src/lib.rs").expect("valid path");
         let document = rust_document(&path, NESTED_SOURCE);
         let released = SyntaxDocument {
             path: path.clone(),
             facts: document.into_facts(),
         };
-        assert!(released.nodes().is_empty());
-        assert!(released.node_places(|_, _| true).is_empty());
+        assert!(released.syntax_elements().is_empty());
+        assert!(released.syntax_element_places(|_, _| true).is_empty());
         assert_eq!(
-            released.node_at(ByteRange { start: 0, end: 1 }, NodeMatch::Enclosing),
+            released.syntax_element_at(ByteRange { start: 0, end: 1 }, SyntaxMatch::Enclosing),
             None
         );
     }

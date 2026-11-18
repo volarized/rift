@@ -118,9 +118,9 @@ fn angular_component_ownership_keeps_plain_html_and_package_boundaries() {
         if index != 3 {
             assert!(
                 document
-                    .nodes()
+                    .syntax_elements()
                     .iter()
-                    .any(|node| node.kind == "interpolation")
+                    .any(|syntax_element| syntax_element.kind == "interpolation")
             );
         }
     }
@@ -399,9 +399,11 @@ fn package_framework_publication_matches_fresh_supplied_and_restored_syntax() {
             let mut symbols = facts.symbols().to_vec();
             for symbol in &mut symbols {
                 symbol.kind = names.symbol_kind(symbol.kind).expect("symbol kind");
-                symbol.node_kind = symbol
-                    .node_kind
-                    .map(|kind| names.node_kind(kind).expect("node kind"));
+                symbol.syntax_element_kind = symbol.syntax_element_kind.map(|kind| {
+                    names
+                        .syntax_element_kind(kind)
+                        .expect("syntax element kind")
+                });
             }
             let facts = SyntaxFacts::from_parts(
                 text,
@@ -471,7 +473,7 @@ fn framework_application_checks_source_witness_and_aggregate_bounds() {
     let raw = provider.analyze(source, limits).expect("raw syntax");
     let limited = SyntaxLimits::new(
         source.text.len() - 1,
-        limits.syntax_nodes_max(),
+        limits.syntax_elements_max(),
         limits.syntax_depth_max(),
     )
     .expect("source bound");

@@ -31,7 +31,7 @@ const GRAMMAR_PREFIX: &str = "tree-sitter";
 
 /// The source the analysis depends on, relative to the repository root. A directory
 /// stands for every `.rs` file below it, because a publication's content is decided by
-/// the whole crate: which node a grammar calls a declaration, which name it exports, and
+/// the whole crate: which syntax element a grammar calls a declaration, which name it exports, and
 /// how a record is normalized and addressed. Vendored grammar inputs are named individually
 /// so generated C, headers, grammar metadata, and the package binding are also pinned.
 ///
@@ -381,7 +381,7 @@ mod tests {
             .iter()
             .filter_map(|source| source["path"].as_str())
             .collect();
-        // A grammar rule set decides which node is a declaration, and changes a
+        // A grammar rule set decides which syntax element is a declaration, and changes a
         // publication while the extraction source stays byte-identical.
         for expected in [
             "crates/rift-analysis/src/revision/manifest.rs",

@@ -68,7 +68,7 @@ def preparing_local(
     ...     assert preparing_local(mixed, selection="current")
     ...     assert not preparing_local(mixed)
     ...     assert not preparing_local({"warnings": [{"code": code, "unit": "rift://source/project/lib.rs"}]}, selection="current")
-    >>> for code in ("results_truncated", "global_response_invalid", "relationship_coverage_missing"):
+    >>> for code in ("results_truncated", "global_response_invalid", "edge_coverage_missing"):
     ...     mixed = {**pending, "warnings": [*pending["warnings"], {"code": code, "unit": "rift://source/project/lib.rs"}]}
     ...     assert not preparing_local(mixed, selection="current")
     """
@@ -158,7 +158,7 @@ async def settled_local(
     >>> answer, count = asyncio.run(read([committing], selection="current", request={"view": "0" * 64}))
     >>> answer is committing, count
     (True, 1)
-    >>> for code in ("results_truncated", "global_response_invalid", "relationship_coverage_missing", "unknown"):
+    >>> for code in ("results_truncated", "global_response_invalid", "edge_coverage_missing", "unknown"):
     ...     assert not preparing_local({**committing, "warnings": [*committing["warnings"], {"code": code}]}, selection="current")
     >>> terminal = {**committing, "warnings": [{"code": "lexical_ranking_unavailable", "detail": "the workspace search database could not be opened, so the answer was ranked by identifier matching alone; the server log names the open failure, and a restart retries it"}]}
     >>> answer, count = asyncio.run(read([terminal], selection="current"))
@@ -170,7 +170,7 @@ async def settled_local(
     >>> answer, count = asyncio.run(read([pending], selection="current", request={"view": "0" * 64}))
     >>> answer is pending, count
     (True, 1)
-    >>> answer, count = asyncio.run(read([pending], request={"query": "SELECT ?symbol { SERVICE <urn:rift:result:" + "0" * 64 + "> {} }"}))
+    >>> answer, count = asyncio.run(read([pending], request={"query": "SELECT ?symbol { ?symbol a :Symbol }", "page": 2}))
     >>> answer is pending, count
     (True, 1)
     >>> refused = {"outcome": "unavailable", "reason": "insufficient_coverage"}

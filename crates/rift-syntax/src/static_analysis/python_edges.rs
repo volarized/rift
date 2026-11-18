@@ -79,13 +79,13 @@ impl EdgePythonKinds {
         visited: Visited<'_, '_>,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
-        let node = visited.node();
-        let id = node.kind_id();
+        let syntax_element = visited.syntax_element();
+        let id = syntax_element.kind_id();
         if id == self.call {
-            if let Some(callee) = node.child_by_field_id(self.function) {
+            if let Some(callee) = syntax_element.child_by_field_id(self.function) {
                 facts
                     .calls
-                    .push(call(node, callee, self.edge_callee(callee)?)?);
+                    .push(call(syntax_element, callee, self.edge_callee(callee)?)?);
             }
         } else if self.definitions.contains(&id) {
             self.edge_definition(visited, facts)?;
@@ -94,7 +94,7 @@ impl EdgePythonKinds {
         } else if self.parameters.contains(&id) {
             self.edge_parameters(visited, facts)?;
         } else if self.assignment.contains(&id) {
-            if let Some(target) = node.child_by_field_id(self.left) {
+            if let Some(target) = syntax_element.child_by_field_id(self.left) {
                 self.edge_shadow(target, visited, facts)?;
             }
         } else if self.unsupported.contains(&id)
@@ -131,8 +131,8 @@ impl EdgePythonKinds {
         visited: Visited<'_, '_>,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
-        let node = visited.node();
-        let name = node.child_by_field_id(self.name.get());
+        let syntax_element = visited.syntax_element();
+        let name = syntax_element.child_by_field_id(self.name.get());
         let scope = edge_enclosing(visited, &self.scopes);
         if let Some((name, scope)) = name.zip(scope) {
             let kind = if scope.kind_id() == self.definitions[1] {
@@ -152,13 +152,13 @@ impl EdgePythonKinds {
         visited: Visited<'_, '_>,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
-        let node = visited.node();
+        let syntax_element = visited.syntax_element();
         let Some(scope) = edge_enclosing(visited, &self.scopes) else {
             return Ok(());
         };
-        let module = node.child_by_field_id(self.module);
-        let mut cursor = node.walk();
-        for imported in node.children_by_field_id(self.name, &mut cursor) {
+        let module = syntax_element.child_by_field_id(self.module);
+        let mut cursor = syntax_element.walk();
+        for imported in syntax_element.children_by_field_id(self.name, &mut cursor) {
             let (name, alias) = if imported.kind_id() == self.aliased {
                 (
                     imported.child_by_field_id(self.name.get()),
@@ -195,12 +195,12 @@ impl EdgePythonKinds {
         visited: Visited<'_, '_>,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
-        let node = visited.node();
-        let Some(scope) = visited.parent().map(Visited::node) else {
+        let syntax_element = visited.syntax_element();
+        let Some(scope) = visited.parent().map(Visited::syntax_element) else {
             return Ok(());
         };
-        let mut cursor = node.walk();
-        for parameter in node.named_children(&mut cursor) {
+        let mut cursor = syntax_element.walk();
+        for parameter in syntax_element.named_children(&mut cursor) {
             let name = if parameter.kind_id() == self.identifier {
                 Some(parameter)
             } else {
@@ -250,9 +250,9 @@ impl EdgePythonKinds {
 fn edge_enclosing<'tree>(visited: Visited<'_, 'tree>, kinds: &[u16]) -> Option<Node<'tree>> {
     let mut parent = visited.parent();
     while let Some(candidate) = parent {
-        let node = candidate.node();
-        if kinds.contains(&node.kind_id()) {
-            return Some(node);
+        let syntax_element = candidate.syntax_element();
+        if kinds.contains(&syntax_element.kind_id()) {
+            return Some(syntax_element);
         }
         parent = candidate.parent();
     }

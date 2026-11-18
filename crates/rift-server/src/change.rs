@@ -78,7 +78,7 @@ pub fn search_change(
     )?;
     order_change_hits(&mut results, params.order);
     let results_max_reached = bound_hits(&mut results, compared.head().results_max());
-    let (results, pagination) = page(results, params.page_index, limit);
+    let (results, pagination) = page(results, params.page, limit);
     let mut warnings = compared.warnings(results_max_reached);
     warnings.extend(object_warnings);
     Ok(SearchResult {
@@ -864,7 +864,7 @@ mod tests {
 
         let answer = fixture.search(&json!({
             "change": {"base": "baseline"},
-            "include": ["source"]
+            "include": {"source": true}
         }))?;
 
         assert_eq!(
@@ -1157,7 +1157,7 @@ mod tests {
 
         let answer = fixture.search(&json!({
             "change": {"base": "baseline", "head": {"kind": "working_tree"}},
-            "limit": 1
+            "max_results": 1
         }))?;
 
         let [ReadWarning::ChangeTruncated { detail, .. }, ..] = answer.warnings.as_slice() else {
@@ -1852,7 +1852,7 @@ mod tests {
 
         let answer = fixture.search(&json!({
             "change": {"base": "baseline"},
-            "include": ["score"]
+            "include": {"score": true}
         }))?;
 
         assert!(answer.results[0].score.is_none(), "{answer:?}");
@@ -1984,13 +1984,13 @@ mod tests {
         let error = fixture
             .search(&json!({
                 "change": {"base": "baseline"},
-                "traversal": {"direction": "incoming", "facets": ["calls"]}
+                "traversal": {"direction": "incoming", "kinds": ["calls"]}
             }))
             .expect_err("a walk beside a comparison must refuse");
 
         assert_eq!(error.slug(), errors::server::read_unsupported::SLUG);
         assert!(error.context().any(|(key, value)| {
-            key == "capability" && value == "relationship traversal beside a comparison"
+            key == "capability" && value == "edge traversal beside a comparison"
         }));
         Ok(())
     }

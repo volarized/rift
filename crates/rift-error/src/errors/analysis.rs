@@ -332,7 +332,7 @@ __rift_error_definition!(
 __rift_error_definition!(
     producer_range_unresolved,
     slug = "rift.analysis.producer_range_unresolved",
-    message = "producer fact range resolves to no node of its source unit: unit {unit}",
+    message = "producer fact range resolves to no syntax element of its source unit: unit {unit}",
     action = "name a byte range inside a source unit the publication carries and retry",
     fields = {
         end: required(unsigned),

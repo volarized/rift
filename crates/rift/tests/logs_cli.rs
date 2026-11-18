@@ -560,7 +560,7 @@ async fn repository_beacon(
         SELECT ?symbol ?name ?kind ?language ?revision ?start ?end ?source {
           ?symbol a :Symbol; :name "beacon"; :name ?name; :kind ?kind;
             :language ?language; :revision ?revision .
-          ?node :of ?symbol; :index 0; :source ?source;
+          ?syntax_element :of ?symbol; :index 0; :source ?source;
             :range [ :unit <rift://source/project/lib.rs>; :start ?start; :end ?end ] .
           FILTER(?language = "rust")
         }
@@ -625,16 +625,16 @@ async fn repository_beacon(
     let Some(RdfTerm::Literal { value: source, .. }) = row.get("source") else {
         return Err("captured source bytes".into());
     };
-    let nodes = proxied_call(
+    let syntax_elements = proxied_call(
         client,
-        "nodes",
+        "facets",
         &serde_json::json!({"symbol":identity,"revision":revision}),
     )
     .await?;
     assert_eq!(
-        nodes["declarations"][0]["source"]["text"],
+        syntax_elements["declarations"][0]["source"]["text"],
         source.as_str(),
-        "{nodes}"
+        "{syntax_elements}"
     );
     Ok(())
 }

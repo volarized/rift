@@ -169,10 +169,7 @@ mod tests {
                 }),
             }],
             warnings: Vec::new(),
-            pagination: Pagination {
-                page_index: 0,
-                total_pages: 1,
-            },
+            pagination: Pagination::new(1, 10, 1),
         }
     }
 
@@ -206,7 +203,7 @@ mod tests {
         );
         assert_eq!(value["languages"][0]["lsp"]["state"], json!("ready"));
         assert_eq!(value["source"][0]["path"], json!("src/view.tsx"));
-        assert_eq!(value["pagination"]["total_pages"], json!(1));
+        assert_eq!(value["pagination"]["pages"], json!(1));
     }
 
     #[test]

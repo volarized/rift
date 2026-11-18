@@ -7,8 +7,8 @@ use rift_core::{ProjectPath, SymbolId as CoreSymbolId};
 use rift_error::{RiftError, errors};
 use rift_lsp::{EngineSession, LineIndex, PositionEncoding, TreeRoot};
 use rift_protocol::read::{
-    ExactKind, Extensions, ReadWarning, Relationship, RelationshipDerivation, RelationshipFacet,
-    SymbolId, TraversalDirection,
+    Edge, EdgeDerivation, EdgeKind, ExactKind, Extensions, ReadWarning, SymbolId,
+    TraversalDirection,
 };
 use tokio::time::Instant;
 
@@ -18,7 +18,7 @@ use super::{
 };
 use crate::ReadService;
 use crate::engine::{EnginePool, EngineSlot, OutgoingAnswer};
-use crate::traversal::TRAVERSAL_NODES_MAX;
+use crate::traversal::TRAVERSAL_SYMBOLS_MAX;
 use lsp_types::{SymbolKind, TypeHierarchyItem};
 
 struct EdgeEngineReport {
@@ -37,10 +37,10 @@ pub async fn graph_heritage_edges(
     reads: &ReadService,
     engines: &EnginePool,
     seed: &SymbolId,
-    kind: RelationshipFacet,
+    kind: EdgeKind,
     direction: TraversalDirection,
     deadline: Instant,
-) -> Result<(Vec<Relationship>, Vec<ReadWarning>), RiftError> {
+) -> Result<(Vec<Edge>, Vec<ReadWarning>), RiftError> {
     let identity = CoreSymbolId::new(seed.as_str())?;
     let Some(declaration) = super::edge_declarations(reads, &identity)?
         .into_iter()
@@ -59,13 +59,13 @@ pub async fn graph_heritage_edges(
     )?;
     let implementation_kind = match declaration.symbol.kind {
         "trait_item" | "interface_declaration" | "interface" | "trait" => {
-            Some(RelationshipFacet::Implements)
+            Some(EdgeKind::Implements)
         }
         "class_declaration"
         | "class_definition"
         | "abstract_class_declaration"
         | "class"
-        | "abstract_class" => Some(RelationshipFacet::Extends),
+        | "abstract_class" => Some(EdgeKind::Extends),
         _ => None,
     };
     let report = match Box::pin(edge_engine_report(
@@ -111,9 +111,9 @@ fn edge_locations(
     reads: &ReadService,
     slot: &EngineSlot,
     seed: &SymbolId,
-    (kind, direction): (RelationshipFacet, TraversalDirection),
+    (kind, direction): (EdgeKind, TraversalDirection),
     report: EdgeEngineReport,
-) -> Result<Vec<Relationship>, RiftError> {
+) -> Result<Vec<Edge>, RiftError> {
     let identity = CoreSymbolId::new(seed.as_str())?;
     let roots = [
         TreeRoot::new(slot.workspace_root())?,
@@ -158,15 +158,15 @@ fn edge_locations(
     Ok(edges)
 }
 
-fn edge_protocol(from: SymbolId, to: SymbolId, kind: RelationshipFacet) -> Relationship {
-    Relationship {
+fn edge_protocol(from: SymbolId, to: SymbolId, kind: EdgeKind) -> Edge {
+    Edge {
         producer: None,
         from,
         to,
         kind: ExactKind(kind.as_ref().to_owned()),
-        facets: vec![kind],
+        kinds: vec![kind],
         occurrence: None,
-        derivation: RelationshipDerivation::Resolution,
+        derivation: EdgeDerivation::Resolution,
         confidence: None,
         extensions: Extensions::default(),
     }
@@ -178,8 +178,8 @@ fn edge_impl_header(
     path: &ProjectPath,
     range: Range,
     encoding: PositionEncoding,
-    kind: RelationshipFacet,
-    edges: &mut Vec<Relationship>,
+    kind: EdgeKind,
+    edges: &mut Vec<Edge>,
 ) -> Result<(), RiftError> {
     let Some(file) = reads.index().file(path) else {
         return Ok(());
@@ -189,10 +189,10 @@ fn edge_impl_header(
     let end = index.byte_offset(encoding, range.end)? as u64;
     let unit = rift_syntax::DocumentPlacement::project_path(path)?;
     for edge in reads
-        .relationships()
+        .edges()
         .incoming(target)
         .iter()
-        .filter(|edge| edge.facet() == kind && edge.occurrence().unit() == unit.unit())
+        .filter(|edge| edge.kind() == kind && edge.occurrence().unit() == unit.unit())
     {
         let occurrence = edge.occurrence().range();
         if start <= occurrence.start() && occurrence.end() <= end {
@@ -205,8 +205,8 @@ fn edge_impl_header(
 async fn edge_engine_report(
     slot: &EngineSlot,
     target: &ReferenceTarget,
-    kind: RelationshipFacet,
-    implementation_kind: Option<RelationshipFacet>,
+    kind: EdgeKind,
+    implementation_kind: Option<EdgeKind>,
     direction: TraversalDirection,
     deadline: Instant,
 ) -> Result<OutgoingAnswer<EdgeEngineReport>, RiftError> {
@@ -240,7 +240,7 @@ async fn edge_engine_report(
                 }
                 if session.capabilities().edges.type_hierarchy {
                     let prepared = session.prepare_type_edges(&path, position).await?;
-                    if prepared.len() > TRAVERSAL_NODES_MAX {
+                    if prepared.len() > TRAVERSAL_SYMBOLS_MAX {
                         return Err(graph_reference_coverage());
                     }
                     for item in prepared {
@@ -248,7 +248,7 @@ async fn edge_engine_report(
                             .await?;
                     }
                 }
-                if locations.len() > TRAVERSAL_NODES_MAX {
+                if locations.len() > TRAVERSAL_SYMBOLS_MAX {
                     return Err(graph_reference_coverage());
                 }
                 Ok(Some(EdgeEngineReport {
@@ -267,7 +267,7 @@ async fn edge_hierarchy_locations(
     session: &mut EngineSession,
     item: TypeHierarchyItem,
     direction: TraversalDirection,
-    kind: RelationshipFacet,
+    kind: EdgeKind,
     locations: &mut Vec<Location>,
 ) -> Result<(), RiftError> {
     let selected = item.kind;
@@ -275,7 +275,7 @@ async fn edge_hierarchy_locations(
         TraversalDirection::Outgoing => session.supertype_edges(item).await?,
         TraversalDirection::Incoming => session.subtype_edges(item).await?,
     };
-    if neighbors.len() > TRAVERSAL_NODES_MAX {
+    if neighbors.len() > TRAVERSAL_SYMBOLS_MAX {
         return Err(graph_reference_coverage());
     }
     for neighbor in neighbors {
@@ -284,9 +284,9 @@ async fn edge_hierarchy_locations(
             TraversalDirection::Incoming => (neighbor.kind, selected),
         };
         let edge = if source != SymbolKind::INTERFACE && target == SymbolKind::INTERFACE {
-            RelationshipFacet::Implements
+            EdgeKind::Implements
         } else {
-            RelationshipFacet::Extends
+            EdgeKind::Extends
         };
         if edge == kind {
             locations.push(Location {
@@ -294,7 +294,7 @@ async fn edge_hierarchy_locations(
                 range: neighbor.selection_range,
             });
         }
-        if locations.len() > TRAVERSAL_NODES_MAX {
+        if locations.len() > TRAVERSAL_SYMBOLS_MAX {
             return Err(graph_reference_coverage());
         }
     }

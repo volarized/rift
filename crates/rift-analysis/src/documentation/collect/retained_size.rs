@@ -93,10 +93,10 @@ impl GetSize for ExtractionCache {
 
     fn get_heap_size_with_tracker<T: GetSizeTracker>(&self, tracker: T) -> (usize, T) {
         let (bytes, tracker) = self.sources.get_heap_size_with_tracker(tracker);
-        let nodes = rift_protocol::btree_material_bytes::<
+        let syntax_elements = rift_protocol::btree_material_bytes::<
             rift_protocol::documentation::DocumentationContentIdentity,
             CachedSource,
         >(self.sources.len());
-        (bytes.saturating_add(nodes), tracker)
+        (bytes.saturating_add(syntax_elements), tracker)
     }
 }

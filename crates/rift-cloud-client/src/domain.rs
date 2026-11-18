@@ -10,7 +10,7 @@ use serde_json::Value;
 use crate::{
     HitLocation, PackageDocumentationHit, PackageIdentity, PackagePatternDeclaration,
     PackagePatternHit, PackageSearchHit, PackageSearchHitContributingField, PackageSearchItem,
-    SourceKind, SourceLocationKind, Symbol, SymbolFacet, SymbolOrigin, TextRange, TypeBinding,
+    SourceKind, SourceLocationKind, Symbol, SymbolKind, SymbolOrigin, TextRange, TypeBinding,
     TypeBindingOrigin, TypeBindingRole, TypeExpression, failure,
 };
 
@@ -604,12 +604,12 @@ fn convert_symbol(value: &Symbol) -> Result<rift_protocol::read::Symbol, RiftErr
         name: value.name.clone(),
         kind: rift_protocol::read::ExactKind::try_from(value.kind.clone())
             .map_err(|source| invalid_source("kind", source))?,
-        facets: value
-            .facets
+        kinds: value
+            .kinds
             .as_deref()
             .unwrap_or_default()
             .iter()
-            .map(convert_facet)
+            .map(convert_symbol_kind)
             .collect(),
         origin: convert_origin(value.origin.as_ref()),
         container: value.container.clone().map(rift_protocol::read::SymbolId),
@@ -681,39 +681,39 @@ fn convert_location(value: &SourceLocationKind) -> rift_protocol::read::SourceLo
     }
 }
 
-fn convert_facet(value: &SymbolFacet) -> rift_protocol::read::SymbolFacet {
-    use rift_protocol::read::SymbolFacet as Protocol;
+fn convert_symbol_kind(value: &SymbolKind) -> rift_protocol::read::SymbolKind {
+    use rift_protocol::read::SymbolKind as Protocol;
     match value {
-        SymbolFacet::Namespace => Protocol::Namespace,
-        SymbolFacet::Module => Protocol::Module,
-        SymbolFacet::TypeType => Protocol::Type,
-        SymbolFacet::Value => Protocol::Value,
-        SymbolFacet::Callable => Protocol::Callable,
-        SymbolFacet::Member => Protocol::Member,
-        SymbolFacet::MemberContainer => Protocol::MemberContainer,
-        SymbolFacet::Parameter => Protocol::Parameter,
-        SymbolFacet::TypeParameter => Protocol::TypeParameter,
-        SymbolFacet::Constructible => Protocol::Constructible,
-        SymbolFacet::Extensible => Protocol::Extensible,
-        SymbolFacet::Implementable => Protocol::Implementable,
-        SymbolFacet::Macro => Protocol::Macro,
-        SymbolFacet::Test => Protocol::Test,
-        SymbolFacet::Annotation => Protocol::Annotation,
-        SymbolFacet::Extension => Protocol::Extension,
-        SymbolFacet::Variant => Protocol::Variant,
-        SymbolFacet::Enumeration => Protocol::Enumeration,
-        SymbolFacet::Alias => Protocol::Alias,
-        SymbolFacet::Property => Protocol::Property,
-        SymbolFacet::Abstract => Protocol::Abstract,
-        SymbolFacet::Constructor => Protocol::Constructor,
-        SymbolFacet::Static => Protocol::Static,
-        SymbolFacet::Mutable => Protocol::Mutable,
-        SymbolFacet::Deprecated => Protocol::Deprecated,
-        SymbolFacet::Public => Protocol::Public,
-        SymbolFacet::Entrypoint => Protocol::Entrypoint,
-        SymbolFacet::Operator => Protocol::Operator,
-        SymbolFacet::Async => Protocol::Async,
-        SymbolFacet::Generator => Protocol::Generator,
+        SymbolKind::Namespace => Protocol::Namespace,
+        SymbolKind::Module => Protocol::Module,
+        SymbolKind::TypeType => Protocol::Type,
+        SymbolKind::Value => Protocol::Value,
+        SymbolKind::Callable => Protocol::Callable,
+        SymbolKind::Member => Protocol::Member,
+        SymbolKind::MemberContainer => Protocol::MemberContainer,
+        SymbolKind::Parameter => Protocol::Parameter,
+        SymbolKind::TypeParameter => Protocol::TypeParameter,
+        SymbolKind::Constructible => Protocol::Constructible,
+        SymbolKind::Extensible => Protocol::Extensible,
+        SymbolKind::Implementable => Protocol::Implementable,
+        SymbolKind::Macro => Protocol::Macro,
+        SymbolKind::Test => Protocol::Test,
+        SymbolKind::Annotation => Protocol::Annotation,
+        SymbolKind::Extension => Protocol::Extension,
+        SymbolKind::Variant => Protocol::Variant,
+        SymbolKind::Enumeration => Protocol::Enumeration,
+        SymbolKind::Alias => Protocol::Alias,
+        SymbolKind::Property => Protocol::Property,
+        SymbolKind::Abstract => Protocol::Abstract,
+        SymbolKind::Constructor => Protocol::Constructor,
+        SymbolKind::Static => Protocol::Static,
+        SymbolKind::Mutable => Protocol::Mutable,
+        SymbolKind::Deprecated => Protocol::Deprecated,
+        SymbolKind::Public => Protocol::Public,
+        SymbolKind::Entrypoint => Protocol::Entrypoint,
+        SymbolKind::Operator => Protocol::Operator,
+        SymbolKind::Async => Protocol::Async,
+        SymbolKind::Generator => Protocol::Generator,
     }
 }
 
@@ -945,7 +945,7 @@ mod tests {
                 format: crate::generated::DocumentationFormat::Markdown,
                 text: "Beacon docs".to_owned(),
             }]),
-            facets: Some(vec![SymbolFacet::Callable]),
+            kinds: Some(vec![SymbolKind::Callable]),
             ..Default::default()
         }
     }

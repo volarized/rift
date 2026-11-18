@@ -22,12 +22,15 @@ async fn test_edge_static_calls_agree_in_both_directions_and_with_flows() -> Tes
         format!("ASK {{ <{root}> :calls ?target . FILTER(?target = <{leaf}>) }}"),
         format!("ASK {{ ?caller :calls <{leaf}> . FILTER(?caller = <{root}>) }}"),
         format!(
-            "ASK {{ SERVICE :flows {{ ?flow :query 'zebraquartz'; :limit 1; :steps ?step . ?step :value <{root}> }} }}"
+            "ASK {{ SERVICE :flows {{ ?flow :query 'zebraquartz'; :max_results 1; :steps ?step . ?step :value <{root}> }} }}"
         ),
     ] {
         let params = QueryParams {
             query: text,
             language: QueryLanguage::Sparql,
+            page: 1,
+            max_results: 10,
+            revision: None,
         };
         let answer = query_after_population(&client, &params).await?;
         assert_eq!(
@@ -64,6 +67,9 @@ async fn test_edge_heritage_imports_aliases_and_outgoing_references_are_queryabl
         let params = QueryParams {
             query: text,
             language: QueryLanguage::Sparql,
+            page: 1,
+            max_results: 10,
+            revision: None,
         };
         let answer = query_after_population(&client, &params).await?;
         assert_eq!(
@@ -124,6 +130,9 @@ async fn test_edge_readiness_budget_reports_a_typed_warning_for_calls_and_struct
         let params = QueryParams {
             query: text,
             language: QueryLanguage::Sparql,
+            page: 1,
+            max_results: 10,
+            revision: None,
         };
         let answer = query_after_population(&client, &params).await?;
         let warnings = answer["warnings"]
@@ -171,6 +180,9 @@ async fn test_edge_rust_struct_usages_and_call_directions_agree_on_the_same_engi
     let usages = QueryParams {
         query: format!("SELECT ?usage ?kind {{ <{worker}> :usages ?usage . ?usage :kind ?kind }}"),
         language: QueryLanguage::Sparql,
+        page: 1,
+        max_results: 10,
+        revision: None,
     };
     let usages = query_after_population(&client, &usages).await?;
     assert!(
@@ -180,6 +192,9 @@ async fn test_edge_rust_struct_usages_and_call_directions_agree_on_the_same_engi
     let outgoing = QueryParams {
         query: format!("SELECT ?target {{ <{run}> :calls ?target }}"),
         language: QueryLanguage::Sparql,
+        page: 1,
+        max_results: 10,
+        revision: None,
     };
     let outgoing = query_after_population(&client, &outgoing).await?;
     let targets = workspace_client::query::rows(&outgoing)?;
@@ -189,6 +204,9 @@ async fn test_edge_rust_struct_usages_and_call_directions_agree_on_the_same_engi
         let incoming = QueryParams {
             query: format!("SELECT ?caller {{ ?caller :calls <{target}> }}"),
             language: QueryLanguage::Sparql,
+            page: 1,
+            max_results: 10,
+            revision: None,
         };
         let incoming = query_after_population(&client, &incoming).await?;
         assert!(
@@ -203,6 +221,9 @@ async fn test_edge_rust_struct_usages_and_call_directions_agree_on_the_same_engi
     let incoming = QueryParams {
         query: format!("SELECT ?caller {{ ?caller :calls <{trait_area}> }}"),
         language: QueryLanguage::Sparql,
+        page: 1,
+        max_results: 10,
+        revision: None,
     };
     let incoming = query_after_population(&client, &incoming).await?;
     let caller = workspace_client::query::rows(&incoming)?
@@ -320,6 +341,9 @@ async fn test_edge_cold_calls_wait_and_reference_answers_need_no_declaration_mar
             &QueryParams {
                 query,
                 language: QueryLanguage::Sparql,
+                page: 1,
+                max_results: 10,
+                revision: None,
             },
         )
         .await?;
@@ -334,6 +358,54 @@ async fn test_edge_cold_calls_wait_and_reference_answers_need_no_declaration_mar
             );
         }
     }
+    client.cancel().await?;
+    task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_edge_queries_page_targets_at_the_same_revision() -> TestResult {
+    let source =
+        "export function root() { alpha(); beta(); }\nfunction alpha() {}\nfunction beta() {}\n";
+    let (_directory, client, task) = served_workspace(&[("entry.mjs", source)], None).await?;
+    let root = captured_seed(&client, "root", "entry.mjs").await?;
+    let mut params = QueryParams {
+        query: format!("SELECT ?target {{ <{root}> :calls ?target }} ORDER BY ?target"),
+        language: QueryLanguage::Sparql,
+        page: 1,
+        max_results: 1,
+        revision: None,
+    };
+    let first = query_after_population(&client, &params).await?;
+    assert_eq!(
+        first["pagination"],
+        json!({"page": 1, "pages": 2, "max_results": 1, "total": 2}),
+        "{first}"
+    );
+    let revision = first["revision"].clone();
+    params.revision = Some(serde_json::from_value(revision.clone())?);
+    params.page = 2;
+    let second = query_after_population(&client, &params).await?;
+    assert_eq!(second["revision"], revision);
+    assert_eq!(
+        second["pagination"],
+        json!({"page": 2, "pages": 2, "max_results": 1, "total": 2}),
+        "{second}"
+    );
+    let first_target =
+        workspace_client::query::iri(&workspace_client::query::rows(&first)?[0], "target")?;
+    let second_target =
+        workspace_client::query::iri(&workspace_client::query::rows(&second)?[0], "target")?;
+    assert!(first_target < second_target, "{first}; {second}");
+    params.page = 3;
+    let empty = query_after_population(&client, &params).await?;
+    assert_eq!(empty["revision"], revision);
+    assert!(workspace_client::query::rows(&empty)?.is_empty(), "{empty}");
+    assert_eq!(
+        empty["pagination"],
+        json!({"page": 3, "pages": 2, "max_results": 1, "total": 2}),
+        "{empty}"
+    );
     client.cancel().await?;
     task.await?;
     Ok(())

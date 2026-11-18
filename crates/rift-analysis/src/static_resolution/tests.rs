@@ -79,7 +79,7 @@ fn test_edge_namespace_imports_resolve_calls_and_heritage() {
         result
             .occurrences
             .iter()
-            .any(|edge| edge.edge_kind == Some(rift_protocol::read::RelationshipFacet::Extends))
+            .any(|edge| edge.edge_kind == Some(rift_protocol::read::EdgeKind::Extends))
     );
 }
 

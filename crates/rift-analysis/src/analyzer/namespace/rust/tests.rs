@@ -91,6 +91,27 @@ fn selected_anchors_for_context(
     origin: &ContributionOrigin,
     library: bool,
 ) -> super::super::Anchors {
+    prepared_for_context(
+        metadata,
+        selected,
+        qualified_name,
+        restored_paths,
+        owner,
+        origin,
+        library,
+    )
+    .anchors
+}
+
+fn prepared_for_context(
+    metadata: &[(&str, &str)],
+    selected: &[(&str, &str)],
+    qualified_name: Option<&str>,
+    restored_paths: bool,
+    owner: &rift_protocol::identity::SymbolOwner,
+    origin: &ContributionOrigin,
+    library: bool,
+) -> super::super::PreparedNamespace {
     let language = rift_syntax::ShippedLanguage::Rust.language();
     let paths = selected
         .iter()
@@ -190,7 +211,7 @@ fn selected_anchors_for_context(
         .map(|path| physical_unit(owner, path))
         .collect::<Vec<_>>();
     assert_original_sources(&input, selected, &units);
-    super::prepare(&input, &admitted).anchors
+    super::prepare(&input, &admitted)
 }
 
 fn selected_library<'input>(
@@ -2470,8 +2491,8 @@ fn assert_local_alias(
         .expect("source-backed public alias");
     assert!(
         object
-            .facets
-            .contains(&rift_protocol::read::SymbolFacet::Alias)
+            .kinds
+            .contains(&rift_protocol::read::SymbolKind::Alias)
     );
     let binding = publication
         .declarations
@@ -2497,11 +2518,11 @@ fn assert_local_alias(
         .expect("owner-preserving identity");
     assert_eq!(identity.owner(), &publication.owner);
     let edge = publication
-        .relationships
+        .edges
         .iter()
         .find(|edge| {
             Some(&edge.from) == object.id.as_ref()
-                && edge.kind.0 == rift_protocol::read::RelationshipFacet::Aliases.as_ref()
+                && edge.kind.0 == rift_protocol::read::EdgeKind::Aliases.as_ref()
         })
         .expect("explicit alias target");
     assert_eq!(edge.to.as_str(), target);
@@ -2522,8 +2543,8 @@ fn assert_local_alias(
     assert!(publication.objects.iter().any(|object| {
         object.id.as_ref().is_some_and(|id| id.as_str() == target)
             && object
-                .facets
-                .contains(&rift_protocol::read::SymbolFacet::Type)
+                .kinds
+                .contains(&rift_protocol::read::SymbolKind::Type)
     }));
 }
 
@@ -2755,8 +2776,8 @@ fn assert_external_alias(publication: &rift_protocol::index::PackagePublication,
         .expect("original public reexport");
     assert!(
         object
-            .facets
-            .contains(&rift_protocol::read::SymbolFacet::Alias)
+            .kinds
+            .contains(&rift_protocol::read::SymbolKind::Alias)
     );
     assert_eq!(
         SymbolIdentity::parse(object.id.as_ref().expect("alias identity").as_str())
@@ -2784,11 +2805,11 @@ fn assert_external_alias(publication: &rift_protocol::index::PackagePublication,
     );
     assert!(binding.source.contains("pub use serde_core"));
     let edge = publication
-        .relationships
+        .edges
         .iter()
         .find(|edge| {
             Some(&edge.from) == object.id.as_ref()
-                && edge.kind.0 == rift_protocol::read::RelationshipFacet::Aliases.as_ref()
+                && edge.kind.0 == rift_protocol::read::EdgeKind::Aliases.as_ref()
         })
         .expect("explicit target binding");
     assert_eq!(edge.to.as_str(), target);
@@ -2834,7 +2855,7 @@ fn external_public_reexports_keep_original_alias_chain_and_defining_owner() {
     );
     assert_external_alias(source.publication(), "Serialize");
     assert!(
-        target.publication().relationships.iter().any(|edge| edge
+        target.publication().edges.iter().any(|edge| edge
             .from
             .as_str()
             .ends_with("/serde_core/Serialize")
@@ -2856,8 +2877,8 @@ fn external_public_reexports_without_admitted_target_remain_unresolved() {
     );
     assert!(!source.publication().objects.iter().any(|object| {
         object
-            .facets
-            .contains(&rift_protocol::read::SymbolFacet::Alias)
+            .kinds
+            .contains(&rift_protocol::read::SymbolKind::Alias)
     }));
 }
 
@@ -2879,8 +2900,8 @@ fn external_public_reexports_refuse_missing_target_and_opaque_source() {
         );
         assert!(!source.publication().objects.iter().any(|object| {
             object
-                .facets
-                .contains(&rift_protocol::read::SymbolFacet::Alias)
+                .kinds
+                .contains(&rift_protocol::read::SymbolKind::Alias)
         }));
     }
 }
@@ -2945,4 +2966,98 @@ fn cold_serde_original_public_reexports_keep_serde_core_owner() {
     for name in ["Deserialize", "Serialize"] {
         assert_external_alias(source.publication(), name);
     }
+}
+
+#[test]
+fn cargo_targets_other_than_the_library_and_their_modules_sit_outside_namespaces() {
+    let origin = ContributionOrigin::new(
+        Some(SourceLocation::Project { package: None }),
+        SourceKind::Authored,
+    )
+    .expect("selected project origin");
+    let manifest = "[package]\nname='app'\nversion='1.0.0'\nbuild='scripts/generate.rs'\n\
+                    [[test]]\nname='checks'\npath='checks/all.rs'\n[[bin]]\nname='named'\n";
+    let prepared = prepared_for_context(
+        &[
+            ("Cargo.toml", "[workspace]\nmembers=['crates/*']\n"),
+            ("crates/app/Cargo.toml", manifest),
+            ("crates/broken/Cargo.toml", "[package\nname='broken'\n"),
+        ],
+        &[
+            ("crates/app/src/lib.rs", "pub mod shared;\n"),
+            ("crates/app/src/shared.rs", "pub fn shared() {}\n"),
+            (
+                "crates/app/src/main.rs",
+                "mod cli;\nmod shared;\nfn main() {}\n",
+            ),
+            ("crates/app/src/cli.rs", "mod flags;\npub fn run() {}\n"),
+            ("crates/app/src/cli/flags.rs", "pub fn parse() {}\n"),
+            ("crates/app/src/bin/named.rs", "fn main() {}\n"),
+            (
+                "crates/app/src/bin/tool/main.rs",
+                "mod helper;\nfn main() {}\n",
+            ),
+            ("crates/app/src/bin/tool/helper.rs", "pub fn help() {}\n"),
+            ("crates/app/src/bin/tool/unused.rs", "pub fn unused() {}\n"),
+            ("crates/app/benches/deep/nested/main.rs", "fn main() {}\n"),
+            ("crates/app/scripts/generate.rs", "fn main() {}\n"),
+            ("crates/app/checks/all.rs", "fn checks() {}\n"),
+            ("crates/app/build.rs", "fn main() {}\n"),
+            ("crates/app/src/orphan.rs", "pub fn orphan() {}\n"),
+            ("crates/broken/src/main.rs", "fn main() {}\n"),
+        ],
+        None,
+        false,
+        &SymbolOwner::Local,
+        &origin,
+        false,
+    );
+    assert_eq!(
+        prepared
+            .outside_namespaces
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        [
+            "crates/app/build.rs",
+            "crates/app/checks/all.rs",
+            "crates/app/scripts/generate.rs",
+            "crates/app/src/bin/named.rs",
+            "crates/app/src/bin/tool/helper.rs",
+            "crates/app/src/bin/tool/main.rs",
+            "crates/app/src/cli.rs",
+            "crates/app/src/cli/flags.rs",
+            "crates/app/src/main.rs",
+        ]
+    );
+    assert!(prepared.anchors.contains_key("crates/app/src/shared.rs"));
+}
+
+#[test]
+fn a_target_that_failed_analysis_does_not_reach_its_modules() {
+    let origin = ContributionOrigin::new(
+        Some(SourceLocation::Project { package: None }),
+        SourceKind::Authored,
+    )
+    .expect("selected project origin");
+    let prepared = prepared_for_context(
+        &[("Cargo.toml", MANIFEST)],
+        &[
+            ("src/main.rs", "mod cli;\nfn main( {}\n"),
+            ("src/cli.rs", "pub fn run() {}\n"),
+        ],
+        None,
+        false,
+        &SymbolOwner::Local,
+        &origin,
+        false,
+    );
+    assert_eq!(
+        prepared
+            .outside_namespaces
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["src/main.rs"]
+    );
 }

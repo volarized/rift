@@ -118,12 +118,12 @@ pub(crate) fn exact_symbol(
     )
 }
 
-/// The nodes page a `/v1/nodes` answer carries. A problem answering 404 states that the
+/// The facets page a `/v1/facets` answer carries. A problem answering 404 states that the
 /// global API holds no declaration of `symbol`, which the local read refuses the same way.
-pub(crate) fn nodes(
+pub(crate) fn facets(
     response: RawResponse,
     symbol: &rift_protocol::read::SymbolId,
-) -> Result<Parsed<rift_protocol::read::NodesResult>, RiftError> {
+) -> Result<Parsed<rift_protocol::read::FacetsResult>, RiftError> {
     if response.status == reqwest::StatusCode::NOT_FOUND
         && crate::is_media(&response.meta, "application/problem+json")
     {
@@ -133,7 +133,7 @@ pub(crate) fn nodes(
     }
     exact_response(
         response,
-        contract::Endpoint::Nodes.operation_id(),
+        contract::Endpoint::Facets.operation_id(),
         &[200],
         |_, _| true,
     )
