@@ -269,7 +269,7 @@ Use the `include` object to select optional projections, such as
 | Member | Adds when `true` |
 | --- | --- |
 | `documentation` | Bounded documentation referring to the exact declaration |
-| `history` | The logical symbol's history edges: the commits that touched it and the symbols changed beside it |
+| `history` | The logical symbol's history edges: the commits that touched a project symbol and the symbols changed beside it, or the releases that changed a package or runtime symbol |
 
 The members combine; an omitted member is `false`, and an omitted `include` adds neither. A
 declaration's source comes from [`facets`](#tool-facets) with the symbol's `id`.
@@ -291,6 +291,21 @@ at most 32 of them; `co_changes_truncated` counts what either bound left out.
 
 The local server fills its history store in the background; an incomplete history answers
 `complete: false` until the store holds the selected revision.
+
+A package or runtime symbol has no commits in your project, so its `history` names releases
+instead. Rift reads it from the global API: the collected releases of the symbol's owner that
+introduced, changed, or removed its declaration, newest release first. Each edge names its
+release as a revision such as `rift://revision/cargo/crates.io/demo@1.0.0`:
+
+- `introduced_in_release` - the oldest collected release that declares the symbol
+- `changed_in_release` - the release changed the declaration from the collected release before
+  it; `change` names the part, as it does for `changed_in`
+- `removed_in_release` - the release no longer declares the symbol the release before it declared
+
+A release history carries no `co_changes` edges. `complete: false` means the history stopped
+before the oldest collected release of the owner.
+
+<ReadExample name="global-symbol-history" />
 
 `max_results` bounds returned declarations. Send `page` and the reported `revision` for
 later declarations. The server refuses a tree revision once the index serves another tree.

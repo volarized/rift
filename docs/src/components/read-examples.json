@@ -231,6 +231,80 @@
       }
     }
   },
+  "global-symbol-history": {
+    "tool": "get_symbol",
+    "arguments": {
+      "id": "rift://symbol/cargo/crates.io/demo/rust/demo/beacon",
+      "include": {
+        "history": true
+      }
+    },
+    "text": "\tfunction beacon\n\trift://source/cargo/crates.io/demo/src/lib.rs:2 · bytes 26..44\n\trift://symbol/cargo/crates.io/demo/rust/demo/beacon\n\tdependency rift://revision/cargo/crates.io/demo@1.0.0\n\n\thistory:\n\t\t1.0.0 · changed in release · body changed\n\t\t0.9.0 · introduced in release\nrelease 1.0.0\n",
+    "json": {
+      "outcome": "found",
+      "symbol": {
+        "id": "rift://symbol/cargo/crates.io/demo/rust/demo/beacon",
+        "language": "rust",
+        "name": "beacon",
+        "kind": "function",
+        "origin": {
+          "location": "dependency",
+          "package": {
+            "manager": "cargo",
+            "registry": "crates.io",
+            "name": "demo",
+            "version": "1.0.0"
+          },
+          "source_kind": "authored"
+        }
+      },
+      "revision": "rift://revision/cargo/crates.io/demo@1.0.0",
+      "declarations": [
+        {
+          "origin": {
+            "location": "dependency",
+            "package": {
+              "manager": "cargo",
+              "registry": "crates.io",
+              "name": "demo",
+              "version": "1.0.0"
+            },
+            "source_kind": "authored"
+          },
+          "unit": "rift://source/cargo/crates.io/demo/src/lib.rs",
+          "range": {
+            "start": 26,
+            "end": 44
+          },
+          "line": 2,
+          "signature_indices": [],
+          "type_indices": [],
+          "documentation_indices": []
+        }
+      ],
+      "pagination": {
+        "page": 1,
+        "pages": 1,
+        "max_results": 10,
+        "total": 1
+      },
+      "history": {
+        "symbol": "rift://symbol/cargo/crates.io/demo/rust/demo/beacon",
+        "edges": [
+          {
+            "edge": "changed_in_release",
+            "revision": "rift://revision/cargo/crates.io/demo@1.0.0",
+            "change": "body_changed"
+          },
+          {
+            "edge": "introduced_in_release",
+            "revision": "rift://revision/cargo/crates.io/demo@0.9.0"
+          }
+        ],
+        "complete": true
+      }
+    }
+  },
   "source-less-runtime": {
     "tool": "get_symbol",
     "arguments": {

@@ -111,6 +111,11 @@ symbol's history as edges. Each commit edge, a
 at in it. A `co_changes` edge names another symbol and the number of listed commits that changed
 both.
 
+A package or runtime symbol has no commits in the workspace, so its history comes from the global
+API as release edges: `introduced_in_release`, `changed_in_release`, or `removed_in_release`, each
+naming a release of the symbol's owner as a `rift://revision/cargo/crates.io/demo@1.0.0`
+revision. A release history carries no commit or `co_changes` edge.
+
 The history store keys each declaration change by the path and qualified name the commit held. A
 [`SymbolId`](/docs/developer/protocol/reference#SymbolId) depends on the module layout of the tree
 that holds the declaration, so the server binds those keys to symbols through the served tree: a

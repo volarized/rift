@@ -424,6 +424,20 @@ left out nothing.
 still filling ended the history before the repository's first commit. When the store did not
 open, the server walks Git per request instead, and that history carries no `co_changes` edge.
 
+A package or runtime symbol's `history` comes from the global API and names releases in place
+of commits. Its edges come newest release first: `introduced_in_release` for the oldest
+collected release that declares the symbol, `changed_in_release` with a `change` for a release
+that changed the declaration from the collected release before it, and `removed_in_release` for
+a release that no longer declares it. Each names its release as a
+`rift://revision/<manager>/<registry>/<name>@<version>` or
+`rift://revision/stdlib/<runtime>@<version>` revision of the symbol's owner.
+
+A release history carries no commit edge, no `co_changes` edge, and no `co_changes_truncated`.
+The server **MUST** treat a global API answer that breaks this, or a `found` answer that omits
+the requested history, as invalid and fail the read. `complete: false` means the history ended
+before the oldest collected release of the owner, and a project symbol's history carries no
+release edge.
+
 ### Symbol ownership [#get_symbol-scope]
 
 A `local:name` owner in a symbol identity selects a profile defined in the root configuration.
@@ -446,6 +460,8 @@ its `revision`. The declaration's `unit` keeps the physical defining owner even 
 owner differs.
 
 <ReadExample name="global-symbol-documentation" />
+
+<ReadExample name="global-symbol-history" />
 
 `revision` selects the [revision](#revision-reads) to read, and the answer carries the revision
 it was read at. For a package or runtime identity it names a release of that identity's owner.
