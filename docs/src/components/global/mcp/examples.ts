@@ -128,6 +128,23 @@ export const GLOBAL_EXAMPLES: Record<string, ToolExample[]> = {
       arguments: { id: "rift://symbol/stdlib/node/javascript/fs/readFile" },
     },
   ],
+  facets: [
+    {
+      label: "Rust struct",
+      arguments: { symbol: ITOA_BUFFER, revision: ITOA_REVISION },
+    },
+    {
+      label: "Rust method",
+      arguments: { symbol: `${ITOA_BUFFER}/new`, revision: ITOA_REVISION },
+    },
+    {
+      label: "Python method",
+      arguments: {
+        symbol: "rift://symbol/pypi/pypi.org/requests/python/requests/sessions/Session/get",
+      },
+    },
+  ],
+  // A server from before `facets` lists `nodes` in its place.
   nodes: [
     {
       label: "Declaration source",

@@ -296,7 +296,7 @@ fn source_is_valid(syntax: &SyntaxFacts, source: &str) -> bool {
 
 fn module_has_default_path(symbol: &rift_syntax::SyntaxSymbol) -> bool {
     symbol.kind == "module"
-        && matches!(symbol.node_kind, None | Some("mod_item"))
+        && matches!(symbol.syntax_element_kind, None | Some("mod_item"))
         && symbol.module_path == Some(rift_syntax::RustModulePath::Absent)
 }
 
@@ -322,7 +322,7 @@ fn module_paths(
     let mut children = Vec::new();
     for symbol in syntax.symbols() {
         if symbol.kind != "module"
-            || !matches!(symbol.node_kind, None | Some("mod_item"))
+            || !matches!(symbol.syntax_element_kind, None | Some("mod_item"))
             || !matches!(
                 symbol.module_path,
                 Some(
@@ -652,7 +652,7 @@ fn local_exports(
 ) {
     let Some(work_max) = input
         .syntax()
-        .syntax_nodes_max()
+        .syntax_elements_max()
         .checked_mul(input.syntax().syntax_depth_max())
     else {
         prepared.unresolved_exports = !requested.is_empty();

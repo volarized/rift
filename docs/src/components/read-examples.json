@@ -4,7 +4,7 @@
     "arguments": {
       "id": "rift://symbol/local/rust/example_project/config/load_config"
     },
-    "text": "\tpub fn load_config(path: &Path) -> Result<Config, ConfigError>\n\tsrc/config.rs:11 \u00b7 bytes 218..355\n\trift://symbol/local/rust/example_project/config/load_config\n\n\tLoads the workspace configuration from `rift.toml`.\n",
+    "text": "\tpub fn load_config(path: &Path) -> Result<Config, ConfigError>\n\tsrc/config.rs:11 · bytes 218..355\n\trift://symbol/local/rust/example_project/config/load_config\n\n\tLoads the workspace configuration from `rift.toml`.\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -12,7 +12,7 @@
         "language": "rust",
         "name": "load_config",
         "kind": "function",
-        "facets": ["value", "callable", "public"],
+        "kinds": ["value", "callable", "public"],
         "visibility": "pub",
         "signatures": [
           {
@@ -52,7 +52,7 @@
     "arguments": {
       "id": "rift://symbol/local@sdk/rust/docs_sdk/load_config"
     },
-    "text": "\tpub fn load_config() -> u32\n\tsrc/lib.rs:2 \u00b7 bytes 25..62\n\trift://symbol/local@sdk/rust/docs_sdk/load_config\n\n\tLoads configuration.\n",
+    "text": "\tpub fn load_config() -> u32\n\tsrc/lib.rs:2 · bytes 25..62\n\trift://symbol/local@sdk/rust/docs_sdk/load_config\n\n\tLoads configuration.\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -60,7 +60,7 @@
         "language": "rust",
         "name": "load_config",
         "kind": "function",
-        "facets": ["value", "callable", "public"],
+        "kinds": ["value", "callable", "public"],
         "visibility": "pub",
         "signatures": [
           {
@@ -100,7 +100,7 @@
     "arguments": {
       "id": "rift://symbol/local/rust/example_project/config/load_configs"
     },
-    "text": "\tunavailable \u00b7 InsufficientCoverage\n\trift://symbol/local/rust/example_project/config/load_configs\n",
+    "text": "\tunavailable · InsufficientCoverage\n\trift://symbol/local/rust/example_project/config/load_configs\n",
     "json": {
       "outcome": "unavailable",
       "id": "rift://symbol/local/rust/example_project/config/load_configs",
@@ -112,468 +112,19 @@
     "arguments": {
       "id": "rift://symbol/rust/src/lib.rs/load_config"
     },
-    "text": "1 error\n\tinvalid_request \u00b7 retry never\n\t\ttool arguments do not match the served schema: accepted rift://symbol/<owner>/<language>/<qualified_path>, example {\"id\":\"rift://symbol/local/rust/example_project/config/Config\"}, {\"id\":\"rift://symbol/local/rust/example_project/config/load_config\"}, field id, tool get_symbol; correct the reported field and resend the request\n\t\trift.mcp.parameter_invalid\n",
+    "text": "1 error\n\tinvalid_request · retry never\n\t\ttool arguments do not match the served schema: accepted rift://symbol/<owner>/<language>/<qualified_path>, example {\"id\":\"rift://symbol/local/rust/example_project/config/Config\"}, {\"id\":\"rift://symbol/local/rust/example_project/config/load_config\"}, field id, tool get_symbol; correct the reported field and resend the request\n\t\trift.mcp.parameter_invalid\n",
     "json": null
-  },
-  "local-nodes": {
-    "tool": "nodes",
-    "arguments": {
-      "path": "src/config.rs",
-      "position": 338,
-      "syntax": true
-    },
-    "text": "30 nodes | rift://symbol/local/rust/example_project/config/load_config\n\tfunction_item | bytes 218..355 | declaration 0 | index 0 | 4 lines\n\tvisibility_modifier | bytes 218..221 | declaration 0 | index 1 | parent 0\n\tidentifier | bytes 225..236 | declaration 0 | index 2 | parent 0\n\tparameters | bytes 236..249 | declaration 0 | index 3 | parent 0\n\tparameter | bytes 237..248 | declaration 0 | index 4 | parent 3\n\tidentifier | bytes 237..241 | declaration 0 | index 5 | parent 4\n\treference_type | bytes 243..248 | declaration 0 | index 6 | parent 4\n\ttype_identifier | bytes 244..248 | declaration 0 | index 7 | parent 6\n\tgeneric_type | bytes 253..280 | declaration 0 | index 8 | parent 0\n\ttype_identifier | bytes 253..259 | declaration 0 | index 9 | parent 8\n\ttype_arguments | bytes 259..280 | declaration 0 | index 10 | parent 8\n\ttype_identifier | bytes 260..266 | declaration 0 | index 11 | parent 10\n\ttype_identifier | bytes 268..279 | declaration 0 | index 12 | parent 10\n\tblock | bytes 281..355 | declaration 0 | index 13 | parent 0 | 4 lines\n\tlet_declaration | bytes 287..329 | declaration 0 | index 14 | parent 13\n\tidentifier | bytes 291..295 | declaration 0 | index 15 | parent 14\n\ttry_expression | bytes 298..328 | declaration 0 | index 16 | parent 14\n\tcall_expression | bytes 298..327 | declaration 0 | index 17 | parent 16\n\tscoped_identifier | bytes 298..321 | declaration 0 | index 18 | parent 17\n\tscoped_identifier | bytes 298..305 | declaration 0 | index 19 | parent 18\n\tidentifier | bytes 298..301 | declaration 0 | index 20 | parent 19\n\tidentifier | bytes 303..305 | declaration 0 | index 21 | parent 19\n\tidentifier | bytes 307..321 | declaration 0 | index 22 | parent 18\n\targuments | bytes 321..327 | declaration 0 | index 23 | parent 17\n\tidentifier | bytes 322..326 | declaration 0 | index 24 | parent 23\n\tcall_expression | bytes 334..353 | declaration 0 | index 25 | parent 13\n\tidentifier | bytes 334..346 | declaration 0 | index 26 | parent 25\n\targuments | bytes 346..353 | declaration 0 | index 27 | parent 25\n\treference_expression | bytes 347..352 | declaration 0 | index 28 | parent 27\n\tidentifier | bytes 348..352 | declaration 0 | index 29 | parent 28\n\n\t\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n\t\t    let text = std::fs::read_to_string(path)?;\n\t\t    parse_config(&text)\n\t\t}\nrevision rift://revision/tree/da468b1f6aaf5252720697b456b49d5e6c3761855849e4ff1c650ae92267da57\n",
-    "json": {
-      "symbol": "rift://symbol/local/rust/example_project/config/load_config",
-      "nodes": [
-        {
-          "declaration": 0,
-          "index": 0,
-          "unit": "rift://source/project/src/config.rs",
-          "language": "rust",
-          "kind": "function_item",
-          "facets": ["declaration", "definition"],
-          "range": {
-            "start": 218,
-            "end": 355
-          },
-          "source": "pub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}"
-        },
-        {
-          "declaration": 0,
-          "index": 1,
-          "unit": "rift://source/project/src/config.rs",
-          "language": "rust",
-          "kind": "visibility_modifier",
-          "range": {
-            "start": 218,
-            "end": 221
-          },
-          "source": "pub",
-          "parent": 0
-        },
-        {
-          "declaration": 0,
-          "index": 2,
-          "unit": "rift://source/project/src/config.rs",
-          "language": "rust",
-          "kind": "identifier",
-          "range": {
-            "start": 225,
-            "end": 236
-          },
-          "source": "load_config",
-          "parent": 0
-        },
-        {
-          "declaration": 0,
-          "index": 3,
-          "unit": "rift://source/project/src/config.rs",
-          "language": "rust",
-          "kind": "parameters",
-          "range": {
-            "start": 236,
-            "end": 249
-          },
-          "source": "(path: &Path)",
-          "parent": 0
-        },
-        {
-          "declaration": 0,
-          "index": 4,
-          "unit": "rift://source/project/src/config.rs",
-          "language": "rust",
-          "kind": "parameter",
-          "range": {
-            "start": 237,
-            "end": 248
-          },
-          "source": "path: &Path",
-          "parent": 3
-        },
-        {
-          "declaration": 0,
-          "index": 5,
-          "unit": "rift://source/project/src/config.rs",
-          "language": "rust",
-          "kind": "identifier",
-          "range": {
-            "start": 237,
-            "end": 241
-          },
-          "source": "path",
-          "parent": 4
-        },
-        {
-          "declaration": 0,
-          "index": 6,
-          "unit": "rift://source/project/src/config.rs",
-          "language": "rust",
-          "kind": "reference_type",
-          "range": {
-            "start": 243,
-            "end": 248
-          },
-          "source": "&Path",
-          "parent": 4
-        },
-        {
-          "declaration": 0,
-          "index": 7,
-          "unit": "rift://source/project/src/config.rs",
-          "language": "rust",
-          "kind": "type_identifier",
-          "range": {
-            "start": 244,
-            "end": 248
-          },
-          "source": "Path",
-          "parent": 6
-        },
-        {
-          "declaration": 0,
-          "index": 8,
-          "unit": "rift://source/project/src/config.rs",
-          "language": "rust",
-          "kind": "generic_type",
-          "range": {
-            "start": 253,
-            "end": 280
-          },
-          "source": "Result<Config, ConfigError>",
-          "parent": 0
-        },
-        {
-          "declaration": 0,
-          "index": 9,
-          "unit": "rift://source/project/src/config.rs",
-          "language": "rust",
-          "kind": "type_identifier",
-          "range": {
-            "start": 253,
-            "end": 259
-          },
-          "source": "Result",
-          "parent": 8
-        },
-        {
-          "declaration": 0,
-          "index": 10,
-          "unit": "rift://source/project/src/config.rs",
-          "language": "rust",
-          "kind": "type_arguments",
-          "range": {
-            "start": 259,
-            "end": 280
-          },
-          "source": "<Config, ConfigError>",
-          "parent": 8
-        },
-        {
-          "declaration": 0,
-          "index": 11,
-          "unit": "rift://source/project/src/config.rs",
-          "language": "rust",
-          "kind": "type_identifier",
-          "range": {
-            "start": 260,
-            "end": 266
-          },
-          "source": "Config",
-          "parent": 10
-        },
-        {
-          "declaration": 0,
-          "index": 12,
-          "unit": "rift://source/project/src/config.rs",
-          "language": "rust",
-          "kind": "type_identifier",
-          "range": {
-            "start": 268,
-            "end": 279
-          },
-          "source": "ConfigError",
-          "parent": 10
-        },
-        {
-          "declaration": 0,
-          "index": 13,
-          "unit": "rift://source/project/src/config.rs",
-          "language": "rust",
-          "kind": "block",
-          "range": {
-            "start": 281,
-            "end": 355
-          },
-          "source": "{\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
-          "parent": 0
-        },
-        {
-          "declaration": 0,
-          "index": 14,
-          "unit": "rift://source/project/src/config.rs",
-          "language": "rust",
-          "kind": "let_declaration",
-          "facets": ["declaration", "definition"],
-          "range": {
-            "start": 287,
-            "end": 329
-          },
-          "source": "let text = std::fs::read_to_string(path)?;",
-          "parent": 13
-        },
-        {
-          "declaration": 0,
-          "index": 15,
-          "unit": "rift://source/project/src/config.rs",
-          "language": "rust",
-          "kind": "identifier",
-          "range": {
-            "start": 291,
-            "end": 295
-          },
-          "source": "text",
-          "parent": 14
-        },
-        {
-          "declaration": 0,
-          "index": 16,
-          "unit": "rift://source/project/src/config.rs",
-          "language": "rust",
-          "kind": "try_expression",
-          "facets": ["expression"],
-          "range": {
-            "start": 298,
-            "end": 328
-          },
-          "source": "std::fs::read_to_string(path)?",
-          "parent": 14
-        },
-        {
-          "declaration": 0,
-          "index": 17,
-          "unit": "rift://source/project/src/config.rs",
-          "language": "rust",
-          "kind": "call_expression",
-          "facets": ["expression"],
-          "range": {
-            "start": 298,
-            "end": 327
-          },
-          "source": "std::fs::read_to_string(path)",
-          "parent": 16
-        },
-        {
-          "declaration": 0,
-          "index": 18,
-          "unit": "rift://source/project/src/config.rs",
-          "language": "rust",
-          "kind": "scoped_identifier",
-          "range": {
-            "start": 298,
-            "end": 321
-          },
-          "source": "std::fs::read_to_string",
-          "parent": 17
-        },
-        {
-          "declaration": 0,
-          "index": 19,
-          "unit": "rift://source/project/src/config.rs",
-          "language": "rust",
-          "kind": "scoped_identifier",
-          "range": {
-            "start": 298,
-            "end": 305
-          },
-          "source": "std::fs",
-          "parent": 18
-        },
-        {
-          "declaration": 0,
-          "index": 20,
-          "unit": "rift://source/project/src/config.rs",
-          "language": "rust",
-          "kind": "identifier",
-          "range": {
-            "start": 298,
-            "end": 301
-          },
-          "source": "std",
-          "parent": 19
-        },
-        {
-          "declaration": 0,
-          "index": 21,
-          "unit": "rift://source/project/src/config.rs",
-          "language": "rust",
-          "kind": "identifier",
-          "range": {
-            "start": 303,
-            "end": 305
-          },
-          "source": "fs",
-          "parent": 19
-        },
-        {
-          "declaration": 0,
-          "index": 22,
-          "unit": "rift://source/project/src/config.rs",
-          "language": "rust",
-          "kind": "identifier",
-          "range": {
-            "start": 307,
-            "end": 321
-          },
-          "source": "read_to_string",
-          "parent": 18
-        },
-        {
-          "declaration": 0,
-          "index": 23,
-          "unit": "rift://source/project/src/config.rs",
-          "language": "rust",
-          "kind": "arguments",
-          "range": {
-            "start": 321,
-            "end": 327
-          },
-          "source": "(path)",
-          "parent": 17
-        },
-        {
-          "declaration": 0,
-          "index": 24,
-          "unit": "rift://source/project/src/config.rs",
-          "language": "rust",
-          "kind": "identifier",
-          "range": {
-            "start": 322,
-            "end": 326
-          },
-          "source": "path",
-          "parent": 23
-        },
-        {
-          "declaration": 0,
-          "index": 25,
-          "unit": "rift://source/project/src/config.rs",
-          "language": "rust",
-          "kind": "call_expression",
-          "facets": ["expression"],
-          "range": {
-            "start": 334,
-            "end": 353
-          },
-          "source": "parse_config(&text)",
-          "parent": 13
-        },
-        {
-          "declaration": 0,
-          "index": 26,
-          "unit": "rift://source/project/src/config.rs",
-          "language": "rust",
-          "kind": "identifier",
-          "range": {
-            "start": 334,
-            "end": 346
-          },
-          "source": "parse_config",
-          "parent": 25
-        },
-        {
-          "declaration": 0,
-          "index": 27,
-          "unit": "rift://source/project/src/config.rs",
-          "language": "rust",
-          "kind": "arguments",
-          "range": {
-            "start": 346,
-            "end": 353
-          },
-          "source": "(&text)",
-          "parent": 25
-        },
-        {
-          "declaration": 0,
-          "index": 28,
-          "unit": "rift://source/project/src/config.rs",
-          "language": "rust",
-          "kind": "reference_expression",
-          "facets": ["expression"],
-          "range": {
-            "start": 347,
-            "end": 352
-          },
-          "source": "&text",
-          "parent": 27
-        },
-        {
-          "declaration": 0,
-          "index": 29,
-          "unit": "rift://source/project/src/config.rs",
-          "language": "rust",
-          "kind": "identifier",
-          "range": {
-            "start": 348,
-            "end": 352
-          },
-          "source": "text",
-          "parent": 28
-        }
-      ],
-      "revision": "rift://revision/tree/da468b1f6aaf5252720697b456b49d5e6c3761855849e4ff1c650ae92267da57"
-    }
-  },
-  "symbol-nodes": {
-    "tool": "nodes",
-    "arguments": {
-      "symbol": "rift://symbol/local/rust/example_project/config/Config"
-    },
-    "text": "Config\nDeclaration 0 | struct_item | src/config.rs | bytes 105..160\n\tpub struct Config {\n\t    pub root: std::path::PathBuf,\n\t}\n\tStructure | field declaration list\n",
-    "json": {
-      "symbol": "rift://symbol/local/rust/example_project/config/Config",
-      "declarations": [
-        {
-          "declaration": 0,
-          "kind": "struct_item",
-          "range": {
-            "start": 105,
-            "end": 160
-          },
-          "source": {
-            "span": {
-              "unit": "rift://source/project/src/config.rs",
-              "range": {
-                "start": 105,
-                "end": 160
-              }
-            },
-            "text": "pub struct Config {\n    pub root: std::path::PathBuf,\n}"
-          },
-          "parts": [
-            {
-              "index": 3,
-              "kind": "field_declaration_list",
-              "range": {
-                "start": 123,
-                "end": 160
-              }
-            }
-          ]
-        }
-      ],
-      "revision": "rift://revision/tree/da468b1f6aaf5252720697b456b49d5e6c3761855849e4ff1c650ae92267da57"
-    }
   },
   "global-symbol-documentation": {
     "tool": "get_symbol",
     "arguments": {
       "id": "rift://symbol/cargo/crates.io/itoa/rust/itoa/Buffer",
       "revision": "rift://revision/cargo/crates.io/itoa@1.0.18",
-      "include": { "documentation": true }
+      "include": {
+        "documentation": true
+      }
     },
-    "text": "\tpub struct Buffer\n\trift://source/cargo/crates.io/itoa/src/lib.rs:72 \u00b7 bytes 2357..2427\n\trift://symbol/cargo/crates.io/itoa/rust/itoa/Buffer\n\tdependency rift://revision/cargo/crates.io/itoa@1.0.18\n\n\tA correctly sized stack allocation for the formatted integer to be written\n\tinto.\n\n\t# Example\n\n\t```\n\tlet mut buffer = itoa::Buffer::new();\n\tlet printed = buffer.format(1234);\n\tassert_eq!(printed, \"1234\");\n\t```\nrelease 1.0.18\n",
+    "text": "\tpub struct Buffer\n\trift://source/cargo/crates.io/itoa/src/lib.rs:72 · bytes 2357..2427\n\trift://symbol/cargo/crates.io/itoa/rust/itoa/Buffer\n\tdependency rift://revision/cargo/crates.io/itoa@1.0.18\n\n\tA correctly sized stack allocation for the formatted integer to be written\n\tinto.\n\n\t# Example\n\n\t```\n\tlet mut buffer = itoa::Buffer::new();\n\tlet printed = buffer.format(1234);\n\tassert_eq!(printed, \"1234\");\n\t```\nrelease 1.0.18\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -581,7 +132,7 @@
         "language": "rust",
         "name": "Buffer",
         "kind": "struct",
-        "facets": ["type", "public"],
+        "kinds": ["type", "public"],
         "origin": {
           "location": "dependency",
           "package": {
@@ -636,7 +187,7 @@
     "arguments": {
       "id": "rift://symbol/stdlib/node/javascript/fs/readFile"
     },
-    "text": "\tfunction readFile(path, options, callback)\n\trift://source/stdlib/node/lib/fs.js:422 \u00b7 bytes 10737..12591\n\trift://symbol/stdlib/node/javascript/fs/readFile\n\tstdlib rift://revision/stdlib/node@26.13.1\n\n\tAsynchronously reads the entire contents of a file.\n\t@param {string | Buffer | URL | number} path\n\t@param {{\n\t  encoding?: string | null;\n\t  flag?: string;\n\t  signal?: AbortSignal;\n\t  } | string} [options]\n\t@param {(\n\t  err?: Error,\n\t  data?: string | Buffer\n\t  ) => any} callback\n\t@returns {void}\nrelease 26.13.1\n",
+    "text": "\tfunction readFile(path, options, callback)\n\trift://source/stdlib/node/lib/fs.js:422 · bytes 10737..12591\n\trift://symbol/stdlib/node/javascript/fs/readFile\n\tstdlib rift://revision/stdlib/node@26.13.1\n\n\tAsynchronously reads the entire contents of a file.\n\t@param {string | Buffer | URL | number} path\n\t@param {{\n\t  encoding?: string | null;\n\t  flag?: string;\n\t  signal?: AbortSignal;\n\t  } | string} [options]\n\t@param {(\n\t  err?: Error,\n\t  data?: string | Buffer\n\t  ) => any} callback\n\t@returns {void}\nrelease 26.13.1\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -644,7 +195,7 @@
         "language": "javascript",
         "name": "readFile",
         "kind": "function",
-        "facets": ["value", "callable", "public"],
+        "kinds": ["value", "callable", "public"],
         "origin": {
           "location": "stdlib",
           "runtime": {
@@ -695,7 +246,7 @@
     "arguments": {
       "id": "rift://symbol/local@sdk/rust/docs_sdk/data_dir"
     },
-    "text": "\tpub fn data_dir() -> &'static str\n\tsrc/lib.rs:8 \u00b7 bytes 118..174\n\tsrc/lib.rs:14 \u00b7 bytes 233..297\n\trift://symbol/local@sdk/rust/docs_sdk/data_dir\n\n\tDirectory the SDK keeps its data in.\n",
+    "text": "\tpub fn data_dir() -> &'static str\n\tsrc/lib.rs:8 · bytes 118..174\n\tsrc/lib.rs:14 · bytes 233..297\n\trift://symbol/local@sdk/rust/docs_sdk/data_dir\n\n\tDirectory the SDK keeps its data in.\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -703,7 +254,7 @@
         "language": "rust",
         "name": "data_dir",
         "kind": "function",
-        "facets": ["value", "callable", "public"],
+        "kinds": ["value", "callable", "public"],
         "visibility": "pub",
         "signatures": [
           {
@@ -757,9 +308,10 @@
     "tool": "get_symbol",
     "arguments": {
       "id": "rift://symbol/local@sdk/rust/docs_sdk/data_dir",
-      "declaration_limit": 1
+      "page": 1,
+      "max_results": 1
     },
-    "text": "\tpub fn data_dir() -> &'static str\n\tsrc/lib.rs:8 \u00b7 bytes 118..174\n\trift://symbol/local@sdk/rust/docs_sdk/data_dir\n\n\tDirectory the SDK keeps its data in.\n\tnext declarations \u00b7 declaration_cursor 1.b9a5edd5f7b93317\n",
+    "text": "\tpub fn data_dir() -> &'static str\n\tsrc/lib.rs:8 · bytes 118..174\n\trift://symbol/local@sdk/rust/docs_sdk/data_dir\n\n\tDirectory the SDK keeps its data in.\n\tpage 1/2, total 2 results\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -767,7 +319,7 @@
         "language": "rust",
         "name": "data_dir",
         "kind": "function",
-        "facets": ["value", "callable", "public"],
+        "kinds": ["value", "callable", "public"],
         "visibility": "pub",
         "signatures": [
           {
@@ -800,17 +352,23 @@
           "documentation_indices": [0]
         }
       ],
-      "declaration_cursor": "1.b9a5edd5f7b93317"
+      "pagination": {
+        "page": 1,
+        "pages": 2,
+        "max_results": 1,
+        "total": 2
+      }
     }
   },
   "multi-declaration-next": {
     "tool": "get_symbol",
     "arguments": {
       "id": "rift://symbol/local@sdk/rust/docs_sdk/data_dir",
-      "declaration_limit": 1,
-      "declaration_cursor": "1.b9a5edd5f7b93317"
+      "page": 2,
+      "max_results": 1,
+      "revision": "rift://revision/tree/b92ca2f51e237d5b116188b2e2a101c0ca7ec68e277981a84d753a8841e10259"
     },
-    "text": "\tpub fn data_dir() -> &'static str\n\tsrc/lib.rs:14 \u00b7 bytes 233..297\n\trift://symbol/local@sdk/rust/docs_sdk/data_dir\n\n\tDirectory the SDK keeps its data in.\n",
+    "text": "\tpub fn data_dir() -> &'static str\n\tsrc/lib.rs:14 · bytes 233..297\n\trift://symbol/local@sdk/rust/docs_sdk/data_dir\n\n\tDirectory the SDK keeps its data in.\n\tpage 2/2, total 2 results\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -818,7 +376,7 @@
         "language": "rust",
         "name": "data_dir",
         "kind": "function",
-        "facets": ["value", "callable", "public"],
+        "kinds": ["value", "callable", "public"],
         "visibility": "pub",
         "signatures": [
           {
@@ -850,7 +408,13 @@
           "type_indices": [],
           "documentation_indices": [0]
         }
-      ]
+      ],
+      "pagination": {
+        "page": 2,
+        "pages": 2,
+        "max_results": 1,
+        "total": 2
+      }
     }
   },
   "map": {
@@ -858,7 +422,7 @@
     "arguments": {
       "uri": "rift://map"
     },
-    "text": "workspace map\nlanguages:\n\tjson \u00b7 1 file \u00b7 2 declarations\n\trust \u00b7 1 file \u00b7 2 declarations\n\ttoml \u00b7 2 files \u00b7 22 declarations\n\ttypescript \u00b7 1 file \u00b7 2 declarations\ndirectories:\n\tsrc \u00b7 1 file\nsource catalog \u00b7 rift://workspace\n",
+    "text": "workspace map\nlanguages:\n\tjson · 1 file · 2 declarations\n\trust · 1 file · 2 declarations\n\ttoml · 2 files · 22 declarations\n\ttypescript · 1 file · 2 declarations\ndirectories:\n\tsrc · 1 file\nsource catalog · rift://workspace\n",
     "json": {
       "revision": "159fb324",
       "languages": [
@@ -930,9 +494,437 @@
         }
       ],
       "pagination": {
-        "page_index": 0,
-        "total_pages": 1
+        "page": 1,
+        "pages": 1
       }
+    }
+  },
+  "symbol-facets": {
+    "tool": "facets",
+    "arguments": {
+      "symbol": "rift://symbol/local/rust/example_project/config/load_config"
+    },
+    "text": "rift://symbol/local/rust/example_project/config/load_config\nDeclaration 0 | function_item | src/config.rs | bytes 218..355\n\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n\t    let text = std::fs::read_to_string(path)?;\n\t    parse_config(&text)\n\t}\n\tfunction_item | bytes 218..355 | declaration 0 | index 0 | 4 lines\n\tvisibility_modifier | bytes 218..221 | declaration 0 | index 1 | parent 0\n\tidentifier | bytes 225..236 | declaration 0 | index 2 | parent 0\n\tparameters | bytes 236..249 | declaration 0 | index 3 | parent 0\n\tparameter | bytes 237..248 | declaration 0 | index 4 | parent 3\n\tidentifier | bytes 237..241 | declaration 0 | index 5 | parent 4\n\treference_type | bytes 243..248 | declaration 0 | index 6 | parent 4\n\ttype_identifier | bytes 244..248 | declaration 0 | index 7 | parent 6\n\tgeneric_type | bytes 253..280 | declaration 0 | index 8 | parent 0\n\ttype_identifier | bytes 253..259 | declaration 0 | index 9 | parent 8\n\ttype_arguments | bytes 259..280 | declaration 0 | index 10 | parent 8\n\ttype_identifier | bytes 260..266 | declaration 0 | index 11 | parent 10\n\ttype_identifier | bytes 268..279 | declaration 0 | index 12 | parent 10\n\tblock | bytes 281..355 | declaration 0 | index 13 | parent 0 | 4 lines\n\tlet_declaration | bytes 287..329 | declaration 0 | index 14 | parent 13\n\tidentifier | bytes 291..295 | declaration 0 | index 15 | parent 14\n\ttry_expression | bytes 298..328 | declaration 0 | index 16 | parent 14\n\tcall_expression | bytes 298..327 | declaration 0 | index 17 | parent 16\n\tscoped_identifier | bytes 298..321 | declaration 0 | index 18 | parent 17\n\tscoped_identifier | bytes 298..305 | declaration 0 | index 19 | parent 18\n\tidentifier | bytes 298..301 | declaration 0 | index 20 | parent 19\n\tidentifier | bytes 303..305 | declaration 0 | index 21 | parent 19\n\tidentifier | bytes 307..321 | declaration 0 | index 22 | parent 18\n\targuments | bytes 321..327 | declaration 0 | index 23 | parent 17\n\tidentifier | bytes 322..326 | declaration 0 | index 24 | parent 23\n\tcall_expression | bytes 334..353 | declaration 0 | index 25 | parent 13\n\tidentifier | bytes 334..346 | declaration 0 | index 26 | parent 25\n\targuments | bytes 346..353 | declaration 0 | index 27 | parent 25\n\treference_expression | bytes 347..352 | declaration 0 | index 28 | parent 27\n\tidentifier | bytes 348..352 | declaration 0 | index 29 | parent 28\n",
+    "json": {
+      "symbol": "rift://symbol/local/rust/example_project/config/load_config",
+      "declarations": [
+        {
+          "declaration": 0,
+          "kind": "function_item",
+          "range": {
+            "start": 218,
+            "end": 355
+          },
+          "source": {
+            "span": {
+              "unit": "rift://source/project/src/config.rs",
+              "range": {
+                "start": 218,
+                "end": 355
+              }
+            },
+            "text": "pub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}"
+          },
+          "syntax": [
+            {
+              "declaration": 0,
+              "index": 0,
+              "unit": "rift://source/project/src/config.rs",
+              "language": "rust",
+              "kind": "function_item",
+              "kinds": ["declaration", "definition"],
+              "range": {
+                "start": 218,
+                "end": 355
+              },
+              "source": "pub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}"
+            },
+            {
+              "declaration": 0,
+              "index": 1,
+              "unit": "rift://source/project/src/config.rs",
+              "language": "rust",
+              "kind": "visibility_modifier",
+              "range": {
+                "start": 218,
+                "end": 221
+              },
+              "source": "pub",
+              "parent": 0
+            },
+            {
+              "declaration": 0,
+              "index": 2,
+              "unit": "rift://source/project/src/config.rs",
+              "language": "rust",
+              "kind": "identifier",
+              "range": {
+                "start": 225,
+                "end": 236
+              },
+              "source": "load_config",
+              "parent": 0
+            },
+            {
+              "declaration": 0,
+              "index": 3,
+              "unit": "rift://source/project/src/config.rs",
+              "language": "rust",
+              "kind": "parameters",
+              "range": {
+                "start": 236,
+                "end": 249
+              },
+              "source": "(path: &Path)",
+              "parent": 0
+            },
+            {
+              "declaration": 0,
+              "index": 4,
+              "unit": "rift://source/project/src/config.rs",
+              "language": "rust",
+              "kind": "parameter",
+              "range": {
+                "start": 237,
+                "end": 248
+              },
+              "source": "path: &Path",
+              "parent": 3
+            },
+            {
+              "declaration": 0,
+              "index": 5,
+              "unit": "rift://source/project/src/config.rs",
+              "language": "rust",
+              "kind": "identifier",
+              "range": {
+                "start": 237,
+                "end": 241
+              },
+              "source": "path",
+              "parent": 4
+            },
+            {
+              "declaration": 0,
+              "index": 6,
+              "unit": "rift://source/project/src/config.rs",
+              "language": "rust",
+              "kind": "reference_type",
+              "range": {
+                "start": 243,
+                "end": 248
+              },
+              "source": "&Path",
+              "parent": 4
+            },
+            {
+              "declaration": 0,
+              "index": 7,
+              "unit": "rift://source/project/src/config.rs",
+              "language": "rust",
+              "kind": "type_identifier",
+              "range": {
+                "start": 244,
+                "end": 248
+              },
+              "source": "Path",
+              "parent": 6
+            },
+            {
+              "declaration": 0,
+              "index": 8,
+              "unit": "rift://source/project/src/config.rs",
+              "language": "rust",
+              "kind": "generic_type",
+              "range": {
+                "start": 253,
+                "end": 280
+              },
+              "source": "Result<Config, ConfigError>",
+              "parent": 0
+            },
+            {
+              "declaration": 0,
+              "index": 9,
+              "unit": "rift://source/project/src/config.rs",
+              "language": "rust",
+              "kind": "type_identifier",
+              "range": {
+                "start": 253,
+                "end": 259
+              },
+              "source": "Result",
+              "parent": 8
+            },
+            {
+              "declaration": 0,
+              "index": 10,
+              "unit": "rift://source/project/src/config.rs",
+              "language": "rust",
+              "kind": "type_arguments",
+              "range": {
+                "start": 259,
+                "end": 280
+              },
+              "source": "<Config, ConfigError>",
+              "parent": 8
+            },
+            {
+              "declaration": 0,
+              "index": 11,
+              "unit": "rift://source/project/src/config.rs",
+              "language": "rust",
+              "kind": "type_identifier",
+              "range": {
+                "start": 260,
+                "end": 266
+              },
+              "source": "Config",
+              "parent": 10
+            },
+            {
+              "declaration": 0,
+              "index": 12,
+              "unit": "rift://source/project/src/config.rs",
+              "language": "rust",
+              "kind": "type_identifier",
+              "range": {
+                "start": 268,
+                "end": 279
+              },
+              "source": "ConfigError",
+              "parent": 10
+            },
+            {
+              "declaration": 0,
+              "index": 13,
+              "unit": "rift://source/project/src/config.rs",
+              "language": "rust",
+              "kind": "block",
+              "range": {
+                "start": 281,
+                "end": 355
+              },
+              "source": "{\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
+              "parent": 0
+            },
+            {
+              "declaration": 0,
+              "index": 14,
+              "unit": "rift://source/project/src/config.rs",
+              "language": "rust",
+              "kind": "let_declaration",
+              "kinds": ["declaration", "definition"],
+              "range": {
+                "start": 287,
+                "end": 329
+              },
+              "source": "let text = std::fs::read_to_string(path)?;",
+              "parent": 13
+            },
+            {
+              "declaration": 0,
+              "index": 15,
+              "unit": "rift://source/project/src/config.rs",
+              "language": "rust",
+              "kind": "identifier",
+              "range": {
+                "start": 291,
+                "end": 295
+              },
+              "source": "text",
+              "parent": 14
+            },
+            {
+              "declaration": 0,
+              "index": 16,
+              "unit": "rift://source/project/src/config.rs",
+              "language": "rust",
+              "kind": "try_expression",
+              "kinds": ["expression"],
+              "range": {
+                "start": 298,
+                "end": 328
+              },
+              "source": "std::fs::read_to_string(path)?",
+              "parent": 14
+            },
+            {
+              "declaration": 0,
+              "index": 17,
+              "unit": "rift://source/project/src/config.rs",
+              "language": "rust",
+              "kind": "call_expression",
+              "kinds": ["expression"],
+              "range": {
+                "start": 298,
+                "end": 327
+              },
+              "source": "std::fs::read_to_string(path)",
+              "parent": 16
+            },
+            {
+              "declaration": 0,
+              "index": 18,
+              "unit": "rift://source/project/src/config.rs",
+              "language": "rust",
+              "kind": "scoped_identifier",
+              "range": {
+                "start": 298,
+                "end": 321
+              },
+              "source": "std::fs::read_to_string",
+              "parent": 17
+            },
+            {
+              "declaration": 0,
+              "index": 19,
+              "unit": "rift://source/project/src/config.rs",
+              "language": "rust",
+              "kind": "scoped_identifier",
+              "range": {
+                "start": 298,
+                "end": 305
+              },
+              "source": "std::fs",
+              "parent": 18
+            },
+            {
+              "declaration": 0,
+              "index": 20,
+              "unit": "rift://source/project/src/config.rs",
+              "language": "rust",
+              "kind": "identifier",
+              "range": {
+                "start": 298,
+                "end": 301
+              },
+              "source": "std",
+              "parent": 19
+            },
+            {
+              "declaration": 0,
+              "index": 21,
+              "unit": "rift://source/project/src/config.rs",
+              "language": "rust",
+              "kind": "identifier",
+              "range": {
+                "start": 303,
+                "end": 305
+              },
+              "source": "fs",
+              "parent": 19
+            },
+            {
+              "declaration": 0,
+              "index": 22,
+              "unit": "rift://source/project/src/config.rs",
+              "language": "rust",
+              "kind": "identifier",
+              "range": {
+                "start": 307,
+                "end": 321
+              },
+              "source": "read_to_string",
+              "parent": 18
+            },
+            {
+              "declaration": 0,
+              "index": 23,
+              "unit": "rift://source/project/src/config.rs",
+              "language": "rust",
+              "kind": "arguments",
+              "range": {
+                "start": 321,
+                "end": 327
+              },
+              "source": "(path)",
+              "parent": 17
+            },
+            {
+              "declaration": 0,
+              "index": 24,
+              "unit": "rift://source/project/src/config.rs",
+              "language": "rust",
+              "kind": "identifier",
+              "range": {
+                "start": 322,
+                "end": 326
+              },
+              "source": "path",
+              "parent": 23
+            },
+            {
+              "declaration": 0,
+              "index": 25,
+              "unit": "rift://source/project/src/config.rs",
+              "language": "rust",
+              "kind": "call_expression",
+              "kinds": ["expression"],
+              "range": {
+                "start": 334,
+                "end": 353
+              },
+              "source": "parse_config(&text)",
+              "parent": 13
+            },
+            {
+              "declaration": 0,
+              "index": 26,
+              "unit": "rift://source/project/src/config.rs",
+              "language": "rust",
+              "kind": "identifier",
+              "range": {
+                "start": 334,
+                "end": 346
+              },
+              "source": "parse_config",
+              "parent": 25
+            },
+            {
+              "declaration": 0,
+              "index": 27,
+              "unit": "rift://source/project/src/config.rs",
+              "language": "rust",
+              "kind": "arguments",
+              "range": {
+                "start": 346,
+                "end": 353
+              },
+              "source": "(&text)",
+              "parent": 25
+            },
+            {
+              "declaration": 0,
+              "index": 28,
+              "unit": "rift://source/project/src/config.rs",
+              "language": "rust",
+              "kind": "reference_expression",
+              "kinds": ["expression"],
+              "range": {
+                "start": 347,
+                "end": 352
+              },
+              "source": "&text",
+              "parent": 27
+            },
+            {
+              "declaration": 0,
+              "index": 29,
+              "unit": "rift://source/project/src/config.rs",
+              "language": "rust",
+              "kind": "identifier",
+              "range": {
+                "start": 348,
+                "end": 352
+              },
+              "source": "text",
+              "parent": 28
+            }
+          ]
+        }
+      ],
+      "revision": "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11"
     }
   }
 }

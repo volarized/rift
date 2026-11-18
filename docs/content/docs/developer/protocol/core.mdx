@@ -19,10 +19,9 @@ The index skips symlinks. A linked file answers under its own path when the sour
 Each provider converts its toolchain's positions to byte offsets, so ranges from different
 providers use one scale.
 
-[`nodes`](/docs/mcp#tool-nodes) returns the syntax nodes of one symbol, or of the declaration
-holding one byte position, in pre-order. Each node carries its grammar kind, byte range, and source
-text. Every source unit has a file node of kind `file` spanning all of it, the only node of a
-file no syntax provider parses.
+[`facets`](/docs/mcp#tool-facets) reads every declaration of one symbol with its location,
+exact source, and syntax structure. Each syntax element carries its grammar kind, byte range,
+and source text. Nested declarations carry their own syntax structure.
 
 ## Source discovery
 
@@ -43,11 +42,11 @@ The key is never a digest. A [`Digest`](/docs/developer/protocol/reference#Diges
 wire only as a short witness where byte identity matters: the first eight hex characters of a
 SHA-256. The server computes and compares the full digest internally, so it never travels whole.
 
-A syntax node has no identity of its own. A [`Node`](/docs/developer/protocol/reference#Node) is
-addressed by its place: node `index` of declaration `declaration` of `symbol`, counted in
-pre-order from the declaration's item node at 0, or node `index` of its `unit` when no declaration
-holds it, counted from the unit's file node at 0. A nested declaration's subtree counts toward the nested symbol alone, so an edit inside
-one declaration leaves the indexes of every other declaration's nodes unchanged.
+A syntax element has no identity of its own. A [`SyntaxElement`](/docs/developer/protocol/reference#SyntaxElement) is
+addressed by its place: element `index` of declaration `declaration` of `symbol`, counted in
+pre-order from the declaration's item at 0, or element `index` of its `unit` when no declaration
+holds it, counted from the unit's file element at 0. A nested declaration's subtree counts toward the nested symbol alone, so an edit inside
+one declaration leaves the indexes of every other declaration's syntax elements unchanged.
 
 [`SourceLocationKind`](/docs/developer/protocol/reference#SourceLocationKind) names where a
 declaration's source belongs: project, dependency, standard library, or external source.
@@ -81,13 +80,13 @@ manager name, such as `cargo` or `npm`.
 
 ## Semantic facts
 
-Providers return facts in families: symbols, the syntax nodes that write them, relationships
+Providers return facts in families: symbols, the syntax elements that write them, edges
 between symbols, resolved types, diagnostics, and history. A family no provider can produce
 refuses with `capability_unavailable`. Signatures and documentation travel on the symbol itself,
 covered under the `types` family.
 
 A search result carries the answer, `pagination`, and `warnings`. An exact symbol read carries
-an `outcome` and the `revision` it was read at, and can carry a `declaration_cursor`. A condition the caller must
+an `outcome` and the `revision` it was read at, and carries declaration `pagination`. A condition the caller must
 weigh - an index that lags the tree - arrives as a typed entry in `warnings`; the
 [Reads](/docs/developer/protocol/mcp#reads) section in the MCP reference states the paging and warning
 contract.

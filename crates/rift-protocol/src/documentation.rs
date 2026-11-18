@@ -580,9 +580,9 @@ pub struct DocumentationConfiguration {
     /// Warnings one documentation collection retains.
     #[schemars(range(min = 1, max = 65_536))]
     pub max_warnings: u32,
-    /// Syntax nodes one documentation parser accepts.
+    /// Syntax syntax elements one documentation parser accepts.
     #[schemars(range(min = 1, max = 100_000_000))]
-    pub max_nodes: u32,
+    pub max_syntax_elements: u32,
     /// Nesting one documentation parser accepts.
     #[schemars(range(min = 1, max = 65_536))]
     pub max_depth: u32,
@@ -611,8 +611,8 @@ impl Default for DocumentationConfiguration {
             max_text: ByteSize::from_bytes(u64::from(DOCUMENTATION_TEXT_BYTES_MAX)),
             max_heading_depth: DOCUMENTATION_HEADING_DEPTH_MAX,
             max_warnings: DOCUMENTATION_WARNINGS_MAX,
-            max_nodes: u32::try_from(crate::configuration::SYNTAX_NODES_DEFAULT)
-                .expect("syntax node default fits u32"),
+            max_syntax_elements: u32::try_from(crate::configuration::SYNTAX_ELEMENTS_DEFAULT)
+                .expect("syntax element default fits u32"),
             max_depth: u32::try_from(crate::configuration::SYNTAX_DEPTH_DEFAULT)
                 .expect("syntax depth default fits u32"),
             max_progress: DOCUMENTATION_PROGRESS_CALLBACKS_MAX,
@@ -685,10 +685,10 @@ impl DocumentationConfiguration {
                 u64::from(DOCUMENTATION_WARNINGS_CEILING),
             ),
             (
-                "documentation.max_nodes",
-                u64::from(self.max_nodes),
+                "documentation.max_syntax_elements",
+                u64::from(self.max_syntax_elements),
                 1,
-                crate::configuration::SYNTAX_NODES_MAX,
+                crate::configuration::SYNTAX_ELEMENTS_MAX,
             ),
             (
                 "documentation.max_depth",

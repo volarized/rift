@@ -1,11 +1,11 @@
-//! RDF projection of acquired call paths and their call sites.
+//! RDF projection of acquired paths of call edges and their call sites.
 
 use std::sync::Arc;
 
 use oxrdf::{BlankNode, Literal, NamedNode, Triple, vocab::rdf};
 use rift_error::RiftError;
-use rift_protocol::read::{RelationshipFacet, SourceUnitId, SourceUnitSpan, SymbolId, TextRange};
-use rift_protocol::relationship_read::QueryOccurrence;
+use rift_protocol::edge_read::QueryOccurrence;
+use rift_protocol::read::{EdgeKind, SourceUnitId, SourceUnitSpan, SymbolId, TextRange};
 
 use super::{GraphDatasetBuilder, GraphFact, TripleWriter, content_blank_node};
 use crate::flow::{FlowPath, FlowResult};
@@ -16,7 +16,7 @@ use crate::sparql::{
 /// The source unit and half-open byte offsets of one call site, when established.
 pub type FlowCallSite = Option<(SourceUnitId, u64, u64)>;
 
-/// Call paths and original call sites from one ranked retrieval.
+/// Paths of call edges and original call sites from one ranked retrieval.
 pub type QueryFlows = FlowResult<Arc<SymbolId>, FlowCallSite>;
 
 impl GraphDatasetBuilder {
@@ -92,7 +92,7 @@ fn write_sites(
                     end: *end,
                 },
             },
-            facet: RelationshipFacet::Calls,
+            kind: EdgeKind::Calls,
         };
         GraphFact::Occurrence {
             key: &key,

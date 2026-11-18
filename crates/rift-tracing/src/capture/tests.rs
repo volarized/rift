@@ -980,8 +980,8 @@ impl Workspace {
         crate::traced!(component = self.component, operation = "index.search", {});
     }
 
-    async fn nodes(&self) {
-        crate::traced!("index.nodes", async {}).await;
+    async fn syntax_elements(&self) {
+        crate::traced!("index.syntax_elements", async {}).await;
     }
 
     fn walk(&self) {
@@ -1017,7 +1017,7 @@ fn an_operation_and_an_event_record_the_function_that_made_them() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("a runtime builds");
-        runtime.block_on(workspace.nodes());
+        runtime.block_on(workspace.syntax_elements());
     });
 
     let records = queued(&mut drain);
@@ -1030,7 +1030,10 @@ fn an_operation_and_an_event_record_the_function_that_made_them() {
         ),
         ("walked", format!("{module}::Workspace::walk")),
         ("index.watch", format!("{module}::watch")),
-        ("index.nodes", format!("{module}::Workspace::nodes")),
+        (
+            "index.syntax_elements",
+            format!("{module}::Workspace::syntax_elements"),
+        ),
     ] {
         assert_eq!(
             fields_of(&records, message)["code.function.name"],

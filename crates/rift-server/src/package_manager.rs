@@ -204,7 +204,7 @@ fn candidates(manager: LspPackageManager) -> &'static [Candidate] {
         local: None,
         arguments: &[],
     }];
-    const NODE: &[Candidate] = &[Candidate {
+    const SYNTAX_ELEMENT: &[Candidate] = &[Candidate {
         program: "typescript-language-server",
         local: Some(if cfg!(windows) {
             "node_modules/.bin/typescript-language-server.cmd"
@@ -235,7 +235,7 @@ fn candidates(manager: LspPackageManager) -> &'static [Candidate] {
     ];
     match manager {
         LspPackageManager::Cargo => CARGO,
-        LspPackageManager::Bun | LspPackageManager::Npm => NODE,
+        LspPackageManager::Bun | LspPackageManager::Npm => SYNTAX_ELEMENT,
         LspPackageManager::Uv => UV,
     }
 }
@@ -364,7 +364,8 @@ mod tests {
     }
 
     #[test]
-    fn declared_node_manager_precedes_lockfiles() -> Result<(), Box<dyn std::error::Error>> {
+    fn declared_syntax_element_manager_precedes_lockfiles() -> Result<(), Box<dyn std::error::Error>>
+    {
         let root = tempfile::tempdir()?;
         assert_eq!(detect("rust", root.path()), Some(LspPackageManager::Cargo));
         assert_eq!(detect("python", root.path()), Some(LspPackageManager::Uv));

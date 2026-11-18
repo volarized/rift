@@ -67,8 +67,7 @@ its situation:
 
 - [`search`](/docs/mcp#tool-search) answers when the target is unknown.
 - [`get_symbol`](/docs/mcp#tool-get_symbol) reads one exact symbol identity returned by search.
-- [`nodes`](/docs/mcp#tool-nodes) answers a symbol's source, every syntax node of its
-  declarations, or the nodes of the declaration at one position.
+- [`facets`](/docs/mcp#tool-facets) answers every declaration of a symbol with its location, source, and syntax structure.
 - `search` with SPARQL property paths follows references and calls. `:usages` selects
   physical occurrences.
 
@@ -117,8 +116,8 @@ The hook puts the search in a SPARQL `query` that calls `SERVICE :search`.
 
 - For `Grep`, the hook passes the same [regex](/docs/mcp#search-pattern) as `:pattern`. It
   maps `path`, `glob`, and `type` to the `include` list in `:paths`, and adds `(?i)` for
-  `-i`. The hook maps `head_limit` to `:limit` and an `offset` at a page boundary to
-  `:page_index`.
+  `-i`. The hook maps `head_limit` to `:max_results` and an `offset` at a page boundary to
+  `:page`.
 - For `Glob`, the hook selects `:target "file"` and passes the regex `\A` as `:pattern`.
   The pattern matches once per indexed file selected by `:paths`, and the query returns
   its path.

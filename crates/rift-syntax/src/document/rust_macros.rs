@@ -2,11 +2,11 @@
 
 use std::collections::BTreeMap;
 
-use super::{ByteRange, SyntaxNode};
+use super::{ByteRange, SyntaxElement};
 
 pub(super) fn capture(
     source: &str,
-    nodes: &[SyntaxNode],
+    syntax_elements: &[SyntaxElement],
     invocations: &mut [super::MacroInvocation],
     mut functions: Option<(
         &super::Language,
@@ -25,55 +25,59 @@ pub(super) fn capture(
     let mut token_work = 0_usize;
     let mut direct = BTreeMap::<usize, Vec<ByteRange>>::new();
     let mut unknown = std::collections::BTreeSet::new();
-    for (index, node) in nodes.iter().enumerate() {
-        let Some(parent_index) = node.parent else {
+    for (index, syntax_element) in syntax_elements.iter().enumerate() {
+        let Some(parent_index) = syntax_element.parent else {
             continue;
         };
         let previous_index = previous.insert(parent_index, index);
-        let Some(parent) = nodes
+        let Some(parent) = syntax_elements
             .get(parent_index)
-            .filter(|node| node.kind == "token_tree")
+            .filter(|syntax_element| syntax_element.kind == "token_tree")
         else {
             continue;
         };
-        let Some(invocation) = parent.parent.and_then(|index| nodes.get(index)) else {
+        let Some(invocation) = parent.parent.and_then(|index| syntax_elements.get(index)) else {
             continue;
         };
         let Some(index) = indices.get(&invocation.range).copied() else {
             continue;
         };
-        direct.entry(index).or_default().push(node.range);
-        if node.has_error || parent.has_error || invocation.has_error {
+        direct.entry(index).or_default().push(syntax_element.range);
+        if syntax_element.has_error || parent.has_error || invocation.has_error {
             unknown.insert(index);
         }
         if let Some(functions) = functions.as_mut()
-            && node.kind == "token_tree"
+            && syntax_element.kind == "token_tree"
         {
             capture_function(
                 source,
-                node,
+                syntax_element,
                 parent_index,
                 functions,
                 &mut pending,
                 (&mut work, &mut token_work),
             );
         }
-        if node.kind != "identifier" {
+        if syntax_element.kind != "identifier" {
             continue;
         }
         let start = previous_index.map_or(parent.range.start.saturating_add(1), |index| {
-            nodes[index].range.end
+            syntax_elements[index].range.end
         });
         let Some(prefix) = text(
             source,
             ByteRange {
                 start,
-                end: node.range.start,
+                end: syntax_element.range.start,
             },
         ) else {
             continue;
         };
-        if functions.is_some() && !node.has_error && !parent.has_error && !invocation.has_error {
+        if functions.is_some()
+            && !syntax_element.has_error
+            && !parent.has_error
+            && !invocation.has_error
+        {
             let trimmed = prefix.trim();
             let public = trimmed == "pub fn";
             if public || trimmed == "fn" {
@@ -82,13 +86,13 @@ pub(super) fn capture(
                     .ok()
                     .and_then(|leading| start.checked_add(leading))
                 {
-                    pending.insert(parent_index, (node.range, start, public, false));
+                    pending.insert(parent_index, (syntax_element.range, start, public, false));
                 }
             }
         }
         capture_module(
             source,
-            node,
+            syntax_element,
             parent,
             start,
             prefix,
@@ -98,7 +102,7 @@ pub(super) fn capture(
     for (index, (invocation, modules, children)) in invocations.iter_mut().enumerate() {
         let ranges = direct.remove(&index).unwrap_or_default();
         if !unknown.contains(&index)
-            && direct_children_valid(source, *invocation, &ranges, nodes.len())
+            && direct_children_valid(source, *invocation, &ranges, syntax_elements.len())
         {
             *children = Some(ranges);
         }
@@ -112,8 +116,8 @@ pub(super) fn capture(
 
 fn capture_module(
     source: &str,
-    node: &SyntaxNode,
-    parent: &SyntaxNode,
+    syntax_element: &SyntaxElement,
+    parent: &SyntaxElement,
     start: u64,
     prefix: &str,
     modules: &mut Vec<ByteRange>,
@@ -131,7 +135,7 @@ fn capture_module(
     let Some(tail) = text(
         source,
         ByteRange {
-            start: node.range.end,
+            start: syntax_element.range.end,
             end: parent.range.end,
         },
     ) else {
@@ -145,7 +149,7 @@ fn capture_module(
     let Some(start) = start.checked_add(u64::try_from(leading).unwrap_or(u64::MAX)) else {
         return;
     };
-    let Some(end) = node
+    let Some(end) = syntax_element
         .range
         .end
         .checked_add(u64::try_from(spaces + 1).unwrap_or(u64::MAX))
@@ -158,7 +162,7 @@ fn capture_module(
 
 fn capture_function(
     source: &str,
-    node: &SyntaxNode,
+    syntax_element: &SyntaxElement,
     parent_index: usize,
     functions: &mut (
         &super::Language,
@@ -170,7 +174,7 @@ fn capture_function(
 ) {
     let (language, limits, symbols) = functions;
     let (work, token_work) = work;
-    let first = text(source, node.range)
+    let first = text(source, syntax_element.range)
         .and_then(|text| text.as_bytes().first())
         .copied();
     if first == Some(b'(') {
@@ -182,20 +186,20 @@ fn capture_function(
     {
         let header = ByteRange {
             start,
-            end: node.range.start,
+            end: syntax_element.range.start,
         };
-        let width = usize::try_from(node.range.end.saturating_sub(header.start)).ok();
+        let width = usize::try_from(syntax_element.range.end.saturating_sub(header.start)).ok();
         if let Some(next) = width
             .and_then(|width| work.checked_add(width))
             .filter(|next| *next <= limits.source_bytes_max())
         {
             *work = next;
-            if symbols.len() < limits.syntax_nodes_max()
+            if symbols.len() < limits.syntax_elements_max()
                 && function_header(source, header, name, *limits, token_work)
-                && tokens(source, node.range, *limits, |_| {
+                && tokens(source, syntax_element.range, *limits, |_| {
                     let Some(next) = token_work
                         .checked_add(1)
-                        .filter(|next| *next <= limits.syntax_nodes_max())
+                        .filter(|next| *next <= limits.syntax_elements_max())
                     else {
                         return false;
                     };
@@ -208,9 +212,9 @@ fn capture_function(
                     name,
                     ByteRange {
                         start,
-                        end: node.range.end,
+                        end: syntax_element.range.end,
                     },
-                    node.range,
+                    syntax_element.range,
                     public,
                 )
             {
@@ -224,7 +228,7 @@ fn text(source: &str, range: ByteRange) -> Option<&str> {
     source.get(usize::try_from(range.start).ok()?..usize::try_from(range.end).ok()?)
 }
 
-// The source digest and original node rows establish the capture. Restoration checks
+// The source digest and original syntax element rows establish the capture. Restoration checks
 // the literal bytes and rejects ranges inside strings, comments, or nested groups.
 pub(crate) struct Context<'source> {
     source: &'source str,
@@ -775,28 +779,31 @@ fn group_end(source: &str, depth_max: usize) -> Option<usize> {
 
 pub(super) fn capture_scope(
     source: &str,
-    nodes: &[SyntaxNode],
+    syntax_elements: &[SyntaxElement],
     has_errors: bool,
 ) -> Option<Vec<super::Scope>> {
-    nodes
-        .iter()
-        .find(|node| node.kind == "source_file" && node.parent.is_none())?;
+    syntax_elements.iter().find(|syntax_element| {
+        syntax_element.kind == "source_file" && syntax_element.parent.is_none()
+    })?;
     let mut rows = BTreeMap::<usize, (ByteRange, Vec<ByteRange>, bool)>::new();
-    for (index, node) in nodes.iter().enumerate() {
-        let root = node.kind == "source_file" && node.parent.is_none();
-        let module = node.kind == "declaration_list"
-            && node
+    for (index, syntax_element) in syntax_elements.iter().enumerate() {
+        let root = syntax_element.kind == "source_file" && syntax_element.parent.is_none();
+        let module = syntax_element.kind == "declaration_list"
+            && syntax_element
                 .parent
-                .and_then(|parent| nodes.get(parent))
+                .and_then(|parent| syntax_elements.get(parent))
                 .is_some_and(|parent| parent.kind == "mod_item");
         if root || module {
-            rows.insert(index, (node.range, Vec::new(), !node.has_error));
+            rows.insert(
+                index,
+                (syntax_element.range, Vec::new(), !syntax_element.has_error),
+            );
         }
     }
-    for node in nodes {
-        if let Some(parent) = node.parent.and_then(|index| rows.get_mut(&index)) {
-            parent.1.push(node.range);
-            parent.2 &= !node.has_error;
+    for syntax_element in syntax_elements {
+        if let Some(parent) = syntax_element.parent.and_then(|index| rows.get_mut(&index)) {
+            parent.1.push(syntax_element.range);
+            parent.2 &= !syntax_element.has_error;
         }
     }
     let mut scopes = rows
@@ -805,7 +812,7 @@ pub(super) fn capture_scope(
             let root = range.start == 0 && usize::try_from(range.end).ok() == Some(source.len());
             let complete = !has_errors
                 && valid
-                && scope_children_valid(source, range, &children, root, nodes.len());
+                && scope_children_valid(source, range, &children, root, syntax_elements.len());
             (range, complete.then_some(children))
         })
         .collect::<Vec<_>>();
@@ -907,7 +914,7 @@ pub fn tokens(
     let mut bounded = |range| {
         let Some(next) = count
             .checked_add(1)
-            .filter(|count| *count <= limits.syntax_nodes_max())
+            .filter(|count| *count <= limits.syntax_elements_max())
         else {
             return false;
         };
@@ -928,7 +935,7 @@ fn function_header(
     if !tokens(source, range, limits, |range| {
         let Some(next) = work
             .checked_add(1)
-            .filter(|next| *next <= limits.syntax_nodes_max())
+            .filter(|next| *next <= limits.syntax_elements_max())
         else {
             return false;
         };

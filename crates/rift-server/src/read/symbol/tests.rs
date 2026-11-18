@@ -55,8 +55,8 @@ fn request(id: SymbolId) -> GetSymbolParams {
             ..GetSymbolInclude::default()
         },
         revision: None,
-        declaration_limit: 1,
-        declaration_cursor: None,
+        max_results: 1,
+        page: 1,
     }
 }
 
@@ -68,60 +68,46 @@ fn declaration_pages_continue_at_the_revision_they_were_read_at() -> TestResult 
     let served = service.served_revision()?;
     let mut params = request(id.clone());
     let mut starts = Vec::new();
-    for page in 0..3 {
-        let result = service.exact_symbol(&params, true)?;
-        assert!(result.is_valid_for(&id));
+    for page in 1..=4 {
+        params.page = page;
+        params.revision = Some(served.clone());
         let GetSymbolResult::Found {
             symbol,
             revision,
             declarations,
-            declaration_cursor,
+            pagination,
             documentation,
             ..
-        } = result
+        } = service.exact_symbol(&params, true)?
         else {
             return Err("an established symbol is found".into());
         };
         assert_eq!(revision, served);
         assert_eq!(symbol.signatures.len(), 3);
-        assert_eq!(declarations.len(), 1);
+        assert_eq!(pagination, rift_protocol::read::Pagination::new(page, 1, 3));
+        assert_eq!(declarations.len(), usize::from(page <= 3));
         assert!(documentation.is_some());
-        starts.push((declarations[0].path.clone(), declarations[0].range.start));
-        assert_eq!(declaration_cursor.is_some(), page < 2, "page {page}");
-        params.declaration_cursor = declaration_cursor;
+        starts.extend(
+            declarations
+                .iter()
+                .map(|declaration| (declaration.path.clone(), declaration.range.start)),
+        );
     }
     starts.sort();
     starts.dedup();
     assert_eq!(starts.len(), 3, "each page answers another declaration");
 
-    let mut first = request(id.clone());
-    let GetSymbolResult::Found {
-        declaration_cursor: Some(cursor),
-        ..
-    } = service.exact_symbol(&first, true)?
-    else {
-        return Err("a first page leaves a cursor".into());
-    };
+    let mut first = request(id);
+    first.revision = Some(served);
     std::fs::write(
         directory.path().join("index.d.ts"),
         OVERLOADS.replace("First", "1st"),
     )?;
     let moved = build(directory.path())?;
-    first.declaration_cursor = Some(cursor.clone());
     let refused = moved
         .exact_symbol(&first, true)
-        .expect_err("a cursor minted at another tree refuses");
-    assert_eq!(refused.slug(), errors::server::read_invalid::SLUG);
-    assert!(
-        refused
-            .context()
-            .any(|(name, value)| name == "field" && value == "declaration_cursor")
-    );
-    first.id = SymbolId::parse("rift://symbol/local/javascript/beacon/close")?;
-    assert!(
-        service.exact_symbol(&first, true).is_err(),
-        "a cursor for another symbol refuses"
-    );
+        .expect_err("another tree refuses");
+    assert_eq!(refused.slug(), errors::server::read_revision_unserved::SLUG);
     Ok(())
 }
 

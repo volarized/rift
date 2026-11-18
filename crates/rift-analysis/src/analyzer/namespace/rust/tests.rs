@@ -2491,8 +2491,8 @@ fn assert_local_alias(
         .expect("source-backed public alias");
     assert!(
         object
-            .facets
-            .contains(&rift_protocol::read::SymbolFacet::Alias)
+            .kinds
+            .contains(&rift_protocol::read::SymbolKind::Alias)
     );
     let binding = publication
         .declarations
@@ -2518,11 +2518,11 @@ fn assert_local_alias(
         .expect("owner-preserving identity");
     assert_eq!(identity.owner(), &publication.owner);
     let edge = publication
-        .relationships
+        .edges
         .iter()
         .find(|edge| {
             Some(&edge.from) == object.id.as_ref()
-                && edge.kind.0 == rift_protocol::read::RelationshipFacet::Aliases.as_ref()
+                && edge.kind.0 == rift_protocol::read::EdgeKind::Aliases.as_ref()
         })
         .expect("explicit alias target");
     assert_eq!(edge.to.as_str(), target);
@@ -2543,8 +2543,8 @@ fn assert_local_alias(
     assert!(publication.objects.iter().any(|object| {
         object.id.as_ref().is_some_and(|id| id.as_str() == target)
             && object
-                .facets
-                .contains(&rift_protocol::read::SymbolFacet::Type)
+                .kinds
+                .contains(&rift_protocol::read::SymbolKind::Type)
     }));
 }
 
@@ -2776,8 +2776,8 @@ fn assert_external_alias(publication: &rift_protocol::index::PackagePublication,
         .expect("original public reexport");
     assert!(
         object
-            .facets
-            .contains(&rift_protocol::read::SymbolFacet::Alias)
+            .kinds
+            .contains(&rift_protocol::read::SymbolKind::Alias)
     );
     assert_eq!(
         SymbolIdentity::parse(object.id.as_ref().expect("alias identity").as_str())
@@ -2805,11 +2805,11 @@ fn assert_external_alias(publication: &rift_protocol::index::PackagePublication,
     );
     assert!(binding.source.contains("pub use serde_core"));
     let edge = publication
-        .relationships
+        .edges
         .iter()
         .find(|edge| {
             Some(&edge.from) == object.id.as_ref()
-                && edge.kind.0 == rift_protocol::read::RelationshipFacet::Aliases.as_ref()
+                && edge.kind.0 == rift_protocol::read::EdgeKind::Aliases.as_ref()
         })
         .expect("explicit target binding");
     assert_eq!(edge.to.as_str(), target);
@@ -2855,7 +2855,7 @@ fn external_public_reexports_keep_original_alias_chain_and_defining_owner() {
     );
     assert_external_alias(source.publication(), "Serialize");
     assert!(
-        target.publication().relationships.iter().any(|edge| edge
+        target.publication().edges.iter().any(|edge| edge
             .from
             .as_str()
             .ends_with("/serde_core/Serialize")
@@ -2877,8 +2877,8 @@ fn external_public_reexports_without_admitted_target_remain_unresolved() {
     );
     assert!(!source.publication().objects.iter().any(|object| {
         object
-            .facets
-            .contains(&rift_protocol::read::SymbolFacet::Alias)
+            .kinds
+            .contains(&rift_protocol::read::SymbolKind::Alias)
     }));
 }
 
@@ -2900,8 +2900,8 @@ fn external_public_reexports_refuse_missing_target_and_opaque_source() {
         );
         assert!(!source.publication().objects.iter().any(|object| {
             object
-                .facets
-                .contains(&rift_protocol::read::SymbolFacet::Alias)
+                .kinds
+                .contains(&rift_protocol::read::SymbolKind::Alias)
         }));
     }
 }

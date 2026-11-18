@@ -22,8 +22,8 @@ use std::{fs, time::Duration};
 
 use axum::http::StatusCode;
 use global_api::{
-    BODY_BOUND_CURSOR, BODY_MATCH_QUERY, COLLECTED_UNIT, FixtureOptions, GlobalFixture, Hold,
-    SymbolFixture, UNSATISFIED_REQUIREMENT,
+    BODY_MATCH_QUERY, COLLECTED_UNIT, FixtureOptions, GlobalFixture, Hold, SymbolFixture,
+    UNSATISFIED_REQUIREMENT,
 };
 use rift_protocol::error::ErrorCode;
 use rmcp::model::ReadResourceRequestParams;
@@ -220,7 +220,7 @@ async fn request_deadline_bounds_global_resolution() -> TestResult {
 const READ_DELAY: Duration = Duration::from_secs(10);
 
 /// A package read the request deadline cuts short discards the remote lane: symbol and full-text `search` each answer the project hits alone, with the timeout warning, well before
-/// the held page would have arrived, and `nodes` of a package symbol, which has no project
+/// the held page would have arrived, and `facets` of a package symbol, which has no project
 /// answer, refuses as temporarily unavailable.
 #[tokio::test]
 async fn request_deadline_bounds_the_remote_package_read() -> TestResult {
@@ -274,13 +274,13 @@ async fn request_deadline_bounds_the_remote_package_read() -> TestResult {
     let symbol = global_api::collected_identity(SymbolFixture::Valid, "beacon");
     let refused = failed_call(
         client
-            .call_tool(tool_request("nodes", &json!({"symbol": symbol})))
+            .call_tool(tool_request("facets", &json!({"symbol": symbol})))
             .await,
     )?;
     let elapsed = started.elapsed();
     assert!(
         elapsed < READ_DELAY,
-        "nodes: the request deadline must end the read wait: elapsed={elapsed:?}"
+        "kinds: the request deadline must end the read wait: elapsed={elapsed:?}"
     );
     assert_eq!(
         refused.code,
@@ -782,7 +782,7 @@ async fn successful_search_uses_remote_phases_without_local_request_fields() -> 
     Ok(())
 }
 
-/// A package `get_symbol` or `nodes` read naming no revision reads the release the
+/// A package `get_symbol` or `facets` read naming no revision reads the release the
 /// workspace's dependencies pin, and its answer reports that release.
 #[tokio::test]
 async fn a_package_symbol_read_names_the_release_the_workspace_pins() -> TestResult {
@@ -798,9 +798,9 @@ async fn a_package_symbol_read_names_the_release_the_workspace_pins() -> TestRes
     let release = "rift://revision/cargo/crates.io/demo@1.0.0";
     let read = call_tool(&client, "get_symbol", json!({"id": id})).await?;
     assert_eq!(read["revision"], release, "{read:#}");
-    let nodes = call_tool(&client, "nodes", json!({"symbol": id})).await?;
-    assert_eq!(nodes["revision"], release, "{nodes:#}");
-    for endpoint in ["/v1/symbols", "/v1/nodes"] {
+    let syntax_elements = call_tool(&client, "facets", json!({"symbol": id})).await?;
+    assert_eq!(syntax_elements["revision"], release, "{syntax_elements:#}");
+    for endpoint in ["/v1/symbols", "/v1/facets"] {
         let asked = fixture
             .requests()
             .await
@@ -817,11 +817,11 @@ async fn a_package_symbol_read_names_the_release_the_workspace_pins() -> TestRes
     Ok(())
 }
 
-/// The nodes of a package symbol come from the global API in the shape a project symbol's
-/// nodes take: the package's `beacon` and the project's `beacon` share each node's identity,
-/// kind, and source, and differ in the unit and offsets that locate them.
+/// Package and project facets use the same shape. Their syntax elements share declaration
+/// ordinals, indexes, kinds, and source, and differ in the unit and offsets that locate them.
 #[tokio::test]
-async fn package_symbol_nodes_come_from_the_global_api_in_the_project_shape() -> TestResult {
+async fn package_symbol_syntax_elements_come_from_the_global_api_in_the_project_shape() -> TestResult
+{
     let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
     let configuration = format!(
         "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
@@ -831,7 +831,7 @@ async fn package_symbol_nodes_come_from_the_global_api_in_the_project_shape() ->
     let workspace = served_dependent_workspace(Some(&configuration)).await?;
     let (directory, client, server_task) = workspace.served;
     let id = global_api::collected_identity(SymbolFixture::Valid, "beacon");
-    let package = call_tool(&client, "nodes", json!({"symbol": id, "syntax": true})).await?;
+    let package = call_tool(&client, "facets", json!({"symbol": id})).await?;
     let found = search_symbols(
         &client,
         json!({"query": "beacon", "scope": "local", "target": "symbol"}),
@@ -844,59 +844,35 @@ async fn package_symbol_nodes_come_from_the_global_api_in_the_project_shape() ->
         .find(|hit| hit["hit"]["symbol"]["name"] == "beacon")
         .and_then(|hit| hit["hit"]["symbol"]["id"].as_str())
         .ok_or("the project declares beacon")?;
-    let local_request = json!({"symbol": local_id, "syntax": true});
-    let local = call_tool(&client, "nodes", local_request).await?;
+    let local_request = json!({"symbol": local_id});
+    let local = call_tool(&client, "facets", local_request).await?;
 
-    let package_nodes = package["nodes"].as_array().ok_or("package nodes")?;
-    let local_nodes = local["nodes"].as_array().ok_or("project nodes")?;
-    assert_eq!(
-        package_nodes.len(),
-        local_nodes.len(),
-        "{package:#}\n{local:#}"
-    );
-    for (package_node, local_node) in package_nodes.iter().zip(local_nodes) {
-        for field in [
-            "declaration",
-            "index",
-            "parent",
-            "kind",
-            "language",
-            "source",
-            "facets",
-        ] {
-            assert_eq!(
-                package_node[field], local_node[field],
-                "{field}: {package:#}"
-            );
-        }
-        assert_eq!(package_node["unit"], COLLECTED_UNIT, "{package:#}");
-        assert_eq!(
-            local_node["unit"], "rift://source/project/src/lib.rs",
-            "{local:#}"
-        );
-    }
+    assert_matching_facet_syntax(&package, &local)?;
     assert_eq!(package["symbol"], json!(id), "{package:#}");
     assert_eq!(
-        package_nodes[0]["source"], "pub fn beacon() {}",
+        package["declarations"][0]["source"]["text"], "pub fn beacon() {}",
         "{package:#}"
     );
 
     let at_release = call_tool(
         &client,
-        "nodes",
-        json!({"symbol": id, "revision": package["revision"], "syntax": true}),
+        "facets",
+        json!({"symbol": id, "revision": package["revision"]}),
     )
     .await?;
     assert_eq!(
         at_release["revision"], package["revision"],
         "{at_release:#}"
     );
-    assert_eq!(at_release["nodes"], package["nodes"], "{at_release:#}");
+    assert_eq!(
+        at_release["declarations"][0]["syntax"], package["declarations"][0]["syntax"],
+        "{at_release:#}"
+    );
 
     let absent = global_api::collected_identity(SymbolFixture::Valid, "absent");
     let refused = failed_call(
         client
-            .call_tool(tool_request("nodes", &json!({"symbol": absent})))
+            .call_tool(tool_request("facets", &json!({"symbol": absent})))
             .await,
     )?;
     assert_eq!(
@@ -909,7 +885,7 @@ async fn package_symbol_nodes_come_from_the_global_api_in_the_project_shape() ->
     let at_revision = failed_call(
         client
             .call_tool(tool_request(
-                "nodes",
+                "facets",
                 &json!({"symbol": id, "revision": "rift://revision/git/main"}),
             ))
             .await,
@@ -923,6 +899,48 @@ async fn package_symbol_nodes_come_from_the_global_api_in_the_project_shape() ->
     drop(directory);
     client.cancel().await?;
     server_task.await?;
+    Ok(())
+}
+
+/// Package and project declarations retain the same syntax structure and source.
+fn assert_matching_facet_syntax(package: &Value, local: &Value) -> TestResult {
+    let package_syntax_elements = package["declarations"][0]["syntax"]
+        .as_array()
+        .ok_or("package facets")?;
+    let local_syntax_elements = local["declarations"][0]["syntax"]
+        .as_array()
+        .ok_or("project facets")?;
+    assert_eq!(
+        package_syntax_elements.len(),
+        local_syntax_elements.len(),
+        "{package:#}\n{local:#}"
+    );
+    for (package_syntax_element, local_syntax_element) in
+        package_syntax_elements.iter().zip(local_syntax_elements)
+    {
+        for field in [
+            "declaration",
+            "index",
+            "parent",
+            "kind",
+            "language",
+            "source",
+            "facets",
+        ] {
+            assert_eq!(
+                package_syntax_element[field], local_syntax_element[field],
+                "{field}: {package:#}"
+            );
+        }
+        assert_eq!(
+            package_syntax_element["unit"], COLLECTED_UNIT,
+            "{package:#}"
+        );
+        assert_eq!(
+            local_syntax_element["unit"], "rift://source/project/src/lib.rs",
+            "{local:#}"
+        );
+    }
     Ok(())
 }
 
@@ -941,7 +959,7 @@ async fn test_global_prose_search_preserves_broad_full_text_order() -> TestResul
         let request = json!({
             "query": global_api::BROAD_BODY_MATCH_QUERY,
             "scope": "global",
-            "limit": limit,
+            "max_results": limit,
             "include": {"source": true, "score": true}
         });
         let answer = call_tool(&client, "search", request).await?;
@@ -989,7 +1007,10 @@ async fn search_requests(fixture: &GlobalFixture) -> Vec<global_api::ObservedReq
 /// advertising 1,000, and one request per phase either way.
 #[tokio::test]
 async fn a_search_asks_one_page_per_phase_at_the_advertised_limit() -> TestResult {
-    for (advertised, limit) in [(200, "limit=200"), (1_000, "limit=1000")] {
+    for (advertised, limit) in [
+        (200, "page=1&max_results=200"),
+        (1_000, "page=1&max_results=1000"),
+    ] {
         let fixture = GlobalFixture::start_with(FixtureOptions {
             page_limit_max: advertised,
             ..FixtureOptions::default()
@@ -1031,10 +1052,10 @@ async fn a_search_asks_one_page_per_phase_at_the_advertised_limit() -> TestResul
 }
 
 /// A search page the service stopped at its response body bound answers what fit, with the
-/// page's `result_truncated` as a `global_page_warning`, and its cursor is not followed: the
+/// page's `result_truncated` as a `global_page_warning`:
 /// search stays at one request per phase.
 #[tokio::test]
-async fn a_page_stopped_at_the_body_bound_answers_without_following_its_cursor() -> TestResult {
+async fn a_page_warning_preserves_the_answer() -> TestResult {
     let fixture = GlobalFixture::start_with(FixtureOptions {
         stopped_at_body_bound: true,
         ..FixtureOptions::default()
@@ -1079,12 +1100,6 @@ async fn a_page_stopped_at_the_body_bound_answers_without_following_its_cursor()
     );
     let searches = search_requests(&fixture).await;
     assert_eq!(searches.len(), 2, "{searches:#?}");
-    assert!(
-        searches
-            .iter()
-            .all(|request| !request.uri.contains(BODY_BOUND_CURSOR)),
-        "the stopped page's cursor is never followed: {searches:#?}"
-    );
     drop(directory);
     client.cancel().await?;
     server_task.await?;
@@ -1231,7 +1246,7 @@ async fn a_package_scoped_pattern_answers_package_matches_from_one_request() -> 
     assert!(
         requests
             .iter()
-            .all(|request| request.uri.ends_with("limit=200")),
+            .all(|request| request.uri.ends_with("page=1&max_results=200")),
         "{requests:#?}"
     );
     drop(directory);
@@ -1946,8 +1961,8 @@ async fn a_refused_package_scoped_read_makes_no_global_request() -> TestResult {
         ),
         (
             "search",
-            json!({"query": "SELECT ?hit { SERVICE :search { ?hit :query 'beacon'; :scope 'all'; :limit 0; :index ?index } }"}),
-            "field limit",
+            json!({"query": "SELECT ?hit { SERVICE :search { ?hit :query 'beacon'; :scope 'all'; :max_results 0; :index ?index } }"}),
+            "field max_results",
         ),
         (
             "search",
@@ -1956,13 +1971,13 @@ async fn a_refused_package_scoped_read_makes_no_global_request() -> TestResult {
         ),
         (
             "search",
-            json!({"query": "SELECT ?hit { SERVICE :search { ?hit :pattern 'beacon'; :scope 'all'; :limit 0; :index ?index } }"}),
-            "field limit",
+            json!({"query": "SELECT ?hit { SERVICE :search { ?hit :pattern 'beacon'; :scope 'all'; :max_results 0; :index ?index } }"}),
+            "field max_results",
         ),
         (
             "get_symbol",
-            json!({"id": id, "declaration_limit": 0}),
-            "field limit",
+            json!({"id": id, "max_results": 0}),
+            "field max_results",
         ),
     ];
     for (tool, request, diagnostic) in refused {
@@ -2476,7 +2491,7 @@ async fn test_identifier_case_precedes_documentation_frequency() -> TestResult {
     let source = "/// searchHit searchHit searchHit searchHit\npub fn SearchHit() {}\npub fn searchHit() {}\n";
     let (_directory, client, server_task) =
         served_workspace(&[("src/lib.rs", source)], None).await?;
-    let request = json!({"query": "searchHit", "limit": 1, "include": {"source": true}});
+    let request = json!({"query": "searchHit", "max_results": 1, "include": {"source": true}});
     let answer = workspace_client::search_after_population(&client, &request).await?;
     assert_eq!(
         answer["results"][0]["hit"]["symbol"]["name"], "searchHit",
@@ -2489,7 +2504,7 @@ async fn test_identifier_case_precedes_documentation_frequency() -> TestResult {
     let answer = call_tool(
         &client,
         "search",
-        json!({"query": "searchHit", "limit": 10}),
+        json!({"query": "searchHit", "max_results": 10}),
     )
     .await?;
     let wrong_case = answer["results"]
@@ -2543,8 +2558,7 @@ async fn test_identifier_case_pairs_rank_exact_spelling_through_mcp() -> TestRes
         ] {
             assert_original_identifier(&client, scope, name).await?;
         }
-        let args =
-            json!({"query": "SEARCHHIT", "scope": scope, "limit": 10, "include": {"source": true}});
+        let args = json!({"query": "SEARCHHIT", "scope": scope, "max_results": 10, "include": {"source": true}});
         let answer = call_tool(&client, "search", args).await?;
         let hits = answer["results"]
             .as_array()
@@ -2577,7 +2591,7 @@ async fn assert_identifier_request(
     query: &str,
     expected: [&str; 2],
 ) -> TestResult {
-    let args = json!({"query": query, "scope": "global", "limit": 10});
+    let args = json!({"query": query, "scope": "global", "max_results": 10});
     let answer = call_tool(client, "search", args).await?;
     assert_eq!(
         answer["results"]
@@ -2603,7 +2617,8 @@ async fn assert_original_identifier(
     scope: &str,
     name: &str,
 ) -> TestResult {
-    let args = json!({"query": name, "scope": scope, "limit": 1, "include": {"source": true}});
+    let args =
+        json!({"query": name, "scope": scope, "max_results": 1, "include": {"source": true}});
     let answer = call_tool(client, "search", args).await?;
     let hits = answer["results"]
         .as_array()
@@ -2638,7 +2653,7 @@ async fn test_native_client_accepts_original_identifier_candidates() -> TestResu
         ..Config::default()
     })?;
     let mut request = case_search_request("SearchHit and searchHit")?;
-    let page = client.search_packages(&request, 10, None).await?;
+    let page = client.search_packages(&request, 10, 1).await?;
     assert_eq!(page.items.len(), 2);
     for name in ["SearchHit", "searchHit", "createProgram", "load_config"] {
         request.query = Some(name.to_owned());
@@ -2648,7 +2663,7 @@ async fn test_native_client_accepts_original_identifier_candidates() -> TestResu
             prefix: false,
         }]);
         request.identifiers = Some(vec![name.to_owned()]);
-        let page = client.search_packages(&request, 1, None).await?;
+        let page = client.search_packages(&request, 1, 1).await?;
         let hit = rift_cloud_client::PackageSearchCandidate::try_from(page.items[0].clone())?;
         let rift_protocol::read::SearchHitTarget::Symbol { symbol } = &hit.hit.hit else {
             return Err("search returns a declaration".into());
@@ -2667,6 +2682,7 @@ fn case_search_request(query: &str) -> TestResult<rift_cloud_client::PackageSear
     use rift_cloud_client::{PackageSearchRequest, PackageSearchRequestPhase, QueryTerm};
     let parsed = rift_ranking::ParsedQuery::parse(query)?;
     Ok(PackageSearchRequest {
+        revision: None,
         query: Some(query.to_owned()),
         terms: Some(
             parsed
@@ -2708,8 +2724,7 @@ async fn test_qualified_identifier_case_ranks_original_spelling() -> TestResult 
     let (_directory, client, server_task) =
         served_workspace(&[("src/lib.rs", source)], None).await?;
     for name in ["createProgram", "createprogram"] {
-        let args =
-            json!({"query": format!("Vault::{name}"), "limit": 1, "include": {"source": true}});
+        let args = json!({"query": format!("Vault::{name}"), "max_results": 1, "include": {"source": true}});
         let answer = call_tool(&client, "search", args).await?;
         assert_eq!(
             answer["results"][0]["hit"]["symbol"]["name"], name,

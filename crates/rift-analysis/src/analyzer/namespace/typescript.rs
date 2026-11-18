@@ -5,7 +5,7 @@ use std::fmt;
 
 use rift_core::{FileDigest, ProjectPath, SymbolId};
 use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
-use rift_protocol::read::SymbolFacet;
+use rift_protocol::read::SymbolKind;
 use rift_syntax::{ByteRange, LogicalDeclaration, SyntaxExportKind, SyntaxFacts, SyntaxSymbol};
 use serde::{Deserialize, Deserializer, de};
 
@@ -460,12 +460,12 @@ fn map_files(
         else {
             continue;
         };
-        let declared_callable = declared.facets.contains(&SymbolFacet::Callable);
-        let target_callable = target.facets.contains(&SymbolFacet::Callable);
+        let declared_callable = declared.kinds.contains(&SymbolKind::Callable);
+        let target_callable = target.kinds.contains(&SymbolKind::Callable);
         let category_matches = match (declared.kind, target.kind) {
             ("variable", "variable") => {
-                declared.facets.contains(&SymbolFacet::Value)
-                    && target.facets.contains(&SymbolFacet::Value)
+                declared.kinds.contains(&SymbolKind::Value)
+                    && target.kinds.contains(&SymbolKind::Value)
                     && declared_callable == target_callable
             }
             ("function" | "variable", "function") => {
@@ -729,8 +729,8 @@ fn declaration_anchors_with_public(
     let mut paths: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut anchors = BTreeMap::new();
     for symbol in syntax.symbols().iter().filter(|symbol| {
-        symbol.node_kind != Some("assignment_expression")
-            || symbol.facets.contains(&SymbolFacet::Public)
+        symbol.syntax_element_kind != Some("assignment_expression")
+            || symbol.kinds.contains(&SymbolKind::Public)
             || public.contains(&symbol.qualified_name)
     }) {
         let literal = declared_module_name(symbol, source);

@@ -887,7 +887,7 @@ impl ConfigurationState {
         let workspace_bytes_max =
             usize::try_from(source.workspace_size.bytes()).unwrap_or(usize::MAX);
         let declarations_max = usize::try_from(source.declarations).unwrap_or(usize::MAX);
-        let relationships_max = usize::try_from(source.relationships).unwrap_or(usize::MAX);
+        let edges_max = usize::try_from(source.edges).unwrap_or(usize::MAX);
         let revision_tree_entries_max =
             usize::try_from(self.history_configuration().tree_entries).unwrap_or(usize::MAX);
         let directory_depth_max = usize::try_from(source.directory_depth).unwrap_or(usize::MAX);
@@ -896,7 +896,7 @@ impl ConfigurationState {
         let syntax = self.syntax_configuration();
         let large_files = self.text_inclusion().large_files();
         base.with_workspace_bounds(files_max, workspace_bytes_max, declarations_max)
-            .and_then(|limits| limits.with_relationships(relationships_max))
+            .and_then(|limits| limits.with_edges(edges_max))
             .and_then(|limits| limits.with_revision_tree_entries(revision_tree_entries_max))
             .and_then(|limits| limits.with_read_bounds(directory_depth_max, results_max))
             .and_then(|limits| {
@@ -12602,7 +12602,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    type RelationshipRow = (String, String, String, String, u64, u64);
+    type EdgeRow = (String, String, String, String, u64, u64);
 
     /// Complete indexed facts exposed by one immutable read publication.
     #[derive(Debug, PartialEq)]
@@ -12614,7 +12614,7 @@ pub(crate) mod tests {
         symbols: BTreeSet<String>,
         names: BTreeSet<String>,
         symbol_reads: BTreeMap<String, Vec<serde_json::Value>>,
-        relationships: BTreeSet<RelationshipRow>,
+        edges: BTreeSet<EdgeRow>,
     }
 
     fn published_facts(published: &PublishedWorkspace) -> TestResult<PublishedFacts> {
@@ -12635,14 +12635,14 @@ pub(crate) mod tests {
         let mut symbol_reads = BTreeMap::new();
         for name in &names {
             let mut pages = Vec::new();
-            let mut page_index = 0;
+            let mut page = 1;
             loop {
                 let params = serde_json::from_value(serde_json::json!({
                     "name": name,
                     "scope": "local",
                     "include": {"documentation": true},
-                    "limit": 64,
-                    "page_index": page_index,
+                    "max_results": 64,
+                    "page": page,
                 }))?;
                 let result = reads.get_symbol(&params)?;
                 if !result.warnings.is_empty() {
@@ -12652,49 +12652,49 @@ pub(crate) mod tests {
                     )
                     .into());
                 }
-                let total_pages = result.pagination.total_pages;
-                if total_pages > 32 {
+                let page_count = result.pagination.pages;
+                if page_count > 32 {
                     return Err(format!("symbol read exceeded 32 pages: {name}").into());
                 }
                 pages.push(serde_json::to_value(&result)?);
-                page_index += 1;
-                if page_index >= total_pages {
+                page += 1;
+                if page > page_count {
                     break;
                 }
-                if page_index > 32 {
+                if page > 32 {
                     return Err(format!("symbol read exceeded 32 pages: {name}").into());
                 }
             }
             symbol_reads.insert(name.clone(), pages);
         }
 
-        let store = reads.relationships();
+        let store = reads.edges();
         if !store.is_complete() || store.dropped_edges() != 0 {
             return Err(format!(
-                "relationship store is incomplete: dropped_edges={}",
+                "edge store is incomplete: dropped_edges={}",
                 store.dropped_edges()
             )
             .into());
         }
-        let mut relationships = BTreeSet::new();
+        let mut edges = BTreeSet::new();
         for id in &ids {
             for edge in store.outgoing(id).iter().chain(store.incoming(id)) {
                 let occurrence = edge.occurrence();
                 let range = occurrence.range();
-                relationships.insert((
+                edges.insert((
                     edge.from().as_str().to_owned(),
                     edge.to().as_str().to_owned(),
-                    serde_json::to_string(&edge.facet())?,
+                    serde_json::to_string(&edge.kind())?,
                     occurrence.unit().to_string(),
                     range.start(),
                     range.end(),
                 ));
             }
         }
-        if relationships.iter().any(|(from, to, ..)| {
+        if edges.iter().any(|(from, to, ..)| {
             !ids.iter().any(|id| id.as_str() == from) || !ids.iter().any(|id| id.as_str() == to)
         }) {
-            return Err("relationship edge names a symbol absent from index documents".into());
+            return Err("edge edge names a symbol absent from index documents".into());
         }
 
         Ok(PublishedFacts {
@@ -12705,7 +12705,7 @@ pub(crate) mod tests {
             symbols: ids.iter().map(ToString::to_string).collect(),
             names,
             symbol_reads,
-            relationships,
+            edges,
         })
     }
 
@@ -12857,7 +12857,7 @@ pub(crate) mod tests {
         );
         let cold_a_facts = published_facts(&cold_a)?;
         assert!(
-            cold_a_facts.relationships.is_empty(),
+            cold_a_facts.edges.is_empty(),
             "fixture semantic edges are empty"
         );
 

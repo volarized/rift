@@ -4,9 +4,9 @@
 use rift_syntax::RustQuery;
 use tree_sitter::{Language, MIN_COMPATIBLE_LANGUAGE_VERSION, Parser, Tree};
 
-const REQUIRED_CAPTURE: &str = "rift.node";
+const REQUIRED_CAPTURE: &str = "rift.syntax_element";
 
-/// Node kinds the ECMAScript rules read from every pinned grammar in the
+/// Grammar kinds the ECMAScript rules read from every pinned grammar in the
 /// family, restated here so a grammar bump that renames one fails this
 /// suite before it fails extraction.
 const ECMASCRIPT_CORE_KINDS: &[&str] = &[
@@ -21,7 +21,7 @@ const ECMASCRIPT_CORE_KINDS: &[&str] = &[
     "identifier",
 ];
 
-/// Node kinds the ECMAScript rules read from the two TypeScript grammars
+/// Grammar kinds the ECMAScript rules read from the two TypeScript grammars
 /// only.
 const TYPESCRIPT_KINDS: &[&str] = &[
     "interface_declaration",
@@ -36,7 +36,7 @@ const TYPESCRIPT_KINDS: &[&str] = &[
 /// the family.
 const ECMASCRIPT_FIELDS: &[&str] = &["name", "body", "value"];
 
-/// Node kinds the markdown rules read from the pinned block grammar,
+/// Grammar kinds the markdown rules read from the pinned block grammar,
 /// restated here so a grammar bump that renames one fails this suite before
 /// it fails extraction.
 const MARKDOWN_KINDS: &[&str] = &["section", "atx_heading", "setext_heading"];
@@ -44,7 +44,7 @@ const MARKDOWN_KINDS: &[&str] = &["section", "atx_heading", "setext_heading"];
 /// Grammar fields the markdown rules read from the pinned block grammar.
 const MARKDOWN_FIELDS: &[&str] = &["heading_content"];
 
-/// Node kinds the JSON rules read from the pinned grammar, restated here so
+/// Grammar kinds the JSON rules read from the pinned grammar, restated here so
 /// a grammar bump that renames one fails this suite before it fails
 /// extraction.
 const JSON_KINDS: &[&str] = &["pair", "string"];
@@ -52,7 +52,7 @@ const JSON_KINDS: &[&str] = &["pair", "string"];
 /// Grammar fields the JSON rules read from the pinned grammar.
 const JSON_FIELDS: &[&str] = &["key", "value"];
 
-/// Node kinds the YAML rules read from the pinned grammar, restated here so
+/// Grammar kinds the YAML rules read from the pinned grammar, restated here so
 /// a grammar bump that renames one fails this suite before it fails
 /// extraction.
 const YAML_KINDS: &[&str] = &[
@@ -71,7 +71,7 @@ const YAML_KINDS: &[&str] = &[
 /// Grammar fields the YAML rules read from the pinned grammar.
 const YAML_FIELDS: &[&str] = &["key", "value"];
 
-/// Node kinds the TOML rules read from the pinned grammar, restated here so
+/// Grammar kinds the TOML rules read from the pinned grammar, restated here so
 /// a grammar bump that renames one fails this suite before it fails
 /// extraction. The pinned grammar declares no fields at all, so there is no
 /// matching `TOML_FIELDS` constant.
@@ -131,7 +131,7 @@ fn assert_kinds_resolve(name: &str, language: &Language, kinds: &[&str]) {
         assert_ne!(
             language.id_for_node_kind(kind, true),
             0,
-            "pinned {name} grammar must define node kind used by symbol \
+            "pinned {name} grammar must define syntax_element kind used by symbol \
              extraction: kind={kind}",
         );
     }
@@ -193,7 +193,7 @@ fn test_rust_grammar_compiles_required_capture_query() {
         query_has_capture(
             &language,
             include_str!("fixtures/rust/valid.rs"),
-            "(source_file) @rift.node",
+            "(source_file) @rift.syntax_element",
         ),
         "required query must capture Rust root",
     );
@@ -211,13 +211,13 @@ fn test_rust_grammar_uses_supported_abi() {
 }
 
 #[test]
-fn test_rust_grammar_resolves_attachment_node_kind_ids() {
+fn test_rust_grammar_resolves_attachment_syntax_element_kind_ids() {
     let language = rust_language();
     for kind in ["attribute_item", "line_comment", "block_comment"] {
         assert_ne!(
             language.id_for_node_kind(kind, true),
             0,
-            "pinned Rust grammar must define node kind used by attachment \
+            "pinned Rust grammar must define syntax_element kind used by attachment \
              classification: kind={kind}",
         );
     }
@@ -400,8 +400,8 @@ fn test_toml_grammar_resolves_every_read_kind_and_declares_no_fields() {
     );
 }
 
-/// A pair with no value at all parses as an `ERROR` node wrapping the bare
-/// key and `=`, not a `pair` node; the malformed fixture is exactly that.
+/// A pair with no value at all parses as an `ERROR` syntax element wrapping the bare
+/// key and `=`, not a `pair` syntax element; the malformed fixture is exactly that.
 #[test]
 fn test_toml_grammar_parses_valid_and_malformed_fixtures() {
     let language = toml_language();

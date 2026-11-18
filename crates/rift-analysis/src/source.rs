@@ -96,7 +96,7 @@ impl IndexedFile {
         self.executable = executable;
     }
 
-    /// Returns syntax facts without the complete node table.
+    /// Returns syntax facts without the complete syntax element table.
     #[must_use]
     pub fn syntax(&self) -> &SyntaxFacts {
         &self.syntax
@@ -161,7 +161,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn indexed_file_keeps_declaration_node_fact_without_full_node_rows() {
+    fn indexed_file_keeps_declaration_syntax_element_fact_without_full_syntax_element_rows() {
         let path = ProjectPath::new("src/lib.rs").expect("valid source path");
         let source = "pub fn beacon() {}\n";
         let document = registry::provider_for_extension("rs")
@@ -176,13 +176,13 @@ mod tests {
             .expect("Rust source parses");
         let symbol_range = document.symbols()[0].range;
         let expected_kind = document
-            .nodes()
+            .syntax_elements()
             .iter()
-            .find(|node| node.range == symbol_range)
-            .map(|node| node.kind);
+            .find(|syntax_element| syntax_element.range == symbol_range)
+            .map(|syntax_element| syntax_element.kind);
         assert!(
             expected_kind.is_some(),
-            "fixture declaration has syntax node"
+            "fixture declaration has syntax element"
         );
 
         let file = IndexedFile::new(
@@ -193,6 +193,9 @@ mod tests {
             document,
         );
 
-        assert_eq!(file.syntax().symbols()[0].node_kind, expected_kind);
+        assert_eq!(
+            file.syntax().symbols()[0].syntax_element_kind,
+            expected_kind
+        );
     }
 }

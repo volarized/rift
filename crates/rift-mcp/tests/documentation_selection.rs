@@ -37,7 +37,7 @@ async fn client_for(root: &Path) -> TestResult<RunningService<RoleClient, ()>> {
 
 /// The paths of the documentation hits a `lighthouse` query answers, sorted.
 async fn documentation_paths(client: &RunningService<RoleClient, ()>) -> TestResult<Vec<String>> {
-    let arguments = json!({ "query": "lighthouse", "target": "documentation", "limit": 50 });
+    let arguments = json!({ "query": "lighthouse", "target": "documentation", "max_results": 50 });
     let answer = search_after_population(client, &arguments).await?;
     let mut paths: Vec<String> = answer["results"]
         .as_array()

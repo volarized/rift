@@ -1,8 +1,8 @@
-pub use rift_analysis::{RELATIONSHIP_EDGES_MAX, RelationshipEdge, RelationshipStore};
+pub use rift_analysis::{EDGES_MAX, Edge, EdgeStore};
 
 #[cfg(test)]
 mod tests {
-    use super::RelationshipStore;
+    use super::EdgeStore;
 
     #[test]
     fn a_real_workspace_fixture_yields_no_edge() -> Result<(), Box<dyn std::error::Error>> {
@@ -19,10 +19,10 @@ mod tests {
             &rift_core::TextFileInclusion::default(),
         )?;
 
-        assert!(index.relationships().is_empty());
-        assert!(index.relationships().is_complete());
-        let relationships: &RelationshipStore = index.relationships();
-        assert_eq!(relationships.dropped_edges(), 0);
+        assert!(index.edges().is_empty());
+        assert!(index.edges().is_complete());
+        let edges: &EdgeStore = index.edges();
+        assert_eq!(edges.dropped_edges(), 0);
         Ok(())
     }
 }

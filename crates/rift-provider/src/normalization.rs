@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use rift_core::{
-    Contribution, ContributionKey, ContributionReference, DeclarationBinding, EquivalenceEvidence,
-    IndexRevision, ReferenceRole, RelationshipKind, SourceApplicability, SourceRevision,
+    Contribution, ContributionKey, ContributionReference, DeclarationBinding, EdgeKind,
+    EquivalenceEvidence, IndexRevision, ReferenceRole, SourceApplicability, SourceRevision,
     SourceUnitId, SymbolId, SymbolRecord, SymbolResolution, TreeRevision,
 };
 
@@ -39,21 +39,21 @@ pub enum NormalizedTarget {
     Contribution(ContributionReference),
 }
 
-/// One Relationship in a captured normalized graph.
+/// One Edge in a captured normalized graph.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NormalizedRelationship {
+pub struct NormalizedEdge {
     index_revision: IndexRevision,
     source: ContributionKey,
-    kind: RelationshipKind,
+    kind: EdgeKind,
     target: NormalizedTarget,
-    derivation: Option<rift_protocol::read::RelationshipDerivation>,
+    derivation: Option<rift_protocol::read::EdgeDerivation>,
     occurrence: Option<DeclarationBinding>,
 }
 
-impl NormalizedRelationship {
+impl NormalizedEdge {
     /// Returns the provider's supplied derivation without inferring it from the kind.
     #[must_use]
-    pub const fn derivation(&self) -> Option<rift_protocol::read::RelationshipDerivation> {
+    pub const fn derivation(&self) -> Option<rift_protocol::read::EdgeDerivation> {
         self.derivation
     }
 
@@ -68,15 +68,15 @@ impl NormalizedRelationship {
         self.index_revision
     }
 
-    /// Returns Contribution supplying Relationship.
+    /// Returns Contribution supplying Edge.
     #[must_use]
     pub const fn source(&self) -> &ContributionKey {
         &self.source
     }
 
-    /// Returns portable Relationship kind.
+    /// Returns portable Edge kind.
     #[must_use]
-    pub const fn kind(&self) -> RelationshipKind {
+    pub const fn kind(&self) -> EdgeKind {
         self.kind
     }
 
@@ -208,7 +208,7 @@ pub struct NormalizedGraph {
     contribution_positions: BTreeMap<ContributionKey, usize>,
     candidates: Vec<AssociationCandidate>,
     references: Vec<NormalizedReference>,
-    relationships: Vec<NormalizedRelationship>,
+    edges: Vec<NormalizedEdge>,
 }
 
 impl NormalizedGraph {
@@ -280,10 +280,10 @@ impl NormalizedGraph {
         &self.references
     }
 
-    /// Returns normalized Relationships.
+    /// Returns normalized Edges.
     #[must_use]
-    pub fn relationships(&self) -> &[NormalizedRelationship] {
-        &self.relationships
+    pub fn edges(&self) -> &[NormalizedEdge] {
+        &self.edges
     }
 
     /// Builds availability at one source position.
@@ -697,7 +697,7 @@ fn normalize_edges(
     records: &[SymbolRecord],
     records_by_contribution: &BTreeMap<ContributionReference, usize>,
     external: &dyn Fn(&ContributionReference) -> Option<SymbolId>,
-) -> (Vec<NormalizedReference>, Vec<NormalizedRelationship>) {
+) -> (Vec<NormalizedReference>, Vec<NormalizedEdge>) {
     let normalize_target = |target: &ContributionReference| {
         let identity = if let Some(index) = records_by_contribution.get(target) {
             records
@@ -713,7 +713,7 @@ fn normalize_edges(
         )
     };
     let mut references = Vec::new();
-    let mut relationships = Vec::new();
+    let mut edges = Vec::new();
     for contribution in contributions {
         references.extend(
             contribution
@@ -727,18 +727,16 @@ fn normalize_edges(
                     targets: reference.targets().iter().map(&normalize_target).collect(),
                 }),
         );
-        relationships.extend(contribution.relationships().iter().map(|relationship| {
-            NormalizedRelationship {
-                index_revision,
-                source: contribution.key().clone(),
-                kind: relationship.kind(),
-                target: normalize_target(relationship.target()),
-                derivation: relationship.derivation(),
-                occurrence: relationship.occurrence().cloned(),
-            }
+        edges.extend(contribution.edges().iter().map(|edge| NormalizedEdge {
+            index_revision,
+            source: contribution.key().clone(),
+            kind: edge.kind(),
+            target: normalize_target(edge.target()),
+            derivation: edge.derivation(),
+            occurrence: edge.occurrence().cloned(),
         }));
     }
-    (references, relationships)
+    (references, edges)
 }
 
 fn build_graph(input: GraphBuild<'_>) -> Result<NormalizedGraph, RiftError> {
@@ -775,7 +773,7 @@ fn build_graph(input: GraphBuild<'_>) -> Result<NormalizedGraph, RiftError> {
                 right.target.symbol(),
             ))
     });
-    let (references, relationships) = normalize_edges(
+    let (references, edges) = normalize_edges(
         index_revision,
         contributions,
         &records,
@@ -794,7 +792,7 @@ fn build_graph(input: GraphBuild<'_>) -> Result<NormalizedGraph, RiftError> {
         contribution_positions,
         candidates,
         references,
-        relationships,
+        edges,
     })
 }
 
@@ -902,7 +900,7 @@ impl get_size2::GetSize for NormalizedReference {
     }
 }
 
-impl get_size2::GetSize for NormalizedRelationship {
+impl get_size2::GetSize for NormalizedEdge {
     fn get_size(&self) -> usize {
         std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
     }
@@ -1000,8 +998,7 @@ impl get_size2::GetSize for NormalizedGraph {
             get_size2::GetSize::get_heap_size_with_tracker(&self.references, tracker);
         bytes = bytes.saturating_add(field);
         tracker = next;
-        let (field, next) =
-            get_size2::GetSize::get_heap_size_with_tracker(&self.relationships, tracker);
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.edges, tracker);
         bytes = bytes.saturating_add(field);
         tracker = next;
         (bytes, tracker)
@@ -1013,12 +1010,11 @@ mod tests {
     use std::sync::Arc;
 
     use rift_core::{
-        Contribution, ContributionKey, ContributionOrigin, ContributionReference,
-        ContributionRelationship, DeclarationBinding, EquivalenceEvidence, ExactKind,
-        IndexRevision, Language, PortableSymbolFacts, ProviderId, ProviderRevision,
-        ProviderSymbolId, ReferenceRole, RelationshipKind, SemanticReference, SourceApplicability,
-        SourceKind, SourceLocation, SourceRange, SourceResolverId, SourceRevision, SourceUnitId,
-        SymbolId, SymbolResolution, TreeRevision,
+        Contribution, ContributionEdge, ContributionKey, ContributionOrigin, ContributionReference,
+        DeclarationBinding, EdgeKind, EquivalenceEvidence, ExactKind, IndexRevision, Language,
+        PortableSymbolFacts, ProviderId, ProviderRevision, ProviderSymbolId, ReferenceRole,
+        SemanticReference, SourceApplicability, SourceKind, SourceLocation, SourceRange,
+        SourceResolverId, SourceRevision, SourceUnitId, SymbolId, SymbolResolution, TreeRevision,
     };
 
     use super::{AssociationState, NormalizedGraph, Normalizer};
@@ -1801,7 +1797,7 @@ mod tests {
     }
 
     #[test]
-    fn references_relationships_and_scope_keep_resolution_state() {
+    fn references_edges_and_scope_keep_resolution_state() {
         let target = reference("syntax", "Beacon");
         let syntax = exact(
             "syntax",
@@ -1836,12 +1832,9 @@ mod tests {
             )
             .expect("reference"),
         ])
-        .relationships(vec![
-            ContributionRelationship::new(RelationshipKind::Reference, target),
-            ContributionRelationship::new(
-                RelationshipKind::Implementation,
-                reference("missing", "Trait"),
-            ),
+        .edges(vec![
+            ContributionEdge::new(EdgeKind::Reference, target),
+            ContributionEdge::new(EdgeKind::Implementation, reference("missing", "Trait")),
         ])
         .build()
         .expect("semantic contribution");
@@ -1858,12 +1851,12 @@ mod tests {
                 if identity.as_str() == "rift://symbol/local/rust/app/Beacon"
         ));
         assert!(matches!(
-            graph.relationships()[0].target(),
+            graph.edges()[0].target(),
             super::NormalizedTarget::Symbol(identity)
                 if identity.as_str() == "rift://symbol/local/rust/app/Beacon"
         ));
         assert!(matches!(
-            graph.relationships()[1].target(),
+            graph.edges()[1].target(),
             super::NormalizedTarget::Contribution(target)
                 if target.provider().as_str() == "missing"
         ));

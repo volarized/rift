@@ -41,7 +41,7 @@ fn one_workspace_page_renders_languages_and_source() {
         "configuration_revision": "3f9a1c2e",
         "languages": [tsx()],
         "source": [{"path": "src/view.tsx", "digest": "8a4d20bc", "language": "typescript:tsx"}],
-        "pagination": {"page_index": 0, "total_pages": 1}
+        "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 10}
     }));
     golden(
         &page,
@@ -63,17 +63,17 @@ fn several_workspace_pages_name_the_page_in_the_header() {
         "configuration_revision": "3f9a1c2e",
         "languages": [{"language": "python", "enabled": false, "execution": false, "syntax": false}],
         "source": [{"path": "src/view.tsx", "digest": "8a4d20bc"}],
-        "pagination": {"page_index": 0, "total_pages": 3}
+        "pagination": {"page": 1, "pages": 3, "max_results": 10, "total": 30}
     }));
     golden(
         &page,
         &[
-            "workspace · page 1/3",
+            "workspace · page 1/3, total 30 results",
             "languages:",
             "\tpython · disabled",
             "source:",
             "\tsrc/view.tsx",
-            "next · rift://workspace?page_index=1",
+            "next · rift://workspace?page=2&max_results=10",
         ],
     );
 }
@@ -83,11 +83,14 @@ fn a_page_past_the_end_names_itself_and_holds_no_source() {
     let page = page_of(json!({
         "configuration_revision": "3f9a1c2e",
         "languages": [], "source": [],
-        "pagination": {"page_index": 4, "total_pages": 3}
+        "pagination": {"page": 4, "pages": 3, "max_results": 10, "total": 30}
     }));
     golden(
         &page,
-        &["workspace · page 5/3", "No source files on this page."],
+        &[
+            "workspace · page 4/3, total 30 results",
+            "No source files on this page.",
+        ],
     );
 }
 
@@ -96,7 +99,7 @@ fn an_empty_workspace_with_one_page_is_its_header_alone() {
     let page = page_of(json!({
         "configuration_revision": "3f9a1c2e",
         "languages": [], "source": [],
-        "pagination": {"page_index": 0, "total_pages": 0}
+        "pagination": {"page": 1, "pages": 0, "max_results": 10, "total": 0}
     }));
     golden(&page, &["workspace", "No source files on this page."]);
 }
@@ -116,7 +119,7 @@ fn a_language_writes_each_capability_and_every_lsp_state() {
     let page = page_of(json!({
         "configuration_revision": "3f9a1c2e",
         "languages": languages, "source": [],
-        "pagination": {"page_index": 0, "total_pages": 1}
+        "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 10}
     }));
     golden(
         &page,
@@ -143,7 +146,7 @@ fn patterns_join_by_comma_and_an_empty_list_writes_no_line() {
              "execution": false, "syntax": false}
         ],
         "source": [],
-        "pagination": {"page_index": 0, "total_pages": 1}
+        "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 10}
     }));
     golden(
         &page,
@@ -169,15 +172,16 @@ fn warnings_leave_workspace_resource_text_unchanged() {
         ],
         "warnings": [{"code": "local_index_preparing", "prepared": 1,
                       "detail": "selected local files are still being prepared"}],
-        "pagination": {"page_index": 1, "total_pages": 2}
+        "pagination": {"page": 1, "pages": 2, "max_results": 10, "total": 20}
     }));
     golden(
         &page,
         &[
-            "workspace · page 2/2",
+            "workspace · page 1/2, total 20 results",
             "source:",
             "\ta.rs · rust",
             "\tnotes.txt",
+            "next · rift://workspace?page=2&max_results=10",
         ],
     );
 }

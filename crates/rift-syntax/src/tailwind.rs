@@ -71,24 +71,24 @@ pub fn tailwind_symbols(
         return errors::syntax::facts_range_invalid().fail();
     }
     let Some(remaining) = limits
-        .syntax_nodes_max()
-        .checked_sub(document.nodes().len())
+        .syntax_elements_max()
+        .checked_sub(document.syntax_elements().len())
     else {
-        return errors::syntax::too_many_nodes()
+        return errors::syntax::too_many_syntax_elements()
             .path(source.path)
-            .syntax_nodes_max(limits.syntax_nodes_max())
+            .syntax_elements_max(limits.syntax_elements_max())
             .fail();
     };
     crate::embedded::admit_depth(source, limits, 0, document)?;
-    let children = Children::new(document.nodes());
+    let children = Children::new(document.syntax_elements());
     let header_ends = header_ends(source.text, &children);
     let mut facts = Collector {
         facts: TailwindFacts::default(),
         remaining,
         exhausted: false,
     };
-    for (index, node) in document.nodes().iter().enumerate() {
-        match node.kind {
+    for (index, syntax_element) in document.syntax_elements().iter().enumerate() {
+        match syntax_element.kind {
             "attribute" | "directive_attribute" | "jsx_attribute" => {
                 classes(source.text, &children, index, &mut facts);
             }
@@ -105,9 +105,9 @@ pub fn tailwind_symbols(
             _ => {}
         }
         if facts.exhausted {
-            return errors::syntax::too_many_nodes()
+            return errors::syntax::too_many_syntax_elements()
                 .path(source.path)
-                .syntax_nodes_max(limits.syntax_nodes_max())
+                .syntax_elements_max(limits.syntax_elements_max())
                 .fail();
         }
     }
@@ -124,19 +124,26 @@ fn import_reference(text: &str, children: &Children<'_>, index: usize, facts: &m
     {
         return;
     }
-    if let Some(value) =
-        descendants(children, index).find(|child| children.nodes[*child].kind == "string_value")
+    if let Some(value) = descendants(children, index)
+        .find(|child| children.syntax_elements[*child].kind == "string_value")
     {
-        first_word(text, children.nodes[value].range, CONFIGURATION, facts);
+        first_word(
+            text,
+            children.syntax_elements[value].range,
+            CONFIGURATION,
+            facts,
+        );
     }
 }
 
 fn header_ends(text: &str, children: &Children<'_>) -> BTreeMap<usize, u64> {
     let keywords: Vec<usize> = children
-        .nodes
+        .syntax_elements
         .iter()
         .enumerate()
-        .filter_map(|(index, node)| (node.kind == "at_keyword").then_some(index))
+        .filter_map(|(index, syntax_element)| {
+            (syntax_element.kind == "at_keyword").then_some(index)
+        })
         .collect();
     keywords
         .iter()
@@ -144,16 +151,18 @@ fn header_ends(text: &str, children: &Children<'_>) -> BTreeMap<usize, u64> {
         .map(|(position, index)| {
             let next = keywords
                 .get(position + 1)
-                .map_or(text.len() as u64, |next| children.nodes[*next].range.start);
-            let mut parent = children.nodes[*index].parent;
+                .map_or(text.len() as u64, |next| {
+                    children.syntax_elements[*next].range.start
+                });
+            let mut parent = children.syntax_elements[*index].parent;
             let mut end = next;
             while let Some(index) = parent {
-                let node = &children.nodes[index];
-                if node.kind == "stylesheet" {
-                    end = end.min(node.range.end);
+                let syntax_element = &children.syntax_elements[index];
+                if syntax_element.kind == "stylesheet" {
+                    end = end.min(syntax_element.range.end);
                     break;
                 }
-                parent = node.parent;
+                parent = syntax_element.parent;
             }
             (*index, end)
         })
@@ -171,7 +180,8 @@ fn classes(text: &str, children: &Children<'_>, index: usize, facts: &mut Collec
     else {
         return;
     };
-    let name = if children.nodes[index].kind == "directive_attribute" && name == "v-bind" {
+    let name = if children.syntax_elements[index].kind == "directive_attribute" && name == "v-bind"
+    {
         let Some(value) = children
             .child(index, "directive_value")
             .and_then(|value| children.text(value, text))
@@ -187,7 +197,7 @@ fn classes(text: &str, children: &Children<'_>, index: usize, facts: &mut Collec
             .indices(index)
             .next()
             .expect("captured attribute name");
-        let end = children.nodes[attribute].range.end;
+        let end = children.syntax_elements[attribute].range.end;
         let range = ByteRange {
             start: end - name.len() as u64,
             end,
@@ -195,7 +205,7 @@ fn classes(text: &str, children: &Children<'_>, index: usize, facts: &mut Collec
         if !name.is_empty() {
             facts.symbol(name, UTILITY, range);
         }
-        facts.unresolved(children.nodes[index].range);
+        facts.unresolved(children.syntax_elements[index].range);
         return;
     }
     if !matches!(
@@ -226,9 +236,9 @@ fn angular_class_binding(
     if let Some(name) = class.and_then(|class| children.child(class, "class_name"))
         && let Some(written) = children.text(name, text)
     {
-        facts.symbol(written, UTILITY, children.nodes[name].range);
+        facts.symbol(written, UTILITY, children.syntax_elements[name].range);
     }
-    facts.unresolved(children.nodes[binding].range);
+    facts.unresolved(children.syntax_elements[binding].range);
     true
 }
 
@@ -242,15 +252,15 @@ fn class_value(
     let descendants = descendants(children, index);
     let value = descendants.clone().find(|child| {
         matches!(
-            children.nodes[*child].kind,
+            children.syntax_elements[*child].kind,
             "attribute_value" | "string" | "template_string"
         )
     });
-    let dynamic = children.nodes[index].kind == "directive_attribute"
+    let dynamic = children.syntax_elements[index].kind == "directive_attribute"
         || !matches!(name, "class" | "className")
         || descendants.clone().any(|child| {
             matches!(
-                children.nodes[child].kind,
+                children.syntax_elements[child].kind,
                 "template_substitution" | "interpolation" | "expression"
             )
         });
@@ -261,14 +271,14 @@ fn class_value(
         {
             if descendants
                 .clone()
-                .any(|child| children.nodes[child].kind == "template_substitution")
+                .any(|child| children.syntax_elements[child].kind == "template_substitution")
             {
-                facts.unresolved(children.nodes[index].range);
+                facts.unresolved(children.syntax_elements[index].range);
             } else {
                 utilities(text, range, facts);
             }
-        } else if children.nodes[value].kind == "attribute_value" && !dynamic {
-            let range = children.nodes[value].range;
+        } else if children.syntax_elements[value].kind == "attribute_value" && !dynamic {
+            let range = children.syntax_elements[value].range;
             if let Some(value) = children.text(value, text) {
                 if value.contains(['{', '}']) {
                     facts.unresolved(range);
@@ -277,29 +287,29 @@ fn class_value(
                 }
             }
         } else {
-            facts.unresolved(children.nodes[index].range);
+            facts.unresolved(children.syntax_elements[index].range);
         }
     } else {
-        facts.unresolved(children.nodes[index].range);
+        facts.unresolved(children.syntax_elements[index].range);
     }
 }
 
 fn static_class_literal(children: &Children<'_>, value: usize, attribute: usize) -> bool {
-    let Some(parent) = children.nodes[value].parent else {
+    let Some(parent) = children.syntax_elements[value].parent else {
         return false;
     };
     parent == attribute
-        || (children.nodes[parent].kind == "jsx_expression"
+        || (children.syntax_elements[parent].kind == "jsx_expression"
             && children.indices(parent).count() == 1)
 }
 
-fn descendants<'nodes>(
-    children: &'nodes Children<'_>,
+fn descendants<'syntax_elements>(
+    children: &'syntax_elements Children<'_>,
     parent: usize,
-) -> impl Iterator<Item = usize> + Clone + 'nodes {
-    let end = children.nodes[parent].range.end;
-    ((parent + 1)..children.nodes.len())
-        .take_while(move |index| children.nodes[*index].range.start < end)
+) -> impl Iterator<Item = usize> + Clone + 'syntax_elements {
+    let end = children.syntax_elements[parent].range.end;
+    ((parent + 1)..children.syntax_elements.len())
+        .take_while(move |index| children.syntax_elements[*index].range.start < end)
 }
 
 fn directive(
@@ -334,7 +344,7 @@ fn directive(
     let range = directive_header(
         text,
         ByteRange {
-            start: children.nodes[index].range.end,
+            start: children.syntax_elements[index].range.end,
             end,
         },
     );
@@ -407,25 +417,25 @@ fn directive_header(text: &str, range: ByteRange) -> ByteRange {
 
 fn directive_block(children: &Children<'_>, start: u64) -> Option<usize> {
     let first = children
-        .nodes
-        .partition_point(|node| node.range.start < start);
-    (first..children.nodes.len())
-        .take_while(|index| children.nodes[*index].range.start == start)
-        .find(|index| children.nodes[*index].kind == "block")
+        .syntax_elements
+        .partition_point(|syntax_element| syntax_element.range.start < start);
+    (first..children.syntax_elements.len())
+        .take_while(|index| children.syntax_elements[*index].range.start == start)
+        .find(|index| children.syntax_elements[*index].kind == "block")
 }
 
 fn layer_utilities(text: &str, children: &Children<'_>, start: u64, facts: &mut Collector) {
     let Some(block) = directive_block(children, start) else {
         return;
     };
-    for child in
-        descendants(children, block).filter(|child| children.nodes[*child].kind == "class_name")
+    for child in descendants(children, block)
+        .filter(|child| children.syntax_elements[*child].kind == "class_name")
     {
         if facts.exhausted {
             return;
         }
         if let Some(name) = children.text(child, text) {
-            facts.symbol(name, UTILITY, children.nodes[child].range);
+            facts.symbol(name, UTILITY, children.syntax_elements[child].range);
         }
     }
 }
@@ -434,8 +444,8 @@ fn theme_properties(text: &str, children: &Children<'_>, start: u64, facts: &mut
     let Some(block) = directive_block(children, start) else {
         return;
     };
-    for child in
-        descendants(children, block).filter(|child| children.nodes[*child].kind == "property_name")
+    for child in descendants(children, block)
+        .filter(|child| children.syntax_elements[*child].kind == "property_name")
     {
         if facts.exhausted {
             return;
@@ -444,7 +454,7 @@ fn theme_properties(text: &str, children: &Children<'_>, start: u64, facts: &mut
             .text(child, text)
             .filter(|name| name.starts_with("--"))
         {
-            facts.symbol(name, THEME, children.nodes[child].range);
+            facts.symbol(name, THEME, children.syntax_elements[child].range);
         }
     }
 }
@@ -459,7 +469,7 @@ fn theme_reference(text: &str, children: &Children<'_>, index: usize, facts: &mu
     let Some(arguments) = children.child(index, "arguments") else {
         return;
     };
-    let range = children.nodes[arguments].range;
+    let range = children.syntax_elements[arguments].range;
     let Some(end) = range.end.checked_sub(1) else {
         return;
     };
@@ -577,8 +587,8 @@ fn symbol(name: &str, kind: &'static str, range: ByteRange) -> SyntaxSymbol {
         qualified_name: name.to_owned(),
         container: None,
         kind,
-        node_kind: None,
-        facets: Vec::new(),
+        syntax_element_kind: None,
+        kinds: Vec::new(),
         visibility: None,
         range,
         item_range: range,
@@ -602,7 +612,7 @@ pub(crate) fn restored_symbol_kind(name: &str) -> Option<&'static str> {
         .find(|kind| *kind == name)
 }
 
-/// Adds contextual source declarations while retaining parser identity and original nodes.
+/// Adds contextual source declarations while retaining parser identity and original syntax elements.
 ///
 /// # Errors
 ///
@@ -617,10 +627,15 @@ pub fn append_framework_symbols(
     if document.source_digest() != Some(&FileDigest::of(source.text.as_bytes())) {
         return errors::syntax::facts_range_invalid().fail();
     }
-    if document.nodes().len().saturating_add(symbols.len()) > limits.syntax_nodes_max() {
-        return errors::syntax::too_many_nodes()
+    if document
+        .syntax_elements()
+        .len()
+        .saturating_add(symbols.len())
+        > limits.syntax_elements_max()
+    {
+        return errors::syntax::too_many_syntax_elements()
             .path(source.path)
-            .syntax_nodes_max(limits.syntax_nodes_max())
+            .syntax_elements_max(limits.syntax_elements_max())
             .fail();
     }
     crate::embedded::admit_depth(source, limits, 0, document)?;
@@ -637,11 +652,11 @@ pub fn append_framework_symbols(
         .len()
         .saturating_add(symbols.len())
         .saturating_add(omitted)
-        > limits.syntax_nodes_max()
+        > limits.syntax_elements_max()
     {
-        return errors::syntax::too_many_nodes()
+        return errors::syntax::too_many_syntax_elements()
             .path(source.path)
-            .syntax_nodes_max(limits.syntax_nodes_max())
+            .syntax_elements_max(limits.syntax_elements_max())
             .fail();
     }
     let mut combined = document.symbols().to_vec();
@@ -651,7 +666,7 @@ pub fn append_framework_symbols(
     let mut result = SyntaxDocument::new(
         document.language().clone(),
         source.path.clone(),
-        document.nodes().to_vec(),
+        document.syntax_elements().to_vec(),
         combined,
         document.has_errors(),
     )

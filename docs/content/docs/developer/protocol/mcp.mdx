@@ -26,7 +26,7 @@ codebase. The answer carries:
 - `hubs` - the most-referenced symbols, ranked by reference count descending
 - `entry_points` - symbols where execution starts
 - `docs` - markdown files, in path order
-- `module_relationships` - the modules a resolved reference reaches between, ranked by that
+- `module_edges` - the modules a resolved reference reaches between, ranked by that
   count descending
 - `packages` - the packages the workspace's manifests and lockfiles state, in `manager`,
   `name`, then selector order
@@ -38,14 +38,14 @@ server **MUST** take the map's revision and counts from the same publication and
 [`local_index_preparing`](#reads) for incomplete preparation.
 
 `entry_points` lists symbols carrying the `entrypoint`
-[`SymbolFacet`](/docs/developer/protocol/reference) - a file-scope `fn main`, not one
+[`SymbolKind`](/docs/developer/protocol/reference) - a file-scope `fn main`, not one
 nested in a module, an `impl` block, or another function. It stays empty for a workspace with no
 such facts.
 
 `hubs` ranks [`SymbolId`](/docs/developer/protocol/reference)s by how often the index
-holds a resolved reference to them, and `module_relationships` folds both ends of every such
+holds a resolved reference to them, and `module_edges` folds both ends of every such
 reference to the module `modules` lists them under, drops a pair whose two ends fold to one
-module, and counts what is left. `module_relationships` carries at most 100 entries, ordered
+module, and counts what is left. `module_edges` carries at most 100 entries, ordered
 by `references` descending, then `from`, then `to`, so a workspace past that bound keeps the
 strongest pairs and two reads of one tree agree. Both read the index alone: the language
 engine resolves a reference for one read and publishes none, so both lists stay empty until a
@@ -117,11 +117,10 @@ MCP text leads with selected matches and call paths for direct retrieval project
 queries show their projected rows, boolean, or triples. Text shortens common RDF namespaces
 and writes ordinary integers and booleans without datatype names. If one page holds the
 entire graph and its only subject is an unreferenced blank node, text groups that subject's
-properties as `[ :active true ; :count 7 ] .` Labels shown in text stay distinct and keep
-the same spelling across pages of the retained answer. Structured content carries the exact
-RDF terms and retained identities.
+properties as `[ :active true ; :count 7 ] .` Labels shown in text stay distinct. Structured
+content carries the exact RDF terms and identities.
 
-`DESCRIBE` uses the library's description behavior over all authoritative captured and published records in its selected dataset. It does not implicitly request every language-engine facet. Facts explicitly required by its `WHERE` pattern retain the same strict acquisition and missing-facts rules as other query forms; bounds still refuse incomplete admission.
+`DESCRIBE` uses the library's description behavior over all authoritative captured and published records in its selected dataset. It does not implicitly request every language-engine fact. Facts explicitly required by its `WHERE` pattern retain the same strict acquisition and missing-facts rules as other query forms; bounds still refuse incomplete admission.
 
 ### Full-text search [#search-fulltext]
 
@@ -142,12 +141,12 @@ LIMIT 5
 ```
 
 `:query`, `:pattern`, `:scope`, `:target`, `:order`, `:rev`, `:paths`, `:packages`, `:include`,
-`:change`, `:limit`, `:page_index`, and `:view` retain their producer meanings inside the service. Structured inputs
-use `rdf:JSON` literals. Conflicting constant inputs refuse. Requesting `:source` and `:score`
-projects the corresponding producer payload. Service input triples select records rather than
+`:change`, `:max_results`, `:page`, and `:view` retain their producer meanings inside the service. Structured inputs
+use `rdf:JSON` literals. Conflicting constant inputs refuse. Portable categories use `:kinds`; the language-specific string uses `:kind`.
+Requesting `:source` and `:score` projects the corresponding producer payload. Service input triples select records rather than
 require those input values as stored facts on every result.
 
-`:limit` and `:page_index` select a producer page. Outer `LIMIT` and `OFFSET` apply to the
+`:max_results` and `:page` select a producer page. Outer `LIMIT` and `OFFSET` apply to the
 SPARQL result after evaluation. Missing producer coverage can make the query unavailable.
 A package answered from the nearest collected release under `package_substituted` is covered.
 A global API read that fails answers `unavailable` with reason `read_failed`, and
@@ -185,9 +184,9 @@ SELECT ?usage ?unit ?start ?end {
 ```
 
 `:usages` exposes raw physical occurrences. Each occurrence retains target, enclosing symbol
-when established, source unit, byte range, and supplied facets. Repeated locations in one
+when established, source unit, byte range, and supplied kinds. Repeated locations in one
 caller, recursive uses, and file-level uses remain distinct. The same physical occurrence
-supplied under two facets has one occurrence identity with both facets.
+supplied under two kinds has one occurrence identity with both kinds.
 
 Symbol adjacency remains separate:
 
@@ -211,18 +210,18 @@ symbols. Call hierarchy retains all established edges and actual ranges. Acquisi
 evaluation share cancellation and request bounds.
 
 Dependency continuation uses admitted source ownership and exact selected context. Supported
-complete-empty facts establish an empty answer. Unsupported facets, an incomplete publication,
+complete-empty facts establish an empty answer. Unsupported kinds, an incomplete publication,
 missing source authority, or a bound reached before completeness returns explicit
 unavailability. Global query serving reads existing collected facts; it does not collect,
 ingest, or backfill global language-engine facts. Local request facts do not enter collection.
 
 ### Flow search [#search-flows]
 
-The local `SERVICE :flows` discovers directed call paths through symbols matched by ranked text
+The local `SERVICE :flows` discovers paths of call edges through symbols matched by ranked text
 retrieval. Each path contains at least one matched symbol and one resolved call edge. The server
 can follow calls into and out of a matched symbol, so that symbol can be a step in the middle.
 
-The caller supplies a constant string in `:query` and may supply an integer `:limit` from 1 to 32.
+The caller supplies a constant string in `:query` and may supply an integer `:max_results` from 1 to 32.
 The default is 5. The server rejects conflicting inputs before it runs retrieval.
 
 **Query**
@@ -231,7 +230,7 @@ The default is 5. The server rejects conflicting inputs before it runs retrieval
 SELECT ?flow ?score ?index ?symbol {
   SERVICE :flows {
     ?flow :query "authentication middleware";
-          :limit 5;
+          :max_results 5;
           :score ?score;
           :steps ?step .
     ?step :index ?index; :value ?symbol .
@@ -255,11 +254,11 @@ index and an arrow, such as `0 → ReadService`. An answer with a single anonymo
 no path label in text. Multiple anonymous paths carry numbers on a single page or retain
 their shortened labels across pages.
 
-The service applies `:limit` to whole flows before SPARQL evaluates the outer query. Outer
+The service applies `:max_results` to whole flows before SPARQL evaluates the outer query. Outer
 `LIMIT` and `OFFSET` apply to solution rows and can split a flow's steps. When the caller
-follows `pagination.next_query`, the retained result keeps the original flow and step identities.
+sends the same `revision`, the server reads the same indexed source.
 
-The server returns usable paths in a positive `SELECT` with `relationship_coverage_missing`
+The server returns usable paths in a positive `SELECT` with `edge_coverage_missing`
 when a provider covers only part of the required calls. The server returns typed unavailability
 when the available calls cannot establish the requested result. A discovery bound that cuts the
 search reports `traversal_truncated`. A page continues the selected flow rows. If discovery reaches a
@@ -322,36 +321,30 @@ Remote acquisition uses bounded batches and holds the selected publication for t
 
 ### Captured answers and pages
 
-A successful answer carries `answer`, optional `view`, and `pagination`.
-`pagination.page_index` and `total_pages` describe transport pages. When another page exists,
-`pagination.next_query` contains its complete SPARQL request. Send it unchanged as `query`.
-The server decodes that stored page rather than evaluating the original statement again.
+A successful answer names the `revision` it read. The caller sends that `revision` for later pages.
+`page` starts at 1 and defaults to 1. `max_results` defaults to 10 and accepts 1 to 1000.
 
-A continuation uses `SERVICE <urn:rift:result:<view-id>?page=<index>>` to address a
-single page of the original binding or graph answer. The page preserves rows, blank nodes,
-triples, and source selected by the original statement. A continuation can expire or request
-a page outside the retained answer. SPARQL `LIMIT` and `OFFSET` apply before transport paging. The text
-writes `next query` when another page is available. The retained view and expiry are available
-in structured content.
+`pagination` carries `page`, `pages`, `max_results`, and `total`. A page past the last returns
+an empty list with the same counts. `pages` is 0 for an empty result set. `ASK` returns a boolean
+without pagination. SPARQL `LIMIT` and `OFFSET` bound the result set before paging.
 
 ### Bounds and missing facts
 
 The server bounds statement size, algebra, fact acquisition, and the evaluated answer.
-`[search.query] page_size` sets the maximum records per transport page, from 1 to 1000.
 `[search.query] page_limit` sets the maximum encoded bytes per page, from 1 KiB to 4 MiB.
 
 A query requiring missing facts returns typed unavailability before evaluation.
 This applies to `ASK`, counts, negation, bindings, and graphs. Available-empty facts differ
 from unavailable facts. A query needing only published symbol names does not require
-unavailable nodes, history, or engine facts. Supplied node facts are preserved; query evaluation
-does not reparse source to manufacture a complete node family.
+unavailable syntax elements, history, or engine facts. Supplied syntax facts are preserved; query evaluation
+does not reparse source to manufacture a complete syntax family.
 
 ### Migration
 
-Former top-level `target`, `scope`, `paths`, `include`, `limit`, `page_index`, `traversal`,
-`change`, and `revision` are rejected. Express field projection, joins, paths, order, and slicing in
+Former top-level `target`, `scope`, `paths`, `include`, `limit`, `traversal`, and `change`
+are rejected. Express field projection, joins, paths, order, and slicing in
 SPARQL. Use `SERVICE :search` for existing ranking, regex, revision comparison, and commit
-producers. Follow `pagination.next_query` for transport pages.
+producers. Send `page` and `max_results` for answer pages.
 
 ## Symbol retrieval
 
@@ -359,7 +352,7 @@ producers. Follow `pagination.next_query` for transport pages.
 
 `id` selects one canonical logical symbol. Ownership and language are encoded in that
 identity; declaration source addresses remain separate. `get_symbol` accepts neither
-name discovery nor `scope`, `packages`, `limit`, or `page_index`.
+name discovery nor `scope`, `packages`, or `limit`.
 
 Every declaration of one qualified path binds to that one identity, so `declarations` lists
 repeated definitions, overloads, and `cfg` variants of one symbol together.
@@ -396,16 +389,13 @@ bounds retain the definite miss and report incomplete alternative work.
 bounded referring documentation, and `history` adds the logical symbol's history edges. An
 omitted member is `false`, and an omitted `include` requests none. The server refuses any other
 member, `source` included, as an invalid request. A declaration's source is read by
-[`nodes`](#tool-nodes) with `symbol`.
+[`facets`](#tool-facets) with `symbol`.
 
-`declaration_limit` defaults to 5 and accepts 1 through 10000. `declaration_cursor` continues
-the declarations of the same symbol at the revision the answer names; the server refuses it for
-another symbol and once that revision is no longer served. Each binding
-retains `origin`, exactly one of `path` and `unit`, `range`, `line`, and
-indices into the symbol's signatures, types, and documentation. The text places each location
-next to the signature and prints `next declarations` when another page is available. These
-calls read `data_dir`, which the `sdk` project declares once under `cfg(unix)` and once under
-`cfg(windows)`:
+`max_results` defaults to 10 and accepts 1 through 10000. `page` selects declarations at the
+revision the answer names. The server refuses a tree revision once the index serves another tree.
+Each binding retains `origin`, exactly one of `path` and `unit`, `range`, `line`, and indices
+into the symbol's signatures, types, and documentation. These calls read `data_dir`, which the
+`sdk` project declares once under `cfg(unix)` and once under `cfg(windows)`:
 
 <ReadExample name="multi-declaration-full" />
 
@@ -463,84 +453,33 @@ selection failures. A malformed identity is refused before lookup:
 
 <ReadExample name="malformed-symbol" />
 
-## Nodes
+## Facets
 
-<McpTool name="nodes" />
+<McpTool name="facets" />
 
-A request selects its nodes through exactly one of `symbol` or `path` with `position`; the server
-**MUST** refuse any other combination with `invalid_request`.
+The request carries `symbol`, an optional `revision`, `page`, and `max_results`.
+The server returns the symbol's declarations in symbol order. One facet is one declaration,
+with its location, exact source, and syntax structure.
 
-A path request **MAY** carry `scope` to select an [accepted project or profile](/docs/developer/configuration#extra-projects).
-The server resolves `path` and any Git `revision` in the selected project. Omitting `scope`
-selects `local`. The caller **MUST** omit `scope` beside `symbol`.
+Each declaration carries `declaration`, `kind`, `range`, `source`, and `syntax`.
+The source span names the returned bytes. The syntax structure lists the declaration's
+item and its descendants in pre-order. Elements of a nested
+declaration belong to that declaration's facet. The item spans the declaration without
+its attached documentation.
 
-A `symbol` read names the symbol and returns its declarations in symbol order. Each declaration
-has its kind, byte range, source excerpt, and selected parts of its syntax tree. The excerpt's
-span names the bytes returned. A summary shows up to four declarations and up to 1536 source
-bytes per declaration. A clipped source excerpt names the returned byte range. Send
-`syntax: true` for the exact source and the full syntax tree.
+A syntax element carries its `index` within the declaration, from 0 at the root, and the
+`parent` index when present. Its `unit`, `language`, and `range` locate it in the source.
+The answer names the revision it read. A symbol with no declaration refuses
+`resource_not_found`.
 
-With `syntax: true`, a `symbol` read answers every node of the symbol: per declaration, in the order
-[`get_symbol`](#tool-get_symbol) lists its declarations, the item node, which spans the
-declaration without its attached documentation, then each node of its item subtree in
-pre-order that no declaration nested in it holds. The answer names the symbol in `symbol`, and
-the item node's `source` is the declaration's source. A symbol with no declaration in the index
-refuses `resource_not_found`.
+The server reads package and runtime symbols through the global API. The answer's
+`revision` names the selected release. The server **MUST** refuse a revision that is not
+a release of the symbol's owner with `invalid_request`.
 
-The server reads the nodes of a package or runtime symbol from the global API, in the release
-`revision` selects. Each node's `unit` is then a source unit of the symbol's owner, such as
-`rift://source/cargo/crates.io/itoa/src/lib.rs`, read at that release, and a symbol the release
-does not declare refuses `resource_not_found`. The server **MUST** refuse a `revision` beside such
-a symbol that is not a release of the symbol's owner with `invalid_request`, and the answer
-carries the release it read as its `revision`.
-
-One answer holds at most `results_max` nodes, or the global API's `page_limit_max` for a package
-or runtime symbol, and 1 MiB of node source, and at least one node.
-When declarations or syntax nodes remain, the answer carries `node_cursor`. The caller **MUST**
-send it back with the same selector to continue the same view. A summary cursor continues
-declarations. A syntax cursor continues the full tree. When one declaration spans several
-syntax pages, a summary continuation can scan a page without another declaration. Follow its
-cursor while one is present. The server refuses a cursor for a different selection or a
-revision it no longer serves. Restart the read without the cursor.
-
-A `position` read selects the symbol of the innermost declaration holding the byte. A byte no
-declaration holds returns an excerpt of up to 1536 bytes around that position. With `syntax: true`,
-a byte outside every declaration selects the file's unit nodes, starting at the file node.
-The file node spans the whole file. A visible text file no syntax provider parses, such as
-`justfile` or `notes.txt`, has one file node in the language `text`. A path the index holds no text for, such as a lockfile, refuses
-`capability_unavailable`, naming the extension or stating that the path carries none, and a file
-a syntax bound left out refuses `content_unavailable`.
-
-During local preparation, the server **MAY** prepare the requested path within the remaining
-[`readiness_timeout`](/docs/developer/configuration#server) budget. An answer for a path outside
-the prepared publication can return syntax while the server logs
-[`local_index_preparing`](#reads). This read leaves published progress at its current position.
-The server returns `temporarily_unavailable` when preparation exceeds the remaining budget.
-
-A node carries no identity. The server **MUST** address each node by its place: a node inside a
-declaration's item subtree carries the `declaration` ordinal among the declarations of the
-answer's `symbol` and its pre-order `index` from the item node at 0; a node outside every
-declaration carries its `index` in its `unit` alone, from the unit's file node at 0. Nodes of a
-nested declaration count toward the nested symbol.
-
-`parent` names the `index` of the enclosing node in the same declaration or unit, and is absent
-for a declaration's item node and for the file node. An address names a place at the read's
-revision, so an edit renumbers the nodes after it.
-The syntax text shows each node on one line with its byte range and address. The structured
-summary carries each selected part's `index` to match it against the full tree.
-
-A node of a project file names that file as a [`SourceUnitId`](/docs/developer/protocol/reference#SourceUnitId),
-such as `rift://source/project/src/config.rs`. The unit names no revision: the answer's
-`revision` names the tree or commit its bytes were read at.
-
-This call reads the declaration of the `Config` struct:
-
-<ReadExample name="symbol-nodes" />
-
-This call reads byte 338 of `src/config.rs`, inside the `parse_config` call, and requests the
-full syntax tree of `load_config`, the declaration holding it:
-
-<ReadExample name="local-nodes" />
+`max_results` defaults to 10 and accepts 1 through 100. The source bound is 1 MiB across the
+syntax elements. A page above that byte bound returns a typed error; the caller can reduce
+`max_results`. A declaration's syntax structure stays with its source. The caller sends the same
+symbol and revision for later pages.
 
 ## Feedback [#tool-feedback]
 
@@ -575,18 +514,15 @@ Callers read code through these tools:
 | --- | --- |
 | [`get_symbol`](#tool-get_symbol) | one logical symbol by canonical identity |
 | [`search`](#tool-search) | bindings, booleans, or RDF triples from selected facts |
-| [`nodes`](#tool-nodes) | source and syntax structure of a symbol or the declaration holding one position |
+| [`facets`](#tool-facets) | every declaration of a symbol with its location, source, and syntax structure |
 
 [Result content](#result-content) defines the representations a tool result carries and the proxy output selection that chooses them.
 
 The index never follows or indexes a symlink, so no read returns one; the file a link points
 at answers under its own path.
 
-`search` carries a `pagination.next_query` when the retained answer has another page.
-`get_symbol` bounds declaration bindings with `declaration_limit` and continues with
-`declaration_cursor`, bound to the revision the answer names. A search answer can carry an
-immutable `view` with an expiry; later searches can retain that selection. Expiry never selects
-latest implicitly.
+`search`, `get_symbol`, and `facets` accept `page` and `max_results`. The response names the
+`revision` it read. The caller sends that revision for later pages.
 
 The server writes read diagnostics to its workspace logs. Use `rift server logs` to inspect them.
 A `stale_index` record names the revision an answer used and the newer tree revision the read captured.
@@ -630,7 +566,7 @@ The server logs diagnostics for ranking and result bounds:
   lacks some of the commits its latest fill selects, or the commit `HEAD` names; `analyzed` and
   `total` state how far the fill has got.
 - `lexical_ranking_truncated` - the lexical ranking stopped at `matches_max` units, and hits
-  past that bound never reach a page, whatever `paths` selects. `total_pages` counts the units
+  past that bound never reach a page, whatever `paths` selects. `pages` counts the units
   that did; a narrower `query` brings the rest inside the bound.
 - `documentation_unavailable` - the documentation this search projects onto crossed a bound, so
   no documentation block joins the answer and declarations and files answer as they would without
@@ -641,7 +577,7 @@ The server logs diagnostics for ranking and result bounds:
   phrase is kept. Shorten `query`, or quote the terms that must be matched.
 - `results_truncated` - the server reached `results_max`, its result bound, before ordering and
   paging. The bound covers both the candidates one read ranks and the hits it returns, so what
-  it cut never reaches any page and `total_pages` counts only what fit. The server logs this
+  it cut never reaches any page and `pages` counts only what fit. The server logs this
   code whenever a read fills the candidate pool, including when every candidate fits.
   A narrower `query` or `paths` brings the read inside the bound.
 
@@ -729,7 +665,7 @@ degraded resolvers first, in resolver order, then the entries no public registry
 packages and requirements the global publication lacks, then the entries a nearest release
 answers for. The global API failure and source omission diagnostics have separate bounds.
 
-`get_symbol` and `nodes` accept an optional `revision`. A local read with no revision
+`get_symbol` and `facets` accept an optional `revision`. A local read with no revision
 selects the working tree.
 
 ### Result content [#result-content]
@@ -747,13 +683,13 @@ The caller selects the representations when it starts the proxy with `rift mcp -
 The proxy **MUST** keep the selected output for its lifetime. Direct HTTP access to
 `rift server` carries both tool representations.
 
-Search text shows the query answer and any continuation. An exact read states its outcome and
+Search text shows the query answer and its pagination. An exact read states its outcome and
 selected object. Use `rift server logs` for diagnostic codes and details.
 The [tool execution failure](#tool-execution-failures) form applies when `isError` is set.
 
 ### Revision-addressed reads [#revision-reads]
 
-`get_symbol` and `nodes` accept `revision`, a [`Revision`](/docs/developer/protocol/reference) IRI
+`get_symbol` and `facets` accept `revision`, a [`Revision`](/docs/developer/protocol/reference) IRI
 that names one point on the history axis:
 
 - `rift://revision/git/<commit>` - a complete lowercase git commit id
@@ -766,7 +702,7 @@ that names one point on the history axis:
 - `rift://revision/tree/<digest>` - the working tree the index serves, by its complete SHA-256
   digest
 
-A `get_symbol` or `nodes` answer carries the `revision` it read. The answer names a commit, a
+A `get_symbol` or `facets` answer carries the `revision` it read. The answer names a commit, a
 release, or a tree. A caller **MAY** send that revision to pin a later exact read to the same point.
 
 A git revision reads committed bytes. The server resolves it in place from the workspace's git
@@ -910,7 +846,7 @@ The answer carries:
 - `source` - captured project paths, content digests, and matched language identities
 - `pagination` - the zero-based page and total page count
 
-The bare URI selects page zero. `rift://workspace?page_index=1` selects another page. Each page
+The bare URI selects page zero. `rift://workspace?page=1` selects another page. Each page
 holds at most 50 source units and repeats the language summaries. When another page exists,
 the compact response ends with its URI. A page past the end returns an empty `source` list
 with the actual page count.
@@ -973,8 +909,8 @@ source:
     }
   ],
   "pagination": {
-    "page_index": 0,
-    "total_pages": 1
+    "page": 1,
+    "pages": 1
   },
   "source": [
     {
@@ -998,7 +934,7 @@ After preparation, the catalog also includes visible files without enabled synta
 ## Errors
 
 A failure travels by its class. A **tool execution failure** is a Rift operating failure on a
-`get_symbol`, `search`, or `nodes` call, such as invalid input, a crossed limit, or a storage
+`get_symbol`, `search`, or `facets` call, such as invalid input, a crossed limit, or a storage
 failure. A **protocol failure** is any other failure: an unknown method or tool, a malformed
 request envelope, a transport failure, a resource read failure, or an MCP error forwarded from
 upstream.
@@ -1034,12 +970,12 @@ The tabs below show execution failures as compact text, and the completed tool r
 
 <Tab value="invalid_request">
 
-**Execution failure, compact text** of a request whose `limit` is below 1:
+**Execution failure, compact text** of a request whose `max_results` is below 1:
 
 ```text
 1 error
 	invalid_request · retry never
-		the request does not match the documented form: field limit, violation zero; correct the reported field and resend the request
+		the request does not match the documented form: field max_results, violation expected 1..=10000, received 0; correct the reported field and resend the request
 		rift.server.read_invalid
 ```
 
@@ -1053,7 +989,7 @@ The tabs below show execution failures as compact text, and the completed tool r
 {
   "content": [
     {
-      "text": "1 error\n\tinvalid_request · retry never\n\t\tthe request does not match the documented form: field limit, violation zero; correct the reported field and resend the request\n\t\trift.server.read_invalid\n",
+      "text": "1 error\n\tinvalid_request · retry never\n\t\tthe request does not match the documented form: field max_results, violation expected 1..=10000, received 0; correct the reported field and resend the request\n\t\trift.server.read_invalid\n",
       "type": "text"
     }
   ],

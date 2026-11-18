@@ -428,13 +428,13 @@ impl GlobalState {
         self.client(configuration).await?.get_symbol(params).await
     }
 
-    /// The nodes of one package or runtime symbol, read from the global API.
-    pub(crate) async fn symbol_nodes(
+    /// The facets of one package or runtime symbol, read from the global API.
+    pub(crate) async fn symbol_kinds(
         &self,
         configuration: &GlobalConfiguration,
-        params: &rift_protocol::read::NodesParams,
-    ) -> Result<rift_protocol::read::NodesResult, RiftError> {
-        self.client(configuration).await?.nodes(params).await
+        params: &rift_protocol::read::FacetsParams,
+    ) -> Result<rift_protocol::read::FacetsResult, RiftError> {
+        self.client(configuration).await?.facets(params).await
     }
 
     pub(crate) async fn client(
@@ -595,46 +595,47 @@ async fn captured_callee_source(
         if let Some(matched) = verified.get(&verified_key) {
             return Ok(*matched);
         }
-        let request = rift_protocol::read::NodesParams {
+        let request = rift_protocol::read::FacetsParams {
             revision: Some(release.clone()),
-            ..rift_protocol::read::NodesParams::of(id.clone())
+            ..rift_protocol::read::FacetsParams::of(id.clone())
         };
-        let answer = client.nodes(&request).await?;
+        let answer = client.facets(&request).await?;
         let matched =
-            answer.revision == release && declared_nodes_match(&answer, id, &position.unit, held);
+            answer.revision == release && declared_kinds_match(&answer, id, &position.unit, held);
         verified.insert(verified_key, matched);
         return Ok(matched);
     }
     Ok(true)
 }
 
-/// Whether the first page of `answer` lists the nodes of `id` with an item node in `unit`, and
-/// every such item node's source equals `held` at the node's byte range.
-fn declared_nodes_match(
-    answer: &rift_protocol::read::NodesResult,
+/// Whether the first page of `answer` lists the facets of `id` with an item syntax element in `unit`, and
+/// every such item syntax element's source equals `held` at the syntax element's byte range.
+fn declared_kinds_match(
+    answer: &rift_protocol::read::FacetsResult,
     id: &SymbolId,
     unit: &rift_protocol::read::SourceUnitId,
     held: &str,
 ) -> bool {
     let mut declared = answer
-        .nodes
+        .declarations
         .iter()
-        .filter(|node| node.index == 0 && &node.unit == unit)
+        .flat_map(|declaration| &declaration.syntax)
+        .filter(|syntax_element| syntax_element.index == 0 && &syntax_element.unit == unit)
         .peekable();
-    answer.symbol.as_ref() == Some(id)
+    &answer.symbol == id
         && declared.peek().is_some()
-        && declared.all(|node| node_matches(node, held))
+        && declared.all(|syntax_element| syntax_element_matches(syntax_element, held))
 }
 
-/// Whether `held` holds the same bytes as `node` at its range.
-fn node_matches(node: &rift_protocol::read::Node, held: &str) -> bool {
+/// Whether `held` holds the same bytes as `syntax element` at its range.
+fn syntax_element_matches(syntax_element: &rift_protocol::read::SyntaxElement, held: &str) -> bool {
     let (Ok(start), Ok(end)) = (
-        usize::try_from(node.range.start),
-        usize::try_from(node.range.end),
+        usize::try_from(syntax_element.range.start),
+        usize::try_from(syntax_element.range.end),
     ) else {
         return false;
     };
-    held.get(start..end) == Some(node.source.as_str())
+    held.get(start..end) == Some(syntax_element.source.as_str())
 }
 
 /// The requests asking for `callees`' positions: one per position encoding, each within
@@ -838,11 +839,8 @@ pub(crate) struct GlobalSearchCandidates {
     pub(crate) warnings: Vec<ReadWarning>,
 }
 
-/// Reads the package matches of one accepted `pattern` search: one page, asked for through
-/// the advertised page limit.
-///
-/// A page that stopped before the last match carries `result_truncated`, which reaches the
-/// caller as a `global_page_warning`, and its cursor is not followed.
+/// Reads one bounded page of package matches for an accepted `pattern` search.
+/// The request uses the advertised maximum result count.
 pub(crate) async fn package_patterns(
     client: &GlobalClient,
     params: &SearchParams,
@@ -852,13 +850,19 @@ pub(crate) async fn package_patterns(
         return Ok(GlobalPatternMatches::default());
     };
     let request = PackagePatternRequest {
+        revision: None,
         pattern,
         packages: Some(packages.to_vec()),
         include: includes_source(params)
             .then_some(PackagePatternRequestInclude { source: Some(true) }),
     };
     let page = client
-        .search_package_patterns(&request, rift_cloud_client::PAGE_LIMIT_MAX, None)
+        .search_package_patterns(
+            &request,
+            rift_cloud_client::PAGE_LIMIT_MAX
+                .min(client.get_capabilities().await?.bounds.page_limit_max),
+            1,
+        )
         .await?;
     let warnings = page_warnings(page.warnings);
     let matches = page
@@ -917,6 +921,7 @@ fn search_request(
     phase: QueryPhase,
 ) -> PackageSearchRequest {
     PackageSearchRequest {
+        revision: None,
         query: Some(query.source().to_owned()),
         terms: Some(
             query
@@ -1094,7 +1099,7 @@ pub(crate) fn merge_search(
         })
         .collect::<Vec<_>>();
     order_search_hits(&mut ordered, params.order);
-    let (results, pagination) = page_window(ordered, params.page_index, limit);
+    let (results, pagination) = page_window(ordered, params.page, limit);
     Ok(SearchResult {
         view: None,
         revision: project_revision(params, local.revision),
@@ -1159,7 +1164,7 @@ pub(crate) fn merge_patterns(
         }
     }
     order_search_hits(&mut hits, params.order);
-    let (results, pagination) = page_window(hits, params.page_index, limit);
+    let (results, pagination) = page_window(hits, params.page, limit);
     let mut warnings = local.warnings;
     warnings.extend(remote.warnings);
     SearchResult {
@@ -1203,7 +1208,7 @@ fn candidate_fields(hit: &SearchHit) -> FieldSet {
 
 /// The identity a project search hit ranks under: its symbol address, or the source unit
 /// and qualified name for a hit that names a unit, its path for a file, its address for a
-/// node, its block for documentation, and its revision for a commit.
+/// syntax element, its block for documentation, and its revision for a commit.
 fn ranking_identity(hit: &SearchHit) -> Result<DocumentIdentity, RiftError> {
     let identity = match (&hit.hit, hit.unit.as_ref(), hit.path.as_ref()) {
         (SearchHitTarget::Symbol { symbol }, unit, _) => {
@@ -1306,24 +1311,11 @@ fn search_hit_key(hit: &SearchHit) -> &str {
     }
 }
 
-pub(crate) fn page_window<T>(items: Vec<T>, page_index: u64, limit: usize) -> (Vec<T>, Pagination) {
-    let total_pages = u64::try_from(items.len().div_ceil(limit)).unwrap_or(u64::MAX);
-    let start = usize::try_from(page_index)
-        .ok()
-        .and_then(|page| page.checked_mul(limit))
-        .unwrap_or(usize::MAX);
-    let page = if start >= items.len() {
-        Vec::new()
-    } else {
-        items.into_iter().skip(start).take(limit).collect()
-    };
-    (
-        page,
-        Pagination {
-            page_index,
-            total_pages,
-        },
-    )
+pub(crate) fn page_window<T>(items: Vec<T>, page: u64, limit: usize) -> (Vec<T>, Pagination) {
+    let pagination = Pagination::new(page, limit as u64, items.len() as u64);
+    let start = pagination.offset();
+    let results = items.into_iter().skip(start).take(limit).collect();
+    (results, pagination)
 }
 
 impl GlobalRoute {
@@ -2024,7 +2016,7 @@ mod tests {
             keys.contains(&revision),
             "a commit hit orders by its revision"
         );
-        let request = serde_json::json!({"query": "load_config", "limit": 10});
+        let request = serde_json::json!({"query": "load_config", "max_results": 10});
         let params: SearchParams = serde_json::from_value(request).expect("a search");
         let limit = rift_server::search_page_limit(&params).expect("an accepted limit");
         let local = SearchResult {
@@ -2423,8 +2415,8 @@ mod tests {
     fn page_window_reports_empty_page_after_last_page() {
         let (page, pagination) = page_window(vec![1, 2, 3], 4, 2);
         assert!(page.is_empty());
-        assert_eq!(pagination.page_index, 4);
-        assert_eq!(pagination.total_pages, 2);
+        assert_eq!(pagination.page, 4);
+        assert_eq!(pagination.pages, 2);
     }
 
     #[test]
@@ -3044,10 +3036,7 @@ mod tests {
                 view: None,
                 revision: None,
                 results: vec![project.clone()],
-                pagination: Pagination {
-                    page_index: 0,
-                    total_pages: 1,
-                },
+                pagination: Pagination::new(1, 10, 1),
                 warnings: vec![ReadWarning::GlobalAccessDisabled],
             };
             let remote = super::GlobalPatternMatches {
@@ -3073,10 +3062,10 @@ mod tests {
         let files = merged(json!({"pattern": "beacon", "scope": "all", "target": "file"}));
         assert_eq!(files.results, [project.clone(), file(4), file(14)]);
         let second_page = merged(json!({
-            "pattern": "beacon", "scope": "all", "target": "all", "limit": 2, "page_index": 1
+            "pattern": "beacon", "scope": "all", "target": "all", "max_results": 2, "page": 2
         }));
         assert_eq!(second_page.results, [file(4), file(14)]);
-        assert_eq!(second_page.pagination.total_pages, 2);
+        assert_eq!(second_page.pagination.pages, 2);
     }
 
     /// The package warnings stop at `DEPENDENCY_WARNINGS_MAX`; the global warning rides
@@ -3108,65 +3097,69 @@ mod tests {
 
 #[cfg(test)]
 mod captured_runtime_tests {
-    use super::declared_nodes_match;
-    use rift_protocol::read::{NodesResult, SymbolId};
+    use super::declared_kinds_match;
+    use rift_protocol::read::{FacetsResult, SymbolId};
 
     const ID: &str = "rift://symbol/stdlib/cpython/python/builtins/len";
     const UNIT: &str = "rift://source/stdlib/cpython/builtins.pyi";
     const STUB: &str = "x = 1\ndef len(obj): ...\n";
     const DECLARED: &str = "def len(obj): ...";
 
-    fn node(index: u64, unit: &str, start: u64, source: &str) -> serde_json::Value {
+    fn syntax_element(index: u64, unit: &str, start: u64, source: &str) -> serde_json::Value {
         let end = start + u64::try_from(source.len()).expect("fixture length fits u64");
-        let mut node = serde_json::json!({
+        let mut syntax_element = serde_json::json!({
             "declaration": 0, "index": index, "unit": unit, "language": "python",
             "kind": "function_definition", "range": {"start": start, "end": end},
             "source": source
         });
         if index > 0 {
-            node["parent"] = serde_json::json!(0);
+            syntax_element["parent"] = serde_json::json!(0);
         }
-        node
+        syntax_element
     }
 
-    fn answer(symbol: Option<&str>, nodes: &[serde_json::Value]) -> NodesResult {
+    fn answer(symbol: Option<&str>, facets: &[serde_json::Value]) -> FacetsResult {
         let revision = "rift://revision/stdlib/cpython@3.12.3";
-        let mut answer = serde_json::json!({"nodes": nodes, "revision": revision});
-        if let Some(symbol) = symbol {
-            answer["symbol"] = serde_json::json!(symbol);
-        }
-        serde_json::from_value(answer).expect("nodes answer")
+        let root = &facets[0];
+        let answer = serde_json::json!({"symbol":symbol.unwrap_or("rift://symbol/stdlib/cpython/python/builtins/other"),"revision":revision,"pagination":{"page":1,"pages":1,"max_results":10,"total":1},"declarations":[{
+            "declaration":root["declaration"],"kind":root["kind"],"range":root["range"],
+            "source":{"span":{"unit":root["unit"],"range":root["range"]},"text":root["source"]},"syntax":facets
+        }]});
+        serde_json::from_value(answer).expect("facets answer")
     }
 
     #[test]
-    fn runtime_stub_nodes_require_exact_bytes_and_unit() {
+    fn runtime_stub_facets_require_exact_bytes_and_unit() {
         let id = SymbolId::parse(ID).expect("runtime symbol");
         let unit = serde_json::from_value(serde_json::json!(UNIT)).expect("runtime source unit");
         let matching = answer(
             Some(ID),
-            &[node(0, UNIT, 6, DECLARED), node(1, UNIT, 10, "obj")],
+            &[
+                syntax_element(0, UNIT, 6, DECLARED),
+                syntax_element(1, UNIT, 10, "obj"),
+            ],
         );
-        assert!(declared_nodes_match(&matching, &id, &unit, STUB));
-        assert!(!declared_nodes_match(
+        assert!(declared_kinds_match(&matching, &id, &unit, STUB));
+        assert!(!declared_kinds_match(
             &matching,
             &id,
             &unit,
             "x = 1\ndef len(arg): ...\n"
         ));
-        assert!(!declared_nodes_match(&matching, &id, &unit, "short"));
+        assert!(!declared_kinds_match(&matching, &id, &unit, "short"));
         let other_unit = answer(
             Some(ID),
-            &[node(
+            &[syntax_element(
                 0,
                 "rift://source/stdlib/cpython/other.pyi",
                 6,
                 DECLARED,
             )],
         );
-        assert!(!declared_nodes_match(&other_unit, &id, &unit, STUB));
-        let shifted = answer(Some(ID), &[node(0, UNIT, 5, DECLARED)]);
-        assert!(!declared_nodes_match(&shifted, &id, &unit, STUB));
-        let unnamed = answer(None, &[node(0, UNIT, 6, DECLARED)]);
-        assert!(!declared_nodes_match(&unnamed, &id, &unit, STUB));
+        assert!(!declared_kinds_match(&other_unit, &id, &unit, STUB));
+        let shifted = answer(Some(ID), &[syntax_element(0, UNIT, 5, DECLARED)]);
+        assert!(!declared_kinds_match(&shifted, &id, &unit, STUB));
+        let unnamed = answer(None, &[syntax_element(0, UNIT, 6, DECLARED)]);
+        assert!(!declared_kinds_match(&unnamed, &id, &unit, STUB));
     }
 }

@@ -31,11 +31,11 @@ from rift_dev.corpus_assertions import (
     database_bytes,
     declaration_pool,
     exact_degradation,
+    facet_syntax,
     language_counts,
     last_line_pattern,
     lexical_breach,
     lexical_content,
-    lists_position,
     logged_read_warnings,
     map_paths,
     no_failed_builds,
@@ -112,7 +112,7 @@ SDK_DISABLED = "OTEL_SDK_DISABLED"
 # plus room for that answer to arrive.
 READINESS_SECONDS = 30.0
 # Pages one sampled symbol read may follow before its declaration must have appeared.
-NODE_PAGES_MAX = 50
+FACET_PAGES_MAX = 50
 READ_SECONDS = READINESS_SECONDS + 10.0
 # A tool's first read over a large workspace under sustained edits waits for the first
 # index to land, so it gets the whole read budget. Every read after it answers from a
@@ -230,6 +230,10 @@ NEXTJS_SAMPLE_PATHS = (
 )
 CORPUS_COLUMNS = ("symbol", "name", "kind", "language", "path", "unit", "start", "end")
 PATH_HIT_LIMIT = 1000
+# Source units one `rift://workspace` page may hold (`WORKSPACE_SOURCE_UNITS_MAX`).
+WORKSPACE_SOURCE_UNITS_MAX = 50
+# A sampled declaration without a canonical identity is checked against its hit's source.
+SAMPLE_COLUMNS = (*CORPUS_COLUMNS, "source")
 
 
 def catalog_paths(workspace: JsonObject) -> dict[str, list[str]]:
@@ -256,6 +260,15 @@ def catalog_paths(workspace: JsonObject) -> dict[str, list[str]]:
     return paths
 
 
+def workspace_page_uri(page: int) -> str:
+    """Select one full page of the workspace source catalog.
+
+    >>> workspace_page_uri(2)
+    'rift://workspace?page=2&max_results=50'
+    """
+    return f"rift://workspace?page={page}&max_results={WORKSPACE_SOURCE_UNITS_MAX}"
+
+
 def corpus_request(parameters: JsonObject) -> JsonObject:
     """Project corpus facts through the served SPARQL retrieval service."""
     columns = list(CORPUS_COLUMNS)
@@ -273,7 +286,7 @@ def sample_path_request(path: str, query: str = "test") -> JsonObject:
         "query": query,
         "target": "symbol",
         "paths": {"include": [path]},
-        "limit": PATH_HIT_LIMIT,
+        "max_results": PATH_HIT_LIMIT,
         "order": "identity",
     }
 
@@ -318,16 +331,15 @@ async def _read_sample_query(
     requests = [sample_path_request(path) for path in paths]
     multiple = len(paths) > 1
     request = (
-        retrieval_batch_request(requests, CORPUS_COLUMNS)
+        retrieval_batch_request(requests, SAMPLE_COLUMNS)
         if multiple
-        else corpus_request(requests[0])
+        else retrieval_request(requests[0], SAMPLE_COLUMNS)
     )
     answer = await settled_local(client, "search", request)
     warnings(answer)
     rows = bindings(answer)
-    view = answer.get("view")
     pagination = object_value(answer.get("pagination"), "sample pagination")
-    count = number(pagination.get("total_pages"), "sample page count")
+    count = number(pagination.get("pages"), "sample page count")
     require(
         0 <= count <= len(paths) * PATH_HIT_LIMIT, "sample page count exceeds hit bound"
     )
@@ -335,19 +347,19 @@ async def _read_sample_query(
     previous = -1
     for page in range(max(count, 1)):
         if page:
-            next_query = string_value(
-                pagination.get("next_query"), "sample continuation"
-            )
-            answer = await client.call("search", {"query": next_query})
+            request["page"] = page + 1
+            if answer.get("revision") is not None:
+                request["revision"] = answer["revision"]
+            answer = await client.call("search", request)
             warnings(answer)
             rows = bindings(answer)
             require(
-                view is not None and answer.get("view") == view, "sample view changed"
+                answer.get("revision") == request.get("revision"),
+                "sample revision changed",
             )
             pagination = object_value(answer.get("pagination"), "sample pagination")
         require(
-            pagination.get("page_index") == page
-            and pagination.get("total_pages") == count,
+            pagination.get("page") == page + 1 and pagination.get("pages") == count,
             "sample pagination changed",
         )
         require(count > 0 or not rows, "sample returned rows without pages")
@@ -367,9 +379,6 @@ async def _read_sample_query(
                 {key: value for key, value in row.items() if key != "slot"}
             )
             previous = slot
-    require(
-        pagination.get("next_query") is None, "sample returned an unadvertised page"
-    )
     return grouped
 
 
@@ -381,15 +390,12 @@ CHURN_PROBE_ID = "rift://symbol/local/rust/rift_corpus_probe/corpus_probe"
 CHURN_REQUESTS: dict[str, JsonObject] = {
     "search": {
         "query": f"SELECT (<{CHURN_PROBE_ID}> AS ?symbol) ?unit ?source ?start ?end "
-        f"{{ ?node :of <{CHURN_PROBE_ID}>; :index 0; :source ?source; "
+        f"{{ ?element :of <{CHURN_PROBE_ID}>; :index 0; :source ?source; "
         ":range [ :unit ?unit; :start ?start; :end ?end ] }"
     },
-    "symbol_nodes": {"symbol": CHURN_PROBE_ID, "syntax": True},
-    "nodes": {"path": PROBE_PATH, "position": 0, "syntax": True},
+    "facets": {"symbol": CHURN_PROBE_ID},
 }
-# The tool each churn read calls: `symbol_nodes` reads the probe declaration's nodes by its
-# symbol identity, the way an agent reads a declaration's source.
-CHURN_TOOLS = {"symbol_nodes": "nodes"}
+CHURN_TOOLS: dict[str, str] = {}
 # The convergence loop resends every churn tool until the newest source lands, so it
 # stands outside the reads it repeats: one whole read budget for each of them.
 CONVERGENCE_SECONDS = READ_SECONDS * len(CHURN_REQUESTS)
@@ -704,20 +710,24 @@ class Corpus:
     async def source_catalog(
         self, client: Client
     ) -> tuple[JsonObject, dict[str, list[str]]]:
-        """Read typed source paths through the existing resource page contract."""
-        first = await client.resource("rift://workspace")
+        """Read typed source paths through the existing resource page contract.
+
+        Each page asks for the most source units one page holds, not the default
+        ten, which would multiply the reads of a large catalog by five.
+        """
+        first = await client.resource(workspace_page_uri(1))
         revision = string_value(
             first.get("configuration_revision"), "configuration revision"
         )
         pagination = object_value(first.get("pagination"), "catalog pagination")
-        pages = number(pagination.get("total_pages"), "catalog total pages")
+        pages = number(pagination.get("pages"), "catalog total pages")
         groups: dict[str, list[str]] = {}
         previous = ""
         for index in range(pages):
             page = (
                 first
                 if index == 0
-                else await client.resource(f"rift://workspace?page_index={index}")
+                else await client.resource(workspace_page_uri(index + 1))
             )
             require(
                 page.get("configuration_revision") == revision,
@@ -729,8 +739,7 @@ class Corpus:
             )
             position = object_value(page.get("pagination"), "catalog pagination")
             require(
-                position.get("page_index") == index
-                and position.get("total_pages") == pages,
+                position.get("page") == index + 1 and position.get("pages") == pages,
                 "catalog page changed",
             )
             require(not warnings(page), "source catalog is still preparing")
@@ -757,13 +766,13 @@ class Corpus:
         >>> def term(value, datatype="string"):
         ...     return {"type": "literal", "value": str(value), "datatype": "http://www.w3.org/2001/XMLSchema#" + datatype}
         >>> rows = [{**{key: term(value) for key, value in {"name": f"entry{index}", "kind": "function", "language": "typescript", "path": "src/test.ts"}.items()}, "start": term(index * 2, "integer"), "end": term(index * 2 + 1, "integer"), "symbol": {"type": "iri", "value": f"urn:fixture:sample:{index}"}} for index in range(SYMBOL_COUNT)]
-        >>> def answer(bindings, index, **continuation):
-        ...     return {"answer": {"result": "bindings", "variables": ["slot", *rows[0]], "bindings": [{**row, "slot": term(0, "integer")} for row in bindings]}, "view": {"id": "retained"}, "pagination": {"page_index": index, "total_pages": 2, **continuation}}
+        >>> def answer(bindings, page):
+        ...     return {"answer": {"result": "bindings", "variables": ["slot", *rows[0]], "bindings": [{**row, "slot": term(0, "integer")} for row in bindings]}, "revision": "rift://revision/tree/" + "0" * 64, "pagination": {"page": page, "pages": 2, "max_results": 100, "total": 200}}
         >>> languages = [{"language": language, "enabled": True, "syntax": True, "include": ["**"]} for language in ("rust", "typescript", "typescript:tsx", "markdown")]
         >>> common = {"configuration_revision": "0123abcd", "languages": languages}
-        >>> first = {**common, "pagination": {"page_index": 0, "total_pages": 2}, "source": [{"path": f"docs/a{index:04}.md", "digest": "0123abcd", "language": "markdown"} for index in range(1000)]}
-        >>> second = {**common, "pagination": {"page_index": 1, "total_pages": 2}, "source": [{"path": path, "digest": "0123abcd", "language": language} for path, language in [("src/test.ts", "typescript"), ("src/ztest.tsx", "typescript:tsx")]]}
-        >>> client = SimpleNamespace(resource=AsyncMock(side_effect=[first, second]), call=AsyncMock(side_effect=[answer(rows[:100], 0, next_query="retained next page"), answer(rows[100:], 1)]))
+        >>> first = {**common, "pagination": {"page": 1, "pages": 2, "max_results": 10, "total": 12}, "source": [{"path": f"docs/a{index:04}.md", "digest": "0123abcd", "language": "markdown"} for index in range(10)]}
+        >>> second = {**common, "pagination": {"page": 2, "pages": 2, "max_results": 10, "total": 12}, "source": [{"path": path, "digest": "0123abcd", "language": language} for path, language in [("src/test.ts", "typescript"), ("src/ztest.tsx", "typescript:tsx")]]}
+        >>> client = SimpleNamespace(resource=AsyncMock(side_effect=[first, second]), call=AsyncMock(side_effect=[answer(rows[:100], 1), answer(rows[100:], 2)]))
         >>> sample = Corpus(cast(Pin, SimpleNamespace(name="nextjs")), Path("rift"), Path("report"))
         >>> selected = asyncio.run(sample.symbol_candidates(cast(Client, client)))
         >>> len(selected), client.call.await_count, client.resource.await_count
@@ -772,7 +781,7 @@ class Corpus:
         True
         >>> client.call.await_args_list[0].args[1]["query"].count("SERVICE :search")
         2
-        >>> client.call.await_args_list[1].args[1] == {"query": "retained next page"}
+        >>> client.call.await_args_list[1].args[1]["page"] == 2
         True
         """
         languages = SAMPLE_LANGUAGES[self.pin.name]
@@ -781,7 +790,7 @@ class Corpus:
             answer = await settled_local(
                 client,
                 "search",
-                corpus_request(sample_path_request(path, query)),
+                retrieval_request(sample_path_request(path, query), SAMPLE_COLUMNS),
             )
             warnings(answer)
             found = bindings(answer)
@@ -1066,7 +1075,7 @@ class Corpus:
                 "pattern": token,
                 "target": "file",
                 "paths": {"include": [path]},
-                "limit": 1,
+                "max_results": 1,
             },
         )
         ended = datetime.now(UTC)
@@ -1128,7 +1137,7 @@ class Corpus:
                 "pattern": pattern,
                 "target": "file",
                 "paths": {"include": [path]},
-                "limit": 1,
+                "max_results": 1,
             },
         )
         ended = datetime.now(UTC)
@@ -1230,32 +1239,14 @@ class Corpus:
                 )
                 require(path.read_bytes() == content, f"read changed {path}")
                 return 0
-            # Declarations can start with attached comments or attributes. Extraction
-            # keeps their end equal to the item end, so its final byte is in the item.
-            request: JsonObject = {
-                "path": str(path.relative_to(self.root)),
-                "position": end - 1,
-                "syntax": True,
-            }
-            answer = await client.call("nodes", request)
-            nodes = objects(answer, "nodes")
-            require(bool(nodes), f"nodes listed nothing at {path}:{end - 1}")
-            if answer.get("symbol") is None:
-                require(
-                    nodes[0].get("kind") == "file"
-                    and nodes[0].get("range") == {"start": 0, "end": len(content)},
-                    f"a unit answer did not open with the file node of {path}",
-                )
-            self.require_node_sources(nodes, unit, content, path)
-            # The nodes covering the position can lie on a later page. Each page is another
-            # read, which the deadline cannot afford for every sample, so the report counts
-            # the declarations whose covering nodes the first page did not reach.
-            listed = answer.get("node_cursor") is None or lists_position(
-                answer, nodes, unit, end - 1
+            # A declaration without a canonical identity has no graph symbol to read, and
+            # graph coverage can exclude its file. The retrieval read that sampled it
+            # carries its source.
+            require(
+                literal(hit, "source").encode() == content[start:end],
+                f"search source disagrees with captured bytes at {path}:{start}-{end}",
             )
-            if not listed:
-                require(path.read_bytes() == content, f"read changed {path}")
-                return 1
+            require(path.read_bytes() == content, f"read changed {path}")
             return 0
 
         beyond = 0
@@ -1277,25 +1268,25 @@ class Corpus:
         )
 
     @staticmethod
-    def require_node_sources(
-        nodes: list[JsonObject], unit: str, content: bytes, path: Path
+    def require_syntax_sources(
+        elements: list[JsonObject], unit: str, content: bytes, path: Path
     ) -> None:
-        """Require each node of the file at project path `unit` to carry its bytes."""
-        for node in nodes:
-            if unit_path(node) != unit:
+        """Require each element of the file at project path `unit` to carry its bytes."""
+        for element in elements:
+            if unit_path(element) != unit:
                 continue
-            node_span = object_value(node.get("range"), "node range")
-            node_start = number(node_span.get("start"), "node start")
-            node_end = number(node_span.get("end"), "node end")
+            element_span = object_value(element.get("range"), "element range")
+            element_start = number(element_span.get("start"), "element start")
+            element_end = number(element_span.get("end"), "element end")
             require(
-                0 <= node_start <= node_end <= len(content),
-                "node range exceeds source",
+                0 <= element_start <= element_end <= len(content),
+                "element range exceeds source",
             )
-            excerpt = node.get("source")
+            excerpt = element.get("source")
             require(
                 isinstance(excerpt, str)
-                and excerpt.encode() == content[node_start:node_end],
-                f"node source disagrees with captured bytes at {path}:{node_start}-{node_end}",
+                and excerpt.encode() == content[element_start:element_end],
+                f"element source disagrees with captured bytes at {path}:{element_start}-{element_end}",
             )
 
     async def require_symbol_item(
@@ -1308,29 +1299,33 @@ class Corpus:
         path: Path,
     ) -> None:
         """Require the symbol read of `identity` to list the sampled declaration's item."""
-        arguments: JsonObject = {"symbol": identity, "syntax": True}
-        for _ in range(NODE_PAGES_MAX):
-            answer = await client.call("nodes", arguments)
+        arguments: JsonObject = {"symbol": identity}
+        for _ in range(FACET_PAGES_MAX):
+            answer = await client.call("facets", arguments)
             require(
                 answer.get("symbol") == identity,
                 f"a symbol read named another symbol: {identity}",
             )
-            nodes = objects(answer, "nodes")
-            self.require_node_sources(nodes, unit, content, path)
+            elements = facet_syntax(answer)
+            self.require_syntax_sources(elements, unit, content, path)
             if any(
-                node.get("index") == 0
-                and unit_path(node) == unit
-                and object_value(node.get("range"), "node range").get("end") == end
-                for node in nodes
+                element.get("index") == 0
+                and unit_path(element) == unit
+                and object_value(element.get("range"), "element range").get("end")
+                == end
+                for element in elements
             ):
                 return
-            cursor = answer.get("node_cursor")
-            if cursor is None:
+            pagination = object_value(answer.get("pagination"), "facets pagination")
+            page = number(pagination.get("page"), "facets page")
+            pages = number(pagination.get("pages"), "facets pages")
+            if page >= pages:
                 break
-            arguments["node_cursor"] = cursor
+            arguments["page"] = page + 1
+            arguments["revision"] = answer["revision"]
         require(
             False,
-            f"nodes omitted sampled declaration: {identity} ending at {path}:{end}",
+            f"elements omitted sampled declaration: {identity} ending at {path}:{end}",
         )
 
     async def lexical_persistence(self, link: Path | None = None) -> None:
@@ -1344,7 +1339,7 @@ class Corpus:
                 "target": "symbol",
                 "paths": {"include": [PROBE_PATH]},
                 "include": {"source": True},
-                "limit": 5,
+                "max_results": 5,
             }
         )
         with self.server(link) as server:
@@ -1412,7 +1407,7 @@ class Corpus:
                 {
                     "query": "next",
                     "paths": {"include": ["package.json"], "exclude": ["*/**"]},
-                    "limit": 100,
+                    "max_results": 100,
                 }
             ),
         )
@@ -1432,7 +1427,6 @@ class Corpus:
             await self.symlink_refused(client, path, workspace)
         self.record(
             "symlinks",
-            nodes="resource_not_found",
             search=0,
             paths=["readme.md", chain],
             control="package.json",
@@ -1443,17 +1437,6 @@ class Corpus:
         self, client: Client, path: str, workspace: set[str]
     ) -> None:
         require((self.root / path).is_symlink(), f"{path}: pinned symlink is absent")
-        try:
-            await client.call("nodes", {"path": path, "position": 0})
-        except ToolFailure as error:
-            require(
-                error.code == "resource_not_found"
-                and error.retry == "never"
-                and error.identity == "rift.server.read_not_found",
-                f"symlink nodes wrong refusal: {error}",
-            )
-        else:
-            raise AssertionError("nodes accepted a symlink")
         selector: JsonObject = {"include": [path]}
         if "/" not in path:
             selector["exclude"] = ["*/**"]
@@ -1497,7 +1480,6 @@ class Corpus:
         """Read complete source revisions while external writes continue every two seconds."""
         path = self.root / probe_path
         requests = {name: dict(request) for name, request in CHURN_REQUESTS.items()}
-        requests["nodes"]["path"] = probe_path
         sources = [churn_source(0).rstrip("\n")]
         written = [time.monotonic()]
         timings: dict[str, list[float]] = {name: [] for name in CHURN_REQUESTS}
@@ -1570,7 +1552,7 @@ class Corpus:
 
         task: asyncio.Task[None] | None = None
         try:
-            identity, _revision = await read("symbol_nodes", CHURN_PROBE_ID)
+            identity, _revision = await read("facets", CHURN_PROBE_ID)
             task = asyncio.create_task(writer())
             reads = 0
             tools = tuple(CHURN_REQUESTS)
@@ -1595,7 +1577,7 @@ class Corpus:
                 # Give the final rebuild time inside the convergence budget before
                 # spending a public read's shorter bound on validating the source.
                 await await_filesystem_publication(server, last_write_at)
-                for name in ("symbol_nodes", "search", "nodes"):
+                for name in ("facets", "search"):
                     while True:
                         _identity, revision = await read(name, identity)
                         if revision == len(sources) - 1:
@@ -1716,7 +1698,7 @@ class Corpus:
                             "query": "FastAPI",
                             "target": "symbol",
                             "paths": {"include": [application]},
-                            "limit": 1000,
+                            "max_results": 1000,
                         }
                     ),
                 )
@@ -1861,7 +1843,7 @@ class Corpus:
                 )
                 count = lexical_breach(failure_records, 20000)
                 answer = await client.call(
-                    "search", corpus_request({"query": "test", "limit": 1})
+                    "search", corpus_request({"query": "test", "max_results": 1})
                 )
                 require(
                     answer.get("outcome") == "unavailable"
@@ -1898,7 +1880,7 @@ class Corpus:
             async with server.connect() as client:
                 await await_startup_publication(server)
                 await client.call(
-                    "search", corpus_request({"query": "test", "limit": 1})
+                    "search", corpus_request({"query": "test", "max_results": 1})
                 )
                 no_failed_builds(await logged(server, "index"))
             self.stop(server)

@@ -114,8 +114,7 @@ async fn the_map_resource_answers_revision_languages_modules_and_entry_points() 
         serde_json::json!(["docs/guide.md"]),
         "{body:#}"
     );
-    assert_eq!(body["pagination"]["page_index"], Value::from(0));
-    assert_eq!(body["pagination"]["total_pages"], Value::from(1));
+    assert!(body.get("pagination").is_none());
 
     client.cancel().await?;
     server_task.await?;
@@ -129,14 +128,11 @@ async fn an_unknown_query_string_on_the_map_uri_is_refused() -> TestResult {
 
     let error = client
         .read_resource(ReadResourceRequestParams::new(
-            "rift://map?page_index=0".to_owned(),
+            "rift://map?page=0".to_owned(),
         ))
         .await
         .expect_err("a query string on rift://map names no resource");
-    assert!(
-        error.to_string().contains("rift://map?page_index=0"),
-        "{error}"
-    );
+    assert!(error.to_string().contains("rift://map?page=0"), "{error}");
 
     client.cancel().await?;
     server_task.await?;

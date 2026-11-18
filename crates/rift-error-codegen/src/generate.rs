@@ -12,9 +12,9 @@ use crate::{ir, validate::CodegenError};
 const INDENT: &str = "    ";
 
 #[derive(Default)]
-struct Node<'a> {
+struct Branch<'a> {
     error: Option<&'a ir::Error>,
-    children: BTreeMap<&'a str, Node<'a>>,
+    children: BTreeMap<&'a str, Branch<'a>>,
 }
 
 /// One registry rendered as a parent module and one file per top-level namespace.
@@ -25,14 +25,14 @@ pub(crate) struct Module {
     pub namespaces: BTreeMap<String, String>,
 }
 
-fn tree(registry: &ir::Registry) -> Node<'_> {
-    let mut root = Node::default();
+fn tree(registry: &ir::Registry) -> Branch<'_> {
+    let mut root = Branch::default();
     for error in &registry.errors {
-        let mut node = &mut root;
+        let mut branch = &mut root;
         for part in &error.path {
-            node = node.children.entry(part.as_str()).or_default();
+            branch = branch.children.entry(part.as_str()).or_default();
         }
-        node.error = Some(error);
+        branch.error = Some(error);
     }
     root
 }
@@ -92,9 +92,9 @@ pub(crate) fn generate_module(registry: &ir::Registry) -> Result<Module, Codegen
     })
 }
 
-fn render_children(output: &mut String, node: &Node<'_>, namespace: &str, depth: usize) {
+fn render_children(output: &mut String, branch: &Branch<'_>, namespace: &str, depth: usize) {
     let indent = INDENT.repeat(depth);
-    for (name, child) in &node.children {
+    for (name, child) in &branch.children {
         output.push('\n');
         if let Some(error) = child.error {
             render_error(output, error, &indent);

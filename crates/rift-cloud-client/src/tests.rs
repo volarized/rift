@@ -49,7 +49,7 @@ mod collection;
 mod declaration;
 mod documentation;
 mod exact_runtime;
-mod nodes;
+mod facets;
 mod pages;
 mod pattern;
 mod resolution;
@@ -85,25 +85,25 @@ enum FixtureMode {
 
 #[derive(Clone)]
 enum OperationFixture {
-    RelationshipRefusal {
+    EdgeRefusal {
         value: serde_json::Value,
         problem: bool,
     },
-    Relationships {
+    Edges {
         pages: Vec<serde_json::Value>,
         advertised: bool,
     },
-    RelationshipBounds {
+    EdgeBounds {
         pages: Vec<serde_json::Value>,
-        bounds: rift_protocol::relationship_read::RelationshipBounds,
+        bounds: rift_protocol::edge_read::EdgeBounds,
         page_limit_min: i64,
         page_limit_max: i64,
     },
     Valid,
     ExactSymbol(serde_json::Value),
     SourceDeclarations(serde_json::Value, StatusCode),
-    /// The `/v1/nodes` answer: this body with this status, or a problem for a 404.
-    Nodes(serde_json::Value, StatusCode),
+    /// The `/v1/facets` answer: this body with this status, or a problem for a 404.
+    Facets(serde_json::Value, StatusCode),
     Documentation {
         search: serde_json::Value,
         symbols: serde_json::Value,
@@ -116,7 +116,7 @@ enum OperationFixture {
     EchoResolution,
     InvalidResolutionAccounting,
     SearchPages,
-    MismatchedCursor,
+    RepeatedPage,
     PageRevisionChange,
     UnrequestedPackage,
     InvalidPublication,
@@ -131,7 +131,7 @@ enum OperationFixture {
     CandidateBound,
     PartialFailure,
     RetrySearch,
-    RepeatedCursor,
+    RepeatedItem,
     InvalidOrigin,
     InvalidSource,
     InvalidSourceIdentity,
@@ -420,7 +420,7 @@ fn operation_response(
     }
     if path.ends_with("/symbols") {
         if let OperationFixture::ExactSymbol(value) = mode {
-            let mut response = json_response(value, None);
+            let mut response = json_response(&declaration_page(value.clone(), request_body), None);
             *response.status_mut() = match value["outcome"].as_str() {
                 Some("missing") => StatusCode::NOT_FOUND,
                 Some("unavailable") => StatusCode::SERVICE_UNAVAILABLE,
@@ -428,7 +428,7 @@ fn operation_response(
             };
             return response;
         }
-        return operation_symbol_response(mode, query);
+        return operation_symbol_response(mode, request_body);
     }
     if path.ends_with("/declarations") {
         if let OperationFixture::SourceDeclarations(value, status) = mode {
@@ -438,51 +438,64 @@ fn operation_response(
         }
         return json_response(&declaration::declaration_response_json(), None);
     }
-    if path.ends_with("/nodes") {
+    if path.ends_with("/facets") {
         return match mode {
-            OperationFixture::Nodes(_, StatusCode::NOT_FOUND) => {
+            OperationFixture::Facets(_, StatusCode::NOT_FOUND) => {
                 problem_response(StatusCode::NOT_FOUND)
             }
-            OperationFixture::Nodes(value, status) => {
-                let mut response = json_response(value, None);
+            OperationFixture::Facets(value, status) => {
+                let mut response =
+                    json_response(&declaration_page(value.clone(), request_body), None);
                 *response.status_mut() = *status;
                 response
             }
-            OperationFixture::CollectionBounds { source_bytes, .. } => {
-                json_response(&nodes::single_node_response_json(*source_bytes), None)
-            }
-            _ => json_response(&nodes::nodes_response_json(), None),
+            OperationFixture::CollectionBounds { source_bytes, .. } => json_response(
+                &declaration_page(
+                    facets::single_syntax_element_response_json(*source_bytes),
+                    request_body,
+                ),
+                None,
+            ),
+            _ => json_response(
+                &declaration_page(facets::facets_response_json(), request_body),
+                None,
+            ),
         };
     }
     if path.ends_with("/patterns") {
-        let mut page = pattern::pattern_page_json(query_cursor(query));
+        let mut page = pattern::pattern_page_json(query_page(query));
         if let OperationFixture::CollectionBounds { source_bytes, .. } = mode {
             page["items"][0]["source"] = serde_json::json!("x".repeat(*source_bytes));
             page["items"][0]["declaration"]["source"] =
                 serde_json::json!("x".repeat(*source_bytes));
         }
+        let total = if query.is_some_and(|query| {
+            query.contains("max_results=1&") || query.ends_with("max_results=1")
+        }) {
+            2
+        } else {
+            1
+        };
+        numbered_page(&mut page, query, total);
         return json_response(&page, None);
     }
     status_response(StatusCode::NOT_FOUND)
 }
-
-/// The `cursor_bytes_max` the nodes fixture advertises, below the client's own bound.
-const NODES_CURSOR_BYTES_ADVERTISED: usize = 64;
 
 /// The `page_limit_max` the pattern fixture advertises, below the client's own bound.
 const PATTERN_PAGE_LIMIT_ADVERTISED: i64 = 200;
 
 fn operation_capabilities_response(mode: &OperationFixture) -> Response {
     capabilities_response_with(|value| match mode {
-        OperationFixture::Relationships {
+        OperationFixture::Edges {
             advertised: true, ..
         }
-        | OperationFixture::RelationshipBounds { .. }
-        | OperationFixture::RelationshipRefusal { .. } => {
+        | OperationFixture::EdgeBounds { .. }
+        | OperationFixture::EdgeRefusal { .. } => {
             value["supported_features"] =
-                serde_json::json!(["resolutions", "search", "symbols", "relationships"]);
-            value["relationship_capabilities"] = operation_relationship_capabilities(mode);
-            if let OperationFixture::RelationshipBounds {
+                serde_json::json!(["resolutions", "search", "symbols", "edges"]);
+            value["edge_capabilities"] = operation_edge_capabilities(mode);
+            if let OperationFixture::EdgeBounds {
                 page_limit_min,
                 page_limit_max,
                 ..
@@ -531,7 +544,7 @@ fn operation_capabilities_response(mode: &OperationFixture) -> Response {
             source_bytes_max, ..
         } => {
             value["supported_features"] =
-                serde_json::json!(["resolutions", "search", "symbols", "patterns", "nodes"]);
+                serde_json::json!(["resolutions", "search", "symbols", "patterns", "facets"]);
             value["bounds"]["request_body_bytes_max"] =
                 serde_json::json!(rift_protocol::configuration::GLOBAL_REQUEST_BYTES_MAX);
             value["bounds"]["response_body_bytes_max"] =
@@ -547,10 +560,9 @@ fn operation_capabilities_response(mode: &OperationFixture) -> Response {
         OperationFixture::PageLimitMax(advertised) => {
             value["bounds"]["page_limit_max"] = serde_json::json!(advertised);
         }
-        OperationFixture::Nodes(_, _) => {
+        OperationFixture::Facets(_, _) => {
             value["supported_features"] =
-                serde_json::json!(["resolutions", "search", "symbols", "nodes"]);
-            value["bounds"]["cursor_bytes_max"] = serde_json::json!(NODES_CURSOR_BYTES_ADVERTISED);
+                serde_json::json!(["resolutions", "search", "symbols", "facets"]);
         }
         OperationFixture::Declarations | OperationFixture::SourceDeclarations(_, _) => {
             value["supported_features"] =
@@ -568,25 +580,25 @@ fn operation_capabilities_response(mode: &OperationFixture) -> Response {
                 "symbols",
                 "patterns",
                 "declarations",
-                "nodes"
+                "facets"
             ]);
         }
         _ => {}
     })
 }
 
-fn operation_relationship_capabilities(mode: &OperationFixture) -> serde_json::Value {
+fn operation_edge_capabilities(mode: &OperationFixture) -> serde_json::Value {
     let mut operations = serde_json::json!([
-        {"direction":"outgoing","facets":["calls"],"bounds":{
-            "max_seeds":64,"max_facets":16,"max_relationships":1000,
+        {"direction":"outgoing","kinds":["calls"],"bounds":{
+            "max_seeds":64,"max_kinds":16,"max_edges":1000,
             "max_occurrences":1000,"max_symbols":10000,"max_sources":10000
         }},
-        {"direction":"incoming","facets":["references"],"bounds":{
-            "max_seeds":64,"max_facets":16,"max_relationships":1000,
+        {"direction":"incoming","kinds":["references"],"bounds":{
+            "max_seeds":64,"max_kinds":16,"max_edges":1000,
             "max_occurrences":1000,"max_symbols":10000,"max_sources":10000
         }}
     ]);
-    if let OperationFixture::RelationshipBounds { bounds, .. } = mode {
+    if let OperationFixture::EdgeBounds { bounds, .. } = mode {
         for operation in operations.as_array_mut().expect("fixture operations") {
             operation["bounds"] = serde_json::to_value(bounds).expect("fixture count bounds");
         }
@@ -653,7 +665,7 @@ fn operation_search_response(
     query: Option<&str>,
     request_number: usize,
 ) -> Response {
-    if let OperationFixture::RelationshipRefusal { value, problem } = mode {
+    if let OperationFixture::EdgeRefusal { value, problem } = mode {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [(
@@ -668,13 +680,9 @@ fn operation_search_response(
         )
             .into_response();
     }
-    if let OperationFixture::Relationships { pages, .. }
-    | OperationFixture::RelationshipBounds { pages, .. } = mode
+    if let OperationFixture::Edges { pages, .. } | OperationFixture::EdgeBounds { pages, .. } = mode
     {
-        let index = query_cursor(query)
-            .and_then(|cursor| cursor.parse::<usize>().ok())
-            .unwrap_or(0);
-        return json_response(pages.get(index).unwrap_or(&serde_json::Value::Null), None);
+        return edge_response(pages);
     }
     if matches!(mode, OperationFixture::PartialFailure) && request_number > 1 {
         return problem_response(StatusCode::SERVICE_UNAVAILABLE);
@@ -682,8 +690,8 @@ fn operation_search_response(
     if matches!(mode, OperationFixture::RetrySearch) && request_number == 1 {
         return problem_response_with_retry(StatusCode::SERVICE_UNAVAILABLE);
     }
-    let cursor = query_cursor(query);
-    let body = match mode {
+    let cursor = query_page(query);
+    let mut body = match mode {
         OperationFixture::Documentation { search, .. }
         | OperationFixture::DocumentationBounds { search, .. } => search.clone(),
         OperationFixture::UnrequestedPackage => {
@@ -724,7 +732,7 @@ fn operation_search_response(
             },
             if cursor.is_some() { "second" } else { "first" },
         ),
-        OperationFixture::MismatchedCursor => mismatched_cursor_page(query),
+        OperationFixture::RepeatedPage => repeated_page(query),
         OperationFixture::BodyBoundStop => pages::body_bound_page(
             search_page_json("demo", Some("next"), "analyzer-v2", "first"),
             search_page_json("demo", None, "analyzer-v2", "second"),
@@ -733,41 +741,58 @@ fn operation_search_response(
         OperationFixture::SearchPages
         | OperationFixture::CandidateBound
         | OperationFixture::PartialFailure
-        | OperationFixture::RepeatedCursor => paged_search_response(mode, cursor),
+        | OperationFixture::RepeatedItem => paged_search_response(mode, cursor),
         _ => search_page_json("demo", None, "analyzer-v2", "first"),
     };
+    let multiple = matches!(
+        mode,
+        OperationFixture::SearchPages
+            | OperationFixture::CandidateBound
+            | OperationFixture::PartialFailure
+            | OperationFixture::RepeatedItem
+            | OperationFixture::RepeatedPage
+            | OperationFixture::PageRevisionChange
+            | OperationFixture::BodyBoundStop
+    );
+    let total = if multiple {
+        2
+    } else {
+        body["items"].as_array().expect("items").len() as u64
+    };
+    numbered_page(&mut body, query, total);
     json_response(&body, None)
 }
 
 fn paged_search_response(mode: &OperationFixture, cursor: Option<&str>) -> serde_json::Value {
     if cursor.is_none() {
         search_page_json("demo", Some("next"), "analyzer-v2", "first")
-    } else if matches!(mode, OperationFixture::RepeatedCursor) {
-        search_page_json("demo", Some("next"), "analyzer-v2", "second")
+    } else if matches!(mode, OperationFixture::RepeatedItem) {
+        search_page_json("demo", None, "analyzer-v2", "first")
     } else {
         search_page_json("demo", None, "analyzer-v2", "second")
     }
 }
 
-fn operation_symbol_response(mode: &OperationFixture, _query: Option<&str>) -> Response {
+fn operation_symbol_response(mode: &OperationFixture, request_body: &[u8]) -> Response {
     let value = match mode {
         OperationFixture::Documentation { symbols, .. }
         | OperationFixture::DocumentationBounds { symbols, .. } => symbols.clone(),
         _ => symbol_result_json("demo", "first"),
     };
-    json_response(&value, None)
+    json_response(&declaration_page(value, request_body), None)
 }
 
-fn query_cursor(query: Option<&str>) -> Option<&str> {
+fn query_page(query: Option<&str>) -> Option<&str> {
     query.and_then(|value| {
         value
             .split('&')
-            .find_map(|item| item.strip_prefix("cursor="))
+            .find_map(|item| item.strip_prefix("page="))
+            .filter(|page| *page != "1")
     })
 }
 
-fn mismatched_cursor_page(query: Option<&str>) -> serde_json::Value {
-    if query.is_some_and(|value| value.contains("cursor=next")) {
+fn repeated_page(query: Option<&str>) -> serde_json::Value {
+    if query.is_some_and(|value| value.contains("page=2")) {
         search_page_json("demo", None, "analyzer-v2", "first")
     } else {
         search_page_json("demo", Some("next"), "analyzer-v2", "first")
@@ -853,12 +878,13 @@ fn search_hit_json(package: &str, suffix: &str) -> serde_json::Value {
 
 fn search_page_json(
     package: &str,
-    next: Option<&str>,
+    _next: Option<&str>,
     analyzer: &str,
     suffix: &str,
 ) -> serde_json::Value {
     serde_json::json!({
-        "items":[search_hit_json(package, suffix)], "next_cursor":next,
+        "items":[search_hit_json(package, suffix)],
+        "revision":"corpus-v1", "pagination":{"page":1,"pages":1,"max_results":20,"total":1},
         "warnings":[], "publication_format":"rift-package-index-v2",
         "analyzer_revision":analyzer, "corpus_revision":"corpus-v1",
         "view":{"id":"a".repeat(64),"expires_at":"2026-10-10T10:05:00Z"}
@@ -919,7 +945,6 @@ fn capabilities_json() -> String {
             "page_limit_min": PAGE_LIMIT_MIN,
             "page_limit_max": PAGE_LIMIT_MAX,
             "page_limit_default": 20,
-            "cursor_bytes_max": CURSOR_BYTES_MAX,
             "candidate_pool_max": CANDIDATE_POOL_MAX,
             "warnings_max": WARNINGS_MAX,
             "source_bytes_max": SOURCE_BYTES_MAX
@@ -1166,7 +1191,7 @@ fn test_client_response_errors_use_bounded_messages() {
 }
 
 #[test]
-fn test_request_relationships_are_validated_before_transport() {
+fn test_request_edges_are_validated_before_transport() {
     let mut resolution = resolution_request();
     resolution.entries[0].availability = PackageAvailability::Path;
     assert_registered_field(
@@ -1220,14 +1245,14 @@ fn test_request_relationships_are_validated_before_transport() {
         "duplicate_package",
     );
     assert_registered_field(
-        &(validate_page(0, None)).expect_err("registered refusal"),
+        &(validate_numbered_page(0, 1)).expect_err("registered refusal"),
         "rift.client.request_invalid",
-        "limit",
+        "max_results",
     );
     assert_registered_field(
-        &(validate_page(1, Some(""))).expect_err("registered refusal"),
+        &(validate_numbered_page(1, 0)).expect_err("registered refusal"),
         "rift.client.request_invalid",
-        "cursor",
+        "page",
     );
 }
 
@@ -1262,7 +1287,7 @@ async fn test_documentation_request_requires_advertised_capability() {
         serde_json::from_str(&capabilities_json()).expect("capabilities fixture");
     let mut request = search_request();
     request.target = Some(PackageSearchRequestTarget::Documentation);
-    let error = validate_search_request_for_capabilities(&request, 20, None, &capabilities)
+    let error = validate_search_request_for_capabilities(&request, 20, &capabilities)
         .expect_err("documentation capability");
     assert_registered_field(&error, "rift.client.configuration_invalid", "feature");
     assert!(error_text_field(&error, "violation").contains("documentation_search"));
@@ -1272,7 +1297,7 @@ async fn test_documentation_request_requires_advertised_capability() {
         .push("documentation_search".to_owned());
     capabilities.documentation_revision = Some("0123abcd".to_owned());
     validate_capabilities(&capabilities).expect("valid documentation capability");
-    assert!(validate_search_request_for_capabilities(&request, 20, None, &capabilities).is_ok());
+    assert!(validate_search_request_for_capabilities(&request, 20, &capabilities).is_ok());
 
     let mut symbol = symbol_request();
     symbol.include.documentation = true;
@@ -1377,7 +1402,7 @@ async fn test_fixture_accepts_additive_capability_field() {
 async fn test_fixture_accepts_additive_nested_symbol_field() {
     let (_server, client) = operation_client(OperationFixture::AdditiveResponse).await;
     let page = client
-        .search_packages(&search_request(), 20, None)
+        .search_packages(&search_request(), 20, 1)
         .await
         .expect("additive symbol field");
     assert_eq!(page.items.len(), 1);
@@ -1421,13 +1446,13 @@ fn test_url_join_preserves_endpoint_path_and_encodes_query() {
     let endpoint = Url::parse("http://127.0.0.1:4321/rift/rest").expect("fixture endpoint URL");
     let mut request = reqwest::Client::new().get(make_url(&endpoint, "/v1/search"));
     request = request.query(&SearchPackagesRequestQuery {
-        limit: Some(10),
-        cursor: Some("a/b c?d".to_owned()),
+        max_results: Some(10),
+        page: Some(2),
     });
     let url = request.build().expect("typed query builds").url().clone();
     assert_eq!(
         url.as_str(),
-        "http://127.0.0.1:4321/rift/rest/v1/search?limit=10&cursor=a%2Fb+c%3Fd"
+        "http://127.0.0.1:4321/rift/rest/v1/search?page=2&max_results=10"
     );
 }
 
@@ -1658,7 +1683,7 @@ async fn test_fixture_retry_statuses_and_headers() {
 async fn test_fixture_retry_repeats_method_query_and_body() {
     let (server, client) = operation_client(OperationFixture::RetrySearch).await;
     client
-        .search_packages(&search_request(), 20, Some("page/2"))
+        .search_packages(&search_request(), 20, 2)
         .await
         .expect("retried search response");
 
@@ -1696,7 +1721,7 @@ async fn test_fixture_documented_problem_statuses_decode() {
         StatusCode::UNSUPPORTED_MEDIA_TYPE,
     ] {
         let (server, client) = operation_client(OperationFixture::Problem(status)).await;
-        let result = client.search_packages(&search_request(), 20, None).await;
+        let result = client.search_packages(&search_request(), 20, 1).await;
         let error = result.expect_err("documented HTTP refusal");
         if status == StatusCode::BAD_REQUEST {
             assert_refused_request(&error, "request", "fixture problem");
@@ -1733,13 +1758,13 @@ async fn operation_failure(
             .await
             .err(),
         Endpoint::Search => client
-            .search_packages(&search_request(), OPERATION_PAGE_LIMIT, None)
+            .search_packages(&search_request(), OPERATION_PAGE_LIMIT, 1)
             .await
             .err(),
         Endpoint::Symbols => client.get_symbol(&symbol_request()).await.err(),
-        Endpoint::Nodes => client.nodes(&nodes::nodes_request()).await.err(),
+        Endpoint::Facets => client.facets(&facets::facets_request()).await.err(),
         Endpoint::Patterns => client
-            .search_package_patterns(&pattern::pattern_request(), OPERATION_PAGE_LIMIT, None)
+            .search_package_patterns(&pattern::pattern_request(), OPERATION_PAGE_LIMIT, 1)
             .await
             .err(),
         Endpoint::Declarations => client
@@ -1790,19 +1815,19 @@ fn test_bad_request_problem_names_the_refused_field() {
     for (problem, field, violation) in [
         (
             Some(problem(
-                "the request does not match the documented form: field declaration_cursor, \
-                 violation declaration cursor failed validation",
+                "the request does not match the documented form: field page, \
+                 violation expected a 1-based page",
                 serde_json::json!({}),
             )),
-            "declaration_cursor",
-            "declaration cursor failed validation",
+            "page",
+            "expected a 1-based page",
         ),
         (
             Some(problem(
                 "refused",
-                serde_json::json!({ "field": "limit", "violation": "exceeds 200" }),
+                serde_json::json!({ "field": "max_results", "violation": "exceeds 200" }),
             )),
-            "limit",
+            "max_results",
             "exceeds 200",
         ),
         (
@@ -1864,7 +1889,7 @@ async fn test_fixture_every_operation_answers_problem_statuses() {
         Endpoint::Resolutions,
         Endpoint::Search,
         Endpoint::Symbols,
-        Endpoint::Nodes,
+        Endpoint::Facets,
         Endpoint::Patterns,
         Endpoint::Declarations,
     ];
@@ -2246,6 +2271,7 @@ fn test_query_term_and_name_bounds_count_characters() {
 
 fn traversal_request() -> PackageSearchRequest {
     PackageSearchRequest {
+        revision: None,
         query: None,
         terms: None,
         identifiers: None,
@@ -2259,7 +2285,7 @@ fn traversal_request() -> PackageSearchRequest {
             to: None,
             depth: Some(1),
             direction: None,
-            facets: None,
+            kinds: None,
         }),
     }
 }
@@ -2324,10 +2350,10 @@ fn empty_search_page_requires_original_captured_view() {
     request.view = Some("a".repeat(64));
     let page: PackageSearchPage =
         serde_json::from_value(value.clone()).expect("empty captured page");
-    validate_search_page(&request, &capabilities, &page, None, SOURCE_BYTES_MAX)
+    validate_search_page(&request, &capabilities, &page, SOURCE_BYTES_MAX)
         .expect("empty page retains requested view");
     request.view = Some("b".repeat(64));
-    let error = validate_search_page(&request, &capabilities, &page, None, SOURCE_BYTES_MAX)
+    let error = validate_search_page(&request, &capabilities, &page, SOURCE_BYTES_MAX)
         .expect_err("different captured view");
     assert_registered_field(&error, "rift.client.response_invalid", "view");
     value.as_object_mut().expect("page").remove("view");
@@ -2336,6 +2362,7 @@ fn empty_search_page_requires_original_captured_view() {
 
 fn search_request() -> PackageSearchRequest {
     PackageSearchRequest {
+        revision: None,
         query: Some("demo".to_owned()),
         terms: Some(vec![QueryTerm {
             text: "demo".to_owned(),
@@ -2367,7 +2394,7 @@ fn symbol_result_json(package: &str, suffix: &str) -> serde_json::Value {
             "origin": {"location": "dependency", "package": package_json(package), "source_kind": "authored"}
         },
         "revision": format!("rift://revision/cargo/crates.io/{package}@1.0.0"),
-        "declarations": [{
+        "pagination": {"page":1,"pages":1,"max_results":10,"total":1}, "declarations": [{
             "origin": {"location": "dependency", "package": package_json(package), "source_kind": "authored"},
             "unit": format!("rift://source/cargo/crates.io/{package}/src/{suffix}.rs"),
             "range": {"start": 0, "end": 4}, "line": 1,
@@ -2577,20 +2604,13 @@ async fn exact_symbol_request_carries_one_immutable_id_and_no_query_selectors() 
         );
         let body: serde_json::Value = serde_json::from_slice(&sent.body).expect("JSON request");
         assert_eq!(body["id"], serde_json::to_value(&id).expect("ID"));
-        assert_eq!(body["declaration_limit"], 5);
+        assert_eq!(body["max_results"], 10);
         assert_eq!(
             body.get("include"),
             None,
             "an omitted include requests no projection"
         );
-        for removed in [
-            "name",
-            "packages",
-            "language",
-            "scope",
-            "limit",
-            "page_index",
-        ] {
+        for removed in ["name", "packages", "language", "scope", "limit"] {
             assert!(body.get(removed).is_none());
         }
         assert_eq!(
@@ -2673,7 +2693,7 @@ async fn test_fixture_search_and_symbol_pages() {
     let (server, client) = operation_client(OperationFixture::Valid).await;
     assert!(
         client
-            .search_packages(&search_request(), 20, None)
+            .search_packages(&search_request(), 20, 1)
             .await
             .is_ok()
     );
@@ -2695,7 +2715,7 @@ async fn test_discovery_search_accepts_omitted_or_empty_package_selection() {
             assert!(serialized.get("packages").is_none());
         }
         let page = client
-            .search_packages(&request, 20, None)
+            .search_packages(&request, 20, 1)
             .await
             .expect("discovery page");
         assert_eq!(page.items.len(), 1);
@@ -2706,8 +2726,7 @@ async fn test_discovery_search_accepts_omitted_or_empty_package_selection() {
     }
     let (_server, client) = operation_client(OperationFixture::UnrequestedPackage).await;
     assert_registered_field(
-        &(client.search_packages(&search_request(), 20, None).await)
-            .expect_err("registered refusal"),
+        &(client.search_packages(&search_request(), 20, 1).await).expect_err("registered refusal"),
         "rift.client.response_invalid",
         "package",
     );
@@ -2716,7 +2735,7 @@ async fn test_discovery_search_accepts_omitted_or_empty_package_selection() {
 #[tokio::test]
 async fn test_fixture_page_assembly_handles_cursor_and_revisions() {
     let (server, client) = operation_client(OperationFixture::SearchPages).await;
-    let pages = client.search_packages_pages(&search_request(), 20).await;
+    let pages = client.search_packages_pages(&search_request(), 1).await;
     assert!(pages.is_ok());
     assert_eq!(pages.ok().map(|value| value.items.len()), Some(2));
     assert_eq!(server.state.requests.load(Ordering::SeqCst), 3);
@@ -2737,38 +2756,38 @@ async fn test_fixture_page_assembly_handles_cursor_and_revisions() {
 
     let (_server, client) = operation_client(OperationFixture::PageRevisionChange).await;
     assert_registered_field(
-        &(client.search_packages_pages(&search_request(), 20).await)
+        &(client.search_packages_pages(&search_request(), 1).await)
             .expect_err("registered refusal"),
         "rift.client.response_invalid",
         "revision",
     );
 
     let (server, client) = operation_client(OperationFixture::CandidateBound).await;
-    let pages = client.search_packages_pages(&search_request(), 20).await;
+    let pages = client.search_packages_pages(&search_request(), 1).await;
     assert_eq!(pages.ok().map(|value| value.items.len()), Some(1));
     assert_eq!(server.state.requests.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
 async fn test_fixture_page_rejects_repeated_cursor_and_partial_failure() {
-    let (_server, client) = operation_client(OperationFixture::RepeatedCursor).await;
+    let (_server, client) = operation_client(OperationFixture::RepeatedItem).await;
     assert_registered_field(
-        &(client.search_packages_pages(&search_request(), 20).await)
+        &(client.search_packages_pages(&search_request(), 1).await)
             .expect_err("registered refusal"),
         "rift.client.response_invalid",
-        "cursor_progress",
+        "duplicate_item",
     );
 
     let (server, client) = operation_client(OperationFixture::PartialFailure).await;
     assert!(matches!(
-        client.search_packages_pages(&search_request(), 20).await,
+        client.search_packages_pages(&search_request(), 1).await,
         Err(ref error) if error.slug().as_str() == "rift.client.remote_unavailable"
             && error_text_field(error, "status") == "503"
     ));
     let requests = server.state.requests.load(Ordering::SeqCst);
     assert!(
         matches!(
-            client.search_packages_pages(&search_request(), 20).await,
+            client.search_packages_pages(&search_request(), 1).await,
         Err(ref error) if error.slug().as_str() == "rift.client.remote_unavailable"
             && error_text_field(error, "status") == "503"
         ),
@@ -2787,7 +2806,7 @@ async fn test_fixture_new_endpoint_replaces_failure_cache() {
     let failed_client = GlobalClient::new(failed_server.config()).expect("failed fixture client");
     assert!(matches!(
         failed_client
-            .search_packages(&search_request(), 20, None)
+            .search_packages(&search_request(), 20, 1)
             .await,
         Err(ref error) if error.slug().as_str() == "rift.client.remote_unavailable"
             && error_text_field(error, "status") == "503"
@@ -2801,7 +2820,7 @@ async fn test_fixture_new_endpoint_replaces_failure_cache() {
         GlobalClient::new(healthy_server.config()).expect("healthy fixture client");
     assert!(
         healthy_client
-            .search_packages(&search_request(), 20, None)
+            .search_packages(&search_request(), 20, 1)
             .await
             .is_ok()
     );
@@ -2809,10 +2828,10 @@ async fn test_fixture_new_endpoint_replaces_failure_cache() {
 }
 
 #[tokio::test]
-async fn test_fixture_rejects_query_mismatched_cursor_page() {
-    let (server, client) = operation_client(OperationFixture::MismatchedCursor).await;
+async fn test_fixture_rejects_query_repeated_page() {
+    let (server, client) = operation_client(OperationFixture::RepeatedPage).await;
     assert_registered_field(
-        &(client.search_packages_pages(&search_request(), 20).await)
+        &(client.search_packages_pages(&search_request(), 1).await)
             .expect_err("registered refusal"),
         "rift.client.response_invalid",
         "duplicate_item",
@@ -2820,7 +2839,7 @@ async fn test_fixture_rejects_query_mismatched_cursor_page() {
     assert_eq!(server.state.requests.load(Ordering::SeqCst), 3);
     assert_eq!(
         server.state.last_query.lock().await.as_deref(),
-        Some("limit=20&cursor=next")
+        Some("page=2&max_results=1")
     );
 }
 
@@ -2828,8 +2847,7 @@ async fn test_fixture_rejects_query_mismatched_cursor_page() {
 async fn test_fixture_rejects_unrequested_package() {
     let (_server, client) = operation_client(OperationFixture::UnrequestedPackage).await;
     assert_registered_field(
-        &(client.search_packages(&search_request(), 20, None).await)
-            .expect_err("registered refusal"),
+        &(client.search_packages(&search_request(), 20, 1).await).expect_err("registered refusal"),
         "rift.client.response_invalid",
         "package",
     );
@@ -2846,7 +2864,7 @@ async fn test_fixture_rejects_invalid_origin_source_and_match_class() {
     for (mode, field) in cases {
         let (_server, client) = operation_client(mode).await;
         assert_registered_field(
-            &(client.search_packages(&search_request(), 20, None).await)
+            &(client.search_packages(&search_request(), 20, 1).await)
                 .expect_err("registered refusal"),
             "rift.client.response_invalid",
             field,
@@ -2884,7 +2902,7 @@ async fn test_fixture_accepts_unknown_match_class_on_a_hit_matching_no_identifie
         let mut request = search_request();
         request.identifiers = Some(identifiers);
         let page = client
-            .search_packages(&request, 20, None)
+            .search_packages(&request, 20, 1)
             .await
             .expect("an unknown hit matching no identifier is valid");
         assert_eq!(page.items.len(), 1);
@@ -2892,8 +2910,7 @@ async fn test_fixture_accepts_unknown_match_class_on_a_hit_matching_no_identifie
 
     let (_server, client) = operation_client(OperationFixture::UnknownMatchClass).await;
     assert_registered_field(
-        &(client.search_packages(&search_request(), 20, None).await)
-            .expect_err("registered refusal"),
+        &(client.search_packages(&search_request(), 20, 1).await).expect_err("registered refusal"),
         "rift.client.response_invalid",
         "match_class",
     );
@@ -3078,10 +3095,9 @@ fn test_capabilities_still_searching_declaration_source_are_refused() {
 async fn test_fixture_enforces_active_server_bounds() {
     let (_server, client) = operation_client(OperationFixture::TightBounds).await;
     assert_registered_field(
-        &(client.search_packages(&search_request(), 3, None).await)
-            .expect_err("registered refusal"),
+        &(client.search_packages(&search_request(), 3, 1).await).expect_err("registered refusal"),
         "rift.client.request_invalid",
-        "limit",
+        "max_results",
     );
     assert!(matches!(
         client.resolve_package_context(&resolution_request()).await,
@@ -3091,7 +3107,9 @@ async fn test_fixture_enforces_active_server_bounds() {
 
     // Each page read meets the advertised response body bound on its own request, refusing
     // the page by its declared length, and records the failure a later request answers.
-    let search_page = search_page_json("demo", None, "analyzer-v2", "first").to_string();
+    let mut search_page = search_page_json("demo", None, "analyzer-v2", "first");
+    numbered_page(&mut search_page, Some("page=1&max_results=2"), 1);
+    let search_page = search_page.to_string();
     let symbol_page = symbol_result_json("demo", "first").to_string();
     for (endpoint, page) in [
         (crate::contract::Endpoint::Search, search_page),
@@ -3125,7 +3143,7 @@ async fn test_fixture_enforces_active_server_bounds() {
     let mut request = search_request();
     request.include = Some(crate::PackageSearchRequestInclude { source: Some(true) });
     assert_registered_field(
-        &(client.search_packages(&request, 20, None).await).expect_err("registered refusal"),
+        &(client.search_packages(&request, 20, 1).await).expect_err("registered refusal"),
         "rift.client.response_invalid",
         "source",
     );
@@ -3158,7 +3176,7 @@ fn generated_exact_symbol_shapes_keep_shared_requests_and_typed_outcomes() {
     use rift_protocol::symbol_read::{GetSymbolParams, GetSymbolResult};
     const ID: &str = "rift://symbol/cargo/crates.io/tokio/rust/tokio/Beacon";
     let request: GetSymbolParams = serde_json::from_value(json!({
-        "id": ID, "include": {"history": true, "documentation": true}, "declaration_limit": 5,
+        "id": ID, "include": {"history": true, "documentation": true}, "max_results": 5,
     }))
     .expect("shared request");
     let wire = serde_json::to_value(&request).expect("shared request encoding");
@@ -3168,8 +3186,8 @@ fn generated_exact_symbol_shapes_keep_shared_requests_and_typed_outcomes() {
             documentation: Some(true),
             history: Some(true),
         }),
-        declaration_limit: Some(request.declaration_limit),
-        declaration_cursor: request.declaration_cursor.clone(),
+        max_results: Some(request.max_results),
+        page: Some(request.page),
         revision: request.revision.as_ref().map(ToString::to_string),
     };
     assert_eq!(
@@ -3177,7 +3195,7 @@ fn generated_exact_symbol_shapes_keep_shared_requests_and_typed_outcomes() {
         wire
     );
     assert_eq!(generated.id, request.id.as_str());
-    assert_eq!(generated.declaration_limit, Some(5));
+    assert_eq!(generated.max_results, Some(5));
     assert_eq!(
         generated.include,
         Some(crate::generated::GetSymbolInclude {
@@ -3186,7 +3204,7 @@ fn generated_exact_symbol_shapes_keep_shared_requests_and_typed_outcomes() {
         })
     );
     for value in [
-        json!({"outcome": "found", "symbol": {"id": ID, "language": "rust", "name": "Beacon", "kind": "struct"}, "revision": "rift://revision/cargo/crates.io/tokio@1.50.0", "declarations": []}),
+        json!({"outcome": "found", "symbol": {"id": ID, "language": "rust", "name": "Beacon", "kind": "struct"}, "revision": "rift://revision/cargo/crates.io/tokio@1.50.0", "pagination": {"page":1,"pages":1,"max_results":10,"total":1}, "declarations": []}),
         json!({"outcome": "missing", "symbol_not_found": {"id": ID, "alternatives": []}, "revision": "rift://revision/cargo/crates.io/tokio@1.50.0"}),
         json!({"outcome": "unavailable", "id": ID, "reason": "exact_release"}),
     ] {
@@ -3240,5 +3258,76 @@ fn generated_exact_symbol_shapes_keep_shared_requests_and_typed_outcomes() {
     );
 }
 
-#[path = "relationships/tests.rs"]
-mod relationships;
+#[path = "edges/tests.rs"]
+mod edges;
+
+fn numbered_page(value: &mut serde_json::Value, query: Option<&str>, total: u64) {
+    let number = |key: &str, default| {
+        query
+            .and_then(|query| query.split('&').find_map(|pair| pair.strip_prefix(key)))
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(default)
+    };
+    let page = number("page=", 1);
+    let max_results = number("max_results=", 10);
+    value["revision"] = serde_json::json!("corpus-v1");
+    value["pagination"] = serde_json::to_value(rift_protocol::read::Pagination::new(
+        page,
+        max_results,
+        total,
+    ))
+    .expect("pagination");
+    if page.saturating_sub(1).saturating_mul(max_results) >= total {
+        value["items"] = serde_json::json!([]);
+    }
+}
+
+fn edge_response(pages: &[serde_json::Value]) -> Response {
+    let Some(mut answer) = pages.first().cloned() else {
+        return json_response(&serde_json::Value::Null, None);
+    };
+    for page in pages.iter().skip(1) {
+        for key in ["symbols", "sources"] {
+            for value in page[key].as_array().into_iter().flatten() {
+                let target = answer
+                    .as_object_mut()
+                    .expect("batch")
+                    .entry(key)
+                    .or_insert_with(|| serde_json::json!([]))
+                    .as_array_mut()
+                    .expect("catalog");
+                if !target.contains(value) {
+                    target.push(value.clone());
+                }
+            }
+        }
+        for (index, group) in page["groups"].as_array().into_iter().flatten().enumerate() {
+            for key in ["edges", "occurrences"] {
+                let values = group[key].as_array().cloned().unwrap_or_default();
+                answer["groups"][index]
+                    .as_object_mut()
+                    .expect("group")
+                    .entry(key)
+                    .or_insert_with(|| serde_json::json!([]))
+                    .as_array_mut()
+                    .expect("group records")
+                    .extend(values);
+            }
+            answer["groups"][index]["complete"] = group["complete"].clone();
+        }
+    }
+    json_response(&answer, None)
+}
+
+fn declaration_page(mut value: serde_json::Value, request_body: &[u8]) -> serde_json::Value {
+    let request: serde_json::Value =
+        serde_json::from_slice(request_body).expect("declaration request");
+    let Some(items) = value["declarations"].as_array() else {
+        return value;
+    };
+    let page = request["page"].as_u64().unwrap_or(1);
+    let max_results = request["max_results"].as_u64().unwrap_or(10);
+    let pagination = rift_protocol::read::Pagination::new(page, max_results, items.len() as u64);
+    value["pagination"] = serde_json::to_value(pagination).expect("pagination");
+    value
+}

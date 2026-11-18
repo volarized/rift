@@ -57,12 +57,12 @@ impl rmcp::ServerHandler for RecordingUpstream {
                 "results": [{"hit":{"target":"symbol", "symbol":{
                     "id":"rift://symbol/local/rust/app/beacon", "language":"rust", "name":"beacon", "kind":"function"
                 }}, "path":"lib.rs", "source":"fn beacon() {}", "range":{"start":0,"end":14}, "line":1}],
-                "pagination":{"page_index":0,"total_pages":1}
+                "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 10}
             }))
             .into()),
             "search" => Ok(CallToolResult::structured(json!({
                 "answer": {"result":"bindings", "variables":["symbol"], "bindings":[]},
-                "pagination": {"page_index":0, "total_pages":0}
+                "pagination": {"page": 1, "pages": 0, "max_results": 10, "total": 0}
             }))
             .into()),
             other => Err(ErrorData::invalid_params(

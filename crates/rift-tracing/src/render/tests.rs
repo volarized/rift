@@ -6,7 +6,7 @@ use crate::record::LogRecord;
 /// 2026-10-04 20:42:58.787Z, the first instant of the owner's sample lines.
 const SAMPLE_MS: i64 = 1_791_146_578_787;
 /// The function that opens the request spans of the sample.
-const NODES: &str = "rift_mcp::server::Server::nodes";
+const FACETS: &str = "rift_mcp::server::Server::facets";
 
 /// A log record at `SAMPLE_MS + offset_ms` with `fields`.
 fn record(
@@ -34,7 +34,7 @@ fn request_span(request: u32, tool: &str) -> Value {
         "fields": {
             "component": "mcp",
             "operation": "tools/call",
-            "code.function.name": NODES,
+            "code.function.name": FACETS,
             "request_id": request.to_string(),
             "tool": tool,
         },
@@ -55,7 +55,7 @@ fn nested_close(offset_ms: i64, name: &str, busy_ns: u64, idle_ns: u64, request:
             "busy_ns": busy_ns.to_string(),
             "idle_ns": idle_ns.to_string(),
             "status.code": "Ok",
-            "root_span": request_span(request, "nodes"),
+            "root_span": request_span(request, "facets"),
         }),
     )
 }
@@ -63,7 +63,7 @@ fn nested_close(offset_ms: i64, name: &str, busy_ns: u64, idle_ns: u64, request:
 /// The close record of the request span `request` itself.
 fn request_close(offset_ms: i64, request: u32, tool: &str, status: &Value) -> LogRecord {
     let mut fields = json!({
-        "code.function.name": NODES,
+        "code.function.name": FACETS,
         "request_id": request.to_string(),
         "tool": tool,
         "span": "closed",
@@ -96,19 +96,19 @@ fn a_stored_page_prints_a_request_group_in_the_settled_layout() {
     let records = [
         nested_close(11, "fingerprint.configuration", 96_900, 13_400, 11),
         nested_close(12, "fingerprint.fold", 12_100, 13_200, 11),
-        request_close(12, 11, "nodes", &json!({"status.code": "Ok"})),
+        request_close(12, 11, "facets", &json!({"status.code": "Ok"})),
     ];
 
     assert_eq!(
         page(&records),
-        "2026-10-04 20:42:58.798Z INFO  rift_mcp::server::Server::nodes   component=mcp \
-         operation=tools/call req=11 tool=nodes  ↳ fingerprint.configuration component=index \
+        "2026-10-04 20:42:58.798Z INFO  rift_mcp::server::Server::facets   component=mcp \
+         operation=tools/call req=11 tool=facets  ↳ fingerprint.configuration component=index \
          operation=fingerprint.configuration close ✓ busy=96.9µs idle=13.4µs\n\
-         2026-10-04 20:42:58.799Z INFO  rift_mcp::server::Server::nodes   component=mcp \
-         operation=tools/call req=11 tool=nodes  ↳ fingerprint.fold          component=index \
+         2026-10-04 20:42:58.799Z INFO  rift_mcp::server::Server::facets   component=mcp \
+         operation=tools/call req=11 tool=facets  ↳ fingerprint.fold          component=index \
          operation=fingerprint.fold          close ✓ busy=12.1µs idle=13.2µs\n\
-         2026-10-04 20:42:58.799Z INFO  rift_mcp::server::Server::nodes   component=mcp \
-         operation=tools/call req=11 tool=nodes  close ✓ busy=6.55ms idle=290µs\n"
+         2026-10-04 20:42:58.799Z INFO  rift_mcp::server::Server::facets   component=mcp \
+         operation=tools/call req=11 tool=facets  close ✓ busy=6.55ms idle=290µs\n"
     );
 }
 
@@ -153,7 +153,7 @@ fn an_event_in_nested_spans_prints_the_root_the_nearest_span_and_its_own_fields(
 
     assert_eq!(
         page(&[event]),
-        "2026-10-04 20:42:58.787Z DEBUG rift_mcp::server::Server::nodes   component=mcp \
+        "2026-10-04 20:42:58.787Z DEBUG rift_mcp::server::Server::facets   component=mcp \
          operation=tools/call req=18 tool=get_symbol  ↳ fingerprint.discover component=index \
          operation=fingerprint.discover walked the workspace component=search files=12\n"
     );
@@ -271,12 +271,12 @@ fn a_lifecycle_record_inside_a_span_prints_its_fields_after_the_message() {
         "info",
         ("mcp", "tools/call"),
         "history fill started",
-        &json!({"phase": "start", "pending": "2", "root_span": request_span(4, "nodes")}),
+        &json!({"phase": "start", "pending": "2", "root_span": request_span(4, "facets")}),
     );
 
     let line = page(&[event]);
     assert!(
-        line.ends_with("tool=nodes  → history fill started pending=2 phase=start\n"),
+        line.ends_with("tool=facets  → history fill started pending=2 phase=start\n"),
         "{line}"
     );
 }
@@ -296,17 +296,17 @@ fn groups_are_separated_by_a_blank_line_and_padded_apart() {
     let mut lines = LogLines::stored_page();
     let first = lines.lines(&[
         nested_close(0, "fingerprint.fold", 12_100, 13_200, 10),
-        request_close(1, 10, "nodes", &json!({"status.code": "Ok"})),
+        request_close(1, 10, "facets", &json!({"status.code": "Ok"})),
         nested_close(2, "fingerprint.fold", 12_100, 13_200, 11),
     ]);
     let second = lines.lines(&[
-        request_close(3, 11, "nodes", &json!({"status.code": "Ok"})),
+        request_close(3, 11, "facets", &json!({"status.code": "Ok"})),
         started,
     ]);
 
     let blank = |text: &str| text.lines().filter(|line| line.is_empty()).count();
     assert_eq!(blank(&first), 1, "{first}");
-    assert!(first.ends_with("\n\n2026-10-04 20:42:58.789Z INFO  rift_mcp::server::Server::nodes   component=mcp operation=tools/call req=11 tool=nodes  ↳ fingerprint.fold component=index operation=fingerprint.fold close ✓ busy=12.1µs idle=13.2µs\n"), "{first}");
+    assert!(first.ends_with("\n\n2026-10-04 20:42:58.789Z INFO  rift_mcp::server::Server::facets   component=mcp operation=tools/call req=11 tool=facets  ↳ fingerprint.fold component=index operation=fingerprint.fold close ✓ busy=12.1µs idle=13.2µs\n"), "{first}");
     assert!(!second.starts_with('\n'), "request 11 continues: {second}");
     assert_eq!(blank(&second), 1, "{second}");
     assert!(
@@ -458,7 +458,7 @@ fn a_message_or_value_that_holds_a_delimiter_prints_quoted() {
         "info",
         ("mcp", "tools/call"),
         "answered: twice",
-        &json!({"reason": "k: v", "root_span": request_span(4, "nodes")}),
+        &json!({"reason": "k: v", "root_span": request_span(4, "facets")}),
     );
 
     assert_eq!(
@@ -472,7 +472,7 @@ fn a_message_or_value_that_holds_a_delimiter_prints_quoted() {
     );
     let inside = page(&[inside]);
     assert!(
-        inside.ends_with("tool=nodes  \"answered: twice\" reason=\"k: v\"\n"),
+        inside.ends_with("tool=facets  \"answered: twice\" reason=\"k: v\"\n"),
         "{inside}"
     );
 }

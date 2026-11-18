@@ -233,7 +233,7 @@ mod tests {
         assert_eq!(
             presentation(
                 "SELECT ?route ?i ?callee ?rank { SERVICE :flows { ?route :query 'ReadService';
-                 :limit 1; :score ?rank; :steps ?step . ?step :index ?i; :value ?callee } }
+                 :max_results 1; :score ?rank; :steps ?step . ?step :index ?i; :value ?callee } }
                  ORDER BY DESC(?rank) ?route ?i OFFSET 1"
             )?,
             QueryPresentation::Flows(BTreeMap::from([

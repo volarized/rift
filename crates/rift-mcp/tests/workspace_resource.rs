@@ -92,8 +92,8 @@ async fn the_workspace_resource_answers_effective_languages_and_source() -> Test
         paths.contains(&"notes.txt"),
         "a visible file no language claims joins the catalog: {body:#}"
     );
-    assert_eq!(body["pagination"]["page_index"], Value::from(0));
-    assert_eq!(body["pagination"]["total_pages"], Value::from(1));
+    assert_eq!(body["pagination"]["page"], Value::from(1));
+    assert_eq!(body["pagination"]["pages"], Value::from(1));
 
     client.cancel().await?;
     server_task.await?;
@@ -105,12 +105,12 @@ async fn a_workspace_page_past_the_end_answers_an_empty_catalog() -> TestResult 
     let (_directory, client, server_task) =
         served_workspace(&[("lib.rs", "pub fn beacon() {}\n")], None).await?;
 
-    let body = resource_body(&client, "rift://workspace?page_index=4").await?;
+    let body = resource_body(&client, "rift://workspace?page=4").await?;
 
     assert_eq!(body["source"], serde_json::json!([]), "{body:#}");
-    assert_eq!(body["pagination"]["page_index"], Value::from(4));
+    assert_eq!(body["pagination"]["page"], Value::from(4));
     assert_eq!(
-        body["pagination"]["total_pages"],
+        body["pagination"]["pages"],
         Value::from(1),
         "the page count stays the catalog's own: {body:#}"
     );
@@ -143,8 +143,8 @@ async fn workspace_pages_partition_the_complete_visible_catalog() -> TestResult 
         },
     )
     .await?;
-    let first = resource_body(&client, "rift://workspace").await?;
-    let second = resource_body(&client, "rift://workspace?page_index=1").await?;
+    let first = resource_body(&client, "rift://workspace?max_results=50").await?;
+    let second = resource_body(&client, "rift://workspace?page=2&max_results=50").await?;
     let first_rows = first["source"].as_array().ok_or("source array")?;
     let second_rows = second["source"].as_array().ok_or("source array")?;
     assert_eq!(first_rows.len(), page_size);
@@ -153,8 +153,8 @@ async fn workspace_pages_partition_the_complete_visible_catalog() -> TestResult 
         3,
         "remaining raw files and configuration"
     );
-    assert_eq!(first["pagination"]["total_pages"], Value::from(2));
-    assert_eq!(second["pagination"]["total_pages"], Value::from(2));
+    assert_eq!(first["pagination"]["pages"], Value::from(2));
+    assert_eq!(second["pagination"]["pages"], Value::from(2));
     assert_eq!(
         first["configuration_revision"],
         second["configuration_revision"]
@@ -178,15 +178,18 @@ async fn workspace_pages_partition_the_complete_visible_catalog() -> TestResult 
         assert_eq!(row["digest"], Value::from(raw_digest));
         assert!(row.get("language").is_none());
     }
-    let repeated = resource_body(&client, "rift://workspace").await?;
+    let repeated = resource_body(&client, "rift://workspace?max_results=50").await?;
     assert_eq!(
         repeated, first,
         "unchanged publication repeats identical page"
     );
-    let overflow =
-        resource_body(&client, "rift://workspace?page_index=18446744073709551615").await?;
+    let overflow = resource_body(
+        &client,
+        "rift://workspace?page=18446744073709551615&max_results=50",
+    )
+    .await?;
     assert_eq!(overflow["source"], serde_json::json!([]));
-    assert_eq!(overflow["pagination"]["total_pages"], Value::from(2));
+    assert_eq!(overflow["pagination"]["pages"], Value::from(2));
 
     client.cancel().await?;
     server_task.await?;

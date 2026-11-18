@@ -887,10 +887,10 @@ message = "source bytes {source_bytes} exceed accepted limit {source_bytes_max}"
 action = "reduce source bytes below {source_bytes_max} and retry"
 fields = { path = { type = "path", format = "display", optional = true }, source_bytes = { type = "unsigned" }, source_bytes_max = { type = "unsigned" } }
 
-[error.syntax.too_many_nodes]
-message = "syntax tree node count exceeds accepted limit {syntax_nodes_max}"
-action = "reduce syntax tree node count below {syntax_nodes_max} and retry"
-fields = { path = { type = "path", format = "display" }, syntax_nodes_max = { type = "unsigned" } }
+[error.syntax.too_many_syntax_elements]
+message = "syntax element count exceeds accepted limit {syntax_elements_max}"
+action = "reduce syntax element count below {syntax_elements_max} and retry"
+fields = { path = { type = "path", format = "display" }, syntax_elements_max = { type = "unsigned" } }
 
 [error.syntax.too_deep]
 message = "syntax tree depth exceeds accepted limit {syntax_depth_max}"
@@ -908,9 +908,9 @@ action = "retry syntax parsing"
 fields = { path = { type = "path", format = "display", optional = true } }
 
 [error.syntax.position_overflow]
-message = "syntax node position does not fit the accepted byte width"
+message = "syntax element position does not fit the accepted byte width"
 action = "report this internal failure with its full context"
-fields = { node_kind = { type = "string" }, start_byte = { type = "unsigned" }, end_byte = { type = "unsigned" }, source = { type = "error", role = "source" } }
+fields = { syntax_element_kind = { type = "string" }, start_byte = { type = "unsigned" }, end_byte = { type = "unsigned" }, source = { type = "error", role = "source" } }
 
 [error.syntax.invalid_query]
 message = "syntax query is invalid at line {line_number}: {line_text}"
@@ -937,10 +937,10 @@ message = "Tree-sitter rejected Markdown inline ranges"
 action = "report this internal failure with its full context"
 fields = { path = { type = "path", format = "display" } }
 
-[error.syntax.unknown_node_kind]
-message = "node kind {node_kind} is outside interpreted grammar vocabulary"
+[error.syntax.unknown_syntax_element_kind]
+message = "syntax element kind {syntax_element_kind} is outside interpreted grammar vocabulary"
 action = "report this internal failure with its full context"
-fields = { node_kind = { type = "string" } }
+fields = { syntax_element_kind = { type = "string" } }
 
 [error.syntax.facts_source_too_large]
 message = "syntax facts source exceeds its byte bound"
@@ -955,8 +955,8 @@ message = "syntax facts source digest does not match"
 action = "parse the supplied source again"
 
 [error.syntax.facts_count_exceeded]
-message = "syntax facts exceed their node bound"
-action = "reduce facts below the accepted node bound and parse again"
+message = "syntax facts exceed their syntax element bound"
+action = "reduce facts below the accepted syntax element bound and parse again"
 
 [error.syntax.facts_range_invalid]
 message = "syntax facts carry an invalid source range"
@@ -1077,7 +1077,7 @@ action = "correct the reported field of the producer facts and retry"
 fields = { field = { type = "string" }, violation = { type = "string" } }
 
 [error.analysis.producer_range_unresolved]
-message = "producer fact range resolves to no node of its source unit: unit {unit}"
+message = "producer fact range resolves to no syntax element of its source unit: unit {unit}"
 action = "name a byte range inside a source unit the publication carries and retry"
 fields = { unit = { type = "string" }, start = { type = "unsigned" }, end = { type = "unsigned" } }
 

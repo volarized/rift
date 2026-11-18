@@ -5,7 +5,7 @@
 //! nested operation, and the message.
 //!
 //! ```text
-//! 2026-10-04 20:42:58.798Z INFO  rift_mcp::server::RiftMcp::nodes   component=mcp operation=tools/call req=11 tool=nodes  ↳ fingerprint.fold component=index operation=fingerprint.fold close ✓ busy=12.1µs idle=13.2µs
+//! 2026-10-04 20:42:58.798Z INFO  rift_mcp::server::RiftMcp::syntax elements   component=mcp operation=tools/call req=11 tool=syntax elements  ↳ fingerprint.fold component=index operation=fingerprint.fold close ✓ busy=12.1µs idle=13.2µs
 //! ```
 //!
 //! - The function is the `code.function.name` of the root span, the outermost span around

@@ -76,7 +76,7 @@ impl GetSize for crate::read::SourceUnitId {
 
 use crate::read::{
     Documentation, ExactKind, ExtensionKey, Extensions, Language, PackageIdentity, Parameter,
-    RuntimeIdentity, Signature, SignatureLink, Symbol, SymbolFacet, SymbolId, SymbolOrigin,
+    RuntimeIdentity, Signature, SignatureLink, Symbol, SymbolId, SymbolKind, SymbolOrigin,
     TypeBinding, TypeExpression,
 };
 
@@ -307,7 +307,7 @@ heap_fields!(
     language,
     name,
     kind,
-    facets => vector,
+    kinds => vector,
     origin,
     container,
     modifiers => vector,
@@ -318,7 +318,7 @@ heap_fields!(
     extensions,
 );
 
-impl GetSize for SymbolFacet {
+impl GetSize for SymbolKind {
     fn get_size(&self) -> usize {
         std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
     }
@@ -444,7 +444,7 @@ pub fn retained_arc_material<V: ?Sized, T: GetSizeTracker>(
     (bytes, tracker)
 }
 
-/// Counts retained map nodes and owned key and value heap material.
+/// Counts retained map syntax elements and owned key and value heap material.
 #[must_use]
 pub fn retained_map_material<K: GetSize + Ord, V, T: GetSizeTracker>(
     values: &std::collections::BTreeMap<K, V>,
@@ -461,15 +461,15 @@ pub fn retained_map_material<K: GetSize + Ord, V, T: GetSizeTracker>(
     (bytes, tracker)
 }
 
-// Rust 1.98 alloc::collections::btree::node: 11 key/value slots, a parent
-// pointer, two u16 fields, and at most 12 child pointers per allocated node.
+// Rust 1.98 alloc::collections::btree::syntax element: 11 key/value slots, a parent
+// pointer, two u16 fields, and at most 12 child pointers per allocated syntax element.
 // Each field is rounded to the largest field alignment before summation.
-// Charging one full internal node per entry plus one root overcharges empty
-// slots and leaf nodes; it does not claim allocator or resident-memory size.
-/// Conservative material occupied by the nodes of a retained `BTreeMap` or `BTreeSet`.
+// Charging one full internal syntax element per entry plus one root overcharges empty
+// slots and leaf syntax elements; it does not claim allocator or resident-memory size.
+/// Conservative material occupied by the syntax elements of a retained `BTreeMap` or `BTreeSet`.
 ///
-/// This bound uses the pinned Rust node layout and includes unused node slots.
-/// Every non-root node retains at least five entries; one root is counted separately.
+/// This bound uses the pinned Rust syntax element layout and includes unused syntax element slots.
+/// Every non-root syntax element retains at least five entries; one root is counted separately.
 /// Overflow returns `usize::MAX`, so a finite admission budget refuses it.
 #[must_use]
 pub fn btree_material_bytes<K, V>(len: usize) -> usize {
@@ -484,7 +484,7 @@ pub fn btree_material_bytes<K, V>(len: usize) -> usize {
         std::mem::size_of::<V>().saturating_mul(11),
         std::mem::size_of::<usize>().saturating_mul(12),
     ];
-    let node = fields.into_iter().try_fold(0usize, |total, field| {
+    let syntax_element = fields.into_iter().try_fold(0usize, |total, field| {
         field
             .checked_add(alignment - 1)
             .map(|padded| padded / alignment * alignment)
@@ -492,7 +492,9 @@ pub fn btree_material_bytes<K, V>(len: usize) -> usize {
     });
     (len / 5)
         .checked_add(1)
-        .and_then(|nodes| node.and_then(|node| nodes.checked_mul(node)))
+        .and_then(|syntax_elements| {
+            syntax_element.and_then(|syntax_element| syntax_elements.checked_mul(syntax_element))
+        })
         .unwrap_or(usize::MAX)
 }
 
@@ -500,10 +502,10 @@ heap_fields!(crate::read::SourceUnitSpan, unit);
 heap_fields!(crate::producer::ProducerName, 0);
 heap_fields!(crate::producer::ProducerRevision, 0);
 heap_fields!(crate::producer::FactProducer, name, revision);
-heap_fields!(crate::read::Relationship, from, kind, facets => vector, to, occurrence, producer, extensions);
-heap_fields!(crate::search::GraphHop, relationship);
+heap_fields!(crate::read::Edge, from, kind, kinds => vector, to, occurrence, producer, extensions);
+heap_fields!(crate::search::GraphHop, edge);
 
-impl GetSize for crate::read::RelationshipFacet {
+impl GetSize for crate::read::EdgeKind {
     fn get_heap_size_with_tracker<T: GetSizeTracker>(&self, tracker: T) -> (usize, T) {
         (0, tracker)
     }
@@ -569,21 +571,21 @@ mod tests {
     }
 
     #[test]
-    fn retained_relationship_material_counts_capacity_and_refuses_unmeasured_facts() {
+    fn retained_edge_material_counts_capacity_and_refuses_unmeasured_facts() {
         let mut kind = String::with_capacity(256);
         kind.push_str("calls");
-        let mut facets = Vec::with_capacity(32);
-        facets.push(crate::read::RelationshipFacet::Calls);
-        let edge = crate::read::Relationship {
+        let mut kinds = Vec::with_capacity(32);
+        kinds.push(crate::read::EdgeKind::Calls);
+        let edge = crate::read::Edge {
             from: SymbolId("rift://symbol/local/rust/app/caller".to_owned()),
             kind: ExactKind(kind),
-            facets,
+            kinds,
             to: SymbolId("rift://symbol/local/rust/app/callee".to_owned()),
             occurrence: Some(crate::read::SourceUnitSpan {
                 unit: crate::read::SourceUnitId("rift://source/project/src/lib.rs".to_owned()),
                 range: crate::read::TextRange { start: 0, end: 12 },
             }),
-            derivation: crate::read::RelationshipDerivation::Resolution,
+            derivation: crate::read::EdgeDerivation::Resolution,
             confidence: None,
             producer: Some(crate::producer::FactProducer {
                 name: crate::producer::ProducerName::parse("demo-indexer").expect("name"),
@@ -595,11 +597,11 @@ mod tests {
         let minimum = edge.kind.0.capacity()
             + producer.name.as_str().len()
             + producer.revision.as_str().len()
-            + edge.facets.capacity() * std::mem::size_of::<crate::read::RelationshipFacet>()
+            + edge.kinds.capacity() * std::mem::size_of::<crate::read::EdgeKind>()
             + edge.from.0.capacity()
             + edge.to.0.capacity();
         let hop = crate::search::GraphHop {
-            relationship: edge,
+            edge,
             direction: crate::search::HopDirection::Outgoing,
         };
         let measured = hop
@@ -608,7 +610,7 @@ mod tests {
         assert!(measured >= std::mem::size_of_val(&hop) + minimum);
         assert_ne!(measured, usize::MAX);
         let mut unmeasured = hop;
-        unmeasured.relationship.extensions = Extensions(std::collections::BTreeMap::from([(
+        unmeasured.edge.extensions = Extensions(std::collections::BTreeMap::from([(
             ExtensionKey("example.org.fact".to_owned()),
             crate::read::ExtensionValue {
                 version: 1,
@@ -678,7 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_maps_count_distinct_nodes_and_shared_value_material_once() {
+    fn retained_maps_count_distinct_syntax_elements_and_shared_value_material_once() {
         let value = std::sync::Arc::new(vec![0u8; 4096]);
         let first: std::collections::BTreeMap<u32, _> = (0..12)
             .map(|key| (key, std::sync::Arc::clone(&value)))
@@ -690,11 +692,11 @@ mod tests {
         let (first_bytes, tracker) =
             retained_map_material(&first, get_size2::StandardTracker::new(), measure);
         let (second_bytes, _) = retained_map_material(&second, tracker, measure);
-        let nodes = btree_material_bytes::<u32, std::sync::Arc<Vec<u8>>>(12);
+        let syntax_elements = btree_material_bytes::<u32, std::sync::Arc<Vec<u8>>>(12);
         let value_bytes =
             std::mem::size_of::<Vec<u8>>() + 2 * std::mem::size_of::<usize>() + value.capacity();
-        assert_eq!(first_bytes, nodes + value_bytes);
-        assert_eq!(second_bytes, nodes);
+        assert_eq!(first_bytes, syntax_elements + value_bytes);
+        assert_eq!(second_bytes, syntax_elements);
         assert_ne!(first_bytes, usize::MAX);
     }
 
