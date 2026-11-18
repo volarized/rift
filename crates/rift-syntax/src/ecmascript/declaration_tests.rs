@@ -185,32 +185,33 @@ fn test_destructured_bindings_declare_one_variable_per_bound_name() {
     let text = "export const { major, minor: mi, ...rest } = version;\n\
                 const [first, [second], third = fallback] = list;\n\
                 const { a = b, c: [d] } = other;\n";
-    let document = javascript(text);
-    let names = document
-        .symbols()
-        .iter()
-        .map(|symbol| {
-            (
-                symbol.qualified_name.as_str(),
-                symbol.kind,
-                spelled(text, symbol.range),
-                symbol.facets.contains(&SymbolFacet::Public),
-            )
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        names,
-        [
-            ("major", "variable", "major", true),
-            ("mi", "variable", "mi", true),
-            ("rest", "variable", "rest", true),
-            ("first", "variable", "first", false),
-            ("second", "variable", "second", false),
-            ("third", "variable", "third", false),
-            ("a", "variable", "a", false),
-            ("d", "variable", "d", false),
-        ]
-    );
+    for document in [javascript(text), typescript(text)] {
+        let names = document
+            .symbols()
+            .iter()
+            .map(|symbol| {
+                (
+                    symbol.qualified_name.as_str(),
+                    symbol.kind,
+                    spelled(text, symbol.range),
+                    symbol.facets.contains(&SymbolFacet::Public),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                ("major", "variable", "major", true),
+                ("mi", "variable", "mi", true),
+                ("rest", "variable", "rest", true),
+                ("first", "variable", "first", false),
+                ("second", "variable", "second", false),
+                ("third", "variable", "third", false),
+                ("a", "variable", "a", false),
+                ("d", "variable", "d", false),
+            ]
+        );
+    }
 }
 
 /// Declarations inside a function, a method, or a variable's value qualify
@@ -247,48 +248,50 @@ fn test_nested_declarations_qualify_under_their_enclosing_declaration() {
 /// as their container.
 #[test]
 fn test_anonymous_default_class_contains_its_members() {
-    let document = javascript("export default class { anon() {} }\n");
-    assert_eq!(
-        declared(&document),
-        [
-            ("default", None, "class"),
-            ("default.anon", Some("default"), "method"),
-        ]
-    );
-    assert!(
-        symbol(&document, "default")
-            .facets
-            .contains(&SymbolFacet::Public)
-    );
+    let text = "export default class { anon() {} }\n";
+    for document in [javascript(text), typescript(text)] {
+        assert_eq!(
+            declared(&document),
+            [
+                ("default", None, "class"),
+                ("default.anon", Some("default"), "method"),
+            ]
+        );
+        assert!(
+            symbol(&document, "default")
+                .facets
+                .contains(&SymbolFacet::Public)
+        );
+    }
 }
 
 /// A variable holding an arrow function or a function expression can be
 /// invoked, so it carries the `callable` category beside `value`.
 #[test]
 fn test_function_valued_variables_carry_the_callable_category() {
-    let document = javascript(
-        "export const make = (n) => n;\nconst legacy = function () {};\nconst plain = 1;\n",
-    );
-    let facets = document
-        .symbols()
-        .iter()
-        .map(|symbol| (symbol.name.as_str(), symbol.facets.clone()))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        facets,
-        [
-            (
-                "make",
-                vec![
-                    SymbolFacet::Value,
-                    SymbolFacet::Callable,
-                    SymbolFacet::Public
-                ]
-            ),
-            ("legacy", vec![SymbolFacet::Value, SymbolFacet::Callable]),
-            ("plain", vec![SymbolFacet::Value]),
-        ]
-    );
+    let text = "export const make = (n) => n;\nconst legacy = function () {};\nconst plain = 1;\n";
+    for document in [javascript(text), typescript(text)] {
+        let facets = document
+            .symbols()
+            .iter()
+            .map(|symbol| (symbol.name.as_str(), symbol.facets.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            facets,
+            [
+                (
+                    "make",
+                    vec![
+                        SymbolFacet::Value,
+                        SymbolFacet::Callable,
+                        SymbolFacet::Public
+                    ]
+                ),
+                ("legacy", vec![SymbolFacet::Value, SymbolFacet::Callable]),
+                ("plain", vec![SymbolFacet::Value]),
+            ]
+        );
+    }
 }
 
 /// Decorators belong to the declaration they qualify: a TypeScript method's

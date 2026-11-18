@@ -357,8 +357,8 @@ fn package_argument_corpus() -> Vec<(&'static str, Value)> {
 fn traversal_search_corpus() -> Vec<(&'static str, Value)> {
     [
         format!("SELECT ?usage ?unit ?start ?end {{ <{TRAVERSAL_CALLEE}> :usages ?usage . ?usage :unit ?unit; :start ?start; :end ?end }} ORDER BY ?unit ?start"),
-        format!("SELECT DISTINCT ?caller {{ ?caller :references <{TRAVERSAL_CALLEE}> }}"),
-        format!("SELECT DISTINCT ?caller {{ ?caller :references+ <{TRAVERSAL_CALLEE}> }}"),
+        format!("SELECT DISTINCT ?caller {{ ?caller :references <{TRAVERSAL_CALLEE}> }} ORDER BY ?caller"),
+        format!("SELECT DISTINCT ?caller {{ ?caller :references+ <{TRAVERSAL_CALLEE}> }} ORDER BY ?caller"),
         format!("SELECT ?caller {{ ?caller :references <{TRAVERSAL_CALLEE}> FILTER(?caller = <{TRAVERSAL_CALLER}>) }}"),
         format!("SELECT ?callee {{ <{TRAVERSAL_CALLER}> :calls ?callee }}"),
         format!("SELECT ?callee {{ <{TRAVERSAL_CALLER}> :calls/:calls ?callee }}"),
