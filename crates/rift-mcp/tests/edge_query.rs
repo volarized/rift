@@ -91,7 +91,7 @@ async fn test_python_rebindings_share_the_existing_symbol_facets() -> TestResult
 
 #[tokio::test]
 async fn test_python_static_member_edges_are_read_through_sparql() -> TestResult {
-    let source = "import models\nclass Base:\n    value: int = 0\n    def run(self): pass\nclass Child(Base):\n    def run(self, value: models.Value) -> models.Value:\n        self.value = value\n        self.value += 1\n        return models.current\ndef typed(value: models.Value):\n    value.run()\n    value.item = 1\n    models.current = value\n    return value.item\n";
+    let source = "import models\nclass Base:\n    value: int = 0\n    def run(self): pass\nclass Child(Base):\n    def run(self, value: models.Value) -> models.Value:\n        self.value = value\n        self.value += 1\n        return models.current\ndef typed(value: models.Value):\n    value.run()\n    value.item = 1\n    models.current = value\n    return value.item\ndef build() -> models.Value | None: return None\ndef alias():\n    module = models\n    value = build()\n    second = value\n    second.item = 2\n    module.current = second\n    return second.item\ndef checked(value):\n    if not isinstance(value, models.Value): return\n    value.item = 3\n";
     let files = [
         ("main.py", source),
         (
@@ -102,6 +102,10 @@ async fn test_python_static_member_edges_are_read_through_sparql() -> TestResult
     let (_directory, client, task) = served_workspace(&files, None).await?;
     captured_seed(&client, "Child", "main.py").await?;
     for query in [
+        "ASK { <rift://symbol/local/python/main/alias> :writes <rift://symbol/local/python/models/Value/item> }",
+        "ASK { <rift://symbol/local/python/main/alias> :reads <rift://symbol/local/python/models/Value/item> }",
+        "ASK { <rift://symbol/local/python/main/alias> :writes <rift://symbol/local/python/models/current> }",
+        "ASK { <rift://symbol/local/python/main/checked> :writes <rift://symbol/local/python/models/Value/item> }",
         "ASK { <rift://symbol/local/python/main/typed> :calls <rift://symbol/local/python/models/Value/run> }",
         "ASK { <rift://symbol/local/python/main/typed> :reads <rift://symbol/local/python/models/Value/item> }",
         "ASK { <rift://symbol/local/python/main/typed> :writes <rift://symbol/local/python/models/Value/item> }",
@@ -110,7 +114,7 @@ async fn test_python_static_member_edges_are_read_through_sparql() -> TestResult
         "ASK { <rift://symbol/local/python/main/Child> :contains <rift://symbol/local/python/main/Child/run> }",
         "ASK { <rift://symbol/local/python/main/Child/run> :overrides <rift://symbol/local/python/main/Base/run> }",
         "ASK { <rift://symbol/local/python/main/Child/run> :reads <rift://symbol/local/python/models/current> }",
-        "ASK { <rift://symbol/local/python/main/Child/run> :writes <rift://symbol/local/python/main/Child/value> }",
+        "ASK { <rift://symbol/local/python/main/Child/run> :writes <rift://symbol/local/python/main/Base/value> }",
         "ASK { <rift://symbol/local/python/main/Child/run> :hasType <rift://symbol/local/python/models/Value> }",
         "ASK { <rift://symbol/local/python/main> :imports <rift://symbol/local/python/models> }",
     ] {

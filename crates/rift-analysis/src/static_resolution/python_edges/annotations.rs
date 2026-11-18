@@ -36,7 +36,7 @@ impl<'source> Index<'source> {
                     self.export_value(file, member, work)?
                 }
                 Value::Symbol(class) => Value::Symbol(self.python_own_member(class, member)?),
-                Value::Instance(_) => return None,
+                Value::Instance(_) | Value::Member { .. } => return None,
             };
         }
         self.value_target(value)

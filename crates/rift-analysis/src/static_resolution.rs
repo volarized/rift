@@ -112,6 +112,7 @@ pub(crate) fn resolve(
 struct Work {
     budget: LoopBudget,
     exhausted: bool,
+    python_depth: u8,
 }
 
 impl Work {
@@ -119,7 +120,19 @@ impl Work {
         Self {
             budget: LoopBudget::new(maximum),
             exhausted: false,
+            python_depth: 0,
         }
+    }
+
+    fn python_lookup<T>(&mut self, lookup: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
+        const DEPTH_MAX: u8 = 32;
+        if self.python_depth >= DEPTH_MAX {
+            return None;
+        }
+        self.python_depth += 1;
+        let result = lookup(self);
+        self.python_depth -= 1;
+        result
     }
 
     fn charge(&mut self) -> bool {
@@ -164,7 +177,8 @@ struct File<'source> {
     classes: EnclosingDefinitions<&'source SyntaxSymbol>,
     class_scopes: BTreeSet<ByteRange>,
     assignments: AssignmentTargets<'source>,
-    python_annotations: BTreeMap<u64, ByteRange>,
+    python_values: BTreeMap<u64, StaticBindingKind>,
+    python_calls: BTreeMap<u64, Vec<&'source StaticCall>>,
 }
 
 #[derive(Default)]
@@ -223,7 +237,8 @@ impl<'source> File<'source> {
             classes: EnclosingDefinitions::new([]),
             class_scopes: BTreeSet::new(),
             assignments: AssignmentTargets::default(),
-            python_annotations: BTreeMap::new(),
+            python_values: BTreeMap::new(),
+            python_calls: BTreeMap::new(),
         };
         file.index_bindings(work)?;
         file.index_symbols(work)?;
@@ -238,13 +253,24 @@ impl<'source> File<'source> {
             let name = self.text(binding.name)?;
             self.by_name.entry(name).or_default().push(binding);
             match binding.kind {
-                StaticBindingKind::PythonAnnotation { annotation }
-                | StaticBindingKind::PythonInstance {
-                    constructor: annotation,
-                } => {
-                    self.python_annotations.insert(binding.name.end, annotation);
+                StaticBindingKind::PythonAnnotation { .. }
+                | StaticBindingKind::PythonFunction { .. }
+                | StaticBindingKind::PythonAlias { .. }
+                | StaticBindingKind::PythonInstance { .. } => {
+                    self.python_values.insert(binding.name.end, binding.kind);
                 }
                 _ => {}
+            }
+        }
+        if self.document.facts.language().name == "python" {
+            for call in self.facts.calls() {
+                if !work.charge() {
+                    return None;
+                }
+                self.python_calls
+                    .entry(call.range.start)
+                    .or_default()
+                    .push(call);
             }
         }
         for range in self.facts.assignments() {

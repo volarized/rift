@@ -1,5 +1,7 @@
 //! Captured Python call sites and lexical import bindings.
 
+mod guards;
+
 use std::sync::OnceLock;
 
 use rift_error::RiftError;
@@ -42,6 +44,8 @@ pub(super) struct EdgePythonKinds {
     type_field: u16,
     left: u16,
     right: u16,
+    guards: guards::TypeGuards,
+    return_type: u16,
 }
 
 pub(super) fn edge_python_kinds() -> &'static EdgePythonKinds {
@@ -104,6 +108,8 @@ pub(super) fn edge_python_kinds() -> &'static EdgePythonKinds {
             type_field: field("type"),
             left: field("left"),
             right: field("right"),
+            guards: guards::TypeGuards::new(&grammar),
+            return_type: field("return_type"),
         }
     })
 }
@@ -161,6 +167,7 @@ impl EdgePythonKinds {
         {
             facts.unsupported_bindings.push(byte_range(scope)?);
         }
+        self.guards.record(visited, source, facts)?;
         self.edge_reference(visited, source, facts)?;
         Ok(())
     }
@@ -195,7 +202,15 @@ impl EdgePythonKinds {
         let name = syntax_element.child_by_field_id(self.name.get());
         let scope = edge_enclosing(visited, &self.scopes);
         if let Some((name, scope)) = name.zip(scope) {
-            let kind = StaticBindingKind::Local;
+            let annotation = syntax_element.child_by_field_id(self.return_type);
+            let kind = match annotation {
+                Some(annotation) if syntax_element.kind_id() == self.definitions[0] => {
+                    StaticBindingKind::PythonFunction {
+                        annotation: byte_range(annotation)?,
+                    }
+                }
+                _ => StaticBindingKind::Local,
+            };
             facts
                 .bindings
                 .push(binding(name, scope, byte_range(scope)?.start, kind)?);
@@ -452,7 +467,11 @@ impl EdgePythonKinds {
         while let Some(target) = pending.pop() {
             if target.kind_id() == self.identifier {
                 let kind = self.edge_assignment_kind(visited, target)?;
-                let available = if matches!(kind, StaticBindingKind::PythonInstance { .. }) {
+                let available = if matches!(
+                    kind,
+                    StaticBindingKind::PythonInstance { .. }
+                        | StaticBindingKind::PythonAlias { .. }
+                ) {
                     byte_range(visited.syntax_element())?.end
                 } else {
                     byte_range(scope)?.start
@@ -501,7 +520,14 @@ impl EdgePythonKinds {
             Some(constructor) => Ok(StaticBindingKind::PythonInstance {
                 constructor: byte_range(constructor)?,
             }),
-            None => Ok(StaticBindingKind::Shadow),
+            None => match assignment.child_by_field_id(self.right) {
+                Some(value) if [self.identifier, self.attribute].contains(&value.kind_id()) => {
+                    Ok(StaticBindingKind::PythonAlias {
+                        value: byte_range(value)?,
+                    })
+                }
+                _ => Ok(StaticBindingKind::Shadow),
+            },
         }
     }
 }

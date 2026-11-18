@@ -58,6 +58,11 @@ impl EdgePythonModules {
 enum Value<'source> {
     Symbol(Target<'source>),
     Instance(Target<'source>),
+    // An inherited declaration retains the subclass assignment for later receiver lookup.
+    Member {
+        declaration: Target<'source>,
+        assigned: Target<'source>,
+    },
     Module(String),
 }
 
@@ -122,11 +127,23 @@ impl<'source> Index<'source> {
         range: ByteRange,
         work: &mut Work,
     ) -> Option<Target<'source>> {
-        let mut names = file.text(range)?.split('.').map(str::trim);
-        let name = names.next()?;
-        let binding = edge_python_binding(file, name, range.start, work)?;
-        let mut value = self.binding_value(file, binding, work)?;
-        for member in names {
+        work.python_lookup(|work| self.python_name(file, range, work))
+            .and_then(|value| self.value_target(value))
+    }
+
+    fn python_name(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+    ) -> Option<Value<'source>> {
+        let (value, suffix) = self.python_name_start(file, range, work)?;
+        let mut value = value;
+        for member in suffix
+            .split('.')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
             if !work.charge() {
                 return None;
             }
@@ -139,12 +156,49 @@ impl<'source> Index<'source> {
                     Some(file) => self.export_value(file, member, work)?,
                     None => self.module_value(&format!("{name}.{member}"))?,
                 },
-                Value::Symbol(target) | Value::Instance(target) => {
-                    Value::Symbol(self.python_member(target, member, work)?)
-                }
+                Value::Symbol(target)
+                | Value::Instance(target)
+                | Value::Member {
+                    assigned: target, ..
+                } => self.python_member_value(target, member, work)?,
             };
         }
-        self.value_target(value)
+        Some(value)
+    }
+
+    fn python_name_start(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+    ) -> Option<(Value<'source>, &'source str)> {
+        let mut prefix = None;
+        for call in file.python_calls.get(&range.start).into_iter().flatten() {
+            if !work.charge() {
+                return None;
+            }
+            if call.range.end <= range.end
+                && prefix.is_none_or(|previous: &StaticCall| previous.range.end < call.range.end)
+            {
+                prefix = Some(*call);
+            }
+        }
+        if let Some(call) = prefix {
+            let target = self.edge_python_call(file, call, work)?;
+            let class = self.python_call_result(target, work)?;
+            let rest = file
+                .text(ByteRange {
+                    start: call.range.end,
+                    end: range.end,
+                })?
+                .trim();
+            return Some((Value::Instance(class), rest.strip_prefix('.')?));
+        }
+        let mut names = file.text(range)?.splitn(2, '.').map(str::trim);
+        let name = names.next()?;
+        let binding = edge_python_binding(file, name, range.start, work)?;
+        let value = self.binding_value(file, binding, work)?;
+        Some((value, names.next().unwrap_or("")))
     }
 
     pub(super) fn edge_python_binding_target(
@@ -173,12 +227,26 @@ impl<'source> Index<'source> {
 
     fn value_target(&self, value: Value<'source>) -> Option<Target<'source>> {
         match value {
-            Value::Symbol(target) => Some(target),
+            Value::Symbol(target)
+            | Value::Member {
+                declaration: target,
+                ..
+            } => Some(target),
             Value::Instance(_) => None,
             Value::Module(name) => self
                 .files
                 .get(self.edge_python.path(&name)?)?
                 .qualified_target("."),
+        }
+    }
+
+    fn python_value_receiver(&self, value: Value<'source>) -> Option<Target<'source>> {
+        match value {
+            Value::Instance(class)
+            | Value::Member {
+                assigned: class, ..
+            } => Some(class),
+            value => self.value_target(value),
         }
     }
 
@@ -188,7 +256,9 @@ impl<'source> Index<'source> {
         binding: &StaticBinding,
         work: &mut Work,
     ) -> Option<Value<'source>> {
-        if let StaticBindingKind::PythonAnnotation { annotation } = binding.kind {
+        if let StaticBindingKind::PythonAnnotation { annotation }
+        | StaticBindingKind::PythonGuard { annotation } = binding.kind
+        {
             return file.target_at(binding.name).map(Value::Symbol).or_else(|| {
                 self.python_annotation(file, annotation, work)
                     .map(Value::Instance)
@@ -206,7 +276,9 @@ impl<'source> Index<'source> {
         match binding.kind {
             StaticBindingKind::Local
             | StaticBindingKind::Shadow
-            | StaticBindingKind::PythonInstance { .. } => {
+            | StaticBindingKind::PythonInstance { .. }
+            | StaticBindingKind::PythonAlias { .. }
+            | StaticBindingKind::PythonFunction { .. } => {
                 file.target_at(binding.name).map(Value::Symbol)
             }
             StaticBindingKind::PythonReceiver { class_name } => {
@@ -249,7 +321,7 @@ impl<'source> Index<'source> {
     fn export_value<'index>(
         &'index self,
         mut file: &'index File<'source>,
-        mut name: &'source str,
+        mut name: &'index str,
         work: &mut Work,
     ) -> Option<Value<'source>> {
         let mut visited = BTreeSet::new();
@@ -272,7 +344,9 @@ impl<'source> Index<'source> {
                 StaticBindingKind::Local
                 | StaticBindingKind::Shadow
                 | StaticBindingKind::PythonAnnotation { .. }
-                | StaticBindingKind::PythonInstance { .. } => {
+                | StaticBindingKind::PythonInstance { .. }
+                | StaticBindingKind::PythonAlias { .. }
+                | StaticBindingKind::PythonFunction { .. } => {
                     return file.target_at(binding.name).map(Value::Symbol);
                 }
                 StaticBindingKind::PythonImport { module, export } => {
@@ -377,7 +451,53 @@ fn edge_python_binding<'source>(
             global = is_global;
             nonlocal = !is_global;
         } else {
-            return selected.filter(|binding| !ambiguous && binding.available_from <= position);
+            let selected =
+                selected.filter(|binding| !ambiguous && binding.available_from <= position)?;
+            return file
+                .python_guard_available(selected, position, work)
+                .then_some(selected);
         }
+    }
+}
+
+impl File<'_> {
+    fn python_guard_available(
+        &self,
+        selected: &StaticBinding,
+        position: u64,
+        work: &mut Work,
+    ) -> bool {
+        if !matches!(selected.kind, StaticBindingKind::PythonGuard { .. }) {
+            return true;
+        }
+        let shadowed = self
+            .by_name
+            .get("isinstance")
+            .into_iter()
+            .flatten()
+            .any(|binding| !work.charge() || binding.scope.contains(selected.name.start));
+        if shadowed {
+            return false;
+        }
+        let owner = self
+            .enclosing_callable(selected.name)
+            .map(|target| target.symbol.name_range);
+        let current = self
+            .enclosing_callable(ByteRange {
+                start: position,
+                end: position.saturating_add(1),
+            })
+            .map(|target| target.symbol.name_range);
+        if owner != current {
+            return false;
+        }
+        let Some(name) = self.text(selected.name) else {
+            return false;
+        };
+        self.by_name.get(name).into_iter().flatten().all(|binding| {
+            let later =
+                binding.name.start >= selected.available_from && binding.name.start < position;
+            work.charge() && !later
+        })
     }
 }

@@ -118,6 +118,21 @@ pub enum StaticBindingKind {
         /// Authored constructor path, requiring static resolution.
         constructor: ByteRange,
     },
+    /// A Python binding initialized by a named value.
+    PythonAlias {
+        /// Authored value path.
+        value: ByteRange,
+    },
+    /// A Python name checked by an `isinstance` condition.
+    PythonGuard {
+        /// Authored class argument.
+        annotation: ByteRange,
+    },
+    /// A Python function with an authored return annotation.
+    PythonFunction {
+        /// Authored return annotation.
+        annotation: ByteRange,
+    },
     /// Dotted Python module import without a local alias.
     PythonModule {
         /// Complete imported module path.
@@ -374,7 +389,10 @@ impl StaticBinding {
             StaticBindingKind::JavaScriptInstance { constructor }
             | StaticBindingKind::PythonInstance { constructor } => valid(constructor),
             StaticBindingKind::PythonReceiver { class_name } => valid(class_name),
-            StaticBindingKind::PythonAnnotation { annotation } => valid(annotation),
+            StaticBindingKind::PythonAnnotation { annotation }
+            | StaticBindingKind::PythonFunction { annotation }
+            | StaticBindingKind::PythonGuard { annotation } => valid(annotation),
+            StaticBindingKind::PythonAlias { value } => valid(value),
             StaticBindingKind::RustUse { path } => valid(path),
             StaticBindingKind::RustReceiver { type_path } => valid(type_path),
             StaticBindingKind::Local
