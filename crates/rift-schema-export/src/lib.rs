@@ -255,6 +255,40 @@ fn validate_global_contract(request: &ExportRequest) -> Result<(), ExportError> 
     let path = request
         .output_dir
         .join(rift_cloud_client::contract::DOCUMENT_PATH);
+    if !request.check {
+        let bytes = fs::read(&path).map_err(|source| ExportError::CheckUnreadable {
+            path: path.clone(),
+            source,
+        })?;
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|source| ExportError::GlobalContract {
+                source: rift_cloud_client::contract::ContractError::Parse {
+                    path: path.clone(),
+                    source,
+                },
+            })?;
+        let schemas = document["components"]["schemas"]
+            .as_object_mut()
+            .ok_or_else(|| ExportError::GlobalContract {
+                source: rift_cloud_client::contract::ContractError::Invalid {
+                    path: path.clone(),
+                    rule: "components must carry schemas".to_owned(),
+                },
+            })?;
+        for (name, schema) in rift_cloud_client::contract::shared_schemas() {
+            schemas.insert(name, schema);
+        }
+        let mut bytes =
+            serde_json::to_vec_pretty(&document).map_err(|source| ExportError::WriteFailed {
+                path: path.clone(),
+                source: io::Error::other(source),
+            })?;
+        bytes.push(b'\n');
+        fs::write(&path, bytes).map_err(|source| ExportError::WriteFailed {
+            path: path.clone(),
+            source,
+        })?;
+    }
     rift_cloud_client::contract::validate(&path)
         .map_err(|source| ExportError::GlobalContract { source })?;
     println!("{} is valid", path.display());

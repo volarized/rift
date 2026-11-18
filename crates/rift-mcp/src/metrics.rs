@@ -43,7 +43,7 @@ pub(crate) const RESOURCES_READ: &str = "resources/read";
 
 /// The tools `RiftMcp` serves, the only values `gen_ai.tool.name` takes.
 pub(crate) const SERVED_TOOLS: [&str; 4] =
-    [crate::feedback::TOOL_NAME, "get_symbol", "nodes", "search"];
+    ["facets", crate::feedback::TOOL_NAME, "get_symbol", "search"];
 
 /// The `error.type` of a tool call answered with `isError`, as the conventions spell it.
 const TOOL_ERROR: &str = "tool_error";

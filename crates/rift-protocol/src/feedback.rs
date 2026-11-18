@@ -4,16 +4,27 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, de};
 
 const TEXT_BYTES_MAX: usize = 4096;
-const DETAILS_MAX: usize = 2;
 
-/// One optional detail the caller may send with a feedback report.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum FeedbackDetail {
-    /// Operating system name, such as `linux`.
-    Os,
-    /// Rift's package version, such as `0.0.78`.
-    RiftVersion,
+/// The diagnostic fields the caller elects to send with a feedback report. An omitted member
+/// is `false`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
+#[schemars(example = serde_json::json!({"os": true, "rift_version": true}))]
+pub struct FeedbackInclude {
+    /// Sends the operating system name, such as `linux`.
+    #[serde(default)]
+    pub os: bool,
+    /// Sends Rift's package version, such as `0.0.78`.
+    #[serde(default)]
+    pub rift_version: bool,
+}
+
+impl FeedbackInclude {
+    /// Whether the caller elected no diagnostic field.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        !self.os && !self.rift_version
+    }
 }
 
 /// The report and any diagnostic fields the caller elects to send.
@@ -21,18 +32,17 @@ pub enum FeedbackDetail {
 #[serde(deny_unknown_fields)]
 #[schemars(extend("rift:since" = "v0.0.79"))]
 #[schemars(example = serde_json::json!({
-    "text": "The nodes tool returned an empty result for a symbol it found.",
-    "include_details": ["os", "rift_version"]
+    "text": "The facets tool returned an empty result for a symbol it found.",
+    "include": {"os": true, "rift_version": true}
 }))]
 pub struct FeedbackParams {
     /// Report text sent verbatim. The caller MUST send nonblank text of at most 4096 UTF-8 bytes.
     #[serde(deserialize_with = "report_text")]
     #[schemars(length(min = 1, max = TEXT_BYTES_MAX), regex(pattern = r"\S"))]
     pub text: String,
-    /// Diagnostic fields to send alongside `text`. Omitted or empty sends no diagnostic fields.
-    #[serde(default, deserialize_with = "selected_details")]
-    #[schemars(length(max = DETAILS_MAX), extend("uniqueItems" = true))]
-    pub include_details: Vec<FeedbackDetail>,
+    /// Diagnostic fields to send alongside `text`. Omitted sends no diagnostic field.
+    #[serde(default)]
+    pub include: FeedbackInclude,
 }
 
 fn report_text<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
@@ -43,20 +53,6 @@ fn report_text<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::
         ));
     }
     Ok(text)
-}
-
-fn selected_details<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Vec<FeedbackDetail>, D::Error> {
-    let details = Vec::<FeedbackDetail>::deserialize(deserializer)?;
-    if details.len() > DETAILS_MAX
-        || matches!(details.as_slice(), [first, second] if first == second)
-    {
-        return Err(de::Error::custom(
-            "expected up to two distinct feedback details",
-        ));
-    }
-    Ok(details)
 }
 
 /// Confirmation from the feedback intake.
@@ -75,15 +71,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn feedback_arguments_apply_byte_and_detail_bounds() {
+    fn feedback_arguments_apply_byte_bounds_and_typed_include() {
         for rejected in [
             json!({"text": ""}),
             json!({"text": " \n\t "}),
             json!({"text": "λ".repeat(TEXT_BYTES_MAX / 2 + 1)}),
-            json!({"text": "valid", "include_details": null}),
-            json!({"text": "valid", "include_details": ["os", "os"]}),
-            json!({"text": "valid", "include_details": ["os", "rift_version", "os"]}),
-            json!({"text": "valid", "include_details": ["host"]}),
+            json!({"text": "valid", "include": null}),
+            json!({"text": "valid", "include": ["os"]}),
+            json!({"text": "valid", "include": {"os": "yes"}}),
+            json!({"text": "valid", "include": {"host": true}}),
+            json!({"text": "valid", "include_details": ["os"]}),
             json!({"text": "valid", "url": "https://example.test"}),
         ] {
             assert!(serde_json::from_value::<FeedbackParams>(rejected).is_err());
@@ -92,6 +89,6 @@ mod tests {
         let largest =
             serde_json::from_value::<FeedbackParams>(json!({"text": text})).expect("at limit");
         assert_eq!(largest.text, text);
-        assert!(largest.include_details.is_empty());
+        assert!(largest.include.is_empty());
     }
 }

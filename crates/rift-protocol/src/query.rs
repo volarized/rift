@@ -25,28 +25,69 @@ pub enum QueryLanguage {
 #[serde(deny_unknown_fields)]
 #[schemars(extend("rift:since" = "v0.0.73"))]
 #[schemars(extend("examples" = [
-    { "query": "SELECT ?symbol ?name { ?symbol a :Symbol; :name ?name } LIMIT 20" },
-    { "query": "ASK { ?symbol a :Symbol; :name 'ReadService' }", "language": "sparql" }
+    {
+        "query": "SELECT ?symbol ?name { ?symbol a :Symbol; :name ?name } LIMIT 20"
+    },
+    {
+        "query": "ASK { ?symbol a :Symbol; :name 'ReadService' }",
+        "language": "sparql"
+    }
 ]))]
 pub struct QueryParams {
-    /// Query text.
+    /// Query text in `language`. A SPARQL query uses `SERVICE :search` for text and regex
+    /// retrieval and `SERVICE :flows` for call paths around ranked symbols.
     pub query: String,
-    /// Currently, only SPARQL is supported.
+    /// The language of `query`. Omitted, `sparql`, the only language the server evaluates.
     #[serde(default)]
     pub language: QueryLanguage,
+    /// The 1-based page to read.
+    #[serde(default = "default_page")]
+    #[schemars(range(min = 1_u64))]
+    pub page: u64,
+    /// Answer rows per page, at most 1000.
+    #[serde(default = "default_max_results")]
+    #[schemars(range(min = 1_u64, max = QUERY_MAX_RESULTS))]
+    pub max_results: u64,
+    /// The indexed revision to read. Omitted reads the served revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<crate::revision::Revision>,
 }
 
-/// One retained page of bindings, a boolean, or RDF triples.
+/// Most answer rows in one query page.
+pub const QUERY_MAX_RESULTS: u64 = 1000;
+fn default_page() -> u64 {
+    crate::read::PAGE_DEFAULT
+}
+fn default_max_results() -> u64 {
+    crate::read::MAX_RESULTS_DEFAULT
+}
+impl Default for QueryParams {
+    fn default() -> Self {
+        Self {
+            query: String::new(),
+            language: QueryLanguage::default(),
+            page: default_page(),
+            max_results: default_max_results(),
+            revision: None,
+        }
+    }
+}
+
+/// One page of bindings, a boolean, or RDF triples.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueryResult {
     /// The result form selected by the query.
     pub answer: QueryAnswer,
-    /// The retained execution and its original expiry.
+    /// The captured read and its expiry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<CapturedView>,
-    /// The transport page within this retained execution.
-    pub pagination: QueryPagination,
+    /// The selected page of answer rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pagination: Option<Pagination>,
+    /// The indexed revision this answer read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<crate::revision::Revision>,
     /// Coverage and discovery limits affecting the query result. For `SERVICE :flows`,
     /// `traversal_truncated` reports the visited symbol count and names the bound in `detail`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -59,14 +100,50 @@ pub struct QueryResult {
 #[schemars(transform = crate::schema::require_result_object)]
 #[schemars(extend("examples" = [
     {
-        "answer": { "result": "bindings", "variables": ["name"], "bindings": [
-            { "name": { "type": "literal", "value": "ReadService", "datatype": "http://www.w3.org/2001/XMLSchema#string" } }
-        ] },
-        "pagination": { "page_index": 0, "total_pages": 1 }
+        "answer": {
+            "result": "bindings",
+            "variables": [
+                "name"
+            ],
+            "bindings": [
+                {
+                    "name": {
+                        "type": "literal",
+                        "value": "ReadService",
+                        "datatype": "http://www.w3.org/2001/XMLSchema#string"
+                    }
+                }
+            ]
+        },
+        "pagination": {
+            "page": 1,
+            "pages": 1,
+            "max_results": 10,
+            "total": 1
+        }
     },
-    { "answer": { "result": "boolean", "value": true }, "pagination": { "page_index": 0, "total_pages": 1 } },
-    { "answer": { "result": "graph", "triples": [] }, "pagination": { "page_index": 0, "total_pages": 0 } },
-    { "outcome": "unavailable", "reason": "view_context" }
+    {
+        "answer": {
+            "result": "boolean",
+            "value": true
+        }
+    },
+    {
+        "answer": {
+            "result": "graph",
+            "triples": []
+        },
+        "pagination": {
+            "page": 1,
+            "pages": 0,
+            "max_results": 10,
+            "total": 0
+        }
+    },
+    {
+        "outcome": "unavailable",
+        "reason": "view_context"
+    }
 ]))]
 pub enum QueryReadResult {
     /// An answer evaluated over every required fact.
@@ -75,43 +152,17 @@ pub enum QueryReadResult {
     Unavailable(SearchUnavailable),
 }
 
-/// The selected transport page and its continuation query.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct QueryPagination {
-    /// The page index and count within the original retained execution.
-    #[serde(flatten)]
-    pub page: Pagination,
-    /// A query selecting the next retained page, absent after the last page.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_query: Option<String>,
-}
-
-impl From<Pagination> for QueryPagination {
-    fn from(page: Pagination) -> Self {
-        Self {
-            page,
-            next_query: None,
-        }
-    }
-}
-/// Bounds on one transport page of a retained query result.
+/// Bounds on one query result page.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct QueryConfiguration {
-    /// Most bindings or triples on one page, from 1 to 1000.
-    #[schemars(range(min = 1, max = 1000))]
-    pub page_size: u64,
     /// Most encoded bytes on one page, from 1 KiB to 4 MiB.
     pub page_limit: crate::configuration::ByteSize,
 }
 
-const QUERY_PAGE_SIZE_DEFAULT: u64 = 50;
-
 impl Default for QueryConfiguration {
     fn default() -> Self {
         Self {
-            page_size: QUERY_PAGE_SIZE_DEFAULT,
             page_limit: crate::configuration::ByteSize::from_bytes(4 * 1024 * 1024),
         }
     }
@@ -119,14 +170,11 @@ impl Default for QueryConfiguration {
 
 impl QueryConfiguration {
     pub(crate) fn violation(&self) -> Option<crate::configuration::ConfigurationViolation> {
-        crate::configuration::first_out_of_range([
-            ("search.query.page_size", self.page_size, 1, 1000),
-            (
-                "search.query.page_limit",
-                self.page_limit.bytes(),
-                1024,
-                4 * 1024 * 1024,
-            ),
-        ])
+        crate::configuration::first_out_of_range([(
+            "search.query.page_limit",
+            self.page_limit.bytes(),
+            1024,
+            4 * 1024 * 1024,
+        )])
     }
 }

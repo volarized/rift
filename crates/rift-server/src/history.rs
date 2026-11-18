@@ -807,10 +807,10 @@ impl SymbolState {
 /// one declaration.
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub(crate) struct SymbolShape {
-    /// The declaration bytes outside the item node: attached outer
+    /// The declaration bytes outside the item syntax element: attached outer
     /// attributes and doc comments.
     attachment: String,
-    /// The item node's own bytes.
+    /// The item syntax element's own bytes.
     item: String,
     /// The body's byte range inside `item`; `None` for a declaration
     /// without one.
@@ -933,7 +933,7 @@ mod tests {
     use rift_core::SourceVisibility;
     use rift_error::RiftError;
     use rift_index::WorkspaceIndexLimits;
-    use rift_protocol::read::{Language, NodeFacet};
+    use rift_protocol::read::{Language, SyntaxKind};
     use rift_syntax::{ByteRange, RustSyntaxProvider};
 
     use super::*;
@@ -955,8 +955,8 @@ mod tests {
             declaration_ordinal: 0,
             container: None,
             kind: "function",
-            node_kind: None,
-            facets: Vec::new(),
+            syntax_element_kind: None,
+            kinds: Vec::new(),
             visibility: None,
             range,
             item_range: item,
@@ -1176,8 +1176,8 @@ mod tests {
             self.inner.analyze(source, limits)
         }
 
-        fn node_facets(&self, kind: &str) -> Vec<NodeFacet> {
-            self.inner.node_facets(kind)
+        fn syntax_element_kinds(&self, kind: &str) -> Vec<SyntaxKind> {
+            self.inner.syntax_element_kinds(kind)
         }
     }
 
@@ -1622,10 +1622,13 @@ mod tests {
         let matched = service.index().symbols("tick", 1)?[0];
         let mut request = GetSymbolParams {
             id: timeline_identity(&service, matched)?,
-            include: vec![rift_protocol::read::GetSymbolInclude::History],
+            include: rift_protocol::read::GetSymbolInclude {
+                history: true,
+                ..rift_protocol::read::GetSymbolInclude::default()
+            },
             revision: None,
-            declaration_limit: 2,
-            declaration_cursor: None,
+            max_results: 2,
+            page: 1,
         };
         let GetSymbolResult::Found {
             history: Some(history),
@@ -1663,10 +1666,13 @@ mod tests {
         let matched = service.index().symbols("beacon_one", 1)?[0];
         let request = GetSymbolParams {
             id: timeline_identity(&service, matched)?,
-            include: vec![rift_protocol::read::GetSymbolInclude::History],
+            include: rift_protocol::read::GetSymbolInclude {
+                history: true,
+                ..rift_protocol::read::GetSymbolInclude::default()
+            },
             revision: None,
-            declaration_limit: 1,
-            declaration_cursor: None,
+            max_results: 1,
+            page: 1,
         };
         let GetSymbolResult::Found {
             history: Some(history),

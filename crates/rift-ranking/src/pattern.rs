@@ -3,14 +3,14 @@
 //!
 //! The plan walks the pattern's `regex-syntax` [`Hir`] into a formula of required
 //! literals, and each literal requires its trigrams under the rule in [`crate::trigram`].
-//! A formula only ever narrows to texts that could match: when a node's requirement
-//! cannot be stated, the node requires nothing, and a pattern whose whole formula requires
+//! A formula only ever narrows to texts that could match: when a syntax element's requirement
+//! cannot be stated, the syntax element requires nothing, and a pattern whose whole formula requires
 //! nothing has no prefilter.
 //!
-//! Each node is read as one of two shapes. An exact node names every string it can
+//! Each syntax element is read as one of two shapes. An exact syntax element names every string it can
 //! match, folded, up to [`EXACT_STRINGS_MAX`] strings: a literal, a small class, a `?` over
-//! an exact node, a counted repetition of one, and a concatenation or alternation of exact
-//! nodes. Any other node carries only a formula. Adjacent exact nodes join into one
+//! an exact syntax element, a counted repetition of one, and a concatenation or alternation of exact
+//! syntax elements. Any other syntax element carries only a formula. Adjacent exact syntax elements join into one
 //! string, so `(?i)websocket`, a concatenation of nine case classes, requires the trigrams
 //! of `websocket`, and `export (async )?function` requires those of
 //! `export async function ` or of `export function `.
@@ -42,11 +42,11 @@ pub const CLASS_EXPANSION_MAX: usize = 8;
 /// without being read.
 const CLASS_MEMBERS_MAX: u32 = 64;
 
-/// Most strings one exact node names. Past it, a concatenation closes its current literal
+/// Most strings one exact syntax element names. Past it, a concatenation closes its current literal
 /// and starts the next, and an alternation keeps a formula per branch.
 pub const EXACT_STRINGS_MAX: usize = 16;
 
-/// Most copies a counted repetition of an exact node expands into.
+/// Most copies a counted repetition of an exact syntax element expands into.
 const REPETITION_EXPANSION_MAX: u32 = 16;
 
 /// Most nested groups one row expression renders. FTS5's parser refuses an expression 33
@@ -294,11 +294,11 @@ fn holds_line_feed(hir: &Hir) -> bool {
     }
 }
 
-/// What the walk knows about one node.
+/// What the walk knows about one syntax element.
 enum Shape {
-    /// Every string the node can match, folded.
+    /// Every string the syntax element can match, folded.
     Exact(BTreeSet<String>),
-    /// A formula every match meets, or `None` when the node requires nothing.
+    /// A formula every match meets, or `None` when the syntax element requires nothing.
     Required(Option<Prefilter>),
 }
 

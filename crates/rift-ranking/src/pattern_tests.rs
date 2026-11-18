@@ -55,7 +55,7 @@ fn an_alternation_requires_one_branch() {
 }
 
 #[test]
-fn an_optional_exact_node_joins_its_neighbours() {
+fn an_optional_exact_syntax_element_joins_its_neighbours() {
     assert_eq!(
         plan(r"export (async )?function \w+Handler"),
         Some(Prefilter::All(vec![
@@ -232,17 +232,17 @@ const NAMED_CLASSES: [&str; 7] = [r"\w", r"\s", r"\d", ".", "(?s:.)", "[0-9a-f]"
 
 const LOOKS: [&str; 6] = ["^", "$", r"\b", r"\B", "(?-m:^)", "(?-m:$)"];
 
-enum Node {
+enum SyntaxElement {
     Literal(Vec<char>),
     Class(Vec<char>),
     Named(&'static str),
     Negated(Vec<char>),
     Look(&'static str),
-    Concat(Vec<Node>),
-    Alternation(Vec<Node>),
-    Repeat(Box<Node>, u32, Option<u32>),
-    Capture(Box<Node>),
-    CaseInsensitive(Box<Node>),
+    Concat(Vec<SyntaxElement>),
+    Alternation(Vec<SyntaxElement>),
+    Repeat(Box<SyntaxElement>, u32, Option<u32>),
+    Capture(Box<SyntaxElement>),
+    CaseInsensitive(Box<SyntaxElement>),
 }
 
 impl Generator {
@@ -275,43 +275,47 @@ impl Generator {
         (0..count).map(|_| self.character()).collect()
     }
 
-    fn node(&mut self, depth: u32) -> Node {
+    fn syntax_element(&mut self, depth: u32) -> SyntaxElement {
         let choice = if depth == 0 {
             self.below(5)
         } else {
             self.below(11)
         };
         match choice {
-            0 | 1 => Node::Literal(self.characters(6)),
-            2 => Node::Class(self.characters(4)),
-            3 => Node::Named(NAMED_CLASSES[self.below(NAMED_CLASSES.len())]),
-            4 => Node::Look(LOOKS[self.below(LOOKS.len())]),
-            5 => Node::Negated(self.characters(2)),
+            0 | 1 => SyntaxElement::Literal(self.characters(6)),
+            2 => SyntaxElement::Class(self.characters(4)),
+            3 => SyntaxElement::Named(NAMED_CLASSES[self.below(NAMED_CLASSES.len())]),
+            4 => SyntaxElement::Look(LOOKS[self.below(LOOKS.len())]),
+            5 => SyntaxElement::Negated(self.characters(2)),
             6 | 7 => {
                 let count = 2 + self.below(3);
-                Node::Concat((0..count).map(|_| self.node(depth - 1)).collect())
+                SyntaxElement::Concat((0..count).map(|_| self.syntax_element(depth - 1)).collect())
             }
             8 => {
                 let count = 2 + self.below(3);
-                Node::Alternation((0..count).map(|_| self.node(depth - 1)).collect())
+                SyntaxElement::Alternation(
+                    (0..count).map(|_| self.syntax_element(depth - 1)).collect(),
+                )
             }
             9 => self.repeat(depth),
-            _ if self.below(2) == 0 => Node::Capture(Box::new(self.node(depth - 1))),
-            _ => Node::CaseInsensitive(Box::new(self.node(depth - 1))),
+            _ if self.below(2) == 0 => {
+                SyntaxElement::Capture(Box::new(self.syntax_element(depth - 1)))
+            }
+            _ => SyntaxElement::CaseInsensitive(Box::new(self.syntax_element(depth - 1))),
         }
     }
 
-    fn repeat(&mut self, depth: u32) -> Node {
-        let inner = Box::new(self.node(depth - 1));
+    fn repeat(&mut self, depth: u32) -> SyntaxElement {
+        let inner = Box::new(self.syntax_element(depth - 1));
         match self.below(5) {
-            0 => Node::Repeat(inner, 0, Some(1)),
-            1 => Node::Repeat(inner, 0, None),
-            2 => Node::Repeat(inner, 1, None),
+            0 => SyntaxElement::Repeat(inner, 0, Some(1)),
+            1 => SyntaxElement::Repeat(inner, 0, None),
+            2 => SyntaxElement::Repeat(inner, 1, None),
             3 => {
                 let count = u32::try_from(self.below(3)).expect("fits") + 1;
-                Node::Repeat(inner, count, Some(count))
+                SyntaxElement::Repeat(inner, count, Some(count))
             }
-            _ => Node::Repeat(inner, 1, Some(3)),
+            _ => SyntaxElement::Repeat(inner, 1, Some(3)),
         }
     }
 
@@ -342,19 +346,19 @@ impl Generator {
         variants[self.below(variants.len())]
     }
 
-    fn sample(&mut self, node: &Node, insensitive: bool, text: &mut String) {
-        match node {
-            Node::Literal(characters) => {
+    fn sample(&mut self, syntax_element: &SyntaxElement, insensitive: bool, text: &mut String) {
+        match syntax_element {
+            SyntaxElement::Literal(characters) => {
                 for &character in characters {
                     let chosen = self.pick(&[character], insensitive);
                     text.push(chosen);
                 }
             }
-            Node::Class(characters) => {
+            SyntaxElement::Class(characters) => {
                 let chosen = self.pick(characters, insensitive);
                 text.push(chosen);
             }
-            Node::Named(name) => {
+            SyntaxElement::Named(name) => {
                 let from: &[char] = match *name {
                     r"\w" => &['a', '_', '0', 'é', 'в', 'K'],
                     r"\s" => &[' ', '\n', '\r'],
@@ -366,18 +370,18 @@ impl Generator {
                 let chosen = self.pick(from, insensitive);
                 text.push(chosen);
             }
-            Node::Negated(_) => text.push(self.character()),
-            Node::Look(_) => {}
-            Node::Concat(members) => {
+            SyntaxElement::Negated(_) => text.push(self.character()),
+            SyntaxElement::Look(_) => {}
+            SyntaxElement::Concat(members) => {
                 for member in members {
                     self.sample(member, insensitive, text);
                 }
             }
-            Node::Alternation(branches) => {
+            SyntaxElement::Alternation(branches) => {
                 let chosen = self.below(branches.len());
                 self.sample(&branches[chosen], insensitive, text);
             }
-            Node::Repeat(inner, min, max) => {
+            SyntaxElement::Repeat(inner, min, max) => {
                 let spread = max.unwrap_or(min + 3) - min;
                 let count = min
                     + u32::try_from(self.below(usize::try_from(spread + 1).expect("fits")))
@@ -386,8 +390,8 @@ impl Generator {
                     self.sample(inner, insensitive, text);
                 }
             }
-            Node::Capture(inner) => self.sample(inner, insensitive, text),
-            Node::CaseInsensitive(inner) => self.sample(inner, true, text),
+            SyntaxElement::Capture(inner) => self.sample(inner, insensitive, text),
+            SyntaxElement::CaseInsensitive(inner) => self.sample(inner, true, text),
         }
     }
 
@@ -404,18 +408,18 @@ fn escaped(characters: &[char]) -> String {
         .collect()
 }
 
-fn render(node: &Node) -> String {
-    match node {
-        Node::Literal(characters) => escaped(characters),
-        Node::Class(characters) => format!("[{}]", escaped(characters)),
-        Node::Named(name) | Node::Look(name) => (*name).to_owned(),
-        Node::Negated(characters) => format!("[^{}]", escaped(characters)),
-        Node::Concat(members) => members.iter().map(render).collect(),
-        Node::Alternation(branches) => format!(
+fn render(syntax_element: &SyntaxElement) -> String {
+    match syntax_element {
+        SyntaxElement::Literal(characters) => escaped(characters),
+        SyntaxElement::Class(characters) => format!("[{}]", escaped(characters)),
+        SyntaxElement::Named(name) | SyntaxElement::Look(name) => (*name).to_owned(),
+        SyntaxElement::Negated(characters) => format!("[^{}]", escaped(characters)),
+        SyntaxElement::Concat(members) => members.iter().map(render).collect(),
+        SyntaxElement::Alternation(branches) => format!(
             "(?:{})",
             branches.iter().map(render).collect::<Vec<_>>().join("|")
         ),
-        Node::Repeat(inner, min, max) => {
+        SyntaxElement::Repeat(inner, min, max) => {
             let operator = match (min, max) {
                 (0, Some(1)) => "?".to_owned(),
                 (0, None) => "*".to_owned(),
@@ -426,8 +430,8 @@ fn render(node: &Node) -> String {
             };
             format!("(?:{}){operator}", render(inner))
         }
-        Node::Capture(inner) => format!("({})", render(inner)),
-        Node::CaseInsensitive(inner) => format!("(?i:{})", render(inner)),
+        SyntaxElement::Capture(inner) => format!("({})", render(inner)),
+        SyntaxElement::CaseInsensitive(inner) => format!("(?i:{})", render(inner)),
     }
 }
 
@@ -501,15 +505,15 @@ fn never_drops_a_match(seed: u64, patterns: usize, texts_per_pattern: usize) -> 
     let mut generator = Generator::new(seed);
     let mut outcome = Outcome::default();
     for _ in 0..patterns {
-        let node = generator.node(3);
-        let source = render(&node);
+        let syntax_element = generator.syntax_element(3);
+        let source = render(&syntax_element);
         let pattern = Pattern::parse(&source, SIZE_LIMIT).expect("generated pattern compiles");
         outcome.patterns += 1;
         outcome.with_prefilter += usize::from(pattern.prefilter().is_some());
         outcome.crossing_lines += usize::from(!pattern.is_line_bound());
         for _ in 0..texts_per_pattern {
             let mut text = generator.noise(6);
-            generator.sample(&node, false, &mut text);
+            generator.sample(&syntax_element, false, &mut text);
             text.push_str(&generator.noise(6));
             outcome.texts += 1;
             outcome.matched += usize::from(assert_selected(seed, &source, &pattern, &text));

@@ -17,25 +17,25 @@ use tree_sitter::Node;
 
 /// Grammar field naming the marker that classifies a `line_comment` or
 /// `block_comment` as an outer (declaration-attached) doc comment, from
-/// tree-sitter-rust's node types. It is absent on inner docs (`//!`,
+/// tree-sitter-rust's syntax element types. It is absent on inner docs (`//!`,
 /// `/*! */`) and on plain comments, so reading it replaces re-deriving
 /// rustdoc's own `///` / `////` / `/**` / `/***` / `/**/` lexing rules from
 /// comment text.
 const OUTER_DOC_MARKER_FIELD: &str = "outer";
 
 /// Grammar spelling of an outer attribute, from tree-sitter-rust's
-/// `node-types.json`.
+/// `syntax element-types.json`.
 const ATTRIBUTE_ITEM_KIND: &str = "attribute_item";
 /// Grammar spelling of a `//` comment, from tree-sitter-rust's
-/// `node-types.json`.
+/// `syntax element-types.json`.
 const LINE_COMMENT_KIND: &str = "line_comment";
 /// Grammar spelling of a `/* */` comment, from tree-sitter-rust's
-/// `node-types.json`.
+/// `syntax element-types.json`.
 const BLOCK_COMMENT_KIND: &str = "block_comment";
 
-/// Numeric grammar ids for the node kinds [`is_attached`] classifies,
+/// Numeric grammar ids for the syntax element kinds [`is_attached`] classifies,
 /// resolved once from the pinned Tree-sitter Rust language so each
-/// classification compares integers instead of node-kind strings.
+/// classification compares integers instead of syntax element-kind strings.
 struct AttachmentKinds {
     attribute_item: u16,
     line_comment: u16,
@@ -47,7 +47,7 @@ impl AttachmentKinds {
     ///
     /// # Panics
     ///
-    /// Panics when the pinned grammar has no node kind by one of the named
+    /// Panics when the pinned grammar has no syntax element kind by one of the named
     /// spellings: `id_for_node_kind` returning `0` means the grammar the
     /// runtime loaded no longer defines a kind this module depends on, a
     /// programmer/grammar-version error rather than a reachable runtime
@@ -58,15 +58,15 @@ impl AttachmentKinds {
         let block_comment = language.id_for_node_kind(BLOCK_COMMENT_KIND, true);
         assert!(
             attribute_item != 0,
-            "pinned Rust grammar must define node kind: kind={ATTRIBUTE_ITEM_KIND}"
+            "pinned Rust grammar must define syntax element kind: kind={ATTRIBUTE_ITEM_KIND}"
         );
         assert!(
             line_comment != 0,
-            "pinned Rust grammar must define node kind: kind={LINE_COMMENT_KIND}"
+            "pinned Rust grammar must define syntax element kind: kind={LINE_COMMENT_KIND}"
         );
         assert!(
             block_comment != 0,
-            "pinned Rust grammar must define node kind: kind={BLOCK_COMMENT_KIND}"
+            "pinned Rust grammar must define syntax element kind: kind={BLOCK_COMMENT_KIND}"
         );
         Self {
             attribute_item,
@@ -88,7 +88,9 @@ fn attachment_kinds() -> &'static AttachmentKinds {
 pub(super) fn declaration_start(visited: Visited<'_, '_>, text: &str) -> usize {
     attached_run(visited, text)
         .last()
-        .map_or(visited.node().start_byte(), |(front, _)| front.start_byte())
+        .map_or(visited.syntax_element().start_byte(), |(front, _)| {
+            front.start_byte()
+        })
 }
 
 /// Whether one of the declaration's attached outer attributes is `#[<name>]`.
@@ -112,15 +114,15 @@ pub(super) fn module_path(
     text: &str,
 ) -> Result<crate::RustModulePath, RiftError> {
     let kinds = attachment_kinds();
-    if let Some(body) = visited.node().child_by_field_name("body") {
+    if let Some(body) = visited.syntax_element().child_by_field_name("body") {
         let mut cursor = body.walk();
-        for node in body.named_children(&mut cursor) {
-            if node.kind() != "inner_attribute_item" {
+        for syntax_element in body.named_children(&mut cursor) {
+            if syntax_element.kind() != "inner_attribute_item" {
                 continue;
             }
-            let Some(attribute) = node
+            let Some(attribute) = syntax_element
                 .named_child(0)
-                .filter(|node| node.kind() == "attribute")
+                .filter(|syntax_element| syntax_element.kind() == "attribute")
             else {
                 return Ok(crate::RustModulePath::Unknown);
             };
@@ -143,17 +145,19 @@ pub(super) fn module_path(
     let mut state = crate::RustModulePath::Absent;
     let mut previous = visited.previous_sibling();
     while let Some(sibling) = previous {
-        let node = sibling.node();
-        if node.kind_id() == kinds.line_comment || node.kind_id() == kinds.block_comment {
+        let syntax_element = sibling.syntax_element();
+        if syntax_element.kind_id() == kinds.line_comment
+            || syntax_element.kind_id() == kinds.block_comment
+        {
             previous = sibling.previous_sibling();
             continue;
         }
-        if node.kind_id() != kinds.attribute_item {
+        if syntax_element.kind_id() != kinds.attribute_item {
             break;
         }
-        let Some(attribute) = node
+        let Some(attribute) = syntax_element
             .named_child(0)
-            .filter(|node| node.kind() == "attribute")
+            .filter(|syntax_element| syntax_element.kind() == "attribute")
         else {
             return Ok(crate::RustModulePath::Unknown);
         };
@@ -190,8 +194,8 @@ fn semantic_attribute_name<'source>(
 ) -> Option<&'source str> {
     attribute
         .named_child(0)
-        .filter(|node| node.kind() == "identifier")
-        .and_then(|node| text.get(node.byte_range()))
+        .filter(|syntax_element| syntax_element.kind() == "identifier")
+        .and_then(|syntax_element| text.get(syntax_element.byte_range()))
 }
 
 fn documentation_cfg_attribute(attribute: Node<'_>, text: &str) -> bool {
@@ -210,7 +214,7 @@ fn documentation_cfg_attribute(attribute: Node<'_>, text: &str) -> bool {
     for (index, expected) in [(0, "("), (1, "docsrs"), (2, ","), (3, "doc"), (5, ")")] {
         if arguments
             .child(index)
-            .and_then(|node| text.get(node.byte_range()))
+            .and_then(|syntax_element| text.get(syntax_element.byte_range()))
             != Some(expected)
         {
             return false;
@@ -218,7 +222,7 @@ fn documentation_cfg_attribute(attribute: Node<'_>, text: &str) -> bool {
     }
     let Some(documentation) = arguments
         .child(4)
-        .filter(|node| node.kind() == "token_tree")
+        .filter(|syntax_element| syntax_element.kind() == "token_tree")
     else {
         return false;
     };
@@ -226,25 +230,27 @@ fn documentation_cfg_attribute(attribute: Node<'_>, text: &str) -> bool {
 }
 
 fn documentation_tokens(documentation: Node<'_>, text: &str) -> bool {
-    if documentation.child(0).is_none_or(|node| node.kind() != "(")
+    if documentation
+        .child(0)
+        .is_none_or(|syntax_element| syntax_element.kind() != "(")
         || documentation
             .child(documentation.child_count() - 1)
-            .is_none_or(|node| node.kind() != ")")
+            .is_none_or(|syntax_element| syntax_element.kind() != ")")
     {
         return false;
     }
     let mut cursor = documentation.walk();
     for _ in 0..rift_core::constants::PROJECT_PATH_BYTES_MAX {
-        let node = cursor.node();
-        if matches!(node.kind(), "metavariable" | "token_repetition")
-            || (!node.is_named()
-                && text.get(node.byte_range()).is_none_or(|token| {
+        let syntax_element = cursor.node();
+        if matches!(syntax_element.kind(), "metavariable" | "token_repetition")
+            || (!syntax_element.is_named()
+                && text.get(syntax_element.byte_range()).is_none_or(|token| {
                     token
                         .chars()
                         .any(|value| ['$', '!', '{', '}', '[', ']', ';'].contains(&value))
                 }))
-            || node.is_missing()
-            || node.is_error()
+            || syntax_element.is_missing()
+            || syntax_element.is_error()
         {
             return false;
         }
@@ -271,7 +277,7 @@ fn literal_path(attribute: Node<'_>, text: &str) -> Result<crate::RustModulePath
     }
     let Some(content) = value
         .named_child(0)
-        .filter(|node| node.kind() == "string_content")
+        .filter(|syntax_element| syntax_element.kind() == "string_content")
     else {
         return Ok(crate::RustModulePath::Unknown);
     };
@@ -315,7 +321,7 @@ fn attached_run<'tree, 'text>(
     let mut run = Vec::new();
     let mut front = visited;
     while let Some(previous) = front.previous_sibling() {
-        let sibling = previous.node();
+        let sibling = previous.syntax_element();
         if !is_attached(sibling) {
             break;
         }
@@ -327,7 +333,7 @@ fn attached_run<'tree, 'text>(
         let Some(sibling_text) = text.get(sibling.byte_range()) else {
             break;
         };
-        let Some(gap) = text.get(sibling.end_byte()..front.node().start_byte()) else {
+        let Some(gap) = text.get(sibling.end_byte()..front.syntax_element().start_byte()) else {
             break;
         };
         if !gap_permits_attachment(sibling_text, gap) {
@@ -339,29 +345,33 @@ fn attached_run<'tree, 'text>(
     run
 }
 
-/// Reports whether `node` is an attribute or an outer doc comment, either
+/// Reports whether `syntax element` is an attribute or an outer doc comment, either
 /// of which can attach to a following declaration.
-fn is_attached(node: Node<'_>) -> bool {
+fn is_attached(syntax_element: Node<'_>) -> bool {
     let kinds = attachment_kinds();
-    let kind_id = node.kind_id();
+    let kind_id = syntax_element.kind_id();
     if kind_id == kinds.attribute_item {
         return true;
     }
     if kind_id == kinds.line_comment || kind_id == kinds.block_comment {
-        return node.child_by_field_name(OUTER_DOC_MARKER_FIELD).is_some();
+        return syntax_element
+            .child_by_field_name(OUTER_DOC_MARKER_FIELD)
+            .is_some();
     }
     false
 }
 
-/// Reports whether `node` is specifically an outer doc comment - `///` or
+/// Reports whether `syntax element` is specifically an outer doc comment - `///` or
 /// `/** */` - never an attribute. [`declaration_start`] extends a
 /// declaration's span over both; only a doc comment carries documentation
 /// text.
-fn is_doc_comment(node: Node<'_>) -> bool {
+fn is_doc_comment(syntax_element: Node<'_>) -> bool {
     let kinds = attachment_kinds();
-    let kind_id = node.kind_id();
+    let kind_id = syntax_element.kind_id();
     (kind_id == kinds.line_comment || kind_id == kinds.block_comment)
-        && node.child_by_field_name(OUTER_DOC_MARKER_FIELD).is_some()
+        && syntax_element
+            .child_by_field_name(OUTER_DOC_MARKER_FIELD)
+            .is_some()
 }
 
 /// Doc-comment text attached in front of the visited declaration - the same
@@ -422,7 +432,7 @@ fn strip_doc_comment_marker(comment: &str) -> String {
 /// Reports whether the whitespace between an attachable sibling and the
 /// declaration holds at most one line break, so a blank line detaches it.
 ///
-/// A `line_comment` node's own span already ends with the newline that
+/// A `line_comment` syntax element's own span already ends with the newline that
 /// terminates its source line (tree-sitter-rust folds it in so consecutive
 /// `///` lines read as adjacent); that swallowed break counts toward the
 /// budget the same as one found in the gap, or a comment immediately

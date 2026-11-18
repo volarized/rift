@@ -27,11 +27,11 @@ fn inline_template_aggregate_bound_refuses_partial_workspace_publication() {
     let position =
         u64::try_from(text.find("title").expect("inline expression")).expect("source position");
     let mut configuration = WorkspaceConfiguration::default();
-    configuration.providers.syntax.max_nodes =
-        u64::try_from(raw.nodes().len()).expect("bounded node count");
+    configuration.providers.syntax.max_syntax_elements =
+        u64::try_from(raw.syntax_elements().len()).expect("bounded syntax element count");
     let limits = WorkspaceIndexLimits::default()
         .with_syntax_configuration(&configuration.providers.syntax)
-        .expect("raw node bound");
+        .expect("raw syntax element bound");
     let index = WorkspaceIndex::build_with_languages(
         root,
         limits,
@@ -46,11 +46,11 @@ fn inline_template_aggregate_bound_refuses_partial_workspace_publication() {
         index
             .syntax(&path)
             .map(|document| document.map(|document| document
-                .nodes_at(position)
+                .syntax_elements_at(position)
                 .into_iter()
                 .cloned()
                 .collect::<Vec<_>>()))
-            .expect("refused source nodes")
+            .expect("refused source syntax elements")
             .is_none()
     );
     assert!(index.warnings().iter().any(|warning| {
@@ -65,14 +65,14 @@ fn inline_template_aggregate_bound_refuses_partial_workspace_publication() {
         accepted
             .syntax(&path)
             .map(|document| document.map(|document| document
-                .nodes_at(position)
+                .syntax_elements_at(position)
                 .into_iter()
                 .cloned()
                 .collect::<Vec<_>>()))
-            .expect("accepted source nodes")
+            .expect("accepted source syntax elements")
             .expect("selected source")
             .iter()
-            .any(|node| node.kind == "interpolation")
+            .any(|syntax_element| syntax_element.kind == "interpolation")
     );
 }
 
@@ -193,20 +193,24 @@ fn angular_workspace_keeps_owned_templates_separate_from_plain_html() {
         if path.ends_with("component.ts") {
             let position = u64::try_from(file.source().find("title").expect("inline expression"))
                 .expect("source position");
-            let nodes = index
+            let syntax_elements = index
                 .syntax(file.path())
                 .map(|document| {
                     document.map(|document| {
                         document
-                            .nodes_at(position)
+                            .syntax_elements_at(position)
                             .into_iter()
                             .cloned()
                             .collect::<Vec<_>>()
                     })
                 })
-                .expect("inline template nodes")
+                .expect("inline template syntax elements")
                 .expect("selected source");
-            assert!(nodes.iter().any(|node| node.kind == "interpolation"));
+            assert!(
+                syntax_elements
+                    .iter()
+                    .any(|syntax_element| syntax_element.kind == "interpolation")
+            );
         }
     }
     write(root, "apps/beacon/component.ts", "export class Beacon {}");

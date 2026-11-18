@@ -20,8 +20,8 @@ impl GraphDatasetBuilder {
     ) -> Result<(), RiftError> {
         let offset = selection
             .request
-            .page_index
-            .checked_mul(selection.request.limit.unwrap_or(0))
+            .page
+            .checked_mul(selection.request.max_results.unwrap_or(0))
             .ok_or_else(projection_failure)?;
         for (index, hit) in result.results.iter().enumerate() {
             let index = offset
@@ -40,19 +40,19 @@ impl GraphDatasetBuilder {
                 self.limits.triples_max(),
             )?;
             if let Some(view) = &result.view {
-                let view_node = child(&id.clone().into(), "view", 0);
+                let view_syntax_element = child(&id.clone().into(), "view", 0);
                 triples.push(Triple::new(
                     id.clone(),
                     vocabulary("view"),
-                    view_node.clone(),
+                    view_syntax_element.clone(),
                 ));
                 triples.push(Triple::new(
-                    view_node.clone(),
+                    view_syntax_element.clone(),
                     vocabulary("id"),
                     Literal::from(view.id.as_str().to_owned()),
                 ));
                 triples.push(Triple::new(
-                    view_node,
+                    view_syntax_element,
                     vocabulary("expires_at"),
                     Literal::from(view.expires_at.clone()),
                 ));
@@ -124,7 +124,7 @@ fn project_fields(
                 Value::Array(values) => {
                     for (index, value) in values.into_iter().enumerate() {
                         let child = child(&subject, &key, index);
-                        if matches!(key.as_str(), "facets" | "evidence" | "modifiers") {
+                        if matches!(key.as_str(), "kinds" | "evidence" | "modifiers") {
                             emit(&subject, &key, value, child, &mut pending, triples)?;
                         } else {
                             triples.push(Triple::new(
@@ -197,12 +197,12 @@ fn emit(
         Value::Object(_) | Value::Array(_) => {
             Literal::new_typed_literal(value.to_string(), named(RDF_JSON)?).into()
         }
-        Value::String(value) if matches!(key, "facets" | "derivation") => vocabulary(&value).into(),
+        Value::String(value) if matches!(key, "kinds" | "derivation") => vocabulary(&value).into(),
         Value::String(value)
             if value.starts_with("rift://")
                 && matches!(
                     key,
-                    "id" | "unit" | "container" | "symbol" | "node" | "evidence"
+                    "id" | "unit" | "container" | "symbol" | "syntax_element" | "evidence"
                 ) =>
         {
             named(&value)?.into()

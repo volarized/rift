@@ -310,14 +310,14 @@ where
         });
         let labeled = span.metadata().target().starts_with(RIFT_TARGET)
             || !(fields.component.is_empty() && fields.operation.is_empty());
-        let node = Arc::new(SpanNode::opened(span.name(), &fields, parent.clone()));
+        let syntax_element = Arc::new(SpanElement::opened(span.name(), &fields, parent.clone()));
         span.extensions_mut().replace(SpanEntry {
             context: if labeled {
-                Some(Arc::clone(&node))
+                Some(Arc::clone(&syntax_element))
             } else {
                 parent
             },
-            node,
+            syntax_element,
             timings: Timings::opened(now(self)),
         });
     }
@@ -334,7 +334,7 @@ where
         let mut fields = RecordedFields::default();
         values.record(&mut fields);
         if let Some(entry) = span.extensions().get::<SpanEntry>() {
-            entry.node.labels_mut().extend(&fields.rest);
+            entry.syntax_element.labels_mut().extend(&fields.rest);
         }
     }
 
@@ -363,12 +363,12 @@ where
     }
 
     fn on_event(&self, event: &Event<'_>, context: Context<'_, S>) {
-        let node = context.event_span(event).and_then(|span| {
+        let syntax_element = context.event_span(event).and_then(|span| {
             span.extensions()
                 .get::<SpanEntry>()
                 .and_then(SpanEntry::context)
         });
-        EVENT_SPAN.with(|held| *held.borrow_mut() = (event_key(event), node));
+        EVENT_SPAN.with(|held| *held.borrow_mut() = (event_key(event), syntax_element));
     }
 }
 
@@ -379,7 +379,7 @@ thread_local! {
     /// A record layer under a filter finds an event's spans through its own filter alone,
     /// so it reads the event's span here. The layer runs first for every event, so the
     /// value a record layer reads was written for the event it is handed.
-    static EVENT_SPAN: RefCell<(usize, Option<Arc<SpanNode>>)> = const { RefCell::new((0, None)) };
+    static EVENT_SPAN: RefCell<(usize, Option<Arc<SpanElement>>)> = const { RefCell::new((0, None)) };
 }
 
 /// The identity of `event` while it is dispatched: every layer is handed one reference.
@@ -389,7 +389,7 @@ fn event_key(event: &Event<'_>) -> usize {
 
 /// The span `event` was emitted in: the one [`SpanContextLayer`] found, or, on a
 /// subscriber without that layer, the nearest span `context` admits.
-fn event_span<S>(event: &Event<'_>, context: &Context<'_, S>) -> Option<Arc<SpanNode>>
+fn event_span<S>(event: &Event<'_>, context: &Context<'_, S>) -> Option<Arc<SpanElement>>
 where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
 {
@@ -410,21 +410,21 @@ where
 /// The start every Rift crate's target shares.
 const RIFT_TARGET: &str = "rift";
 
-/// What [`SpanContextLayer`] keeps in one span's extensions: the span's own node, the
-/// node the records inside it name as their span, and its timings.
+/// What [`SpanContextLayer`] keeps in one span's extensions: the span's own syntax element, the
+/// syntax element the records inside it name as their span, and its timings.
 ///
 /// A dependency's span that carries neither `component` nor `operation`, such as `rmcp`'s
 /// `serve_inner` around Rift's request span, names no context of its own: the records
 /// inside it, and the spans that open inside it, see the Rift span around it. Its own
 /// close record still names it.
 struct SpanEntry {
-    node: Arc<SpanNode>,
-    context: Option<Arc<SpanNode>>,
+    syntax_element: Arc<SpanElement>,
+    context: Option<Arc<SpanElement>>,
     timings: Timings,
 }
 
 impl SpanEntry {
-    fn context(&self) -> Option<Arc<SpanNode>> {
+    fn context(&self) -> Option<Arc<SpanElement>> {
         self.context.clone()
     }
 }
@@ -515,14 +515,14 @@ fn nanoseconds(duration: Duration) -> u64 {
 /// One span as the records inside it see it: its labels and fields, the span it opened
 /// in, and the outermost span around it.
 #[derive(Debug)]
-pub(crate) struct SpanNode {
+pub(crate) struct SpanElement {
     labels: RwLock<SpanLabels>,
     parent: Option<Arc<Self>>,
     root: Option<Arc<Self>>,
 }
 
-impl SpanNode {
-    /// The node of the span `name` opened with `fields` inside `parent`.
+impl SpanElement {
+    /// The syntax element of the span `name` opened with `fields` inside `parent`.
     fn opened(name: &str, fields: &RecordedFields, parent: Option<Arc<Self>>) -> Self {
         let root = parent
             .as_ref()
@@ -545,8 +545,8 @@ impl SpanNode {
     /// The `component` and `operation` an event inside this span is filed under when it
     /// names none itself: each from the nearest span, this one first, that names it.
     fn inherited(&self, component: &mut String, operation: &mut String) {
-        let mut node = Some(self);
-        while let Some(current) = node {
+        let mut syntax_element = Some(self);
+        while let Some(current) = syntax_element {
             if !component.is_empty() && !operation.is_empty() {
                 return;
             }
@@ -558,7 +558,7 @@ impl SpanNode {
                 operation.clone_from(&labels.operation);
             }
             drop(labels);
-            node = current.parent.as_deref();
+            syntax_element = current.parent.as_deref();
         }
     }
 }
@@ -587,7 +587,11 @@ pub(crate) fn span_failure(id: &tracing::span::Id) -> Option<&'static str> {
     tracing::dispatcher::get_default(|dispatch| {
         let span = dispatch.downcast_ref::<Registry>()?.span(id)?;
         let extensions = span.extensions();
-        extensions.get::<SpanEntry>()?.node.labels().failure()
+        extensions
+            .get::<SpanEntry>()?
+            .syntax_element
+            .labels()
+            .failure()
     })
 }
 
@@ -623,7 +627,7 @@ where
     let span = context.span(id)?;
     let extensions = span.extensions();
     let entry = extensions.get::<SpanEntry>()?;
-    let labels = entry.node.labels();
+    let labels = entry.syntax_element.labels();
     let Timings {
         busy_ns, idle_ns, ..
     } = entry.timings;
@@ -646,7 +650,7 @@ where
     }
     let (component, operation) = (labels.component.clone(), labels.operation.clone());
     drop(labels);
-    let root = entry.node.root.clone();
+    let root = entry.syntax_element.root.clone();
     drop(extensions);
     let spans = root
         .as_deref()
@@ -716,7 +720,7 @@ where
 /// [`SPAN_CONTEXT_BYTES_MAX`] bytes per span member.
 fn record_fields(
     own: impl IntoIterator<Item = (String, Value)>,
-    spans: &[(&'static str, &SpanNode)],
+    spans: &[(&'static str, &SpanElement)],
 ) -> String {
     let maximum = LOG_FIELDS_BYTES_MAX - "{}".len() - FIELDS_LEFT_OUT_BYTES_MAX;
     let contexts = spans

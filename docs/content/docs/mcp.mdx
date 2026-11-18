@@ -77,7 +77,7 @@ While Rift prepares the local index, the map can show discovered files before th
 are available. `rift server logs` reports incomplete preparation as `local_index_preparing`.
 
 The [map reference](/docs/developer/protocol/mcp#resource-map) describes additional facts, such as
-entry points and relationships, and when they are available. It also shows a map as compact text.
+entry points and edges, and when they are available. It also shows a map as compact text.
 
 </Callout>
 
@@ -108,9 +108,9 @@ SELECT ?symbol ?kind {
 }
 ```
 
-A symbol's IRI is its canonical identity. A graph node relates to its symbol through `:of`
+A symbol's IRI is its canonical identity. A syntax element relates to its symbol through `:of`
 and can carry a `:range` and `:source`. Pass the symbol IRI to `get_symbol` for its declarations,
-or to `nodes` for its syntax and source at a selected revision.
+or to `facets` for its syntax and source at a selected revision.
 
 ### Full-text search [#search-fulltext]
 
@@ -130,7 +130,7 @@ LIMIT 5
 
 The service's `:query` is the ranked text. The outer request's `query` is SPARQL.
 Project `:source` or `:score` when needed. Use outer `ORDER BY`, `LIMIT`, and `OFFSET`
-to order and select the rows. The service's `:limit` and `:page_index` select a producer page
+to order and select the rows. The service's `:max_results` and `:page` select a producer page
 before SPARQL evaluates filters, joins, and aggregates.
 
 ### Hybrid search [#search-hybrid]
@@ -187,7 +187,7 @@ The server refuses a `:packages` value written as a plain string, and an entry t
 `registry`. A workspace whose [`[search] default_scope`](/docs/developer/configuration#search)
 is `global` reads this service with no `:scope`.
 
-Global relationship queries read facts already collected for the selected package or runtime.
+Global edge queries read facts already collected for the selected package or runtime.
 
 ### References and calls [#search-traversal]
 
@@ -237,16 +237,10 @@ An incomplete history store cannot establish a complete answer.
 
 ### Paging and retained results
 
-The response's `pagination.next_query` is the next request's SPARQL statement. Send it
-unchanged as `query` to read the next transport page of the original execution. A source
-edit does not replace its rows, blank nodes, or selected source bytes.
-
-The continuation names one retained page and expires with the original view. After expiry,
-run the original statement again to start a new execution. SPARQL `LIMIT` and `OFFSET`
-apply before the transport pages are formed.
-
-See the [protocol reference](/docs/developer/protocol/mcp#search) for result terms, bounds,
-required facts, and migration from the former selector fields.
+`page` starts at 1 and defaults to 1. `max_results` defaults to 10. The response carries
+`pagination: { page, pages, max_results, total }`. A page past the last returns an empty list.
+Send the returned `revision` with later pages. SPARQL `LIMIT` and `OFFSET` bound the result
+set before paging. `ASK` returns a boolean without pagination.
 
 ## Symbols [#tool-get_symbol]
 
@@ -269,15 +263,16 @@ captured source from a synthetic builtin:
 
 <ReadExample name="source-less-builtin" />
 
-Use `include` to select optional projections:
+Use the `include` object to select optional projections, such as
+`"include": {"documentation": true, "history": true}`:
 
-| Include | Adds |
+| Member | Adds when `true` |
 | --- | --- |
 | `documentation` | Bounded documentation referring to the exact declaration |
 | `history` | The logical symbol's history edges: the commits that touched it and the symbols changed beside it |
 
-The options combine; an omitted or empty `include` adds neither. A declaration's source comes
-from [`nodes`](#tool-nodes) with the symbol's `id`.
+The members combine; an omitted member is `false`, and an omitted `include` adds neither. A
+declaration's source comes from [`facets`](#tool-facets) with the symbol's `id`.
 
 `history` answers edges from the symbol. The commit edges come first, newest first, each naming
 its commit as a `rift://revision/git/<commit>` revision with the commit's author and the path the
@@ -297,9 +292,8 @@ at most 32 of them; `co_changes_truncated` counts what either bound left out.
 The local server fills its history store in the background; an incomplete history answers
 `complete: false` until the store holds the selected revision.
 
-`declaration_limit` bounds returned declarations; a returned `declaration_cursor` continues
-the same symbol at the revision the answer names. Once the index serves another tree, the
-cursor refuses and the read starts again without it. It is not hit paging.
+`max_results` bounds returned declarations. Send `page` and the reported `revision` for
+later declarations. The server refuses a tree revision once the index serves another tree.
 
 <span id="get_symbol-scope" />
 
@@ -316,8 +310,8 @@ A package or runtime identity names an owner across releases. Discover it with
 If the requested release has no complete coverage, `search` can return an unavailable
 answer. Check `rift server logs` for the release and the coverage details.
 
-Several declaration bindings share one identity. `declaration_limit` and its returned cursor
-continue those bindings at the same revision:
+Several declaration bindings share one identity. `page` and `max_results` select those bindings
+at the same revision:
 
 <ReadExample name="multi-declaration-full" />
 
@@ -343,53 +337,24 @@ A malformed identity is refused before lookup:
 `outcome: "unavailable"` with its typed reason, rather than a definite miss.
 See the [symbol reference](/docs/developer/protocol/mcp#tool-get_symbol) for bounds and refusals.
 
-## Nodes [#tool-nodes]
+## Facets [#tool-facets]
 
-`nodes` reads a symbol's declarations with their source and structure. Use a symbol identity or a
-position inside a declaration. The answer shows the declaration's source before its parts and
-gives byte ranges for a precise edit target.
+`facets` reads every declaration of a symbol with its location, source, and syntax structure.
+The agent passes the symbol identity returned by `search` or `get_symbol`:
 
-To read the `Config` struct of the sample project, the agent passes its symbol identity:
+<ReadExample name="symbol-facets" />
 
-<ReadExample name="symbol-nodes" />
+Each declaration carries exact source and its syntax tree.
+`declaration` is its ordinal among the symbol's declarations. A syntax element's `index`
+is its pre-order position within that declaration, from the root at 0; `parent` names the
+index of the element around it. Nested declarations have their own facets.
 
-The summary shows a source excerpt and selected syntax parts for each declaration. Use
-`syntax: true` to read every node, down to each identifier. If the answer includes
-`node_cursor`, send it back with the same selector to continue declarations or syntax.
-
-For a package or runtime symbol found through `SERVICE :search` with `:scope "global"`, Rift reads
-the declaration from the global API at the release `revision` names, such as
-`rift://revision/cargo/crates.io/demo@1.0.0`, or at the version your project's dependencies pin when the
-request names none. Each node's `unit` names a source unit of the package, such as
+For a package or runtime symbol, Rift reads the global API at the release `revision`
+names, or at the version the project's dependencies pin when the request names none.
+The declaration's `source.span.unit` names its source unit, such as
 `rift://source/cargo/crates.io/demo/src/lib.rs`.
 
-<Callout type="info">
-
-The position is a UTF-8 byte offset, rather than a line or character number.
-
-</Callout>
-
-In the sample `src/config.rs`, byte `338` lies inside the `parse_config` call. With `syntax: true`,
-the position selects the syntax tree of `load_config`, the declaration holding it:
-
-<ReadExample name="local-nodes" />
-
-The answer names the symbol once, and each node carries its address inside it:
-
-- `declaration` is the declaration's ordinal among the symbol's declarations, and `index` is the
-  node's place inside that declaration, from the declaration's own node at 0: `334..353`, the
-  `parse_config(&text)` call, is node 25 of `load_config`.
-- `parent` is the index of the node around it: the call's parent, node 13, is the function body.
-- A node has no identity of its own. Its address names its place in the current code, so the
-  agent reads again after an edit before using it.
-
-A byte outside every declaration, such as one in an import, returns a source excerpt around
-that position. With `syntax: true`, the same position selects the file's nodes, starting with
-the file node at index 0.
-
-The agent chooses the range it needs and applies the change with its own editing tools.
-After the file changes, it should read again before using its ranges for another edit.
-See the [nodes reference](/docs/developer/protocol/mcp#tool-nodes) for the response shape and supported files.
+Send `page` with the same symbol and revision to read later declarations.
 
 ## Feedback [#tool-feedback]
 
@@ -405,12 +370,12 @@ conversation, show the user that excerpt and get approval to send it in this rep
 
 ```json
 {
-  "text": "The nodes tool returned an empty result for a symbol it found.",
-  "include_details": ["os", "rift_version"]
+  "text": "The facets tool returned an empty result for a symbol it found.",
+  "include": {"os": true, "rift_version": true}
 }
 ```
 
-The server sends the diagnostic fields named in `include_details`. Omit it to send the text alone.
+The server sends the diagnostic fields set to `true` in `include`. Omit it to send the text alone.
 See the [feedback reference](/docs/developer/protocol/mcp#tool-feedback) for the payload and failure behavior.
 
 ## Edits and index updates [#edit-and-index-updates]
@@ -426,9 +391,8 @@ the local index. See [Index](/docs/developer/architecture#index) for local updat
 ## Reading results [#reads]
 
 `search` projects the variables named in `SELECT`, returns a boolean for `ASK`, or returns
-RDF triples for a graph query. Follow `pagination.next_query` to read the next page of the
-same execution. An exact `get_symbol` read bounds declaration bindings with
-`declaration_limit` and continues with `declaration_cursor` at the reported revision.
+RDF triples for a graph query. `page` and `max_results` select answer rows. Exact `get_symbol`
+and `facets` reads select declarations with the same pair at the reported revision.
 
 A query that requires missing facts returns `outcome: "unavailable"`. A completed query can
 return an empty result when its required facts are available. Run `rift server logs` to
@@ -443,7 +407,7 @@ The [result content reference](/docs/developer/protocol/mcp#result-content) defi
 <Accordions>
 <Accordion title="Earlier revisions" id="revision-reads">
 
-Every `get_symbol` and `nodes` answer names the revision it was read at, such as
+Every `get_symbol` and `facets` answer names the revision it was read at, such as
 `rift://revision/tree/<digest>` for the working tree the index serves. The agent can read older
 project code by adding `revision` to either tool. For example, this reads the function from
 `main` without changing the working tree:

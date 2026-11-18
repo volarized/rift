@@ -169,7 +169,7 @@ async fn serves_tools_and_stops_on_external_cancel() -> TestResult {
         .map(|tool| tool.name.as_ref())
         .collect();
     assert_eq!(names.len(), 4, "the surface contains exactly four tools");
-    for expected in ["feedback", "get_symbol", "nodes", "search"] {
+    for expected in ["facets", "feedback", "get_symbol", "search"] {
         assert!(
             names.contains(&expected),
             "{expected} missing from {names:?}"
@@ -509,7 +509,7 @@ async fn http_tools_list_preserves_object_output_unions() -> TestResult {
         .map(|tool| tool.name.to_string())
         .collect::<Vec<_>>();
     names.sort();
-    assert_eq!(names, ["feedback", "get_symbol", "nodes", "search"]);
+    assert_eq!(names, ["facets", "feedback", "get_symbol", "search"]);
     for tool in &listing.tools {
         let output = tool
             .output_schema

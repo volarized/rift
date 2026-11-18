@@ -32,14 +32,16 @@ fn ambient_modules_keep_literal_scope_and_commonjs_exports_keep_statement_ranges
         .iter()
         .find(|symbol| symbol.kind == "namespace")
         .expect("ambient module");
-    assert_eq!(module.node_kind, Some("module"));
+    assert_eq!(module.syntax_element_kind, Some("module"));
     let declaration = document
-        .nodes()
+        .syntax_elements()
         .iter()
-        .find(|node| node.kind == "module" && node.range == module.item_range)
-        .expect("original module declaration node");
+        .find(|syntax_element| {
+            syntax_element.kind == "module" && syntax_element.range == module.item_range
+        })
+        .expect("original module declaration syntax element");
     let statement = document
-        .nodes()
+        .syntax_elements()
         .get(declaration.parent.expect("ambient parent"))
         .expect("original ambient statement");
     assert_eq!(statement.kind, "ambient_declaration");
@@ -108,8 +110,8 @@ fn named_aliases_keep_defining_names_and_reexport_sources() {
             .collect::<Vec<_>>(),
         ["format2", "SemVer", "SemVer.format"]
     );
-    assert!(document.symbols()[0].facets.contains(&SymbolFacet::Public));
-    assert!(!document.symbols()[2].facets.contains(&SymbolFacet::Public));
+    assert!(document.symbols()[0].kinds.contains(&SymbolKind::Public));
+    assert!(!document.symbols()[2].kinds.contains(&SymbolKind::Public));
 }
 
 #[test]
@@ -223,10 +225,10 @@ fn empty_exports_are_recorded_and_export_walk_keeps_existing_bounds() {
             },
             SyntaxLimits::new(100, 2, 10).expect("positive limits"),
         )
-        .expect_err("node bound");
+        .expect_err("syntax element bound");
     assert_eq!(
         error.slug(),
-        rift_error::errors::syntax::too_many_nodes::SLUG
+        rift_error::errors::syntax::too_many_syntax_elements::SLUG
     );
 }
 
@@ -261,8 +263,8 @@ fn declared_exports_keep_bindings_public_facts_and_complete_statement_ranges() {
             .iter()
             .find(|symbol| symbol.name == "format")
             .expect("declared function");
-        assert!(format.facets.contains(&SymbolFacet::Public));
-        assert!(format.facets.contains(&SymbolFacet::Callable));
+        assert!(format.kinds.contains(&SymbolKind::Public));
+        assert!(format.kinds.contains(&SymbolKind::Callable));
         assert_eq!(format.range, bindings[0].range);
         assert_eq!(
             token(text, Some(format.item_range)),
@@ -274,14 +276,14 @@ fn declared_exports_keep_bindings_public_facts_and_complete_statement_ranges() {
             .iter()
             .find(|symbol| symbol.name == "hidden")
             .expect("unexported declaration");
-        assert!(!hidden.facets.contains(&SymbolFacet::Public));
+        assert!(!hidden.kinds.contains(&SymbolKind::Public));
         assert!(bindings.iter().all(|binding| binding.container.is_none()));
         assert!(
             document
                 .symbols()
                 .iter()
                 .filter(|symbol| { matches!(symbol.name.as_str(), "run" | "nested") })
-                .all(|symbol| !symbol.facets.contains(&SymbolFacet::Public))
+                .all(|symbol| !symbol.kinds.contains(&SymbolKind::Public))
         );
     }
 }
@@ -297,9 +299,9 @@ fn declared_function_types_keep_variable_kind_and_callable_fact() {
             }
             assert_eq!(symbol.kind, "variable");
             assert!(symbol.signatures.is_empty());
-            assert!(symbol.facets.contains(&SymbolFacet::Value));
+            assert!(symbol.kinds.contains(&SymbolKind::Value));
             assert_eq!(
-                symbol.facets.contains(&SymbolFacet::Callable),
+                symbol.kinds.contains(&SymbolKind::Callable),
                 symbol.name == "parse"
             );
         }

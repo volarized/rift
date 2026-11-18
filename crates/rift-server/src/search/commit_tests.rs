@@ -173,7 +173,7 @@ fn a_commit_search_answers_every_term_first_then_some_each_newest_first() -> Tes
     assert_eq!(summaries(&single), ["Fix the release notes"]);
     let none = service.search_commits(&commit_search("nothing matches this")?)?;
     assert!(none.results.is_empty());
-    assert_eq!(none.pagination.total_pages, 0);
+    assert_eq!(none.pagination.pages, 0);
     Ok(())
 }
 
@@ -334,13 +334,13 @@ fn a_commit_search_pages_by_limit() -> TestResult {
     let folder = tempfile::tempdir()?;
     let service = searchable(directory.path(), folder.path())?;
     let paged: SearchParams = serde_json::from_value(
-        json!({"target": "commit", "query": "beacon", "limit": 1, "page_index": 1}),
+        json!({"target": "commit", "query": "beacon", "max_results": 1, "page": 2}),
     )?;
 
     let second = service.search_commits(&paged)?;
 
     assert_eq!(summaries(&second), ["Introduce the beacon"]);
-    assert_eq!(second.pagination.total_pages, 2);
+    assert_eq!(second.pagination.pages, 2);
     Ok(())
 }
 

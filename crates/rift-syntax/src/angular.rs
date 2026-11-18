@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::{ByteRange, SyntaxDocument, SyntaxNode, SyntaxSource};
+use crate::{ByteRange, SyntaxDocument, SyntaxElement, SyntaxSource};
 
 const ANGULAR_CORE: &str = "@angular/core";
 const COMPONENT: &str = "Component";
@@ -40,38 +40,38 @@ pub enum AngularTemplate {
 
 /// Finds Angular components from their imports and captured TypeScript declaration syntax.
 ///
-/// Work follows the bounded document's nodes and ancestor depth. This function performs
+/// Work follows the bounded document's syntax elements and ancestor depth. This function performs
 /// no parsing and preserves dynamic template expressions as unresolved source ranges.
 #[must_use]
 pub fn angular_components(
     source: SyntaxSource<'_>,
     document: &SyntaxDocument,
 ) -> Vec<AngularComponent> {
-    let children = Children::new(document.nodes());
+    let children = Children::new(document.syntax_elements());
     let imports = component_imports(source.text, &children);
     let shadows = binding_shadows(source.text, &children, &imports);
     document
-        .nodes()
+        .syntax_elements()
         .iter()
         .enumerate()
-        .filter(|(_, node)| node.kind == "decorator")
+        .filter(|(_, syntax_element)| syntax_element.kind == "decorator")
         .filter_map(|(index, _)| component(source.text, &children, &imports, &shadows, index))
         .collect()
 }
 
-pub(crate) struct Children<'nodes> {
-    pub(crate) nodes: &'nodes [SyntaxNode],
+pub(crate) struct Children<'syntax_elements> {
+    pub(crate) syntax_elements: &'syntax_elements [SyntaxElement],
     first: Vec<Option<usize>>,
     next: Vec<Option<usize>>,
 }
 
-impl<'nodes> Children<'nodes> {
-    pub(crate) fn new(nodes: &'nodes [SyntaxNode]) -> Self {
-        let mut first = vec![None; nodes.len()];
-        let mut next = vec![None; nodes.len()];
-        let mut last = vec![None; nodes.len()];
-        for (index, node) in nodes.iter().enumerate() {
-            if let Some(parent) = node.parent {
+impl<'syntax_elements> Children<'syntax_elements> {
+    pub(crate) fn new(syntax_elements: &'syntax_elements [SyntaxElement]) -> Self {
+        let mut first = vec![None; syntax_elements.len()];
+        let mut next = vec![None; syntax_elements.len()];
+        let mut last = vec![None; syntax_elements.len()];
+        for (index, syntax_element) in syntax_elements.iter().enumerate() {
+            if let Some(parent) = syntax_element.parent {
                 if let Some(previous) = last[parent] {
                     next[previous] = Some(index);
                 } else {
@@ -80,7 +80,11 @@ impl<'nodes> Children<'nodes> {
                 last[parent] = Some(index);
             }
         }
-        Self { nodes, first, next }
+        Self {
+            syntax_elements,
+            first,
+            next,
+        }
     }
 
     pub(crate) fn indices(&self, parent: usize) -> impl Iterator<Item = usize> + '_ {
@@ -89,11 +93,11 @@ impl<'nodes> Children<'nodes> {
 
     pub(crate) fn child(&self, parent: usize, kind: &str) -> Option<usize> {
         self.indices(parent)
-            .find(|index| self.nodes[*index].kind == kind)
+            .find(|index| self.syntax_elements[*index].kind == kind)
     }
 
     pub(crate) fn text<'source>(&self, index: usize, text: &'source str) -> Option<&'source str> {
-        let range = self.nodes[index].range;
+        let range = self.syntax_elements[index].range;
         let start = usize::try_from(range.start).ok()?;
         let end = usize::try_from(range.end).ok()?;
         text.get(start..end)
@@ -104,13 +108,13 @@ impl<'nodes> Children<'nodes> {
         index: usize,
         text: &'source str,
     ) -> Option<(&'source str, ByteRange)> {
-        let node = &self.nodes[index];
-        if !matches!(node.kind, "string" | "template_string") {
+        let syntax_element = &self.syntax_elements[index];
+        if !matches!(syntax_element.kind, "string" | "template_string") {
             return None;
         }
         if self.indices(index).any(|child| {
             matches!(
-                self.nodes[child].kind,
+                self.syntax_elements[child].kind,
                 "escape_sequence" | "template_substitution"
             )
         }) {
@@ -122,8 +126,8 @@ impl<'nodes> Children<'nodes> {
             return None;
         }
         let range = ByteRange {
-            start: node.range.start + 1,
-            end: node.range.end.checked_sub(1)?,
+            start: syntax_element.range.start + 1,
+            end: syntax_element.range.end.checked_sub(1)?,
         };
         written
             .get(1..written.len().checked_sub(1)?)
@@ -133,8 +137,8 @@ impl<'nodes> Children<'nodes> {
 
 fn component_imports(text: &str, children: &Children<'_>) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
-    for (index, node) in children.nodes.iter().enumerate() {
-        if node.kind != "import_statement" {
+    for (index, syntax_element) in children.syntax_elements.iter().enumerate() {
+        if syntax_element.kind != "import_statement" {
             continue;
         }
         let Some(source) = children.child(index, "string") else {
@@ -146,7 +150,12 @@ fn component_imports(text: &str, children: &Children<'_>) -> BTreeSet<String> {
         let Some(clause) = children.child(index, "import_clause") else {
             continue;
         };
-        if type_modifier(text, children, index, children.nodes[clause].range.start) {
+        if type_modifier(
+            text,
+            children,
+            index,
+            children.syntax_elements[clause].range.start,
+        ) {
             continue;
         }
         import_clause(text, children, clause, &mut names);
@@ -155,11 +164,12 @@ fn component_imports(text: &str, children: &Children<'_>) -> BTreeSet<String> {
 }
 
 fn type_modifier(text: &str, children: &Children<'_>, index: usize, end: u64) -> bool {
-    let mut start = children.nodes[index].range.start;
+    let mut start = children.syntax_elements[index].range.start;
     for child in children.indices(index).filter(|child| {
-        children.nodes[*child].kind == "comment" && children.nodes[*child].range.start < end
+        children.syntax_elements[*child].kind == "comment"
+            && children.syntax_elements[*child].range.start < end
     }) {
-        let range = children.nodes[child].range;
+        let range = children.syntax_elements[child].range;
         if modifier_in(text, start, range.start) {
             return true;
         }
@@ -181,7 +191,7 @@ fn modifier_in(text: &str, start: u64, end: u64) -> bool {
 
 fn import_clause(text: &str, children: &Children<'_>, clause: usize, names: &mut BTreeSet<String>) {
     for index in children.indices(clause) {
-        match children.nodes[index].kind {
+        match children.syntax_elements[index].kind {
             "namespace_import" => {
                 if let Some(name) = children
                     .child(index, "identifier")
@@ -203,14 +213,14 @@ fn named_imports(
     names: &mut BTreeSet<String>,
 ) {
     for index in children.indices(imports) {
-        if children.nodes[index].kind != "import_specifier"
+        if children.syntax_elements[index].kind != "import_specifier"
             || children.child(index, "type").is_some()
         {
             continue;
         }
         let mut identifiers = children
             .indices(index)
-            .filter(|index| children.nodes[*index].kind == "identifier");
+            .filter(|index| children.syntax_elements[*index].kind == "identifier");
         let Some(name) = identifiers
             .next()
             .and_then(|index| children.text(index, text))
@@ -220,7 +230,12 @@ fn named_imports(
         let Some(first) = children.child(index, "identifier") else {
             continue;
         };
-        if type_modifier(text, children, index, children.nodes[first].range.start) {
+        if type_modifier(
+            text,
+            children,
+            index,
+            children.syntax_elements[first].range.start,
+        ) {
             continue;
         }
         if name != COMPONENT {
@@ -241,23 +256,23 @@ fn component(
     shadows: &BTreeMap<usize, BTreeSet<String>>,
     decorator: usize,
 ) -> Option<AngularComponent> {
-    let parent = children.nodes[decorator].parent?;
-    let class = if children.nodes[parent].kind == "export_statement" {
+    let parent = children.syntax_elements[decorator].parent?;
+    let class = if children.syntax_elements[parent].kind == "export_statement" {
         children.child(parent, "class_declaration")?
     } else {
         parent
     };
-    if children.nodes[class].kind != "class_declaration" {
+    if children.syntax_elements[class].kind != "class_declaration" {
         return None;
     }
     let call = children.child(decorator, "call_expression")?;
     let name = children.indices(call).find(|index| {
         matches!(
-            children.nodes[*index].kind,
+            children.syntax_elements[*index].kind,
             "identifier" | "member_expression"
         )
     })?;
-    let callee = if children.nodes[name].kind == "member_expression" {
+    let callee = if children.syntax_elements[name].kind == "member_expression" {
         let object = children.child(name, "identifier")?;
         let property = children.child(name, "property_identifier")?;
         format!(
@@ -272,7 +287,7 @@ fn component(
         return None;
     }
     let root = callee.split('.').next()?;
-    let mut ancestor = children.nodes[class].parent;
+    let mut ancestor = children.syntax_elements[class].parent;
     while let Some(index) = ancestor {
         if shadows
             .get(&index)
@@ -280,7 +295,7 @@ fn component(
         {
             return None;
         }
-        ancestor = children.nodes[index].parent;
+        ancestor = children.syntax_elements[index].parent;
     }
     let arguments = children.child(call, "arguments")?;
     let templates = if let Some(object) = children.child(arguments, "object") {
@@ -290,11 +305,11 @@ fn component(
             .collect()
     } else {
         vec![AngularTemplate::Unresolved {
-            range: children.nodes[arguments].range,
+            range: children.syntax_elements[arguments].range,
         }]
     };
     Some(AngularComponent {
-        range: children.nodes[class].range,
+        range: children.syntax_elements[class].range,
         templates,
     })
 }
@@ -309,7 +324,7 @@ fn binding_shadows(
         .filter_map(|name| name.split('.').next())
         .collect();
     let mut shadows: BTreeMap<usize, BTreeSet<String>> = BTreeMap::new();
-    for index in 0..children.nodes.len() {
+    for index in 0..children.syntax_elements.len() {
         let Some((scope, bindings)) = scoped_bindings(children, index) else {
             continue;
         };
@@ -322,33 +337,36 @@ fn binding_shadows(
 }
 
 fn scoped_bindings(children: &Children<'_>, index: usize) -> Option<(usize, Vec<usize>)> {
-    let node = &children.nodes[index];
+    let syntax_element = &children.syntax_elements[index];
     let first_binding = |parent| {
         children
             .indices(parent)
-            .find(|child| binding_kind(children.nodes[*child].kind))
+            .find(|child| binding_kind(children.syntax_elements[*child].kind))
     };
-    match node.kind {
+    match syntax_element.kind {
         "formal_parameters" => Some((
-            node.parent?,
+            syntax_element.parent?,
             children.indices(index).filter_map(first_binding).collect(),
         )),
         "arrow_function" if children.child(index, "formal_parameters").is_none() => {
             Some((index, vec![children.child(index, "identifier")?]))
         }
         "variable_declarator" | "function_declaration" => {
-            let binding = if node.kind == "function_declaration" {
+            let binding = if syntax_element.kind == "function_declaration" {
                 children.child(index, "identifier")?
             } else {
                 first_binding(index)?
             };
-            let mut ancestor = node.parent;
-            for _ in 0..children.nodes.len() {
+            let mut ancestor = syntax_element.parent;
+            for _ in 0..children.syntax_elements.len() {
                 let scope = ancestor?;
-                if matches!(children.nodes[scope].kind, "statement_block" | "program") {
+                if matches!(
+                    children.syntax_elements[scope].kind,
+                    "statement_block" | "program"
+                ) {
                     return Some((scope, vec![binding]));
                 }
-                ancestor = children.nodes[scope].parent;
+                ancestor = children.syntax_elements[scope].parent;
             }
             None
         }
@@ -364,7 +382,7 @@ fn binding_names(
 ) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     while let Some(binding) = pending.pop() {
-        match children.nodes[binding].kind {
+        match children.syntax_elements[binding].kind {
             "identifier" | "shorthand_property_identifier_pattern" => {
                 if let Some(name) = children
                     .text(binding, text)
@@ -381,7 +399,7 @@ fn binding_names(
             _ => pending.extend(
                 children
                     .indices(binding)
-                    .filter(|index| binding_kind(children.nodes[*index].kind)),
+                    .filter(|index| binding_kind(children.syntax_elements[*index].kind)),
             ),
         }
     }
@@ -403,12 +421,12 @@ fn binding_kind(kind: &str) -> bool {
 }
 
 fn template(text: &str, children: &Children<'_>, index: usize) -> Option<AngularTemplate> {
-    if children.nodes[index].kind != "pair" {
+    if children.syntax_elements[index].kind != "pair" {
         return None;
     }
     let mut members = children.indices(index);
     let key = members.next()?;
-    let name = if children.nodes[key].kind == "string" {
+    let name = if children.syntax_elements[key].kind == "string" {
         children.literal(key, text)?.0
     } else {
         children.text(key, text)?
@@ -423,7 +441,7 @@ fn template(text: &str, children: &Children<'_>, index: usize) -> Option<Angular
         },
         Some((_, range)) => AngularTemplate::Inline { range },
         None => AngularTemplate::Unresolved {
-            range: children.nodes[value].range,
+            range: children.syntax_elements[value].range,
         },
     })
 }

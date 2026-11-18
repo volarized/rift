@@ -1070,8 +1070,8 @@ fn commonjs_original_react_builds_keep_distinct_modules_and_public_bindings() {
             .expect("original raw useState");
         assert!(
             !declaration
-                .facets
-                .contains(&rift_protocol::read::SymbolFacet::Public)
+                .kinds
+                .contains(&rift_protocol::read::SymbolKind::Public)
         );
         let anchors = prepared
             .anchors

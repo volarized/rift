@@ -17,7 +17,7 @@ pub(super) fn record(
     let mut assignments = Vec::new();
     let mut visited = 0_usize;
     let mut cursor = root.walk();
-    while let Some((node, depth)) = pending.pop() {
+    while let Some((syntax_element, depth)) = pending.pop() {
         visited += 1;
         if depth > limits.syntax_depth_max() {
             return errors::syntax::too_deep()
@@ -25,51 +25,53 @@ pub(super) fn record(
                 .syntax_depth_max(limits.syntax_depth_max())
                 .fail();
         }
-        if visited + pending.len() > limits.syntax_nodes_max() {
-            return errors::syntax::too_many_nodes()
+        if visited + pending.len() > limits.syntax_elements_max() {
+            return errors::syntax::too_many_syntax_elements()
                 .path(source.path)
-                .syntax_nodes_max(limits.syntax_nodes_max())
+                .syntax_elements_max(limits.syntax_elements_max())
                 .fail();
         }
-        if blocked_binding(node, source.text)
-            && let Some(scope) = lexical_scope(node)
+        if blocked_binding(syntax_element, source.text)
+            && let Some(scope) = lexical_scope(syntax_element)
         {
             blocked.insert(scope.id());
         }
-        if node.kind_id() == kinds.assignment_expression {
-            assignments.push(node);
-            if node
+        if syntax_element.kind_id() == kinds.assignment_expression {
+            assignments.push(syntax_element);
+            if syntax_element
                 .child_by_field_name("left")
                 .and_then(|left| source.text.get(left.byte_range()))
                 == Some("module.exports")
-                && let Some(scope) = lexical_scope(node)
+                && let Some(scope) = lexical_scope(syntax_element)
             {
                 replaced.insert(scope.id());
             }
         }
         if visited
             .saturating_add(pending.len())
-            .saturating_add(node.named_child_count())
-            > limits.syntax_nodes_max()
+            .saturating_add(syntax_element.named_child_count())
+            > limits.syntax_elements_max()
         {
-            return errors::syntax::too_many_nodes()
+            return errors::syntax::too_many_syntax_elements()
                 .path(source.path)
-                .syntax_nodes_max(limits.syntax_nodes_max())
+                .syntax_elements_max(limits.syntax_elements_max())
                 .fail();
         }
-        extract::push_named_children(&mut pending, &mut cursor, node, |child| (child, depth + 1));
+        extract::push_named_children(&mut pending, &mut cursor, syntax_element, |child| {
+            (child, depth + 1)
+        });
     }
-    for node in assignments {
-        if !module_execution(node, &blocked) {
+    for syntax_element in assignments {
+        if !module_execution(syntax_element, &blocked) {
             continue;
         }
-        let Some(binding) = assignment(node, source.text, kinds)? else {
+        let Some(binding) = assignment(syntax_element, source.text, kinds)? else {
             continue;
         };
-        if binding.kind == SyntaxExportKind::Named && !module_execution(node, &replaced) {
+        if binding.kind == SyntaxExportKind::Named && !module_execution(syntax_element, &replaced) {
             continue;
         }
-        bindings.insert(node.id(), binding);
+        bindings.insert(syntax_element.id(), binding);
     }
     Ok(())
 }
@@ -78,36 +80,38 @@ fn receiver(text: &str) -> bool {
     matches!(text, "exports" | "module" | "require" | "eval")
 }
 
-fn binding_contains(node: Node<'_>, source: &str) -> bool {
-    let mut pending = vec![node];
-    let mut cursor = node.walk();
-    while let Some(node) = pending.pop() {
+fn binding_contains(syntax_element: Node<'_>, source: &str) -> bool {
+    let mut pending = vec![syntax_element];
+    let mut cursor = syntax_element.walk();
+    while let Some(syntax_element) = pending.pop() {
         if matches!(
-            node.kind(),
+            syntax_element.kind(),
             "identifier" | "shorthand_property_identifier_pattern"
-        ) && source.get(node.byte_range()).is_some_and(receiver)
+        ) && source
+            .get(syntax_element.byte_range())
+            .is_some_and(receiver)
         {
             return true;
         }
-        extract::push_named_children(&mut pending, &mut cursor, node, |child| child);
+        extract::push_named_children(&mut pending, &mut cursor, syntax_element, |child| child);
     }
     false
 }
 
-fn blocked_binding(node: Node<'_>, source: &str) -> bool {
-    let binding = match node.kind() {
+fn blocked_binding(syntax_element: Node<'_>, source: &str) -> bool {
+    let binding = match syntax_element.kind() {
         "variable_declarator" | "function_declaration" | "class_declaration" => {
-            node.child_by_field_name("name")
+            syntax_element.child_by_field_name("name")
         }
-        "formal_parameters" | "import_clause" | "catch_clause" => Some(node),
-        "assignment_expression" | "augmented_assignment_expression" => node
+        "formal_parameters" | "import_clause" | "catch_clause" => Some(syntax_element),
+        "assignment_expression" | "augmented_assignment_expression" => syntax_element
             .child_by_field_name("left")
             .filter(|left| !matches!(left.kind(), "member_expression" | "subscript_expression")),
-        "update_expression" => node
+        "update_expression" => syntax_element
             .child_by_field_name("argument")
             .filter(|left| !matches!(left.kind(), "member_expression" | "subscript_expression")),
         "call_expression" => {
-            return node
+            return syntax_element
                 .child_by_field_name("function")
                 .and_then(|function| source.get(function.byte_range()))
                 == Some("eval");
@@ -117,9 +121,9 @@ fn blocked_binding(node: Node<'_>, source: &str) -> bool {
     binding.is_some_and(|binding| binding_contains(binding, source))
 }
 
-fn lexical_scope(mut node: Node<'_>) -> Option<Node<'_>> {
+fn lexical_scope(mut syntax_element: Node<'_>) -> Option<Node<'_>> {
     let function_binding = matches!(
-        node.kind(),
+        syntax_element.kind(),
         "formal_parameters"
             | "variable_declarator"
             | "assignment_expression"
@@ -128,7 +132,7 @@ fn lexical_scope(mut node: Node<'_>) -> Option<Node<'_>> {
             | "call_expression"
             | "function_declaration"
     );
-    while let Some(parent) = node.parent() {
+    while let Some(parent) = syntax_element.parent() {
         if matches!(
             parent.kind(),
             "program"
@@ -141,7 +145,7 @@ fn lexical_scope(mut node: Node<'_>) -> Option<Node<'_>> {
         {
             return Some(parent);
         }
-        node = parent;
+        syntax_element = parent;
     }
     None
 }
@@ -170,8 +174,8 @@ fn immediate_function(function: Node<'_>) -> bool {
     })
 }
 
-fn module_execution(mut node: Node<'_>, blocked: &BTreeSet<usize>) -> bool {
-    while let Some(parent) = node.parent() {
+fn module_execution(mut syntax_element: Node<'_>, blocked: &BTreeSet<usize>) -> bool {
+    while let Some(parent) = syntax_element.parent() {
         if blocked.contains(&parent.id()) {
             return false;
         }
@@ -187,25 +191,25 @@ fn module_execution(mut node: Node<'_>, blocked: &BTreeSet<usize>) -> bool {
             | "call_expression" => {}
             _ => return false,
         }
-        node = parent;
+        syntax_element = parent;
     }
     false
 }
 
 fn assignment(
-    node: Node<'_>,
+    syntax_element: Node<'_>,
     source: &str,
     kinds: &EcmaScriptKinds,
 ) -> Result<Option<SyntaxExportBinding>, RiftError> {
-    let Some(left) = kinds.child(node, EcmaScriptGrammarField::Left) else {
+    let Some(left) = kinds.child(syntax_element, EcmaScriptGrammarField::Left) else {
         return Ok(None);
     };
     let Some(target) = kinds.export_target(left, source) else {
         return Ok(None);
     };
-    let range = extract::byte_range(node)?;
+    let range = extract::byte_range(syntax_element)?;
     if target == ExportTarget::Property {
-        let Some((property, _)) = kinds.export_function(node, source) else {
+        let Some((property, _)) = kinds.export_function(syntax_element, source) else {
             return Ok(None);
         };
         let name = extract::byte_range(property)?;
@@ -219,7 +223,7 @@ fn assignment(
             type_only: false,
         }));
     }
-    let Some(value) = kinds.child(node, EcmaScriptGrammarField::Right) else {
+    let Some(value) = kinds.child(syntax_element, EcmaScriptGrammarField::Right) else {
         return Ok(None);
     };
     if value.kind() != "call_expression"

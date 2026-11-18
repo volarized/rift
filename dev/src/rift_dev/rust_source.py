@@ -20,16 +20,16 @@ def code_rows(root, contents: bytes, entire_test: bool) -> tuple[set[int], set[i
     tests: set[int] = set()
     work = [(root, entire_test)]
     while work:
-        node, inside_test = work.pop()
-        if node.type in COMMENT_TYPES:
+        element, inside_test = work.pop()
+        if element.type in COMMENT_TYPES:
             continue
-        if not node.children:
-            last = node.end_point.row - (node.end_point.column == 0)
+        if not element.children:
+            last = element.end_point.row - (element.end_point.column == 0)
             destination = tests if inside_test else production
-            destination.update(range(node.start_point.row + 1, last + 2))
+            destination.update(range(element.start_point.row + 1, last + 2))
             continue
         attributes = []
-        for child in node.children:
+        for child in element.children:
             if child.type in COMMENT_TYPES:
                 continue
             if child.type == "attribute_item":
@@ -58,14 +58,14 @@ def measurement_elapsed_rows(contents: bytes) -> set[int]:
     parser = Parser(Language(tree_sitter_rust.language()))
     tree = parser.parse(contents)
 
-    def nodes(root):
+    def elements(root):
         if root is None:
             return
         work = [root]
         while work:
-            node = work.pop()
-            yield node
-            work.extend(reversed(node.children))
+            element = work.pop()
+            yield element
+            work.extend(reversed(element.children))
 
     def is_in_call_scope(declaration, call_blocks: set[int]) -> bool:
         parent = declaration.parent
@@ -87,30 +87,30 @@ def measurement_elapsed_rows(contents: bytes) -> set[int]:
                 call_blocks.add(block.start_byte)
             block = block.parent
         declarations = [
-            node
-            for node in nodes(function_scope)
-            if node.type == "let_declaration"
-            and node.start_byte < identifier.start_byte
-            and is_in_call_scope(node, call_blocks)
-            and name in identifiers(node.child_by_field_name("pattern"))
+            element
+            for element in elements(function_scope)
+            if element.type == "let_declaration"
+            and element.start_byte < identifier.start_byte
+            and is_in_call_scope(element, call_blocks)
+            and name in identifiers(element.child_by_field_name("pattern"))
         ]
-        latest = max(declarations, key=lambda node: node.start_byte, default=None)
+        latest = max(declarations, key=lambda element: element.start_byte, default=None)
         return latest is not None and contains_measurement(
             latest.child_by_field_name("value")
         )
 
-    def contains_measurement(node) -> bool:
-        if node is None:
+    def contains_measurement(element) -> bool:
+        if element is None:
             return False
-        if node.type == "macro_invocation":
+        if element.type == "macro_invocation":
             return bool(
                 re.search(
                     rb"\bmeasure_elapsed\s*!",
-                    contents[node.start_byte : node.end_byte],
+                    contents[element.start_byte : element.end_byte],
                 )
             )
-        if node.type == "call_expression":
-            function = node.child_by_field_name("function")
+        if element.type == "call_expression":
+            function = element.child_by_field_name("function")
             if function is not None and function.type == "field_expression":
                 field = function.child_by_field_name("field")
                 receiver = function.child_by_field_name("value")
@@ -123,14 +123,14 @@ def measurement_elapsed_rows(contents: bytes) -> set[int]:
                     return bound_to_measurement(receiver)
                 return contains_measurement(receiver)
             return contains_measurement(function)
-        if node.type in {"field_expression", "try_expression", "await_expression"}:
-            return any(contains_measurement(child) for child in node.named_children)
+        if element.type in {"field_expression", "try_expression", "await_expression"}:
+            return any(contains_measurement(child) for child in element.named_children)
         return False
 
-    def identifiers(node) -> set[bytes]:
+    def identifiers(element) -> set[bytes]:
         return {
             contents[child.start_byte : child.end_byte]
-            for child in nodes(node)
+            for child in elements(element)
             if child.type == "identifier"
         }
 
@@ -146,7 +146,7 @@ def measurement_elapsed_rows(contents: bytes) -> set[int]:
         )
 
     rows: set[int] = set()
-    for call in nodes(tree.root_node):
+    for call in elements(tree.root_node):
         if call.type != "call_expression":
             continue
         function = call.child_by_field_name("function")
@@ -194,14 +194,14 @@ def measurement_elapsed_rows(contents: bytes) -> set[int]:
                 call_blocks.add(block.start_byte)
             block = block.parent
         declarations = [
-            node
-            for node in nodes(function_scope)
-            if node.type == "let_declaration"
-            and node.start_byte < call.start_byte
-            and is_in_call_scope(node, call_blocks)
-            and name in identifiers(node.child_by_field_name("pattern"))
+            element
+            for element in elements(function_scope)
+            if element.type == "let_declaration"
+            and element.start_byte < call.start_byte
+            and is_in_call_scope(element, call_blocks)
+            and name in identifiers(element.child_by_field_name("pattern"))
         ]
-        latest = max(declarations, key=lambda node: node.start_byte, default=None)
+        latest = max(declarations, key=lambda element: element.start_byte, default=None)
         if latest is not None and contains_measurement(
             latest.child_by_field_name("value")
         ):
@@ -235,24 +235,24 @@ def stored_duration_elapsed_rows(contents: bytes) -> set[int]:
     parser = Parser(Language(tree_sitter_rust.language()))
     tree = parser.parse(contents)
 
-    def nodes(root):
+    def elements(root):
         if root is None:
             return
         work = [root]
         while work:
-            node = work.pop()
-            yield node
-            work.extend(reversed(node.children))
+            element = work.pop()
+            yield element
+            work.extend(reversed(element.children))
 
-    def identifiers(node) -> set[bytes]:
+    def identifiers(element) -> set[bytes]:
         return {
             contents[child.start_byte : child.end_byte]
-            for child in nodes(node)
+            for child in elements(element)
             if child.type == "identifier"
         }
 
     rows: set[int] = set()
-    for arm in nodes(tree.root_node):
+    for arm in elements(tree.root_node):
         if arm.type != "match_arm":
             continue
         pattern = arm.child_by_field_name("pattern")
@@ -262,7 +262,7 @@ def stored_duration_elapsed_rows(contents: bytes) -> set[int]:
         if value.type != "macro_invocation":
             continue
         variants = [
-            child for child in nodes(pattern) if child.type == "tuple_struct_pattern"
+            child for child in elements(pattern) if child.type == "tuple_struct_pattern"
         ]
         bindings = set()
         for variant in variants:

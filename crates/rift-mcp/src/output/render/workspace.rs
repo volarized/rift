@@ -43,15 +43,21 @@ pub(super) fn answer(out: &mut TextWriter, page: &WorkspaceResourcePage) -> Resu
         for unit in source {
             sections.entry(0, &unit_line(unit))?;
         }
-    } else if pagination.page_index >= pagination.total_pages {
+    } else if pagination.page > pagination.pages {
         out.raw_line(0, "No source files on this page.")?;
     }
     if let Some(next) = pagination
-        .page_index
+        .page
         .checked_add(1)
-        .filter(|next| *next < pagination.total_pages)
+        .filter(|next| *next <= pagination.pages)
     {
-        out.raw_line(0, &format!("next · {WORKSPACE_URI}?page_index={next}"))?;
+        out.raw_line(
+            0,
+            &format!(
+                "next · {WORKSPACE_URI}?page={next}&max_results={}",
+                pagination.max_results
+            ),
+        )?;
     }
     Ok(())
 }

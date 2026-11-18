@@ -65,7 +65,7 @@ fn conditional_analysis(files: Vec<(&str, &str)>) -> super::PackageAnalysis {
     super::PackageAnalyzer::analyze(input, 1).expect("conditional package analysis")
 }
 
-fn node_analysis(files: Vec<(&str, &str)>) -> super::PackageAnalysis {
+fn syntax_element_analysis(files: Vec<(&str, &str)>) -> super::PackageAnalysis {
     let runtime = rift_protocol::read::RuntimeIdentity {
         runtime: "node".to_owned(),
         version: "26.11.1".to_owned(),
@@ -545,9 +545,9 @@ fn test_a_declaration_file_joins_its_esm_and_commonjs_builds() {
 
 /// Captured Node module observations join declarations from their physical package owner.
 #[test]
-fn test_node_declare_module_members_join_the_runtime_module() {
+fn test_syntax_element_declare_module_members_join_the_runtime_module() {
     let declarations_source = "declare module \"fs\" {\n    export function readFile(path: string, callback: (data: string) => void): void;\n    export function readFile(path: string, encoding: string, callback: (data: string) => void): void;\n    export function watch(path: string): void;\n}\n";
-    let publication = node_analysis(vec![
+    let publication = syntax_element_analysis(vec![
         ("lib/fs.d.ts", declarations_source),
         (
             "lib/fs.js",

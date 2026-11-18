@@ -2,6 +2,20 @@
 
 Generated from the served tool surface.
 
+## facets
+
+Reads every declaration of `symbol` with its location, source, and syntax structure.
+The result includes each declaration's syntax tree.
+Use `page` with the same symbol and revision to continue declarations.
+Use `revision` to read a commit or release, or to pin the served working tree.
+
+Parameters:
+
+- `symbol` (required) - The symbol whose declarations the server reads.
+- `max_results` - Results per page, at most 100.
+- `page` - The 1-based page to read.
+- `revision` - The revision to read.
+
 ## feedback
 
 Sends a feedback report over HTTPS to the public Rift intake, or to the intake that
@@ -13,15 +27,15 @@ approval for any exact conversation excerpt before including it in a report.
 Parameters:
 
 - `text` (required) - Report text sent verbatim.
-- `include_details` - Diagnostic fields to send alongside `text`.
+- `include` - Diagnostic fields to send alongside `text`.
 
 ## get_symbol
 
 Reads one logical symbol by its canonical `id` at one `revision`; the answer names the
-revision it read, and `declaration_cursor` continues its declarations at that revision.
+revision it read, and `page` selects its declarations at that revision.
 A complete exact miss returns `symbol_not_found` and up to three alternatives.
 An unavailable selection returns its typed cause. A found symbol carries its facts and
-each declaration's location; `nodes` with `symbol` reads a declaration's source. Use
+each declaration's location; `facets` with `symbol` reads a declaration's source. Use
 `search` for discovery.
 
 Parameters:
@@ -29,38 +43,19 @@ Parameters:
 - `id` (required) - Canonical identity.
 - `include` - Requested projections.
 - `revision` - The revision to read.
-- `declaration_limit` - Most declarations returned in this read.
-- `declaration_cursor` - Continuation a preceding read returned, bound to this symbol and the revision it read.
-
-## nodes
-
-Reads the selected symbol's declarations with their source and structure. A UTF-8
-byte `position` selects its enclosing declaration, or a source excerpt if none holds
-it. Use `scope` to select a registered project or profile for a path read.
-Send `syntax: true` for the full syntax tree, including individual tokens. Use the
-returned `node_cursor` with the same selector to continue declarations or syntax.
-A node's `index` and `parent` address nodes
-within the same declaration or source unit.
-Use `revision` to read a commit or release, or to pin the served working tree.
-
-Parameters:
-
-- `symbol` - The symbol whose nodes the read lists: each declaration's item node, then the descendants that belong to that declaration and not to a declaration nested in it, outermost first per declaration.
-- `path` - Project-relative file to inspect.
-- `position` - UTF-8 byte offset inside the declaration whose nodes the read lists - one position, not a range; the nodes themselves carry the spans.
-- `node_cursor` - Continuation a preceding read returned, bound to the symbol or unit its answer listed and the tree revision it read.
-- `revision` - The revision to read: a git revision reads that commit, a tree revision the served working tree, and a release revision selects the release of a package or runtime `symbol`'s owner.
-- `scope` - Project that owns `path`.
-- `syntax` - Return a page of the full syntax tree.
+- `max_results` - Results per page, at most 10,000.
+- `page` - The 1-based page to read.
 
 ## search
 
-Evaluate SPARQL over captured code facts. Use `SERVICE :search` for text and regex
-retrieval and `SERVICE :flows` for call paths around ranked symbols. Continue a
-paged answer with its `next_query`.
+Performs search across the index using a query language. `language` names the query
+language and defaults to `sparql`.
 
 Parameters:
 
-- `query` (required) - Query text.
-- `language` - Currently, only SPARQL is supported.
+- `query` (required) - Query text in `language`.
+- `language` - The language of `query`.
+- `page` - The 1-based page to read.
+- `max_results` - Answer rows per page, at most 1000.
+- `revision` - The indexed revision to read.
 

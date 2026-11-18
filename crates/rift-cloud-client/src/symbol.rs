@@ -3,16 +3,13 @@ use rift_error::RiftError;
 
 use rift_protocol::{
     identity::{SymbolIdentity, SymbolOwner},
-    read::{
-        GetSymbolInclude, Language, PAGE_LIMIT_MAX, SourceKind, SourceLocationKind, SymbolOrigin,
-    },
+    read::{Language, SourceKind, SourceLocationKind, SymbolOrigin},
     symbol_read::{GetSymbolParams, GetSymbolResult},
 };
 
 use crate::{
-    CURSOR_BYTES_MAX, GlobalClient, SYMBOL_DOCUMENTATION_FEATURE, active_response_body_bytes_max,
-    contract, failure, response, serialize_body, smaller_bound, supports_feature,
-    validate_body_for_capabilities,
+    GlobalClient, SYMBOL_DOCUMENTATION_FEATURE, active_response_body_bytes_max, contract, failure,
+    response, serialize_body, smaller_bound, supports_feature, validate_body_for_capabilities,
 };
 
 impl GlobalClient {
@@ -35,7 +32,7 @@ impl GlobalClient {
             }
             validate_request(request)?;
             let capabilities = self.get_capabilities().await?;
-            if request.include.contains(&GetSymbolInclude::Documentation)
+            if request.include.documentation
                 && !supports_feature(&capabilities, SYMBOL_DOCUMENTATION_FEATURE)
             {
                 return Err(failure::configuration_invalid(
@@ -43,15 +40,6 @@ impl GlobalClient {
                     &format!(
                         "global API does not advertise feature: {SYMBOL_DOCUMENTATION_FEATURE}"
                     ),
-                ));
-            }
-            if request.declaration_cursor.as_ref().is_some_and(|cursor| {
-                cursor.len() > smaller_bound(capabilities.bounds.cursor_bytes_max, CURSOR_BYTES_MAX)
-            }) {
-                return Err(failure::request_invalid(
-                    "get_symbol",
-                    "declaration_cursor",
-                    "field failed validation",
                 ));
             }
             let body = serialize_body(request, self.inner.config.max_request)?;
@@ -115,22 +103,18 @@ fn validate_request(request: &GetSymbolParams) -> Result<(), RiftError> {
             "field failed validation",
         ));
     }
-    if !(1..=PAGE_LIMIT_MAX).contains(&request.declaration_limit) {
+    if !(1..=rift_protocol::symbol_read::GET_SYMBOL_MAX_RESULTS).contains(&request.max_results) {
         return Err(failure::request_invalid(
             "validate_request",
-            "declaration_limit",
+            "max_results",
             "field failed validation",
         ));
     }
-    if request
-        .declaration_cursor
-        .as_ref()
-        .is_some_and(|cursor| cursor.is_empty() || cursor.len() > CURSOR_BYTES_MAX)
-    {
+    if request.page == 0 {
         return Err(failure::request_invalid(
             "validate_request",
-            "declaration_cursor",
-            "field failed validation",
+            "page",
+            "expected a 1-based page",
         ));
     }
     Ok(())
@@ -160,12 +144,20 @@ fn valid_result(
         GetSymbolResult::Found {
             symbol,
             declarations,
+            pagination,
             history,
             documentation,
             ..
         } => {
-            u64::try_from(declarations.len())
-                .is_ok_and(|length| length <= request.declaration_limit)
+            super::validate_pagination(
+                pagination,
+                request.max_results,
+                request.page,
+                declarations.len(),
+            )
+            .is_ok()
+                && u64::try_from(declarations.len())
+                    .is_ok_and(|length| length <= request.max_results)
                 && (valid_origin(&symbol.origin, owner, version)
                     || (declarations.is_empty()
                         && symbol.origin.source_kind == SourceKind::Synthetic
@@ -186,9 +178,9 @@ fn valid_result(
                         })
                     })
                 })
-                && (history.is_none() || request.include.contains(&GetSymbolInclude::History))
+                && (history.is_none() || request.include.history)
                 && documentation.as_ref().is_none_or(|context| {
-                    request.include.contains(&GetSymbolInclude::Documentation)
+                    request.include.documentation
                         && valid_documentation(
                             context,
                             &request.id,

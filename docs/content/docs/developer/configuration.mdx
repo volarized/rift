@@ -31,12 +31,12 @@ raised within its range. A value outside that range fails configuration validati
 
 A CI job or a container often needs one bound raised without editing the workspace's
 `rift.toml`. Every key has an environment variable for that: `RIFT_`, then the key's path with
-its members joined by `_` and uppercased. `[providers.syntax] max_nodes` is
-`RIFT_PROVIDERS_SYNTAX_MAX_NODES`, and `[server] port_range.min` is
+its members joined by `_` and uppercased. `[providers.syntax] max_syntax_elements` is
+`RIFT_PROVIDERS_SYNTAX_MAX_SYNTAX_ELEMENTS`, and `[server] port_range.min` is
 `RIFT_SERVER_PORT_RANGE_MIN`:
 
 ```sh
-RIFT_PROVIDERS_SYNTAX_MAX_NODES=5000000 RIFT_PROVIDERS_SYNTAX_MAX_FILE=16mb rift server start
+RIFT_PROVIDERS_SYNTAX_MAX_SYNTAX_ELEMENTS=5000000 RIFT_PROVIDERS_SYNTAX_MAX_FILE=16mb rift server start
 ```
 
 - a variable's value replaces the file's value for its key; a key no variable names keeps the
@@ -99,8 +99,8 @@ requests as soon as the file is accepted.
 <VersionBadge version="v0.0.47" />
 
 Initial source preparation runs in the background. A local read can return prepared files with
-[`local_index_preparing`](/docs/developer/protocol/mcp#reads); a targeted `nodes` read spends
-its remaining `readiness_timeout` budget preparing the requested file. The warning reports
+[`local_index_preparing`](/docs/developer/protocol/mcp#reads). A `facets` read refuses while
+source preparation is incomplete. The warning reports
 incomplete source independently of lexical and vector readiness.
 
 Three additional keys bound background validation and repository serving:
@@ -195,7 +195,7 @@ respect_gitignore = true
 files = 100000
 workspace_size = "512mb"
 declarations = 1000000
-relationships = 10000000
+edges = 10000000
 directory_depth = 64
 ```
 
@@ -235,7 +235,7 @@ leaves the rest out, and reports each one as an unavailable source naming this k
 holds a full index in about 5 GiB, which is room for a workspace twice the size of the largest
 Rift is tested against - raise it on a machine with memory to spare, lower it on one without.
 
-`relationships` bounds relationship edges retained together, 1 to 500000000. The index keeps the
+`edges` bounds edges retained together, 1 to 500000000. The index keeps the
 edges that fit and counts the omitted edges. `directory_depth` bounds the directory levels scanned
 below the workspace root, 1 to 4096; a deeper directory refuses the rebuild naming this key.
 
@@ -277,7 +277,7 @@ max_references = 250000
 max_text = "4kb"
 max_heading_depth = 512
 max_warnings = 256
-max_nodes = 250000
+max_syntax_elements = 250000
 max_depth = 512
 max_progress = 131072
 max_layer_blocks = 2000000
@@ -307,7 +307,7 @@ The collection bounds apply to local documentation and exact-package documentati
 - `max_text` caps one heading, language, destination, or reference spelling, 1b to 1mb
 - `max_heading_depth` caps a block's heading path and heading levels, 1 to 65536
 - `max_warnings` caps retained collection warnings, 1 to 65536
-- `max_nodes` caps a documentation parser's syntax nodes, 1 to 100000000; `max_depth` caps its
+- `max_syntax_elements` caps a documentation parser's syntax elements, 1 to 100000000; `max_depth` caps its
   nesting, 1 to 65536
 - `max_progress` caps one reStructuredText parser's progress callbacks, 1 to 4294967295
 - `max_layer_blocks` caps blocks held across a documentation layer's collections, 1 to 100000000
@@ -326,12 +326,12 @@ most 32 references and 16kb of excerpts. Notebook cell identity and source-range
 license metadata validation, retain their protocol bounds.
 
 A change to the table rebuilds the index. Every key has its `RIFT_DOCUMENTATION_*` variable, such
-as `RIFT_DOCUMENTATION_MAX_FILE` and `RIFT_DOCUMENTATION_MAX_NODES`, under the
+as `RIFT_DOCUMENTATION_MAX_FILE` and `RIFT_DOCUMENTATION_MAX_SYNTAX_ELEMENTS`, under the
 [environment variable rules](#environment-variables). To raise documentation parser bounds for the
 next server start:
 
 ```sh
-RIFT_DOCUMENTATION_MAX_FILE=16mb RIFT_DOCUMENTATION_MAX_NODES=5000000 rift server start
+RIFT_DOCUMENTATION_MAX_FILE=16mb RIFT_DOCUMENTATION_MAX_SYNTAX_ELEMENTS=5000000 rift server start
 ```
 
 ## Dependencies
@@ -411,7 +411,7 @@ the other dependency keys.
 ## Package collection
 
 Exact-package collection separates input and parsing bounds from publication capacity.
-[`[source]`](#source) bounds selected files, source bytes, declarations, and relationships;
+[`[source]`](#source) bounds selected files, source bytes, declarations, and edges;
 [`[providers.syntax]`](#providers) bounds each syntax parse; [`[documentation]`](#documentation)
 bounds collected documentation. `[package]` bounds the records that analysis publishes:
 
@@ -547,8 +547,8 @@ max_source = "1mb"
 max_symbols = 10000
 max_sources = 10000
 max_seeds = 64
-max_facets = 16
-max_relationships = 1000
+max_kinds = 16
+max_edges = 1000
 max_occurrences = 1000
 capabilities_ttl = "15m"
 resolution_ttl = "15m"
@@ -571,9 +571,9 @@ failure_ttl = "30s"
 - `max_source` caps one source payload, including documentation source and excerpts, 1b to 64mb,
   default `1mb`; the client applies the smaller of this value and the source bound the global
   API advertises. Documentation excerpts also keep their separate response bound
-- `max_symbols` and `max_sources` cap original symbol and source records per relationship page
-- `max_seeds` and `max_facets` cap selected subjects and facets per relationship request
-- `max_relationships` and `max_occurrences` cap relationship and occurrence projections per group.
+- `max_symbols` and `max_sources` cap original symbol and source records per edge page
+- `max_seeds` and `max_kinds` cap selected subjects and kinds per edge request
+- `max_edges` and `max_occurrences` cap edge and occurrence projections per group.
   The client applies the smaller of each positive count and the bound the global API advertises
 - `capabilities_ttl` and `resolution_ttl` default to `"15m"` and accept `1m` to `24h`
 - `failure_ttl` defaults to `"30s"` and accepts `1s` to `1h`
@@ -820,8 +820,8 @@ connection and replaces a saved one with the same name.
 
 To read a linked Git worktree through the same connection, register its checkout directory under
 its own name. For example, `rift mcp --extra review=../web-review` serves the linked checkout under
-`local@review`. A `nodes` path read can send `"scope": "local@review"` with a path relative to
-that checkout. `revision` selects a commit in its repository when the read needs committed source.
+`local@review`. A `facets` read takes a symbol whose identity names `local@review`.
+`revision` selects a commit in its repository when the read needs committed source.
 
 <VersionBadge version="v0.0.72" />
 
@@ -1026,7 +1026,7 @@ cpu_share = 0.25
 ```
 
 `enabled = false` turns the history provider off: the server refuses a revision-addressed read -
-a git `revision` on [`get_symbol`](/docs/mcp#tool-get_symbol) or `nodes`, or a git revision selected by `SERVICE :search` - a
+a git `revision` on [`get_symbol`](/docs/mcp#tool-get_symbol) or `facets`, or a git revision selected by `SERVICE :search` - a
 [change comparison](/docs/mcp#search-change), and a [commit search](/docs/mcp#search-commits)
 with `capability_unavailable`. A workspace without version control cannot serve those reads
 whatever this table says.
@@ -1065,12 +1065,12 @@ source every syntax provider takes:
 ```toml
 [providers.syntax]
 max_file = "4mb"
-max_nodes = 250000
+max_syntax_elements = 250000
 max_depth = 512
 ```
 
 - `max_file` bounds the bytes of one source, 1b to 64mb
-- `max_nodes` bounds the syntax nodes one source produces, 1 to 100000000
+- `max_syntax_elements` bounds the syntax elements one source produces, 1 to 100000000
 - `max_depth` bounds how deep one source's syntax tree nests, 1 to 65536
 
 A source past any bound is left out of the index while the rest of the workspace serves: a
@@ -1129,9 +1129,10 @@ of the two on its own, and writes to one wait for that database's turn alone.
 
 <VersionBadge version="v0.0.73" />
 
-`[search.query]` bounds a transport page. `page_size` accepts 1 to 1000 bindings or triples
-and defaults to 50. `page_limit` accepts 1 KiB to 4 MiB of encoded response and defaults to
-4 MiB. Follow `pagination.next_query` to read the remaining pages from the same execution.
+`[search.query] page_limit` accepts 1 KiB to 4 MiB of encoded response and defaults to
+4 MiB. The request selects rows with `page` and `max_results`. A page above the byte bound
+returns a typed error; the caller can reduce `max_results`.
+
 
 <VersionBadge version="v0.0.25" />
 
@@ -1201,7 +1202,7 @@ default_scope = "global"
 - the server refuses `global` and `all` beside `:rev`, `:change`, and a
   [commit search](/docs/developer/protocol/mcp#search-commits), so under either value such a
   service selects `:scope "local"` itself
-- under `global`, `tools/list` serves `search`, `get_symbol`, and `nodes` examples that read a
+- under `global`, `tools/list` serves `search`, `get_symbol`, and `facets` examples that read a
   crates.io release in place of the project examples, so a server that holds no project lists
   examples it answers
 

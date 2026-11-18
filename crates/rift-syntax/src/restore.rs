@@ -222,16 +222,16 @@ impl SyntaxNames {
         })
     }
 
-    /// Returns a named grammar node kind, or `None` for an unknown spelling.
+    /// Returns a named grammar syntax element kind, or `None` for an unknown spelling.
     #[must_use]
-    pub fn node_kind(&self, name: &str) -> Option<&'static str> {
-        let native = grammar_node_kind(self.grammar, name);
+    pub fn syntax_element_kind(&self, name: &str) -> Option<&'static str> {
+        let native = grammar_syntax_element_kind(self.grammar, name);
         if native.is_some() {
             return native;
         }
         self.embedded_languages()
             .iter()
-            .find_map(|shipped| grammar_node_kind(grammar(*shipped), name))
+            .find_map(|shipped| grammar_syntax_element_kind(grammar(*shipped), name))
     }
 
     fn embedded_languages(&self) -> &'static [ShippedLanguage] {
@@ -297,7 +297,7 @@ fn ordered(ranges: impl IntoIterator<Item = ByteRange>) -> Result<(), RiftError>
 }
 
 fn count(count: usize, limits: SyntaxLimits) -> Result<(), RiftError> {
-    if count > limits.syntax_nodes_max() {
+    if count > limits.syntax_elements_max() {
         return Err(errors::syntax::facts_count_exceeded().error());
     }
     Ok(())
@@ -434,8 +434,8 @@ fn validate_symbol(
 ) -> Result<(), RiftError> {
     if names.symbol_kind(symbol.kind).is_none()
         || symbol
-            .node_kind
-            .is_some_and(|kind| names.node_kind(kind).is_none())
+            .syntax_element_kind
+            .is_some_and(|kind| names.syntax_element_kind(kind).is_none())
     {
         return Err(errors::syntax::facts_kind_invalid().error());
     }
@@ -457,7 +457,7 @@ fn validate_symbol(
             return Err(errors::syntax::facts_range_invalid().error());
         }
     }
-    count(symbol.facets.len(), limits)?;
+    count(symbol.kinds.len(), limits)?;
     count(symbol.documentation_ranges.len(), limits)?;
     count(symbol.signatures.len(), limits)?;
     count(symbol.documentation.len(), limits)?;
@@ -547,7 +547,9 @@ fn validate_module_path(
     };
     if language != &ShippedLanguage::Rust.language()
         || symbol.kind != "module"
-        || symbol.node_kind.is_some_and(|kind| kind != "mod_item")
+        || symbol
+            .syntax_element_kind
+            .is_some_and(|kind| kind != "mod_item")
     {
         return Err(errors::syntax::facts_structure_invalid().error());
     }
@@ -762,7 +764,7 @@ fn validate_links(
 impl SyntaxFacts {
     /// Validates and restores normalized facts for exact source bytes and syntax bounds.
     ///
-    /// Each collection is bounded by `limits.syntax_nodes_max()`. Validation checks UTF-8
+    /// Each collection is bounded by `limits.syntax_elements_max()`. Validation checks UTF-8
     /// ranges, source order, provider names, declaration ordinals, and parent references.
     /// Decoded text fits the source byte bound. Signatures retain the source header and
     /// language emitted by the syntax walk; semantic fields must remain empty.
@@ -882,7 +884,10 @@ fn validate_export_bindings(
     Ok(())
 }
 
-fn grammar_node_kind(grammar: &'static tree_sitter::Language, name: &str) -> Option<&'static str> {
+fn grammar_syntax_element_kind(
+    grammar: &'static tree_sitter::Language,
+    name: &str,
+) -> Option<&'static str> {
     let id = grammar.id_for_node_kind(name, true);
     grammar.node_kind_for_id(id).filter(|kind| *kind == name)
 }
@@ -1004,7 +1009,7 @@ fn validate_scope(
                     .chain(&parts.left_out_symbols)
                     .any(|symbol| {
                         symbol.kind == "module"
-                            && symbol.node_kind == Some("mod_item")
+                            && symbol.syntax_element_kind == Some("mod_item")
                             && symbol.body_range == Some(*scope)
                     }))
         {
