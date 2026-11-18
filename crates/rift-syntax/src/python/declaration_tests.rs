@@ -3,7 +3,7 @@
 //! `type` statements, instance attributes, and `__doc__` assignments.
 
 use rift_core::ProjectPath;
-use rift_protocol::read::SymbolFacet;
+use rift_protocol::read::SymbolKind;
 
 use super::*;
 
@@ -71,18 +71,14 @@ fn test_class_bodies_declare_methods_with_member_categories() {
             (
                 symbol.qualified_name.as_str(),
                 symbol.kind,
-                symbol.facets.clone(),
+                symbol.kinds.clone(),
             )
         })
         .collect::<Vec<_>>();
-    let method = |extra: &[SymbolFacet]| {
-        let mut facets = vec![
-            SymbolFacet::Value,
-            SymbolFacet::Callable,
-            SymbolFacet::Member,
-        ];
-        facets.extend_from_slice(extra);
-        facets
+    let method = |extra: &[SymbolKind]| {
+        let mut kinds = vec![SymbolKind::Value, SymbolKind::Callable, SymbolKind::Member];
+        kinds.extend_from_slice(extra);
+        kinds
     };
     assert_eq!(
         declarations,
@@ -91,30 +87,30 @@ fn test_class_bodies_declare_methods_with_member_categories() {
                 "Model",
                 "class",
                 vec![
-                    SymbolFacet::Type,
-                    SymbolFacet::MemberContainer,
-                    SymbolFacet::Constructible,
-                    SymbolFacet::Extensible,
+                    SymbolKind::Type,
+                    SymbolKind::MemberContainer,
+                    SymbolKind::Constructible,
+                    SymbolKind::Extensible,
                 ]
             ),
             (
                 "Model.__init__",
                 "method",
-                method(&[SymbolFacet::Constructor])
+                method(&[SymbolKind::Constructor])
             ),
-            ("Model.label", "method", method(&[SymbolFacet::Property])),
-            ("Model.make", "method", method(&[SymbolFacet::Static])),
-            ("Model.build", "method", method(&[SymbolFacet::Static])),
+            ("Model.label", "method", method(&[SymbolKind::Property])),
+            ("Model.make", "method", method(&[SymbolKind::Static])),
+            ("Model.build", "method", method(&[SymbolKind::Static])),
             ("Model.save", "method", method(&[])),
             (
                 "Model.save.step",
                 "function",
-                vec![SymbolFacet::Value, SymbolFacet::Callable]
+                vec![SymbolKind::Value, SymbolKind::Callable]
             ),
             (
                 "helper",
                 "function",
-                vec![SymbolFacet::Value, SymbolFacet::Callable]
+                vec![SymbolKind::Value, SymbolKind::Callable]
             ),
         ]
     );
@@ -145,8 +141,8 @@ fn test_module_assignments_declare_every_bound_name_and_type_statements() {
     );
     assert_eq!(spelled(text, symbol(&document, "B").range), "B");
     assert_eq!(
-        symbol(&document, "Pair").facets,
-        [SymbolFacet::Type, SymbolFacet::Alias]
+        symbol(&document, "Pair").kinds,
+        [SymbolKind::Type, SymbolKind::Alias]
     );
     assert_eq!(
         spelled(text, symbol(&document, "Pair").range),
@@ -207,15 +203,15 @@ fn test_instance_attributes_assigned_in_methods_declare_class_members() {
         ]
     );
     let name = symbol(&document, "Model.name");
-    assert_eq!(name.facets, [SymbolFacet::Value, SymbolFacet::Member]);
+    assert_eq!(name.kinds, [SymbolKind::Value, SymbolKind::Member]);
     assert_eq!(spelled(text, name.range), "self.name = name");
     assert_eq!(
         name.name_range.map(|range| spelled(text, range)),
         Some("name")
     );
     assert_eq!(
-        symbol(&document, "Model.kind").facets,
-        [SymbolFacet::Value, SymbolFacet::Member]
+        symbol(&document, "Model.kind").kinds,
+        [SymbolKind::Value, SymbolKind::Member]
     );
 }
 
@@ -337,7 +333,7 @@ fn test_module_declaration_retains_documentation_and_distinct_bound_names() {
         .find(|symbol| symbol.kind == "module")
         .expect("each Python file declares its module");
     assert_eq!(module.qualified_name, ".");
-    assert_eq!(module.facets, [SymbolFacet::Namespace, SymbolFacet::Module]);
+    assert_eq!(module.kinds, [SymbolKind::Namespace, SymbolKind::Module]);
     assert_eq!(module.container, None);
     assert_eq!(spelled(text, module.range), text);
     assert_eq!(module.documentation[0].text, "Module docstring.");

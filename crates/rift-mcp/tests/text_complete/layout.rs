@@ -1,32 +1,4 @@
-//! Check of what the compact text of a `search`, `get_symbol`, or `nodes` answer promises.
-//!
-//! The text is a curated layout, so it does not state every field of the structured answer: the
-//! normal state is implicit. This check asserts only what `crates/rift-mcp/src/output/render.rs`
-//! and `render/{layout,facts,search,symbol,nodes}.rs` write for the exceptional state, and
-//! never asserts the absence of other text.
-//!
-//! The text is a sequence of counted sections. A section is a title at column 0, then its
-//! entries indented by one level. Any non-empty line at column 0 is a title. A level is one tab.
-//!
-//! - Items section, always first: the title is `N result` or `N results` (`N node` or `N nodes`
-//!   for `nodes`), then ` · page P/T` when `total_pages > 1` or the page lies past the end. A
-//!   `nodes` answer has no page. No blank line follows the title or separates two items.
-//! - One hit has no marker and indents every line by one level. Several hits each start with
-//!   a numbered marker at one level and indent their further lines by two.
-//! - Per `search` hit, in order: the location, every `matched_by` name, and `score <value>` on the
-//!   location line; the symbol, node, or documented-symbol identity as a line; the returned source
-//!   line by line. A commit hit states its revision cut to 8 characters, author, subject, paths,
-//!   and both truncation flags.
-//! - A `search` hit whose target is `symbol` and whose `traversal_path` has a hop is a walk hit.
-//!   It is no item: the walk hits form a tree after the items, checked by [`walk`]. The items are
-//!   the other hits, and only they take markers. A blank line separates the last item from the
-//!   first root.
-//! - Per `get_symbol` hit: the location line, the symbol identity, every history version, the
-//!   `history (incomplete):` label exactly when the history is incomplete, and the source.
-//!   A single-item answer ends its items section with its source.
-//! - Per `nodes` entry: kind, byte range, address, line count for multiline source, facets, and
-//!   regions on one line. Sources end the section, each after one blank line. The text writes
-//!   the source of each node no earlier node in the same unit encloses.
+//! Checks the compact text of search and symbol reads against their structured results.
 
 mod walk;
 
@@ -43,8 +15,6 @@ const SECTION_LEVELS: usize = 1;
 const MARKER_LEVELS: usize = 1;
 /// Separates the facts of one line.
 const SEPARATOR: &str = " · ";
-/// Separates the facts of a syntax node.
-const NODE_SEPARATOR: &str = " | ";
 /// Characters of a hash that stay when it is cut.
 const HASH_CUT: usize = 8;
 /// Relative difference under which a score token states a score.
@@ -57,15 +27,12 @@ const HISTORY_INCOMPLETE_LABEL: &str = "history (incomplete):";
 const MESSAGE_TRUNCATED_LINE: &str = "message truncated";
 /// Tail of the label of a cut path list.
 const PATHS_TRUNCATED_TAIL: &str = "+ paths · truncated";
-/// Facets of a node that the head line states.
-const NODE_FACT_FACETS: [&str; 2] = ["generated", "test"];
 
 /// The tool whose answer the text states.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum Tool {
     Search,
     GetSymbol,
-    Nodes,
 }
 
 impl Tool {
@@ -74,7 +41,6 @@ impl Tool {
         match self {
             Self::Search => "results",
             Self::GetSymbol => "hits",
-            Self::Nodes => "nodes",
         }
     }
 
@@ -82,7 +48,6 @@ impl Tool {
     fn noun(self) -> &'static str {
         match self {
             Self::Search | Self::GetSymbol => "result",
-            Self::Nodes => "node",
         }
     }
 }
@@ -159,7 +124,6 @@ pub(super) fn text_states(tool: Tool, text: &str, structured: &Value) -> Result<
         rest
     };
     let rest = revision_states(rest, structured.get("revision"))?;
-    let rest = cursor_states(rest, structured.get("node_cursor"))?;
     require(rest.is_empty(), "$.layout", || {
         format!("unexpected section: {}", rest[0].title)
     })?;
@@ -175,11 +139,8 @@ fn items_states(tool: Tool, entries: &[&str], items: &[Value]) -> Result<(), Str
     require(entries.first() != Some(&""), &format!("$.{key}"), || {
         "no blank line may follow the title".to_owned()
     })?;
-    if tool == Tool::Nodes {
-        return node_entries_states(entries, items);
-    }
     let plan = Plan::of(items, tool == Tool::Search)?;
-    let (item_entries, nodes) = plan.split(entries)?;
+    let (item_entries, symbols) = plan.split(entries)?;
     let listed = plan.outside();
     let chunks = chunk_items(&item_entries, listed.len(), key)?;
     for ((index, hit), chunk) in listed.iter().zip(&chunks) {
@@ -197,7 +158,7 @@ fn items_states(tool: Tool, entries: &[&str], items: &[Value]) -> Result<(), Str
             symbol_hit(&item, hit, &at)?;
         }
     }
-    plan.states(&nodes)?;
+    plan.states(&symbols)?;
     if tool == Tool::GetSymbol {
         single_symbol_ends_with_source(entries, items)?;
     }
@@ -275,40 +236,29 @@ fn require(holds: bool, at: &str, what: impl FnOnce() -> String) -> Result<(), S
 /// Checks the count and, for a paged tool, the page of the title of the items section.
 fn title_states(title: &str, count: usize, tool: Tool, structured: &Value) -> Result<(), String> {
     let counted = counted(count, tool.noun());
-    let separator = if tool == Tool::Nodes {
-        NODE_SEPARATOR
-    } else {
-        SEPARATOR
-    };
-    let mut facts = title.split(separator);
+    let mut facts = title.split(SEPARATOR);
     require(
         facts.next() == Some(counted.as_str()),
         &format!("$.{}", tool.items_key()),
         || format!("the title must open with `{counted}`, got `{title}`"),
     )?;
-    if tool == Tool::Nodes {
-        let symbol = text_at(structured, "/symbol");
-        return require(
-            facts.next() == symbol && facts.next().is_none(),
-            "$.symbol",
-            || format!("a nodes title states its symbol alone, got `{title}`"),
-        );
-    }
     let number = |name: &str| {
         structured
             .pointer(&format!("/pagination/{name}"))
             .and_then(Value::as_u64)
             .ok_or_else(|| format!("$.pagination.{name}: must be an integer"))
     };
-    let (page_index, total_pages) = (number("page_index")?, number("total_pages")?);
-    let past_the_end = total_pages > 0 && page_index >= total_pages;
-    if total_pages <= 1 && !past_the_end {
+    let (page, pages) = (number("page")?, number("pages")?);
+    let past_the_end = pages > 0 && page > pages;
+    if pages <= 1 && !past_the_end {
         return Ok(());
     }
-    let page = format!("page {}/{total_pages}", page_index + 1);
-    require(facts.any(|fact| fact == page), "$.pagination", || {
-        format!("the title must state `{page}`, got `{title}`")
-    })
+    let page = format!("page {page}/{pages}");
+    require(
+        facts.any(|fact| fact.starts_with(&page)),
+        "$.pagination",
+        || format!("the title must state `{page}`, got `{title}`"),
+    )
 }
 
 /// The lines of one item, indent removed.
@@ -336,10 +286,10 @@ impl<'a> Item<'a> {
         Ok(Self { lines })
     }
 
-    /// The item of the lines of a tree node, whose `head` has its indent and lead removed.
+    /// The item of the lines of a tree symbol, whose `head` has its indent and lead removed.
     ///
     /// Every further non-empty line must carry `levels` levels.
-    fn node(chunk: &[&'a str], head: &'a str, levels: usize, at: &str) -> Result<Self, String> {
+    fn symbol(chunk: &[&'a str], head: &'a str, levels: usize, at: &str) -> Result<Self, String> {
         let mut lines = vec![head];
         for line in chunk.iter().skip(1) {
             if line.is_empty() {
@@ -506,7 +456,7 @@ fn search_hit(item: &Item<'_>, hit: &Value, at: &str) -> Result<(), String> {
 
 /// Checks `score <value>` among the facts of the location line.
 ///
-/// `distance` is not written: the depth of a node in the tree shows it.
+/// `distance` is not written: the depth of a symbol in the tree shows it.
 fn score_states(facts: &[&str], hit: &Value, at: &str) -> Result<(), String> {
     if let Some(score) = hit.get("score").and_then(Value::as_f64) {
         let stated = facts
@@ -772,98 +722,6 @@ fn edge_states(entry: Option<&str>, edge: &Value, at: &str) -> Result<(), String
     Ok(())
 }
 
-/// Checks one line per syntax node, followed by the written sources.
-fn node_entries_states(entries: &[&str], nodes: &[Value]) -> Result<(), String> {
-    let (rows, sources) = entries
-        .split_at_checked(nodes.len())
-        .ok_or("$.nodes: missing node rows")?;
-    for (index, (row, node)) in rows.iter().zip(nodes).enumerate() {
-        let at = format!("$.nodes[{index}]");
-        let row = row
-            .strip_prefix(INDENT_UNIT)
-            .ok_or_else(|| format!("{at}: missing node row indent"))?;
-        node_entry(row, node, &at)?;
-    }
-    written_sources_states(sources, nodes)
-}
-
-/// Checks the kind, byte range, address, and other facts on one syntax node line.
-fn node_entry(row: &str, node: &Value, at: &str) -> Result<(), String> {
-    let kind = text_at(node, "/kind").ok_or_else(|| format!("{at}.kind: must be a string"))?;
-    let mut facts = row.split(NODE_SEPARATOR);
-    let kind = visible(kind);
-    require(facts.next() == Some(kind.as_str()), at, || {
-        format!("the node row must open with the kind `{kind}`, got `{row}`")
-    })?;
-    let number = |pointer: &str| node.pointer(pointer).and_then(Value::as_u64);
-    let range = format!(
-        "bytes {}..{}",
-        number("/range/start").unwrap_or_default(),
-        number("/range/end").unwrap_or_default(),
-    );
-    require(
-        facts.next() == Some(range.as_str()),
-        &format!("{at}.range"),
-        || format!("the node row must give the byte range `{range}`"),
-    )?;
-    let index = number("/index").ok_or_else(|| format!("{at}.index: must be an integer"))?;
-    let declaration =
-        number("/declaration").map(|declaration| format!("declaration {declaration}"));
-    let parent = number("/parent").map(|parent| format!("parent {parent}"));
-    let address = declaration
-        .into_iter()
-        .chain([format!("index {index}")])
-        .chain(parent);
-    for field in address {
-        require(
-            facts.next() == Some(field.as_str()),
-            &format!("{at}.index"),
-            || format!("the node address must include `{field}` in order"),
-        )?;
-    }
-    let facts = facts.collect::<Vec<_>>();
-    let source =
-        text_at(node, "/source").ok_or_else(|| format!("{at}.source: must be a string"))?;
-    let count = source.lines().count();
-    let counted = format!("{count} lines");
-    require(
-        facts.contains(&counted.as_str()) == (count > 1),
-        &format!("{at}.source"),
-        || format!("`{counted}` must appear exactly when the excerpt has several lines"),
-    )?;
-    let node_facets = node.get("facets").and_then(Value::as_array);
-    for name in NODE_FACT_FACETS {
-        let holds = node_facets
-            .into_iter()
-            .flatten()
-            .any(|facet| facet.as_str() == Some(name));
-        require(
-            facts.contains(&name) == holds,
-            &format!("{at}.facets"),
-            || format!("`{name}` must appear exactly when the facet holds"),
-        )?;
-    }
-    for region in node
-        .get("regions")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let number = |position: &str| region.pointer(position).and_then(Value::as_u64);
-        let at = format!("{at}.regions");
-        let role = text_at(region, "/role").ok_or_else(|| format!("{at}: missing role"))?;
-        let start = number("/range/start").ok_or_else(|| format!("{at}: missing start"))?;
-        let end = number("/range/end").ok_or_else(|| format!("{at}: missing end"))?;
-        let region = format!("{role} {start}..{end}");
-        require(facts.contains(&region.as_str()), &at, || {
-            format!("the node row must state region `{region}`")
-        })?;
-    }
-    Ok(())
-}
-
-/// Checks the `node_cursor CURSOR` line that opens the sections after the items when the answer
-/// carries a cursor, and returns the sections after it.
 /// Checks the `revision` line that ends an answer reporting the revision it was read at,
 /// before any captured view.
 fn revision_states<'text, 'sections>(
@@ -882,82 +740,6 @@ fn revision_states<'text, 'sections>(
         }
         _ => Err("$.revision: the text must state the revision the answer was read at".to_owned()),
     }
-}
-
-fn cursor_states<'text, 'sections>(
-    sections: &'sections [Section<'text>],
-    cursor: Option<&Value>,
-) -> Result<&'sections [Section<'text>], String> {
-    let Some(cursor) = cursor else {
-        return Ok(sections);
-    };
-    let cursor = cursor.as_str().ok_or("$.node_cursor: must be a string")?;
-    match sections.split_first() {
-        Some((first, rest))
-            if first.title == format!("node_cursor {cursor}") && first.entries.is_empty() =>
-        {
-            Ok(rest)
-        }
-        _ => Err("$.node_cursor: the text must state the cursor after the items".to_owned()),
-    }
-}
-
-/// The nodes whose source the text writes: each node no earlier node of the same unit
-/// encloses.
-fn written_nodes(nodes: &[Value]) -> Vec<(usize, &Value)> {
-    fn span(node: &Value) -> (Option<&str>, Option<u64>, Option<u64>) {
-        let number = |name: &str| {
-            node.pointer(&format!("/range/{name}"))
-                .and_then(Value::as_u64)
-        };
-        (text_at(node, "/unit"), number("start"), number("end"))
-    }
-    let mut outermost: Vec<(usize, &Value)> = Vec::new();
-    for (index, node) in nodes.iter().enumerate() {
-        let (unit, start, end) = span(node);
-        let enclosed = outermost.iter().any(|(_, outer)| {
-            let (outer_unit, outer_start, outer_end) = span(outer);
-            outer_unit == unit && outer_start <= start && end <= outer_end
-        });
-        if !enclosed {
-            outermost.push((index, node));
-        }
-    }
-    outermost
-}
-
-/// Checks the source section, with each written source after one blank line.
-///
-/// The sources carry the item indent. An answer without nodes writes no source.
-fn written_sources_states(entries: &[&str], nodes: &[Value]) -> Result<(), String> {
-    let levels = item_indent(nodes.len() > 1);
-    let written = written_nodes(nodes);
-    let Some((last, _)) = written.last() else {
-        return require(entries.is_empty(), "$.nodes", || {
-            "empty node section has entries".to_owned()
-        });
-    };
-    let at = format!("$.nodes[{last}].source");
-    let mut expected = Vec::new();
-    for (index, node) in &written {
-        let source = text_at(node, "/source")
-            .ok_or_else(|| format!("$.nodes[{index}].source: must be a string"))?;
-        expected.push(String::new());
-        expected.extend(indented_lines(source, levels));
-    }
-    require(
-        entries
-            .iter()
-            .copied()
-            .eq(expected.iter().map(String::as_str)),
-        &at,
-        || {
-            format!(
-                "the items section must end with each written source after a blank line, indented by \
-             {levels} levels"
-            )
-        },
-    )
 }
 
 #[cfg(test)]
@@ -1004,7 +786,7 @@ mod tests {
                         "symbol": { "id": "rift://symbol/rust/src/d.rs/d", "name": "d" }
                     },
                     "score": 1.5,
-                    "matched_by": ["relationship", "name"],
+                    "matched_by": ["edge", "name"],
                     "source": "pub fn d() {\n    2\n}",
                     "line": 30,
                     "path": "src/d.rs",
@@ -1012,26 +794,26 @@ mod tests {
                     "traversal_path": [
                         {
                             "direction": "outgoing",
-                            "relationship": {
+                            "edge": {
                                 "from": "rift://symbol/rust/src/m.rs/main",
                                 "to": "rift://symbol/rust/src/b.rs/b",
-                                "facets": ["calls"],
+                                "kinds": ["calls"],
                                 "derivation": "resolution"
                             }
                         },
                         {
                             "direction": "outgoing",
-                            "relationship": {
+                            "edge": {
                                 "from": "rift://symbol/rust/src/b.rs/b",
                                 "to": "rift://symbol/rust/src/d.rs/d",
-                                "facets": ["calls", "has_type"],
+                                "kinds": ["calls", "has_type"],
                                 "derivation": "heuristic"
                             }
                         }
                     ]
                 }
             ],
-            "pagination": { "page_index": 1, "total_pages": 3 }
+            "pagination": {"page": 2, "pages": 3, "max_results": 10, "total": 30}
         })
     }
 
@@ -1112,7 +894,7 @@ mod tests {
                     ]
                 }
             }],
-            "pagination": { "page_index": 0, "total_pages": 1 }
+            "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 10}
         })
     }
 
@@ -1181,7 +963,7 @@ mod tests {
     fn an_empty_answer_needs_only_its_header() {
         let answer = json!({
             "results": [],
-            "pagination": { "page_index": 0, "total_pages": 0 }
+            "pagination": {"page": 1, "pages": 0, "max_results": 10, "total": 0}
         });
         assert_eq!(text_states(Tool::Search, "0 results\n", &answer), Ok(()));
         assert!(text_states(Tool::Search, "0 results\n\t[1] a\n", &answer).is_err());
@@ -1191,7 +973,7 @@ mod tests {
     fn a_page_past_the_end_states_its_page() -> Result<(), String> {
         let answer = json!({
             "results": [],
-            "pagination": { "page_index": 4, "total_pages": 2 }
+            "pagination": {"page": 5, "pages": 2, "max_results": 10, "total": 20}
         });
         assert_eq!(
             text_states(Tool::Search, "0 results · page 5/2\n", &answer),
@@ -1309,13 +1091,13 @@ mod tests {
     }
 
     /// A hop over the edge `from` to `to`, followed in `direction`.
-    fn hop(direction: &str, (from, to): (&str, &str), facets: &[&str], derivation: &str) -> Value {
+    fn hop(direction: &str, (from, to): (&str, &str), kinds: &[&str], derivation: &str) -> Value {
         json!({
             "direction": direction,
-            "relationship": {
+            "edge": {
                 "from": id_of(from),
                 "to": id_of(to),
-                "facets": facets,
+                "kinds": kinds,
                 "derivation": derivation
             }
         })
@@ -1343,7 +1125,7 @@ mod tests {
 
     /// An answer of one page that holds all of `results`.
     fn page_of(results: &[Value]) -> Value {
-        json!({ "results": results, "pagination": { "page_index": 0, "total_pages": 1 } })
+        json!({ "results": results, "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 10} })
     }
 
     /// A `search` answer with one item, a file hit, and two trees. `load_config` is a hit outside
@@ -1369,12 +1151,12 @@ mod tests {
         page_of(&[
             file,
             named_hit("load_config", 10, &["name"], Vec::new()),
-            named_hit("run", 20, &["relationship"], vec![to_run()]),
+            named_hit("run", 20, &["edge"], vec![to_run()]),
             scored(
                 named_hit(
                     "main",
                     9,
-                    &["relationship", "name"],
+                    &["edge", "name"],
                     vec![
                         to_run(),
                         hop("incoming", ("main", "run"), &["calls"], "syntax"),
@@ -1385,7 +1167,7 @@ mod tests {
             named_hit(
                 "reload_config",
                 41,
-                &["relationship"],
+                &["edge"],
                 vec![hop(
                     "incoming",
                     ("reload_config", "load_config"),
@@ -1396,7 +1178,7 @@ mod tests {
             named_hit(
                 "parse",
                 4,
-                &["relationship"],
+                &["edge"],
                 vec![
                     hop("outgoing", ("serve", "handler"), &["calls"], "resolution"),
                     hop(
@@ -1446,7 +1228,7 @@ mod tests {
 \t\t\t\tat rift://symbol/rust/src/parse.rs/parse
 ";
 
-    /// The block of the node `reload_config` of [`WALK_TEXT`], with the blank line before it.
+    /// The block of the symbol `reload_config` of [`WALK_TEXT`], with the blank line before it.
     const RELOAD_BLOCK: &str = "\n\t\t↳ called\n\t\t\tby fn reload_config()\n\t\t\tin src/reload_config.rs:41\n\t\t\tat rift://symbol/rust/src/reload_config.rs/reload_config\n";
 
     /// Asserts the failure of the walk text edited by `from` to `to` names `path`.
@@ -1494,7 +1276,7 @@ mod tests {
     }
 
     #[test]
-    fn a_wrong_relationship_word_is_refused() -> Result<(), String> {
+    fn a_wrong_edge_word_is_refused() -> Result<(), String> {
         walk_refusal(
             "\t\t↳ referenced\n",
             "\t\t↳ calls\n",
@@ -1551,7 +1333,7 @@ mod tests {
         )?;
         let mut answer = walk_answer();
         let hit = &mut answer["results"][4];
-        hit["matched_by"] = json!(["relationship", "name"]);
+        hit["matched_by"] = json!(["edge", "name"]);
         hit.as_object_mut()
             .ok_or("the hit must be an object")?
             .retain(|key, _| key != "path" && key != "line");
@@ -1564,7 +1346,7 @@ mod tests {
     }
 
     #[test]
-    fn the_identity_line_of_a_node_starts_with_at() -> Result<(), String> {
+    fn the_identity_line_of_a_symbol_starts_with_at() -> Result<(), String> {
         walk_refusal(
             "\t\t\tat rift://symbol/rust/src/run.rs/run\n",
             "\t\t\trift://symbol/rust/src/run.rs/run\n",
@@ -1622,7 +1404,7 @@ mod tests {
     }
 
     #[test]
-    fn a_node_at_a_wrong_indent_is_refused() -> Result<(), String> {
+    fn a_symbol_at_a_wrong_indent_is_refused() -> Result<(), String> {
         walk_refusal(
             "\n\t\t↳ called\n\t\t\tby fn reload_config()",
             "\n\t↳ called\n\t\t\tby fn reload_config()",
@@ -1651,7 +1433,7 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_node_is_refused() -> Result<(), String> {
+    fn a_missing_symbol_is_refused() -> Result<(), String> {
         walk_refusal(RELOAD_BLOCK, "", "$.results[4].traversal_path[0]")?;
         walk_refusal(
             "\n\t\t↳ calls\n\t\t\tat rift://symbol/rust/src/handler.rs/handler\n",
@@ -1671,7 +1453,7 @@ mod tests {
     }
 
     #[test]
-    fn a_node_that_comes_before_its_turn_is_refused() -> Result<(), String> {
+    fn a_symbol_that_comes_before_its_turn_is_refused() -> Result<(), String> {
         let swapped = edited(WALK_TEXT, RELOAD_BLOCK, "")?;
         let text = edited(
             &swapped,
@@ -1684,7 +1466,7 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_blank_line_before_a_node_is_refused() -> Result<(), String> {
+    fn a_missing_blank_line_before_a_symbol_is_refused() -> Result<(), String> {
         walk_refusal(
             "\n\n\t\t↳ called\n\t\t\tby fn reload_config()",
             "\n\t\t↳ called\n\t\t\tby fn reload_config()",
@@ -1713,7 +1495,7 @@ mod tests {
     }
 
     #[test]
-    fn a_blank_line_after_the_last_node_is_refused() -> Result<(), String> {
+    fn a_blank_line_after_the_last_symbol_is_refused() -> Result<(), String> {
         let text = format!("{WALK_TEXT}\n");
         let failure = refused(Tool::Search, &text, &walk_answer())?;
         assert!(failure.contains("$.results[5]"), "{failure}");
@@ -1741,13 +1523,13 @@ mod tests {
     }
 
     #[test]
-    fn two_walk_hits_that_reach_one_symbol_under_one_parent_each_get_a_node() -> Result<(), String>
+    fn two_walk_hits_that_reach_one_symbol_under_one_parent_each_get_a_symbol() -> Result<(), String>
     {
         let reach = |line| {
             named_hit(
                 "x",
                 line,
-                &["relationship"],
+                &["edge"],
                 vec![hop("incoming", ("x", "root"), &["calls"], "resolution")],
             )
         };
@@ -1777,10 +1559,10 @@ mod tests {
     }
 
     #[test]
-    fn a_node_leaves_out_the_relationship_field_and_keeps_the_others() -> Result<(), String> {
+    fn a_symbol_leaves_out_the_edge_field_and_keeps_the_others() -> Result<(), String> {
         walk_refusal(
             "in src/main.rs:9 · name",
-            "in src/main.rs:9 · relationship, name",
+            "in src/main.rs:9 · edge, name",
             "$.results[3]",
         )?;
         walk_refusal(
@@ -1806,7 +1588,7 @@ mod tests {
     }
 
     #[test]
-    fn a_node_without_a_hit_writes_its_identity_alone() -> Result<(), String> {
+    fn a_symbol_without_a_hit_writes_its_identity_alone() -> Result<(), String> {
         walk_refusal(
             "handler.rs/handler\n",
             "handler.rs/handler\n\t\t\tsrc/x.rs:1\n",
@@ -1820,7 +1602,7 @@ mod tests {
     }
 
     #[test]
-    fn the_source_of_a_node_follows_a_blank_line_at_its_further_line_indent() -> Result<(), String>
+    fn the_source_of_a_symbol_follows_a_blank_line_at_its_further_line_indent() -> Result<(), String>
     {
         let mut answer = walk_answer();
         answer["results"][5]["source"] = json!("fn parse() {\n    1\n}");
@@ -1916,8 +1698,8 @@ mod tests {
     }
 
     #[test]
-    fn a_hop_reads_a_facet_by_its_direction() {
-        // Direction, facet, head line words, and whether the declaration line starts with `by `.
+    fn a_hop_reads_a_kind_by_its_direction() {
+        // Direction, kind, head line words, and whether the declaration line starts with `by `.
         let cases = [
             ("incoming", "has_type", "type of", false),
             ("incoming", "annotated_by", "annotates", false),
@@ -1929,34 +1711,34 @@ mod tests {
             ("outgoing", "mixes_in", "mixes in", false),
             ("outgoing", "calls", "calls", false),
         ];
-        for (direction, facet, words, by) in cases {
+        for (direction, kind, words, by) in cases {
             let answer = page_of(&[named_hit(
                 "x",
                 1,
-                &["relationship"],
-                vec![hop(direction, ("x", "x"), &[facet], "resolution")],
+                &["edge"],
+                vec![hop(direction, ("x", "x"), &[kind], "resolution")],
             )]);
             let word = if by { "by " } else { "" };
             let text = format!(
                 "1 result\n\tat rift://symbol/rust/src/x.rs/x\n\n\t\t↳ {words}\n\t\t\t{word}fn x()\n\t\t\tin src/x.rs:1\n\t\t\tat rift://symbol/rust/src/x.rs/x\n"
             );
-            assert_eq!(text_states(Tool::Search, &text, &answer), Ok(()), "{facet}");
+            assert_eq!(text_states(Tool::Search, &text, &answer), Ok(()), "{kind}");
             let wrong = text.replace(words, "touches");
             assert!(
                 text_states(Tool::Search, &wrong, &answer).is_err(),
-                "{facet}"
+                "{kind}"
             );
         }
     }
 
     #[test]
-    fn several_facets_move_by_only_when_every_phrase_ends_in_it() {
-        let hit = |facets: &[&str]| {
+    fn several_kinds_move_by_only_when_every_phrase_ends_in_it() {
+        let hit = |kinds: &[&str]| {
             page_of(&[named_hit(
                 "x",
                 1,
-                &["relationship"],
-                vec![hop("incoming", ("x", "root"), facets, "resolution")],
+                &["edge"],
+                vec![hop("incoming", ("x", "root"), kinds, "resolution")],
             )])
         };
         let all = "1 result\n\tat rift://symbol/rust/src/root.rs/root\n\n\t\t↳ called, referenced\n\t\t\tby fn x()\n\t\t\tin src/x.rs:1\n\t\t\tat rift://symbol/rust/src/x.rs/x\n";
@@ -2107,7 +1889,7 @@ mod tests {
                 },
                 { "hit": { "target": "file", "size": 3 }, "unit": "rift://source/p/a.rs" }
             ],
-            "pagination": { "page_index": 0, "total_pages": 1 }
+            "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 10}
         });
         let text = "\
 2 results
@@ -2133,186 +1915,5 @@ mod tests {
         assert_eq!(cut_hash("0123456789abcdef"), "01234567");
         assert_eq!(cut_hash("main"), "main");
         assert_eq!(cut_hash("0123456"), "0123456");
-    }
-
-    /// A `nodes` answer: an outer node with a symbol, regions, and facets, and an inner node.
-    fn nodes_answer() -> Value {
-        json!({
-            "nodes": [
-                {
-                    "declaration": 0,
-                    "index": 0,
-                    "kind": "function_item",
-                    "facets": ["declaration", "test", "generated"],
-                    "range": { "start": 0, "end": 20 },
-                    "source": "fn a() {\n    b\n}\n// tail",
-                    "regions": [
-                        { "role": "name", "range": { "start": 3, "end": 4 } },
-                        { "role": "body", "range": { "start": 8, "end": 20 } }
-                    ]
-                },
-                {
-                    "index": 1,
-                    "kind": "identifier",
-                    "range": { "start": 21, "end": 29 },
-                    "source": "a\n\nb"
-                }
-            ]
-        })
-    }
-
-    /// The text the layout writes for [`nodes_answer`].
-    const NODES_TEXT: &str = "\
-2 nodes
-\tfunction_item | bytes 0..20 | declaration 0 | index 0 | 4 lines | generated | test | name 3..4 | body 8..20
-\tidentifier | bytes 21..29 | index 1 | 3 lines
-
-\t\tfn a() {
-\t\t    b
-\t\t}
-\t\t// tail
-
-\t\ta
-
-\t\tb
-";
-
-    /// Asserts the failure of the nodes text edited by `from` to `to` names `path`.
-    fn nodes_refusal(from: &str, to: &str, path: &str) -> Result<(), String> {
-        let text = edited(NODES_TEXT, from, to)?;
-        let failure = refused(Tool::Nodes, &text, &nodes_answer())?;
-        assert!(failure.contains(path), "{path} not in {failure}");
-        Ok(())
-    }
-
-    #[test]
-    fn the_layout_text_of_nodes_passes() {
-        assert_eq!(
-            text_states(Tool::Nodes, NODES_TEXT, &nodes_answer()),
-            Ok(())
-        );
-    }
-
-    #[test]
-    fn one_node_has_no_marker_and_no_indent() {
-        let answer = json!({
-            "nodes": [{
-                "index": 1,
-                "kind": "identifier",
-                "range": { "start": 3, "end": 9 },
-                "source": "name"
-            }]
-        });
-        let text = "1 node\n\tidentifier | bytes 3..9 | index 1\n\n\tname\n";
-        assert_eq!(text_states(Tool::Nodes, text, &answer), Ok(()));
-        let indented = text.replace("\n\tname\n", "\n\t\tname\n");
-        assert!(text_states(Tool::Nodes, &indented, &answer).is_err());
-    }
-
-    #[test]
-    fn an_empty_nodes_answer_needs_only_its_header() {
-        let answer = json!({ "nodes": [] });
-        assert_eq!(text_states(Tool::Nodes, "0 nodes\n", &answer), Ok(()));
-        assert!(text_states(Tool::Nodes, "1 node\n", &answer).is_err());
-    }
-
-    #[test]
-    fn a_wrong_node_count_or_a_page_in_the_header_is_refused() -> Result<(), String> {
-        nodes_refusal("2 nodes", "3 nodes", "$.nodes")?;
-        nodes_refusal("2 nodes", "2 results", "$.nodes")
-    }
-
-    #[test]
-    fn a_node_head_states_its_kind_range_and_identity_in_order() -> Result<(), String> {
-        nodes_refusal("function_item", "block", "$.nodes[0]")?;
-        nodes_refusal("bytes 0..20", "bytes 0..21", "$.nodes[0].range")?;
-        nodes_refusal("index 0", "index 2", "$.nodes[0].index")?;
-        nodes_refusal("identifier", "function_item", "$.nodes[1]")?;
-        nodes_refusal("bytes 21..29 | ", "", "$.nodes[1].range")?;
-        nodes_refusal("index 1", "index 2", "$.nodes[1].index")?;
-        nodes_refusal(" | name 3..4 | body 8..20", "", "$.nodes[0].regions")?;
-        nodes_refusal("name 3..4", "name 3..5", "$.nodes[0].regions")
-    }
-
-    #[test]
-    fn the_line_count_and_the_facets_appear_exactly_when_they_hold() -> Result<(), String> {
-        nodes_refusal(" | 4 lines", "", "$.nodes[0].source")?;
-        nodes_refusal(" | 3 lines", "", "$.nodes[1].source")?;
-        nodes_refusal("index 0 | 4 lines", "index 0", "$.nodes[0].source")?;
-        nodes_refusal(" | generated", "", "$.nodes[0].facets")?;
-        nodes_refusal(" | test", "", "$.nodes[0].facets")?;
-        let answer = with(nodes_answer(), "/nodes/1/kind", json!("block"))?;
-        let text = edited(NODES_TEXT, "identifier", "block")?;
-        assert_eq!(text_states(Tool::Nodes, &text, &answer), Ok(()));
-        let spurious = edited(NODES_TEXT, "index 1 | 3 lines", "index 1 | 2 lines")?;
-        let failure = refused(Tool::Nodes, &spurious, &nodes_answer())?;
-        assert!(failure.contains("$.nodes[1].source"), "{failure}");
-        Ok(())
-    }
-
-    #[test]
-    fn each_outermost_source_ends_the_text_after_a_blank_line() -> Result<(), String> {
-        nodes_refusal("\t\ta\n\n\t\tb\n", "\t\ta\n\n\t\tc\n", "$.nodes[1].source")?;
-        nodes_refusal("\t\ta\n\n\t\tb\n", "\t\ta\n\n\t\t b\n", "$.nodes[1].source")?;
-        nodes_refusal("\t\ta\n\n\t\tb\n", "\t\ta\n\nb\n", "$.layout")?;
-        let blank = edited(NODES_TEXT, "// tail\n\n\t\ta", "// tail\n\t\ta")?;
-        let failure = refused(Tool::Nodes, &blank, &nodes_answer())?;
-        assert!(failure.contains("$.nodes[1].source"), "{failure}");
-        Ok(())
-    }
-
-    #[test]
-    fn a_symbol_answer_writes_each_outermost_source_then_its_cursor() {
-        let answer = json!({
-            "symbol": "rift://symbol/rust/a.rs/A",
-            "nodes": [
-                {
-                    "declaration": 0,
-                    "index": 0,
-                    "unit": "rift://source/project/a.rs",
-                    "kind": "function_item",
-                    "range": { "start": 0, "end": 9 },
-                    "source": "fn a() {}"
-                },
-                {
-                    "declaration": 0,
-                    "index": 2,
-                    "parent": 0,
-                    "unit": "rift://source/project/a.rs",
-                    "kind": "identifier",
-                    "range": { "start": 3, "end": 4 },
-                    "source": "a"
-                },
-                {
-                    "declaration": 1,
-                    "index": 0,
-                    "unit": "rift://source/project/b.rs",
-                    "kind": "function_item",
-                    "range": { "start": 0, "end": 9 },
-                    "source": "fn a() {}"
-                }
-            ],
-            "node_cursor": "3.0123456789abcdef"
-        });
-        let text = "3 nodes | rift://symbol/rust/a.rs/A\n\tfunction_item | bytes 0..9 | declaration 0 | index 0\n\tidentifier | bytes 3..4 | declaration 0 | index 2 | parent 0\n\tfunction_item | bytes 0..9 | declaration 1 | index 0\n\n\t\tfn a() {}\n\n\t\tfn a() {}\nnode_cursor 3.0123456789abcdef\n";
-        assert_eq!(text_states(Tool::Nodes, text, &answer), Ok(()));
-        let one_source = text.replace("\n\n\t\tfn a() {}\nnode_cursor", "\nnode_cursor");
-        assert!(text_states(Tool::Nodes, &one_source, &answer).is_err());
-        let without_cursor = text.replace("node_cursor 3.0123456789abcdef\n", "");
-        let failure = text_states(Tool::Nodes, &without_cursor, &answer)
-            .expect_err("the cursor line is required");
-        assert!(failure.contains("$.node_cursor"), "{failure}");
-    }
-
-    #[test]
-    fn warnings_in_text_or_structured_content_are_refused() -> Result<(), String> {
-        let text = format!("{NODES_TEXT}1 warning\n\tstale_index: index lags\n");
-        let failure = refused(Tool::Nodes, &text, &nodes_answer())?;
-        assert!(failure.contains("$.layout"), "{failure}");
-        let mut answer = nodes_answer();
-        answer["warnings"] = json!([]);
-        let failure = refused(Tool::Nodes, NODES_TEXT, &answer)?;
-        assert!(failure.contains("$.warnings"), "{failure}");
-        Ok(())
     }
 }

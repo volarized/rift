@@ -17,7 +17,7 @@ pub struct DocumentationLimits {
     pub(super) text_bytes_max: u64,
     pub(super) heading_depth_max: u32,
     pub(super) warnings_max: u32,
-    pub(super) nodes_max: u32,
+    pub(super) syntax_elements_max: u32,
     pub(super) depth_max: u32,
     pub(super) progress_callbacks_max: u32,
     pub(super) layer_blocks_max: u32,
@@ -55,7 +55,7 @@ impl DocumentationLimits {
             text_bytes_max: configuration.max_text.bytes(),
             heading_depth_max: configuration.max_heading_depth,
             warnings_max: configuration.max_warnings,
-            nodes_max: configuration.max_nodes,
+            syntax_elements_max: configuration.max_syntax_elements,
             depth_max: configuration.max_depth,
             progress_callbacks_max: configuration.max_progress,
             layer_blocks_max: configuration.max_layer_blocks,
@@ -104,7 +104,7 @@ impl DocumentationLimits {
         })?;
         rift_syntax::SyntaxLimits::new(
             source_bytes_max,
-            self.nodes_max as usize,
+            self.syntax_elements_max as usize,
             self.depth_max as usize,
         )
     }

@@ -69,7 +69,7 @@ async fn source_exclude_drops_an_already_indexed_file_from_symbol_search_and_the
 
     // Baseline: both files are indexed before the exclusion lands.
     let symbol_arguments = json!({
-        "query": "phantom_generated", "target": "symbol", "include": ["source"],
+        "query": "phantom_generated", "target": "symbol", "include": {"source": true},
         "paths": {"include": ["phantom_symbol.rs"]},
     });
     let symbol = search_after_population(&client, &symbol_arguments).await?;

@@ -347,7 +347,7 @@ fn explicit_python_reexports_alias_the_defining_declaration() {
     let publication = analysis.publication();
     let prefix = "rift://symbol/stdlib/python/python/";
     let mut aliases = publication
-        .relationships
+        .edges
         .iter()
         .filter_map(|edge| {
             Some((

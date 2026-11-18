@@ -52,7 +52,7 @@ async fn incoming_references(configuration: &str) -> TestResult {
         tool_request(
             "search_retrieval",
             &json!({"target":"symbol", "traversal":{
-                "seed":seed, "direction":"incoming", "facets":["references"]
+                "seed":seed, "direction":"incoming", "kinds":["references"]
             }}),
         ),
     )
@@ -70,18 +70,11 @@ async fn incoming_references(configuration: &str) -> TestResult {
         .ok_or("caller must carry its traversal path")?;
     assert_eq!(path.len(), 1, "{answer:#}");
     assert_eq!(path[0]["direction"], json!("incoming"), "{answer:#}");
-    let relationship = &path[0]["relationship"];
-    assert_eq!(
-        relationship["from"], hit["hit"]["symbol"]["id"],
-        "{answer:#}"
-    );
-    assert_eq!(relationship["to"], json!(seed), "{answer:#}");
-    assert_eq!(relationship["facets"], json!(["references"]), "{answer:#}");
-    assert_eq!(
-        relationship["derivation"],
-        json!("resolution"),
-        "{answer:#}"
-    );
+    let edge = &path[0]["edge"];
+    assert_eq!(edge["from"], hit["hit"]["symbol"]["id"], "{answer:#}");
+    assert_eq!(edge["to"], json!(seed), "{answer:#}");
+    assert_eq!(edge["kinds"], json!(["references"]), "{answer:#}");
+    assert_eq!(edge["derivation"], json!("resolution"), "{answer:#}");
     assert_eq!(
         std::fs::read_to_string(directory.path().join("service.py"))?,
         SERVICE

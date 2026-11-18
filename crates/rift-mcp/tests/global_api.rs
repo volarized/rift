@@ -1,10 +1,10 @@
 //! A fixture global API on a loopback port.
 //!
-//! It answers the capability, resolution, symbol, nodes, search, and pattern endpoints
+//! It answers the capability, resolution, symbol, syntax elements, search, and pattern endpoints
 //! `rift-cloud-client` reads, and records every request it receives. Its collection holds
 //! one package, [`COLLECTED`], whose `src/lib.rs` declares [`DECLARATIONS`]; a symbol
-//! request answers the declaration it names, a nodes request that declaration's syntax
-//! nodes, a search request the declarations its
+//! request answers the declaration it names, a syntax elements request that declaration's syntax
+//! syntax elements, a search request the declarations its
 //! identifiers match, and a pattern request the matches of its pattern in that file, so
 //! each answer passes the client's own validation. The
 //! collected release also answers, as the nearest release, an exact `demo` entry at another
@@ -68,9 +68,6 @@ pub(crate) const PAGE_LIMIT_ADVERTISED: u64 = 200;
 /// The `dependency_entries_max` the fixture's capabilities advertise unless a test sets
 /// another: the client's own bound.
 const DEPENDENCY_ENTRIES_ADVERTISED: u64 = 20_000;
-
-/// The cursor a search page stopped at the response body bound names.
-pub(crate) const BODY_BOUND_CURSOR: &str = "after-body-bound";
 
 /// The query the fixture answers with `beacon` matched inside its body: a word no
 /// declaration name holds, so the hit claims the `unknown` class and `file_content`.
@@ -152,7 +149,7 @@ pub(crate) enum SymbolFixture {
 pub(crate) enum Hold {
     /// The resolution endpoint's answer.
     Resolution(Duration),
-    /// The symbol, nodes, and search endpoints' answers.
+    /// The symbol, syntax elements, and search endpoints' answers.
     Read(Duration),
     /// The declarations endpoint's answer.
     Declarations(Duration),
@@ -230,7 +227,7 @@ impl FixtureState {
         }
     }
 
-    /// Waits out the read hold, when the fixture holds symbol, nodes, and search answers.
+    /// Waits out the read hold, when the fixture holds symbol, syntax elements, and search answers.
     async fn hold_read(&self) {
         if let Some(Hold::Read(delay)) = self.options.hold {
             tokio::time::sleep(delay).await;
@@ -325,18 +322,20 @@ async fn global_handler(
         .is_some_and(|value| value == "1");
     let uri = request.uri().to_string();
     let path = request.uri().path().to_owned();
-    let limit = request
-        .uri()
-        .query()
-        .and_then(|query| {
-            query
-                .split('&')
-                .find_map(|member| member.strip_prefix("limit="))
-        })
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or_else(|| {
-            usize::try_from(PAGE_LIMIT_ADVERTISED).expect("advertised page bound fits usize")
-        });
+    let query = request.uri().query().map(str::to_owned);
+    let number = |field: &str, default: u64| {
+        query
+            .as_deref()
+            .and_then(|query| {
+                query
+                    .split('&')
+                    .find_map(|member| member.strip_prefix(field))
+            })
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(default)
+    };
+    let page_number = number("page=", 1);
+    let max_results = number("max_results=", 10);
     let Ok(bytes) = to_bytes(request.into_body(), REQUEST_BODY_BYTES_MAX).await else {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     };
@@ -377,24 +376,36 @@ async fn global_handler(
             options.stopped_at_body_bound,
             options.query_narrowed,
         );
-        bound_case_page(&mut page, options.symbol, limit);
+        page = numbered_result(page, "items", page_number, max_results);
         return state.response(page);
     }
     if path.ends_with("/symbols") {
         state.hold_read().await;
-        return state.response(symbols(options.symbol, &body));
+        return state.response(numbered_result(
+            symbols(options.symbol, &body),
+            "declarations",
+            body["page"].as_u64().unwrap_or(1),
+            body["max_results"].as_u64().unwrap_or(10),
+        ));
     }
-    if path.ends_with("/nodes") {
+    if path.ends_with("/facets") {
         state.hold_read().await;
-        return symbol_nodes(&body).map_or_else(
+        return symbol_kinds(&body).map_or_else(
             || problem_response(StatusCode::NOT_FOUND),
-            |nodes| state.response(nodes),
+            |syntax_elements| {
+                state.response(numbered_result(
+                    syntax_elements,
+                    "declarations",
+                    body["page"].as_u64().unwrap_or(1),
+                    body["max_results"].as_u64().unwrap_or(10),
+                ))
+            },
         );
     }
     if path.ends_with("/patterns") {
         return pattern_page(&body).map_or_else(
             || StatusCode::BAD_REQUEST.into_response(),
-            |page| state.response(page),
+            |page| state.response(numbered_result(page, "items", page_number, max_results)),
         );
     }
     StatusCode::NOT_FOUND.into_response()
@@ -426,15 +437,6 @@ fn problem_response(status: StatusCode) -> Response {
 }
 
 /// Applies the requested page bound to the case regression's already ranked declarations.
-fn bound_case_page(page: &mut Value, fixture: SymbolFixture, limit: usize) {
-    if matches!(fixture, SymbolFixture::CasePairs) {
-        page["items"]
-            .as_array_mut()
-            .expect("a page carries items")
-            .truncate(limit);
-    }
-}
-
 /// The capabilities the fixture advertises under `options`, every feature it serves but
 /// the withheld ones.
 fn capabilities(options: &FixtureOptions) -> Value {
@@ -447,7 +449,7 @@ fn capabilities(options: &FixtureOptions) -> Value {
         "symbol_documentation",
         "patterns",
         "declarations",
-        "nodes",
+        "facets",
     ]
     .into_iter()
     .filter(|feature| !withheld.contains(feature))
@@ -474,8 +476,7 @@ fn capabilities(options: &FixtureOptions) -> Value {
             "packages_max": 20000,
             "page_limit_min": 1,
             "page_limit_max": options.page_limit_max,
-            "page_limit_default": 20,
-            "cursor_bytes_max": 4096,
+            "page_limit_default": 10,
             "candidate_pool_max": 1000,
             "warnings_max": 32,
             "source_bytes_max": 1_048_576
@@ -701,13 +702,13 @@ fn release_revision(id: &str) -> Value {
     )
 }
 
-/// The nodes of the collected declaration `request` names, as a symbol read of
-/// [`COLLECTED_SOURCE`] lists them: the item node, then its visibility, name, parameters,
+/// The syntax elements of the collected declaration `request` names, as a symbol read of
+/// [`COLLECTED_SOURCE`] lists them: the item syntax element, then its visibility, name, parameters,
 /// and body, in the fixture's view when the request names one. `None` for any other symbol.
-fn symbol_nodes(request: &Value) -> Option<Value> {
+fn symbol_kinds(request: &Value) -> Option<Value> {
     let id = request["symbol"].as_str()?;
     if id == named_identity(&NAMED_POSITIONS[0]) {
-        return Some(runtime_nodes(request));
+        return Some(runtime_facets(request));
     }
     let name = DECLARATIONS
         .into_iter()
@@ -721,26 +722,35 @@ fn symbol_nodes(request: &Value) -> Option<Value> {
         ("parameters", "pub fn ".len() + name.len(), "()"),
         ("block", item.len() - "{}".len(), "{}"),
     ];
-    let nodes = parts
+    let syntax_elements = parts
         .into_iter()
         .enumerate()
         .map(|(index, (kind, offset, source))| {
-            let node_start = start + offset;
-            let mut node = json!({
+            let syntax_element_start = start + offset;
+            let mut syntax_element = json!({
                 "declaration": 0, "index": index, "unit": COLLECTED_UNIT, "language": "rust",
                 "kind": kind,
-                "range": {"start": node_start, "end": node_start + source.len()},
+                "range": {"start": syntax_element_start, "end": syntax_element_start + source.len()},
                 "source": source,
             });
             if index == 0 {
-                node["facets"] = json!(["declaration", "definition"]);
+                syntax_element["kinds"] = json!(["declaration", "definition"]);
             } else {
-                node["parent"] = json!(0);
+                syntax_element["parent"] = json!(0);
             }
-            node
+            syntax_element
         })
         .collect::<Vec<_>>();
-    Some(json!({"symbol": id, "nodes": nodes, "revision": release_revision(id)}))
+    Some(facet_answer(id, &release_revision(id), &syntax_elements))
+}
+
+fn facet_answer(id: &str, revision: &Value, syntax: &[Value]) -> Value {
+    let root = &syntax[0];
+    json!({"symbol":id,"revision":revision,"declarations":[{
+        "declaration":root["declaration"],"kind":root["kind"],"range":root["range"],
+        "source":{"span":{"unit":root["unit"],"range":root["range"]},"text":root["source"]},
+        "syntax":syntax
+    }]})
 }
 
 /// The byte range of the runtime `len` declaration in the embedded standard library stub.
@@ -755,18 +765,22 @@ fn runtime_declaration() -> (usize, usize) {
     (start, end)
 }
 
-/// The item node of the runtime `len` declaration, carrying the embedded standard library
+/// The item syntax element of the runtime `len` declaration, carrying the embedded standard library
 /// stub's own bytes at its range, at the release the request names.
-fn runtime_nodes(request: &Value) -> Value {
+fn runtime_facets(request: &Value) -> Value {
     let builtins = python_runtime::builtins();
     let (start, end) = runtime_declaration();
     let source = &builtins[start..end];
-    let mut answer = json!({"symbol": named_identity(&NAMED_POSITIONS[0]), "nodes": [{
-        "declaration": 0, "index": 0,
-        "unit": named_unit(&NAMED_POSITIONS[0]), "language": "python",
-        "kind": "function_definition", "facets": ["declaration", "definition"],
-        "range": {"start": start, "end": end}, "source": source,
-    }], "revision": release_revision(&named_identity(&NAMED_POSITIONS[0]))});
+    let mut answer = facet_answer(
+        &named_identity(&NAMED_POSITIONS[0]),
+        &release_revision(&named_identity(&NAMED_POSITIONS[0])),
+        &[json!({
+            "declaration": 0, "index": 0,
+            "unit": named_unit(&NAMED_POSITIONS[0]), "language": "python",
+            "kind": "function_definition", "kinds": ["declaration", "definition"],
+            "range": {"start": start, "end": end}, "source": source,
+        })],
+    );
     if let Some(revision) = request.get("revision") {
         answer["revision"] = revision.clone();
     }
@@ -882,9 +896,7 @@ fn search_page(
         "detail": "the page stopped at response_body_bytes_max"
     });
     warnings.push(truncated);
-    let mut stopped = page(&items, &json!(warnings));
-    stopped["next_cursor"] = json!(BODY_BOUND_CURSOR);
-    stopped
+    page(&items, &json!(warnings))
 }
 
 /// One body match retaining the declaration's original identity and source.
@@ -1014,9 +1026,7 @@ fn matched_declarations(
 }
 
 fn includes_source(request: &Value) -> bool {
-    request["include"]
-        .as_array()
-        .is_some_and(|fields| fields.iter().any(|field| field == "source"))
+    request["include"]["source"] == Value::Bool(true)
 }
 
 /// The wire spelling of `class`, and the field it was proved against.
@@ -1085,4 +1095,23 @@ fn collected_hit(fixture: SymbolFixture, declaration: &str, with_source: bool) -
         hit["source"] = json!(&source[range]);
     }
     hit
+}
+
+fn numbered_result(mut value: Value, key: &str, page: u64, max_results: u64) -> Value {
+    let Some(items) = value[key].as_array() else {
+        return value;
+    };
+    let pagination = rift_protocol::read::Pagination::new(page, max_results, items.len() as u64);
+    let selected: Vec<_> = items
+        .iter()
+        .skip(pagination.offset())
+        .take(usize::try_from(max_results).expect("fixture count fits usize"))
+        .cloned()
+        .collect();
+    value[key] = json!(selected);
+    value["pagination"] = serde_json::to_value(pagination).expect("pagination");
+    if key == "items" {
+        value["revision"] = value["corpus_revision"].clone();
+    }
+    value
 }

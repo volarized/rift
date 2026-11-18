@@ -34,7 +34,7 @@ async fn test_collection_documentation_source_uses_smaller_configured_and_advert
     let page: PackageSearchPage = serde_json::from_value(value).expect("documentation page");
     let mut request = search_request();
     request.target = Some(PackageSearchRequestTarget::Documentation);
-    request.include = Some(vec!["source".to_owned()]);
+    request.include = Some(crate::PackageSearchRequestInclude { source: Some(true) });
     let document = "[global]\nmax_source = \"1b\"\n";
     let config = accepted_config(
         document,
@@ -42,18 +42,18 @@ async fn test_collection_documentation_source_uses_smaller_configured_and_advert
         "https://example.test",
     );
     assert_registered_field(
-        &validate_search_page(&request, &capabilities, &page, None, config.max_source)
+        &validate_search_page(&request, &capabilities, &page, config.max_source)
             .expect_err("configured bound refusal"),
         "rift.client.response_invalid",
         "source",
     );
     let environment = ConfigurationEnvironment::from_variables([("RIFT_GLOBAL_MAX_SOURCE", "5b")]);
     let config = accepted_config(document, &environment, "https://example.test");
-    validate_search_page(&request, &capabilities, &page, None, config.max_source)
+    validate_search_page(&request, &capabilities, &page, config.max_source)
         .expect("exact configured documentation source bound");
     capabilities.bounds.source_bytes_max = 4;
     assert_registered_field(
-        &validate_search_page(&request, &capabilities, &page, None, config.max_source)
+        &validate_search_page(&request, &capabilities, &page, config.max_source)
             .expect_err("configured bound refusal"),
         "rift.client.response_invalid",
         "source",
@@ -72,7 +72,7 @@ async fn test_collection_documentation_source_uses_smaller_configured_and_advert
             "documentation": documentation, "excerpt": "guide"}]
     });
     let mut request = request;
-    request.include = vec![GetSymbolInclude::Documentation];
+    request.include.documentation = true;
     let error = canonical_symbol_response(value.clone(), &request, 1)
         .await
         .expect_err("configured excerpt bound");
@@ -168,11 +168,11 @@ async fn test_collection_config_and_environment_deliver_source_past_default_boun
     .await
     .expect("fixture server");
     let mut search = search_request();
-    search.include = Some(vec!["source".to_owned()]);
+    search.include = Some(crate::PackageSearchRequestInclude { source: Some(true) });
     let default = GlobalClient::new(server.config()).expect("default client");
     assert_registered_field(
         &default
-            .search_packages(&search, 20, None)
+            .search_packages(&search, 20, 1)
             .await
             .expect_err("configured bound refusal"),
         "rift.client.response_invalid",
@@ -188,7 +188,7 @@ async fn test_collection_config_and_environment_deliver_source_past_default_boun
     );
     let client = GlobalClient::new(config).expect("configured client");
     let page = client
-        .search_packages(&search, 20, None)
+        .search_packages(&search, 20, 1)
         .await
         .expect("configured source accepted");
     let candidate =
@@ -213,18 +213,21 @@ async fn test_collection_config_and_environment_deliver_source_past_default_boun
     assert_eq!(config.max_response, 4 << 20);
     assert_eq!(config.max_source, 2 << 20);
     let client = GlobalClient::new(config).expect("environment client");
-    let nodes = client
-        .nodes(&super::nodes::nodes_request())
+    let facets = client
+        .facets(&super::facets::facets_request())
         .await
-        .expect("configured node source");
+        .expect("configured syntax element source");
     assert_eq!(
-        nodes.nodes.first().map(|node| node.source.len()),
+        facets
+            .declarations
+            .first()
+            .map(|declaration| declaration.source.text.len()),
         Some(source_bytes)
     );
     let mut patterns = pattern::pattern_request();
-    patterns.include = Some(vec!["source".to_owned()]);
+    patterns.include = Some(crate::PackagePatternRequestInclude { source: Some(true) });
     let page = client
-        .search_package_patterns(&patterns, 20, None)
+        .search_package_patterns(&patterns, 20, 1)
         .await
         .expect("configured pattern source");
     let candidate = PackagePatternMatch::try_from(page.items.first().expect("pattern item"))
@@ -254,13 +257,13 @@ async fn test_collection_operations_use_smaller_advertised_and_configured_bounds
     .await
     .expect("fixture server");
     let mut search = search_request();
-    search.include = Some(vec!["source".to_owned()]);
+    search.include = Some(crate::PackageSearchRequestInclude { source: Some(true) });
     let mut config = server.config();
     config.max_source = 2 << 20;
     let client = GlobalClient::new(config).expect("configured client");
     assert_registered_field(
         &client
-            .search_packages(&search, 20, None)
+            .search_packages(&search, 20, 1)
             .await
             .expect_err("configured bound refusal"),
         "rift.client.response_invalid",
@@ -271,7 +274,7 @@ async fn test_collection_operations_use_smaller_advertised_and_configured_bounds
     config.max_request = 1;
     let client = GlobalClient::new(config).expect("request bound client");
     let error = client
-        .search_packages(&search, 20, None)
+        .search_packages(&search, 20, 1)
         .await
         .expect_err("request body bound refusal");
     assert_eq!(error.slug().as_str(), "rift.client.body_limit");
@@ -280,7 +283,7 @@ async fn test_collection_operations_use_smaller_advertised_and_configured_bounds
     config.max_response = 4096;
     let client = GlobalClient::new(config).expect("response bound client");
     let error = client
-        .search_packages(&search, 20, None)
+        .search_packages(&search, 20, 1)
         .await
         .expect_err("response body bound refusal");
     assert_eq!(error.slug().as_str(), "rift.client.body_limit");

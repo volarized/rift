@@ -42,32 +42,39 @@ fn vue_setup_and_ordinary_scripts_keep_original_unicode_offsets_and_styles() {
             .iter()
             .any(|symbol| symbol.name == "title")
     );
-    assert!(document.nodes().iter().any(|node| node.kind == "rule_set"));
     assert!(
         document
-            .nodes()
+            .syntax_elements()
             .iter()
-            .any(|node| node.kind == "interpolation")
+            .any(|syntax_element| syntax_element.kind == "rule_set")
     );
     assert!(
         document
-            .nodes()
+            .syntax_elements()
             .iter()
-            .all(|node| node.range.end <= text.len() as u64)
+            .any(|syntax_element| syntax_element.kind == "interpolation")
     );
     assert!(
         document
-            .nodes()
+            .syntax_elements()
+            .iter()
+            .all(|syntax_element| syntax_element.range.end <= text.len() as u64)
+    );
+    assert!(
+        document
+            .syntax_elements()
             .iter()
             .enumerate()
-            .all(|(index, node)| node.parent.is_none_or(|parent| parent < index))
+            .all(|(index, syntax_element)| syntax_element
+                .parent
+                .is_none_or(|parent| parent < index))
     );
     let names = SyntaxNames::new(document.language()).expect("component vocabulary");
-    for node in document.nodes() {
+    for syntax_element in document.syntax_elements() {
         assert!(
-            names.node_kind(node.kind).is_some(),
-            "stored node {} must restore",
-            node.kind
+            names.syntax_element_kind(syntax_element.kind).is_some(),
+            "stored syntax element {} must restore",
+            syntax_element.kind
         );
     }
     for symbol in document.symbols() {
@@ -90,20 +97,30 @@ fn svelte_template_control_flow_and_typescript_script_share_host_ranges() {
             .iter()
             .any(|symbol| symbol.name == "beams")
     );
-    assert!(document.nodes().iter().any(|node| node.kind.contains("if")));
     assert!(
         document
-            .nodes()
+            .syntax_elements()
             .iter()
-            .any(|node| node.kind.contains("each"))
+            .any(|syntax_element| syntax_element.kind.contains("if"))
     );
     assert!(
         document
-            .nodes()
+            .syntax_elements()
             .iter()
-            .any(|node| node.kind == "expression")
+            .any(|syntax_element| syntax_element.kind.contains("each"))
     );
-    assert!(document.nodes().iter().any(|node| node.kind == "rule_set"));
+    assert!(
+        document
+            .syntax_elements()
+            .iter()
+            .any(|syntax_element| syntax_element.kind == "expression")
+    );
+    assert!(
+        document
+            .syntax_elements()
+            .iter()
+            .any(|syntax_element| syntax_element.kind == "rule_set")
+    );
 }
 
 #[test]
@@ -118,43 +135,45 @@ fn component_malformed_source_reports_errors_and_unknown_embedded_languages_stay
     assert!(document.symbols().is_empty());
     assert_eq!(
         document
-            .nodes()
+            .syntax_elements()
             .iter()
-            .filter(|node| node.kind == "raw_text")
+            .filter(|syntax_element| syntax_element.kind == "raw_text")
             .count(),
         3
     );
     assert!(
         !document
-            .nodes()
+            .syntax_elements()
             .iter()
-            .any(|node| node.kind == "program" || node.kind == "stylesheet")
+            .any(|syntax_element| syntax_element.kind == "program"
+                || syntax_element.kind == "stylesheet")
     );
 }
 
 #[test]
-fn combined_component_nodes_cross_one_aggregate_bound() {
+fn combined_component_syntax_elements_cross_one_aggregate_bound() {
     let text = "<script>export const beam = 1;</script><script>export const light = 2;</script><style>.beam { color:red; }</style>";
     let provider = VueSyntaxProvider::default();
     let complete = analyze(&provider, text);
     let path = ProjectPath::new("src/Beacon.vue").expect("fixture path");
     let source = SyntaxSource { path: &path, text };
-    let limits =
-        SyntaxLimits::new(text.len(), complete.nodes().len() - 1, 128).expect("positive bounds");
+    let limits = SyntaxLimits::new(text.len(), complete.syntax_elements().len() - 1, 128)
+        .expect("positive bounds");
     let error = provider
         .analyze(source, limits)
         .expect_err("combined syntax exceeds bound");
     assert_eq!(
         error.slug(),
-        rift_error::errors::syntax::too_many_nodes::SLUG
+        rift_error::errors::syntax::too_many_syntax_elements::SLUG
     );
-    let exact = SyntaxLimits::new(text.len(), complete.nodes().len(), 128).expect("exact bounds");
+    let exact =
+        SyntaxLimits::new(text.len(), complete.syntax_elements().len(), 128).expect("exact bounds");
     assert_eq!(
         provider
             .analyze(source, exact)
             .expect("exact bound")
-            .nodes(),
-        complete.nodes()
+            .syntax_elements(),
+        complete.syntax_elements()
     );
     let small_source = SyntaxLimits::new(text.len() - 1, 1000, 128).expect("positive bounds");
     assert_eq!(
@@ -181,7 +200,10 @@ fn angular_external_template_parses_bindings_pipes_and_control_flow() {
         "if_statement",
     ] {
         assert!(
-            document.nodes().iter().any(|node| node.kind == kind),
+            document
+                .syntax_elements()
+                .iter()
+                .any(|syntax_element| syntax_element.kind == kind),
             "Angular grammar must expose {kind}"
         );
     }
@@ -203,27 +225,37 @@ fn angular_inline_template_preserves_typescript_identity_and_unicode_offsets() {
     assert!(!template.has_errors());
     assert!(
         template
-            .nodes()
+            .syntax_elements()
             .iter()
-            .all(|node| node.range.start >= range.start && node.range.end <= range.end)
+            .all(|syntax_element| syntax_element.range.start >= range.start
+                && syntax_element.range.end <= range.end)
     );
     let host = TypeScriptDialect::TypeScript
         .provider()
         .analyze(source, SyntaxLimits::default())
         .expect("TypeScript component");
-    let host_count = host.nodes().len();
+    let host_count = host.syntax_elements().len();
     let document = append_angular_templates(source, SyntaxLimits::default(), &host, &[range])
         .expect("combined templates");
     assert_eq!(document.language(), host.language());
     assert_eq!(document.symbols(), host.symbols());
-    assert_eq!(document.nodes().len(), host_count + template.nodes().len());
-    assert!(document.nodes().iter().any(|node| node.kind == "pipe_call"));
-    let limits = SyntaxLimits::new(text.len(), document.nodes().len() - 1, 128).expect("bounds");
+    assert_eq!(
+        document.syntax_elements().len(),
+        host_count + template.syntax_elements().len()
+    );
+    assert!(
+        document
+            .syntax_elements()
+            .iter()
+            .any(|syntax_element| syntax_element.kind == "pipe_call")
+    );
+    let limits =
+        SyntaxLimits::new(text.len(), document.syntax_elements().len() - 1, 128).expect("bounds");
     assert_eq!(
         append_angular_templates(source, limits, &host, &[range])
-            .expect_err("aggregate nodes")
+            .expect_err("aggregate syntax elements")
             .slug(),
-        rift_error::errors::syntax::too_many_nodes::SLUG
+        rift_error::errors::syntax::too_many_syntax_elements::SLUG
     );
 }
 
@@ -241,8 +273,8 @@ fn angular_component_ownership_requires_runtime_import_and_class_decorator() {
     assert_eq!(
         components.len(),
         3,
-        "components={components:?}; nodes={:?}",
-        document.nodes()
+        "components={components:?}; syntax_elements={:?}",
+        document.syntax_elements()
     );
     assert_eq!(components[0].templates.len(), 2);
     let AngularTemplate::Inline { range } = components[0].templates[0] else {
@@ -345,22 +377,22 @@ fn component_host_and_embedded_depth_share_exact_configured_bound() {
     let document = provider
         .analyze(source, SyntaxLimits::default())
         .expect("Vue syntax");
-    let mut depths = Vec::with_capacity(document.nodes().len());
-    for node in document.nodes() {
-        depths.push(node.parent.map_or(0, |parent| depths[parent] + 1));
+    let mut depths = Vec::with_capacity(document.syntax_elements().len());
+    for syntax_element in document.syntax_elements() {
+        depths.push(syntax_element.parent.map_or(0, |parent| depths[parent] + 1));
     }
     let depth = *depths.iter().max().expect("root depth");
-    let admitted =
-        SyntaxLimits::new(text.len(), document.nodes().len(), depth).expect("exact bounds");
+    let admitted = SyntaxLimits::new(text.len(), document.syntax_elements().len(), depth)
+        .expect("exact bounds");
     assert_eq!(
         provider
             .analyze(source, admitted)
             .expect("exact depth")
-            .nodes(),
-        document.nodes()
+            .syntax_elements(),
+        document.syntax_elements()
     );
-    let refused =
-        SyntaxLimits::new(text.len(), document.nodes().len(), depth - 1).expect("reduced depth");
+    let refused = SyntaxLimits::new(text.len(), document.syntax_elements().len(), depth - 1)
+        .expect("reduced depth");
     assert_eq!(
         provider
             .analyze(source, refused)
@@ -401,7 +433,7 @@ fn angular_empty_inline_template_retains_existing_typescript_facts() {
         combined.facts().origin(),
         rift_syntax::SyntaxOrigin::Framework
     );
-    assert_eq!(combined.nodes(), host.nodes());
+    assert_eq!(combined.syntax_elements(), host.syntax_elements());
     assert_eq!(combined.symbols(), host.symbols());
     assert_eq!(combined.language(), host.language());
     assert_eq!(combined.source_digest(), host.source_digest());

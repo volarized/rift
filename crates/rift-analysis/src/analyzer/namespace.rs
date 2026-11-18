@@ -46,6 +46,9 @@ pub(crate) struct PreparedNamespace {
     pub(crate) mappings: BTreeMap<String, BTreeMap<String, rift_syntax::LogicalDeclaration>>,
     pub(crate) exports: Vec<ExportBinding>,
     pub(crate) unresolved_exports: bool,
+    /// Original file paths no namespace reaches by construction: their declarations carry
+    /// no identity because the language assigns none there, not because analysis failed.
+    pub(crate) outside_namespaces: BTreeSet<String>,
 }
 
 pub(crate) fn placed_aliases(
@@ -123,6 +126,7 @@ pub(crate) fn prepare_context(
     prepared.anchors.extend(rust.anchors);
     prepared.exports.extend(rust.exports);
     prepared.unresolved_exports |= rust.unresolved_exports;
+    prepared.outside_namespaces.extend(rust.outside_namespaces);
     let mut roots = input.import_roots().to_vec();
     for root in python::import_roots(input) {
         if !roots.iter().any(|accepted| {

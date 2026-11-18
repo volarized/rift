@@ -720,7 +720,7 @@ fn supplied_markdown_syntax_keeps_selected_parser_bounds() {
 
     for configuration in [
         DocumentationConfiguration {
-            max_nodes: 1,
+            max_syntax_elements: 1,
             ..DocumentationConfiguration::default()
         },
         DocumentationConfiguration {

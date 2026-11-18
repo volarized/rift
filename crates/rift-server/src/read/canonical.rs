@@ -208,15 +208,15 @@ impl LocalSymbolViewInput {
     ///
     /// # Errors
     /// Returns a syntax read or graph admission refusal before completing the projection.
-    pub fn project_nodes(
+    pub fn project_syntax_elements(
         &self,
         reads: &ReadService,
-        selection: rift_search::sparql::NodeSelection<'_>,
+        selection: rift_search::sparql::SyntaxSelection<'_>,
         dataset: &mut rift_search::sparql::GraphDatasetBuilder,
         cancellation: &rift_search::sparql::QueryCancellation,
         deadline: std::time::Instant,
     ) -> Result<(), RiftError> {
-        use rift_protocol::read::{NodesParams, SymbolId};
+        use rift_protocol::read::{FacetsParams, SymbolId};
         use rift_search::sparql::SymbolAddress;
 
         self.project_symbols(selection.symbols, dataset, cancellation, deadline)?;
@@ -230,22 +230,26 @@ impl LocalSymbolViewInput {
             ) {
                 continue;
             }
-            let mut request = NodesParams::of(id.clone());
+            let mut request = FacetsParams::of(id.clone());
             loop {
                 check_graph_projection(cancellation, deadline)?;
-                let page = reads.nodes(&request)?;
-                for node in page.nodes {
-                    dataset.insert_declared_node(&id, &node, selection.source)?;
+                let page = reads.facets(&request)?;
+                for syntax_element in page
+                    .declarations
+                    .into_iter()
+                    .flat_map(|declaration| declaration.syntax)
+                {
+                    dataset.insert_declared_syntax_element(
+                        &id,
+                        &syntax_element,
+                        selection.source,
+                    )?;
                 }
-                let Some(cursor) = page.node_cursor else {
+                if request.page >= page.pagination.pages {
                     break;
-                };
-                if request.node_cursor.as_ref() == Some(&cursor) {
-                    return errors::server::search_coverage_unavailable()
-                        .operation("graph syntax nodes")
-                        .fail();
                 }
-                request.node_cursor = Some(cursor);
+                request.revision = Some(page.revision);
+                request.page += 1;
             }
         }
         Ok(())

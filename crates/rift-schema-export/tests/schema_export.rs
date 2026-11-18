@@ -32,12 +32,12 @@ fn check_request(directory: &tempfile::TempDir) -> TestResult<export::ExportRequ
     ])?)
 }
 
-/// Node paths retain the shared character class. Canonical symbol and source paths
+/// Syntax element paths retain the shared character class. Canonical symbol and source paths
 /// accept encoded `@` and refuse ambiguous separators through their complete schemas.
 #[test]
 fn every_served_identity_pattern_spells_its_path_with_the_shared_class() -> TestResult {
-    fn patterns(node: &Value, found: &mut Vec<String>) {
-        match node {
+    fn patterns(syntax_element: &Value, found: &mut Vec<String>) {
+        match syntax_element {
             Value::Object(members) => {
                 for (key, value) in members {
                     match value {
@@ -201,10 +201,36 @@ fn package_index_schema_document_is_deterministic() -> TestResult {
 #[test]
 fn global_contract_target_validates_the_published_contract() -> TestResult {
     let request = export::parse_arguments([
+        "--check".to_owned(),
         "--global-contract".to_owned(),
         repository_root()?.join("docs").display().to_string(),
     ])?;
     export::run(&request)?;
+    Ok(())
+}
+
+#[test]
+fn global_contract_write_restores_shared_models_and_keeps_route_examples() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let public = directory.path().join("public");
+    fs::create_dir_all(&public)?;
+    let path = public.join("global-api.openapi.json");
+    let source = repository_root()?.join("docs/public/global-api.openapi.json");
+    let mut document: Value = serde_json::from_slice(&fs::read(source)?)?;
+    let routes = document["paths"].clone();
+    document["components"]["schemas"]["FacetsParams"] = serde_json::json!({});
+    fs::write(&path, serde_json::to_vec(&document)?)?;
+    let request = export::parse_arguments([
+        "--global-contract".to_owned(),
+        directory.path().display().to_string(),
+    ])?;
+    export::run(&request)?;
+    let generated: Value = serde_json::from_slice(&fs::read(&path)?)?;
+    assert_eq!(generated["paths"], routes);
+    assert_eq!(
+        generated["components"]["schemas"]["FacetsParams"]["required"],
+        serde_json::json!(["symbol"])
+    );
     Ok(())
 }
 
@@ -215,6 +241,7 @@ fn global_contract_target_reports_contract_drift() -> TestResult {
     fs::create_dir_all(&public)?;
     fs::write(public.join("global-api.openapi.json"), "{}")?;
     let request = export::parse_arguments([
+        "--check".to_owned(),
         "--global-contract".to_owned(),
         directory.path().display().to_string(),
     ])?;

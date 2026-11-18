@@ -772,7 +772,7 @@ fn markdown_facts(input: &DocumentationInput<'_>) -> Result<Arc<SyntaxFacts>, Ri
         }
         let accepted = input.limits();
         let bounds_accepted = syntax.syntax_limits().is_some_and(|bounds| {
-            bounds.syntax_nodes_max() <= accepted.nodes_max as usize
+            bounds.syntax_elements_max() <= accepted.syntax_elements_max as usize
                 && bounds.syntax_depth_max() <= accepted.depth_max as usize
         });
         if bounds_accepted {

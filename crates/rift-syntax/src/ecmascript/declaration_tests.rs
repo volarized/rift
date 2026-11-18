@@ -2,7 +2,7 @@
 //! plain variables: abstract classes, class fields, enum members,
 //! destructured bindings, and declarations nested in callables.
 
-use rift_protocol::read::SymbolFacet;
+use rift_protocol::read::SymbolKind;
 
 use super::*;
 use crate::javascript::JavaScriptSyntaxProvider;
@@ -78,11 +78,11 @@ fn test_abstract_class_declares_a_class_containing_its_members() {
         ]
     );
     let shape = symbol(&document, "Shape");
-    assert!(shape.facets.contains(&SymbolFacet::Abstract));
-    assert!(shape.facets.contains(&SymbolFacet::Public));
+    assert!(shape.kinds.contains(&SymbolKind::Abstract));
+    assert!(shape.kinds.contains(&SymbolKind::Public));
     let area = symbol(&document, "Shape.area");
-    assert!(area.facets.contains(&SymbolFacet::Abstract));
-    assert!(area.facets.contains(&SymbolFacet::Callable));
+    assert!(area.kinds.contains(&SymbolKind::Abstract));
+    assert!(area.kinds.contains(&SymbolKind::Callable));
     assert_eq!(
         area.signatures
             .first()
@@ -112,7 +112,7 @@ fn test_class_fields_and_parameter_properties_declare_class_properties() {
         ]
     );
     let sides = symbol(&document, "Shape.sides");
-    assert_eq!(sides.facets, [SymbolFacet::Value, SymbolFacet::Member]);
+    assert_eq!(sides.kinds, [SymbolKind::Value, SymbolKind::Member]);
     assert_eq!(
         sides.documentation.first().map(|doc| doc.text.as_str()),
         Some("Side count.")
@@ -167,7 +167,7 @@ fn test_enum_members_declare_under_their_enum() {
         ]
     );
     let member = symbol(&document, "Kind.B");
-    assert_eq!(member.facets, [SymbolFacet::Variant]);
+    assert_eq!(member.kinds, [SymbolKind::Variant]);
     assert_eq!(
         member.name_range.map(|range| spelled(text, range)),
         Some("B")
@@ -194,7 +194,7 @@ fn test_destructured_bindings_declare_one_variable_per_bound_name() {
                     symbol.qualified_name.as_str(),
                     symbol.kind,
                     spelled(text, symbol.range),
-                    symbol.facets.contains(&SymbolFacet::Public),
+                    symbol.kinds.contains(&SymbolKind::Public),
                 )
             })
             .collect::<Vec<_>>();
@@ -259,8 +259,8 @@ fn test_anonymous_default_class_contains_its_members() {
         );
         assert!(
             symbol(&document, "default")
-                .facets
-                .contains(&SymbolFacet::Public)
+                .kinds
+                .contains(&SymbolKind::Public)
         );
     }
 }
@@ -271,24 +271,20 @@ fn test_anonymous_default_class_contains_its_members() {
 fn test_function_valued_variables_carry_the_callable_category() {
     let text = "export const make = (n) => n;\nconst legacy = function () {};\nconst plain = 1;\n";
     for document in [javascript(text), typescript(text)] {
-        let facets = document
+        let kinds = document
             .symbols()
             .iter()
-            .map(|symbol| (symbol.name.as_str(), symbol.facets.clone()))
+            .map(|symbol| (symbol.name.as_str(), symbol.kinds.clone()))
             .collect::<Vec<_>>();
         assert_eq!(
-            facets,
+            kinds,
             [
                 (
                     "make",
-                    vec![
-                        SymbolFacet::Value,
-                        SymbolFacet::Callable,
-                        SymbolFacet::Public
-                    ]
+                    vec![SymbolKind::Value, SymbolKind::Callable, SymbolKind::Public]
                 ),
-                ("legacy", vec![SymbolFacet::Value, SymbolFacet::Callable]),
-                ("plain", vec![SymbolFacet::Value]),
+                ("legacy", vec![SymbolKind::Value, SymbolKind::Callable]),
+                ("plain", vec![SymbolKind::Value]),
             ]
         );
     }

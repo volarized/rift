@@ -6,7 +6,7 @@
 
 use std::sync::OnceLock;
 
-use rift_protocol::read::{Language, NodeFacet};
+use rift_protocol::read::{Language, SyntaxKind};
 
 use crate::document::SyntaxDocument;
 use crate::ecmascript::{self, EcmaScriptKinds};
@@ -49,8 +49,8 @@ impl SyntaxProvider for JavaScriptSyntaxProvider {
         )
     }
 
-    fn node_facets(&self, kind: &str) -> Vec<NodeFacet> {
-        ecmascript::node_facets(kind)
+    fn syntax_element_kinds(&self, kind: &str) -> Vec<SyntaxKind> {
+        ecmascript::syntax_element_kinds(kind)
     }
 }
 
@@ -68,7 +68,7 @@ pub(crate) fn javascript_kinds() -> &'static EcmaScriptKinds {
 #[cfg(test)]
 mod tests {
     use rift_core::{PROVIDER_SYMBOL_ID_BYTES_MAX, ProjectPath};
-    use rift_protocol::read::SymbolFacet;
+    use rift_protocol::read::SymbolKind;
 
     use super::*;
 
@@ -167,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    fn test_exported_declarations_carry_the_public_facet_and_no_visibility() {
+    fn test_exported_declarations_carry_the_public_kind_and_no_visibility() {
         let text = "export function shipped() {}\nexport const limit = 1;\nexport default class Router {}\nfunction hidden() {}\n";
         let document = analyze(text);
         let facts = document
@@ -176,7 +176,7 @@ mod tests {
             .map(|symbol| {
                 (
                     symbol.name.as_str(),
-                    symbol.facets.contains(&SymbolFacet::Public),
+                    symbol.kinds.contains(&SymbolKind::Public),
                     symbol.visibility.clone(),
                 )
             })
@@ -193,7 +193,7 @@ mod tests {
     }
 
     /// Every qualified name `document` declares, beside whether it carries the
-    /// `Public` facet.
+    /// `Public` kind.
     fn public_facts(document: &SyntaxDocument) -> Vec<(&str, bool)> {
         document
             .symbols()
@@ -201,7 +201,7 @@ mod tests {
             .map(|symbol| {
                 (
                     symbol.qualified_name.as_str(),
-                    symbol.facets.contains(&SymbolFacet::Public),
+                    symbol.kinds.contains(&SymbolKind::Public),
                 )
             })
             .collect()
@@ -369,34 +369,30 @@ mod tests {
     }
 
     #[test]
-    fn test_document_facets_render_kind_categories() {
+    fn test_document_kinds_render_kind_categories() {
         let document = analyze(
             "export function shipped() {}\nclass Router { route() {} }\nconst limit = 1;\n",
         );
-        let facets = document
+        let kinds = document
             .symbols()
             .iter()
-            .map(|symbol| symbol.facets.clone())
+            .map(|symbol| symbol.kinds.clone())
             .collect::<Vec<_>>();
         assert_eq!(
-            facets,
+            kinds,
             [
-                vec![
-                    SymbolFacet::Value,
-                    SymbolFacet::Callable,
-                    SymbolFacet::Public
-                ],
-                vec![SymbolFacet::Type],
-                vec![SymbolFacet::Value, SymbolFacet::Callable],
-                vec![SymbolFacet::Value],
+                vec![SymbolKind::Value, SymbolKind::Callable, SymbolKind::Public],
+                vec![SymbolKind::Type],
+                vec![SymbolKind::Value, SymbolKind::Callable],
+                vec![SymbolKind::Value],
             ]
         );
     }
 
     /// Body ranges span the statement block, class body, or declarator
-    /// value, and stay absent where the node omits the field.
+    /// value, and stay absent where the syntax element omits the field.
     #[test]
-    fn test_body_range_present_exactly_where_the_node_declares_one() {
+    fn test_body_range_present_exactly_where_the_syntax_element_declares_one() {
         let text = "function compute() { return 1; }\nclass Router { route() {} }\nlet bare;\nconst limit = 3;\n";
         let document = analyze(text);
         let spans = document
@@ -430,7 +426,7 @@ mod tests {
 
     /// An exported declaration's complete span starts at `export`, the
     /// statement carrying it, while `item_range` stays the declaration's own
-    /// node; a plain comment before the statement stays outside both.
+    /// syntax element; a plain comment before the statement stays outside both.
     #[test]
     fn test_declaration_range_starts_at_the_statement_carrying_it() {
         let text = "// a note\nexport function shipped() {}\nfunction local() {}\n";
@@ -499,7 +495,7 @@ mod tests {
 
     /// The span climbs with the walk: the `JSDoc` above `export` or `const`
     /// sits inside the declaration's `range`, so reading the declaration's
-    /// source shows it. A second declarator starts at its own node.
+    /// source shows it. A second declarator starts at its own syntax element.
     #[test]
     fn jsdoc_above_export_or_const_sits_inside_the_range() {
         let text = "/** Exported. */\nexport function shown() {}\n\
@@ -557,12 +553,12 @@ mod tests {
         let document = analyze(text);
         assert!(!document.has_errors());
         assert_eq!(document.symbols()[0].name, "Banner");
-        assert!(document.symbols()[0].facets.contains(&SymbolFacet::Public));
+        assert!(document.symbols()[0].kinds.contains(&SymbolKind::Public));
         assert!(
             document
-                .nodes()
+                .syntax_elements()
                 .iter()
-                .any(|node| node.kind == "jsx_element"),
+                .any(|syntax_element| syntax_element.kind == "jsx_element"),
             "the parsed tree must carry the JSX element"
         );
     }
@@ -596,11 +592,11 @@ mod tests {
     fn test_provider_reports_malformed_tree_without_dropping_facts() {
         let document = analyze("function broken( {\n");
         assert!(document.has_errors());
-        assert!(!document.nodes().is_empty());
+        assert!(!document.syntax_elements().is_empty());
     }
 
     #[test]
-    fn test_provider_enforces_source_node_and_depth_limits() {
+    fn test_provider_enforces_source_syntax_element_and_depth_limits() {
         let source_error = JavaScriptSyntaxProvider::default()
             .analyze(
                 SyntaxSource {
@@ -615,7 +611,7 @@ mod tests {
             rift_error::errors::syntax::source_too_large::SLUG
         );
 
-        let node_error = JavaScriptSyntaxProvider::default()
+        let syntax_element_error = JavaScriptSyntaxProvider::default()
             .analyze(
                 SyntaxSource {
                     path: &path(),
@@ -623,10 +619,10 @@ mod tests {
                 },
                 SyntaxLimits::new(100, 1, 10).expect("positive limits"),
             )
-            .expect_err("node bound");
+            .expect_err("syntax element bound");
         assert_eq!(
-            node_error.slug(),
-            rift_error::errors::syntax::too_many_nodes::SLUG
+            syntax_element_error.slug(),
+            rift_error::errors::syntax::too_many_syntax_elements::SLUG
         );
 
         let depth_error = JavaScriptSyntaxProvider::default()
@@ -644,7 +640,7 @@ mod tests {
         );
     }
 
-    /// An empty source parses to a bare program node under any positive
+    /// An empty source parses to a bare program syntax element under any positive
     /// bound.
     #[test]
     fn test_empty_source_parses_with_no_symbols() {
@@ -702,9 +698,9 @@ mod tests {
             .find(|symbol| symbol.name == "useState")
             .expect("original property binding");
         assert_eq!(symbol.kind, "function");
-        assert_eq!(symbol.node_kind, Some("assignment_expression"));
-        assert!(symbol.facets.contains(&SymbolFacet::Callable));
-        assert!(!symbol.facets.contains(&SymbolFacet::Public));
+        assert_eq!(symbol.syntax_element_kind, Some("assignment_expression"));
+        assert!(symbol.kinds.contains(&SymbolKind::Callable));
+        assert!(!symbol.kinds.contains(&SymbolKind::Public));
         assert_eq!(
             &source[usize::try_from(symbol.item_range.start).expect("item start")
                 ..usize::try_from(symbol.item_range.end).expect("item end")],
@@ -748,8 +744,8 @@ mod tests {
         );
         assert!(symbols[0].range.end < symbols[1].range.start);
         for symbol in symbols {
-            assert_eq!(symbol.node_kind, Some("assignment_expression"));
-            assert!(!symbol.facets.contains(&SymbolFacet::Public));
+            assert_eq!(symbol.syntax_element_kind, Some("assignment_expression"));
+            assert!(!symbol.kinds.contains(&SymbolKind::Public));
         }
         let changed = analyze(&source.replace("return 2", "return 3"));
         assert_eq!(changed.symbols().len(), document.symbols().len());
@@ -773,7 +769,7 @@ mod tests {
                 .iter()
                 .find(|symbol| symbol.name == "open")
                 .expect("physical anonymous property binding");
-            assert!(!symbol.facets.contains(&SymbolFacet::Public), "{source}");
+            assert!(!symbol.kinds.contains(&SymbolKind::Public), "{source}");
             assert!(
                 document
                     .facts()
@@ -840,8 +836,8 @@ mod tests {
                     symbol.range.start,
                     u64::try_from(expected_start).expect("supplied source offset")
                 );
-                assert_eq!(symbol.node_kind, Some("assignment_expression"));
-                assert!(!symbol.facets.contains(&SymbolFacet::Public));
+                assert_eq!(symbol.syntax_element_kind, Some("assignment_expression"));
+                assert!(!symbol.kinds.contains(&SymbolKind::Public));
                 let start = usize::try_from(symbol.item_range.start).expect("item start");
                 let end = usize::try_from(symbol.item_range.end).expect("item end");
                 assert!(source[start..end].starts_with(prefix));

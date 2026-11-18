@@ -228,7 +228,7 @@ fn is_string(literal: &Literal) -> bool {
 fn term_bytes(term: &Term) -> usize {
     match term {
         Term::NamedNode(iri) => iri.as_str().len(),
-        Term::BlankNode(node) => node.as_str().len(),
+        Term::BlankNode(syntax_element) => syntax_element.as_str().len(),
         Term::Literal(literal) => literal.value().len(),
     }
 }

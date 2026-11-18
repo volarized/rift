@@ -1,6 +1,6 @@
 //! Text of the `search` hits, each laid out per target variant.
 //!
-//! Hits a relationship walk reached are written as a tree by the `walk` module.
+//! Hits an edge walk reached are written as a tree by the `walk` module.
 
 use rift_protocol::documentation::DocumentationHit;
 use rift_protocol::read::{ProjectPath, SourceUnitId, Symbol, SymbolId, TextRange};
@@ -65,7 +65,7 @@ fn split(hit: &SearchHit) -> (&SearchHitTarget, HitView<'_>) {
     (target, view)
 }
 
-/// Writes a `search` answer: the hits outside a relationship walk as items, then the walk.
+/// Writes a `search` answer: the hits outside an edge walk as items, then the walk.
 pub(super) fn answer(
     out: &mut TextWriter,
     page: &Page<'_>,
@@ -78,7 +78,7 @@ pub(super) fn answer(
     })
 }
 
-/// The first hop and the further hops of the relationship path that reached `hit`, when its
+/// The first hop and the further hops of the edge path that reached `hit`, when its
 /// target is a symbol and it carries hops.
 pub(super) fn walked(hit: &SearchHit) -> Option<(&GraphHop, &[GraphHop])> {
     let (target, view) = split(hit);
@@ -96,7 +96,7 @@ pub(super) fn symbol_id(hit: &SearchHit) -> Option<&SymbolId> {
     }
 }
 
-/// Writes one search hit outside a relationship walk.
+/// Writes one search hit outside an edge walk.
 fn hit(lines: &mut Lines<'_>, hit: &SearchHit) -> Result<(), TextError> {
     let (target, view) = split(hit);
     match target {
@@ -141,11 +141,11 @@ fn matched_facts(
     Ok(facts)
 }
 
-/// Writes the node of a relationship walk that is `hit`: the lines of a symbol hit behind
-/// `labels`, without the `relationship` field among its matched fields, which the tree states.
+/// Writes the syntax element of an edge walk that is `hit`: the lines of a symbol hit behind
+/// `labels`, without the `edge` field among its matched fields, which the tree states.
 ///
 /// A hit whose target is not a symbol writes nothing.
-pub(super) fn walk_node(
+pub(super) fn walk_symbol(
     lines: &mut Lines<'_>,
     hit: &SearchHit,
     labels: walk::Labels,
@@ -158,7 +158,7 @@ pub(super) fn walk_node(
         .matched_by
         .iter()
         .copied()
-        .filter(|field| *field != MatchedField::Relationship)
+        .filter(|field| *field != MatchedField::Edge)
         .collect();
     symbol_hit(lines, symbol, &view, &matched, labels)
 }
@@ -174,8 +174,8 @@ fn labeled(label: Option<&str>, text: &str) -> String {
 /// Writes the symbol hit: declaration, facts with the `matched` fields, identity, summary,
 /// change, source.
 ///
-/// A node under the root of a relationship walk has its head line already and writes the
-/// declaration below it. A node of a walk writes the facts and the identity behind the words
+/// A symbol under the root of an edge walk has its head line already and writes the
+/// declaration below it. A symbol of a walk writes the facts and the identity behind the words
 /// of `labels`.
 fn symbol_hit(
     lines: &mut Lines<'_>,

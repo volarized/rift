@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use rift_error::errors;
-use rift_protocol::read::{Language, NodeFacet, SymbolFacet};
+use rift_protocol::read::{Language, SymbolKind, SyntaxKind};
 use strum::VariantArray;
 use tree_sitter::{Node, Parser, Query as TreeSitterQuery, QueryCursor, StreamingIterator};
 
@@ -67,23 +67,23 @@ impl RustSymbolKind {
         }
     }
 
-    /// Portable facets for this kind, before visibility adds `Public`.
-    fn facets(self) -> Vec<SymbolFacet> {
+    /// Portable kinds for this kind, before visibility adds `Public`.
+    fn kinds(self) -> Vec<SymbolKind> {
         match self {
-            Self::Function => vec![SymbolFacet::Value, SymbolFacet::Callable],
-            Self::Struct | Self::Enum | Self::Union => vec![SymbolFacet::Type],
+            Self::Function => vec![SymbolKind::Value, SymbolKind::Callable],
+            Self::Struct | Self::Enum | Self::Union => vec![SymbolKind::Type],
             Self::Trait => vec![
-                SymbolFacet::Type,
-                SymbolFacet::Implementable,
-                SymbolFacet::MemberContainer,
+                SymbolKind::Type,
+                SymbolKind::Implementable,
+                SymbolKind::MemberContainer,
             ],
-            Self::Field => vec![SymbolFacet::Value, SymbolFacet::Member],
-            Self::AssociatedType => vec![SymbolFacet::Type, SymbolFacet::Member],
-            Self::TypeAlias => vec![SymbolFacet::Type, SymbolFacet::Alias],
-            Self::Module => vec![SymbolFacet::Namespace, SymbolFacet::Module],
-            Self::Macro => vec![SymbolFacet::Macro],
-            Self::Constant | Self::Static => vec![SymbolFacet::Value],
-            Self::Variant => vec![SymbolFacet::Variant],
+            Self::Field => vec![SymbolKind::Value, SymbolKind::Member],
+            Self::AssociatedType => vec![SymbolKind::Type, SymbolKind::Member],
+            Self::TypeAlias => vec![SymbolKind::Type, SymbolKind::Alias],
+            Self::Module => vec![SymbolKind::Namespace, SymbolKind::Module],
+            Self::Macro => vec![SymbolKind::Macro],
+            Self::Constant | Self::Static => vec![SymbolKind::Value],
+            Self::Variant => vec![SymbolKind::Variant],
         }
     }
 
@@ -104,14 +104,14 @@ impl RustSymbolKind {
     }
 }
 
-/// Tree-sitter grammar node kind interpreted by this module.
+/// Tree-sitter grammar syntax element kind interpreted by this module.
 ///
 /// Vocabulary comes from the `node-types.json` of the pinned
 /// tree-sitter-rust 0.24.2 grammar. The grammar defines many more kinds;
 /// only the ones this module reads are listed, so conversion from an
 /// arbitrary kind string is fallible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, VariantArray)]
-enum RustGrammarNodeKind {
+enum RustGrammarSyntaxKind {
     /// `const_item` declaration.
     ConstItem,
     /// `enum_item` declaration.
@@ -154,7 +154,7 @@ enum RustGrammarNodeKind {
     EnumVariantList,
 }
 
-impl RustGrammarNodeKind {
+impl RustGrammarSyntaxKind {
     /// Returns grammar spelling from tree-sitter-rust `node-types.json`.
     const fn as_str(self) -> &'static str {
         match self {
@@ -212,12 +212,15 @@ impl RustGrammarNodeKind {
     }
 }
 
-impl std::str::FromStr for RustGrammarNodeKind {
+impl std::str::FromStr for RustGrammarSyntaxKind {
     type Err = RiftError;
 
     fn from_str(kind: &str) -> Result<Self, Self::Err> {
-        Self::from_kind(kind)
-            .ok_or_else(|| errors::syntax::unknown_node_kind().node_kind(kind).error())
+        Self::from_kind(kind).ok_or_else(|| {
+            errors::syntax::unknown_syntax_element_kind()
+                .syntax_element_kind(kind)
+                .error()
+        })
     }
 }
 
@@ -407,7 +410,7 @@ impl SyntaxProvider for RustSyntaxProvider {
         let rules = RustGrammarRules {
             traits: file_traits(tree.root_node(), source.text),
         };
-        let (nodes, symbols, _) = extract::extract_with_capture(
+        let (syntax_elements, symbols, _) = extract::extract_with_capture(
             tree.root_node(),
             source,
             limits,
@@ -419,31 +422,31 @@ impl SyntaxProvider for RustSyntaxProvider {
             self.language.clone(),
             source,
             limits,
-            nodes,
+            syntax_elements,
             symbols,
             tree.root_node().has_error(),
         )
         .with_static_facts(Some(capture.finish())))
     }
 
-    fn node_facets(&self, kind: &str) -> Vec<NodeFacet> {
-        let mut facets = Vec::new();
+    fn syntax_element_kinds(&self, kind: &str) -> Vec<SyntaxKind> {
+        let mut kinds = Vec::new();
         if kind == attachment::ATTRIBUTE_ITEM_KIND || kind == INNER_ATTRIBUTE_ITEM_KIND {
-            return vec![NodeFacet::Annotation];
+            return vec![SyntaxKind::Annotation];
         }
         if kind.ends_with("_item") || kind.ends_with("_declaration") {
-            facets.extend([NodeFacet::Declaration, NodeFacet::Definition]);
+            kinds.extend([SyntaxKind::Declaration, SyntaxKind::Definition]);
         }
         if kind.ends_with("_expression") {
-            facets.push(NodeFacet::Expression);
+            kinds.push(SyntaxKind::Expression);
         }
         if kind.ends_with("_statement") {
-            facets.push(NodeFacet::Statement);
+            kinds.push(SyntaxKind::Statement);
         }
         if kind.contains("comment") {
-            facets.push(NodeFacet::Comment);
+            kinds.push(SyntaxKind::Comment);
         }
-        facets
+        kinds
     }
 }
 
@@ -470,7 +473,7 @@ enum VisibilityOwner {
 
 /// The visibility of each trait declared at module scope in the file -
 /// the source root and the bodies of inline `mod` items, never function
-/// bodies - by trait name. Each node is read once, so the work is linear in
+/// bodies - by trait name. Each syntax element is read once, so the work is linear in
 /// the parsed tree.
 fn file_traits(root: Node<'_>, text: &str) -> BTreeMap<String, Option<RustVisibility>> {
     let mut traits: BTreeMap<String, Option<RustVisibility>> = BTreeMap::new();
@@ -478,8 +481,8 @@ fn file_traits(root: Node<'_>, text: &str) -> BTreeMap<String, Option<RustVisibi
     let mut cursor = root.walk();
     while let Some(scope) = pending.pop() {
         for item in scope.named_children(&mut cursor) {
-            match RustGrammarNodeKind::from_kind(item.kind()) {
-                Some(RustGrammarNodeKind::TraitItem) => {
+            match RustGrammarSyntaxKind::from_kind(item.kind()) {
+                Some(RustGrammarSyntaxKind::TraitItem) => {
                     let Some(name) = declaration_name(item, text) else {
                         continue;
                     };
@@ -493,7 +496,7 @@ fn file_traits(root: Node<'_>, text: &str) -> BTreeMap<String, Option<RustVisibi
                         })
                         .or_insert_with(|| Some(visibility.clone()));
                 }
-                Some(RustGrammarNodeKind::ModItem) => {
+                Some(RustGrammarSyntaxKind::ModItem) => {
                     pending.extend(item.child_by_field_name(RustGrammarField::Body.as_str()));
                 }
                 _ => {}
@@ -521,19 +524,29 @@ impl RustGrammarRules {
     /// take their enum's.
     fn visibility_owner(&self, visited: Visited<'_, '_>, text: &str) -> VisibilityOwner {
         let kind = |visited: Option<Visited<'_, '_>>| {
-            visited.and_then(|visited| RustGrammarNodeKind::from_kind(visited.node().kind()))
+            visited.and_then(|visited| {
+                RustGrammarSyntaxKind::from_kind(visited.syntax_element().kind())
+            })
         };
         let parent = visited.parent();
         let holder = parent.and_then(Visited::parent);
         match (kind(parent), kind(holder)) {
-            (Some(RustGrammarNodeKind::DeclarationList), Some(RustGrammarNodeKind::TraitItem)) => {
-                let trait_item = holder.map(Visited::node);
-                VisibilityOwner::Inherited(trait_item.map_or(RustVisibility::Private, |node| {
-                    declaration_visibility(node, text)
-                }))
+            (
+                Some(RustGrammarSyntaxKind::DeclarationList),
+                Some(RustGrammarSyntaxKind::TraitItem),
+            ) => {
+                let trait_item = holder.map(Visited::syntax_element);
+                VisibilityOwner::Inherited(
+                    trait_item.map_or(RustVisibility::Private, |syntax_element| {
+                        declaration_visibility(syntax_element, text)
+                    }),
+                )
             }
-            (Some(RustGrammarNodeKind::DeclarationList), Some(RustGrammarNodeKind::ImplItem)) => {
-                let Some(implementation) = holder.map(Visited::node) else {
+            (
+                Some(RustGrammarSyntaxKind::DeclarationList),
+                Some(RustGrammarSyntaxKind::ImplItem),
+            ) => {
+                let Some(implementation) = holder.map(Visited::syntax_element) else {
                     return VisibilityOwner::Own;
                 };
                 if implementation
@@ -546,14 +559,17 @@ impl RustGrammarRules {
                     .and_then(|name| self.traits.get(name).cloned().flatten())
                     .map_or(VisibilityOwner::Unknown, VisibilityOwner::Inherited)
             }
-            (Some(RustGrammarNodeKind::EnumVariantList), Some(RustGrammarNodeKind::EnumItem)) => {
+            (
+                Some(RustGrammarSyntaxKind::EnumVariantList),
+                Some(RustGrammarSyntaxKind::EnumItem),
+            ) => {
                 VisibilityOwner::Inherited(holder.map_or(RustVisibility::Private, |enumeration| {
-                    declaration_visibility(enumeration.node(), text)
+                    declaration_visibility(enumeration.syntax_element(), text)
                 }))
             }
             (
-                Some(RustGrammarNodeKind::FieldDeclarationList),
-                Some(RustGrammarNodeKind::EnumVariant),
+                Some(RustGrammarSyntaxKind::FieldDeclarationList),
+                Some(RustGrammarSyntaxKind::EnumVariant),
             ) => holder.map_or(VisibilityOwner::Own, |variant| {
                 self.visibility_owner(variant, text)
             }),
@@ -563,8 +579,9 @@ impl RustGrammarRules {
 }
 
 impl GrammarRules for RustGrammarRules {
-    fn name_range(&self, node: Node<'_>) -> Result<Option<crate::ByteRange>, RiftError> {
-        node.child_by_field_name(RustGrammarField::Name.as_str())
+    fn name_range(&self, syntax_element: Node<'_>) -> Result<Option<crate::ByteRange>, RiftError> {
+        syntax_element
+            .child_by_field_name(RustGrammarField::Name.as_str())
             .map(extract::byte_range)
             .transpose()
     }
@@ -574,13 +591,13 @@ impl GrammarRules for RustGrammarRules {
         visited: Visited<'_, '_>,
         text: &str,
     ) -> Result<Option<Declaration>, RiftError> {
-        let node = visited.node();
-        let Some(kind) =
-            RustGrammarNodeKind::from_kind(node.kind()).and_then(RustGrammarNodeKind::symbol_kind)
+        let syntax_element = visited.syntax_element();
+        let Some(kind) = RustGrammarSyntaxKind::from_kind(syntax_element.kind())
+            .and_then(RustGrammarSyntaxKind::symbol_kind)
         else {
             return Ok(None);
         };
-        let Some(name) = declaration_name(node, text) else {
+        let Some(name) = declaration_name(syntax_element, text) else {
             return Ok(None);
         };
         let visibility = match self.visibility_owner(visited, text) {
@@ -588,40 +605,40 @@ impl GrammarRules for RustGrammarRules {
             VisibilityOwner::Inherited(visibility) => Some(visibility),
             VisibilityOwner::Unknown => None,
         };
-        let mut facets = kind.facets();
+        let mut kinds = kind.kinds();
         if visibility == Some(RustVisibility::Public) {
-            facets.push(SymbolFacet::Public);
+            kinds.push(SymbolKind::Public);
         }
         if is_entrypoint(visited, kind, &name) {
-            facets.push(SymbolFacet::Entrypoint);
+            kinds.push(SymbolKind::Entrypoint);
         }
         let (documentation, documentation_ranges) =
             attachment::attached_documentation(visited, text)?;
         Ok(Some(Declaration {
             name,
             kind: kind.word(),
-            facets,
+            kinds,
             visibility: visibility.as_ref().map(RustVisibility::authored),
-            body_range: body_range(node, kind)?,
+            body_range: body_range(syntax_element, kind)?,
             documentation,
             documentation_ranges,
         }))
     }
 
-    fn container_name(&self, node: Node<'_>, text: &str) -> Option<String> {
-        match RustGrammarNodeKind::from_kind(node.kind())? {
-            RustGrammarNodeKind::ModItem
-            | RustGrammarNodeKind::StructItem
-            | RustGrammarNodeKind::EnumItem
-            | RustGrammarNodeKind::TraitItem
-            | RustGrammarNodeKind::UnionItem
-            | RustGrammarNodeKind::EnumVariant
-            | RustGrammarNodeKind::FunctionItem => {
-                let name = node.child_by_field_name(RustGrammarField::Name.as_str())?;
+    fn container_name(&self, syntax_element: Node<'_>, text: &str) -> Option<String> {
+        match RustGrammarSyntaxKind::from_kind(syntax_element.kind())? {
+            RustGrammarSyntaxKind::ModItem
+            | RustGrammarSyntaxKind::StructItem
+            | RustGrammarSyntaxKind::EnumItem
+            | RustGrammarSyntaxKind::TraitItem
+            | RustGrammarSyntaxKind::UnionItem
+            | RustGrammarSyntaxKind::EnumVariant
+            | RustGrammarSyntaxKind::FunctionItem => {
+                let name = syntax_element.child_by_field_name(RustGrammarField::Name.as_str())?;
                 text.get(name.byte_range()).map(Into::into)
             }
-            RustGrammarNodeKind::ImplItem => {
-                let item = node.child_by_field_name(RustGrammarField::Type.as_str())?;
+            RustGrammarSyntaxKind::ImplItem => {
+                let item = syntax_element.child_by_field_name(RustGrammarField::Type.as_str())?;
                 text.get(implemented_type(item).byte_range())
                     .map(|value| value.split_whitespace().collect::<String>())
             }
@@ -631,7 +648,7 @@ impl GrammarRules for RustGrammarRules {
 
     /// A declaration's start, extended over its attached outer attributes
     /// and outer doc comments so the whole declaration - not just the item
-    /// node - is what the symbol read returns.
+    /// syntax element - is what the symbol read returns.
     fn declaration_start(&self, visited: Visited<'_, '_>, text: &str) -> usize {
         attachment::declaration_start(visited, text)
     }
@@ -645,7 +662,7 @@ impl GrammarRules for RustGrammarRules {
         visited: Visited<'_, '_>,
         text: &str,
     ) -> Result<Option<crate::RustModulePath>, RiftError> {
-        if visited.node().kind() != RustGrammarNodeKind::ModItem.as_str() {
+        if visited.syntax_element().kind() != RustGrammarSyntaxKind::ModItem.as_str() {
             return Ok(None);
         }
         attachment::module_path(visited, text).map(Some)
@@ -669,8 +686,8 @@ fn rust_parser() -> Result<Parser, RiftError> {
     Ok(parser)
 }
 
-fn declaration_name(node: Node<'_>, text: &str) -> Option<String> {
-    let name = node.child_by_field_name(RustGrammarField::Name.as_str())?;
+fn declaration_name(syntax_element: Node<'_>, text: &str) -> Option<String> {
+    let name = syntax_element.child_by_field_name(RustGrammarField::Name.as_str())?;
     text.get(name.byte_range()).map(Into::into)
 }
 
@@ -685,12 +702,13 @@ const INNER_ATTRIBUTE_ITEM_KIND: &str = "inner_attribute_item";
 /// block applies to it: methods of `impl<T> Holder<T>` qualify through
 /// `Holder`, the name the `struct` itself declares. A self type the grammar
 /// does not spell as a `generic_type` is already its own name.
-fn implemented_type(node: Node<'_>) -> Node<'_> {
-    if node.kind() != GENERIC_TYPE_KIND {
-        return node;
+fn implemented_type(syntax_element: Node<'_>) -> Node<'_> {
+    if syntax_element.kind() != GENERIC_TYPE_KIND {
+        return syntax_element;
     }
-    node.child_by_field_name(RustGrammarField::Type.as_str())
-        .unwrap_or(node)
+    syntax_element
+        .child_by_field_name(RustGrammarField::Type.as_str())
+        .unwrap_or(syntax_element)
 }
 
 /// The attribute that exports a `macro_rules!` macro from its crate.
@@ -703,7 +721,7 @@ fn declared_visibility(
     kind: RustSymbolKind,
     text: &str,
 ) -> RustVisibility {
-    let authored = declaration_visibility(visited.node(), text);
+    let authored = declaration_visibility(visited.syntax_element(), text);
     if kind == RustSymbolKind::Macro
         && authored == RustVisibility::Private
         && attachment::has_attached_attribute(visited, text, MACRO_EXPORT_ATTRIBUTE)
@@ -713,25 +731,26 @@ fn declared_visibility(
     authored
 }
 
-fn declaration_visibility(node: Node<'_>, text: &str) -> RustVisibility {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| child.kind() == RustGrammarNodeKind::VisibilityModifier.as_str())
+fn declaration_visibility(syntax_element: Node<'_>, text: &str) -> RustVisibility {
+    let mut cursor = syntax_element.walk();
+    syntax_element
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == RustGrammarSyntaxKind::VisibilityModifier.as_str())
         .and_then(|child| text.get(child.byte_range()))
         .map_or(RustVisibility::Private, RustVisibility::from_authored)
 }
 
-fn declaration_facets(kind: RustSymbolKind, visibility: &RustVisibility) -> Vec<SymbolFacet> {
-    let mut facets = kind.facets();
+fn declaration_kinds(kind: RustSymbolKind, visibility: &RustVisibility) -> Vec<SymbolKind> {
+    let mut kinds = kind.kinds();
     if visibility == &RustVisibility::Public {
-        facets.push(SymbolFacet::Public);
+        kinds.push(SymbolKind::Public);
     }
-    facets
+    kinds
 }
 
 /// Numeric grammar ids for the ancestor kinds [`is_file_scope`] checks,
 /// resolved once from the pinned Tree-sitter Rust language so each
-/// classification compares integers instead of node-kind strings.
+/// classification compares integers instead of syntax element-kind strings.
 struct RustEnclosureKinds {
     module: u16,
     implementation: u16,
@@ -744,32 +763,32 @@ impl RustEnclosureKinds {
     ///
     /// # Panics
     ///
-    /// Panics when the pinned grammar has no node kind by one of the named
+    /// Panics when the pinned grammar has no syntax element kind by one of the named
     /// spellings: `id_for_node_kind` returning `0` means the grammar the
     /// runtime loaded no longer defines a kind this module depends on, a
     /// programmer/grammar-version error rather than a reachable runtime
     /// state.
     fn resolve(language: &tree_sitter::Language) -> Self {
-        let mod_item = language.id_for_node_kind(RustGrammarNodeKind::ModItem.as_str(), true);
-        let impl_item = language.id_for_node_kind(RustGrammarNodeKind::ImplItem.as_str(), true);
-        let trait_item = language.id_for_node_kind(RustGrammarNodeKind::TraitItem.as_str(), true);
+        let mod_item = language.id_for_node_kind(RustGrammarSyntaxKind::ModItem.as_str(), true);
+        let impl_item = language.id_for_node_kind(RustGrammarSyntaxKind::ImplItem.as_str(), true);
+        let trait_item = language.id_for_node_kind(RustGrammarSyntaxKind::TraitItem.as_str(), true);
         let function_item =
-            language.id_for_node_kind(RustGrammarNodeKind::FunctionItem.as_str(), true);
+            language.id_for_node_kind(RustGrammarSyntaxKind::FunctionItem.as_str(), true);
         assert!(
             mod_item != 0,
-            "pinned Rust grammar must define node kind: kind=mod_item"
+            "pinned Rust grammar must define syntax element kind: kind=mod_item"
         );
         assert!(
             impl_item != 0,
-            "pinned Rust grammar must define node kind: kind=impl_item"
+            "pinned Rust grammar must define syntax element kind: kind=impl_item"
         );
         assert!(
             trait_item != 0,
-            "pinned Rust grammar must define node kind: kind=trait_item"
+            "pinned Rust grammar must define syntax element kind: kind=trait_item"
         );
         assert!(
             function_item != 0,
-            "pinned Rust grammar must define node kind: kind=function_item"
+            "pinned Rust grammar must define syntax element kind: kind=function_item"
         );
         Self {
             module: mod_item,
@@ -786,7 +805,7 @@ fn rust_enclosure_kinds() -> &'static RustEnclosureKinds {
     KINDS.get_or_init(|| RustEnclosureKinds::resolve(&rust_grammar()))
 }
 
-/// Reports whether `node` is a direct child of the source file's root scope:
+/// Reports whether `syntax element` is a direct child of the source file's root scope:
 /// no ancestor is a `mod_item`, `impl_item`, `trait_item`, or
 /// `function_item`. Bounded by the parsed tree's depth, which
 /// [`SyntaxLimits`] caps during extraction.
@@ -794,7 +813,7 @@ fn is_file_scope(visited: Visited<'_, '_>) -> bool {
     let kinds = rust_enclosure_kinds();
     let mut ancestor = visited.parent();
     while let Some(current) = ancestor {
-        let kind_id = current.node().kind_id();
+        let kind_id = current.syntax_element().kind_id();
         if kind_id == kinds.module
             || kind_id == kinds.implementation
             || kind_id == kinds.trait_definition
@@ -807,8 +826,8 @@ fn is_file_scope(visited: Visited<'_, '_>) -> bool {
     true
 }
 
-/// Reports whether `node` is a file-scope `fn main` - the binary
-/// entrypoint - so [`SymbolFacet::Entrypoint`] applies. A `main` nested in
+/// Reports whether `syntax element` is a file-scope `fn main` - the binary
+/// entrypoint - so [`SymbolKind::Entrypoint`] applies. A `main` nested in
 /// a `mod`, an `impl`, a `trait`, or another `fn` never qualifies.
 fn is_entrypoint(visited: Visited<'_, '_>, kind: RustSymbolKind, name: &str) -> bool {
     kind == RustSymbolKind::Function && name == "main" && is_file_scope(visited)
@@ -816,12 +835,15 @@ fn is_entrypoint(visited: Visited<'_, '_>, kind: RustSymbolKind, name: &str) -> 
 
 /// The implementation part of one declaration: its grammar `body` or `value`
 /// field's span. `None` when the kind declares no such field, or when this
-/// node omits it - a unit struct, a `mod name;`, a valueless trait constant.
-fn body_range(node: Node<'_>, kind: RustSymbolKind) -> Result<Option<ByteRange>, RiftError> {
+/// syntax element omits it - a unit struct, a `mod name;`, a valueless trait constant.
+fn body_range(
+    syntax_element: Node<'_>,
+    kind: RustSymbolKind,
+) -> Result<Option<ByteRange>, RiftError> {
     let Some(field) = kind.body_field() else {
         return Ok(None);
     };
-    let Some(body) = node.child_by_field_name(field.as_str()) else {
+    let Some(body) = syntax_element.child_by_field_name(field.as_str()) else {
         return Ok(None);
     };
     extract::byte_range(body).map(Some)
@@ -853,7 +875,7 @@ pub(crate) fn literal_function(
     let declaration = extract::Declaration {
         name: name.clone(),
         kind: RustSymbolKind::Function.word(),
-        facets: declaration_facets(RustSymbolKind::Function, &visibility),
+        kinds: declaration_kinds(RustSymbolKind::Function, &visibility),
         visibility: Some(visibility.authored()),
         body_range: Some(body_range),
         documentation: Vec::new(),
@@ -866,8 +888,8 @@ pub(crate) fn literal_function(
         qualified_name: name,
         container: None,
         kind: declaration.kind,
-        node_kind: None,
-        facets: declaration.facets,
+        syntax_element_kind: None,
+        kinds: declaration.kinds,
         visibility: declaration.visibility,
         range: item_range,
         item_range,
@@ -915,7 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn test_provider_extracts_nested_rust_declarations_and_byte_nodes() {
+    fn test_provider_extracts_nested_rust_declarations_and_byte_syntax_elements() {
         let text = "pub mod café {\r\npub(crate) struct Item;\r\nimpl Item { fn load() {} }\r\n}";
         let document = analyze(text);
         let names = document
@@ -933,7 +955,7 @@ mod tests {
         assert_eq!(document.path(), &path());
         assert_eq!(document.language().name, "rust");
         let load = text.find("load").expect("fixture contains method") as u64;
-        assert!(document.nodes_at(load).len() >= 3);
+        assert!(document.syntax_elements_at(load).len() >= 3);
         assert!(!document.has_errors());
     }
 
@@ -1139,7 +1161,7 @@ mod tests {
         assert_eq!(function.signatures[0].language.name, "rust");
     }
 
-    /// A kind the grammar declares no `Callable` facet for never renders a signature, even
+    /// A kind the grammar declares no `Callable` kind for never renders a signature, even
     /// when it carries a `body_range` - a struct's braces are not a callable implementation.
     #[test]
     fn test_a_non_callable_declaration_with_a_body_range_renders_no_signature() {
@@ -1216,10 +1238,7 @@ mod tests {
         assert_eq!(names, ["Option::None", "Option::Some", "Option::Pair"]);
         assert_eq!(variants[0].documentation[0].text, "No value.");
         assert!(variants.iter().all(|symbol| symbol.signatures.is_empty()));
-        assert_eq!(
-            variants[0].facets,
-            [SymbolFacet::Variant, SymbolFacet::Public]
-        );
+        assert_eq!(variants[0].kinds, [SymbolKind::Variant, SymbolKind::Public]);
         assert_eq!(variants[0].visibility.as_deref(), Some("pub"));
     }
 
@@ -1303,35 +1322,31 @@ mod tests {
                 ("hidden", Some("private")),
             ]
         );
-        assert!(document.symbols()[0].facets.contains(&SymbolFacet::Public));
+        assert!(document.symbols()[0].kinds.contains(&SymbolKind::Public));
     }
 
     #[test]
-    fn test_document_facets_render_kind_categories_and_public_visibility() {
+    fn test_document_kinds_render_kind_categories_and_public_visibility() {
         let document =
             analyze("pub fn f() {}\ntype A = u8;\nmod m {}\nmacro_rules! q { () => {}; }");
-        let facets = document
+        let kinds = document
             .symbols()
             .iter()
-            .map(|symbol| symbol.facets.clone())
+            .map(|symbol| symbol.kinds.clone())
             .collect::<Vec<_>>();
         assert_eq!(
-            facets,
+            kinds,
             [
-                vec![
-                    SymbolFacet::Value,
-                    SymbolFacet::Callable,
-                    SymbolFacet::Public
-                ],
-                vec![SymbolFacet::Type, SymbolFacet::Alias],
-                vec![SymbolFacet::Namespace, SymbolFacet::Module],
-                vec![SymbolFacet::Macro],
+                vec![SymbolKind::Value, SymbolKind::Callable, SymbolKind::Public],
+                vec![SymbolKind::Type, SymbolKind::Alias],
+                vec![SymbolKind::Namespace, SymbolKind::Module],
+                vec![SymbolKind::Macro],
             ]
         );
     }
 
     /// Every declaration kind whose grammar declares a body or value field
-    /// carries `body_range`; a kind or node without one carries `None`.
+    /// carries `body_range`; a kind or syntax element without one carries `None`.
     #[test]
     fn test_document_body_range_present_exactly_where_the_grammar_declares_one() {
         let text = "fn f() { 1; }\nstruct S { x: u8 }\nstruct Unit;\nenum E { A }\n\
@@ -1372,30 +1387,33 @@ mod tests {
     }
 
     #[test]
-    fn test_provider_node_facets_classify_declaration_expression_statement_and_comment() {
+    fn test_provider_syntax_element_kinds_classify_declaration_expression_statement_and_comment() {
         let provider = RustSyntaxProvider::default();
         assert_eq!(
-            provider.node_facets("function_item"),
-            [NodeFacet::Declaration, NodeFacet::Definition]
+            provider.syntax_element_kinds("function_item"),
+            [SyntaxKind::Declaration, SyntaxKind::Definition]
         );
         assert_eq!(
-            provider.node_facets("binary_expression"),
-            [NodeFacet::Expression]
+            provider.syntax_element_kinds("binary_expression"),
+            [SyntaxKind::Expression]
         );
         assert_eq!(
-            provider.node_facets("expression_statement"),
-            [NodeFacet::Statement]
-        );
-        assert_eq!(provider.node_facets("line_comment"), [NodeFacet::Comment]);
-        assert_eq!(
-            provider.node_facets("attribute_item"),
-            [NodeFacet::Annotation]
+            provider.syntax_element_kinds("expression_statement"),
+            [SyntaxKind::Statement]
         );
         assert_eq!(
-            provider.node_facets("inner_attribute_item"),
-            [NodeFacet::Annotation]
+            provider.syntax_element_kinds("line_comment"),
+            [SyntaxKind::Comment]
         );
-        assert_eq!(provider.node_facets("identifier"), []);
+        assert_eq!(
+            provider.syntax_element_kinds("attribute_item"),
+            [SyntaxKind::Annotation]
+        );
+        assert_eq!(
+            provider.syntax_element_kinds("inner_attribute_item"),
+            [SyntaxKind::Annotation]
+        );
+        assert_eq!(provider.syntax_element_kinds("identifier"), []);
     }
 
     #[test]
@@ -1425,8 +1443,8 @@ mod tests {
             rift_error::errors::syntax::too_many_captures::SLUG
         );
         assert_eq!(
-            RustQuery::new("(missing_node) @rift.name")
-                .expect_err("invalid node kind must fail")
+            RustQuery::new("(missing_syntax_element) @rift.name")
+                .expect_err("invalid syntax element kind must fail")
                 .slug(),
             rift_error::errors::syntax::invalid_query::SLUG
         );
@@ -1436,11 +1454,11 @@ mod tests {
     fn test_provider_reports_malformed_tree_without_dropping_facts() {
         let document = analyze("fn broken( {");
         assert!(document.has_errors());
-        assert!(!document.nodes().is_empty());
+        assert!(!document.syntax_elements().is_empty());
     }
 
     #[test]
-    fn test_provider_enforces_source_node_depth_and_positive_limits() {
+    fn test_provider_enforces_source_syntax_element_depth_and_positive_limits() {
         assert_eq!(
             SyntaxLimits::new(0, 1, 1).expect_err("zero limit").slug(),
             rift_error::errors::syntax::zero_limit::SLUG,
@@ -1459,7 +1477,7 @@ mod tests {
             rift_error::errors::syntax::source_too_large::SLUG
         );
 
-        let node_error = RustSyntaxProvider::default()
+        let syntax_element_error = RustSyntaxProvider::default()
             .analyze(
                 SyntaxSource {
                     path: &path(),
@@ -1467,10 +1485,10 @@ mod tests {
                 },
                 SyntaxLimits::new(100, 1, 10).expect("positive limits"),
             )
-            .expect_err("node bound");
+            .expect_err("syntax element bound");
         assert_eq!(
-            node_error.slug(),
-            rift_error::errors::syntax::too_many_nodes::SLUG
+            syntax_element_error.slug(),
+            rift_error::errors::syntax::too_many_syntax_elements::SLUG
         );
 
         let depth_error = RustSyntaxProvider::default()
@@ -1489,22 +1507,25 @@ mod tests {
     }
 
     #[test]
-    fn test_grammar_node_kind_round_trips_and_rejects_unknown() {
-        for kind in RustGrammarNodeKind::VARIANTS.iter().copied() {
+    fn test_grammar_syntax_element_kind_round_trips_and_rejects_unknown() {
+        for kind in RustGrammarSyntaxKind::VARIANTS.iter().copied() {
             assert_eq!(
                 kind.as_str()
-                    .parse::<RustGrammarNodeKind>()
+                    .parse::<RustGrammarSyntaxKind>()
                     .expect("known kind"),
                 kind
             );
         }
         let error = "flumph_item"
-            .parse::<RustGrammarNodeKind>()
+            .parse::<RustGrammarSyntaxKind>()
             .expect_err("unknown kind");
-        assert_eq!(error.slug(), errors::syntax::unknown_node_kind::SLUG);
+        assert_eq!(
+            error.slug(),
+            errors::syntax::unknown_syntax_element_kind::SLUG
+        );
         assert_eq!(
             error.context().collect::<Vec<_>>(),
-            vec![("node_kind", "flumph_item".to_owned())]
+            vec![("syntax_element_kind", "flumph_item".to_owned())]
         );
     }
 
@@ -1521,7 +1542,7 @@ mod tests {
     fn test_zero_limit_error_names_offending_bound_and_configuration_site() {
         let cases = [
             (SyntaxLimits::new(0, 1, 1), "source_bytes_max"),
-            (SyntaxLimits::new(1, 0, 1), "syntax_nodes_max"),
+            (SyntaxLimits::new(1, 0, 1), "syntax_elements_max"),
             (SyntaxLimits::new(1, 1, 0), "syntax_depth_max"),
         ];
         for (result, bound) in cases {
@@ -1578,7 +1599,7 @@ mod tests {
 
     #[test]
     fn test_tree_bound_errors_report_path_and_configured_limit() {
-        let node_error = RustSyntaxProvider::default()
+        let syntax_element_error = RustSyntaxProvider::default()
             .analyze(
                 SyntaxSource {
                     path: &path(),
@@ -1586,19 +1607,22 @@ mod tests {
                 },
                 SyntaxLimits::new(100, 1, 10).expect("positive limits"),
             )
-            .expect_err("node bound");
-        assert_eq!(node_error.slug(), errors::syntax::too_many_nodes::SLUG);
+            .expect_err("syntax element bound");
+        assert_eq!(
+            syntax_element_error.slug(),
+            errors::syntax::too_many_syntax_elements::SLUG
+        );
         assert!(
-            node_error
+            syntax_element_error
                 .context()
                 .any(|(key, value)| key == "path" && value == "src/lib.rs")
         );
         assert!(
-            node_error
+            syntax_element_error
                 .context()
-                .any(|(key, value)| key == "syntax_nodes_max" && value == "1")
+                .any(|(key, value)| key == "syntax_elements_max" && value == "1")
         );
-        assert!(node_error.to_string().contains("src/lib.rs"));
+        assert!(syntax_element_error.to_string().contains("src/lib.rs"));
 
         let depth_error = RustSyntaxProvider::default()
             .analyze(
@@ -1625,7 +1649,8 @@ mod tests {
 
     #[test]
     fn test_query_errors_report_line_reason_and_capture_limit() {
-        let error = RustQuery::new("(missing_node) @rift.name").expect_err("invalid node kind");
+        let error = RustQuery::new("(missing_syntax_element) @rift.name")
+            .expect_err("invalid syntax element kind");
         assert!(std::error::Error::source(&error).is_some());
         assert_eq!(error.slug(), errors::syntax::invalid_query::SLUG);
         assert!(
@@ -1708,18 +1733,25 @@ mod tests {
         );
         assert_eq!(overflow.slug(), errors::syntax::position_overflow::SLUG);
         assert!(std::error::Error::source(&overflow).is_some());
-        assert!(overflow.context().any(|(key, _)| key == "node_kind"));
+        assert!(
+            overflow
+                .context()
+                .any(|(key, _)| key == "syntax_element_kind")
+        );
     }
 
     #[test]
-    fn test_unknown_node_kind_and_zero_limit_report_code_and_context() {
+    fn test_unknown_syntax_element_kind_and_zero_limit_report_code_and_context() {
         let unknown = "bogus"
-            .parse::<RustGrammarNodeKind>()
+            .parse::<RustGrammarSyntaxKind>()
             .expect_err("unregistered kind");
-        assert_eq!(unknown.slug(), errors::syntax::unknown_node_kind::SLUG);
+        assert_eq!(
+            unknown.slug(),
+            errors::syntax::unknown_syntax_element_kind::SLUG
+        );
         assert_eq!(
             unknown.context().collect::<Vec<_>>(),
-            vec![("node_kind", "bogus".to_owned())]
+            vec![("syntax_element_kind", "bogus".to_owned())]
         );
         let zero = SyntaxLimits::new(0, 1, 1).expect_err("zero source bound");
         assert_eq!(zero.slug(), errors::syntax::zero_limit::SLUG);
@@ -1730,44 +1762,44 @@ mod tests {
     }
 
     #[test]
-    fn test_file_scope_main_carries_the_entrypoint_facet() {
+    fn test_file_scope_main_carries_the_entrypoint_kind() {
         let document = analyze("fn main() {}\n");
         let main = &document.symbols()[0];
         assert_eq!(main.name, "main");
-        assert!(main.facets.contains(&SymbolFacet::Entrypoint));
+        assert!(main.kinds.contains(&SymbolKind::Entrypoint));
     }
 
     #[test]
-    fn test_main_nested_in_a_module_does_not_carry_the_entrypoint_facet() {
+    fn test_main_nested_in_a_module_does_not_carry_the_entrypoint_kind() {
         let document = analyze("mod tests {\n    fn main() {}\n}\n");
         let main = document
             .symbols()
             .iter()
             .find(|symbol| symbol.name == "main");
         let main = main.expect("fixture declares a nested main");
-        assert!(!main.facets.contains(&SymbolFacet::Entrypoint));
+        assert!(!main.kinds.contains(&SymbolKind::Entrypoint));
     }
 
     #[test]
-    fn test_a_method_named_main_does_not_carry_the_entrypoint_facet() {
+    fn test_a_method_named_main_does_not_carry_the_entrypoint_kind() {
         let document = analyze("struct S;\nimpl S {\n    fn main(&self) {}\n}\n");
         let main = document
             .symbols()
             .iter()
             .find(|symbol| symbol.name == "main");
         let main = main.expect("fixture declares a method named main");
-        assert!(!main.facets.contains(&SymbolFacet::Entrypoint));
+        assert!(!main.kinds.contains(&SymbolKind::Entrypoint));
     }
 
     #[test]
-    fn test_a_trait_default_main_does_not_carry_the_entrypoint_facet() {
+    fn test_a_trait_default_main_does_not_carry_the_entrypoint_kind() {
         let document = analyze("trait Runs {\n    fn main() {}\n}\n");
         let main = document
             .symbols()
             .iter()
             .find(|symbol| symbol.name == "main");
         let main = main.expect("fixture declares a trait default method named main");
-        assert!(!main.facets.contains(&SymbolFacet::Entrypoint));
+        assert!(!main.kinds.contains(&SymbolKind::Entrypoint));
     }
 
     #[test]

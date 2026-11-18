@@ -13,7 +13,7 @@ mod python_runtime_environment;
 // This binary serves its own fixture and uses `workspace_client` only to wait for map readiness.
 #[expect(dead_code, reason = "the relative-root helpers serve other suites")]
 mod workspace_client;
-// The text checks of `nodes`, `search`, and `get_symbol` results, and their own tests; this
+// The text checks of `facets`, `search`, and `get_symbol` results, and their own tests; this
 // binary alone declares it.
 mod text_complete;
 
@@ -88,13 +88,11 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
         "{context}: {structured:#}"
     );
     if name == "get_symbol" {
-        let include = request.get("include").and_then(Value::as_array);
-        let expects_history =
-            include.is_some_and(|entries| entries.contains(&Value::from("history")));
+        let expects_history = request["include"]["history"] == Value::Bool(true);
         for hit in structured["declarations"].as_array().into_iter().flatten() {
             assert!(
-                hit.get("source").is_none() && hit.get("node").is_none(),
-                "a declaration carries no source and no node address; `nodes` reads them: \
+                hit.get("source").is_none() && hit.get("syntax_element").is_none(),
+                "a declaration carries no source and no syntax_element address; `facets` reads them: \
                  {request:#} {hit:#}"
             );
             if !expects_history {
@@ -149,7 +147,7 @@ fn request_reaches_dependencies(name: &str, request: &Value) -> Option<bool> {
             SymbolOwner::Package { .. } | SymbolOwner::Runtime { .. }
         ));
     }
-    if name == "nodes" {
+    if name == "facets" {
         return Some(request["symbol"].as_str().is_some_and(|id| {
             SymbolIdentity::parse(id).is_ok_and(|identity| {
                 matches!(
@@ -210,8 +208,8 @@ fn exact_request_owner_controls_source_resolvers_and_refuses_malformed_identity(
     );
     assert_eq!(
         request_reaches_dependencies(
-            "nodes",
-            &json!({"query":"SELECT ?node { ?node a :Node; :unit <rift://source/project/lib.rs> }"})
+            "facets",
+            &json!({"query":"SELECT ?syntax_element { ?syntax_element a :SyntaxElement; :unit <rift://source/project/lib.rs> }"})
         ),
         Some(false)
     );
@@ -400,7 +398,7 @@ async fn absent_request(
         rift_protocol::read::Language::from_identity_segment(language)?,
         path,
     )?;
-    let mut request = json!({"id":missing.wire_identity(),"include":[]});
+    let mut request = json!({"id":missing.wire_identity(),"include":{}});
     if let Some(revision) = revision {
         request["revision"] = json!(format!("rift://revision/git/{revision}"));
     }
@@ -408,7 +406,7 @@ async fn absent_request(
 }
 
 /// A workspace whose `[search] default_scope` is `global` lists `search`, `get_symbol`, and
-/// `nodes` examples that read a package release, each one valid against its input schema; a
+/// `facets` examples that read a package release, each one valid against its input schema; a
 /// workspace reading `local` lists the declared project examples.
 #[tokio::test]
 async fn tools_list_examples_follow_the_default_scope() -> TestResult {
@@ -435,7 +433,7 @@ async fn tools_list_examples_follow_the_default_scope() -> TestResult {
         let client = ().serve(client_transport).await?;
         workspace_client::await_workspace_ready(&client).await?;
         let tools = client.list_all_tools().await?;
-        for name in ["search", "get_symbol", "nodes"] {
+        for name in ["search", "get_symbol", "facets"] {
             let tool = tools
                 .iter()
                 .find(|tool| tool.name == name)
@@ -596,7 +594,7 @@ async fn get_symbol_configured_work_preserves_named_miss_and_exact_hits() -> Tes
     let result = client
         .call_tool(tools_call_request(
             "get_symbol",
-            &json!({"id":exact_id,"include":[]}),
+            &json!({"id":exact_id,"include":{}}),
         )?)
         .await?;
     assert!(!result.is_error.unwrap_or(false));
@@ -722,9 +720,9 @@ async fn get_symbol_miss_uses_requested_revision_and_remote_matches_clear_the_wa
     assert_eq!(answer["symbol"]["id"], remote["id"]);
     assert!(answer.get("symbol_not_found").is_none());
     for request in [
-        json!({"query":"helper_beacon","scope":"global","include":[]}),
-        json!({"query":"helper_beacon","scope":"all","include":[]}),
-        json!({"query":"helper_beacon","scope":"all","include":[],"limit":1,"page_index":100}),
+        json!({"query":"helper_beacon","scope":"global","include":{}}),
+        json!({"query":"helper_beacon","scope":"all","include":{}}),
+        json!({"query":"helper_beacon","scope":"all","include":{},"max_results":1,"page":100}),
     ] {
         let request = serde_json::to_value(workspace_client::query::retrieval(
             &serde_json::from_value(request.clone())?,
@@ -765,7 +763,7 @@ impl CorpusArms {
     fn observe(&mut self, structured: &Value) {
         self.dependency_units += dependency_unit_count(&structured["declarations"]);
         self.search_dependency_units += dependency_unit_count(&structured["answer"]["bindings"]);
-        for identity in node_units(structured) {
+        for identity in source_units(structured) {
             if identity.contains('@') && !identity.contains("%40") {
                 self.literal_at_identities += 1;
             }
@@ -808,7 +806,9 @@ impl CorpusArms {
         );
         assert!(
             self.literal_at_identities > 0 && self.escaped_identities > 0,
-            "literal @ and percent-encoded node identities remain valid"
+            "literal @ and percent-encoded source identities remain valid: {}/{}",
+            self.literal_at_identities,
+            self.escaped_identities,
         );
         for form in ["bindings", "boolean", "graph"] {
             assert!(
@@ -827,22 +827,30 @@ impl CorpusArms {
     }
 }
 
-/// Every file identity one answer's nodes carry under `unit`: the identity whose path the
-/// server encodes, since a node's own identity is a content digest with no path.
-fn node_units(structured: &Value) -> Vec<String> {
+/// Every source identity one answer's syntax elements carry under `unit`.
+fn source_units(structured: &Value) -> Vec<String> {
     let mut found = Vec::new();
     let mut pending = vec![structured];
     while let Some(value) = pending.pop() {
         match value {
             Value::Object(members) => {
                 for (key, member) in members {
-                    match member {
-                        Value::String(identity)
-                            if key == "unit" && identity.starts_with("rift://source/project/") =>
+                    let identity = match member {
+                        Value::String(identity) => Some(identity.as_str()),
+                        Value::Object(term)
+                            if term.get("type").and_then(Value::as_str) == Some("iri") =>
                         {
-                            found.push(identity.clone());
+                            term.get("value").and_then(Value::as_str)
                         }
-                        _ => pending.push(member),
+                        _ => None,
+                    };
+                    if key == "unit"
+                        && let Some(identity) = identity
+                        && identity.starts_with("rift://source/project/")
+                    {
+                        found.push(identity.to_owned());
+                    } else {
+                        pending.push(member);
                     }
                 }
             }
@@ -938,9 +946,9 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
         let (input, output) = validators.get(name).ok_or("advertised corpus tool")?;
         let mut request = request;
         let mut followed = 0usize;
-        let mut expected_page = 0u64;
+        let mut expected_page = request["page"].as_u64().unwrap_or(1);
         let mut past_end = false;
-        let mut original = None;
+
         loop {
             assert!(
                 followed <= FOLLOWED_PAGES_MAX,
@@ -959,40 +967,27 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
             let Some(page) = structured.get("pagination") else {
                 break;
             };
-            let page_index = page["page_index"].as_u64().ok_or("page index")?;
-            let total_pages = page["total_pages"].as_u64().ok_or("page count")?;
-            assert_eq!(page_index, expected_page, "original retained page index");
-            if total_pages > 1 {
+            let page_number = page["page"].as_u64().ok_or("page number")?;
+            let pages = page["pages"].as_u64().ok_or("page count")?;
+            assert_eq!(page_number, expected_page, "requested page number");
+            if pages > 1 {
                 arms.multi_page_results += 1;
-                if original.is_none() {
-                    let answer: rift_protocol::query::QueryAnswer =
-                        serde_json::from_value(structured["answer"].clone())?;
-                    let view: rift_protocol::symbol_read::CapturedViewId =
-                        serde_json::from_value(structured["view"]["id"].clone())?;
-                    original = Some((answer, view, total_pages));
-                }
             }
-            if page_index >= total_pages {
-                assert!(
-                    paged_rows(name, &structured)
-                        .ok_or("query rows")?
-                        .is_empty(),
-                    "past-end retained page is empty: {structured}"
-                );
+            if page_number > pages {
+                if let Some(rows) = paged_rows(name, &structured) {
+                    assert!(rows.is_empty(), "past-end page is empty: {structured}");
+                }
                 arms.past_end_pages += 1;
                 break;
             }
-            if let Some(query) = page["next_query"].as_str() {
+            if page_number < pages || (!past_end && pages > 1) {
                 followed += 1;
-                expected_page = page_index + 1;
-                request = json!({"query":query, "language":"sparql"});
-                continue;
-            }
-            if !past_end && let Some((answer, view, pages)) = &original {
-                followed += 1;
-                expected_page = *pages;
-                past_end = true;
-                request = json!({"query":rift_search::sparql::continuation_query(answer, view, *pages)?, "language":"sparql"});
+                expected_page = page_number + 1;
+                past_end = page_number == pages;
+                request["page"] = json!(expected_page);
+                if let Some(revision) = structured.get("revision") {
+                    request["revision"] = revision.clone();
+                }
                 continue;
             }
             break;
@@ -1014,7 +1009,7 @@ async fn assert_complete_remote_binding(
     let (_complete, complete_client, complete_task) =
         served_fixture_with_setup(None, None, false, true).await?;
     let request = workspace_client::query::retrieval(&serde_json::from_value(json!({
-        "query":"helper_beacon", "scope":"global", "include":["source"]
+        "query":"helper_beacon", "scope":"global", "include":{"source": true}
     }))?)?;
     let request = serde_json::to_value(request)?;
     let (input, output) = validators.get("search").ok_or("search validators")?;
@@ -1246,12 +1241,11 @@ async fn outgoing_walks_over_scripted_engines_match_the_served_schemas() -> Test
     Ok(())
 }
 
-/// A global API with declaration lookups but missing relationship coverage returns
+/// A global API with declaration lookups but missing edge coverage returns
 /// typed unavailability in the advertised search result schema.
 #[cfg(unix)]
 #[tokio::test]
-async fn a_package_walk_with_missing_relationship_coverage_matches_the_served_schema() -> TestResult
-{
+async fn a_package_walk_with_missing_edge_coverage_matches_the_served_schema() -> TestResult {
     let global = GlobalFixture::start_with(global_api::FixtureOptions {
         python_collection: true,
         ..global_api::FixtureOptions::default()
@@ -1358,7 +1352,7 @@ async fn packages_beside_the_local_scope_or_rev_refuse_naming_packages() -> Test
         if name == "get_symbol" {
             assert!(
                 failure.message.contains("tool get_symbol")
-                    && failure.message.contains("accepted declaration_cursor")
+                    && failure.message.contains("accepted id")
                     && !failure.message.contains("accepted packages"),
                 "the schema refusal lists exact retrieval fields: {request}: {}",
                 failure.message
@@ -1498,8 +1492,12 @@ async fn reads_report_their_revision_and_a_moved_tree_refuses() -> TestResult {
         .to_owned();
     assert!(tree.starts_with("rift://revision/tree/"), "{current:#}");
     let pinned = json!({ "symbol": id, "revision": tree });
-    let nodes = structured_answer(&client, "nodes", &pinned).await?;
-    assert_eq!(nodes["revision"], json!(tree), "{nodes:#}");
+    let syntax_elements = structured_answer(&client, "facets", &pinned).await?;
+    assert_eq!(
+        syntax_elements["revision"],
+        json!(tree),
+        "{syntax_elements:#}"
+    );
     let at_main = json!({ "id": id, "revision": "rift://revision/git/main" });
     let committed = structured_answer(&client, "get_symbol", &at_main).await?;
     let commit = committed["revision"].as_str().ok_or("commit revision")?;
@@ -1513,7 +1511,9 @@ async fn reads_report_their_revision_and_a_moved_tree_refuses() -> TestResult {
     let moved =
         json!({ "symbol": id, "revision": format!("rift://revision/tree/{}", "0".repeat(64)) });
     let refused = workspace_client::failed_call(
-        client.call_tool(tools_call_request("nodes", &moved)?).await,
+        client
+            .call_tool(tools_call_request("facets", &moved)?)
+            .await,
     )?;
     assert_eq!(
         refused.code,
@@ -1679,10 +1679,10 @@ fn has_null_arm(property: &Value) -> bool {
     null_type || null_branch
 }
 
-/// Every property below `node` that its object does not require and whose schema
+/// Every property below `syntax element` that its object does not require and whose schema
 /// accepts `null` beside another value, named by the path to it.
-fn optional_null_properties(node: &Value, path: &str, found: &mut Vec<String>) {
-    match node {
+fn optional_null_properties(syntax_element: &Value, path: &str, found: &mut Vec<String>) {
+    match syntax_element {
         Value::Object(object) => {
             let required = object.get("required").and_then(Value::as_array);
             let properties = object.get("properties").and_then(Value::as_object);
@@ -1732,6 +1732,102 @@ async fn no_advertised_optional_property_accepts_null() -> TestResult {
         found.is_empty(),
         "tools/list advertises optional properties that accept null: {found:#?}"
     );
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// Every selected answer list uses the same page counts and typed input refusals.
+#[tokio::test]
+async fn paging_lists_validate_at_boundaries_and_refuse_invalid_counts() -> TestResult {
+    let (_fixture, client, server_task) = served_fixture().await?;
+    let tools = client.list_all_tools().await?;
+    let validators = tool_validators(&tools)?;
+    let id = workspace_client::captured_seed(&client, "beacon_one", "lib.rs").await?;
+    let query = "SELECT ?value { VALUES ?value { 1 2 } } ORDER BY ?value";
+    for (name, mut request, total, maximum) in [
+        (
+            "search",
+            json!({"query": query}),
+            2,
+            rift_protocol::query::QUERY_MAX_RESULTS,
+        ),
+        (
+            "get_symbol",
+            json!({"id": id}),
+            1,
+            rift_protocol::symbol_read::GET_SYMBOL_MAX_RESULTS,
+        ),
+        (
+            "facets",
+            json!({"symbol": id}),
+            1,
+            rift_protocol::read::FACETS_MAX_RESULTS,
+        ),
+    ] {
+        let (input, output) = validators.get(name).ok_or("paged tool validator")?;
+        for page in 1..=total + 1 {
+            request["page"] = json!(page);
+            request["max_results"] = json!(1);
+            assert_validates(input, &request, "paged request");
+            let answer = structured_answer(&client, name, &request).await?;
+            assert_validates(output, &answer, "paged answer");
+            assert_eq!(
+                answer["pagination"],
+                json!({"page":page,"pages":total,"max_results":1,"total":total})
+            );
+            let rows = if name == "search" {
+                &answer["answer"]["bindings"]
+            } else {
+                &answer["declarations"]
+            };
+            assert_eq!(
+                rows.as_array().ok_or("answer rows")?.len(),
+                usize::from(page <= total)
+            );
+            request["revision"] = answer["revision"].clone();
+        }
+        for (field, value) in [
+            ("page", 0),
+            ("max_results", 0),
+            ("max_results", maximum + 1),
+        ] {
+            request["page"] = json!(1);
+            request["max_results"] = json!(1);
+            request[field] = json!(value);
+            assert!(!input.is_valid(&request));
+            let failure = workspace_client::failed_call(
+                client.call_tool(tools_call_request(name, &request)?).await,
+            )?;
+            assert_eq!(
+                failure.code,
+                ErrorCode::InvalidRequest,
+                "{name}: {failure:?}"
+            );
+        }
+    }
+    for query in [
+        "SELECT ?value { VALUES ?value {} }",
+        "CONSTRUCT { <urn:fixture:subject> <urn:fixture:predicate> ?value } WHERE { VALUES ?value {} }",
+        "SELECT ?value { VALUES ?value { 1 2 3 } } ORDER BY ?value LIMIT 2 OFFSET 1",
+        "DESCRIBE <urn:fixture:absent>",
+        "ASK { VALUES ?value { 1 } }",
+    ] {
+        let request = json!({"query":query,"max_results":2});
+        let answer = structured_answer(&client, "search", &request).await?;
+        let (input, output) = validators.get("search").ok_or("query validator")?;
+        assert_validates(input, &request, "query request");
+        assert_validates(output, &answer, "query answer");
+        if answer["answer"]["result"] == "boolean" {
+            assert!(answer.get("pagination").is_none());
+        } else {
+            let total = u64::from(query.contains("LIMIT 2")) * 2;
+            assert_eq!(
+                answer["pagination"],
+                json!({"page":1,"pages":u64::from(total > 0),"max_results":2,"total":total})
+            );
+        }
+    }
     client.cancel().await?;
     server_task.await?;
     Ok(())

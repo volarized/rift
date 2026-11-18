@@ -100,8 +100,8 @@ pub struct PackageIdentity {
 pub type SourceUnitId = String;
 /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
 pub type SymbolId = String;
-/// Readable Symbol assembled from normalized Contributions. Source structure lives in Node
-/// and is connected through Relationship.
+/// Readable Symbol assembled from normalized Contributions. Source structure lives in `SyntaxElement`
+/// and is connected through Edge.
 #[serde_with::skip_serializing_none]
 #[derive(
     Debug,
@@ -128,9 +128,9 @@ pub struct Symbol {
     #[validate(length(min = 1u64), regex(path = "REGEX_SYMBOL_KIND"))]
     pub kind: String,
     /// Portable classification for cross-language queries, absent when empty. The local
-    /// kinds `trait` and `interface` can both carry the `type` facet.
+    /// kinds `trait` and `interface` can both carry the `type` kind.
     #[default(Some(Default::default()))]
-    pub facets: Option<Vec<SymbolFacet>>,
+    pub kinds: Option<Vec<SymbolKind>>,
     /// Where a symbol belongs and how its declaration came to exist. Source location and
     /// generation are separate: generated code can belong to the project or to a dependency.
     /// Absent from `Symbol` entirely when it says a project declaration, authored, with no
@@ -357,10 +357,10 @@ impl<'de> serde::Deserialize<'de> for DocumentationFormat {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
 pub struct Extensions {}
-/// One portable category a symbol falls into. Kinds are language-specific; facets are
-/// shared, so a filter written once applies to every served language.
+/// One portable category a symbol falls into, shared across served languages.
+/// The language-specific `kind` names the declaration in its provider's vocabulary.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
-pub enum SymbolFacet {
+pub enum SymbolKind {
     /// A named scope that groups declarations.
     #[serde(rename = "namespace")]
     #[default]
@@ -453,7 +453,7 @@ pub enum SymbolFacet {
     #[serde(rename = "generator")]
     Generator,
 }
-impl core::fmt::Display for SymbolFacet {
+impl core::fmt::Display for SymbolKind {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Namespace => write!(f, "namespace"),
@@ -489,43 +489,43 @@ impl core::fmt::Display for SymbolFacet {
         }
     }
 }
-impl<'de> serde::Deserialize<'de> for SymbolFacet {
+impl<'de> serde::Deserialize<'de> for SymbolKind {
     fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
         match s.to_ascii_lowercase().as_str() {
-            "namespace" => Ok(SymbolFacet::Namespace),
-            "module" => Ok(SymbolFacet::Module),
-            "type" => Ok(SymbolFacet::TypeType),
-            "value" => Ok(SymbolFacet::Value),
-            "callable" => Ok(SymbolFacet::Callable),
-            "member" => Ok(SymbolFacet::Member),
-            "member_container" => Ok(SymbolFacet::MemberContainer),
-            "parameter" => Ok(SymbolFacet::Parameter),
-            "type_parameter" => Ok(SymbolFacet::TypeParameter),
-            "constructible" => Ok(SymbolFacet::Constructible),
-            "extensible" => Ok(SymbolFacet::Extensible),
-            "implementable" => Ok(SymbolFacet::Implementable),
-            "macro" => Ok(SymbolFacet::Macro),
-            "test" => Ok(SymbolFacet::Test),
-            "annotation" => Ok(SymbolFacet::Annotation),
-            "extension" => Ok(SymbolFacet::Extension),
-            "variant" => Ok(SymbolFacet::Variant),
-            "enumeration" => Ok(SymbolFacet::Enumeration),
-            "alias" => Ok(SymbolFacet::Alias),
-            "property" => Ok(SymbolFacet::Property),
-            "abstract" => Ok(SymbolFacet::Abstract),
-            "constructor" => Ok(SymbolFacet::Constructor),
-            "static" => Ok(SymbolFacet::Static),
-            "mutable" => Ok(SymbolFacet::Mutable),
-            "public" => Ok(SymbolFacet::Public),
-            "deprecated" => Ok(SymbolFacet::Deprecated),
-            "entrypoint" => Ok(SymbolFacet::Entrypoint),
-            "operator" => Ok(SymbolFacet::Operator),
-            "async" => Ok(SymbolFacet::Async),
-            "generator" => Ok(SymbolFacet::Generator),
+            "namespace" => Ok(SymbolKind::Namespace),
+            "module" => Ok(SymbolKind::Module),
+            "type" => Ok(SymbolKind::TypeType),
+            "value" => Ok(SymbolKind::Value),
+            "callable" => Ok(SymbolKind::Callable),
+            "member" => Ok(SymbolKind::Member),
+            "member_container" => Ok(SymbolKind::MemberContainer),
+            "parameter" => Ok(SymbolKind::Parameter),
+            "type_parameter" => Ok(SymbolKind::TypeParameter),
+            "constructible" => Ok(SymbolKind::Constructible),
+            "extensible" => Ok(SymbolKind::Extensible),
+            "implementable" => Ok(SymbolKind::Implementable),
+            "macro" => Ok(SymbolKind::Macro),
+            "test" => Ok(SymbolKind::Test),
+            "annotation" => Ok(SymbolKind::Annotation),
+            "extension" => Ok(SymbolKind::Extension),
+            "variant" => Ok(SymbolKind::Variant),
+            "enumeration" => Ok(SymbolKind::Enumeration),
+            "alias" => Ok(SymbolKind::Alias),
+            "property" => Ok(SymbolKind::Property),
+            "abstract" => Ok(SymbolKind::Abstract),
+            "constructor" => Ok(SymbolKind::Constructor),
+            "static" => Ok(SymbolKind::Static),
+            "mutable" => Ok(SymbolKind::Mutable),
+            "public" => Ok(SymbolKind::Public),
+            "deprecated" => Ok(SymbolKind::Deprecated),
+            "entrypoint" => Ok(SymbolKind::Entrypoint),
+            "operator" => Ok(SymbolKind::Operator),
+            "async" => Ok(SymbolKind::Async),
+            "generator" => Ok(SymbolKind::Generator),
             _ => {
                 Err(
                     serde::de::Error::unknown_variant(
@@ -1086,7 +1086,6 @@ pub struct CapabilityBounds {
     pub page_limit_min: i64,
     pub page_limit_max: i64,
     pub page_limit_default: i64,
-    pub cursor_bytes_max: i64,
     pub candidate_pool_max: i64,
     pub warnings_max: i64,
     pub source_bytes_max: i64,
@@ -1113,8 +1112,8 @@ pub struct Capabilities {
     pub bounds: CapabilityBounds,
     /// Documentation revision used for documentation reads.
     pub documentation_revision: Option<String>,
-    /// Complete relationship operations supported by existing collected facts. Absence establishes no supported operation.
-    pub relationship_capabilities: Option<Vec<RelationshipCapability>>,
+    /// Complete edge operations supported by existing collected facts. Absence establishes no supported operation.
+    pub edge_capabilities: Option<Vec<EdgeCapability>>,
     /// Additional properties not defined in the schema.
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
@@ -1165,7 +1164,7 @@ pub struct PackageResolutionResponse {
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
 }
-/// A lexical package declaration search or a bounded relationship walk.
+/// A lexical package declaration search or a bounded edge walk.
 #[serde_with::skip_serializing_none]
 #[derive(
     Debug,
@@ -1177,10 +1176,10 @@ pub struct PackageResolutionResponse {
 )]
 #[serde(deny_unknown_fields)]
 pub struct PackageSearchRequest {
-    /// A bounded relationship walk starting at one symbol.
+    /// A bounded edge walk starting at one symbol.
     ///
     /// From `seed`, the server visits its neighbors, then their neighbors, up to `depth` hops,
-    /// following `direction` and narrowed to `facets`; each reached symbol keeps the shortest
+    /// following `direction` and narrowed to `kinds`; each reached symbol keeps the shortest
     /// path the walk found to it.
     #[validate(nested)]
     pub traversal: Option<SearchTraversal>,
@@ -1193,9 +1192,8 @@ pub struct PackageSearchRequest {
     /// Identifier candidates of `query`, in the order Rift extracts them. The server refuses a request whose list differs from the candidates it extracts from `query`.
     #[validate(length(max = 16u64))]
     pub identifiers: Option<Vec<String>>,
-    /// Optional fields to include.
-    #[validate(length(max = 1u64))]
-    pub include: Option<Vec<String>>,
+    /// Optional fields to include. An omitted member is `false`.
+    pub include: Option<PackageSearchRequestInclude>,
     /// Selected exact package versions. Omitted or empty, use the newest collected stable version of each package, or its newest prerelease when no stable version is collected.
     #[validate(length(max = 20_000u64), nested)]
     pub packages: Option<Vec<PackageIdentity>>,
@@ -1209,6 +1207,9 @@ pub struct PackageSearchRequest {
         regex(path = "REGEX_PACKAGE_SEARCH_REQUEST_VIEW")
     )]
     pub view: Option<String>,
+    /// The indexed revision to read. Omitted reads the served revision.
+    #[validate(length(min = 1u64, max = 128u64))]
+    pub revision: Option<String>,
 }
 /// Match class established for one declaration identifier. A search hit that matches none of the requested identifiers reports `unknown`; a symbol lookup hit never does.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
@@ -1267,8 +1268,8 @@ pub struct PackageSearchHit {
     /// One package as its package manager identifies it.
     #[validate(nested)]
     pub package: PackageIdentity,
-    /// Readable Symbol assembled from normalized Contributions. Source structure lives in Node
-    /// and is connected through Relationship.
+    /// Readable Symbol assembled from normalized Contributions. Source structure lives in `SyntaxElement`
+    /// and is connected through Edge.
     #[validate(nested)]
     pub symbol: Symbol,
     /// The provider's qualified declaration name used for identifier ranking, with its original spelling.
@@ -1302,13 +1303,11 @@ pub struct PackageSearchHit {
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
 }
-/// One ranked page of package declarations. A page **MUST NOT** take the response past `response_body_bytes_max`: the server stops it before the first item that would, and the page carries the items that fit, `next_cursor` at the first item left out, and a `result_truncated` warning. The server **MUST** retain the captured view and its original expiry on every page, including an empty page.
+/// One page of package declarations. The response carries pagination for the selected declarations. A page above response_body_bytes_max is refused.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 pub struct PackageSearchPage {
     /// Ranked package declarations.
     pub items: Vec<PackageSearchItem>,
-    /// Opaque cursor for the next page.
-    pub next_cursor: Option<String>,
     /// Warnings attached to this page.
     pub warnings: Vec<Warning>,
     /// Publication format used by the package index.
@@ -1321,6 +1320,10 @@ pub struct PackageSearchPage {
     pub documentation_revision: Option<String>,
     /// The immutable serving view and the expiry promised by its owner.
     pub view: CapturedView,
+    /// The requested page and the size of its complete result set.
+    pub pagination: Pagination,
+    /// The indexed revision this answer read.
+    pub revision: String,
     /// Additional properties not defined in the schema.
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
@@ -1343,15 +1346,17 @@ pub struct PackagePatternRequest {
     /// Selected exact package versions. Omitted or empty, use the newest collected stable version of each package, or its newest prerelease when no stable version is collected.
     #[validate(length(max = 20_000u64), nested)]
     pub packages: Option<Vec<PackageIdentity>>,
-    /// Optional fields to include.
-    #[validate(length(max = 1u64))]
-    pub include: Option<Vec<String>>,
+    /// Optional fields to include. An omitted member is `false`.
+    pub include: Option<PackagePatternRequestInclude>,
+    /// The indexed revision to read. Omitted reads the served revision.
+    #[validate(length(min = 1u64, max = 128u64))]
+    pub revision: Option<String>,
 }
 /// The smallest declaration whose range holds a match. A match no declaration holds carries none.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 pub struct PackagePatternDeclaration {
-    /// Readable Symbol assembled from normalized Contributions. Source structure lives in Node
-    /// and is connected through Relationship.
+    /// Readable Symbol assembled from normalized Contributions. Source structure lives in `SyntaxElement`
+    /// and is connected through Edge.
     pub symbol: Symbol,
     /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
     /// from whatever its toolchain counts in at its own boundary, so two toolchains' column
@@ -1361,7 +1366,7 @@ pub struct PackagePatternDeclaration {
     pub range: TextRange,
     /// One-based source line containing the declaration.
     pub line: i64,
-    /// The declaration's source, when the request includes `source`.
+    /// The declaration's source, when `include.source` is `true`.
     pub source: Option<String>,
     /// Additional properties not defined in the schema.
     #[serde(flatten)]
@@ -1386,19 +1391,17 @@ pub struct PackagePatternHit {
     pub size: i64,
     /// The smallest declaration whose range holds a match. A match no declaration holds carries none.
     pub declaration: Option<PackagePatternDeclaration>,
-    /// The line where the match begins, without its line ending, when the request includes `source`.
+    /// The line where the match begins, without its line ending, when `include.source` is `true`.
     pub source: Option<String>,
     /// Additional properties not defined in the schema.
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
 }
-/// One page of pattern matches. A page that stops before the last match carries `next_cursor` at the first match left out and a `result_truncated` warning naming the bound it stopped at. A page **MUST NOT** take the response past `response_body_bytes_max`: the server stops it before the first match that would.
+/// One page of results at the named revision. A page past the last returns an empty list with the same pagination. The server refuses a page that exceeds the response byte bound.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 pub struct PackagePatternPage {
     /// Matches in package, file path, and offset order.
     pub items: Vec<PackagePatternHit>,
-    /// Opaque cursor for the next page.
-    pub next_cursor: Option<String>,
     /// Warnings attached to this page.
     pub warnings: Vec<Warning>,
     /// Publication format used by the package index.
@@ -1409,6 +1412,10 @@ pub struct PackagePatternPage {
     pub corpus_revision: String,
     /// The immutable serving view and the expiry promised by its owner.
     pub view: Option<CapturedView>,
+    /// The requested page and the size of its complete result set.
+    pub pagination: Pagination,
+    /// The indexed revision this answer read.
+    pub revision: String,
     /// Additional properties not defined in the schema.
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
@@ -2170,13 +2177,13 @@ pub struct SearchHit {
     pub hit: SearchHitTarget,
     /// The ranking value attached to this hit and used to merge duplicate hits.
     /// Exact original identifier spelling ranks before this value under `relevance`.
-    /// Present on the wire when `include` names `score`; comparable within one answer
+    /// Present on the wire when `include.score` is `true`; comparable within one answer
     /// and nowhere else.
     pub score: Option<f64>,
     /// Which indexed fields produced the match. Absent when empty.
     #[default(Some(Default::default()))]
     pub matched_by: Option<Vec<MatchedField>>,
-    /// The source text around the hit, requested with `include: ["source"]`. Covers the
+    /// The source text around the hit, requested with `include: {"source": true}`. Covers the
     /// hit's `range`; a caller that needs the range already has it there.
     pub source: Option<String>,
     /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
@@ -2206,7 +2213,7 @@ pub struct SearchHit {
         regex(path = "REGEX_PACKAGE_SEARCH_HIT_UNIT")
     )]
     pub unit: Option<String>,
-    /// Shortest relationship path to this hit, present when a traversal reached it,
+    /// Shortest edge path to this hit, present when a traversal reached it,
     /// including a hit also matched lexically.
     #[validate(length(min = 1u64, max = 2u64), nested)]
     pub traversal_path: Option<Vec<GraphHop>>,
@@ -2219,10 +2226,10 @@ pub struct SearchHit {
     #[validate(nested)]
     pub change: Option<SymbolChange>,
 }
-/// A bounded relationship walk starting at one symbol.
+/// A bounded edge walk starting at one symbol.
 ///
 /// From `seed`, the server visits its neighbors, then their neighbors, up to `depth` hops,
-/// following `direction` and narrowed to `facets`; each reached symbol keeps the shortest
+/// following `direction` and narrowed to `kinds`; each reached symbol keeps the shortest
 /// path the walk found to it.
 #[serde_with::skip_serializing_none]
 #[derive(
@@ -2242,10 +2249,10 @@ pub struct SearchTraversal {
     /// engine supplies the edges of both: its references for `incoming`, its call hierarchy for
     /// `outgoing`.
     pub direction: Option<TraversalDirection>,
-    /// Portable relationship facets eligible for the walk. Omitted or empty, every facet is
+    /// Portable edge kinds eligible for the walk. Omitted or empty, every kind is
     /// eligible.
     #[validate(length(max = 29u64))]
-    pub facets: Option<Vec<RelationshipFacet>>,
+    pub kinds: Option<Vec<EdgeKind>>,
     /// Hops the walk may take from `seed`. The server accepts 1 or 2. Omitted, 1.
     #[validate(range(min = 1, max = 2))]
     #[default(Some(1u64))]
@@ -2361,9 +2368,9 @@ pub enum MatchedField {
     /// The project-relative path matched.
     #[serde(rename = "path")]
     Path,
-    /// A relationship traversal reached the hit.
-    #[serde(rename = "relationship")]
-    Relationship,
+    /// An edge traversal reached the hit.
+    #[serde(rename = "edge")]
+    Edge,
     /// A comparison `change` named found the declaration changed.
     #[serde(rename = "change")]
     Change,
@@ -2377,7 +2384,7 @@ impl core::fmt::Display for MatchedField {
             Self::Content => write!(f, "content"),
             Self::Ranked => write!(f, "ranked"),
             Self::Path => write!(f, "path"),
-            Self::Relationship => write!(f, "relationship"),
+            Self::Edge => write!(f, "edge"),
             Self::Change => write!(f, "change"),
         }
     }
@@ -2395,7 +2402,7 @@ impl<'de> serde::Deserialize<'de> for MatchedField {
             "content" => Ok(MatchedField::Content),
             "ranked" => Ok(MatchedField::Ranked),
             "path" => Ok(MatchedField::Path),
-            "relationship" => Ok(MatchedField::Relationship),
+            "edge" => Ok(MatchedField::Edge),
             "change" => Ok(MatchedField::Change),
             _ => {
                 Err(
@@ -2408,7 +2415,7 @@ impl<'de> serde::Deserialize<'de> for MatchedField {
                             "content",
                             "ranked",
                             "path",
-                            "relationship",
+                            "edge",
                             "change",
                         ],
                     ),
@@ -2417,7 +2424,7 @@ impl<'de> serde::Deserialize<'de> for MatchedField {
         }
     }
 }
-/// One auditable step in a search traversal. `relationship` retains its occurrence and
+/// One auditable step in a search traversal. `edge` retains its occurrence and
 /// derivation; `direction` records how the walk followed it.
 #[derive(
     Debug,
@@ -2433,8 +2440,8 @@ pub struct GraphHop {
     /// One directed edge between two symbols. Its occurrence is where it was read from, and its
     /// derivation is how much the provider knew when it was read.
     #[validate(nested)]
-    pub relationship: Relationship,
-    /// How one path step followed its directed relationship.
+    pub edge: Edge,
+    /// How one path step followed its directed edge.
     pub direction: HopDirection,
 }
 /// Which edge direction a search traversal walks from each visited symbol. A language
@@ -2443,12 +2450,12 @@ pub struct GraphHop {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
 pub enum TraversalDirection {
     /// Walks edges arriving at each visited symbol: the references a language engine
-    /// resolves to it, each hop carrying the `references` facet.
+    /// resolves to it, each hop carrying the `references` kind.
     #[serde(rename = "incoming")]
     #[default]
     Incoming,
     /// Walks edges leaving each visited symbol: the calls a language engine's call
-    /// hierarchy names for it, each hop carrying the `calls` facet.
+    /// hierarchy names for it, each hop carrying the `calls` kind.
     #[serde(rename = "outgoing")]
     Outgoing,
 }
@@ -2517,7 +2524,7 @@ pub struct CommitHit {
     /// Whether the commit changed more paths than `paths` lists.
     pub paths_truncated: bool,
 }
-/// How one path step followed its directed relationship.
+/// How one path step followed its directed edge.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
 pub enum HopDirection {
     /// The walk followed the edge from source to target.
@@ -2562,7 +2569,7 @@ impl<'de> serde::Deserialize<'de> for HopDirection {
     oas3_gen_support::Default
 )]
 #[serde(deny_unknown_fields)]
-pub struct Relationship {
+pub struct Edge {
     /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub from: String,
@@ -2572,7 +2579,7 @@ pub struct Relationship {
     /// Portable classification, so a query for `imports` finds local kinds such as `import`
     /// and `use` alike.
     #[validate(length(min = 1u64))]
-    pub facets: Vec<RelationshipFacet>,
+    pub kinds: Vec<EdgeKind>,
     /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub to: String,
@@ -2582,7 +2589,7 @@ pub struct Relationship {
     /// How this edge was established. Every edge reaches Rift from a provider, and this field
     /// records whether the provider resolved the edge semantically, read it from syntax, or
     /// inferred it.
-    pub derivation: RelationshipDerivation,
+    pub derivation: EdgeDerivation,
     /// How likely a `heuristic` edge is to hold, from 0 to 1. Absent for any other
     /// derivation.
     #[validate(range(min = 0.0, max = 1.0))]
@@ -2600,7 +2607,7 @@ pub struct Relationship {
 /// records whether the provider resolved the edge semantically, read it from syntax, or
 /// inferred it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
-pub enum RelationshipDerivation {
+pub enum EdgeDerivation {
     /// The provider resolved the edge semantically, so a consumer may act on it directly.
     #[serde(rename = "resolution")]
     #[default]
@@ -2612,7 +2619,7 @@ pub enum RelationshipDerivation {
     #[serde(rename = "heuristic")]
     Heuristic,
 }
-impl core::fmt::Display for RelationshipDerivation {
+impl core::fmt::Display for EdgeDerivation {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Resolution => write!(f, "resolution"),
@@ -2621,16 +2628,16 @@ impl core::fmt::Display for RelationshipDerivation {
         }
     }
 }
-impl<'de> serde::Deserialize<'de> for RelationshipDerivation {
+impl<'de> serde::Deserialize<'de> for EdgeDerivation {
     fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
         match s.to_ascii_lowercase().as_str() {
-            "resolution" => Ok(RelationshipDerivation::Resolution),
-            "syntax" => Ok(RelationshipDerivation::Syntax),
-            "heuristic" => Ok(RelationshipDerivation::Heuristic),
+            "resolution" => Ok(EdgeDerivation::Resolution),
+            "syntax" => Ok(EdgeDerivation::Syntax),
+            "heuristic" => Ok(EdgeDerivation::Heuristic),
             _ => {
                 Err(
                     serde::de::Error::unknown_variant(
@@ -2760,39 +2767,15 @@ pub struct FindDeclarationsResult {
     /// Typed read warnings, including explicit partial coverage.
     pub warnings: Option<Vec<ReadWarning>>,
 }
-/// One optional `get_symbol` hit field the caller may opt into through `include`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
-pub enum GetSymbolInclude {
-    /// The hit's version-control timeline.
-    #[serde(rename = "history")]
-    #[default]
-    History,
-    /// Bounded documentation referring to the exact declaration.
-    #[serde(rename = "documentation")]
-    Documentation,
-}
-impl core::fmt::Display for GetSymbolInclude {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::History => write!(f, "history"),
-            Self::Documentation => write!(f, "documentation"),
-        }
-    }
-}
-impl<'de> serde::Deserialize<'de> for GetSymbolInclude {
-    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        match s.to_ascii_lowercase().as_str() {
-            "history" => Ok(GetSymbolInclude::History),
-            "documentation" => Ok(GetSymbolInclude::Documentation),
-            _ => {
-                Err(serde::de::Error::unknown_variant(&s, &["history", "documentation"]))
-            }
-        }
-    }
+/// The optional `get_symbol` projections the caller opts into. An omitted member is `false`.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, PartialEq, Serialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct GetSymbolInclude {
+    /// Attaches bounded documentation referring to the exact declaration.
+    pub documentation: Option<bool>,
+    /// Attaches the symbol's version-control timeline.
+    pub history: Option<bool>,
 }
 /// Reads one exact logical symbol obtained from discovery or another read.
 #[serde_with::skip_serializing_none]
@@ -2809,23 +2792,22 @@ pub struct GetSymbolParams {
     /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub id: String,
-    /// Requested projections. Omitted or empty requests none. A declaration's source is read
-    /// by `nodes` with `symbol`.
-    pub include: Option<Vec<GetSymbolInclude>>,
+    /// The optional `get_symbol` projections the caller opts into. An omitted member is `false`.
+    pub include: Option<GetSymbolInclude>,
     /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
     #[validate(
         length(min = 1u64, max = 8_192u64),
         regex(path = "REGEX_GET_SYMBOL_PARAMS_REVISION")
     )]
     pub revision: Option<String>,
-    /// Most declarations returned in this read. Omitted uses the existing five-item bound.
+    /// Results per page, at most 10,000.
     #[validate(range(min = 1, max = 10000))]
-    #[default(Some(5u64))]
-    pub declaration_limit: Option<u64>,
-    /// Continuation a preceding read returned, bound to this symbol and the revision it read.
-    /// The server refuses it for another symbol and once that revision is no longer served.
-    #[validate(length(min = 1u64, max = 4_096u64))]
-    pub declaration_cursor: Option<String>,
+    #[default(Some(10u64))]
+    pub max_results: Option<u64>,
+    /// The 1-based page to read.
+    #[validate(range(min = 1))]
+    #[default(Some(1u64))]
+    pub page: Option<u64>,
 }
 /// Exactly one logical object, definite absence, or explicit selection unavailability.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
@@ -3007,6 +2989,8 @@ impl<'de> serde::Deserialize<'de> for PositionEncoding {
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(default)]
 pub struct ReadWarning {
+    #[default(Some("object_unavailable".to_string()))]
+    pub code: Option<String>,
     /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. It names no revision: a read selects the revision whose bytes it answers. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
     pub unit: Option<String>,
     /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
@@ -3021,8 +3005,6 @@ pub struct ReadWarning {
     pub field: Option<String>,
     /// Enforced public field bound.
     pub bound: Option<u64>,
-    #[default(Some("object_unavailable".to_string()))]
-    pub code: Option<String>,
     /// Frameworks whose syntax depends on package or component context.
     pub framework: Option<SyntaxFramework>,
     /// The missing package version, configuration, or template source.
@@ -3066,9 +3048,9 @@ pub struct ReadWarning {
     pub providers: Option<Vec<String>>,
     /// Symbols the walk visited before it stopped, equal to the bound it hit.
     pub visited: Option<u64>,
-    /// The requested facets no lane populates, in the request's own order,
-    /// deduplicated. Absent when every requested facet has a lane.
-    pub facets: Option<Vec<RelationshipFacet>>,
+    /// The requested kinds no lane populates, in the request's own order,
+    /// deduplicated. Absent when every requested kind has a lane.
+    pub kinds: Option<Vec<EdgeKind>>,
     /// A language name and its optional dialect, joined by `:`. `sql` and `sql:postgresql` are two languages with two symbol spaces.
     pub language: Option<String>,
     /// Edges the walk dropped over every depth, one per call the engine named.
@@ -3100,9 +3082,9 @@ pub struct ReadWarning {
     pub resolver: Option<String>,
 }
 /// One portable category an edge falls into. The local kinds `import` and `use` can share
-/// the `imports` facet, which lets one query cross languages.
+/// the `imports` kind, which lets one query cross languages.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
-pub enum RelationshipFacet {
+pub enum EdgeKind {
     /// The source contains the target within its scope.
     #[serde(rename = "contains")]
     #[default]
@@ -3192,7 +3174,7 @@ pub enum RelationshipFacet {
     #[serde(rename = "binds")]
     Binds,
 }
-impl core::fmt::Display for RelationshipFacet {
+impl core::fmt::Display for EdgeKind {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Contains => write!(f, "contains"),
@@ -3227,42 +3209,42 @@ impl core::fmt::Display for RelationshipFacet {
         }
     }
 }
-impl<'de> serde::Deserialize<'de> for RelationshipFacet {
+impl<'de> serde::Deserialize<'de> for EdgeKind {
     fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
         match s.to_ascii_lowercase().as_str() {
-            "contains" => Ok(RelationshipFacet::Contains),
-            "declares" => Ok(RelationshipFacet::Declares),
-            "augments" => Ok(RelationshipFacet::Augments),
-            "references" => Ok(RelationshipFacet::References),
-            "calls" => Ok(RelationshipFacet::Calls),
-            "constructs" => Ok(RelationshipFacet::Constructs),
-            "reads" => Ok(RelationshipFacet::Reads),
-            "writes" => Ok(RelationshipFacet::Writes),
-            "imports" => Ok(RelationshipFacet::Imports),
-            "exports" => Ok(RelationshipFacet::Exports),
-            "extends" => Ok(RelationshipFacet::Extends),
-            "implements" => Ok(RelationshipFacet::Implements),
-            "has_type" => Ok(RelationshipFacet::HasType),
-            "overrides" => Ok(RelationshipFacet::Overrides),
-            "aliases" => Ok(RelationshipFacet::Aliases),
-            "generates" => Ok(RelationshipFacet::Generates),
-            "depends_on" => Ok(RelationshipFacet::DependsOn),
-            "annotated_by" => Ok(RelationshipFacet::AnnotatedBy),
-            "throws" => Ok(RelationshipFacet::Throws),
-            "catches" => Ok(RelationshipFacet::Catches),
-            "bounded_by" => Ok(RelationshipFacet::BoundedBy),
-            "instantiates" => Ok(RelationshipFacet::Instantiates),
-            "specializes" => Ok(RelationshipFacet::Specializes),
-            "overloads" => Ok(RelationshipFacet::Overloads),
-            "mixes_in" => Ok(RelationshipFacet::MixesIn),
-            "embeds" => Ok(RelationshipFacet::Embeds),
-            "tests" => Ok(RelationshipFacet::Tests),
-            "configures" => Ok(RelationshipFacet::Configures),
-            "binds" => Ok(RelationshipFacet::Binds),
+            "contains" => Ok(EdgeKind::Contains),
+            "declares" => Ok(EdgeKind::Declares),
+            "augments" => Ok(EdgeKind::Augments),
+            "references" => Ok(EdgeKind::References),
+            "calls" => Ok(EdgeKind::Calls),
+            "constructs" => Ok(EdgeKind::Constructs),
+            "reads" => Ok(EdgeKind::Reads),
+            "writes" => Ok(EdgeKind::Writes),
+            "imports" => Ok(EdgeKind::Imports),
+            "exports" => Ok(EdgeKind::Exports),
+            "extends" => Ok(EdgeKind::Extends),
+            "implements" => Ok(EdgeKind::Implements),
+            "has_type" => Ok(EdgeKind::HasType),
+            "overrides" => Ok(EdgeKind::Overrides),
+            "aliases" => Ok(EdgeKind::Aliases),
+            "generates" => Ok(EdgeKind::Generates),
+            "depends_on" => Ok(EdgeKind::DependsOn),
+            "annotated_by" => Ok(EdgeKind::AnnotatedBy),
+            "throws" => Ok(EdgeKind::Throws),
+            "catches" => Ok(EdgeKind::Catches),
+            "bounded_by" => Ok(EdgeKind::BoundedBy),
+            "instantiates" => Ok(EdgeKind::Instantiates),
+            "specializes" => Ok(EdgeKind::Specializes),
+            "overloads" => Ok(EdgeKind::Overloads),
+            "mixes_in" => Ok(EdgeKind::MixesIn),
+            "embeds" => Ok(EdgeKind::Embeds),
+            "tests" => Ok(EdgeKind::Tests),
+            "configures" => Ok(EdgeKind::Configures),
+            "binds" => Ok(EdgeKind::Binds),
             _ => {
                 Err(
                     serde::de::Error::unknown_variant(
@@ -3312,6 +3294,17 @@ impl<'de> serde::Deserialize<'de> for RelationshipFacet {
 pub type RevisionId = String;
 /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
 pub type Revision = String;
+/// A copy of source from the catalog. The unit may belong to the project, a dependency, or
+/// the standard library; the excerpt preserves bytes as they were when the answer was
+/// produced.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct SourceExcerpt {
+    /// One byte range in a source-catalog unit.
+    pub span: SourceUnitSpan,
+    /// The source bytes returned by the request.
+    pub text: String,
+}
 /// One exact position in a source unit, at the release of a package or runtime unit.
 #[serde_with::skip_serializing_none]
 #[derive(
@@ -3784,6 +3777,19 @@ impl<'de> serde::Deserialize<'de> for SyntaxFramework {
         }
     }
 }
+/// The requested page and the size of its complete result set.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct Pagination {
+    /// The 1-based page this answer serves.
+    pub page: u64,
+    /// Page count, zero when the result set is empty.
+    pub pages: u64,
+    /// Results per page.
+    pub max_results: u64,
+    /// Total results within the server's result bound.
+    pub total: u64,
+}
 /// The captured selection cannot serve this search or pattern request.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(untagged)]
@@ -3801,10 +3807,7 @@ impl SearchUnavailable {
         })
     }
 }
-/// Lists syntax nodes with their source: every node of one `symbol`, or the nodes of the
-/// innermost declaration holding one `position` in one file, or of that file's unit when no
-/// declaration holds it. Each node carries its kind, range, source text, and place, including
-/// expressions smaller than a declaration.
+/// Reads every declaration of one symbol with its location, source, and syntax structure.
 #[serde_with::skip_serializing_none]
 #[derive(
     Debug,
@@ -3814,34 +3817,19 @@ impl SearchUnavailable {
     validator::Validate,
     oas3_gen_support::Default
 )]
-#[serde(deny_unknown_fields)]
-pub struct NodesParams {
+#[serde(deny_unknown_fields, default)]
+pub struct FacetsParams {
     /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
-    pub symbol: Option<String>,
-    /// One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift
-    /// normalizes what it emits and what it accepts, and compares byte-for-byte. The empty path
-    /// names the root itself. Absolute paths, backslashes, control characters, empty segments,
-    /// and `.` or `..` segments are refused before the filesystem is touched. The limit is 1000
-    /// UTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal
-    /// fails the read that touches them with `content_unavailable`.
-    #[validate(
-        length(max = 1_000u64),
-        regex(path = "REGEX_DOCUMENTATION_LICENSE_FILE_PATH")
-    )]
-    pub path: Option<String>,
-    /// UTF-8 byte offset inside the declaration whose nodes the read lists - one position,
-    /// not a range; the nodes themselves carry the spans. The read lists the nodes of the
-    /// innermost declaration holding the node at the position, or of the file's unit when no
-    /// declaration holds it. A position inside a multi-byte character is valid; a position at
-    /// or past the file's byte length refuses.
-    #[validate(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
-    pub position: Option<u64>,
-    /// Continuation a preceding read returned, bound to the symbol or unit its answer listed
-    /// and the tree revision it read. The caller MUST send it with the selector of that read;
-    /// the server refuses it for another symbol or unit and once the tree has moved.
-    #[validate(length(min = 1u64, max = 4_096u64))]
-    pub node_cursor: Option<String>,
+    pub symbol: String,
+    /// Results per page, at most 100.
+    #[validate(range(min = 1, max = 100))]
+    #[default(Some(10u64))]
+    pub max_results: Option<u64>,
+    /// The 1-based page to read.
+    #[validate(range(min = 1))]
+    #[default(Some(1u64))]
+    pub page: Option<u64>,
     /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
     #[validate(
         length(min = 1u64, max = 8_192u64),
@@ -3849,41 +3837,38 @@ pub struct NodesParams {
     )]
     pub revision: Option<String>,
 }
-/// The nodes a read selected, each with its source text and its place inside its symbol or
-/// unit.
+/// Declarations of one symbol, each with its location, source, and syntax structure.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
-pub struct NodesResult {
+pub struct FacetsResult {
     /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
-    pub symbol: Option<String>,
-    /// Nodes the read selected, in pre-order: per declaration, in the order a symbol read
-    /// lists them, or the unit's nodes from its file node on.
-    pub nodes: Vec<Node>,
-    /// Continuation for the rest of an answer whose nodes crossed its node count or source
-    /// byte bound. Absent when the answer holds the last node.
-    pub node_cursor: Option<String>,
+    pub symbol: String,
+    /// Declarations in symbol order, with each declaration's syntax elements in pre-order.
+    pub declarations: Vec<FacetDeclaration>,
+    /// The requested page and the size of its complete result set.
+    pub pagination: Pagination,
     /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
     pub revision: String,
-    /// Warnings attached to this result. Absent when there is nothing to warn about.
+    /// Conditions affecting this answer. Absent when empty.
     #[default(Some(Default::default()))]
     pub warnings: Option<Vec<ReadWarning>>,
 }
-/// One node of a source unit's syntax tree, with its source text, addressed by its place inside
-/// a symbol. A node inside a declaration's item subtree is node `index` of declaration
-/// `declaration` of the symbol the read names; a node outside every declaration is node `index`
-/// of its `unit`. Indexes count in pre-order from 0 at the declaration's item node, or from 0 at
-/// the unit's file node, and skip the subtrees of nested declarations, whose nodes belong to the
-/// nested symbol. The address names a place at the read's revision: an edit renumbers the nodes
+/// One syntax element of a source unit's syntax tree, with its source text, addressed by its place inside
+/// a symbol. A syntax element inside a declaration's item subtree is syntax element `index` of declaration
+/// `declaration` of the symbol the read names; a syntax element outside every declaration is syntax element `index`
+/// of its `unit`. Indexes count in pre-order from 0 at the declaration's item syntax element, or from 0 at
+/// the unit's file syntax element, and skip the subtrees of nested declarations, whose syntax elements belong to the
+/// nested symbol. The address names a place at the read's revision: an edit renumbers the syntax elements
 /// after it.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
-pub struct Node {
-    /// Ordinal of the declaration holding this node among the declarations of the symbol the
-    /// read names, from 0 in the order a symbol read lists them. Absent for a node outside
-    /// every declaration: the file node, an import, a top-level statement.
+pub struct SyntaxElement {
+    /// Ordinal of the declaration holding this syntax element among the declarations of the symbol the
+    /// read names, from 0 in the order a symbol read lists them. Absent for a syntax element outside
+    /// every declaration: the file syntax element, an import, a top-level statement.
     pub declaration: Option<u64>,
-    /// Pre-order position of this node inside its declaration's item subtree, or inside its
-    /// unit when `declaration` is absent. The item node and the unit's file node are 0.
+    /// Pre-order position of this syntax element inside its declaration's item subtree, or inside its
+    /// unit when `declaration` is absent. The item syntax element and the unit's file syntax element are 0.
     pub index: u64,
     /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. It names no revision: a read selects the revision whose bytes it answers. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
     pub unit: String,
@@ -3894,30 +3879,30 @@ pub struct Node {
     /// Portable structural classification, so a query can ask for bodies or imports without
     /// knowing the grammar that produced them. Absent when empty.
     #[default(Some(Default::default()))]
-    pub facets: Option<Vec<NodeFacet>>,
+    pub kinds: Option<Vec<SyntaxKind>>,
     /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
     /// from whatever its toolchain counts in at its own boundary, so two toolchains' column
     /// numbers arrive here on the same scale. No JSON Schema keyword can tie one field to
     /// another, so that `end` is never below `start` is asserted by the surface
     /// validation tests instead.
     pub range: TextRange,
-    /// The node's exact source text: the bytes `range` spans at the read's revision.
+    /// The syntax element's exact source text: the bytes `range` spans at the read's revision.
     pub source: String,
-    /// The node's named parts, including its function body and documentation. Absent when empty.
+    /// The syntax element's named parts, including its function body and documentation. Absent when empty.
     #[default(Some(Default::default()))]
-    pub regions: Option<Vec<NodeRegion>>,
-    /// `index` of the node this one is nested inside, in the same declaration or unit. Absent
-    /// for node 0.
+    pub regions: Option<Vec<FacetRegion>>,
+    /// `index` of the syntax element this one is nested inside, in the same declaration or unit. Absent
+    /// for syntax element 0.
     pub parent: Option<u64>,
     /// Facts a provider carries that the model has no field for, under a reverse-domain key.
     /// Keys and values use RFC 8785 canonical JSON. Consumers skip entries they do not
     /// implement.
     pub extensions: Option<serde_json::Value>,
 }
-/// Portable structural facets, so a filter can ask for bodies or imports without knowing the
+/// Portable structural kinds, so a filter can ask for bodies or imports without knowing the
 /// grammar that produced them.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
-pub enum NodeFacet {
+pub enum SyntaxKind {
     /// Introduces a name.
     #[default]
     Declaration,
@@ -3956,7 +3941,7 @@ pub enum NodeFacet {
     /// Belongs to test code.
     Test,
 }
-impl core::fmt::Display for NodeFacet {
+impl core::fmt::Display for SyntaxKind {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Declaration => write!(f, "declaration"),
@@ -3980,31 +3965,31 @@ impl core::fmt::Display for NodeFacet {
         }
     }
 }
-impl<'de> serde::Deserialize<'de> for NodeFacet {
+impl<'de> serde::Deserialize<'de> for SyntaxKind {
     fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
         match s.to_ascii_lowercase().as_str() {
-            "declaration" => Ok(NodeFacet::Declaration),
-            "definition" => Ok(NodeFacet::Definition),
-            "body" => Ok(NodeFacet::Body),
-            "block" => Ok(NodeFacet::Block),
-            "statement" => Ok(NodeFacet::Statement),
-            "expression" => Ok(NodeFacet::Expression),
-            "type_expression" => Ok(NodeFacet::TypeExpression),
-            "import" => Ok(NodeFacet::Import),
-            "export" => Ok(NodeFacet::Export),
-            "parameter" => Ok(NodeFacet::Parameter),
-            "argument" => Ok(NodeFacet::Argument),
-            "annotation" => Ok(NodeFacet::Annotation),
-            "comment" => Ok(NodeFacet::Comment),
-            "identifier" => Ok(NodeFacet::Identifier),
-            "literal" => Ok(NodeFacet::Literal),
-            "pattern" => Ok(NodeFacet::Pattern),
-            "generated" => Ok(NodeFacet::Generated),
-            "test" => Ok(NodeFacet::Test),
+            "declaration" => Ok(SyntaxKind::Declaration),
+            "definition" => Ok(SyntaxKind::Definition),
+            "body" => Ok(SyntaxKind::Body),
+            "block" => Ok(SyntaxKind::Block),
+            "statement" => Ok(SyntaxKind::Statement),
+            "expression" => Ok(SyntaxKind::Expression),
+            "type_expression" => Ok(SyntaxKind::TypeExpression),
+            "import" => Ok(SyntaxKind::Import),
+            "export" => Ok(SyntaxKind::Export),
+            "parameter" => Ok(SyntaxKind::Parameter),
+            "argument" => Ok(SyntaxKind::Argument),
+            "annotation" => Ok(SyntaxKind::Annotation),
+            "comment" => Ok(SyntaxKind::Comment),
+            "identifier" => Ok(SyntaxKind::Identifier),
+            "literal" => Ok(SyntaxKind::Literal),
+            "pattern" => Ok(SyntaxKind::Pattern),
+            "generated" => Ok(SyntaxKind::Generated),
+            "test" => Ok(SyntaxKind::Test),
             _ => {
                 Err(
                     serde::de::Error::unknown_variant(
@@ -4035,11 +4020,11 @@ impl<'de> serde::Deserialize<'de> for NodeFacet {
         }
     }
 }
-/// One named part of a node, and the bytes it spans.
+/// One named part of a syntax element, and the bytes it spans.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
-pub struct NodeRegion {
-    /// One named part of a node. A language marks these out inside a declaration, so an
+pub struct FacetRegion {
+    /// One named part of a syntax element. A language marks these out inside a declaration, so an
     /// operation can address the body of a function without addressing its documentation.
     pub role: RegionRole,
     /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
@@ -4049,11 +4034,11 @@ pub struct NodeRegion {
     /// validation tests instead.
     pub range: TextRange,
 }
-/// One named part of a node. A language marks these out inside a declaration, so an
+/// One named part of a syntax element. A language marks these out inside a declaration, so an
 /// operation can address the body of a function without addressing its documentation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
 pub enum RegionRole {
-    /// The stretch that best identifies the node when presented.
+    /// The stretch that best identifies the syntax element when presented.
     #[default]
     Selection,
     /// The name being declared.
@@ -4062,11 +4047,11 @@ pub enum RegionRole {
     Header,
     /// The implementation, without documentation or header.
     Body,
-    /// The interior of the node without its delimiters.
+    /// The interior of the syntax element without its delimiters.
     Content,
     /// The doc comment attached to the declaration.
     Documentation,
-    /// The full extent including what surrounds the node proper.
+    /// The full extent including what surrounds the syntax element proper.
     Enclosing,
 }
 impl core::fmt::Display for RegionRole {
@@ -4156,8 +4141,8 @@ pub struct QueryOccurrence {
     /// One byte range in a source-catalog unit.
     pub source: SourceUnitSpan,
     /// One portable category an edge falls into. The local kinds `import` and `use` can share
-    /// the `imports` facet, which lets one query cross languages.
-    pub facet: RelationshipFacet,
+    /// the `imports` kind, which lets one query cross languages.
+    pub kind: EdgeKind,
 }
 /// Selected source bytes, when their projection was requested.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
@@ -4174,22 +4159,22 @@ pub struct QuerySource {
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
 pub struct QuerySymbol {
-    /// Readable Symbol assembled from normalized Contributions. Source structure lives in Node
-    /// and is connected through Relationship.
+    /// Readable Symbol assembled from normalized Contributions. Source structure lives in `SyntaxElement`
+    /// and is connected through Edge.
     pub symbol: Symbol,
     /// Physical declarations, preserving their association indices.
     pub declarations: Vec<SymbolDeclaration>,
 }
-/// Positive count bounds for one raw relationship operation.
+/// Positive count bounds for one raw edge operation.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
-pub struct RelationshipBounds {
+pub struct EdgeBounds {
     /// Most subjects in one request.
     pub max_seeds: u64,
-    /// Most selected facets in one request.
-    pub max_facets: u64,
-    /// Most relationship projections in one group.
-    pub max_relationships: u64,
+    /// Most selected kinds in one request.
+    pub max_kinds: u64,
+    /// Most edge projections in one group.
+    pub max_edges: u64,
     /// Most occurrence projections in one group.
     pub max_occurrences: u64,
     /// Most original symbol records in one page.
@@ -4197,99 +4182,78 @@ pub struct RelationshipBounds {
     /// Most original source units in one page.
     pub max_sources: u64,
 }
-/// One relationship operation the reader establishes from its existing collected facts.
+/// One edge operation the reader establishes from its existing collected facts.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
-pub struct RelationshipCapability {
+pub struct EdgeCapability {
     /// Which edge direction a search traversal walks from each visited symbol. A language
     /// engine supplies the edges of both: its references for `incoming`, its call hierarchy for
     /// `outgoing`.
     pub direction: TraversalDirection,
-    /// Facets whose complete selected-domain reads the reader supports.
-    pub facets: Vec<RelationshipFacet>,
-    /// Positive count bounds for one raw relationship operation.
-    pub bounds: Option<RelationshipBounds>,
+    /// Kinds whose complete selected-domain reads the reader supports.
+    pub kinds: Vec<EdgeKind>,
+    /// Positive count bounds for one raw edge operation.
+    pub bounds: Option<EdgeBounds>,
 }
-/// Original relationship records for one requested subject on this page.
+/// Original edge records for one requested subject on this page.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
-pub struct RelationshipGroup {
+pub struct EdgeGroup {
     /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     pub seed: String,
     /// Original records, preserving parallel edges, evidence and occurrences.
-    pub relationships: Vec<RelationshipRecord>,
+    pub edges: Vec<EdgeRecord>,
     /// Physical usages, including recursive and file-level locations without a caller symbol.
-    /// Page limits count distinct original record identities across relationships and usages.
+    /// Page limits count distinct original record identities across edges and usages.
     /// Multiple projections of one original record consume one slot; independent records
     /// consume separate slots even when their payloads or locations are equal.
-    pub occurrences: Option<Vec<RelationshipOccurrence>>,
+    pub occurrences: Option<Vec<EdgeOccurrence>>,
     /// Provider exhausted this subject's adjacency under the selected exact domain.
     pub complete: bool,
 }
-/// An optional projection of records in a relationship page.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
-pub enum RelationshipInclude {
-    /// Exact UTF-8 bytes of the selected source units.
-    #[serde(rename = "source")]
-    #[default]
-    Source,
-}
-impl core::fmt::Display for RelationshipInclude {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Source => write!(f, "source"),
-        }
-    }
-}
-impl<'de> serde::Deserialize<'de> for RelationshipInclude {
-    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        match s.to_ascii_lowercase().as_str() {
-            "source" => Ok(RelationshipInclude::Source),
-            _ => Err(serde::de::Error::unknown_variant(&s, &["source"])),
-        }
-    }
+/// The optional projections of records in an edge page. An omitted member is `false`.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, PartialEq, Serialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct EdgeInclude {
+    /// Attaches the exact UTF-8 bytes of the selected source units.
+    pub source: Option<bool>,
 }
 /// One physical usage projected from an original selected-publication record.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
-pub struct RelationshipOccurrence {
-    /// Opaque full identity of one original relationship record within its selected publication.
+pub struct EdgeOccurrence {
+    /// Opaque full identity of one original edge record within its selected publication.
     pub id: String,
-    /// Opaque full identity of one original relationship record within its selected publication.
-    pub relationship: Option<String>,
+    /// Opaque full identity of one original edge record within its selected publication.
+    pub edge: Option<String>,
     /// One physical reference or call supplied by a selected provider.
     pub occurrence: QueryOccurrence,
 }
-/// One original relationship record, independent of equal endpoint or evidence payloads.
+/// One original edge record, independent of equal endpoint or evidence payloads.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
-pub struct RelationshipRecord {
-    /// Opaque full identity of one original relationship record within its selected publication.
+pub struct EdgeRecord {
+    /// Opaque full identity of one original edge record within its selected publication.
     pub id: String,
     /// One directed edge between two symbols. Its occurrence is where it was read from, and its
     /// derivation is how much the provider knew when it was read.
-    pub relationship: Relationship,
+    pub edge: Edge,
 }
-/// Opaque full identity of one original relationship record within its selected publication.
-pub type RelationshipRecordId = String;
-/// One raw relationship page from an immutable selected publication.
+/// Opaque full identity of one original edge record within its selected publication.
+pub type EdgeRecordId = String;
+/// One raw edge page from an immutable selected publication.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
-pub struct RelationshipSearchPage {
+pub struct EdgeSearchPage {
     /// One authoritative group for every requested subject, in request order.
-    pub groups: Vec<RelationshipGroup>,
+    pub groups: Vec<EdgeGroup>,
     /// Exact symbols reached by this page. Identical captured records may repeat across pages;
     /// conflicting records are refused.
     pub symbols: Option<Vec<QuerySymbol>>,
     /// Physical source catalog and requested bytes for reached declarations and occurrences.
     /// Identical captured records may repeat across pages; conflicting records are refused.
     pub sources: Option<Vec<QuerySource>>,
-    /// Opaque continuation bound to subjects, direction, facets and selected domain.
-    pub next_cursor: Option<String>,
     /// Existing warnings retained without treating missing facts as complete empty.
     pub warnings: Option<Vec<ReadWarning>>,
     /// Analyzer revision shared by every page and exact read.
@@ -4299,7 +4263,7 @@ pub struct RelationshipSearchPage {
     /// The immutable serving view and the expiry promised by its owner.
     pub view: CapturedView,
 }
-/// The exclusive raw relationship request on the existing search endpoint.
+/// The exclusive raw edge request on the existing search endpoint.
 #[serde_with::skip_serializing_none]
 #[derive(
     Debug,
@@ -4310,19 +4274,18 @@ pub struct RelationshipSearchPage {
     oas3_gen_support::Default
 )]
 #[serde(deny_unknown_fields)]
-pub struct RelationshipSearchRequest {
+pub struct EdgeSearchRequest {
     /// One incoming or outgoing adjacency selection, without ranking or path projection.
     #[validate(nested)]
-    pub relationships: RelationshipSelection,
+    pub edges: EdgeSelection,
     /// Exact eligible package domain. Required unless `view` retains that domain.
     #[validate(length(min = 1u64, max = 20_000u64), nested)]
     pub packages: Option<Vec<PackageIdentity>>,
     /// Exact eligible runtime domain, retaining compiler or runtime versions.
     #[validate(length(min = 1u64, max = 20_000u64), nested)]
     pub runtimes: Option<Vec<RuntimeIdentity>>,
-    /// Requested exact projections; source bytes use the same selected publication.
-    #[validate(length(max = 1u64))]
-    pub include: Option<Vec<String>>,
+    /// The optional projections of records in an edge page. An omitted member is `false`.
+    pub include: Option<EdgeInclude>,
     /// A service-issued key for one immutable view in one serving context.
     #[validate(
         length(min = 3u64, max = 4_096u64),
@@ -4340,7 +4303,7 @@ pub struct RelationshipSearchRequest {
     oas3_gen_support::Default
 )]
 #[serde(deny_unknown_fields)]
-pub struct RelationshipSelection {
+pub struct EdgeSelection {
     /// Established subjects whose complete adjacency is required.
     #[validate(length(min = 1u64))]
     pub seeds: Vec<String>,
@@ -4348,11 +4311,34 @@ pub struct RelationshipSelection {
     /// engine supplies the edges of both: its references for `incoming`, its call hierarchy for
     /// `outgoing`.
     pub direction: TraversalDirection,
-    /// Portable relationship facets. Empty selects every available facet.
-    pub facets: Vec<RelationshipFacet>,
+    /// Portable edge kinds. Empty selects every available kind.
+    pub kinds: Vec<EdgeKind>,
 }
 /// Complete lowercase SHA-256 digest of immutable source bytes.
 pub type SourceDigest = String;
+/// One facet: a declaration with its location, source, and syntax structure.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct FacetDeclaration {
+    /// Declaration ordinal in the symbol, from zero.
+    pub declaration: u64,
+    /// A provider-local kind preserving the construct name used by that language implementation.
+    pub kind: String,
+    /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
+    /// from whatever its toolchain counts in at its own boundary, so two toolchains' column
+    /// numbers arrive here on the same scale. No JSON Schema keyword can tie one field to
+    /// another, so that `end` is never below `start` is asserted by the surface
+    /// validation tests instead.
+    pub range: TextRange,
+    /// A copy of source from the catalog. The unit may belong to the project, a dependency, or
+    /// the standard library; the excerpt preserves bytes as they were when the answer was
+    /// produced.
+    pub source: SourceExcerpt,
+    /// Named regions supplied by the syntax provider.
+    pub regions: Option<Vec<FacetRegion>>,
+    /// The declaration's syntax structure.
+    pub syntax: Vec<SyntaxElement>,
+}
 /// Returns supported package managers, features, publication revisions, and active bounds.
 #[derive(Debug, Clone, validator::Validate, oas3_gen_support::Default)]
 pub struct GetCapabilitiesRequest {}
@@ -4447,7 +4433,7 @@ pub enum GetCapabilitiesResponse {
     Ok(Capabilities),
     ///304: The cached capability representation has not changed.
     NotModified,
-    ///400: Request JSON, query parameters, or field relationships are invalid.
+    ///400: Request JSON, query parameters, or field edges are invalid.
     BadRequest(ProblemDetails),
     ///401: Authentication is required or credentials are invalid.
     Unauthorized(ProblemDetails),
@@ -4574,7 +4560,7 @@ impl ResolvePackageContextRequest {
 pub enum ResolvePackageContextResponse {
     ///200: Resolution result accounting for every submitted entry.
     Ok(PackageResolutionResponse),
-    ///400: Request JSON, query parameters, or field relationships are invalid.
+    ///400: Request JSON, query parameters, or field edges are invalid.
     BadRequest(ProblemDetails),
     ///401: Authentication is required or credentials are invalid.
     Unauthorized(ProblemDetails),
@@ -4602,21 +4588,21 @@ pub enum ResolvePackageContextResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, oas3_gen_support::Default)]
 #[serde(untagged)]
 pub enum SearchRequestBody {
-    /// A lexical package declaration search or a bounded relationship walk.
+    /// A lexical package declaration search or a bounded edge walk.
     #[default]
     Package(PackageSearchRequest),
-    /// The exclusive raw relationship request on the existing search endpoint.
-    Relationship(RelationshipSearchRequest),
+    /// The exclusive raw edge request on the existing search endpoint.
+    Edge(EdgeSearchRequest),
 }
 impl SearchRequestBody {
-    /// A lexical package declaration search or a bounded relationship walk.
+    /// A lexical package declaration search or a bounded edge walk.
     pub fn package() -> Self {
         Self::Package(PackageSearchRequest::default())
     }
-    /// The exclusive raw relationship request on the existing search endpoint.
-    pub fn relationship(relationships: RelationshipSelection) -> Self {
-        Self::Relationship(RelationshipSearchRequest {
-            relationships,
+    /// The exclusive raw edge request on the existing search endpoint.
+    pub fn edge(edges: EdgeSelection) -> Self {
+        Self::Edge(EdgeSearchRequest {
+            edges,
             ..Default::default()
         })
     }
@@ -4631,15 +4617,16 @@ impl SearchRequestBody {
     oas3_gen_support::Default
 )]
 pub struct SearchPackagesRequestQuery {
-    /// Maximum entries in one page, at most the `page_limit_max` the capabilities advertise; the server refuses a larger one.
+    /// The 1-based page to read.
+    #[validate(range(min = 1))]
+    #[default(Some(1u64))]
+    pub page: Option<u64>,
+    /// Results per page. The server refuses a value above the advertised maximum.
     #[validate(range(min = 1i64, max = 1_000i64))]
-    #[default(Some(100i64))]
-    pub limit: Option<i64>,
-    /// Opaque cursor for the next page.
-    #[validate(length(max = 4_096u64))]
-    pub cursor: Option<String>,
+    #[default(Some(10i64))]
+    pub max_results: Option<i64>,
 }
-/// Returns one ranked declaration page from selected exact package versions.
+/// Returns one page of results from the selected exact package versions. The caller pins later pages with the returned `revision`.
 #[derive(Debug, Clone, validator::Validate, oas3_gen_support::Default)]
 pub struct SearchPackagesRequest {
     #[validate(nested)]
@@ -4762,9 +4749,9 @@ impl SearchPackagesRequest {
 /// Response types for searchPackages
 #[derive(Debug, Clone)]
 pub enum SearchPackagesResponse {
-    ///200: One ranked package declaration page or one complete relationship page.
+    ///200: One ranked package declaration page or one complete edge page.
     Ok(Search200Response),
-    ///400: Request JSON, query parameters, or field relationships are invalid.
+    ///400: Request JSON, query parameters, or field edges are invalid.
     BadRequest(ProblemDetails),
     ///401: Authentication is required or credentials are invalid.
     Unauthorized(ProblemDetails),
@@ -4791,7 +4778,7 @@ pub enum SearchPackagesResponse {
     ///default: Unknown response
     Unknown,
 }
-/// Reads one exact logical symbol obtained from discovery or another read.
+/// Reads one exact logical symbol obtained from discovery or another read. The caller selects declarations with `page` and `max_results`, and pins later pages with `revision`.
 #[derive(Debug, Clone, validator::Validate, oas3_gen_support::Default)]
 pub struct GetSymbolRequest {
     /// Reads one exact logical symbol obtained from discovery or another read.
@@ -4918,7 +4905,7 @@ impl GetSymbolRequest {
 pub enum GetSymbolResponse {
     ///200: One exact logical symbol.
     Ok(GetSymbolResult),
-    ///400: Request JSON, query parameters, or field relationships are invalid.
+    ///400: Request JSON, query parameters, or field edges are invalid.
     BadRequest(ProblemDetails),
     ///401: Authentication is required or credentials are invalid.
     Unauthorized(ProblemDetails),
@@ -4947,120 +4934,120 @@ pub enum GetSymbolResponse {
     ///default: Unknown response
     Unknown,
 }
-/// Lists the syntax nodes of one package or runtime symbol with their source text, in the exact release its identity names: each declaration's item node, then the descendants that belong to that declaration and not to a declaration nested in it, outermost first per declaration. Every node's `unit` is a source unit of that release. The request carries `symbol` and MAY carry `node_cursor` and `revision`; the server refuses `path` and `position`. A page holds at most `page_limit_max` nodes and, beyond its first node, at most `x-rift-page-source-bytes-max` bytes of node source; `node_cursor` continues where the page stopped. A symbol the release does not declare answers 404.
+/// Reads every declaration of one package or runtime symbol with its location, exact source, and syntax structure. The caller selects declarations with `page` and `max_results`, and pins later pages with `revision`.
 #[derive(Debug, Clone, validator::Validate, oas3_gen_support::Default)]
-pub struct NodesRequest {
-    /// The package or runtime symbol whose nodes the request lists.
+pub struct FacetsRequest {
+    /// The package or runtime symbol whose facets the request reads.
     #[validate(nested)]
-    pub body: NodesParams,
+    pub body: FacetsParams,
 }
-impl NodesRequest {
+impl FacetsRequest {
     /// Parse the HTTP response into the response enum.
     pub async fn parse_response(
         req: reqwest::Response,
-    ) -> anyhow::Result<NodesResponse> {
+    ) -> anyhow::Result<FacetsResponse> {
         let status = req.status();
         if status == http::StatusCode::OK {
             let data = oas3_gen_support::Diagnostics::<
-                NodesResult,
+                FacetsResult,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(NodesResponse::Ok(data));
+            return Ok(FacetsResponse::Ok(data));
         }
         if status == http::StatusCode::BAD_REQUEST {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(NodesResponse::BadRequest(data));
+            return Ok(FacetsResponse::BadRequest(data));
         }
         if status == http::StatusCode::UNAUTHORIZED {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(NodesResponse::Unauthorized(data));
+            return Ok(FacetsResponse::Unauthorized(data));
         }
         if status == http::StatusCode::FORBIDDEN {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(NodesResponse::Forbidden(data));
+            return Ok(FacetsResponse::Forbidden(data));
         }
         if status == http::StatusCode::NOT_ACCEPTABLE {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(NodesResponse::NotAcceptable(data));
+            return Ok(FacetsResponse::NotAcceptable(data));
         }
         if status == http::StatusCode::PAYLOAD_TOO_LARGE {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(NodesResponse::ContentTooLarge(data));
+            return Ok(FacetsResponse::ContentTooLarge(data));
         }
         if status == http::StatusCode::UNSUPPORTED_MEDIA_TYPE {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(NodesResponse::UnsupportedMediaType(data));
+            return Ok(FacetsResponse::UnsupportedMediaType(data));
         }
         if status == http::StatusCode::TOO_MANY_REQUESTS {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(NodesResponse::TooManyRequests(data));
+            return Ok(FacetsResponse::TooManyRequests(data));
         }
         if status == http::StatusCode::INTERNAL_SERVER_ERROR {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(NodesResponse::InternalServerError(data));
+            return Ok(FacetsResponse::InternalServerError(data));
         }
         if status == http::StatusCode::BAD_GATEWAY {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(NodesResponse::BadGateway(data));
+            return Ok(FacetsResponse::BadGateway(data));
         }
         if status == http::StatusCode::SERVICE_UNAVAILABLE {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(NodesResponse::ServiceUnavailable(data));
+            return Ok(FacetsResponse::ServiceUnavailable(data));
         }
         if status == http::StatusCode::GATEWAY_TIMEOUT {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(NodesResponse::GatewayTimeout(data));
+            return Ok(FacetsResponse::GatewayTimeout(data));
         }
         if status == http::StatusCode::NOT_FOUND {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(NodesResponse::NotFound(data));
+            return Ok(FacetsResponse::NotFound(data));
         }
         let _ = req.bytes().await?;
-        return Ok(NodesResponse::Unknown);
+        return Ok(FacetsResponse::Unknown);
     }
 }
-/// Response types for nodes
+/// Response types for facets
 #[derive(Debug, Clone)]
-pub enum NodesResponse {
-    ///200: The symbol's nodes with their source text.
-    Ok(NodesResult),
-    ///400: Request JSON, query parameters, or field relationships are invalid.
+pub enum FacetsResponse {
+    ///200: The symbol's declarations with exact source and syntax structure.
+    Ok(FacetsResult),
+    ///400: Request JSON, query parameters, or field edges are invalid.
     BadRequest(ProblemDetails),
     ///401: Authentication is required or credentials are invalid.
     Unauthorized(ProblemDetails),
@@ -5097,15 +5084,16 @@ pub enum NodesResponse {
     oas3_gen_support::Default
 )]
 pub struct SearchPackagePatternsRequestQuery {
-    /// Maximum entries in one page, at most the `page_limit_max` the capabilities advertise; the server refuses a larger one.
+    /// The 1-based page to read.
+    #[validate(range(min = 1))]
+    #[default(Some(1u64))]
+    pub page: Option<u64>,
+    /// Results per page. The server refuses a value above the advertised maximum.
     #[validate(range(min = 1i64, max = 1_000i64))]
-    #[default(Some(100i64))]
-    pub limit: Option<i64>,
-    /// Opaque cursor for the next page.
-    #[validate(length(max = 4_096u64))]
-    pub cursor: Option<String>,
+    #[default(Some(10i64))]
+    pub max_results: Option<i64>,
 }
-/// Returns the matches of one regular expression over the source files of selected exact package versions, in package order as the request lists them, then file path order, then match offset. The server verifies candidate files in that order and stops a page at `limit` hits, at `x-rift-page-files-max` files, or at `x-rift-page-text-bytes-max` bytes of verified text, whichever comes first; `next_cursor` continues where the page stopped, and a `result_truncated` warning names the bound.
+/// Returns one page of results from the selected exact package versions. The caller pins later pages with the returned `revision`.
 #[derive(Debug, Clone, validator::Validate, oas3_gen_support::Default)]
 pub struct SearchPackagePatternsRequest {
     #[validate(nested)]
@@ -5213,7 +5201,7 @@ impl SearchPackagePatternsRequest {
 pub enum SearchPackagePatternsResponse {
     ///200: One page of pattern matches.
     Ok(PackagePatternPage),
-    ///400: Request JSON, query parameters, or field relationships are invalid.
+    ///400: Request JSON, query parameters, or field edges are invalid.
     BadRequest(ProblemDetails),
     ///401: Authentication is required or credentials are invalid.
     Unauthorized(ProblemDetails),
@@ -5344,7 +5332,7 @@ impl FindDeclarationsRequest {
 pub enum FindDeclarationsResponse {
     ///200: Ordered outcomes for every submitted position.
     Ok(FindDeclarationsResult),
-    ///400: Request JSON, query parameters, or field relationships are invalid.
+    ///400: Request JSON, query parameters, or field edges are invalid.
     BadRequest(ProblemDetails),
     ///401: Authentication is required or credentials are invalid.
     Unauthorized(ProblemDetails),
@@ -5411,6 +5399,14 @@ impl<'de> serde::Deserialize<'de> for WarningCode {
             _ => Ok(WarningCode::Unknown),
         }
     }
+}
+/// Optional fields to include. An omitted member is `false`.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, PartialEq, Serialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct PackageSearchRequestInclude {
+    /// Attaches the declaration's source to each hit.
+    pub source: Option<bool>,
 }
 /// Ranking phase to execute.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
@@ -5528,6 +5524,14 @@ impl<'de> serde::Deserialize<'de> for PackageSearchHitContributingField {
         }
     }
 }
+/// Optional fields to include. An omitted member is `false`.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, PartialEq, Serialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct PackagePatternRequestInclude {
+    /// Attaches the line where each match begins and the source of its enclosing declaration.
+    pub source: Option<bool>,
+}
 /// A visible workspace file.
 #[derive(
     Debug,
@@ -5540,6 +5544,8 @@ impl<'de> serde::Deserialize<'de> for PackageSearchHitContributingField {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct DocumentationSourceIdentityProjectPath {
+    #[default("project".to_string())]
+    pub kind: String,
     /// One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift
     /// normalizes what it emits and what it accepts, and compares byte-for-byte. The empty path
     /// names the root itself. Absolute paths, backslashes, control characters, empty segments,
@@ -5551,8 +5557,6 @@ pub struct DocumentationSourceIdentityProjectPath {
         regex(path = "REGEX_DOCUMENTATION_LICENSE_FILE_PATH")
     )]
     pub path: String,
-    #[default("project".to_string())]
-    pub kind: String,
 }
 /// A source unit supplied by an exact package adapter.
 #[derive(
@@ -5566,14 +5570,14 @@ pub struct DocumentationSourceIdentityProjectPath {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct DocumentationSourceIdentitySourceUnitId {
+    #[default("package".to_string())]
+    pub kind: String,
     /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. It names no revision: a read selects the revision whose bytes it answers. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
     #[validate(
         length(min = 17u64, max = 8_192u64),
         regex(path = "REGEX_PACKAGE_SEARCH_HIT_UNIT")
     )]
     pub unit: String,
-    #[default("package".to_string())]
-    pub kind: String,
 }
 /// A valid identifier stored in the notebook.
 #[derive(
@@ -5587,11 +5591,11 @@ pub struct DocumentationSourceIdentitySourceUnitId {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct NotebookCellIdentityObject {
+    #[default("authored".to_string())]
+    pub kind: String,
     /// Identifier accepted by the notebook format.
     #[validate(length(min = 1u64))]
     pub id: String,
-    #[default("authored".to_string())]
-    pub kind: String,
 }
 /// The cell's zero-based position in its notebook.
 #[derive(
@@ -5605,11 +5609,11 @@ pub struct NotebookCellIdentityObject {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct NotebookCellIdentityObject2 {
+    #[default("indexed".to_string())]
+    pub kind: String,
     /// Position among every cell, including unselected cells.
     #[validate(range(min = 0))]
     pub index: u32,
-    #[default("indexed".to_string())]
-    pub kind: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
 pub enum PackageDocumentationHitContributingField {
@@ -5658,11 +5662,11 @@ impl<'de> serde::Deserialize<'de> for PackageDocumentationHitContributingField {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct SearchHitTargetDocumentationHit {
+    #[default("documentation".to_string())]
+    pub target: String,
     /// One documentation block projected from its existing content owner.
     #[validate(nested)]
     pub documentation: DocumentationHit,
-    #[default("documentation".to_string())]
-    pub target: String,
 }
 /// A symbol hit: the declaration a provider resolved.
 #[derive(
@@ -5676,12 +5680,12 @@ pub struct SearchHitTargetDocumentationHit {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct SearchHitTargetSymbol {
-    /// Readable Symbol assembled from normalized Contributions. Source structure lives in Node
-    /// and is connected through Relationship.
-    #[validate(nested)]
-    pub symbol: Symbol,
     #[default("symbol".to_string())]
     pub target: String,
+    /// Readable Symbol assembled from normalized Contributions. Source structure lives in `SyntaxElement`
+    /// and is connected through Edge.
+    #[validate(nested)]
+    pub symbol: Symbol,
 }
 /// A file hit: one entry of the tree, whether or not any provider reads it.
 #[serde_with::skip_serializing_none]
@@ -5696,6 +5700,8 @@ pub struct SearchHitTargetSymbol {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct SearchHitTargetObject {
+    #[default("file".to_string())]
+    pub target: String,
     /// Size in bytes.
     #[validate(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
     pub size: u64,
@@ -5703,8 +5709,6 @@ pub struct SearchHitTargetObject {
     /// Absent when empty.
     #[default(Some(Default::default()))]
     pub languages: Option<Vec<String>>,
-    #[default("file".to_string())]
-    pub target: String,
 }
 /// A commit hit: one commit the history store holds, matched by its message.
 #[derive(
@@ -5718,18 +5722,18 @@ pub struct SearchHitTargetObject {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct SearchHitTargetCommitHit {
+    #[default("commit".to_string())]
+    pub target: String,
     /// One commit whose message matched a commit search, as the history store holds it.
     #[validate(nested)]
     pub commit: CommitHit,
-    #[default("commit".to_string())]
-    pub target: String,
 }
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 pub struct PackageSearchItemVariant0 {
     /// One package as its package manager identifies it.
     pub package: PackageIdentity,
-    /// Readable Symbol assembled from normalized Contributions. Source structure lives in Node
-    /// and is connected through Relationship.
+    /// Readable Symbol assembled from normalized Contributions. Source structure lives in `SyntaxElement`
+    /// and is connected through Edge.
     pub symbol: Symbol,
     /// The provider's qualified declaration name used for identifier ranking, with its original spelling.
     pub qualified_name: String,
@@ -5782,13 +5786,13 @@ pub struct PackageSearchItemVariant2 {
     pub hit: PackageSearchItemVariant2Hit,
     /// The ranking value attached to this hit and used to merge duplicate hits.
     /// Exact original identifier spelling ranks before this value under `relevance`.
-    /// Present on the wire when `include` names `score`; comparable within one answer
+    /// Present on the wire when `include.score` is `true`; comparable within one answer
     /// and nowhere else.
     pub score: Option<f64>,
     /// Which indexed fields produced the match. Absent when empty.
     #[default(Some(Default::default()))]
     pub matched_by: Option<Vec<MatchedField>>,
-    /// The source text around the hit, requested with `include: ["source"]`. Covers the
+    /// The source text around the hit, requested with `include: {"source": true}`. Covers the
     /// hit's `range`; a caller that needs the range already has it there.
     pub source: Option<String>,
     /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
@@ -5808,7 +5812,7 @@ pub struct PackageSearchItemVariant2 {
     pub path: Option<String>,
     /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. It names no revision: a read selects the revision whose bytes it answers. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
     pub unit: Option<String>,
-    /// Shortest relationship path to this hit, present when a traversal reached it,
+    /// Shortest edge path to this hit, present when a traversal reached it,
     /// including a hit also matched lexically.
     pub traversal_path: Option<Vec<GraphHop>>,
     /// Number of edges in `traversal_path`. It is present exactly when `traversal_path` is
@@ -5822,6 +5826,8 @@ pub struct PackageSearchItemVariant2 {
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct DeclarationPositionResultObject {
+    #[default("found".to_string())]
+    pub outcome: String,
     /// One exact position in a source unit, at the release of a package or runtime unit.
     pub position: SourcePosition,
     /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
@@ -5830,42 +5836,42 @@ pub struct DeclarationPositionResultObject {
     pub kind: String,
     /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
     pub revision: String,
-    #[default("found".to_string())]
-    pub outcome: String,
 }
 /// The complete facts of the position's release hold no declaration at this position.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct DeclarationPositionResultSourcePosition {
-    /// One exact position in a source unit, at the release of a package or runtime unit.
-    pub position: SourcePosition,
     #[default("missing".to_string())]
     pub outcome: String,
+    /// One exact position in a source unit, at the release of a package or runtime unit.
+    pub position: SourcePosition,
 }
 /// Presence or absence cannot be established at this exact position.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct DeclarationPositionResultObject2 {
+    #[default("unavailable".to_string())]
+    pub outcome: String,
     /// One exact position in a source unit, at the release of a package or runtime unit.
     pub position: SourcePosition,
     /// Why an exact selection cannot establish presence or definite absence.
     pub reason: SymbolUnavailableReason,
-    #[default("unavailable".to_string())]
-    pub outcome: String,
 }
 /// The exact identity was established, even when it has no source declarations.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct GetSymbolResultObject {
-    /// Readable Symbol assembled from normalized Contributions. Source structure lives in Node
-    /// and is connected through Relationship.
+    #[default("found".to_string())]
+    pub outcome: String,
+    /// Readable Symbol assembled from normalized Contributions. Source structure lives in `SyntaxElement`
+    /// and is connected through Edge.
     pub symbol: Symbol,
     /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
     pub revision: String,
     /// Declaration bindings in deterministic source order.
     pub declarations: Vec<SymbolDeclaration>,
-    /// Continuation for the remaining declarations at `revision`.
-    pub declaration_cursor: Option<String>,
+    /// The requested page and the size of its complete result set.
+    pub pagination: Pagination,
     /// One symbol's history as edges from the symbol to the commits that touched it and to the
     /// symbols changed beside it. The history follows first parents from the served revision,
     /// or the selected releases in version order, through the commits the history store holds,
@@ -5876,26 +5882,26 @@ pub struct GetSymbolResultObject {
     pub documentation: Option<DocumentationContext>,
     /// Projection cuts and other typed read warnings.
     pub warnings: Option<Vec<ReadWarning>>,
-    #[default("found".to_string())]
-    pub outcome: String,
 }
 /// The valid identity is absent from the completely searched exact selection.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct GetSymbolResultObject2 {
+    #[default("missing".to_string())]
+    pub outcome: String,
     /// Definite absence after a complete exact selection, with bounded alternatives.
     pub symbol_not_found: SymbolNotFound,
     /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
     pub revision: String,
     /// Warnings, including incomplete candidate work.
     pub warnings: Option<Vec<ReadWarning>>,
-    #[default("missing".to_string())]
-    pub outcome: String,
 }
 /// The exact selection cannot establish presence or absence.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct GetSymbolResultObject3 {
+    #[default("unavailable".to_string())]
+    pub outcome: String,
     /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     pub id: String,
     /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
@@ -5904,8 +5910,6 @@ pub struct GetSymbolResultObject3 {
     pub reason: SymbolUnavailableReason,
     /// Details and available partial-read warnings.
     pub warnings: Option<Vec<ReadWarning>>,
-    #[default("unavailable".to_string())]
-    pub outcome: String,
 }
 /// The commit brought the symbol into existence.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
@@ -5971,22 +5975,22 @@ pub struct HistoryEdgeSymbolId {
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct SearchUnavailableObject {
+    #[default("unavailable".to_string())]
+    pub outcome: String,
     /// Why an exact selection cannot establish presence or definite absence.
     pub reason: SymbolUnavailableReason,
     /// The immutable serving view and the expiry promised by its owner.
     pub view: Option<CapturedView>,
     /// Details and partial-read warnings.
     pub warnings: Option<Vec<ReadWarning>>,
-    #[default("unavailable".to_string())]
-    pub outcome: String,
 }
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(untagged)]
 pub enum Search200Response {
-    /// One ranked page of package declarations. A page **MUST NOT** take the response past `response_body_bytes_max`: the server stops it before the first item that would, and the page carries the items that fit, `next_cursor` at the first item left out, and a `result_truncated` warning. The server **MUST** retain the captured view and its original expiry on every page, including an empty page.
+    /// One page of package declarations. The response carries pagination for the selected declarations. A page above response_body_bytes_max is refused.
     #[default]
     Package(PackageSearchPage),
-    /// One raw relationship page from an immutable selected publication.
-    Relationship(RelationshipSearchPage),
+    /// One raw edge page from an immutable selected publication.
+    Edge(EdgeSearchPage),
 }
 

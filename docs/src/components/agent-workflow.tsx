@@ -46,9 +46,9 @@ const steps = [
     direction: "down",
   },
   {
-    title: "Nodes",
-    address: "nodes",
-    href: "#tool-nodes",
+    title: "Facets",
+    address: "facets",
+    href: "#tool-facets",
     description: "Inspect syntax and choose the range to edit.",
     owner: "Rift",
     icon: TreeStructureIcon,
@@ -94,7 +94,7 @@ export function AgentWorkflow() {
       aria-describedby="agent-workflow-description"
     >
       <p id="agent-workflow-description" className="sr-only">
-        Read the map, search, retrieve a symbol, inspect nodes, then edit with the agent's tools.
+        Read the map, search, retrieve a symbol, inspect facets, then edit with the agent's tools.
         Rift detects project file changes and updates the local index, closing the cycle back to the
         map and subsequent reads. Search and Symbols also draw dependency facts from the global
         index. Each card links to its documentation.

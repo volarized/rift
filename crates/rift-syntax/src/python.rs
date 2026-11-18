@@ -34,7 +34,7 @@ use std::num::NonZeroU16;
 use std::sync::OnceLock;
 
 use rift_error::errors;
-use rift_protocol::read::{Documentation, DocumentationFormat, Language, NodeFacet, SymbolFacet};
+use rift_protocol::read::{Documentation, DocumentationFormat, Language, SymbolKind, SyntaxKind};
 use tree_sitter::{Node, Parser};
 
 use crate::document::SyntaxDocument;
@@ -51,7 +51,7 @@ mod declaration_tests;
 const FUNCTION_KIND: &str = "function_definition";
 /// Grammar spelling of a class definition.
 const CLASS_KIND: &str = "class_definition";
-/// Grammar spelling of the node wrapping a decorated `def` or `class`.
+/// Grammar spelling of the syntax element wrapping a decorated `def` or `class`.
 const DECORATED_KIND: &str = "decorated_definition";
 /// Grammar spelling of a suite of statements.
 const BLOCK_KIND: &str = "block";
@@ -241,12 +241,12 @@ impl PythonKinds {
     }
 }
 
-/// Resolves one node kind id, proving the pinned grammar defines it.
+/// Resolves one syntax element kind id, proving the pinned grammar defines it.
 fn kind_id(language: &tree_sitter::Language, kind: &str) -> u16 {
     let id = language.id_for_node_kind(kind, true);
     assert!(
         id != 0,
-        "pinned Python grammar must define node kind used by symbol \
+        "pinned Python grammar must define syntax_element kind used by symbol \
          extraction: kind={kind}"
     );
     id
@@ -273,11 +273,11 @@ enum DeclarationScope {
 }
 
 impl DeclarationScope {
-    /// Portable facets a variable declared in this scope carries.
-    fn variable_facets(self) -> Vec<SymbolFacet> {
+    /// Portable kinds a variable declared in this scope carries.
+    fn variable_kinds(self) -> Vec<SymbolKind> {
         match self {
-            Self::Module => vec![SymbolFacet::Value],
-            Self::Class => vec![SymbolFacet::Value, SymbolFacet::Member],
+            Self::Module => vec![SymbolKind::Value],
+            Self::Class => vec![SymbolKind::Value, SymbolKind::Member],
         }
     }
 }
@@ -299,8 +299,8 @@ struct PythonRules {
 impl PythonRules {
     /// The spelled name behind a definition's `name` field; `None` when the
     /// tree is missing it.
-    fn field_name(&self, node: Node<'_>, text: &str) -> Option<String> {
-        let name = node.child_by_field_id(self.kinds.name.get())?;
+    fn field_name(&self, syntax_element: Node<'_>, text: &str) -> Option<String> {
+        let name = syntax_element.child_by_field_id(self.kinds.name.get())?;
         text.get(name.byte_range()).map(str::to_owned)
     }
 
@@ -324,8 +324,8 @@ impl PythonRules {
     /// The definition's docstring: its body suite's leading string
     /// expression, quotes stripped. `None` when the body opens with
     /// anything else.
-    fn docstring(&self, node: Node<'_>, text: &str) -> Result<StringText, RiftError> {
-        let Some(body) = node.child_by_field_id(self.kinds.body.get()) else {
+    fn docstring(&self, syntax_element: Node<'_>, text: &str) -> Result<StringText, RiftError> {
+        let Some(body) = syntax_element.child_by_field_id(self.kinds.body.get()) else {
             return Ok((String::new(), Vec::new()));
         };
         let Some(first) = body.named_child(0) else {
@@ -349,17 +349,17 @@ impl PythonRules {
         visited: Visited<'_, '_>,
         text: &str,
         kind: &'static str,
-        facets: Vec<SymbolFacet>,
+        kinds: Vec<SymbolKind>,
     ) -> Result<Option<Declaration>, RiftError> {
-        let node = visited.node();
-        let Some(name) = self.field_name(node, text) else {
+        let syntax_element = visited.syntax_element();
+        let Some(name) = self.field_name(syntax_element, text) else {
             return Ok(None);
         };
-        let body_range = match node.child_by_field_id(self.kinds.body.get()) {
+        let body_range = match syntax_element.child_by_field_id(self.kinds.body.get()) {
             Some(body) => Some(extract::byte_range(body)?),
             None => None,
         };
-        let (content, documentation_ranges) = self.docstring(node, text)?;
+        let (content, documentation_ranges) = self.docstring(syntax_element, text)?;
         let (documentation, documentation_ranges) = if content.is_empty() {
             (Vec::new(), Vec::new())
         } else {
@@ -374,7 +374,7 @@ impl PythonRules {
         Ok(Some(Declaration {
             name,
             kind,
-            facets,
+            kinds,
             visibility: None,
             body_range,
             documentation,
@@ -386,14 +386,14 @@ impl PythonRules {
     /// carry no declaration because a source binding requires a non-empty range.
     fn module_declaration(
         &self,
-        node: Node<'_>,
+        syntax_element: Node<'_>,
         text: &str,
     ) -> Result<Option<Declaration>, RiftError> {
-        if node.start_byte() == node.end_byte() {
+        if syntax_element.start_byte() == syntax_element.end_byte() {
             return Ok(None);
         }
-        let mut cursor = node.walk();
-        let string = node
+        let mut cursor = syntax_element.walk();
+        let string = syntax_element
             .named_children(&mut cursor)
             .find(|child| child.kind_id() != self.kinds.comment)
             .and_then(|statement| literal_string(self.kinds, statement, text));
@@ -412,7 +412,7 @@ impl PythonRules {
         Ok(Some(Declaration {
             name: MODULE_KIND.to_owned(),
             kind: MODULE_KIND,
-            facets: vec![SymbolFacet::Namespace, SymbolFacet::Module],
+            kinds: vec![SymbolKind::Namespace, SymbolKind::Module],
             visibility: None,
             body_range: None,
             documentation,
@@ -424,13 +424,13 @@ impl PythonRules {
     fn is_method(&self, function: Visited<'_, '_>) -> bool {
         let block = function
             .parent()
-            .filter(|parent| parent.node().kind_id() == self.kinds.decorated)
+            .filter(|parent| parent.syntax_element().kind_id() == self.kinds.decorated)
             .map_or(function.parent(), Visited::parent);
         block.is_some_and(|block| {
-            block.node().kind_id() == self.kinds.block
-                && block
-                    .parent()
-                    .is_some_and(|definition| definition.node().kind_id() == self.kinds.class)
+            block.syntax_element().kind_id() == self.kinds.block
+                && block.parent().is_some_and(|definition| {
+                    definition.syntax_element().kind_id() == self.kinds.class
+                })
         })
     }
 
@@ -444,13 +444,13 @@ impl PythonRules {
     ) -> Vec<&'text str> {
         let Some(decorated) = visited
             .parent()
-            .filter(|parent| parent.node().kind_id() == self.kinds.decorated)
+            .filter(|parent| parent.syntax_element().kind_id() == self.kinds.decorated)
         else {
             return Vec::new();
         };
-        let mut cursor = decorated.node().walk();
+        let mut cursor = decorated.syntax_element().walk();
         let decorators: Vec<_> = decorated
-            .node()
+            .syntax_element()
             .named_children(&mut cursor)
             .filter(|child| child.kind_id() == self.kinds.decorator)
             .collect();
@@ -474,29 +474,25 @@ impl PythonRules {
     /// The categories a method carries beside `value`, `callable`, and
     /// `member`: `constructor` for `__init__`, `static` for a static or class
     /// method, `property` for a property accessor.
-    fn method_facets(&self, visited: Visited<'_, '_>, text: &str) -> Vec<SymbolFacet> {
-        let mut facets = vec![
-            SymbolFacet::Value,
-            SymbolFacet::Callable,
-            SymbolFacet::Member,
-        ];
-        if self.field_name(visited.node(), text).as_deref() == Some(CONSTRUCTOR_NAME) {
-            facets.push(SymbolFacet::Constructor);
+    fn method_kinds(&self, visited: Visited<'_, '_>, text: &str) -> Vec<SymbolKind> {
+        let mut kinds = vec![SymbolKind::Value, SymbolKind::Callable, SymbolKind::Member];
+        if self.field_name(visited.syntax_element(), text).as_deref() == Some(CONSTRUCTOR_NAME) {
+            kinds.push(SymbolKind::Constructor);
         }
         let decorators = self.decorator_names(visited, text);
         if decorators
             .iter()
             .any(|name| STATIC_DECORATORS.contains(name))
         {
-            facets.push(SymbolFacet::Static);
+            kinds.push(SymbolKind::Static);
         }
         if decorators
             .iter()
             .any(|name| PROPERTY_DECORATORS.contains(name))
         {
-            facets.push(SymbolFacet::Property);
+            kinds.push(SymbolKind::Property);
         }
-        facets
+        kinds
     }
 
     /// Where a statement declares: the module, or a class body, climbing
@@ -508,7 +504,7 @@ impl PythonRules {
     fn statement_scope(&self, statement: Visited<'_, '_>) -> Option<DeclarationScope> {
         let mut holder = statement.parent()?;
         loop {
-            let id = holder.node().kind_id();
+            let id = holder.syntax_element().kind_id();
             if id == self.kinds.module {
                 return Some(DeclarationScope::Module);
             }
@@ -516,7 +512,7 @@ impl PythonRules {
                 return None;
             }
             let owner = holder.parent()?;
-            let owner_id = owner.node().kind_id();
+            let owner_id = owner.syntax_element().kind_id();
             if owner_id == self.kinds.class {
                 return Some(DeclarationScope::Class);
             }
@@ -528,7 +524,7 @@ impl PythonRules {
             if !self
                 .kinds
                 .declaring_statements
-                .contains(&compound.node().kind_id())
+                .contains(&compound.syntax_element().kind_id())
             {
                 return None;
             }
@@ -545,12 +541,15 @@ impl PythonRules {
         let mut current = assignment;
         loop {
             let parent = current.parent()?;
-            let id = parent.node().kind_id();
+            let id = parent.syntax_element().kind_id();
             if id == self.kinds.expression_statement {
                 return Some(parent);
             }
             let is_value = id == self.kinds.assignment
-                && parent.node().child_by_field_id(self.kinds.right.get()) == Some(current.node());
+                && parent
+                    .syntax_element()
+                    .child_by_field_id(self.kinds.right.get())
+                    == Some(current.syntax_element());
             if !is_value {
                 return None;
             }
@@ -558,7 +557,7 @@ impl PythonRules {
         }
     }
 
-    /// The assignment a target node binds through: the target is the
+    /// The assignment a target syntax element binds through: the target is the
     /// assignment's `left` side, or sits inside the tuple and list patterns
     /// that form it. With `through_pattern`, only a target inside a pattern
     /// counts.
@@ -571,10 +570,12 @@ impl PythonRules {
         let mut patterned = false;
         loop {
             let parent = child.parent()?;
-            let id = parent.node().kind_id();
+            let id = parent.syntax_element().kind_id();
             if id == self.kinds.assignment {
-                let binds = parent.node().child_by_field_id(self.kinds.left.get())
-                    == Some(child.node())
+                let binds = parent
+                    .syntax_element()
+                    .child_by_field_id(self.kinds.left.get())
+                    == Some(child.syntax_element())
                     && (patterned || !through_pattern);
                 return binds.then_some(parent);
             }
@@ -591,7 +592,7 @@ impl PythonRules {
         Declaration {
             name: name.to_owned(),
             kind: VARIABLE_KIND_WORD,
-            facets: scope.variable_facets(),
+            kinds: scope.variable_kinds(),
             visibility: None,
             body_range: None,
             documentation: Vec::new(),
@@ -602,7 +603,9 @@ impl PythonRules {
     /// The declared variable behind an assignment whose target is one plain
     /// identifier.
     fn assignment_declaration(&self, visited: Visited<'_, '_>, text: &str) -> Option<Declaration> {
-        let target = visited.node().child_by_field_id(self.kinds.left.get())?;
+        let target = visited
+            .syntax_element()
+            .child_by_field_id(self.kinds.left.get())?;
         if target.kind_id() != self.kinds.identifier {
             return None;
         }
@@ -615,7 +618,7 @@ impl PythonRules {
         let assignment = self.target_assignment(visited, true)?;
         let scope = self.statement_scope(self.assignment_statement(assignment)?)?;
         Some(Self::variable(
-            text.get(visited.node().byte_range())?,
+            text.get(visited.syntax_element().byte_range())?,
             scope,
         ))
     }
@@ -628,12 +631,12 @@ impl PythonRules {
         visited: Visited<'walk, 'tree>,
         text: &str,
     ) -> Option<Visited<'walk, 'tree>> {
-        let node = visited.node();
-        if node.kind_id() != self.kinds.attribute {
+        let syntax_element = visited.syntax_element();
+        if syntax_element.kind_id() != self.kinds.attribute {
             return None;
         }
-        let object = node.child_by_field_id(self.kinds.object.get())?;
-        let name = node.child_by_field_id(self.kinds.attribute_name.get())?;
+        let object = syntax_element.child_by_field_id(self.kinds.object.get())?;
+        let name = syntax_element.child_by_field_id(self.kinds.attribute_name.get())?;
         if object.kind_id() != self.kinds.identifier || name.kind_id() != self.kinds.identifier {
             return None;
         }
@@ -641,7 +644,7 @@ impl PythonRules {
         let mut current = self.assignment_statement(assignment)?;
         let function = loop {
             let parent = current.parent()?;
-            let id = parent.node().kind_id();
+            let id = parent.syntax_element().kind_id();
             if id == self.kinds.function {
                 break parent;
             }
@@ -653,7 +656,7 @@ impl PythonRules {
         if !self.is_method(function) {
             return None;
         }
-        let receiver = self.first_parameter(function.node(), text)?;
+        let receiver = self.first_parameter(function.syntax_element(), text)?;
         (text.get(object.byte_range()) == Some(receiver)).then_some(function)
     }
 
@@ -675,7 +678,7 @@ impl PythonRules {
         visited: Visited<'_, '_>,
         text: &str,
     ) -> Result<Option<Declaration>, RiftError> {
-        let Some(name) = self.type_alias_name(visited.node()) else {
+        let Some(name) = self.type_alias_name(visited.syntax_element()) else {
             return Ok(None);
         };
         if self.statement_scope(visited).is_none() {
@@ -685,14 +688,14 @@ impl PythonRules {
             return Ok(None);
         };
         let body_range = visited
-            .node()
+            .syntax_element()
             .child_by_field_id(self.kinds.right.get())
             .map(extract::byte_range)
             .transpose()?;
         Ok(Some(Declaration {
             name: name.to_owned(),
             kind: TYPE_ALIAS_KIND_WORD,
-            facets: vec![SymbolFacet::Type, SymbolFacet::Alias],
+            kinds: vec![SymbolKind::Type, SymbolKind::Alias],
             visibility: None,
             body_range,
             documentation: Vec::new(),
@@ -734,7 +737,7 @@ fn assigned_docs(
         }
         let Some(assignment) = statement
             .named_child(0)
-            .filter(|node| node.kind_id() == kinds.assignment)
+            .filter(|syntax_element| syntax_element.kind_id() == kinds.assignment)
         else {
             continue;
         };
@@ -902,9 +905,9 @@ impl PythonRules {
         let mut documented = BTreeMap::new();
         let mut cursor = root.walk();
         'walk: loop {
-            let node = cursor.node();
-            if [self.kinds.module, self.kinds.block].contains(&node.kind_id()) {
-                self.attribute_block_docs(node, text, &mut documented)?;
+            let syntax_element = cursor.node();
+            if [self.kinds.module, self.kinds.block].contains(&syntax_element.kind_id()) {
+                self.attribute_block_docs(syntax_element, text, &mut documented)?;
             }
             if cursor.goto_first_child() {
                 continue;
@@ -932,13 +935,13 @@ impl GrammarRules for PythonRules {
         text: &str,
         _qualification: &str,
     ) -> Result<Option<crate::SyntaxExportBinding>, RiftError> {
-        let node = visited.node();
-        if node.kind_id() != self.kinds.aliased_import {
+        let syntax_element = visited.syntax_element();
+        if syntax_element.kind_id() != self.kinds.aliased_import {
             return Ok(None);
         }
         let Some(statement) = visited
             .parent()
-            .filter(|parent| parent.node().kind_id() == self.kinds.import_from)
+            .filter(|parent| parent.syntax_element().kind_id() == self.kinds.import_from)
         else {
             return Ok(None);
         };
@@ -946,15 +949,15 @@ impl GrammarRules for PythonRules {
             return Ok(None);
         }
         let (Some(name), Some(alias), Some(module)) = (
-            node.child_by_field_id(self.kinds.name.get()),
-            node.child_by_field_id(self.kinds.alias.get()),
+            syntax_element.child_by_field_id(self.kinds.name.get()),
+            syntax_element.child_by_field_id(self.kinds.alias.get()),
             statement
-                .node()
+                .syntax_element()
                 .child_by_field_id(self.kinds.module_name.get()),
         ) else {
             return Ok(None);
         };
-        let spelled = |node: Node<'_>| text.get(node.byte_range());
+        let spelled = |syntax_element: Node<'_>| text.get(syntax_element.byte_range());
         if name.named_child_count() != 1
             || spelled(name).is_none()
             || spelled(name) != spelled(alias)
@@ -963,7 +966,7 @@ impl GrammarRules for PythonRules {
         }
         Ok(Some(crate::SyntaxExportBinding {
             kind: crate::SyntaxExportKind::Named,
-            range: extract::byte_range(statement.node())?,
+            range: extract::byte_range(statement.syntax_element())?,
             local: Some(extract::byte_range(name)?),
             exported: Some(extract::byte_range(alias)?),
             source: Some(extract::byte_range(module)?),
@@ -977,21 +980,23 @@ impl GrammarRules for PythonRules {
         visited: Visited<'_, '_>,
         text: &str,
     ) -> Result<Option<crate::PythonOverload>, RiftError> {
-        if visited.node().kind_id() != self.kinds.function {
+        if visited.syntax_element().kind_id() != self.kinds.function {
             return Ok(None);
         }
-        self.overloads.state(visited.node(), text).map(Some)
+        self.overloads
+            .state(visited.syntax_element(), text)
+            .map(Some)
     }
 
-    fn name_range(&self, node: Node<'_>) -> Result<Option<crate::ByteRange>, RiftError> {
-        let name = if node.kind_id() == self.kinds.identifier {
-            Some(node)
-        } else if node.kind_id() == self.kinds.attribute {
-            node.child_by_field_id(self.kinds.attribute_name.get())
-        } else if node.kind_id() == self.kinds.type_alias_statement {
-            self.type_alias_name(node)
+    fn name_range(&self, syntax_element: Node<'_>) -> Result<Option<crate::ByteRange>, RiftError> {
+        let name = if syntax_element.kind_id() == self.kinds.identifier {
+            Some(syntax_element)
+        } else if syntax_element.kind_id() == self.kinds.attribute {
+            syntax_element.child_by_field_id(self.kinds.attribute_name.get())
+        } else if syntax_element.kind_id() == self.kinds.type_alias_statement {
+            self.type_alias_name(syntax_element)
         } else {
-            node.child_by_field_id(self.kinds.name.get())
+            syntax_element.child_by_field_id(self.kinds.name.get())
         };
         name.map(extract::byte_range).transpose()
     }
@@ -1001,21 +1006,21 @@ impl GrammarRules for PythonRules {
         visited: Visited<'_, '_>,
         text: &str,
     ) -> Result<Option<Declaration>, RiftError> {
-        let node = visited.node();
-        let id = node.kind_id();
+        let syntax_element = visited.syntax_element();
+        let id = syntax_element.kind_id();
         if id == self.kinds.module {
-            return self.module_declaration(node, text);
+            return self.module_declaration(syntax_element, text);
         }
         if id == self.kinds.function {
             if self.is_method(visited) {
-                let facets = self.method_facets(visited, text);
-                return self.definition_declaration(visited, text, METHOD_KIND_WORD, facets);
+                let kinds = self.method_kinds(visited, text);
+                return self.definition_declaration(visited, text, METHOD_KIND_WORD, kinds);
             }
             return self.definition_declaration(
                 visited,
                 text,
                 FUNCTION_KIND_WORD,
-                vec![SymbolFacet::Value, SymbolFacet::Callable],
+                vec![SymbolKind::Value, SymbolKind::Callable],
             );
         }
         if id == self.kinds.class {
@@ -1024,10 +1029,10 @@ impl GrammarRules for PythonRules {
                 text,
                 CLASS_KIND_WORD,
                 vec![
-                    SymbolFacet::Type,
-                    SymbolFacet::MemberContainer,
-                    SymbolFacet::Constructible,
-                    SymbolFacet::Extensible,
+                    SymbolKind::Type,
+                    SymbolKind::MemberContainer,
+                    SymbolKind::Constructible,
+                    SymbolKind::Extensible,
                 ],
             );
         }
@@ -1041,7 +1046,7 @@ impl GrammarRules for PythonRules {
             let Some(_) = self.attribute_method(visited, text) else {
                 return Ok(None);
             };
-            let name = node
+            let name = syntax_element
                 .child_by_field_id(self.kinds.attribute_name.get())
                 .and_then(|name| text.get(name.byte_range()));
             return Ok(name.map(|name| Self::variable(name, DeclarationScope::Class)));
@@ -1061,7 +1066,7 @@ impl GrammarRules for PythonRules {
         qualification: &str,
     ) -> Option<String> {
         let method = self.attribute_method(visited, text)?;
-        let name = self.field_name(method.node(), text)?;
+        let name = self.field_name(method.syntax_element(), text)?;
         let class = qualification
             .strip_suffix(name.as_str())?
             .strip_suffix(SCOPE_QUALIFICATION_SEPARATOR)?;
@@ -1070,34 +1075,36 @@ impl GrammarRules for PythonRules {
 
     /// An instance attribute assigned alone spans its whole assignment, as
     /// a one-name assignment does; one inside a tuple target spans itself.
-    fn declaration_node<'tree>(&self, visited: Visited<'_, 'tree>) -> Node<'tree> {
-        let node = visited.node();
-        if node.kind_id() != self.kinds.attribute {
-            return node;
+    fn declaration_syntax_element<'tree>(&self, visited: Visited<'_, 'tree>) -> Node<'tree> {
+        let syntax_element = visited.syntax_element();
+        if syntax_element.kind_id() != self.kinds.attribute {
+            return syntax_element;
         }
         visited
             .parent()
-            .map(Visited::node)
+            .map(Visited::syntax_element)
             .filter(|parent| {
                 parent.kind_id() == self.kinds.assignment
-                    && parent.child_by_field_id(self.kinds.left.get()) == Some(node)
+                    && parent.child_by_field_id(self.kinds.left.get()) == Some(syntax_element)
             })
-            .unwrap_or(node)
+            .unwrap_or(syntax_element)
     }
 
-    fn container_name(&self, node: Node<'_>, text: &str) -> Option<String> {
-        if node.kind_id() != self.kinds.function && node.kind_id() != self.kinds.class {
+    fn container_name(&self, syntax_element: Node<'_>, text: &str) -> Option<String> {
+        if syntax_element.kind_id() != self.kinds.function
+            && syntax_element.kind_id() != self.kinds.class
+        {
             return None;
         }
-        self.field_name(node, text)
+        self.field_name(syntax_element, text)
     }
 
     /// A decorated definition starts at its first decorator, so the whole
     /// declaration removes with its decorators.
     fn declaration_start(&self, visited: Visited<'_, '_>, _text: &str) -> usize {
-        match visited.parent().map(Visited::node) {
+        match visited.parent().map(Visited::syntax_element) {
             Some(parent) if parent.kind_id() == self.kinds.decorated => parent.start_byte(),
-            _ => visited.node().start_byte(),
+            _ => visited.syntax_element().start_byte(),
         }
     }
 
@@ -1164,13 +1171,14 @@ impl SyntaxProvider for PythonSyntaxProvider {
             assigned_docs: BTreeMap::new(),
         };
         rules.assigned_docs = assigned_docs(&rules, tree.root_node(), source.text)?;
-        let (nodes, mut symbols, export_bindings) = extract::extract_with_export_bindings(
-            tree.root_node(),
-            source,
-            limits,
-            &self.language,
-            &rules,
-        )?;
+        let (syntax_elements, mut symbols, export_bindings) =
+            extract::extract_with_export_bindings(
+                tree.root_node(),
+                source,
+                limits,
+                &self.language,
+                &rules,
+            )?;
         if let Some(module) = symbols
             .first_mut()
             .filter(|symbol| symbol.kind == MODULE_KIND)
@@ -1182,7 +1190,7 @@ impl SyntaxProvider for PythonSyntaxProvider {
         Ok(SyntaxDocument::new(
             self.language.clone(),
             source.path.clone(),
-            nodes,
+            syntax_elements,
             symbols,
             tree.root_node().has_error(),
         )
@@ -1191,24 +1199,24 @@ impl SyntaxProvider for PythonSyntaxProvider {
         .with_syntax_limits(limits))
     }
 
-    fn node_facets(&self, kind: &str) -> Vec<NodeFacet> {
-        let mut facets = Vec::new();
+    fn syntax_element_kinds(&self, kind: &str) -> Vec<SyntaxKind> {
+        let mut kinds = Vec::new();
         if kind == MODULE_KIND || kind.ends_with("_definition") {
-            facets.extend([NodeFacet::Declaration, NodeFacet::Definition]);
+            kinds.extend([SyntaxKind::Declaration, SyntaxKind::Definition]);
         }
         if kind == BLOCK_KIND {
-            facets.push(NodeFacet::Block);
+            kinds.push(SyntaxKind::Block);
         }
         if kind.ends_with("_statement") {
-            facets.push(NodeFacet::Statement);
+            kinds.push(SyntaxKind::Statement);
         }
         if kind.contains("comment") {
-            facets.push(NodeFacet::Comment);
+            kinds.push(SyntaxKind::Comment);
         }
         if kind == DECORATOR_KIND {
-            facets.push(NodeFacet::Annotation);
+            kinds.push(SyntaxKind::Annotation);
         }
-        facets
+        kinds
     }
 }
 
@@ -1270,17 +1278,17 @@ mod tests {
         let document = analyze("def serve():\n    pass\n\nclass Widget:\n    pass\n");
         let function = symbol(&document, "serve");
         assert_eq!(function.kind, "function");
-        assert_eq!(function.facets, [SymbolFacet::Value, SymbolFacet::Callable]);
+        assert_eq!(function.kinds, [SymbolKind::Value, SymbolKind::Callable]);
         assert_eq!(function.visibility, None);
         let class = symbol(&document, "Widget");
         assert_eq!(class.kind, "class");
         assert_eq!(
-            class.facets,
+            class.kinds,
             [
-                SymbolFacet::Type,
-                SymbolFacet::MemberContainer,
-                SymbolFacet::Constructible,
-                SymbolFacet::Extensible,
+                SymbolKind::Type,
+                SymbolKind::MemberContainer,
+                SymbolKind::Constructible,
+                SymbolKind::Extensible,
             ]
         );
     }
@@ -1432,7 +1440,7 @@ mod tests {
             "LIMIT = 16\n\nclass Widget:\n    retries = 2\n    def open(self):\n        local = 1\n",
         );
         assert_eq!(symbol(&document, "LIMIT").kind, "variable");
-        assert_eq!(symbol(&document, "LIMIT").facets, [SymbolFacet::Value]);
+        assert_eq!(symbol(&document, "LIMIT").kinds, [SymbolKind::Value]);
         assert_eq!(symbol(&document, "Widget.retries").kind, "variable");
         assert!(
             !document
@@ -1482,20 +1490,26 @@ mod tests {
     }
 
     #[test]
-    fn test_node_facets_cover_definitions_blocks_statements_and_comments() {
+    fn test_syntax_element_kinds_cover_definitions_blocks_statements_and_comments() {
         let provider = PythonSyntaxProvider::default();
         assert_eq!(
-            provider.node_facets("function_definition"),
-            [NodeFacet::Declaration, NodeFacet::Definition]
+            provider.syntax_element_kinds("function_definition"),
+            [SyntaxKind::Declaration, SyntaxKind::Definition]
         );
-        assert_eq!(provider.node_facets("block"), [NodeFacet::Block]);
+        assert_eq!(provider.syntax_element_kinds("block"), [SyntaxKind::Block]);
         assert_eq!(
-            provider.node_facets("expression_statement"),
-            [NodeFacet::Statement]
+            provider.syntax_element_kinds("expression_statement"),
+            [SyntaxKind::Statement]
         );
-        assert_eq!(provider.node_facets("comment"), [NodeFacet::Comment]);
-        assert_eq!(provider.node_facets("decorator"), [NodeFacet::Annotation]);
-        assert_eq!(provider.node_facets("identifier"), []);
+        assert_eq!(
+            provider.syntax_element_kinds("comment"),
+            [SyntaxKind::Comment]
+        );
+        assert_eq!(
+            provider.syntax_element_kinds("decorator"),
+            [SyntaxKind::Annotation]
+        );
+        assert_eq!(provider.syntax_element_kinds("identifier"), []);
     }
 
     #[test]

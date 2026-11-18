@@ -4,9 +4,9 @@ use rift_core::ProjectPath;
 use rift_error::RiftError;
 use rift_error::errors;
 use rift_protocol::configuration::{
-    SYNTAX_DEPTH_DEFAULT, SYNTAX_FILE_BYTES_DEFAULT, SYNTAX_NODES_DEFAULT, SyntaxConfiguration,
+    SYNTAX_DEPTH_DEFAULT, SYNTAX_ELEMENTS_DEFAULT, SYNTAX_FILE_BYTES_DEFAULT, SyntaxConfiguration,
 };
-use rift_protocol::read::{Language, NodeFacet};
+use rift_protocol::read::{Language, SyntaxKind};
 use serde::Serialize;
 
 use crate::document::SyntaxDocument;
@@ -17,8 +17,8 @@ use crate::document::SyntaxDocument;
 pub enum SyntaxBound {
     /// Accepted source bytes.
     SourceBytesMax,
-    /// Accepted syntax nodes.
-    SyntaxNodesMax,
+    /// Accepted syntax elements.
+    SyntaxElementsMax,
     /// Accepted syntax depth.
     SyntaxDepthMax,
     /// Accepted query captures.
@@ -27,8 +27,8 @@ pub enum SyntaxBound {
 
 /// Bytes accepted from one source under the default `[providers.syntax]` table.
 pub(crate) const SOURCE_BYTES_MAX_DEFAULT: usize = bound(SYNTAX_FILE_BYTES_DEFAULT);
-/// Syntax nodes accepted from one source under the default `[providers.syntax]` table.
-pub(crate) const SYNTAX_NODES_MAX_DEFAULT: usize = bound(SYNTAX_NODES_DEFAULT);
+/// Syntax syntax elements accepted from one source under the default `[providers.syntax]` table.
+pub(crate) const SYNTAX_ELEMENTS_MAX_DEFAULT: usize = bound(SYNTAX_ELEMENTS_DEFAULT);
 /// Syntax depth accepted from one source under the default `[providers.syntax]` table.
 pub(crate) const SYNTAX_DEPTH_MAX_DEFAULT: usize = bound(SYNTAX_DEPTH_DEFAULT);
 
@@ -62,7 +62,7 @@ pub struct SyntaxSource<'a> {
 #[allow(clippy::struct_field_names)]
 pub struct SyntaxLimits {
     source_bytes_max: usize,
-    syntax_nodes_max: usize,
+    syntax_elements_max: usize,
     syntax_depth_max: usize,
 }
 
@@ -74,19 +74,19 @@ impl SyntaxLimits {
     /// Returns [`RiftError`] naming the first zero bound.
     pub fn new(
         source_bytes_max: usize,
-        syntax_nodes_max: usize,
+        syntax_elements_max: usize,
         syntax_depth_max: usize,
     ) -> Result<Self, RiftError> {
         let bounds = [
             (source_bytes_max, SyntaxBound::SourceBytesMax),
-            (syntax_nodes_max, SyntaxBound::SyntaxNodesMax),
+            (syntax_elements_max, SyntaxBound::SyntaxElementsMax),
             (syntax_depth_max, SyntaxBound::SyntaxDepthMax),
         ];
         for (value, bound) in bounds {
             if value == 0 {
                 let bound = match bound {
                     SyntaxBound::SourceBytesMax => "source_bytes_max",
-                    SyntaxBound::SyntaxNodesMax => "syntax_nodes_max",
+                    SyntaxBound::SyntaxElementsMax => "syntax_elements_max",
                     SyntaxBound::SyntaxDepthMax => "syntax_depth_max",
                     SyntaxBound::CapturesMax => "captures_max",
                 };
@@ -95,7 +95,7 @@ impl SyntaxLimits {
         }
         Ok(Self {
             source_bytes_max,
-            syntax_nodes_max,
+            syntax_elements_max,
             syntax_depth_max,
         })
     }
@@ -103,7 +103,7 @@ impl SyntaxLimits {
     /// The bounds every provider parses under unless the caller supplies others.
     pub const DEFAULT: Self = Self::declared(
         SOURCE_BYTES_MAX_DEFAULT,
-        SYNTAX_NODES_MAX_DEFAULT,
+        SYNTAX_ELEMENTS_MAX_DEFAULT,
         SYNTAX_DEPTH_MAX_DEFAULT,
     );
 
@@ -116,7 +116,7 @@ impl SyntaxLimits {
     pub fn from_configuration(configuration: &SyntaxConfiguration) -> Result<Self, RiftError> {
         Self::new(
             bound(configuration.max_file.bytes()),
-            bound(configuration.max_nodes),
+            bound(configuration.max_syntax_elements),
             bound(configuration.max_depth),
         )
     }
@@ -129,7 +129,7 @@ impl SyntaxLimits {
     /// `const` item, so a zero default fails the build, not a request.
     pub(crate) const fn declared(
         source_bytes_max: usize,
-        syntax_nodes_max: usize,
+        syntax_elements_max: usize,
         syntax_depth_max: usize,
     ) -> Self {
         assert!(
@@ -137,8 +137,8 @@ impl SyntaxLimits {
             "a provider's declared source byte bound must be positive"
         );
         assert!(
-            syntax_nodes_max > 0,
-            "a provider's declared syntax node bound must be positive"
+            syntax_elements_max > 0,
+            "a provider's declared syntax element bound must be positive"
         );
         assert!(
             syntax_depth_max > 0,
@@ -146,7 +146,7 @@ impl SyntaxLimits {
         );
         Self {
             source_bytes_max,
-            syntax_nodes_max,
+            syntax_elements_max,
             syntax_depth_max,
         }
     }
@@ -157,10 +157,10 @@ impl SyntaxLimits {
         self.source_bytes_max
     }
 
-    /// Returns maximum accepted syntax nodes.
+    /// Returns maximum accepted syntax elements.
     #[must_use]
-    pub const fn syntax_nodes_max(self) -> usize {
-        self.syntax_nodes_max
+    pub const fn syntax_elements_max(self) -> usize {
+        self.syntax_elements_max
     }
 
     /// Returns maximum accepted syntax depth.
@@ -200,7 +200,7 @@ pub trait SyntaxProvider: std::fmt::Debug + Send + Sync {
     /// The language identity this provider files facts under.
     fn language(&self) -> &Language;
 
-    /// Parses source under `limits` and extracts named nodes and declarations.
+    /// Parses source under `limits` and extracts named syntax elements and declarations.
     ///
     /// # Errors
     ///
@@ -212,8 +212,8 @@ pub trait SyntaxProvider: std::fmt::Debug + Send + Sync {
         limits: SyntaxLimits,
     ) -> Result<SyntaxDocument, RiftError>;
 
-    /// Portable structural facets for one grammar node kind.
-    fn node_facets(&self, kind: &str) -> Vec<NodeFacet>;
+    /// Portable structural kinds for one grammar syntax element kind.
+    fn syntax_element_kinds(&self, kind: &str) -> Vec<SyntaxKind>;
 }
 
 #[cfg(test)]
@@ -224,7 +224,7 @@ mod tests {
     fn test_limits_reject_each_zero_bound_with_its_configuration_name() {
         let cases = [
             (SyntaxLimits::new(0, 1, 1), "source_bytes_max"),
-            (SyntaxLimits::new(1, 0, 1), "syntax_nodes_max"),
+            (SyntaxLimits::new(1, 0, 1), "syntax_elements_max"),
             (SyntaxLimits::new(1, 1, 0), "syntax_depth_max"),
         ];
         for (result, bound_name) in cases {
@@ -242,7 +242,7 @@ mod tests {
         let accepted = SyntaxLimits::new(3, 4, 5).expect("positive bounds");
         assert_eq!(accepted, SyntaxLimits::declared(3, 4, 5));
         assert_eq!(accepted.source_bytes_max(), 3);
-        assert_eq!(accepted.syntax_nodes_max(), 4);
+        assert_eq!(accepted.syntax_elements_max(), 4);
         assert_eq!(accepted.syntax_depth_max(), 5);
     }
 
@@ -257,7 +257,7 @@ mod tests {
         );
         let configured = SyntaxLimits::from_configuration(&SyntaxConfiguration {
             max_file: ByteSize::from_bytes(16 << 20),
-            max_nodes: 5_000_000,
+            max_syntax_elements: 5_000_000,
             max_depth: 2_048,
             ..SyntaxConfiguration::default()
         })
@@ -267,7 +267,7 @@ mod tests {
             SyntaxLimits::new(16 << 20, 5_000_000, 2_048).expect("bounds")
         );
         let zero = SyntaxConfiguration {
-            max_nodes: 0,
+            max_syntax_elements: 0,
             ..SyntaxConfiguration::default()
         };
         assert!(SyntaxLimits::from_configuration(&zero).is_err());

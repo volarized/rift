@@ -151,7 +151,7 @@ impl GetSize for WorkspaceSymbolView {
 }
 
 impl WorkspaceSymbolView {
-    /// Retained material charge, including owned capacities and conservative `BTree` node storage.
+    /// Retained material charge, including owned capacities and conservative `BTree` syntax element storage.
     ///
     /// This charge bounds admitted material. It is not an allocator or process RSS measurement.
     /// Unsupported heap payloads and arithmetic overflow return `usize::MAX` for refusal.

@@ -25,7 +25,7 @@ pub const COMPUTED_BYTES_MAX: usize = 64 * 1024 * 1024;
 /// Default most triples one dataset materializes. An in-memory dataset indexes each triple
 /// six ways, so 200,000 triples hold tens of MiB.
 pub const TRIPLES_MAX: usize = 200_000;
-/// Default most bytes of literal text one dataset holds, 32 MiB: node source dominates it.
+/// Default most bytes of literal text one dataset holds, 32 MiB: syntax element source dominates it.
 pub const LITERAL_BYTES_MAX: usize = 32 * 1024 * 1024;
 /// Default most solutions or triples one answer carries.
 pub const SOLUTIONS_MAX: usize = 10_000;

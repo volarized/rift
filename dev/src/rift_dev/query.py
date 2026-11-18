@@ -26,13 +26,17 @@ _INPUT_FIELDS = frozenset(
         "packages",
         "paths",
         "include",
-        "limit",
-        "page_index",
+        "max_results",
+        "page",
         "rev",
         "revision",
         "change",
     }
 )
+# Rows one `search` answer page may hold (`QUERY_MAX_RESULTS`). Every page of a query
+# answer evaluates the query again, so a read that needs the whole answer asks for the
+# largest page instead of the default ten rows.
+QUERY_MAX_RESULTS = 1000
 _OUTPUT_FIELDS = frozenset(
     {
         "hit",
@@ -65,12 +69,12 @@ def name_request(name: str) -> JsonObject:
 
 
 def declaration_request(name: str) -> JsonObject:
-    """Select a named symbol and its item node from the captured graph."""
+    """Select a named symbol and its item element from the captured graph."""
     value = quoted(name)
     return {
         "query": f"""SELECT ?symbol ?name ?language ?unit ?source ?start ?end {{
           ?symbol a :Symbol; :name {value}; :name ?name; :language ?language .
-          ?node :of ?symbol; :index 0; :source ?source;
+          ?element :of ?symbol; :index 0; :source ?source;
                 :range [ :unit ?unit; :start ?start; :end ?end ] .
         }}"""
     }
@@ -91,10 +95,20 @@ def retrieval_request(
     parameters: Mapping[str, Json],
     columns: Sequence[str] = ("symbol", "name", "path", "unit", "start", "end"),
 ) -> JsonObject:
-    """Invoke existing retrieval through standard SERVICE syntax and explicit projection."""
+    """Invoke existing retrieval through standard SERVICE syntax and explicit projection.
+
+    `max_results` and `page` among `parameters` bound the hits the SERVICE call
+    retrieves. The answer is read in pages of `QUERY_MAX_RESULTS` rows, so an answer
+    of up to that many rows arrives in one request.
+
+    >>> request = retrieval_request({"query": "test", "max_results": 5}, ("hit",))
+    >>> request["max_results"] == QUERY_MAX_RESULTS, ":max_results 5 ." in request["query"]
+    (True, True)
+    """
     projection = " ".join(f"?{column}" for column in columns)
     return {
-        "query": f"SELECT {projection} {{ {_retrieval_service(parameters, columns)} }} ORDER BY ?index"
+        "query": f"SELECT {projection} {{ {_retrieval_service(parameters, columns)} }} ORDER BY ?index",
+        "max_results": QUERY_MAX_RESULTS,
     }
 
 
@@ -110,7 +124,8 @@ def retrieval_batch_request(
         for slot, parameters in enumerate(requests)
     )
     return {
-        "query": f"SELECT ?slot {projection} {{ {branches} }} ORDER BY ?slot ?index"
+        "query": f"SELECT ?slot {projection} {{ {branches} }} ORDER BY ?slot ?index",
+        "max_results": QUERY_MAX_RESULTS,
     }
 
 

@@ -42,7 +42,7 @@ impl<'a> Tokens<'a> {
             depth: limits.syntax_depth_max(),
             work: Cell::new(0),
             work_max: limits
-                .syntax_nodes_max()
+                .syntax_elements_max()
                 .checked_mul(limits.syntax_depth_max())?,
         };
         let scopes = file.syntax.scope()?;

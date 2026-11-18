@@ -17,7 +17,8 @@ rift-core.workspace = true
 rift-mcp.workspace = true
 rift-protocol.workspace = true
 
+serde_json.workspace = true
+
 [dev-dependencies]
 jsonschema.workspace = true
-serde_json.workspace = true
 tempfile.workspace = true

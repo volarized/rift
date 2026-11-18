@@ -541,7 +541,7 @@ impl PackageCallee {
             kind: kind.clone(),
             language,
             name: self.name.clone(),
-            facets: Vec::new(),
+            kinds: Vec::new(),
             origin,
             container: None,
             modifiers: Vec::new(),
@@ -937,7 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn node_resolves_the_nearest_typescript_package_above_a_module() -> TestResult {
+    fn syntax_element_resolves_the_nearest_typescript_package_above_a_module() -> TestResult {
         let directory = tempfile::tempdir()?;
         let root = directory.path();
         let module = root.join("node_modules/typescript-language-server/lib/cli.mjs");

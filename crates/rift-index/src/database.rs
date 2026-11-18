@@ -774,7 +774,7 @@ impl WorkspaceDatabase {
     /// A read-only pooled connection with this file's connection-local pragmas.
     ///
     /// Foreign keys are not configured: no table here carries a foreign-key
-    /// relationship to another.
+    /// edge to another.
     pub(crate) async fn connection(&self) -> Result<Connection, RiftError> {
         self.configured_connection(ConnectionAccess::Read).await
     }

@@ -262,7 +262,12 @@ async fn declaration_members_bound_names_and_module_exports_are_addressable() ->
     within("workspace preparation", await_workspace_ready(&client)).await??;
     for &(path, kind, container) in DECLARATION_READS {
         let id = format!("rift://symbol/local/{path}");
-        let answer = proxied_call(&client, "get_symbol", &json!({"id":id})).await?;
+        let answer = proxied_call(
+            &client,
+            "get_symbol",
+            &json!({"id":id, "page":1, "max_results":10}),
+        )
+        .await?;
         assert_eq!(answer["symbol"]["id"], id, "{answer}");
         assert_eq!(answer["symbol"]["kind"], kind, "{answer}");
         let expected = container.map(|path| format!("rift://symbol/local/{path}"));
@@ -279,9 +284,46 @@ async fn declaration_members_bound_names_and_module_exports_are_addressable() ->
             );
         }
     }
+    declaration_pages(&client).await?;
     client.cancel().await?;
     let stopped = run_rift(root, &["server", "stop"]).await?;
     require_success(&stopped, "stop after declaration reads")?;
     failure_window.passed();
+    Ok(())
+}
+
+/// Newly collected declarations use the same paging contract for symbols and facets.
+async fn declaration_pages(
+    client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
+) -> TestResult {
+    let id = "rift://symbol/local/rust/rift_live_fixture/Point/x";
+    let request = json!({"id":id, "page":1, "max_results":1});
+    let symbol = proxied_call(client, "get_symbol", &request).await?;
+    let revision = symbol["revision"].as_str().ok_or("symbol revision")?;
+    assert_eq!(
+        symbol["pagination"],
+        json!({"page":1,"pages":1,"max_results":1,"total":1})
+    );
+    assert!(
+        symbol["symbol"]["kinds"]
+            .as_array()
+            .ok_or("symbol kinds")?
+            .contains(&json!("member"))
+    );
+    let request = json!({"symbol":id,"revision":revision,"page":1,"max_results":1});
+    let facets = proxied_call(client, "facets", &request).await?;
+    assert_eq!(facets["pagination"], symbol["pagination"]);
+    assert_eq!(facets["revision"], revision);
+    assert_eq!(facets["declarations"][0]["kind"], "field_declaration");
+    for (tool, selector) in [("get_symbol", "id"), ("facets", "symbol")] {
+        let request = json!({selector:id,"revision":revision,"page":2,"max_results":1});
+        let answer = proxied_call(client, tool, &request).await?;
+        assert_eq!(answer["declarations"], json!([]), "{answer}");
+        assert_eq!(
+            answer["pagination"],
+            json!({"page":2,"pages":1,"max_results":1,"total":1})
+        );
+        assert_eq!(answer["revision"], revision);
+    }
     Ok(())
 }

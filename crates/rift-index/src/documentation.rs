@@ -893,7 +893,7 @@ mod tests {
         )
         .expect("notebook");
         let lowered = DocumentationConfiguration {
-            max_nodes: 1,
+            max_syntax_elements: 1,
             ..Default::default()
         };
         let limits = DocumentationLimits::from_configuration(&lowered).expect("bounds");

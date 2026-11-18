@@ -11,7 +11,7 @@
 //!
 //! Rift also runs the standard library version probes by default, and a probe answers
 //! from the machine's own toolchain, so a fixture's package context would follow
-//! whatever `rustc` and `node` the runner installed. `resolution = "static"` reads the
+//! whatever `rustc` and `syntax element` the runner installed. `resolution = "static"` reads the
 //! pins alone and runs no program.
 //!
 //! `rift-mcp`'s own unit tests declare the same tables again, in `server.rs`: an

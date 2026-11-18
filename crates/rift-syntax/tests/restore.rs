@@ -270,12 +270,12 @@ fn complete_facts_restore_for_every_shipped_language() {
                 names.symbol_kind(&decoded_kind)
             };
             assert_eq!(resolved_kind, Some(symbol.kind));
-            if let Some(kind) = symbol.node_kind {
-                let resolved_node = {
-                    let decoded_node = kind.to_owned();
-                    names.node_kind(&decoded_node)
+            if let Some(kind) = symbol.syntax_element_kind {
+                let resolved_syntax_element = {
+                    let decoded_syntax_element = kind.to_owned();
+                    names.syntax_element_kind(&decoded_syntax_element)
                 };
-                assert_eq!(resolved_node, Some(kind));
+                assert_eq!(resolved_syntax_element, Some(kind));
             }
         }
     }
@@ -487,7 +487,7 @@ fn invalid_ranges_names_order_and_source_witness_are_refused() {
         Err(errors::syntax::facts_kind_invalid::SLUG)
     );
     let mut invalid = original;
-    invalid.symbols[0].node_kind = Some("unknown_node_kind");
+    invalid.symbols[0].syntax_element_kind = Some("unknown_syntax_element_kind");
     assert_eq!(
         SyntaxFacts::from_parts(text, SyntaxLimits::default(), invalid)
             .map_err(|error| error.slug()),
@@ -660,7 +660,7 @@ fn unknown_language_dialect_and_provider_names_are_refused() {
     let javascript =
         SyntaxNames::new(&ShippedLanguage::JavaScript.language()).expect("JavaScript names");
     assert!(javascript.symbol_kind("interface").is_none());
-    assert!(javascript.node_kind("unknown_kind").is_none());
+    assert!(javascript.syntax_element_kind("unknown_kind").is_none());
     let typescript =
         SyntaxNames::new(&ShippedLanguage::TypeScript.language()).expect("TypeScript names");
     assert_eq!(typescript.symbol_kind("interface"), Some("interface"));
@@ -1184,7 +1184,7 @@ fn rust_macro_invocations_keep_original_top_level_ranges_and_unknown_state() {
     ] {
         let document = parsed(ShippedLanguage::Rust, source);
         let symbol = &document.facts().symbols()[0];
-        assert_eq!(symbol.node_kind, Some("mod_item"));
+        assert_eq!(symbol.syntax_element_kind, Some("mod_item"));
         assert_eq!(symbol.body_range, None);
         assert_eq!(
             &source[usize::try_from(symbol.item_range.start).expect("item start")
@@ -1253,20 +1253,21 @@ fn rust_macro_direct_tokens_keep_original_ranges_unknown_empty_and_charge() {
     assert_eq!(invocations.len(), 2);
     let direct = invocations[0].2.as_ref().expect("complete direct tokens");
     let expected = document
-        .nodes()
+        .syntax_elements()
         .iter()
-        .filter(|node| {
-            node.parent
-                .and_then(|parent| document.nodes().get(parent))
+        .filter(|syntax_element| {
+            syntax_element
+                .parent
+                .and_then(|parent| document.syntax_elements().get(parent))
                 .is_some_and(|parent| {
                     parent.kind == "token_tree"
                         && parent
                             .parent
-                            .and_then(|parent| document.nodes().get(parent))
+                            .and_then(|parent| document.syntax_elements().get(parent))
                             .is_some_and(|parent| parent.range == invocations[0].0)
                 })
         })
-        .map(|node| node.range)
+        .map(|syntax_element| syntax_element.range)
         .collect::<Vec<_>>();
     assert_eq!(direct, &expected);
     assert!(direct.iter().any(|range| &source
@@ -1396,18 +1397,19 @@ fn rust_scope_preserves_original_root_and_module_children() {
     assert_eq!(scopes.len(), 2);
     for (range, children) in scopes {
         let (parent, _) = document
-            .nodes()
+            .syntax_elements()
             .iter()
             .enumerate()
-            .find(|(_, node)| {
-                node.range == *range && matches!(node.kind, "source_file" | "declaration_list")
+            .find(|(_, syntax_element)| {
+                syntax_element.range == *range
+                    && matches!(syntax_element.kind, "source_file" | "declaration_list")
             })
-            .expect("original scope node");
+            .expect("original scope syntax element");
         let original = document
-            .nodes()
+            .syntax_elements()
             .iter()
-            .filter(|node| node.parent == Some(parent))
-            .map(|node| node.range)
+            .filter(|syntax_element| syntax_element.parent == Some(parent))
+            .map(|syntax_element| syntax_element.range)
             .collect::<Vec<_>>();
         assert_eq!(children.as_ref(), Some(&original));
     }
@@ -1690,20 +1692,22 @@ fn rust_root_expression_macro_invocations_keep_original_parent_and_restore_charg
             *expected
         );
         let original = document
-            .nodes()
+            .syntax_elements()
             .iter()
-            .find(|node| node.kind == "macro_invocation" && node.range == range)
-            .expect("original invocation node");
+            .find(|syntax_element| {
+                syntax_element.kind == "macro_invocation" && syntax_element.range == range
+            })
+            .expect("original invocation syntax element");
         let parent = document
-            .nodes()
+            .syntax_elements()
             .get(original.parent.expect("original parent"))
-            .expect("parent node");
+            .expect("parent syntax element");
         if index == 0 {
             assert_eq!(parent.kind, "expression_statement");
             let root = document
-                .nodes()
+                .syntax_elements()
                 .get(parent.parent.expect("original root"))
-                .expect("root node");
+                .expect("root syntax element");
             assert_eq!(root.kind, "source_file");
             assert_eq!(root.parent, None);
         } else {
@@ -1926,19 +1930,19 @@ fn literal_macro_functions_keep_original_header_body_and_restore() {
         .iter()
         .find(|symbol| symbol.name == "spawn")
         .expect("literal original function");
-    assert_eq!(spawn.node_kind, None);
+    assert_eq!(spawn.syntax_element_kind, None);
     assert_eq!(spawn.name_range, None);
     assert_eq!(spawn.kind, "function");
     assert_eq!(spawn.visibility.as_deref(), Some("pub"));
     assert!(
         spawn
-            .facets
-            .contains(&rift_protocol::read::SymbolFacet::Callable)
+            .kinds
+            .contains(&rift_protocol::read::SymbolKind::Callable)
     );
     assert!(
         spawn
-            .facets
-            .contains(&rift_protocol::read::SymbolFacet::Public)
+            .kinds
+            .contains(&rift_protocol::read::SymbolKind::Public)
     );
     let body = spawn.body_range.expect("original body");
     let start = usize::try_from(spawn.item_range.start).expect("start");
@@ -2072,14 +2076,14 @@ fn literal_macro_functions_keep_name_bounds_and_reject_corrupt_body_ranges() {
 }
 
 #[test]
-fn literal_macro_functions_obey_original_source_and_node_bounds() {
+fn literal_macro_functions_obey_original_source_and_syntax_element_bounds() {
     let source = "opaque! { fn kept<F>(future: F) -> F { future } }";
     let language = ShippedLanguage::Rust.language();
     let provider = rift_syntax::registry::provider_for_language(&language).expect("Rust provider");
     let path = ProjectPath::new("source.rs").expect("source path");
     for limits in [
         SyntaxLimits::new(source.len() - 1, 100, 100).expect("byte bound"),
-        SyntaxLimits::new(source.len(), 2, 100).expect("node bound"),
+        SyntaxLimits::new(source.len(), 2, 100).expect("syntax element bound"),
     ] {
         assert!(
             provider

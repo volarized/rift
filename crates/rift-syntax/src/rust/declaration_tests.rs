@@ -3,7 +3,7 @@
 //! the visibility trait items take from their trait.
 
 use rift_core::ProjectPath;
-use rift_protocol::read::SymbolFacet;
+use rift_protocol::read::SymbolKind;
 
 use super::*;
 
@@ -75,8 +75,8 @@ fn test_named_fields_declare_under_struct_union_and_variant() {
     );
     let x = symbol(&document, "Point::x");
     assert_eq!(
-        x.facets,
-        [SymbolFacet::Value, SymbolFacet::Member, SymbolFacet::Public]
+        x.kinds,
+        [SymbolKind::Value, SymbolKind::Member, SymbolKind::Public]
     );
     assert_eq!(x.visibility.as_deref(), Some("pub"));
     assert_eq!(
@@ -86,15 +86,15 @@ fn test_named_fields_declare_under_struct_union_and_variant() {
     assert_eq!(spelled(text, x.range), "/// Horizontal.\n    pub x: i32");
     assert_eq!(x.name_range.map(|range| spelled(text, range)), Some("x"));
     let y = symbol(&document, "Point::y");
-    assert_eq!(y.facets, [SymbolFacet::Value, SymbolFacet::Member]);
+    assert_eq!(y.kinds, [SymbolKind::Value, SymbolKind::Member]);
     assert_eq!(y.visibility.as_deref(), Some("private"));
     assert_eq!(
-        symbol(&document, "Bits").facets,
-        [SymbolFacet::Type, SymbolFacet::Public]
+        symbol(&document, "Bits").kinds,
+        [SymbolKind::Type, SymbolKind::Public]
     );
     let blue = symbol(&document, "Color::Blue::b");
     assert_eq!(blue.visibility.as_deref(), Some("pub"));
-    assert!(blue.facets.contains(&SymbolFacet::Public));
+    assert!(blue.kinds.contains(&SymbolKind::Public));
 }
 
 /// A trait's associated type and constant declare under the trait, beside
@@ -121,17 +121,17 @@ fn test_trait_associated_items_declare_under_the_trait() {
         ]
     );
     assert_eq!(
-        symbol(&document, "Shape").facets,
+        symbol(&document, "Shape").kinds,
         [
-            SymbolFacet::Type,
-            SymbolFacet::Implementable,
-            SymbolFacet::MemberContainer,
-            SymbolFacet::Public,
+            SymbolKind::Type,
+            SymbolKind::Implementable,
+            SymbolKind::MemberContainer,
+            SymbolKind::Public,
         ]
     );
     assert_eq!(
-        symbol(&document, "Shape::Unit").facets,
-        [SymbolFacet::Type, SymbolFacet::Member, SymbolFacet::Public]
+        symbol(&document, "Shape::Unit").kinds,
+        [SymbolKind::Type, SymbolKind::Member, SymbolKind::Public]
     );
 }
 
@@ -155,8 +155,8 @@ fn test_trait_items_take_the_visibility_of_their_trait() {
     assert_eq!(visibility("Point::area"), Some("pub"));
     assert!(
         symbol(&document, "Point::area")
-            .facets
-            .contains(&SymbolFacet::Public)
+            .kinds
+            .contains(&SymbolKind::Public)
     );
     assert_eq!(visibility("Point::depth"), Some("pub(crate)"));
     assert_eq!(visibility("Point::fmt"), None);
@@ -190,7 +190,7 @@ fn test_a_qualified_trait_does_not_take_an_unrelated_local_traits_visibility() {
     assert_eq!(symbol(&document, "Point::area").visibility, None);
     assert!(
         !symbol(&document, "Point::area")
-            .facets
-            .contains(&SymbolFacet::Public)
+            .kinds
+            .contains(&SymbolKind::Public)
     );
 }
