@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, VecDeque};
 use rift_core::{FileDigest, ProjectPath, SymbolId};
 use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
 use rift_protocol::index::python_identifier_is_valid;
-use rift_syntax::SyntaxFacts;
+use rift_syntax::{SyntaxFacts, SyntaxLimits};
 use serde::Deserialize;
 use unicode_normalization::UnicodeNormalization;
 
@@ -63,7 +63,7 @@ pub(super) fn prepare(
             &inventory,
             &originals,
             (scope, &mut admitted, &mut exports),
-            input.syntax().syntax_depth_max(),
+            input.syntax(),
             library,
         );
         requested.extend(
@@ -148,12 +148,11 @@ fn target_paths(
         };
         if !reached.insert(path.clone())
             || originals.get(path.as_str()).copied() != Some(file.source)
-            || file.syntax.has_errors()
             || !source_is_valid(file.syntax, file.source)
         {
             continue;
         }
-        for (child, _) in module_children(file, &directory, inventory) {
+        for (child, _) in module_children(file, &directory, inventory, input.syntax()) {
             let child_directory = child
                 .strip_suffix("/mod.rs")
                 .or_else(|| child.strip_suffix(".rs"))
@@ -305,15 +304,25 @@ fn module_children(
     file: &super::SelectedFile<'_>,
     directory: &str,
     inventory: &BTreeMap<&str, &super::SelectedFile<'_>>,
+    limits: SyntaxLimits,
 ) -> Vec<(String, Vec<String>)> {
-    module_paths(file, directory, &|path| inventory.contains_key(path))
+    module_paths(
+        file,
+        directory,
+        &|path| inventory.contains_key(path),
+        limits,
+    )
 }
 
 fn module_paths(
     file: &super::SelectedFile<'_>,
     directory: &str,
     contains: &dyn Fn(&str) -> bool,
+    limits: SyntaxLimits,
 ) -> Vec<(String, Vec<String>)> {
+    let Some(invalid) = super::errors::invalid_declarations(file, limits) else {
+        return Vec::new();
+    };
     let syntax = file.syntax;
     let symbols = syntax
         .symbols()
@@ -323,6 +332,7 @@ fn module_paths(
     let mut children = Vec::new();
     for symbol in syntax.symbols() {
         if symbol.kind != "module"
+            || invalid.contains(&symbol.item_range)
             || !matches!(symbol.syntax_element_kind, None | Some("mod_item"))
             || !matches!(
                 symbol.module_path,
@@ -892,6 +902,7 @@ pub(super) fn namespace_paths(
             },
             directory,
             contains,
+            input.syntax(),
         ) {
             let directory = path
                 .strip_suffix("/mod.rs")
