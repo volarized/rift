@@ -256,6 +256,16 @@ impl NormalizedGraph {
             .and_then(|index| self.records.get(*index))
     }
 
+    /// Returns the position in [`Self::records`] of the record associated with a
+    /// provider-local reference.
+    ///
+    /// Contributions merged into one record share its position, so a caller visiting every
+    /// declaration can answer a question about the record once.
+    #[must_use]
+    pub fn record_position_for(&self, reference: &ContributionReference) -> Option<usize> {
+        self.records_by_contribution.get(reference).copied()
+    }
+
     /// Returns established identity associated with provider-local reference.
     #[must_use]
     pub fn identity_for(&self, reference: &ContributionReference) -> Option<&SymbolId> {
