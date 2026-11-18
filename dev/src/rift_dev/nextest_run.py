@@ -54,6 +54,9 @@ CASES_MAX = 32_768
 RUN_SECONDS_MAX = 3_600.0
 EXIT_WAIT_SECONDS = 10.0
 CONSOLE_BYTES_MAX = 64 * 1024
+# A failing case's error is the end of its output: a Python traceback and the Rust
+# test's `Error:` line follow every server log the harness prints before them.
+CONSOLE_ERROR_BYTES_MAX = 16 * 1024
 CONSOLE_EVIDENCE_MAX = 8
 LINE_CHARS_MAX = 2_000
 OPEN_LINES_MAX = 100
@@ -1021,6 +1024,22 @@ class EventReader:
                         self.cases.tests.pop(name, None)
 
 
+def output_tail(output: str, bytes_max: int, artifact: Path) -> str:
+    """The last `bytes_max` bytes of a case's output, naming the file holding the rest.
+
+    >>> output_tail("short", 16, Path("report.txt"))
+    'short'
+    >>> output_tail("server log\\nAssertionError: lost\\n", 21, Path("report.txt"))
+    '[11 earlier bytes are in report.txt]\\nAssertionError: lost\\n'
+    """
+    data = output.encode("utf-8")
+    if len(data) <= bytes_max:
+        return output
+    omitted = len(data) - bytes_max
+    tail = data[omitted:].decode("utf-8", errors="ignore")
+    return f"[{omitted} earlier bytes are in {artifact}]\n{tail}"
+
+
 def failure_report(
     outcome: Outcome,
     held: CaseTelemetry,
@@ -1364,7 +1383,9 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
             [
                 f"{outcome.case.test} failed!",
                 "  Error:",
-                (result.stdout or result.reason)
+                output_tail(
+                    result.stdout or result.reason, CONSOLE_ERROR_BYTES_MAX, path
+                )
                 if result
                 else "No terminal result received.",
                 "  Logs and metrics:",
