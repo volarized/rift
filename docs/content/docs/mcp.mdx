@@ -269,15 +269,16 @@ captured source from a synthetic builtin:
 
 <ReadExample name="source-less-builtin" />
 
-Use `include` to select optional projections:
+Use the `include` object to select optional projections, such as
+`"include": {"documentation": true, "history": true}`:
 
-| Include | Adds |
+| Member | Adds when `true` |
 | --- | --- |
 | `documentation` | Bounded documentation referring to the exact declaration |
 | `history` | The logical symbol's history edges: the commits that touched it and the symbols changed beside it |
 
-The options combine; an omitted or empty `include` adds neither. A declaration's source comes
-from [`nodes`](#tool-nodes) with the symbol's `id`.
+The members combine; an omitted member is `false`, and an omitted `include` adds neither. A
+declaration's source comes from [`nodes`](#tool-nodes) with the symbol's `id`.
 
 `history` answers edges from the symbol. The commit edges come first, newest first, each naming
 its commit as a `rift://revision/git/<commit>` revision with the commit's author and the path the
@@ -406,11 +407,11 @@ conversation, show the user that excerpt and get approval to send it in this rep
 ```json
 {
   "text": "The nodes tool returned an empty result for a symbol it found.",
-  "include_details": ["os", "rift_version"]
+  "include": {"os": true, "rift_version": true}
 }
 ```
 
-The server sends the diagnostic fields named in `include_details`. Omit it to send the text alone.
+The server sends the diagnostic fields set to `true` in `include`. Omit it to send the text alone.
 See the [feedback reference](/docs/developer/protocol/mcp#tool-feedback) for the payload and failure behavior.
 
 ## Edits and index updates [#edit-and-index-updates]

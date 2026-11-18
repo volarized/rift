@@ -17,8 +17,8 @@ use rift_protocol::{
     configuration::HistoryConfiguration,
     map::WorkspaceMap,
     read::{
-        GetSymbolParams, GetSymbolResult, NodesParams, ReadWarning, SYMBOL_ALTERNATIVES_MAX,
-        SearchScope, SyntaxFramework,
+        GetSymbolInclude, GetSymbolParams, GetSymbolResult, NodesParams, ReadWarning,
+        SYMBOL_ALTERNATIVES_MAX, SearchScope, SyntaxFramework,
     },
 };
 use rift_server::ReadService;
@@ -83,7 +83,7 @@ fn unresolved_angular_template_urls_keep_source_nodes_and_path_owned_warnings() 
             language: None,
             scope: SearchScope::Local,
             packages: Vec::new(),
-            include: Vec::new(),
+            include: GetSymbolInclude::default(),
             limit: 10,
             page_index: 0,
             revision: None,
@@ -241,7 +241,7 @@ fn symbol_pages(
             language: None,
             scope: SearchScope::Local,
             packages: Vec::new(),
-            include: Vec::new(),
+            include: GetSymbolInclude::default(),
             limit: 1,
             page_index,
             revision: None,
@@ -316,7 +316,7 @@ fn symbol_page_validation_rejects_incomplete_or_invalid_misses() -> TestResult {
     let (current_ids, current_names) = symbol_facts(directory.path())?;
     let request = |name: &str| -> TestResult<GetSymbolParams> {
         Ok(serde_json::from_value(
-            serde_json::json!({"name": name, "include": []}),
+            serde_json::json!({"name": name, "include": {}}),
         )?)
     };
     let miss = service.get_symbol(&request("Absent")?)?;

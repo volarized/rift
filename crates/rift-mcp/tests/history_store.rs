@@ -59,7 +59,7 @@ async fn travelled_history(
 ) -> TestResult<Value> {
     let search = search_after_population(
         client,
-        &json!({"query": "travelled", "target": "symbol", "include": ["source"]}),
+        &json!({"query": "travelled", "target": "symbol", "include": {"source": true}}),
     )
     .await?;
     let mut rows = search["results"]
@@ -87,7 +87,10 @@ async fn travelled_history(
     assert_eq!(identity.wire_identity(), id);
     let structured = call_retrying_acceptance(
         client,
-        tool_request("get_symbol", &json!({"id": id, "include": ["history"]})),
+        tool_request(
+            "get_symbol",
+            &json!({"id": id, "include": {"history": true}}),
+        ),
     )
     .await?;
     assert_eq!(structured["outcome"], "found", "{structured}");
@@ -96,7 +99,7 @@ async fn travelled_history(
         client,
         tool_request(
             "get_symbol",
-            &json!({"id": id, "include": ["history"], "revision": structured["revision"]}),
+            &json!({"id": id, "include": {"history": true}, "revision": structured["revision"]}),
         ),
     )
     .await?;

@@ -13,7 +13,7 @@ approval for any exact conversation excerpt before including it in a report.
 Parameters:
 
 - `text` (required) - Report text sent verbatim.
-- `include_details` - Diagnostic fields to send alongside `text`.
+- `include` - Diagnostic fields to send alongside `text`.
 
 ## get_symbol
 
@@ -55,12 +55,11 @@ Parameters:
 
 ## search
 
-Evaluate SPARQL over captured code facts. Use `SERVICE :search` for text and regex
-retrieval and `SERVICE :flows` for call paths around ranked symbols. Continue a
-paged answer with its `next_query`.
+Performs search across the index using a query language. `language` names the query
+language and defaults to `sparql`.
 
 Parameters:
 
-- `query` (required) - Query text.
-- `language` - Currently, only SPARQL is supported.
+- `query` (required) - Query text in `language`.
+- `language` - The language of `query`.
 

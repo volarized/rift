@@ -2,7 +2,7 @@
 
 use rift_error::{RiftError, errors};
 use rift_protocol::identity::SymbolIdentity;
-use rift_protocol::read::{GetSymbolInclude, ReadWarning, SymbolHistory};
+use rift_protocol::read::{ReadWarning, SymbolHistory};
 use rift_protocol::symbol_read::{
     GetSymbolParams, GetSymbolResult, SymbolAlternative, SymbolMatchContext, SymbolNotFound,
     SymbolUnavailableReason,
@@ -103,7 +103,7 @@ impl ReadService {
                 warnings,
             ));
         }
-        let history = if request.include.contains(&GetSymbolInclude::History) {
+        let history = if request.include.history {
             let Some(history) = self.exact_history(index, request, key)? else {
                 return Ok(unavailable(
                     request,
@@ -120,7 +120,7 @@ impl ReadService {
         let next = page.offset.saturating_add(declarations.len());
         let documentation = request
             .include
-            .contains(&GetSymbolInclude::Documentation)
+            .documentation
             .then(|| exact_documentation(index, request));
         warnings.extend(super::symbol_disagreement_warning(readable.assembled()));
         Ok(GetSymbolResult::Found {

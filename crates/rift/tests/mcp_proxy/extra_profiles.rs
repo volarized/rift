@@ -26,7 +26,7 @@ async fn beacons(
 ) -> TestResult<BTreeMap<String, (String, Option<String>)>> {
     let parameters = serde_json::from_value(json!({
         "query":"beacon", "target":"symbol", "scope":scope,
-        "paths":{"include":["lib.rs"]}, "include":["source"], "limit":10,
+        "paths":{"include":["lib.rs"]}, "include":{"source": true}, "limit":10,
     }))?;
     let arguments = query::retrieval(&parameters)?;
     let answer = crate::workspace_client::query_after_population(client, &arguments).await?;

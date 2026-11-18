@@ -178,7 +178,7 @@ impl RiftMcp {
 pub(super) fn exact_request(id: &SymbolId, revision: &Revision) -> GetSymbolParams {
     GetSymbolParams {
         id: id.clone(),
-        include: Vec::new(),
+        include: rift_protocol::read::GetSymbolInclude::default(),
         revision: Some(revision.clone()),
         declaration_limit: 1,
         declaration_cursor: None,

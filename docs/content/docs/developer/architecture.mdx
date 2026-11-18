@@ -628,7 +628,7 @@ hit. Under `target: "all"`, an attached comment keeps its symbol result when tha
 a file match outside the comment remains a file result.
 
 For example, a guide containing the inline code `Compass` can contribute context to
-`get_symbol` with its established `id` and `include: ["documentation"]`. The reference resolves only
+`get_symbol` with its established `id` and `include: {"documentation": true}`. The reference resolves only
 when the selected declaration set establishes one exact target. Ambiguous names remain unresolved.
 The read returns at most 32 references per symbol and 16 KiB of documentation excerpts across the
 page, with typed warnings for missing bytes or reached bounds.

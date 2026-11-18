@@ -64,11 +64,11 @@ pub(crate) fn projected_retrieval(
         write!(group, "OPTIONAL {{ ?hit :{field} ?{field} }} ")?;
         write!(projected, " ?{field}")?;
     }
-    for include in parameters.include.as_ref().into_iter().flatten() {
-        let field = match include {
-            rift_protocol::read::SearchInclude::Source => "source",
-            rift_protocol::read::SearchInclude::Score => "score",
-        };
+    let include = parameters.include;
+    for (field, selected) in [("source", include.source), ("score", include.score)] {
+        if !selected {
+            continue;
+        }
         write!(group, "OPTIONAL {{ ?hit :{field} ?{field} }} ")?;
         write!(projected, " ?{field}")?;
     }

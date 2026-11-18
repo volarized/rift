@@ -66,9 +66,10 @@ pub use generated::{
     GetCapabilitiesResponse, IdentifierMatchClass, Language, NotebookCellIdentity,
     NotebookCellKind, PackageAvailability, PackageContextEntry, PackageDocumentationHit,
     PackageDocumentationHitContributingField, PackageIdentity, PackagePatternDeclaration,
-    PackagePatternHit, PackagePatternPage, PackagePatternRequest, PackageResolutionRequest,
-    PackageResolutionResponse, PackageSearchHit, PackageSearchHitContributingField,
-    PackageSearchRequest, PackageSearchRequestPhase, PackageSearchRequestTarget, Parameter,
+    PackagePatternHit, PackagePatternPage, PackagePatternRequest, PackagePatternRequestInclude,
+    PackageResolutionRequest, PackageResolutionResponse, PackageSearchHit,
+    PackageSearchHitContributingField, PackageSearchRequest, PackageSearchRequestInclude,
+    PackageSearchRequestPhase, PackageSearchRequestTarget, Parameter,
     PositionEncoding as PackageDeclarationRequestPositionEncoding, ProblemDetails,
     PublicationFormat, QueryTerm, RelationshipFacet, ResolvePackageContextRequest,
     ResolvePackageContextResponse, ResolvedRequirement, Search200Response,
@@ -1754,17 +1755,6 @@ fn validate_search_request(request: &PackageSearchRequest) -> Result<(), RiftErr
             )
         })?;
     }
-    if request
-        .include
-        .as_ref()
-        .is_some_and(|values| values.len() > 1 || values.iter().any(|value| value != "source"))
-    {
-        return Err(failure::request_invalid(
-            "validate_search_request",
-            "include",
-            "field failed validation",
-        ));
-    }
     validate_packages(request.packages.as_deref().unwrap_or_default())
 }
 
@@ -2049,7 +2039,7 @@ fn validate_search_documentation_hit(
             source,
         )
     })?;
-    if hit.source.is_some() && !includes_source(request.include.as_deref()) {
+    if hit.source.is_some() && !includes_source(request) {
         return Err(failure::response_invalid(
             "validate_search_page",
             "source",
@@ -2119,7 +2109,7 @@ fn validate_search_page(
                         None,
                     ));
                 }
-                if hit.source.is_some() && !includes_source(request.include.as_deref()) {
+                if hit.source.is_some() && !includes_source(request) {
                     return Err(failure::response_invalid(
                         "validate_search_page",
                         "source",
@@ -2217,7 +2207,7 @@ fn validate_canonical_search_hit(
         }
     }
     if hit.source.as_ref().is_some_and(|source| {
-        !includes_source(request.include.as_deref())
+        !includes_source(request)
             || source.len() > smaller_bound(capabilities.bounds.source_bytes_max, source_bytes_max)
     }) {
         return Err(failure::response_invalid(
@@ -2369,8 +2359,12 @@ impl PageMetadata<'_> {
     }
 }
 
-fn includes_source(include: Option<&[String]>) -> bool {
-    include.is_some_and(|fields| fields.iter().any(|field| field == "source"))
+fn includes_source(request: &PackageSearchRequest) -> bool {
+    request
+        .include
+        .as_ref()
+        .and_then(|include| include.source)
+        .unwrap_or_default()
 }
 
 #[derive(Clone, Copy)]

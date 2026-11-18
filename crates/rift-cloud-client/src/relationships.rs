@@ -433,10 +433,6 @@ fn validate_request(
             .len()
             .saturating_add(request.runtimes.len())
             > crate::PACKAGES_MAX
-        || request.include.len() > 1
-        || request.include.iter().any(|include| {
-            *include != rift_protocol::relationship_read::RelationshipInclude::Source
-        })
     {
         return Err(failure::request_invalid(
             "relationship_page",
