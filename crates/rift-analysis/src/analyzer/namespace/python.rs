@@ -68,6 +68,55 @@ struct Config {
     py_modules: Option<Vec<String>>,
 }
 
+pub(super) fn local_module(input: &NamespaceInput<'_>, path: &str) -> Option<Vec<String>> {
+    let metadata = input
+        .files()
+        .iter()
+        .chain(input.context_sources())
+        .filter_map(|source| {
+            let path = source.path().as_str();
+            let parent = if path == "pyproject.toml" {
+                ""
+            } else {
+                path.strip_suffix("/pyproject.toml")?
+            };
+            Some((parent, *source))
+        })
+        .filter(|(parent, _)| {
+            parent.is_empty()
+                || path
+                    .strip_prefix(parent)
+                    .is_some_and(|tail| tail.starts_with('/'))
+        })
+        .max_by_key(|(parent, _)| parent.len());
+    if metadata.is_some_and(|(_, source)| config(source, input.syntax()).is_some()) {
+        return None;
+    }
+    let parent = metadata.map_or("", |(parent, _)| parent);
+    let relative = if parent.is_empty() {
+        path
+    } else {
+        &path[parent.len() + 1..]
+    };
+    let relative = relative.strip_prefix("src/").unwrap_or(relative);
+    let (module, extension) = relative.rsplit_once('.')?;
+    if !matches!(extension, "py" | "pyi") {
+        return None;
+    }
+    let mut parts = module.split('/').collect::<Vec<_>>();
+    if parts.last() == Some(&"__init__") {
+        parts.pop();
+    }
+    if parts.is_empty()
+        || !parts
+            .iter()
+            .all(|part| rift_protocol::index::python_identifier_is_valid(part))
+    {
+        return None;
+    }
+    Some(parts.into_iter().map(str::to_owned).collect())
+}
+
 fn config(source: PackageSource<'_>, syntax: SyntaxLimits) -> Option<Config> {
     let path = source.path().as_str();
     let parent = if path == "pyproject.toml" {

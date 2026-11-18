@@ -9,9 +9,12 @@ use rift_syntax::SyntaxFacts;
 
 use crate::{ExactPackageInput, NamespaceInput, PackageImportRoot, PackageImportRootOrigin};
 
+mod errors;
 pub(crate) mod python;
 mod rust;
 mod typescript;
+
+use self::errors::retain_valid_declarations;
 
 /// One selected file with its retained, path-independent syntax facts.
 pub(crate) struct SelectedFile<'source> {
@@ -25,6 +28,8 @@ pub(super) type Anchors = BTreeMap<String, BTreeMap<String, SymbolId>>;
 
 #[cfg(test)]
 mod digest_tests;
+#[cfg(test)]
+mod symbol_ids;
 
 /// One export binding whose defining declaration and logical owner are established.
 pub(crate) struct ExportBinding {
@@ -172,7 +177,51 @@ pub(crate) fn prepare_context(
     if roots_accepted {
         python::prepare_exports(input, selected, &captured, &roots, &mut prepared);
     }
+    prepare_documents(input, selected, &captured, &mut prepared);
     prepared
+}
+
+fn prepare_documents(
+    input: &NamespaceInput<'_>,
+    selected: &[SelectedFile<'_>],
+    captured: &BTreeMap<&str, crate::PackageSource<'_>>,
+    prepared: &mut PreparedNamespace,
+) {
+    for file in selected {
+        let language = file.syntax.language();
+        let document = matches!(
+            language.name.as_str(),
+            "markdown" | "json" | "yaml" | "toml"
+        );
+        if !document || language.dialect.is_some() {
+            continue;
+        }
+        let Some(source) = captured
+            .get(file.path.as_str())
+            .filter(|source| source.text() == file.source)
+        else {
+            continue;
+        };
+        if file.syntax.source_digest() != Some(&source.source_digest()) {
+            continue;
+        }
+        let anchors = file
+            .syntax
+            .symbols()
+            .iter()
+            .filter_map(|symbol| {
+                let path = vec![file.path.as_str().to_owned(), symbol.qualified_name.clone()];
+                let identity =
+                    SymbolIdentity::new(input.owner().clone(), language.clone(), path).ok()?;
+                let identity = SymbolId::new(identity.wire_identity()).ok()?;
+                Some((symbol.qualified_name.clone(), identity))
+            })
+            .collect();
+        prepared.anchors.insert(
+            file.path.as_str().to_owned(),
+            retain_valid_declarations(input, file, anchors),
+        );
+    }
 }
 
 fn identity_anchors_with_roots(
@@ -182,17 +231,19 @@ fn identity_anchors_with_roots(
     source: crate::PackageSource<'_>,
     roots: &[PackageImportRoot],
 ) -> BTreeMap<String, SymbolId> {
-    if syntax.language().name != "python"
-        || syntax.language().dialect.is_some()
-        || syntax.has_errors()
-    {
+    if syntax.language().name != "python" || syntax.language().dialect.is_some() {
         return BTreeMap::new();
     }
     let digest = source.source_digest();
     if syntax.source_digest() != Some(&digest) {
         return BTreeMap::new();
     }
-    let Some(module) = python_module(path, roots) else {
+    let local_fallback = input.owner().is_local() && input.import_roots().is_empty();
+    let Some(module) = python_module(path, roots).or_else(|| {
+        local_fallback
+            .then(|| python::local_module(input, path))
+            .flatten()
+    }) else {
         return BTreeMap::new();
     };
     let mut anchors = BTreeMap::new();
@@ -225,7 +276,12 @@ fn identity_anchors_with_roots(
             anchors.insert(symbol.qualified_name.clone(), identity);
         }
     }
-    anchors
+    let file = SelectedFile {
+        path: source.path(),
+        source: source.text(),
+        syntax,
+    };
+    retain_valid_declarations(input, &file, anchors)
 }
 
 fn python_declaration_name(symbol: &rift_syntax::SyntaxSymbol) -> Option<String> {

@@ -375,7 +375,10 @@ mod tests {
     #[test]
     fn structural_facts_without_namespace_supply_no_symbol_alternatives() -> TestResult {
         let directory = tempfile::tempdir()?;
-        std::fs::write(directory.path().join("facts.json"), "{\"beacon\": 1}")?;
+        std::fs::write(
+            directory.path().join("facts.c"),
+            "int beacon(void) { return 1; }",
+        )?;
         let index = WorkspaceIndex::build(
             directory.path(),
             WorkspaceIndexLimits::default(),
@@ -386,7 +389,7 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert!(index.assembled_symbol(matches[0])?.identity().is_none());
         assert!(super::symbols(&index, index.files(), "beaco", None, index.limits(),)?.is_empty());
-        assert_eq!(matches[0].file.path().as_str(), "facts.json");
+        assert_eq!(matches[0].file.path().as_str(), "facts.c");
         let range = matches[0].symbol.item_range;
         let start = usize::try_from(range.start)?;
         let end = usize::try_from(range.end)?;

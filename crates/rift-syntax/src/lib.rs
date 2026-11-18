@@ -15,6 +15,7 @@ pub mod language;
 mod markdown;
 mod native;
 mod parse;
+mod parse_errors;
 mod provider;
 mod python;
 pub mod registry;

@@ -13313,13 +13313,28 @@ mod tests {
         let primary_id = identity(&primary);
         let named_id = identity(&named);
         assert_ne!(primary_id, named_id);
+        let package_name = |id: &SymbolId| {
+            let owner = rift_protocol::identity::SymbolIdentity::parse(id.as_str())
+                .expect("owner")
+                .owner()
+                .clone();
+            let language = rift_protocol::read::Language::from_identity_segment("json")
+                .expect("JSON language");
+            let identity = rift_protocol::identity::SymbolIdentity::new(
+                owner,
+                language,
+                vec!["package.json".to_owned(), "name".to_owned()],
+            )
+            .expect("document identity");
+            SymbolId::new(identity.wire_identity()).expect("canonical identity")
+        };
         assert_eq!(
             primary.canonical_examples(2).expect("deduplicated sample"),
-            std::slice::from_ref(&primary_id)
+            [primary_id.clone(), package_name(&primary_id)]
         );
         assert_eq!(
             named.canonical_examples(2).expect("named sample"),
-            std::slice::from_ref(&named_id)
+            [named_id.clone(), package_name(&named_id)]
         );
         assert_eq!(
             rift_protocol::identity::SymbolIdentity::parse(primary_id.as_str())
@@ -13488,7 +13503,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_examples_deduplicate_bindings_and_keep_fewer_than_two() {
+    fn canonical_examples_deduplicate_bindings_and_include_document_ids() {
         let root = tempfile::tempdir().expect("workspace");
         fs::write(
             root.path().join("package.json"),
@@ -13514,7 +13529,14 @@ mod tests {
         .expect("captured index");
         assert!(index.symbol_declarations.get().is_none());
         let examples = index.canonical_examples(2).expect("cold first request");
-        assert_eq!(examples.len(), 1, "three bindings belong to one object");
+        assert_eq!(examples.len(), 2, "one code symbol and one document symbol");
+        let document = rift_protocol::identity::SymbolIdentity::new(
+            index.owner().clone(),
+            rift_protocol::read::Language::from_identity_segment("json").expect("language"),
+            vec!["package.json".to_owned(), "name".to_owned()],
+        )
+        .expect("document identity");
+        assert_eq!(examples[1].as_str(), document.wire_identity());
         assert!(index.symbol_declarations.get().is_none());
         assert_eq!(index.symbols("open", 10).expect("bindings").len(), 3);
         assert_eq!(
