@@ -10,8 +10,8 @@
 //! indent their further lines by two. Single-line facts are written with control characters made
 //! visible; multi-line text is written line by line, bytes unchanged.
 //!
-//! The hits a relationship walk reached are the nodes of a tree, one entry of the section. A
-//! node under the root starts with a lead such as `↳ called`, one level deeper than the lines
+//! The hits a relationship walk reached are the syntax elements of a tree, one entry of the section. A
+//! syntax element under the root starts with a lead such as `↳ called`, one level deeper than the lines
 //! of its parent, and indents its further lines by one more.
 
 use std::fmt::Display;
@@ -25,9 +25,9 @@ use crate::output::text::{TextError, TextWriter, visible};
 const SECTION_INDENT: usize = 1;
 /// Levels, past the section indent, that indent the further lines of one item among several.
 const MARKER_INDENT: usize = 1;
-/// Levels, past the head of a node under the root, that indent its further lines and the heads
-/// of the nodes under it.
-const NODE_INDENT: usize = 1;
+/// Levels, past the head of a syntax element under the root, that indent its further lines and the heads
+/// of the syntax elements under it.
+const SYNTAX_ELEMENT_INDENT: usize = 1;
 /// Noun counted by the title of the items of `search` and `get_symbol`.
 const RESULT_NOUN: &str = "result";
 
@@ -44,7 +44,7 @@ pub(super) struct Lines<'a> {
     /// Levels that indent the first line of the item.
     head_indent: usize,
     /// Text written before the first line: the marker of an item among several, or the lead of
-    /// a tree node.
+    /// a tree syntax element.
     lead: Option<String>,
 }
 
@@ -60,32 +60,23 @@ impl<'a> Lines<'a> {
         }
     }
 
-    /// The lines of a tree node `depth` levels under the root, behind `lead` when it has one.
+    /// The lines of a tree syntax element `depth` levels under the root, behind `lead` when it has one.
     ///
-    /// The root indents every line like a single item. A node under it starts its head one level
+    /// The root indents every line like a single item. A syntax element under it starts its head one level
     /// deeper than the lines of its parent and indents its further lines by one more.
-    pub(super) fn node(out: &'a mut TextWriter, depth: usize, lead: Option<String>) -> Self {
-        let head_indent = SECTION_INDENT.saturating_add(NODE_INDENT.saturating_mul(depth));
+    pub(super) fn walk_symbol(out: &'a mut TextWriter, depth: usize, lead: Option<String>) -> Self {
+        let head_indent =
+            SECTION_INDENT.saturating_add(SYNTAX_ELEMENT_INDENT.saturating_mul(depth));
         let indent = if depth == 0 {
             head_indent
         } else {
-            head_indent.saturating_add(NODE_INDENT)
+            head_indent.saturating_add(SYNTAX_ELEMENT_INDENT)
         };
         Self {
             out,
             indent,
             head_indent,
             lead,
-        }
-    }
-
-    /// Lines that continue the last of `count` items after its head and facts.
-    pub(super) fn after_last(out: &'a mut TextWriter, count: usize) -> Self {
-        Self {
-            out,
-            indent: item_indent(count),
-            head_indent: SECTION_INDENT,
-            lead: None,
         }
     }
 

@@ -27,14 +27,14 @@
 //! at one level and indent their further lines by two. Text an answer copies, such as source,
 //! keeps its own whitespace after the indent. No blank line separates two items or two sections.
 //! The hits a relationship walk reached are written as a tree; see the `walk` module.
-//! `nodes` answers, failures, and workspace pages follow the same principles; see the
-//! `nodes`, `error`, and `workspace` modules.
+//! `facets` answers, failures, and workspace pages follow the same principles; see the
+//! `facets`, `error`, and `workspace` modules.
 
 mod error;
+mod facets;
 mod facts;
 mod layout;
 mod map;
-mod nodes;
 mod query;
 mod search;
 mod symbol;
@@ -43,8 +43,7 @@ mod walk;
 mod workspace;
 
 use rift_protocol::error::ErrorData;
-use rift_protocol::nodes_read::NodesToolResult;
-use rift_protocol::read::{GetSymbolResult, NodesResult};
+use rift_protocol::read::{FacetsResult, GetSymbolResult};
 use rift_protocol::search::SearchResult;
 use rift_protocol::workspace::WorkspaceResourcePage;
 
@@ -53,7 +52,6 @@ use super::warnings::{log_warnings, record_documentation, record_warnings};
 use layout::Page;
 
 pub(crate) use error::RegisteredFailure;
-pub(crate) use nodes::select as select_nodes;
 pub(crate) use query::{QueryDisplay, QueryOutput};
 
 /// An answer that writes itself as text.
@@ -193,29 +191,13 @@ impl Render for GetSymbolResult {
     }
 }
 
-impl Render for NodesToolResult {
-    fn log_warnings(&mut self) {
-        match self {
-            Self::Summary(summary) => record_warnings(&mut summary.warnings),
-            Self::Syntax(result) => result.log_warnings(),
-        }
-    }
-
-    fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
-        match self {
-            Self::Summary(summary) => nodes::summary(out, summary),
-            Self::Syntax(result) => result.render(out),
-        }
-    }
-}
-
-impl Render for NodesResult {
+impl Render for FacetsResult {
     fn log_warnings(&mut self) {
         record_warnings(&mut self.warnings);
     }
 
     fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
-        nodes::answer(out, self)
+        facets::answer(out, self)
     }
 }
 

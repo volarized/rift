@@ -8,7 +8,7 @@ use rift_protocol::read::{
 };
 
 use crate::ReadService;
-use crate::traversal::TRAVERSAL_NODES_MAX;
+use crate::traversal::TRAVERSAL_SYMBOLS_MAX;
 
 use super::{CallCorroboration, CallDestination, CallProvider, GraphCalls};
 
@@ -34,7 +34,7 @@ impl<'read> CapturedCalls<'read> {
         let mut calls = adjacent.iter().filter(|edge| {
             edge.facet() == RelationshipFacet::Calls && edge.static_callee().is_some()
         });
-        let edges = calls.by_ref().take(TRAVERSAL_NODES_MAX).collect();
+        let edges = calls.by_ref().take(TRAVERSAL_SYMBOLS_MAX).collect();
         Self {
             reads,
             direction,
@@ -209,7 +209,7 @@ impl CallEvidence {
             for (provider, destination) in destinations {
                 let agrees = agrees_with(destination);
                 conflict |= !agrees;
-                if records.len() == TRAVERSAL_NODES_MAX {
+                if records.len() == TRAVERSAL_SYMBOLS_MAX {
                     return true;
                 }
                 records.push(CallCorroboration {

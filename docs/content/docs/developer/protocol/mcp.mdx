@@ -343,8 +343,8 @@ The server bounds statement size, algebra, fact acquisition, and the evaluated a
 A query requiring missing facts returns typed unavailability before evaluation.
 This applies to `ASK`, counts, negation, bindings, and graphs. Available-empty facts differ
 from unavailable facts. A query needing only published symbol names does not require
-unavailable nodes, history, or engine facts. Supplied node facts are preserved; query evaluation
-does not reparse source to manufacture a complete node family.
+unavailable syntax elements, history, or engine facts. Supplied syntax facts are preserved; query evaluation
+does not reparse source to manufacture a complete syntax family.
 
 ### Migration
 
@@ -391,7 +391,7 @@ bounds retain the definite miss and report incomplete alternative work.
 `include` selects projections: `documentation` adds bounded referring documentation, and
 `history` adds the logical symbol's history edges. An omitted or empty `include` requests none. The
 server refuses any other entry, `source` included, as an invalid request. A declaration's
-source is read by [`nodes`](#tool-nodes) with `symbol`.
+source is read by [`facets`](#tool-facets) with `symbol`.
 
 `declaration_limit` defaults to 5 and accepts 1 through 10000. `declaration_cursor` continues
 the declarations of the same symbol at the revision the answer names; the server refuses it for
@@ -456,84 +456,35 @@ selection failures. A malformed identity is refused before lookup:
 
 <ReadExample name="malformed-symbol" />
 
-## Nodes
+## Facets
 
-<McpTool name="nodes" />
+<McpTool name="facets" />
 
-A request selects its nodes through exactly one of `symbol` or `path` with `position`; the server
-**MUST** refuse any other combination with `invalid_request`.
+The request carries `symbol`, an optional `revision`, and an optional `facet_cursor`.
+The server returns the symbol's declarations in symbol order. One facet is one declaration,
+with its location, exact source, and syntax structure.
 
-A path request **MAY** carry `scope` to select an [accepted project or profile](/docs/developer/configuration#extra-projects).
-The server resolves `path` and any Git `revision` in the selected project. Omitting `scope`
-selects `local`. The caller **MUST** omit `scope` beside `symbol`.
+Each declaration carries `declaration`, `kind`, `range`, `source`, and `syntax`.
+The source span names the returned bytes. The syntax structure lists the declaration's
+item and its descendants in pre-order. Elements of a nested
+declaration belong to that declaration's facet. The item spans the declaration without
+its attached documentation.
 
-A `symbol` read names the symbol and returns its declarations in symbol order. Each declaration
-has its kind, byte range, source excerpt, and selected parts of its syntax tree. The excerpt's
-span names the bytes returned. A summary shows up to four declarations and up to 1536 source
-bytes per declaration. A clipped source excerpt names the returned byte range. Send
-`syntax: true` for the exact source and the full syntax tree.
+A syntax element carries its `index` within the declaration, from 0 at the root, and the
+`parent` index when present. Its `unit`, `language`, and `range` locate it in the source.
+The answer names the revision it read. A symbol with no declaration refuses
+`resource_not_found`.
 
-With `syntax: true`, a `symbol` read answers every node of the symbol: per declaration, in the order
-[`get_symbol`](#tool-get_symbol) lists its declarations, the item node, which spans the
-declaration without its attached documentation, then each node of its item subtree in
-pre-order that no declaration nested in it holds. The answer names the symbol in `symbol`, and
-the item node's `source` is the declaration's source. A symbol with no declaration in the index
-refuses `resource_not_found`.
+The server reads package and runtime symbols through the global API. The answer's
+`revision` names the selected release. The server **MUST** refuse a revision that is not
+a release of the symbol's owner with `invalid_request`.
 
-The server reads the nodes of a package or runtime symbol from the global API, in the release
-`revision` selects. Each node's `unit` is then a source unit of the symbol's owner, such as
-`rift://source/cargo/crates.io/demo/src/lib.rs`, read at that release, and a symbol the release
-does not declare refuses `resource_not_found`. The server **MUST** refuse a `revision` beside such
-a symbol that is not a release of the symbol's owner with `invalid_request`, and the answer
-carries the release it read as its `revision`.
-
-One answer holds at most `results_max` nodes, or the global API's `page_limit_max` for a package
-or runtime symbol, and 1 MiB of node source, and at least one node.
-When declarations or syntax nodes remain, the answer carries `node_cursor`. The caller **MUST**
-send it back with the same selector to continue the same view. A summary cursor continues
-declarations. A syntax cursor continues the full tree. When one declaration spans several
-syntax pages, a summary continuation can scan a page without another declaration. Follow its
-cursor while one is present. The server refuses a cursor for a different selection or a
-revision it no longer serves. Restart the read without the cursor.
-
-A `position` read selects the symbol of the innermost declaration holding the byte. A byte no
-declaration holds returns an excerpt of up to 1536 bytes around that position. With `syntax: true`,
-a byte outside every declaration selects the file's unit nodes, starting at the file node.
-The file node spans the whole file. A visible text file no syntax provider parses, such as
-`justfile` or `notes.txt`, has one file node in the language `text`. A path the index holds no text for, such as a lockfile, refuses
-`capability_unavailable`, naming the extension or stating that the path carries none, and a file
-a syntax bound left out refuses `content_unavailable`.
-
-During local preparation, the server **MAY** prepare the requested path within the remaining
-[`readiness_timeout`](/docs/developer/configuration#server) budget. An answer for a path outside
-the prepared publication can return syntax while the server logs
-[`local_index_preparing`](#reads). This read leaves published progress at its current position.
-The server returns `temporarily_unavailable` when preparation exceeds the remaining budget.
-
-A node carries no identity. The server **MUST** address each node by its place: a node inside a
-declaration's item subtree carries the `declaration` ordinal among the declarations of the
-answer's `symbol` and its pre-order `index` from the item node at 0; a node outside every
-declaration carries its `index` in its `unit` alone, from the unit's file node at 0. Nodes of a
-nested declaration count toward the nested symbol.
-
-`parent` names the `index` of the enclosing node in the same declaration or unit, and is absent
-for a declaration's item node and for the file node. An address names a place at the read's
-revision, so an edit renumbers the nodes after it.
-The syntax text shows each node on one line with its byte range and address. The structured
-summary carries each selected part's `index` to match it against the full tree.
-
-A node of a project file names that file as a [`SourceUnitId`](/docs/developer/protocol/reference#SourceUnitId),
-such as `rift://source/project/src/config.rs`. The unit names no revision: the answer's
-`revision` names the tree or commit its bytes were read at.
-
-This call reads the declaration of the `Config` struct:
-
-<ReadExample name="symbol-nodes" />
-
-This call reads byte 338 of `src/config.rs`, inside the `parse_config` call, and requests the
-full syntax tree of `load_config`, the declaration holding it:
-
-<ReadExample name="local-nodes" />
+A page holds at most `results_max` declarations, or the global API's `page_limit_max`.
+The source bound is 1 MiB across the syntax elements; a page always includes at least one
+whole declaration. A declaration's syntax structure stays with its source. When declarations
+remain, the response carries `facet_cursor`. The caller **MUST** send it with the same
+symbol and revision. The server refuses a cursor for another symbol or a revision it no
+longer serves.
 
 ## Feedback [#tool-feedback]
 
@@ -568,7 +519,7 @@ Callers read code through these tools:
 | --- | --- |
 | [`get_symbol`](#tool-get_symbol) | one logical symbol by canonical identity |
 | [`search`](#tool-search) | bindings, booleans, or RDF triples from selected facts |
-| [`nodes`](#tool-nodes) | source and syntax structure of a symbol or the declaration holding one position |
+| [`facets`](#tool-facets) | every declaration of a symbol with its location, source, and syntax structure |
 
 [Result content](#result-content) defines the representations a tool result carries and the proxy output selection that chooses them.
 
@@ -722,7 +673,7 @@ degraded resolvers first, in resolver order, then the entries no public registry
 packages and requirements the global publication lacks, then the entries a nearest release
 answers for. The global API failure and source omission diagnostics have separate bounds.
 
-`get_symbol` and `nodes` accept an optional `revision`. A local read with no revision
+`get_symbol` and `facets` accept an optional `revision`. A local read with no revision
 selects the working tree.
 
 ### Result content [#result-content]
@@ -746,7 +697,7 @@ The [tool execution failure](#tool-execution-failures) form applies when `isErro
 
 ### Revision-addressed reads [#revision-reads]
 
-`get_symbol` and `nodes` accept `revision`, a [`Revision`](/docs/developer/protocol/reference) IRI
+`get_symbol` and `facets` accept `revision`, a [`Revision`](/docs/developer/protocol/reference) IRI
 that names one point on the history axis:
 
 - `rift://revision/git/<commit>` - a complete lowercase git commit id
@@ -759,7 +710,7 @@ that names one point on the history axis:
 - `rift://revision/tree/<digest>` - the working tree the index serves, by its complete SHA-256
   digest
 
-A `get_symbol` or `nodes` answer carries the `revision` it read. The answer names a commit, a
+A `get_symbol` or `facets` answer carries the `revision` it read. The answer names a commit, a
 release, or a tree. A caller **MAY** send that revision to pin a later exact read to the same point.
 
 A git revision reads committed bytes. The server resolves it in place from the workspace's git
@@ -990,7 +941,7 @@ After preparation, the catalog also includes visible files without enabled synta
 ## Errors
 
 A failure travels by its class. A **tool execution failure** is a Rift operating failure on a
-`get_symbol`, `search`, or `nodes` call, such as invalid input, a crossed limit, or a storage
+`get_symbol`, `search`, or `facets` call, such as invalid input, a crossed limit, or a storage
 failure. A **protocol failure** is any other failure: an unknown method or tool, a malformed
 request envelope, a transport failure, a resource read failure, or an MCP error forwarded from
 upstream.

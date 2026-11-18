@@ -1,6 +1,6 @@
 //! SPARQL evaluation over Rift's graph model.
 //!
-//! A caller states one read's facts - symbols, nodes, source units, revisions, and the edges
+//! A caller states one read's facts - symbols, syntax elements, source units, revisions, and the edges
 //! between them - as [`GraphFact`] values. [`GraphDatasetBuilder`] writes each fact as triples
 //! over the fixed vocabulary under [`VOCABULARY_NAMESPACE`], within [`GraphLimits`].
 //! [`GraphQuery::parse`] admits one SPARQL 1.1 query, and
@@ -60,8 +60,8 @@ mod tests;
 pub const LOCAL_GRAPH: &str = "urn:rift:graph:local";
 
 pub use dataset::{
-    FlowCallSite, GraphDataset, GraphDatasetBuilder, GraphFact, HistoryEvent, NodeAddress,
-    NodeFact, NodeLocation, QueryFlows, RevisionIri, SymbolAddress, SymbolRelation,
+    FlowCallSite, GraphDataset, GraphDatasetBuilder, GraphFact, HistoryEvent, QueryFlows,
+    RevisionIri, SymbolAddress, SymbolRelation, SyntaxAddress, SyntaxFact, SyntaxLocation,
 };
 pub use evaluation::{GraphAnswer, GraphTerm, QueryCancellation, SolutionTable};
 pub use inventory::{OccurrenceSelection, SemanticInventory};
@@ -74,7 +74,7 @@ pub use page::{PageForm, PageSelection, continuation_query};
 pub use presentation::{QueryField, QueryPresentation};
 pub use query::GraphQuery;
 pub use requirements::{
-    AdjacencySelection, AdjacencyStep, NodeSelection, ReachedNodes, SymbolSelection,
+    AdjacencySelection, AdjacencyStep, ReachedFacets, SymbolSelection, SyntaxSelection,
 };
 pub use retrieval::RetrievalSelection;
 pub use vocabulary::{

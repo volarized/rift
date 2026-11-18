@@ -284,23 +284,23 @@ pub(crate) fn parse_markdown_trees(
     let mut callback_budget = ProgressBudget::new(bounds.progress_callbacks_max);
     let block = parse_block_tree(source, &block_language, &mut callback_budget)?;
     let fact_kinds = markdown_fact_kinds(&block_language, &inline_language);
-    let block_nodes = bounded_tree_nodes(
+    let block_syntax_elements = bounded_tree_syntax_elements(
         block.root_node(),
         0,
         source.path,
-        NodeBound::whole(limits.syntax_nodes_max()),
+        ElementBound::whole(limits.syntax_elements_max()),
         limits.syntax_depth_max(),
     )?;
-    let (inline_nodes, inline_ranges) =
-        inline_range_plan(source.path, &block_nodes, fact_kinds, bounds)?;
+    let (inline_syntax_elements, inline_ranges) =
+        inline_range_plan(source.path, &block_syntax_elements, fact_kinds, bounds)?;
     let inline = parse_inline_trees(
         source,
         &inline_language,
-        inline_nodes,
+        inline_syntax_elements,
         inline_ranges,
         &mut callback_budget,
     )?;
-    check_combined_node_bound(source.path, limits, block_nodes.len(), &inline)?;
+    check_combined_syntax_element_bound(source.path, limits, block_syntax_elements.len(), &inline)?;
     Ok(MarkdownTrees { block, inline })
 }
 
@@ -336,19 +336,22 @@ fn parse_block_tree(
 
 fn inline_range_plan<'tree>(
     path: &ProjectPath,
-    block_nodes: &'tree [BoundedNode<'tree>],
+    block_syntax_elements: &'tree [BoundedElement<'tree>],
     kinds: &MarkdownFactKinds,
     bounds: MarkdownParseBounds,
-) -> Result<(Vec<&'tree BoundedNode<'tree>>, Vec<Vec<Range>>), RiftError> {
-    let inline_nodes: Vec<_> = block_nodes
+) -> Result<(Vec<&'tree BoundedElement<'tree>>, Vec<Vec<Range>>), RiftError> {
+    let inline_syntax_elements: Vec<_> = block_syntax_elements
         .iter()
-        .filter(|node| {
-            node.node.kind_id() == kinds.inline || node.node.kind_id() == kinds.pipe_table_cell
+        .filter(|syntax_element| {
+            syntax_element.syntax_element.kind_id() == kinds.inline
+                || syntax_element.syntax_element.kind_id() == kinds.pipe_table_cell
         })
         .collect();
-    let inline_ranges = inline_nodes
+    let inline_ranges = inline_syntax_elements
         .iter()
-        .map(|node| inline_parse_ranges(node.node, kinds.block_continuation))
+        .map(|syntax_element| {
+            inline_parse_ranges(syntax_element.syntax_element, kinds.block_continuation)
+        })
         .collect::<Vec<_>>();
     let count = inline_ranges
         .iter()
@@ -367,13 +370,13 @@ fn inline_range_plan<'tree>(
             .observed(count)
             .fail();
     }
-    Ok((inline_nodes, inline_ranges))
+    Ok((inline_syntax_elements, inline_ranges))
 }
 
 fn parse_inline_trees(
     source: SyntaxSource<'_>,
     language: &tree_sitter::Language,
-    inline_nodes: Vec<&BoundedNode<'_>>,
+    inline_syntax_elements: Vec<&BoundedElement<'_>>,
     inline_ranges: Vec<Vec<Range>>,
     callback_budget: &mut ProgressBudget,
 ) -> Result<Vec<InlineTreeFact>, RiftError> {
@@ -385,16 +388,16 @@ fn parse_inline_trees(
             .runtime_abi_max(tree_sitter::LANGUAGE_VERSION)
             .error()
     })?;
-    let mut inline = Vec::with_capacity(inline_nodes.len());
-    for (node, ranges) in inline_nodes.into_iter().zip(inline_ranges) {
+    let mut inline = Vec::with_capacity(inline_syntax_elements.len());
+    for (syntax_element, ranges) in inline_syntax_elements.into_iter().zip(inline_ranges) {
         let Some(tree) = parse_inline_tree(source, &mut parser, &ranges, callback_budget)? else {
             continue;
         };
         inline.push(InlineTreeFact {
-            parent_id: node.node.id(),
+            parent_id: syntax_element.syntax_element.id(),
             ranges,
             tree,
-            base_depth: node.depth,
+            base_depth: syntax_element.depth,
         });
     }
     Ok(inline)
@@ -431,21 +434,21 @@ fn parse_inline_tree(
     })
 }
 
-fn check_combined_node_bound(
+fn check_combined_syntax_element_bound(
     path: &ProjectPath,
     limits: SyntaxLimits,
-    mut node_count: usize,
+    mut syntax_element_count: usize,
     inline: &[InlineTreeFact],
 ) -> Result<(), RiftError> {
     for tree in inline {
-        let nodes = bounded_tree_nodes(
+        let syntax_elements = bounded_tree_syntax_elements(
             tree.tree.root_node(),
             tree.base_depth,
             path,
-            NodeBound::after(limits.syntax_nodes_max(), node_count),
+            ElementBound::after(limits.syntax_elements_max(), syntax_element_count),
             limits.syntax_depth_max(),
         )?;
-        node_count = node_count.saturating_add(nodes.len());
+        syntax_element_count = syntax_element_count.saturating_add(syntax_elements.len());
     }
     Ok(())
 }
@@ -461,8 +464,13 @@ pub(crate) fn extract_markdown_facts(
     let inline_language: tree_sitter::Language = tree_sitter_md::INLINE_LANGUAGE.into();
     let kinds = markdown_fact_kinds(&block_language, &inline_language);
     let block_facts = extract_block_facts(source, trees, syntax, limits, kinds)?;
-    let authored_facts =
-        extract_authored_facts(source, trees, limits, kinds, &block_facts.node_blocks)?;
+    let authored_facts = extract_authored_facts(
+        source,
+        trees,
+        limits,
+        kinds,
+        &block_facts.syntax_element_blocks,
+    )?;
     let mut links = authored_facts.links;
     let mut reference_candidates = authored_facts.reference_candidates;
     let mut error_ranges = authored_facts.error_ranges;
@@ -496,7 +504,7 @@ pub(crate) fn extract_markdown_facts(
 struct MarkdownBlockExtraction {
     blocks: Vec<MarkdownBlockFact>,
     headings: Vec<MarkdownHeadingFact>,
-    node_blocks: HashMap<usize, ByteRange>,
+    syntax_element_blocks: HashMap<usize, ByteRange>,
 }
 
 fn extract_block_facts(
@@ -506,20 +514,20 @@ fn extract_block_facts(
     limits: SyntaxLimits,
     kinds: &MarkdownFactKinds,
 ) -> Result<MarkdownBlockExtraction, RiftError> {
-    let block_nodes = bounded_tree_nodes(
+    let block_syntax_elements = bounded_tree_syntax_elements(
         trees.block.root_node(),
         0,
         source.path,
-        NodeBound::whole(limits.syntax_nodes_max()),
+        ElementBound::whole(limits.syntax_elements_max()),
         limits.syntax_depth_max(),
     )?;
     let line_starts = rift_core::line::line_starts(source.text);
     let mut headings = Vec::new();
-    let mut heading_for_node = HashMap::new();
+    let mut heading_for_syntax_element = HashMap::new();
     let mut blocks = Vec::new();
-    let mut node_blocks = HashMap::with_capacity(block_nodes.len());
+    let mut syntax_element_blocks = HashMap::with_capacity(block_syntax_elements.len());
     let heading_symbols = heading_symbols_by_start(syntax);
-    // `bounded_tree_nodes` already checked this tree's node and depth limits.
+    // `bounded_tree_syntax_elements` already checked this tree's syntax element and depth limits.
     let mut stack = vec![(
         trees.block.root_node(),
         None::<Node<'_>>,
@@ -527,10 +535,11 @@ fn extract_block_facts(
         None::<ByteRange>,
     )];
     let mut cursor = trees.block.walk();
-    while let Some((node, parent, inherited_heading, inherited_block)) = stack.pop() {
+    while let Some((syntax_element, parent, inherited_heading, inherited_block)) = stack.pop() {
         let mut child_heading = inherited_heading;
-        if node.kind_id() == kinds.section {
-            if let Some(declared) = declaring_heading(node, kinds.atx_heading, kinds.setext_heading)
+        if syntax_element.kind_id() == kinds.section {
+            if let Some(declared) =
+                declaring_heading(syntax_element, kinds.atx_heading, kinds.setext_heading)
                 && let Some(index) = add_heading(
                     declared,
                     inherited_heading,
@@ -539,41 +548,46 @@ fn extract_block_facts(
                     &mut headings,
                 )?
             {
-                heading_for_node.insert(declared.id(), index);
+                heading_for_syntax_element.insert(declared.id(), index);
                 child_heading = Some(index);
             }
-        } else if node.kind_id() == kinds.setext_heading
-            && !declares_its_section(node, parent, kinds.atx_heading, kinds.setext_heading)
+        } else if syntax_element.kind_id() == kinds.setext_heading
+            && !declares_its_section(
+                syntax_element,
+                parent,
+                kinds.atx_heading,
+                kinds.setext_heading,
+            )
             && let Some(index) = add_heading(
-                node,
+                syntax_element,
                 inherited_heading,
                 source.text,
                 &heading_symbols,
                 &mut headings,
             )?
         {
-            heading_for_node.insert(node.id(), index);
+            heading_for_syntax_element.insert(syntax_element.id(), index);
         }
 
         let mut current_block = inherited_block;
-        if let Some(structure) = block_structure(node.kind_id(), kinds) {
-            let range = extract::byte_range(node)?;
+        if let Some(structure) = block_structure(syntax_element.kind_id(), kinds) {
+            let range = extract::byte_range(syntax_element)?;
             current_block = Some(range);
             let heading = if structure == MarkdownBlockStructure::Heading {
-                heading_for_node
-                    .get(&node.id())
+                heading_for_syntax_element
+                    .get(&syntax_element.id())
                     .copied()
                     .or(inherited_heading)
             } else {
                 inherited_heading
             };
-            let code_language = block_is_code(node.kind_id(), kinds)
-                .then(|| code_language(node, source.text, kinds.info_string))
+            let code_language = block_is_code(syntax_element.kind_id(), kinds)
+                .then(|| code_language(syntax_element, source.text, kinds.info_string))
                 .flatten();
             blocks.push(MarkdownBlockFact {
                 range,
                 line: rift_core::line::line_of(&line_starts, range.start),
-                kind: if block_is_code(node.kind_id(), kinds) {
+                kind: if block_is_code(syntax_element.kind_id(), kinds) {
                     MarkdownBlockKind::Code
                 } else {
                     MarkdownBlockKind::Prose
@@ -584,18 +598,18 @@ fn extract_block_facts(
             });
         }
         if let Some(block_range) = current_block {
-            node_blocks.insert(node.id(), block_range);
+            syntax_element_blocks.insert(syntax_element.id(), block_range);
         }
 
-        extract::push_named_children(&mut stack, &mut cursor, node, |child| {
-            (child, Some(node), child_heading, current_block)
+        extract::push_named_children(&mut stack, &mut cursor, syntax_element, |child| {
+            (child, Some(syntax_element), child_heading, current_block)
         });
     }
 
     Ok(MarkdownBlockExtraction {
         blocks,
         headings,
-        node_blocks,
+        syntax_element_blocks,
     })
 }
 
@@ -610,13 +624,13 @@ fn extract_authored_facts(
     trees: &MarkdownTrees,
     limits: SyntaxLimits,
     kinds: &MarkdownFactKinds,
-    node_blocks: &HashMap<usize, ByteRange>,
+    syntax_element_blocks: &HashMap<usize, ByteRange>,
 ) -> Result<MarkdownAuthoredExtraction, RiftError> {
     let mut links = Vec::new();
     let mut reference_candidates = Vec::new();
     let mut error_ranges = tree_error_ranges(trees.block.root_node())?;
     for inline_tree in &trees.inline {
-        let block_range = node_blocks.get(&inline_tree.parent_id).copied();
+        let block_range = syntax_element_blocks.get(&inline_tree.parent_id).copied();
         let Some(block_range) = block_range else {
             continue;
         };
@@ -631,22 +645,23 @@ fn extract_authored_facts(
                 });
             }
         }
-        let inline_nodes = bounded_tree_nodes(
+        let inline_syntax_elements = bounded_tree_syntax_elements(
             root,
             inline_tree.base_depth,
             source.path,
-            NodeBound::whole(limits.syntax_nodes_max()),
+            ElementBound::whole(limits.syntax_elements_max()),
             limits.syntax_depth_max(),
         )?;
-        for (index, entry) in inline_nodes.iter().enumerate() {
-            if entry.node.kind_id() == kinds.code_span {
-                let range = code_span_content_range(entry.node, kinds.code_span_delimiter)?;
+        for (index, entry) in inline_syntax_elements.iter().enumerate() {
+            if entry.syntax_element.kind_id() == kinds.code_span {
+                let range =
+                    code_span_content_range(entry.syntax_element, kinds.code_span_delimiter)?;
                 if range.start < range.end {
                     reference_candidates.push(MarkdownReferenceCandidate { block_range, range });
                 }
             }
-            let inline = InlineNode {
-                nodes: &inline_nodes,
+            let inline = InlineElement {
+                syntax_elements: &inline_syntax_elements,
                 index,
             };
             collect_inline_link(inline, block_range, source.text, kinds, &mut links)?;
@@ -696,33 +711,33 @@ impl ProgressBudget {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct BoundedNode<'tree> {
-    node: Node<'tree>,
+struct BoundedElement<'tree> {
+    syntax_element: Node<'tree>,
     depth: usize,
-    /// The parent's index among the walk's nodes; `None` for the root.
+    /// The parent's index among the walk's syntax elements; `None` for the root.
     parent: Option<usize>,
 }
 
-/// One node of a bounded walk, with the walk's nodes its ancestors are read from.
+/// One syntax element of a bounded walk, with the walk's syntax elements its ancestors are read from.
 #[derive(Debug, Clone, Copy)]
-struct InlineNode<'walk, 'tree> {
-    nodes: &'walk [BoundedNode<'tree>],
+struct InlineElement<'walk, 'tree> {
+    syntax_elements: &'walk [BoundedElement<'tree>],
     index: usize,
 }
 
-impl<'tree> InlineNode<'_, 'tree> {
-    fn node(self) -> Node<'tree> {
-        self.nodes[self.index].node
+impl<'tree> InlineElement<'_, 'tree> {
+    fn syntax_element(self) -> Node<'tree> {
+        self.syntax_elements[self.index].syntax_element
     }
 
     /// The nearest ancestor whose kind is one of `kinds`, stepping through the
     /// parents the bounded walk recorded.
     fn nearest_ancestor(self, kinds: &[u16]) -> Option<Node<'tree>> {
-        let mut current = self.nodes[self.index].parent;
+        let mut current = self.syntax_elements[self.index].parent;
         while let Some(index) = current {
-            let ancestor = self.nodes[index];
-            if kinds.contains(&ancestor.node.kind_id()) {
-                return Some(ancestor.node);
+            let ancestor = self.syntax_elements[index];
+            if kinds.contains(&ancestor.syntax_element.kind_id()) {
+                return Some(ancestor.syntax_element);
             }
             current = ancestor.parent;
         }
@@ -799,46 +814,46 @@ fn required_kind(language: &tree_sitter::Language, kind: &str) -> u16 {
     id
 }
 
-/// The nodes one bounded walk may take, and the configured bound its refusal
+/// The syntax elements one bounded walk may take, and the configured bound its refusal
 /// names.
 #[derive(Debug, Clone, Copy)]
-struct NodeBound {
-    /// Nodes this walk may take: the configured bound less the nodes earlier
+struct ElementBound {
+    /// Facets this walk may take: the configured bound less the syntax elements earlier
     /// trees of the same source already took.
     remaining: usize,
-    /// The configured `syntax_nodes_max`.
-    syntax_nodes_max: usize,
+    /// The configured `syntax_elements_max`.
+    syntax_elements_max: usize,
 }
 
-impl NodeBound {
+impl ElementBound {
     /// A walk that may take the whole configured bound.
-    fn whole(syntax_nodes_max: usize) -> Self {
+    fn whole(syntax_elements_max: usize) -> Self {
         Self {
-            remaining: syntax_nodes_max,
-            syntax_nodes_max,
+            remaining: syntax_elements_max,
+            syntax_elements_max,
         }
     }
 
-    /// A walk after earlier trees of the same source took `taken` nodes.
-    fn after(syntax_nodes_max: usize, taken: usize) -> Self {
+    /// A walk after earlier trees of the same source took `taken` syntax elements.
+    fn after(syntax_elements_max: usize, taken: usize) -> Self {
         Self {
-            remaining: syntax_nodes_max.saturating_sub(taken),
-            syntax_nodes_max,
+            remaining: syntax_elements_max.saturating_sub(taken),
+            syntax_elements_max,
         }
     }
 }
 
-fn bounded_tree_nodes<'tree>(
+fn bounded_tree_syntax_elements<'tree>(
     root: Node<'tree>,
     base_depth: usize,
     path: &ProjectPath,
-    bound: NodeBound,
+    bound: ElementBound,
     depth_max: usize,
-) -> Result<Vec<BoundedNode<'tree>>, RiftError> {
+) -> Result<Vec<BoundedElement<'tree>>, RiftError> {
     let mut result = Vec::new();
     let mut pending = vec![(root, base_depth, None)];
     let mut cursor = root.walk();
-    while let Some((node, depth, parent)) = pending.pop() {
+    while let Some((syntax_element, depth, parent)) = pending.pop() {
         if depth > depth_max {
             return errors::syntax::too_deep()
                 .path(path)
@@ -846,36 +861,36 @@ fn bounded_tree_nodes<'tree>(
                 .fail();
         }
         if result.len() == bound.remaining {
-            return errors::syntax::too_many_nodes()
+            return errors::syntax::too_many_syntax_elements()
                 .path(path)
-                .syntax_nodes_max(bound.syntax_nodes_max)
+                .syntax_elements_max(bound.syntax_elements_max)
                 .fail();
         }
         let index = result.len();
-        result.push(BoundedNode {
-            node,
+        result.push(BoundedElement {
+            syntax_element,
             depth,
             parent,
         });
-        if result.len() + pending.len() + node.named_child_count() > bound.remaining {
-            return errors::syntax::too_many_nodes()
+        if result.len() + pending.len() + syntax_element.named_child_count() > bound.remaining {
+            return errors::syntax::too_many_syntax_elements()
                 .path(path)
-                .syntax_nodes_max(bound.syntax_nodes_max)
+                .syntax_elements_max(bound.syntax_elements_max)
                 .fail();
         }
-        extract::push_named_children(&mut pending, &mut cursor, node, |child| {
+        extract::push_named_children(&mut pending, &mut cursor, syntax_element, |child| {
             (child, depth + 1, Some(index))
         });
     }
     Ok(result)
 }
 
-fn inline_parse_ranges(node: Node<'_>, block_continuation: u16) -> Vec<Range> {
+fn inline_parse_ranges(syntax_element: Node<'_>, block_continuation: u16) -> Vec<Range> {
     let mut ranges = Vec::new();
-    let mut start_byte = node.start_byte();
-    let mut start_point = node.start_position();
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
+    let mut start_byte = syntax_element.start_byte();
+    let mut start_point = syntax_element.start_position();
+    let mut cursor = syntax_element.walk();
+    for child in syntax_element.named_children(&mut cursor) {
         if child.kind_id() != block_continuation {
             continue;
         }
@@ -891,13 +906,13 @@ fn inline_parse_ranges(node: Node<'_>, block_continuation: u16) -> Vec<Range> {
         start_byte = child_range.end_byte;
         start_point = child_range.end_point;
     }
-    let end_byte = node.end_byte();
+    let end_byte = syntax_element.end_byte();
     if start_byte < end_byte {
         ranges.push(Range {
             start_byte,
             start_point,
             end_byte,
-            end_point: node.end_position(),
+            end_point: syntax_element.end_position(),
         });
     }
     ranges
@@ -908,17 +923,17 @@ fn declaring_heading(section: Node<'_>, atx_heading: u16, setext_heading: u16) -
     (first.kind_id() == atx_heading || first.kind_id() == setext_heading).then_some(first)
 }
 
-/// Whether `node` is the heading its parent section declares; the block walk
+/// Whether `syntax element` is the heading its parent section declares; the block walk
 /// hands over the parent it already holds.
 fn declares_its_section(
-    node: Node<'_>,
+    syntax_element: Node<'_>,
     parent: Option<Node<'_>>,
     atx_heading: u16,
     setext_heading: u16,
 ) -> bool {
     parent
         .and_then(|parent| declaring_heading(parent, atx_heading, setext_heading))
-        .is_some_and(|heading| heading.id() == node.id())
+        .is_some_and(|heading| heading.id() == syntax_element.id())
 }
 
 /// Each heading symbol's index, by the byte offset it starts at; the first
@@ -937,17 +952,17 @@ fn heading_symbols_by_start(syntax: &SyntaxDocument) -> HashMap<u64, usize> {
 }
 
 fn add_heading(
-    node: Node<'_>,
+    syntax_element: Node<'_>,
     parent: Option<usize>,
     source: &str,
     heading_symbols: &HashMap<u64, usize>,
     headings: &mut Vec<MarkdownHeadingFact>,
 ) -> Result<Option<usize>, RiftError> {
-    let range = extract::byte_range(node)?;
+    let range = extract::byte_range(syntax_element)?;
     let Some(&symbol_index) = heading_symbols.get(&range.start) else {
         return Ok(None);
     };
-    let level = heading_level(node, source);
+    let level = heading_level(syntax_element, source);
     let index = headings.len();
     headings.push(MarkdownHeadingFact {
         symbol_index,
@@ -980,8 +995,8 @@ fn shallower_ancestor(
     None
 }
 
-fn heading_level(node: Node<'_>, source: &str) -> u8 {
-    let Ok(range) = extract::byte_range(node) else {
+fn heading_level(syntax_element: Node<'_>, source: &str) -> u8 {
+    let Ok(range) = extract::byte_range(syntax_element) else {
         return 1;
     };
     let start = usize::try_from(range.start)
@@ -991,7 +1006,7 @@ fn heading_level(node: Node<'_>, source: &str) -> u8 {
         .unwrap_or(source.len())
         .min(source.len());
     let text = &source[start..end];
-    if node.kind() == "atx_heading" {
+    if syntax_element.kind() == "atx_heading" {
         return u8::try_from(
             text.bytes()
                 .take_while(|byte| *byte == b'#')
@@ -1004,33 +1019,39 @@ fn heading_level(node: Node<'_>, source: &str) -> u8 {
     if underline.starts_with('=') { 1 } else { 2 }
 }
 
-fn block_structure(node_kind: u16, kinds: &MarkdownFactKinds) -> Option<MarkdownBlockStructure> {
-    if node_kind == kinds.atx_heading || node_kind == kinds.setext_heading {
+fn block_structure(
+    syntax_element_kind: u16,
+    kinds: &MarkdownFactKinds,
+) -> Option<MarkdownBlockStructure> {
+    if syntax_element_kind == kinds.atx_heading || syntax_element_kind == kinds.setext_heading {
         Some(MarkdownBlockStructure::Heading)
-    } else if node_kind == kinds.paragraph {
+    } else if syntax_element_kind == kinds.paragraph {
         Some(MarkdownBlockStructure::Paragraph)
-    } else if node_kind == kinds.list {
+    } else if syntax_element_kind == kinds.list {
         Some(MarkdownBlockStructure::List)
-    } else if node_kind == kinds.pipe_table {
+    } else if syntax_element_kind == kinds.pipe_table {
         Some(MarkdownBlockStructure::Table)
-    } else if node_kind == kinds.block_quote {
+    } else if syntax_element_kind == kinds.block_quote {
         Some(MarkdownBlockStructure::BlockQuote)
-    } else if node_kind == kinds.fenced_code_block || node_kind == kinds.indented_code_block {
+    } else if syntax_element_kind == kinds.fenced_code_block
+        || syntax_element_kind == kinds.indented_code_block
+    {
         Some(MarkdownBlockStructure::Code)
-    } else if node_kind == kinds.link_reference_definition {
+    } else if syntax_element_kind == kinds.link_reference_definition {
         Some(MarkdownBlockStructure::LinkDefinition)
     } else {
         None
     }
 }
 
-fn block_is_code(node_kind: u16, kinds: &MarkdownFactKinds) -> bool {
-    node_kind == kinds.fenced_code_block || node_kind == kinds.indented_code_block
+fn block_is_code(syntax_element_kind: u16, kinds: &MarkdownFactKinds) -> bool {
+    syntax_element_kind == kinds.fenced_code_block
+        || syntax_element_kind == kinds.indented_code_block
 }
 
-fn code_language(node: Node<'_>, source: &str, info_string_kind: u16) -> Option<String> {
-    let mut pending = vec![node];
-    let mut cursor = node.walk();
+fn code_language(syntax_element: Node<'_>, source: &str, info_string_kind: u16) -> Option<String> {
+    let mut pending = vec![syntax_element];
+    let mut cursor = syntax_element.walk();
     while let Some(current) = pending.pop() {
         if current.kind_id() == info_string_kind {
             let start = current.start_byte();
@@ -1044,21 +1065,21 @@ fn code_language(node: Node<'_>, source: &str, info_string_kind: u16) -> Option<
 }
 
 fn collect_inline_link(
-    inline: InlineNode<'_, '_>,
+    inline: InlineElement<'_, '_>,
     block_range: ByteRange,
     source: &str,
     kinds: &MarkdownFactKinds,
     links: &mut Vec<MarkdownLinkFact>,
 ) -> Result<(), RiftError> {
-    let node = inline.node();
-    let kind = node.kind_id();
+    let syntax_element = inline.syntax_element();
+    let kind = syntax_element.kind_id();
     if kind == kinds.link_destination {
         let parent_link = inline.nearest_ancestor(&[kinds.inline_link, kinds.image]);
         let Some(parent_link) = parent_link else {
             return Ok(());
         };
         let range = extract::byte_range(parent_link)?;
-        let destination_range = extract::byte_range(node)?;
+        let destination_range = extract::byte_range(syntax_element)?;
         links.push(MarkdownLinkFact {
             kind: MarkdownLinkKind::Authored,
             block_range,
@@ -1074,11 +1095,11 @@ fn collect_inline_link(
         links.push(MarkdownLinkFact {
             kind: MarkdownLinkKind::ReferenceUse,
             block_range,
-            range: extract::byte_range(node)?,
+            range: extract::byte_range(syntax_element)?,
             destination_range: None,
             fragment_range: None,
-            label_range: child_range(node, kinds.link_label)?
-                .or(child_range(node, kinds.link_text)?),
+            label_range: child_range(syntax_element, kinds.link_label)?
+                .or(child_range(syntax_element, kinds.link_text)?),
         });
     }
     Ok(())
@@ -1092,11 +1113,11 @@ fn collect_block_links(
 ) -> Result<(), RiftError> {
     let mut pending = vec![root];
     let mut cursor = root.walk();
-    while let Some(node) = pending.pop() {
-        if node.kind_id() == kinds.link_reference_definition {
-            let range = extract::byte_range(node)?;
-            let destination = child_node(node, kinds.block_link_destination);
-            let label = child_node(node, kinds.link_label);
+    while let Some(syntax_element) = pending.pop() {
+        if syntax_element.kind_id() == kinds.link_reference_definition {
+            let range = extract::byte_range(syntax_element)?;
+            let destination = child_syntax_element(syntax_element, kinds.block_link_destination);
+            let label = child_syntax_element(syntax_element, kinds.link_label);
             let destination_range = destination.map(extract::byte_range).transpose()?;
             links.push(MarkdownLinkFact {
                 kind: MarkdownLinkKind::ReferenceDefinition,
@@ -1107,19 +1128,22 @@ fn collect_block_links(
                 label_range: label.map(extract::byte_range).transpose()?,
             });
         }
-        extract::push_named_children(&mut pending, &mut cursor, node, |child| child);
+        extract::push_named_children(&mut pending, &mut cursor, syntax_element, |child| child);
     }
     Ok(())
 }
 
-fn child_node(node: Node<'_>, kind: u16) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    node.children(&mut cursor)
+fn child_syntax_element(syntax_element: Node<'_>, kind: u16) -> Option<Node<'_>> {
+    let mut cursor = syntax_element.walk();
+    syntax_element
+        .children(&mut cursor)
         .find(|child| child.kind_id() == kind)
 }
 
-fn child_range(node: Node<'_>, kind: u16) -> Result<Option<ByteRange>, RiftError> {
-    child_node(node, kind).map(extract::byte_range).transpose()
+fn child_range(syntax_element: Node<'_>, kind: u16) -> Result<Option<ByteRange>, RiftError> {
+    child_syntax_element(syntax_element, kind)
+        .map(extract::byte_range)
+        .transpose()
 }
 
 fn fragment_range(source: &str, destination: ByteRange) -> Option<ByteRange> {
@@ -1138,18 +1162,21 @@ fn fragment_range(source: &str, destination: ByteRange) -> Option<ByteRange> {
     })
 }
 
-fn code_span_content_range(node: Node<'_>, delimiter_kind: u16) -> Result<ByteRange, RiftError> {
+fn code_span_content_range(
+    syntax_element: Node<'_>,
+    delimiter_kind: u16,
+) -> Result<ByteRange, RiftError> {
     let mut first = None;
     let mut last = None;
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
+    let mut cursor = syntax_element.walk();
+    for child in syntax_element.children(&mut cursor) {
         if child.kind_id() == delimiter_kind {
             let range = extract::byte_range(child)?;
             first.get_or_insert(range);
             last = Some(range);
         }
     }
-    let full = extract::byte_range(node)?;
+    let full = extract::byte_range(syntax_element)?;
     let Some((first, last)) = first.zip(last) else {
         return Ok(full);
     };
@@ -1168,11 +1195,11 @@ fn tree_error_ranges(root: Node<'_>) -> Result<Vec<ByteRange>, RiftError> {
 fn append_tree_errors(root: Node<'_>, ranges: &mut Vec<ByteRange>) -> Result<(), RiftError> {
     let mut pending = vec![root];
     let mut cursor = root.walk();
-    while let Some(node) = pending.pop() {
-        if node.is_error() || node.is_missing() {
-            ranges.push(extract::byte_range(node)?);
+    while let Some(syntax_element) = pending.pop() {
+        if syntax_element.is_error() || syntax_element.is_missing() {
+            ranges.push(extract::byte_range(syntax_element)?);
         }
-        extract::push_named_children(&mut pending, &mut cursor, node, |child| child);
+        extract::push_named_children(&mut pending, &mut cursor, syntax_element, |child| child);
     }
     Ok(())
 }
@@ -1243,7 +1270,7 @@ fn nearest_kept_heading(
 ///
 /// A non-empty block overlaps a non-empty error range it shares a byte with,
 /// and an empty error range whose position lies within the block, both ends
-/// included: a zero-width missing node at a block's edge still marks it. An
+/// included: a zero-width missing syntax element at a block's edge still marks it. An
 /// empty block overlaps every error range whose ends enclose its position,
 /// both ends included.
 #[derive(Debug)]
@@ -1317,7 +1344,7 @@ fn sorted_unique_ranges(mut ranges: Vec<ByteRange>) -> Vec<ByteRange> {
 impl MarkdownFacts {
     /// Validates and restores complete Markdown facts for the supplied declarations.
     ///
-    /// Collections fit the syntax node bound. Parent indices must precede children;
+    /// Collections fit the syntax element bound. Parent indices must precede children;
     /// ranges and references must address the supplied UTF-8 source and declarations.
     ///
     /// # Errors
@@ -1447,20 +1474,21 @@ mod tests {
     }
 
     #[test]
-    fn empty_tree_still_counts_toward_node_bound() {
+    fn empty_tree_still_counts_toward_syntax_element_bound() {
         let path = ProjectPath::new("docs/facts.md").expect("valid path");
         let mut parser = Parser::new();
         parser
             .set_language(&tree_sitter_md::LANGUAGE.into())
             .expect("pinned grammar");
         let tree = parser.parse("", None).expect("empty document parses");
-        let Err(error) = bounded_tree_nodes(tree.root_node(), 0, &path, NodeBound::whole(0), 16)
+        let Err(error) =
+            bounded_tree_syntax_elements(tree.root_node(), 0, &path, ElementBound::whole(0), 16)
         else {
-            panic!("root exceeds zero node bound");
+            panic!("root exceeds zero syntax element bound");
         };
         assert_eq!(
             error.slug(),
-            rift_error::errors::syntax::too_many_nodes::SLUG
+            rift_error::errors::syntax::too_many_syntax_elements::SLUG
         );
     }
 
@@ -1481,7 +1509,7 @@ mod tests {
     }
 
     #[test]
-    fn parser_error_ranges_include_zero_width_missing_nodes() {
+    fn parser_error_ranges_include_zero_width_missing_syntax_elements() {
         let containing = range(1, 5);
         assert!(overlaps_indexed(containing, &[range(3, 3)]));
         assert!(overlaps_indexed(range(1, 1), &[containing]));
@@ -1539,7 +1567,7 @@ mod tests {
     }
 
     #[test]
-    fn inline_trees_past_the_combined_node_bound_name_the_configured_bound() {
+    fn inline_trees_past_the_combined_syntax_element_bound_name_the_configured_bound() {
         let text = "# Title\n\nSome *emphasis* and `code` with a [link](target).\n";
         let path = ProjectPath::new("docs/facts.md").expect("valid path");
         let mut parser = Parser::new();
@@ -1547,31 +1575,36 @@ mod tests {
             .set_language(&tree_sitter_md::LANGUAGE.into())
             .expect("pinned grammar");
         let block = parser.parse(text, None).expect("fixture parses");
-        let block_nodes =
-            bounded_tree_nodes(block.root_node(), 0, &path, NodeBound::whole(1024), 16)
-                .expect("the block tree fits")
-                .len();
-        let syntax_nodes_max = block_nodes + 1;
+        let block_syntax_elements = bounded_tree_syntax_elements(
+            block.root_node(),
+            0,
+            &path,
+            ElementBound::whole(1024),
+            16,
+        )
+        .expect("the block tree fits")
+        .len();
+        let syntax_elements_max = block_syntax_elements + 1;
         let source = SyntaxSource { path: &path, text };
         let error = parse_markdown_trees(
             source,
-            SyntaxLimits::declared(1024, syntax_nodes_max, 16),
+            SyntaxLimits::declared(1024, syntax_elements_max, 16),
             MarkdownParseBounds::default(),
         )
         .expect_err("the inline trees cross the bound the block tree left");
         assert_eq!(
             error.slug(),
-            rift_error::errors::syntax::too_many_nodes::SLUG
+            rift_error::errors::syntax::too_many_syntax_elements::SLUG
         );
         let context = error.context().collect::<Vec<_>>();
         assert!(
             context
                 .iter()
-                .any(|(key, value)| *key == "syntax_nodes_max"
-                    && value == &syntax_nodes_max.to_string()),
+                .any(|(key, value)| *key == "syntax_elements_max"
+                    && value == &syntax_elements_max.to_string()),
             "the refusal must name the configured bound: context={context:?}"
         );
-        assert!(error.to_string().contains(&syntax_nodes_max.to_string()));
+        assert!(error.to_string().contains(&syntax_elements_max.to_string()));
     }
 
     #[test]

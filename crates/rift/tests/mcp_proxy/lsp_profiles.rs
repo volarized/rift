@@ -172,16 +172,16 @@ async fn symbol_read(
     };
     assert_eq!(symbol.id.as_ref(), Some(id), "{answer}");
     assert_eq!(declarations.len(), 1, "{answer}");
-    let nodes = proxied_call(
+    let syntax_elements = proxied_call(
         client,
-        "nodes",
-        &json!({"symbol":id, "revision":answer["revision"], "syntax":true}),
+        "facets",
+        &json!({"symbol":id, "revision":answer["revision"]}),
     )
     .await?;
     assert_eq!(
-        nodes["nodes"][0]["source"].as_str(),
+        syntax_elements["declarations"][0]["source"]["text"].as_str(),
         Some(hit.source.as_str()),
-        "{nodes}"
+        "{syntax_elements}"
     );
     assert_eq!(
         declarations[0].path.as_ref().map(|path| path.0.as_str()),
@@ -270,10 +270,11 @@ async fn caller_read(
     let rows = query::rows(&answer)?;
     assert_eq!(rows.len(), 1, "{answer}");
     let caller = query::iri(&rows[0], "symbol")?;
-    let nodes = proxied_call(client, "nodes", &json!({"symbol":caller, "syntax":true})).await?;
+    let syntax_elements = proxied_call(client, "facets", &json!({"symbol":caller})).await?;
     assert_eq!(
-        nodes["nodes"][0]["source"], "pub fn caller() -> u32 {\n    beacon()\n}",
-        "{nodes}"
+        syntax_elements["declarations"][0]["source"]["text"],
+        "pub fn caller() -> u32 {\n    beacon()\n}",
+        "{syntax_elements}"
     );
     assert_eq!(
         SymbolIdentity::parse(query::iri(&rows[0], "symbol")?)?.owner(),

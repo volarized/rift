@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import cast
 
 from dulwich.repo import Repo
 
@@ -42,7 +41,7 @@ from rift_dev.rift_test_client import (
 from rift_dev.trace import TEST_CASE_KEY, Collector, resource_attribute
 
 AGENT_SECONDS = 300.0
-READ_TOOLS = {"search", "get_symbol", "nodes"}
+READ_TOOLS = {"search", "get_symbol", "facets"}
 RESOURCE_URIS = {"rift://map", "rift://workspace"}
 
 
@@ -156,8 +155,8 @@ async def check_resources(client: Client) -> None:
     string_value(orientation.get("revision"), "map.revision")
 
 
-async def declaration_node(client: Client, name: str) -> str:
-    """Prove get_symbol and nodes answer the searched declaration at one revision."""
+async def declaration_facet(client: Client, name: str) -> str:
+    """Prove get_symbol and elements answer the searched declaration at one revision."""
     hit = await symbol_hit(client, name)
     identity = symbol_id(hit)
     answer = await client.call("get_symbol", {"id": identity})
@@ -188,37 +187,36 @@ async def declaration_node(client: Client, name: str) -> str:
     )
     revision = string_value(answer.get("revision"), "symbol.revision")
     listing = await client.call(
-        "nodes",
+        "facets",
         {
-            "path": path,
-            "position": cast(int, end) - 1,
-            "syntax": True,
+            "symbol": identity,
             "revision": revision,
         },
     )
     require(
         listing.get("revision") == revision,
-        f"nodes answered another revision: {listing}",
+        f"elements answered another revision: {listing}",
     )
-    nodes = [
-        object_value(entry, "node")
-        for entry in array_value(listing.get("nodes"), "nodes.nodes")
+    elements = [
+        object_value(entry, "element")
+        for declaration_value in array_value(listing.get("declarations"), "facets.declarations")
+        for entry in array_value(object_value(declaration_value, "declaration").get("syntax"), "syntax")
     ]
     require(
         listing.get("symbol") == identity,
-        f"nodes did not answer the declaration's symbol: {listing}",
+        f"elements did not answer the declaration's symbol: {listing}",
     )
-    require(bool(nodes), f"nodes listed nothing: {listing}")
-    node = nodes[0]
+    require(bool(elements), f"elements listed nothing: {listing}")
+    element = elements[0]
     require(
-        node.get("range") == span
-        and node.get("declaration") == 0
-        and node.get("index") == 0,
-        f"the declaration's item node is not node 0 of its declaration: {listing}",
+        element.get("range") == span
+        and element.get("declaration") == 0
+        and element.get("index") == 0,
+        f"the declaration's item element is not element 0 of its declaration: {listing}",
     )
     require(
-        node.get("source") == literal(hit, "source"),
-        f"nodes changed source: {listing}",
+        element.get("source") == literal(hit, "source"),
+        f"elements changed source: {listing}",
     )
     return identity
 
@@ -263,7 +261,7 @@ async def check_agent(binary: Path, version: str | None = None) -> None:
                     await check_resources(client)
                     await check_external_change(client, root)
                     await check_mixed_references_unavailable(client)
-                    await declaration_node(client, "beacon_one")
+                    await declaration_facet(client, "beacon_one")
                     client.require_complete(READ_TOOLS)
                 server.stop()
                 logs = await asyncio.to_thread(server.read_records)

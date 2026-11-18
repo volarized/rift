@@ -11,7 +11,7 @@ mod documentation_store;
 mod language;
 mod lazy_database;
 mod lexical;
-mod located_node;
+mod located_syntax_element;
 mod producer;
 mod semantic;
 mod trigram_store;
@@ -36,9 +36,9 @@ pub use lexical::{
     LexicalChange, LexicalIndexLimits, LexicalMatch, LexicalRanking, LexicalSearchIndex,
     LexicalStamp, PublishedIndex, RevisionScoped, is_connection_unavailable,
 };
-pub use located_node::{LocatedNode, NodeAddress, whole_range};
+pub use located_syntax_element::{LocatedSyntax, SyntaxAddress, whole_range};
 pub use producer::{
-    ExtractionInput, FactExtractor, PRODUCER_FACTS_MAX, PublicationNodes, accept_extracted_facts,
+    ExtractionInput, FactExtractor, PRODUCER_FACTS_MAX, PublicationSyntax, accept_extracted_facts,
     accept_producer_facts,
 };
 pub use relationship::{RELATIONSHIP_EDGES_MAX, RelationshipEdge, RelationshipStore};
@@ -57,7 +57,7 @@ pub use rift_error::RiftError;
 pub use trigram_store::{PatternCandidate, PatternCandidates, TrigramBatch, UnindexedRows};
 pub use vector::{StoredVector, VectorStore};
 pub use workspace::{
-    IndexRead, IndexedFile, IndexedFileNodes, ReadableSymbol, SymbolMatch, TextSourceFile,
+    IndexRead, IndexedFile, IndexedFileSyntax, ReadableSymbol, SymbolMatch, TextSourceFile,
     WorkspaceFingerprint, WorkspaceIndex, WorkspaceIndexLimits, WorkspaceIndexPreparation,
     WorkspaceIndexWarning, WorkspaceMapPaths, WorkspaceSourcePolicy, capture_digests,
     capture_digests_with_languages, capture_digests_with_languages_cancellable,

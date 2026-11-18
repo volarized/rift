@@ -213,12 +213,15 @@ async fn test_collection_config_and_environment_deliver_source_past_default_boun
     assert_eq!(config.max_response, 4 << 20);
     assert_eq!(config.max_source, 2 << 20);
     let client = GlobalClient::new(config).expect("environment client");
-    let nodes = client
-        .nodes(&super::nodes::nodes_request())
+    let facets = client
+        .facets(&super::facets::facets_request())
         .await
-        .expect("configured node source");
+        .expect("configured syntax element source");
     assert_eq!(
-        nodes.nodes.first().map(|node| node.source.len()),
+        facets
+            .declarations
+            .first()
+            .map(|declaration| declaration.source.text.len()),
         Some(source_bytes)
     );
     let mut patterns = pattern::pattern_request();

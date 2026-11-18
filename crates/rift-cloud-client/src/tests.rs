@@ -49,7 +49,7 @@ mod collection;
 mod declaration;
 mod documentation;
 mod exact_runtime;
-mod nodes;
+mod facets;
 mod pages;
 mod pattern;
 mod resolution;
@@ -102,8 +102,8 @@ enum OperationFixture {
     Valid,
     ExactSymbol(serde_json::Value),
     SourceDeclarations(serde_json::Value, StatusCode),
-    /// The `/v1/nodes` answer: this body with this status, or a problem for a 404.
-    Nodes(serde_json::Value, StatusCode),
+    /// The `/v1/facets` answer: this body with this status, or a problem for a 404.
+    Facets(serde_json::Value, StatusCode),
     Documentation {
         search: serde_json::Value,
         symbols: serde_json::Value,
@@ -438,20 +438,21 @@ fn operation_response(
         }
         return json_response(&declaration::declaration_response_json(), None);
     }
-    if path.ends_with("/nodes") {
+    if path.ends_with("/facets") {
         return match mode {
-            OperationFixture::Nodes(_, StatusCode::NOT_FOUND) => {
+            OperationFixture::Facets(_, StatusCode::NOT_FOUND) => {
                 problem_response(StatusCode::NOT_FOUND)
             }
-            OperationFixture::Nodes(value, status) => {
+            OperationFixture::Facets(value, status) => {
                 let mut response = json_response(value, None);
                 *response.status_mut() = *status;
                 response
             }
-            OperationFixture::CollectionBounds { source_bytes, .. } => {
-                json_response(&nodes::single_node_response_json(*source_bytes), None)
-            }
-            _ => json_response(&nodes::nodes_response_json(), None),
+            OperationFixture::CollectionBounds { source_bytes, .. } => json_response(
+                &facets::single_syntax_element_response_json(*source_bytes),
+                None,
+            ),
+            _ => json_response(&facets::facets_response_json(), None),
         };
     }
     if path.ends_with("/patterns") {
@@ -466,8 +467,8 @@ fn operation_response(
     status_response(StatusCode::NOT_FOUND)
 }
 
-/// The `cursor_bytes_max` the nodes fixture advertises, below the client's own bound.
-const NODES_CURSOR_BYTES_ADVERTISED: usize = 64;
+/// The `cursor_bytes_max` the facets fixture advertises, below the client's own bound.
+const FACETS_CURSOR_BYTES_ADVERTISED: usize = 64;
 
 /// The `page_limit_max` the pattern fixture advertises, below the client's own bound.
 const PATTERN_PAGE_LIMIT_ADVERTISED: i64 = 200;
@@ -531,7 +532,7 @@ fn operation_capabilities_response(mode: &OperationFixture) -> Response {
             source_bytes_max, ..
         } => {
             value["supported_features"] =
-                serde_json::json!(["resolutions", "search", "symbols", "patterns", "nodes"]);
+                serde_json::json!(["resolutions", "search", "symbols", "patterns", "facets"]);
             value["bounds"]["request_body_bytes_max"] =
                 serde_json::json!(rift_protocol::configuration::GLOBAL_REQUEST_BYTES_MAX);
             value["bounds"]["response_body_bytes_max"] =
@@ -547,10 +548,10 @@ fn operation_capabilities_response(mode: &OperationFixture) -> Response {
         OperationFixture::PageLimitMax(advertised) => {
             value["bounds"]["page_limit_max"] = serde_json::json!(advertised);
         }
-        OperationFixture::Nodes(_, _) => {
+        OperationFixture::Facets(_, _) => {
             value["supported_features"] =
-                serde_json::json!(["resolutions", "search", "symbols", "nodes"]);
-            value["bounds"]["cursor_bytes_max"] = serde_json::json!(NODES_CURSOR_BYTES_ADVERTISED);
+                serde_json::json!(["resolutions", "search", "symbols", "facets"]);
+            value["bounds"]["cursor_bytes_max"] = serde_json::json!(FACETS_CURSOR_BYTES_ADVERTISED);
         }
         OperationFixture::Declarations | OperationFixture::SourceDeclarations(_, _) => {
             value["supported_features"] =
@@ -568,7 +569,7 @@ fn operation_capabilities_response(mode: &OperationFixture) -> Response {
                 "symbols",
                 "patterns",
                 "declarations",
-                "nodes"
+                "facets"
             ]);
         }
         _ => {}
@@ -1744,7 +1745,7 @@ async fn operation_failure(
             .await
             .err(),
         Endpoint::Symbols => client.get_symbol(&symbol_request()).await.err(),
-        Endpoint::Nodes => client.nodes(&nodes::nodes_request()).await.err(),
+        Endpoint::Facets => client.facets(&facets::facets_request()).await.err(),
         Endpoint::Patterns => client
             .search_package_patterns(&pattern::pattern_request(), OPERATION_PAGE_LIMIT, None)
             .await
@@ -1871,7 +1872,7 @@ async fn test_fixture_every_operation_answers_problem_statuses() {
         Endpoint::Resolutions,
         Endpoint::Search,
         Endpoint::Symbols,
-        Endpoint::Nodes,
+        Endpoint::Facets,
         Endpoint::Patterns,
         Endpoint::Declarations,
     ];

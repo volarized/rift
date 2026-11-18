@@ -765,8 +765,8 @@ mod tests {
         let second = RdfTerm::BlankNode {
             value: "retained_node_ã2_more".to_owned(),
         };
-        let row = |value| BTreeMap::from([("node".to_owned(), value)]);
-        let variables = vec!["node".to_owned()];
+        let row = |value| BTreeMap::from([("syntax_element".to_owned(), value)]);
+        let variables = vec!["syntax_element".to_owned()];
         let full = QueryAnswer::Bindings {
             variables: variables.clone(),
             bindings: vec![row(first.clone()), row(second.clone()), row(first.clone())],

@@ -9,7 +9,7 @@ use rift_analysis::{
 };
 use rift_error::RiftError;
 use rift_protocol::identity::SymbolOwner;
-use rift_protocol::read::{Language, Node, SourceKind, SourceUnitId, Symbol, SymbolId};
+use rift_protocol::read::{Language, SourceKind, SourceUnitId, Symbol, SymbolId, SyntaxElement};
 use rift_protocol::revision::Revision;
 use rift_search::sparql::{GraphDatasetBuilder, GraphFact, RevisionIri, SymbolAddress};
 use rift_server::{CalleePackage, CalleeRoots, PackageCallee};
@@ -102,7 +102,7 @@ impl InstalledTarget {
             .filter(|item| item.symbol == selected.symbol)
             .map(|item| InstalledDeclaration {
                 range: item.range.clone(),
-                kind: item.node_kind.clone(),
+                kind: item.syntax_element_kind.clone(),
             })
             .collect();
         Ok(Self {
@@ -151,7 +151,7 @@ impl InstalledTarget {
     pub(super) fn project(
         &self,
         dataset: &mut GraphDatasetBuilder,
-        include_node: Option<bool>,
+        include_syntax_element: Option<bool>,
     ) -> Result<(), RiftError> {
         let id = self.id()?;
         let revision = RevisionIri::parse(&self.revision.to_string())?;
@@ -162,7 +162,7 @@ impl InstalledTarget {
             language: &self.symbol.language,
             revision: &revision,
         })?;
-        if let Some(include_source) = include_node {
+        if let Some(include_source) = include_syntax_element {
             for (index, declaration) in self.declarations.iter().enumerate() {
                 let range = &declaration.range;
                 let start = usize::try_from(range.start).map_err(|_| coverage_failure())?;
@@ -176,9 +176,9 @@ impl InstalledTarget {
                 } else {
                     String::new()
                 };
-                dataset.insert_declared_node(
+                dataset.insert_declared_syntax_element(
                     id,
-                    &Node {
+                    &SyntaxElement {
                         declaration: Some(u64::try_from(index).map_err(|_| coverage_failure())?),
                         index: 0,
                         unit: self.unit.clone(),

@@ -66,7 +66,7 @@ const GLOBAL_EXAMPLE_SEARCH: &str = concat!(
     ":symbol ?symbol; :index ?index . ?symbol :name ?name } } ORDER BY ?index LIMIT 5"
 );
 
-/// Replaces the examples of `search`, `get_symbol`, and `nodes` with ones that read a package
+/// Replaces the examples of `search`, `get_symbol`, and `facets` with ones that read a package
 /// release, for a server whose `[search] default_scope` is `global`.
 ///
 /// The declared examples name a project's own symbols and files, which a server holding no
@@ -80,7 +80,7 @@ pub(crate) fn serve_global_examples(tools: &mut [rmcp::model::Tool]) {
                 { "id": GLOBAL_EXAMPLE_SYMBOL, "include": ["documentation"] },
                 { "id": GLOBAL_EXAMPLE_SYMBOL, "revision": GLOBAL_EXAMPLE_REVISION },
             ]),
-            "nodes" => json!([
+            "facets" => json!([
                 { "symbol": GLOBAL_EXAMPLE_SYMBOL },
                 { "symbol": GLOBAL_EXAMPLE_SYMBOL, "revision": GLOBAL_EXAMPLE_REVISION },
             ]),
@@ -148,7 +148,7 @@ mod tests {
             let examples = served.input_schema["examples"]
                 .as_array()
                 .expect("every tool lists examples");
-            if !matches!(served.name.as_ref(), "search" | "get_symbol" | "nodes") {
+            if !matches!(served.name.as_ref(), "search" | "get_symbol" | "facets") {
                 assert_eq!(served, declared, "{} keeps its examples", served.name);
                 continue;
             }
@@ -210,10 +210,10 @@ mod tests {
                 continue;
             }
             let mut pending = vec![&tool["output_schema"]];
-            while let Some(node) = pending.pop() {
-                match node {
+            while let Some(syntax_element) = pending.pop() {
+                match syntax_element {
                     serde_json::Value::Object(object) => {
-                        assert!(!object.contains_key("warnings"), "{node}");
+                        assert!(!object.contains_key("warnings"), "{syntax_element}");
                         pending.extend(object.values());
                     }
                     serde_json::Value::Array(items) => pending.extend(items),

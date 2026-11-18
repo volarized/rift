@@ -31,11 +31,11 @@ from rift_dev.corpus_assertions import (
     database_bytes,
     declaration_pool,
     exact_degradation,
+    facet_syntax,
     language_counts,
     last_line_pattern,
     lexical_breach,
     lexical_content,
-    lists_position,
     logged_read_warnings,
     map_paths,
     no_failed_builds,
@@ -65,9 +65,11 @@ from rift_dev.machine import machine, machine_line
 from rift_dev.nextest_run import CollectionSummary, retained_collector
 from rift_dev.query import (
     bindings,
+    declaration_request,
     iri,
     literal,
     optional_iri,
+    project_source_unit,
     retrieval_batch_request,
     retrieval_request,
 )
@@ -112,7 +114,7 @@ SDK_DISABLED = "OTEL_SDK_DISABLED"
 # plus room for that answer to arrive.
 READINESS_SECONDS = 30.0
 # Pages one sampled symbol read may follow before its declaration must have appeared.
-NODE_PAGES_MAX = 50
+FACET_PAGES_MAX = 50
 READ_SECONDS = READINESS_SECONDS + 10.0
 # A tool's first read over a large workspace under sustained edits waits for the first
 # index to land, so it gets the whole read budget. Every read after it answers from a
@@ -381,15 +383,12 @@ CHURN_PROBE_ID = "rift://symbol/local/rust/rift_corpus_probe/corpus_probe"
 CHURN_REQUESTS: dict[str, JsonObject] = {
     "search": {
         "query": f"SELECT (<{CHURN_PROBE_ID}> AS ?symbol) ?unit ?source ?start ?end "
-        f"{{ ?node :of <{CHURN_PROBE_ID}>; :index 0; :source ?source; "
+        f"{{ ?element :of <{CHURN_PROBE_ID}>; :index 0; :source ?source; "
         ":range [ :unit ?unit; :start ?start; :end ?end ] }"
     },
-    "symbol_nodes": {"symbol": CHURN_PROBE_ID, "syntax": True},
-    "nodes": {"path": PROBE_PATH, "position": 0, "syntax": True},
+    "facets": {"symbol": CHURN_PROBE_ID},
 }
-# The tool each churn read calls: `symbol_nodes` reads the probe declaration's nodes by its
-# symbol identity, the way an agent reads a declaration's source.
-CHURN_TOOLS = {"symbol_nodes": "nodes"}
+CHURN_TOOLS: dict[str, str] = {}
 # The convergence loop resends every churn tool until the newest source lands, so it
 # stands outside the reads it repeats: one whole read budget for each of them.
 CONVERGENCE_SECONDS = READ_SECONDS * len(CHURN_REQUESTS)
@@ -1230,32 +1229,21 @@ class Corpus:
                 )
                 require(path.read_bytes() == content, f"read changed {path}")
                 return 0
-            # Declarations can start with attached comments or attributes. Extraction
-            # keeps their end equal to the item end, so its final byte is in the item.
-            request: JsonObject = {
-                "path": str(path.relative_to(self.root)),
-                "position": end - 1,
-                "syntax": True,
-            }
-            answer = await client.call("nodes", request)
-            nodes = objects(answer, "nodes")
-            require(bool(nodes), f"nodes listed nothing at {path}:{end - 1}")
-            if answer.get("symbol") is None:
-                require(
-                    nodes[0].get("kind") == "file"
-                    and nodes[0].get("range") == {"start": 0, "end": len(content)},
-                    f"a unit answer did not open with the file node of {path}",
-                )
-            self.require_node_sources(nodes, unit, content, path)
-            # The nodes covering the position can lie on a later page. Each page is another
-            # read, which the deadline cannot afford for every sample, so the report counts
-            # the declarations whose covering nodes the first page did not reach.
-            listed = answer.get("node_cursor") is None or lists_position(
-                answer, nodes, unit, end - 1
+            # Search reads the captured declaration when no canonical symbol identity exists.
+            request = declaration_request(literal(hit, "name"))
+            query = string_value(request.get("query"), "declaration query").rstrip()
+            request["query"] = query.removesuffix("}") + (
+                f" FILTER(?unit = <{project_source_unit(unit)}> && ?end = {end}) }}"
             )
-            if not listed:
-                require(path.read_bytes() == content, f"read changed {path}")
-                return 1
+            answer = await client.call("search", request)
+            rows = bindings(answer)
+            require(bool(rows), f"search omitted declaration source at {path}:{end}")
+            for row in rows:
+                source_start = int(literal(row, "start"))
+                source_end = int(literal(row, "end"))
+                require(0 <= source_start <= source_end <= len(content), "declaration range exceeds source")
+                require(literal(row, "source").encode() == content[source_start:source_end], f"search source disagrees at {path}")
+            require(path.read_bytes() == content, f"read changed {path}")
             return 0
 
         beyond = 0
@@ -1277,25 +1265,25 @@ class Corpus:
         )
 
     @staticmethod
-    def require_node_sources(
-        nodes: list[JsonObject], unit: str, content: bytes, path: Path
+    def require_syntax_sources(
+        elements: list[JsonObject], unit: str, content: bytes, path: Path
     ) -> None:
-        """Require each node of the file at project path `unit` to carry its bytes."""
-        for node in nodes:
-            if unit_path(node) != unit:
+        """Require each element of the file at project path `unit` to carry its bytes."""
+        for element in elements:
+            if unit_path(element) != unit:
                 continue
-            node_span = object_value(node.get("range"), "node range")
-            node_start = number(node_span.get("start"), "node start")
-            node_end = number(node_span.get("end"), "node end")
+            element_span = object_value(element.get("range"), "element range")
+            element_start = number(element_span.get("start"), "element start")
+            element_end = number(element_span.get("end"), "element end")
             require(
-                0 <= node_start <= node_end <= len(content),
-                "node range exceeds source",
+                0 <= element_start <= element_end <= len(content),
+                "element range exceeds source",
             )
-            excerpt = node.get("source")
+            excerpt = element.get("source")
             require(
                 isinstance(excerpt, str)
-                and excerpt.encode() == content[node_start:node_end],
-                f"node source disagrees with captured bytes at {path}:{node_start}-{node_end}",
+                and excerpt.encode() == content[element_start:element_end],
+                f"element source disagrees with captured bytes at {path}:{element_start}-{element_end}",
             )
 
     async def require_symbol_item(
@@ -1308,29 +1296,29 @@ class Corpus:
         path: Path,
     ) -> None:
         """Require the symbol read of `identity` to list the sampled declaration's item."""
-        arguments: JsonObject = {"symbol": identity, "syntax": True}
-        for _ in range(NODE_PAGES_MAX):
-            answer = await client.call("nodes", arguments)
+        arguments: JsonObject = {"symbol": identity}
+        for _ in range(FACET_PAGES_MAX):
+            answer = await client.call("facets", arguments)
             require(
                 answer.get("symbol") == identity,
                 f"a symbol read named another symbol: {identity}",
             )
-            nodes = objects(answer, "nodes")
-            self.require_node_sources(nodes, unit, content, path)
+            elements = facet_syntax(answer)
+            self.require_syntax_sources(elements, unit, content, path)
             if any(
-                node.get("index") == 0
-                and unit_path(node) == unit
-                and object_value(node.get("range"), "node range").get("end") == end
-                for node in nodes
+                element.get("index") == 0
+                and unit_path(element) == unit
+                and object_value(element.get("range"), "element range").get("end") == end
+                for element in elements
             ):
                 return
-            cursor = answer.get("node_cursor")
+            cursor = answer.get("facet_cursor")
             if cursor is None:
                 break
-            arguments["node_cursor"] = cursor
+            arguments["facet_cursor"] = cursor
         require(
             False,
-            f"nodes omitted sampled declaration: {identity} ending at {path}:{end}",
+            f"elements omitted sampled declaration: {identity} ending at {path}:{end}",
         )
 
     async def lexical_persistence(self, link: Path | None = None) -> None:
@@ -1432,7 +1420,6 @@ class Corpus:
             await self.symlink_refused(client, path, workspace)
         self.record(
             "symlinks",
-            nodes="resource_not_found",
             search=0,
             paths=["readme.md", chain],
             control="package.json",
@@ -1443,17 +1430,6 @@ class Corpus:
         self, client: Client, path: str, workspace: set[str]
     ) -> None:
         require((self.root / path).is_symlink(), f"{path}: pinned symlink is absent")
-        try:
-            await client.call("nodes", {"path": path, "position": 0})
-        except ToolFailure as error:
-            require(
-                error.code == "resource_not_found"
-                and error.retry == "never"
-                and error.identity == "rift.server.read_not_found",
-                f"symlink nodes wrong refusal: {error}",
-            )
-        else:
-            raise AssertionError("nodes accepted a symlink")
         selector: JsonObject = {"include": [path]}
         if "/" not in path:
             selector["exclude"] = ["*/**"]
@@ -1497,7 +1473,6 @@ class Corpus:
         """Read complete source revisions while external writes continue every two seconds."""
         path = self.root / probe_path
         requests = {name: dict(request) for name, request in CHURN_REQUESTS.items()}
-        requests["nodes"]["path"] = probe_path
         sources = [churn_source(0).rstrip("\n")]
         written = [time.monotonic()]
         timings: dict[str, list[float]] = {name: [] for name in CHURN_REQUESTS}
@@ -1570,7 +1545,7 @@ class Corpus:
 
         task: asyncio.Task[None] | None = None
         try:
-            identity, _revision = await read("symbol_nodes", CHURN_PROBE_ID)
+            identity, _revision = await read("facets", CHURN_PROBE_ID)
             task = asyncio.create_task(writer())
             reads = 0
             tools = tuple(CHURN_REQUESTS)
@@ -1595,7 +1570,7 @@ class Corpus:
                 # Give the final rebuild time inside the convergence budget before
                 # spending a public read's shorter bound on validating the source.
                 await await_filesystem_publication(server, last_write_at)
-                for name in ("symbol_nodes", "search", "nodes"):
+                for name in ("facets", "search"):
                     while True:
                         _identity, revision = await read(name, identity)
                         if revision == len(sources) - 1:

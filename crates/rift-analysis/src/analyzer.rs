@@ -107,7 +107,7 @@ impl AnalyzedFile {
         &self.file
     }
 
-    /// The grammar kind of the item node of the declaration bound at `range`; absent when
+    /// The grammar kind of the item syntax element of the declaration bound at `range`; absent when
     /// the syntax provider names none.
     fn item_kind(&self, range: rift_core::SourceRange) -> Option<String> {
         let key = (range.start(), range.end());
@@ -263,14 +263,14 @@ fn analyzed_file(
     })
 }
 
-/// The grammar kind of each declaration's item node, keyed by the item range a declaration
+/// The grammar kind of each declaration's item syntax element, keyed by the item range a declaration
 /// binding spans. One pass over the file's declarations, so a binding's lookup is
 /// logarithmic.
 fn item_kinds(symbols: &[rift_syntax::SyntaxSymbol]) -> BTreeMap<(u64, u64), &'static str> {
     symbols
         .iter()
         .filter_map(|symbol| {
-            let kind = symbol.node_kind?;
+            let kind = symbol.syntax_element_kind?;
             Some(((symbol.item_range.start, symbol.item_range.end), kind))
         })
         .collect()
@@ -282,7 +282,7 @@ fn external_work_limits(input: &ExactPackageInput<'_>) -> (std::cell::Cell<usize
         input
             .limits()
             .syntax()
-            .syntax_nodes_max()
+            .syntax_elements_max()
             .checked_mul(input.limits().syntax().syntax_depth_max())
             .unwrap_or(0),
     )
@@ -2015,7 +2015,7 @@ impl Records {
                 start: binding.range().start(),
                 end: binding.range().end(),
             },
-            node_kind: held.item_kind(binding.range()),
+            syntax_element_kind: held.item_kind(binding.range()),
             line: line_of(starts, binding.range().start()),
             signature_indices: fact_indices(owner, &object.signatures, facts.signatures_slice())?,
             type_indices: fact_indices(owner, &object.types, facts.type_bindings())?,
@@ -2797,7 +2797,7 @@ mod tests {
         let generated = format!("values = [{}]\n", "1, ".repeat(300_000));
         let files = vec![("pkg/generated.py", generated.as_str())];
         let Err(declared) = package_result(ShippedLanguage::Python, files.clone(), None) else {
-            panic!("a source past the declared node bound must be refused");
+            panic!("a source past the declared syntax element bound must be refused");
         };
         assert!(declared.slug().as_str().starts_with("rift.syntax."));
 
@@ -2884,12 +2884,12 @@ mod tests {
         let kinds = publication
             .declarations
             .iter()
-            .map(|declaration| declaration.node_kind.as_deref())
+            .map(|declaration| declaration.syntax_element_kind.as_deref())
             .collect::<Vec<_>>();
         assert_eq!(
             kinds,
             [Some("function_item"), Some("function_item")],
-            "each declaration names its item node's grammar kind"
+            "each declaration names its item syntax element's grammar kind"
         );
     }
 

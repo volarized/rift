@@ -36,7 +36,7 @@ mod overload;
 const FUNCTION_KIND: &str = "function_definition";
 /// Grammar spelling of a class definition.
 const CLASS_KIND: &str = "class_definition";
-/// Grammar spelling of the node wrapping a decorated `def` or `class`.
+/// Grammar spelling of the syntax element wrapping a decorated `def` or `class`.
 const DECORATED_KIND: &str = "decorated_definition";
 /// Grammar spelling of a suite of statements.
 const BLOCK_KIND: &str = "block";
@@ -115,12 +115,12 @@ impl PythonKinds {
     }
 }
 
-/// Resolves one node kind id, proving the pinned grammar defines it.
+/// Resolves one syntax element kind id, proving the pinned grammar defines it.
 fn kind_id(language: &tree_sitter::Language, kind: &str) -> u16 {
     let id = language.id_for_node_kind(kind, true);
     assert!(
         id != 0,
-        "pinned Python grammar must define node kind used by symbol \
+        "pinned Python grammar must define syntax_element kind used by symbol \
          extraction: kind={kind}"
     );
     id
@@ -146,8 +146,8 @@ struct PythonRules {
 impl PythonRules {
     /// The spelled name behind a definition's `name` field; `None` when the
     /// tree is missing it.
-    fn field_name(&self, node: Node<'_>, text: &str) -> Option<String> {
-        let name = node.child_by_field_id(self.kinds.name.get())?;
+    fn field_name(&self, syntax_element: Node<'_>, text: &str) -> Option<String> {
+        let name = syntax_element.child_by_field_id(self.kinds.name.get())?;
         text.get(name.byte_range()).map(str::to_owned)
     }
 
@@ -156,10 +156,10 @@ impl PythonRules {
     /// anything else.
     fn docstring(
         &self,
-        node: Node<'_>,
+        syntax_element: Node<'_>,
         text: &str,
     ) -> Result<(Vec<Documentation>, Vec<crate::ByteRange>), RiftError> {
-        let Some(body) = node.child_by_field_id(self.kinds.body.get()) else {
+        let Some(body) = syntax_element.child_by_field_id(self.kinds.body.get()) else {
             return Ok((Vec::new(), Vec::new()));
         };
         let Some(first) = body.named_child(0) else {
@@ -200,19 +200,19 @@ impl PythonRules {
     /// One definition's declaration facts, shared by `def` and `class`.
     fn definition_declaration(
         &self,
-        node: Node<'_>,
+        syntax_element: Node<'_>,
         text: &str,
         kind: &'static str,
         facets: Vec<SymbolFacet>,
     ) -> Result<Option<Declaration>, RiftError> {
-        let Some(name) = self.field_name(node, text) else {
+        let Some(name) = self.field_name(syntax_element, text) else {
             return Ok(None);
         };
-        let body_range = match node.child_by_field_id(self.kinds.body.get()) {
+        let body_range = match syntax_element.child_by_field_id(self.kinds.body.get()) {
             Some(body) => Some(extract::byte_range(body)?),
             None => None,
         };
-        let (documentation, documentation_ranges) = self.docstring(node, text)?;
+        let (documentation, documentation_ranges) = self.docstring(syntax_element, text)?;
         Ok(Some(Declaration {
             name,
             kind,
@@ -230,8 +230,8 @@ impl PythonRules {
         if !self.assignment_scope_accepted(visited) {
             return None;
         }
-        let node = visited.node();
-        let target = node.child_by_field_id(self.kinds.left.get())?;
+        let syntax_element = visited.syntax_element();
+        let target = syntax_element.child_by_field_id(self.kinds.left.get())?;
         if target.kind_id() != self.kinds.identifier {
             return None;
         }
@@ -254,19 +254,19 @@ impl PythonRules {
         let Some(statement) = visited.parent() else {
             return false;
         };
-        if statement.node().kind_id() != self.kinds.expression_statement {
+        if statement.syntax_element().kind_id() != self.kinds.expression_statement {
             return false;
         }
         let Some(holder) = statement.parent() else {
             return false;
         };
-        if holder.node().kind_id() == self.kinds.module {
+        if holder.syntax_element().kind_id() == self.kinds.module {
             return true;
         }
-        holder.node().kind_id() == self.kinds.block
+        holder.syntax_element().kind_id() == self.kinds.block
             && holder
                 .parent()
-                .is_some_and(|definition| definition.node().kind_id() == self.kinds.class)
+                .is_some_and(|definition| definition.syntax_element().kind_id() == self.kinds.class)
     }
 }
 
@@ -276,13 +276,16 @@ impl GrammarRules for PythonRules {
         visited: Visited<'_, '_>,
         text: &str,
     ) -> Result<Option<crate::PythonOverload>, RiftError> {
-        if visited.node().kind_id() != self.kinds.function {
+        if visited.syntax_element().kind_id() != self.kinds.function {
             return Ok(None);
         }
-        self.overloads.state(visited.node(), text).map(Some)
+        self.overloads
+            .state(visited.syntax_element(), text)
+            .map(Some)
     }
-    fn name_range(&self, node: Node<'_>) -> Result<Option<crate::ByteRange>, RiftError> {
-        node.child_by_field_id(self.kinds.name.get())
+    fn name_range(&self, syntax_element: Node<'_>) -> Result<Option<crate::ByteRange>, RiftError> {
+        syntax_element
+            .child_by_field_id(self.kinds.name.get())
             .map(extract::byte_range)
             .transpose()
     }
@@ -292,42 +295,44 @@ impl GrammarRules for PythonRules {
         visited: Visited<'_, '_>,
         text: &str,
     ) -> Result<Option<Declaration>, RiftError> {
-        let node = visited.node();
-        if node.kind_id() == self.kinds.function {
+        let syntax_element = visited.syntax_element();
+        if syntax_element.kind_id() == self.kinds.function {
             return self.definition_declaration(
-                node,
+                syntax_element,
                 text,
                 FUNCTION_KIND_WORD,
                 vec![SymbolFacet::Value, SymbolFacet::Callable],
             );
         }
-        if node.kind_id() == self.kinds.class {
+        if syntax_element.kind_id() == self.kinds.class {
             return self.definition_declaration(
-                node,
+                syntax_element,
                 text,
                 CLASS_KIND_WORD,
                 vec![SymbolFacet::Type],
             );
         }
-        if node.kind_id() == self.kinds.assignment {
+        if syntax_element.kind_id() == self.kinds.assignment {
             return Ok(self.assignment_declaration(visited, text));
         }
         Ok(None)
     }
 
-    fn container_name(&self, node: Node<'_>, text: &str) -> Option<String> {
-        if node.kind_id() != self.kinds.function && node.kind_id() != self.kinds.class {
+    fn container_name(&self, syntax_element: Node<'_>, text: &str) -> Option<String> {
+        if syntax_element.kind_id() != self.kinds.function
+            && syntax_element.kind_id() != self.kinds.class
+        {
             return None;
         }
-        self.field_name(node, text)
+        self.field_name(syntax_element, text)
     }
 
     /// A decorated definition starts at its first decorator, so the whole
     /// declaration removes with its decorators.
     fn declaration_start(&self, visited: Visited<'_, '_>, _text: &str) -> usize {
-        match visited.parent().map(Visited::node) {
+        match visited.parent().map(Visited::syntax_element) {
             Some(parent) if parent.kind_id() == self.kinds.decorated => parent.start_byte(),
-            _ => visited.node().start_byte(),
+            _ => visited.syntax_element().start_byte(),
         }
     }
 
@@ -392,12 +397,12 @@ impl SyntaxProvider for PythonSyntaxProvider {
             kinds: python_kinds(),
             overloads: overload::OverloadContext::new(tree.root_node(), source.text, limits)?,
         };
-        let (nodes, symbols) =
+        let (syntax_elements, symbols) =
             extract::extract(tree.root_node(), source, limits, &self.language, &rules)?;
         Ok(SyntaxDocument::new(
             self.language.clone(),
             source.path.clone(),
-            nodes,
+            syntax_elements,
             symbols,
             tree.root_node().has_error(),
         )
@@ -405,7 +410,7 @@ impl SyntaxProvider for PythonSyntaxProvider {
         .with_syntax_limits(limits))
     }
 
-    fn node_facets(&self, kind: &str) -> Vec<NodeFacet> {
+    fn syntax_element_facets(&self, kind: &str) -> Vec<NodeFacet> {
         let mut facets = Vec::new();
         if kind.ends_with("_definition") {
             facets.extend([NodeFacet::Declaration, NodeFacet::Definition]);
@@ -677,19 +682,22 @@ mod tests {
     }
 
     #[test]
-    fn test_node_facets_cover_definitions_blocks_statements_and_comments() {
+    fn test_syntax_element_facets_cover_definitions_blocks_statements_and_comments() {
         let provider = PythonSyntaxProvider::default();
         assert_eq!(
-            provider.node_facets("function_definition"),
+            provider.syntax_element_facets("function_definition"),
             [NodeFacet::Declaration, NodeFacet::Definition]
         );
-        assert_eq!(provider.node_facets("block"), [NodeFacet::Block]);
+        assert_eq!(provider.syntax_element_facets("block"), [NodeFacet::Block]);
         assert_eq!(
-            provider.node_facets("expression_statement"),
+            provider.syntax_element_facets("expression_statement"),
             [NodeFacet::Statement]
         );
-        assert_eq!(provider.node_facets("comment"), [NodeFacet::Comment]);
-        assert_eq!(provider.node_facets("identifier"), []);
+        assert_eq!(
+            provider.syntax_element_facets("comment"),
+            [NodeFacet::Comment]
+        );
+        assert_eq!(provider.syntax_element_facets("identifier"), []);
     }
 
     #[test]

@@ -214,13 +214,13 @@ impl WorkspaceSymbolView {
     }
 
     /// Parses captured bytes with their admitted language, framework context and bounds, and
-    /// returns the document with its complete node table.
+    /// returns the document with its complete syntax element table.
     ///
-    /// No path matcher or filesystem read selects the provider. Temporary node material
+    /// No path matcher or filesystem read selects the provider. Temporary syntax element material
     /// remains bounded by the captured syntax limits and is not stored after the read.
     ///
     /// # Errors
-    /// Returns the captured source or syntax refusal when node reconstruction fails.
+    /// Returns the captured source or syntax refusal when syntax element reconstruction fails.
     pub fn syntax(
         &self,
         path: &ProjectPath,

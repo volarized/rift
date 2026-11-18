@@ -2970,12 +2970,12 @@ impl Tower {
         Ok(())
     }
 
-    /// `target: "node"` left `SearchParamsTarget`'s served variants; a request naming it is
+    /// `target: "syntax element"` left `SearchParamsTarget`'s served variants; a request naming it is
     /// refused at deserialization, not accepted and silently ignored.
     #[test]
-    fn search_target_node_is_refused_as_an_unknown_enum_value() {
+    fn search_target_syntax_element_is_refused_as_an_unknown_enum_value() {
         let result: Result<SearchParams, _> =
-            serde_json::from_value(json!({"query": "Beacon", "target": "node"}));
+            serde_json::from_value(json!({"query": "Beacon", "target": "syntax_element"}));
         assert!(
             result.is_err(),
             "a withdrawn target value must fail deserialization"

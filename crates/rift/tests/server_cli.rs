@@ -2785,16 +2785,16 @@ fn a_misspelled_variable_refuses_every_request_naming_it() -> TestResult {
 
     let answer = started_answer_holding(
         root,
-        &[("RIFT_PROVIDERS_SYNTAX_MAX_NODE", "5000000")],
+        &[("RIFT_PROVIDERS_SYNTAX_MAX_SYNTAX_ELEMENT", "5000000")],
         "beacon",
         "configuration_invalid",
     )?;
     assert!(
-        answer.contains("RIFT_PROVIDERS_SYNTAX_MAX_NODE"),
+        answer.contains("RIFT_PROVIDERS_SYNTAX_MAX_SYNTAX_ELEMENT"),
         "{answer}"
     );
     assert!(
-        answer.contains("RIFT_PROVIDERS_SYNTAX_MAX_NODES"),
+        answer.contains("RIFT_PROVIDERS_SYNTAX_MAX_SYNTAX_ELEMENTS"),
         "{answer}"
     );
 

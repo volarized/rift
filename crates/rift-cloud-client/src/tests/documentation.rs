@@ -420,7 +420,7 @@ async fn symbol_answer_carrying_declaration_source_is_refused() {
     )
     .await
     .expect("declaration without source");
-    for field in ["source", "source_complete", "node"] {
+    for field in ["source", "source_complete", "syntax_element"] {
         let mut value = symbol_result_json("demo", "first");
         value["declarations"][0][field] = json!("demo");
         assert!(

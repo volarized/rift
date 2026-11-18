@@ -1883,14 +1883,14 @@ async fn search_traversal_outgoing_names_a_standard_library_callee_by_its_global
         .requests()
         .await
         .into_iter()
-        .filter(|request| request.uri.ends_with("/nodes"))
+        .filter(|request| request.uri.ends_with("/facets"))
         .filter_map(|request| request.body)
         .filter(|body| body["symbol"] == json!(runtime_id))
         .collect();
     assert_eq!(
         stub_requests.len(),
         1,
-        "one stub nodes read: {stub_requests:?}"
+        "one stub facets read: {stub_requests:?}"
     );
     assert!(stub_requests[0]["revision"].is_string());
 

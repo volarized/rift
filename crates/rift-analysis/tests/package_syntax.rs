@@ -221,9 +221,11 @@ fn checked_restored(syntax: &PackageSyntax, text: &str) -> PackageSyntax {
     for symbol in &mut symbols {
         let kind = symbol.kind.to_owned();
         symbol.kind = names.symbol_kind(&kind).expect("restored provider kind");
-        symbol.node_kind = symbol.node_kind.map(|kind| {
+        symbol.syntax_element_kind = symbol.syntax_element_kind.map(|kind| {
             let captured = kind.to_owned();
-            names.node_kind(&captured).expect("restored grammar kind")
+            names
+                .syntax_element_kind(&captured)
+                .expect("restored grammar kind")
         });
     }
     let digest = rift_core::FileDigest::of(text.as_bytes());
@@ -623,19 +625,19 @@ fn incompatible_recorded_inputs_fall_back_to_current_provider() {
     for limits in [
         SyntaxLimits::new(
             limits.source_bytes_max() + 1,
-            limits.syntax_nodes_max(),
+            limits.syntax_elements_max(),
             limits.syntax_depth_max(),
         )
         .expect("bounds"),
         SyntaxLimits::new(
             limits.source_bytes_max(),
-            limits.syntax_nodes_max() + 1,
+            limits.syntax_elements_max() + 1,
             limits.syntax_depth_max(),
         )
         .expect("bounds"),
         SyntaxLimits::new(
             limits.source_bytes_max(),
-            limits.syntax_nodes_max(),
+            limits.syntax_elements_max(),
             limits.syntax_depth_max() + 1,
         )
         .expect("bounds"),
@@ -820,7 +822,7 @@ fn supplied_identity_cannot_replace_facts_syntax_bounds() {
     let limits = SyntaxLimits::default();
     let raised = SyntaxLimits::new(
         limits.source_bytes_max(),
-        limits.syntax_nodes_max() + 1,
+        limits.syntax_elements_max() + 1,
         limits.syntax_depth_max(),
     )
     .expect("bounds");

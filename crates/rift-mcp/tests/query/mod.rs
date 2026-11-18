@@ -21,7 +21,7 @@ pub(crate) fn declaration(name: &str, path: &str) -> QueryParams {
     let unit = rift_protocol::identity::encode_source_unit_key(path);
     QueryParams {
         query: format!(
-            "SELECT ?symbol ?name ?kind ?language ?unit ?source ?start ?end {{ ?symbol a :Symbol; :name {name}; :name ?name; :kind ?kind; :language ?language . ?node :of ?symbol; :index 0; :source ?source; :range [ :unit <rift://source/project/{unit}>; :unit ?unit; :start ?start; :end ?end ] }}"
+            "SELECT ?symbol ?name ?kind ?language ?unit ?source ?start ?end {{ ?symbol a :Symbol; :name {name}; :name ?name; :kind ?kind; :language ?language . ?syntax_element :of ?symbol; :index 0; :source ?source; :range [ :unit <rift://source/project/{unit}>; :unit ?unit; :start ?start; :end ?end ] }}"
         ),
         language: QueryLanguage::Sparql,
     }

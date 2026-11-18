@@ -807,10 +807,10 @@ impl SymbolState {
 /// one declaration.
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub(crate) struct SymbolShape {
-    /// The declaration bytes outside the item node: attached outer
+    /// The declaration bytes outside the item syntax element: attached outer
     /// attributes and doc comments.
     attachment: String,
-    /// The item node's own bytes.
+    /// The item syntax element's own bytes.
     item: String,
     /// The body's byte range inside `item`; `None` for a declaration
     /// without one.
@@ -955,7 +955,7 @@ mod tests {
             declaration_ordinal: 0,
             container: None,
             kind: "function",
-            node_kind: None,
+            syntax_element_kind: None,
             facets: Vec::new(),
             visibility: None,
             range,
@@ -1176,8 +1176,8 @@ mod tests {
             self.inner.analyze(source, limits)
         }
 
-        fn node_facets(&self, kind: &str) -> Vec<NodeFacet> {
-            self.inner.node_facets(kind)
+        fn syntax_element_facets(&self, kind: &str) -> Vec<NodeFacet> {
+            self.inner.syntax_element_facets(kind)
         }
     }
 

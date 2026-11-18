@@ -14,7 +14,7 @@ pub enum RdfTerm {
         /// The complete IRI.
         value: String,
     },
-    /// A blank-node identity within the retained answer.
+    /// A blank node identity within the retained answer.
     BlankNode {
         /// The identity retained across every page of this answer.
         value: String,

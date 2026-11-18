@@ -139,7 +139,7 @@ impl StaticFacts {
     ///
     /// # Errors
     ///
-    /// Returns an error when a collection exceeds the node bound or carries invalid ranges.
+    /// Returns an error when a collection exceeds the syntax element bound or carries invalid ranges.
     pub fn from_parts(
         source: &str,
         limits: SyntaxLimits,
@@ -218,7 +218,7 @@ impl StaticFacts {
         ];
         if lengths
             .into_iter()
-            .any(|length| length > limits.syntax_nodes_max())
+            .any(|length| length > limits.syntax_elements_max())
         {
             return errors::syntax::facts_count_exceeded().fail();
         }
@@ -330,13 +330,15 @@ impl<'source> Capture<'source> {
         }
     }
 
-    pub(crate) fn record(&mut self, node: Node<'_>) -> Result<(), RiftError> {
-        if node.is_missing() {
+    pub(crate) fn record(&mut self, syntax_element: Node<'_>) -> Result<(), RiftError> {
+        if syntax_element.is_missing() {
             return Ok(());
         }
         match self.grammar {
-            Grammar::JavaScript(kinds) => kinds.record(node, self.source, &mut self.facts.0),
-            Grammar::Rust(kinds) => kinds.record(node, self.source, &mut self.facts.0),
+            Grammar::JavaScript(kinds) => {
+                kinds.record(syntax_element, self.source, &mut self.facts.0)
+            }
+            Grammar::Rust(kinds) => kinds.record(syntax_element, self.source, &mut self.facts.0),
         }
     }
 
@@ -361,13 +363,13 @@ fn field(grammar: &Language, name: &str) -> u16 {
         .get()
 }
 
-fn identifier(node: Node<'_>, id: u16) -> Option<Node<'_>> {
-    (node.kind_id() == id && !node.is_missing()).then_some(node)
+fn identifier(syntax_element: Node<'_>, id: u16) -> Option<Node<'_>> {
+    (syntax_element.kind_id() == id && !syntax_element.is_missing()).then_some(syntax_element)
 }
 
-fn enclosing<'tree>(node: Node<'tree>, kinds: &[u16]) -> Option<Node<'tree>> {
-    let mut parent = node.parent();
-    // Capture runs after the shared syntax walk has admitted each node's depth.
+fn enclosing<'tree>(syntax_element: Node<'tree>, kinds: &[u16]) -> Option<Node<'tree>> {
+    let mut parent = syntax_element.parent();
+    // Capture runs after the shared syntax walk has admitted each syntax element's depth.
     while let Some(candidate) = parent {
         if kinds.contains(&candidate.kind_id()) {
             return Some(candidate);
@@ -391,9 +393,13 @@ fn binding(
     })
 }
 
-fn call(node: Node<'_>, callee: Node<'_>, shape: StaticCallee) -> Result<StaticCall, RiftError> {
+fn call(
+    syntax_element: Node<'_>,
+    callee: Node<'_>,
+    shape: StaticCallee,
+) -> Result<StaticCall, RiftError> {
     Ok(StaticCall {
-        range: byte_range(node)?,
+        range: byte_range(syntax_element)?,
         callee_range: byte_range(callee)?,
         callee: shape,
     })

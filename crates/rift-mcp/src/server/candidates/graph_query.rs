@@ -292,7 +292,7 @@ impl RiftMcp {
                     .acquire_semantic_inventory(resolved, required, deadline)
                     .await?))
             } else if query.symbol_selection().is_some()
-                || query.node_selection().is_some()
+                || query.syntax_element_selection().is_some()
                 || !query.reads_base()
             {
                 Ok(Ok(AcquiredAdjacency::default()))
@@ -369,19 +369,19 @@ fn project_local_endpoints(
     cancellation: &QueryCancellation,
     deadline: std::time::Instant,
 ) -> Result<(), RiftError> {
-    if !selected.symbol_details && selected.nodes.is_none() {
+    if !selected.symbol_details && selected.syntax_elements.is_none() {
         return Ok(());
     }
     for endpoint in acquired.local_endpoints() {
         let identity = rift_protocol::identity::SymbolIdentity::parse(endpoint.as_str())?;
         if identity.owner().is_local() {
             let symbols = rift_search::sparql::SymbolSelection::Identified(endpoint.as_str());
-            if let Some(nodes) = selected.nodes {
-                input.project_nodes(
+            if let Some(syntax_elements) = selected.syntax_elements {
+                input.project_syntax_elements(
                     reads,
-                    rift_search::sparql::NodeSelection {
+                    rift_search::sparql::SyntaxSelection {
                         symbols,
-                        source: nodes.source,
+                        source: syntax_elements.source,
                     },
                     dataset,
                     cancellation,
@@ -490,8 +490,8 @@ impl AcquiredGraph {
             )?;
         } else if let Some(exact) = &exact {
             exact.project(&mut dataset)?;
-        } else if let Some(selection) = query.node_selection() {
-            input.project_nodes(
+        } else if let Some(selection) = query.syntax_element_selection() {
+            input.project_syntax_elements(
                 &reads,
                 selection,
                 &mut dataset,
@@ -1213,7 +1213,7 @@ mod tests {
             "{metadata:?}"
         );
         let evidence = server.graph_query(QueryParams {
-            query: format!("SELECT ?source ?unit {{ ?node :of <{}> ; :index 0 ; :source ?source ; :range [ :unit ?unit ; :start ?start ; :end ?end ] }}", id.as_str()),
+            query: format!("SELECT ?source ?unit {{ ?syntax_element :of <{}> ; :index 0 ; :source ?source ; :range [ :unit ?unit ; :start ?start ; :end ?end ] }}", id.as_str()),
             language: QueryLanguage::Sparql,
         }).await.map_err(|failure| format!("{failure:?}"))?.0.result;
         assert!(
@@ -1239,7 +1239,7 @@ mod tests {
     fn graph_capabilities(managers: &[&str], relationships: &[Value]) -> Value {
         json!({
             "supported_package_managers": managers,
-                    "supported_features": ["resolutions", "search", "symbols", "relationships", "nodes"],
+                    "supported_features": ["resolutions", "search", "symbols", "relationships", "facets"],
                     "publication_format": "rift-package-index-v2",
                     "analyzer_revision": "analyzer-v1",
                     "corpus_revision": "corpus-v1",
@@ -1636,7 +1636,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn graph_query_reads_captured_declaration_excerpts_without_an_exact_node_read()
+    async fn graph_query_reads_captured_declaration_excerpts_without_an_exact_syntax_element_read()
     -> TestResult {
         let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let app = remote_graph_routes(Arc::clone(&requests), "2099-01-01T00:00:00Z".to_owned());
@@ -1656,7 +1656,7 @@ mod tests {
             RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
         let statement = format!(
             "SELECT ?source ?unit ?start ?end {{ <{ROOT}> :calls ?target . \
-             ?node :of ?target; :index 0; :source ?source; :range [ :unit ?unit; :start ?start; :end ?end ] }}"
+             ?syntax_element :of ?target; :index 0; :source ?source; :range [ :unit ?unit; :start ?start; :end ?end ] }}"
         );
         let response = server
             .graph_query(QueryParams {
@@ -1686,7 +1686,7 @@ mod tests {
         assert_eq!(row["end"]["value"], "29");
 
         let metadata = server.graph_query(QueryParams {
-            query: format!("SELECT ?kind {{ <{ROOT}> :calls ?target . ?node :of ?target; :index 0; :kind ?kind }}"),
+            query: format!("SELECT ?kind {{ <{ROOT}> :calls ?target . ?syntax_element :of ?target; :index 0; :kind ?kind }}"),
             language: QueryLanguage::Sparql,
         }).await.map_err(|failure| format!("{failure:?}"))?.0.result;
         assert!(
@@ -1707,7 +1707,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn graph_query_reads_remote_node_pages_at_the_selected_release() -> TestResult {
+    async fn graph_query_reads_remote_syntax_element_pages_at_the_selected_release() -> TestResult {
         const RELEASE: &str = "rift://revision/cargo/crates.io/demo@1.0.0";
         const UNIT: &str = "rift://source/cargo/crates.io/demo/src/lib.rs";
         let pages = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1731,25 +1731,26 @@ mod tests {
                     "signature_indices":[],"type_indices":[],"documentation_indices":[]}]
             }))
         }))
-        .route("/rift/v1/nodes", axum::routing::post(move |bytes: axum::body::Bytes| {
+        .route("/rift/v1/facets", axum::routing::post(move |bytes: axum::body::Bytes| {
             let observed = Arc::clone(&observed);
             async move {
-                let request: Value = serde_json::from_slice(&bytes).expect("exact node request");
+                let request: Value = serde_json::from_slice(&bytes).expect("exact syntax element request");
                 assert_eq!(request["symbol"], ROOT);
                 assert_eq!(request["revision"], RELEASE);
                 observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let page = if let Some(cursor) = request["node_cursor"].as_str() {
-                    assert_eq!(cursor, "next-node");
-                    json!({"symbol":ROOT,"revision":RELEASE,"nodes":[{
-                        "declaration":0,"index":1,"unit":UNIT,"language":"rust","kind":"identifier",
-                        "range":{"start":3,"end":7},"source":"root","parent":0
-                    }]})
-                } else {
-                    json!({"symbol":ROOT,"revision":RELEASE,"node_cursor":"next-node","nodes":[{
-                        "declaration":0,"index":0,"unit":UNIT,"language":"rust","kind":"function_item",
-                        "range":{"start":0,"end":12},"source":"fn root() {}"
-                    }]})
-                };
+                let (ordinal, start) = if let Some(cursor) = request["facet_cursor"].as_str() {
+                    assert_eq!(cursor, "next-facet"); (1, 13)
+                } else { (0, 0) };
+                let source = "fn root() {}";
+                let mut page = json!({"symbol":ROOT,"revision":RELEASE,"declarations":[{
+                    "declaration":ordinal,"kind":"function_item","range":{"start":start,"end":start+12},
+                    "source":{"span":{"unit":UNIT,"range":{"start":start,"end":start+12}},"text":source},
+                    "syntax":[
+                        {"declaration":ordinal,"index":0,"unit":UNIT,"language":"rust","kind":"function_item","range":{"start":start,"end":start+12},"source":source},
+                        {"declaration":ordinal,"index":1,"unit":UNIT,"language":"rust","kind":"identifier","range":{"start":start+3,"end":start+7},"source":"root","parent":0}
+                    ]
+                }]});
+                if ordinal == 0 { page["facet_cursor"] = json!("next-facet"); }
                 json_response(&page)
             }
         }));
@@ -1770,7 +1771,7 @@ mod tests {
         let result = server
             .graph_query(QueryParams {
                 query: format!(
-                    "SELECT ?i ?text {{ ?node :of <{ROOT}>; :index ?i; :source ?text }} ORDER BY ?i"
+                    "SELECT ?i ?text {{ ?syntax_element :of <{ROOT}>; :index ?i; :source ?text }} ORDER BY ?i"
                 ),
                 language: QueryLanguage::Sparql,
             })
@@ -1780,10 +1781,10 @@ mod tests {
             .result;
         service.abort();
         let QueryReadResult::Results(result) = result else {
-            return Err(format!("expected exact node rows, received {result:?}").into());
+            return Err(format!("expected exact syntax element rows, received {result:?}").into());
         };
         let QueryAnswer::Bindings { bindings, .. } = result.answer else {
-            return Err("expected exact node bindings".into());
+            return Err("expected exact syntax element bindings".into());
         };
         assert_eq!(pages.load(std::sync::atomic::Ordering::Relaxed), 2);
         let sources = bindings
@@ -1793,7 +1794,7 @@ mod tests {
                 _ => "",
             })
             .collect::<Vec<_>>();
-        assert_eq!(sources, ["fn root() {}", "root"]);
+        assert_eq!(sources, ["fn root() {}", "fn root() {}", "root", "root"]);
         Ok(())
     }
 

@@ -100,8 +100,8 @@ impl SyntaxProvider for TypeScriptSyntaxProvider {
         )
     }
 
-    fn node_facets(&self, kind: &str) -> Vec<NodeFacet> {
-        ecmascript::node_facets(kind)
+    fn syntax_element_facets(&self, kind: &str) -> Vec<NodeFacet> {
+        ecmascript::syntax_element_facets(kind)
     }
 }
 
@@ -377,7 +377,7 @@ mod tests {
     /// the type alias value, and stay absent on bodyless signatures and
     /// ambient declarations.
     #[test]
-    fn test_body_range_present_exactly_where_the_node_declares_one() {
+    fn test_body_range_present_exactly_where_the_syntax_element_declares_one() {
         let text = "interface Route { path: string }\nenum Mode { Fast }\ntype Alias = Route;\nnamespace Registry { export const limit = 1; }\ndeclare function ambient(): void;\ndeclare const bare: number;\nclass Widget { open(): void {} }\n";
         let document = analyze(text);
         let spans = document
@@ -495,11 +495,11 @@ mod tests {
     fn test_provider_reports_malformed_tree_without_dropping_facts() {
         let document = analyze("interface Broken {\n");
         assert!(document.has_errors());
-        assert!(!document.nodes().is_empty());
+        assert!(!document.syntax_elements().is_empty());
     }
 
     #[test]
-    fn test_provider_enforces_source_node_and_depth_limits() {
+    fn test_provider_enforces_source_syntax_element_and_depth_limits() {
         let bounded = |limits: SyntaxLimits, text: &str| {
             TypeScriptSyntaxProvider::new(TypeScriptDialect::TypeScript).analyze(
                 SyntaxSource {
@@ -519,14 +519,14 @@ mod tests {
             rift_error::errors::syntax::source_too_large::SLUG
         );
 
-        let node_error = bounded(
+        let syntax_element_error = bounded(
             SyntaxLimits::new(100, 1, 10).expect("positive limits"),
             "let x = 1;",
         )
-        .expect_err("node bound");
+        .expect_err("syntax element bound");
         assert_eq!(
-            node_error.slug(),
-            rift_error::errors::syntax::too_many_nodes::SLUG
+            syntax_element_error.slug(),
+            rift_error::errors::syntax::too_many_syntax_elements::SLUG
         );
 
         let depth_error = bounded(
@@ -664,9 +664,9 @@ mod tests {
         assert_eq!(declaration.container.as_deref(), Some("\"node:buffer\""));
         assert!(
             document
-                .nodes()
+                .syntax_elements()
                 .iter()
-                .any(|node| node.kind == "global_namespace")
+                .any(|syntax_element| syntax_element.kind == "global_namespace")
         );
         let globals = document
             .symbols()

@@ -7,12 +7,12 @@
 //!
 //! Decisions this module fixes:
 //! - Nesting follows the grammar's section tree. The pinned block grammar
-//!   opens and closes `section` nodes at ATX headings, one nesting level per
+//!   opens and closes `section` syntax elements at ATX headings, one nesting level per
 //!   heading level; a section starting with a heading declares that
 //!   heading's symbol and spans the whole section, subsections included. A
 //!   setext heading never closes a section: one that starts a section
 //!   declares it, and any later setext heading in the same section stays a
-//!   loose child - it declares from its own node, spans only its own lines,
+//!   loose child - it declares from its own syntax element, spans only its own lines,
 //!   owns no `body_range`, and files under the section that holds it,
 //!   whatever its underline level, so containers nest exactly as ranges
 //!   nest.
@@ -31,7 +31,7 @@
 //!   its heading line, absent for a section that is only a heading.
 //! - Headings carry no visibility and no portable symbol facet: `visibility`
 //!   stays `None` and `facets` stays empty.
-//! - A document with no headings emits no symbols; its nodes still serve.
+//! - A document with no headings emits no symbols; its syntax elements still serve.
 //! - `signatures` and `documentation` stay empty for every heading: a
 //!   heading has no callable form, and its `body_range` is the section's own
 //!   prose, not a preceding comment, so there is nothing to attach as
@@ -60,7 +60,7 @@ const SECTION_KIND: &str = "section";
 const ATX_HEADING_KIND: &str = "atx_heading";
 /// Grammar spelling of a `setext_heading` (a content line over `===` or `---`).
 const SETEXT_HEADING_KIND: &str = "setext_heading";
-/// Grammar field holding a heading's content: the inline node of an ATX
+/// Grammar field holding a heading's content: the inline syntax element of an ATX
 /// heading, the content paragraph of a setext heading. Absent on a heading
 /// with no content.
 const HEADING_CONTENT_FIELD: &str = "heading_content";
@@ -99,12 +99,12 @@ impl MarkdownKinds {
     }
 }
 
-/// Resolves one node kind id, proving the pinned grammar defines it.
+/// Resolves one syntax element kind id, proving the pinned grammar defines it.
 fn kind_id(language: &tree_sitter::Language, kind: &str) -> u16 {
     let id = language.id_for_node_kind(kind, true);
     assert!(
         id != 0,
-        "pinned markdown grammar must define node kind used by symbol \
+        "pinned markdown grammar must define syntax_element kind used by symbol \
          extraction: kind={kind}"
     );
     id
@@ -140,12 +140,12 @@ impl MarkdownRules {
 
     /// Whether `heading` is the one its parent section declares. A loose
     /// setext heading - one the grammar left mid-section - is not, and
-    /// declares from its own node instead.
+    /// declares from its own syntax element instead.
     fn declares_its_section(&self, heading: Visited<'_, '_>) -> bool {
         heading
             .parent()
-            .and_then(|parent| self.declaring_heading(parent.node()))
-            .is_some_and(|declaring| declaring.id() == heading.node().id())
+            .and_then(|parent| self.declaring_heading(parent.syntax_element()))
+            .is_some_and(|declaring| declaring.id() == heading.syntax_element().id())
     }
 
     /// The heading's name: its content text trimmed of structural markers
@@ -193,7 +193,7 @@ fn without_closing_hash_run(content: &str) -> &str {
 
 impl MarkdownRules {
     /// The declaration of a section starting with a heading: named by that
-    /// heading, spanning the walker's node range, with the content past the
+    /// heading, spanning the walker's syntax element range, with the content past the
     /// heading line as the body.
     fn section_declaration(
         &self,
@@ -227,7 +227,7 @@ impl MarkdownRules {
         if self.declares_its_section(heading) {
             return None;
         }
-        let name = self.heading_name(heading.node(), text)?;
+        let name = self.heading_name(heading.syntax_element(), text)?;
         Some(Declaration {
             name,
             kind: HEADING_KIND_WORD,
@@ -246,27 +246,27 @@ impl GrammarRules for MarkdownRules {
         visited: Visited<'_, '_>,
         text: &str,
     ) -> Result<Option<Declaration>, RiftError> {
-        let node = visited.node();
-        if node.kind_id() == self.kinds.section {
-            return self.section_declaration(node, text);
+        let syntax_element = visited.syntax_element();
+        if syntax_element.kind_id() == self.kinds.section {
+            return self.section_declaration(syntax_element, text);
         }
-        if node.kind_id() == self.kinds.setext_heading {
+        if syntax_element.kind_id() == self.kinds.setext_heading {
             return Ok(self.loose_setext_declaration(visited, text));
         }
         Ok(None)
     }
 
-    fn container_name(&self, node: Node<'_>, text: &str) -> Option<String> {
-        if node.kind_id() != self.kinds.section {
+    fn container_name(&self, syntax_element: Node<'_>, text: &str) -> Option<String> {
+        if syntax_element.kind_id() != self.kinds.section {
             return None;
         }
-        let heading = self.declaring_heading(node)?;
+        let heading = self.declaring_heading(syntax_element)?;
         self.heading_name(heading, text)
     }
 
-    /// A declaration starts at its own node: nothing attaches in front.
+    /// A declaration starts at its own syntax element: nothing attaches in front.
     fn declaration_start(&self, visited: Visited<'_, '_>, _text: &str) -> usize {
-        visited.node().start_byte()
+        visited.syntax_element().start_byte()
     }
 
     fn qualification_separator(&self) -> &'static str {
@@ -307,7 +307,7 @@ impl SyntaxProvider for MarkdownSyntaxProvider {
         let rules = MarkdownRules {
             kinds: markdown_kinds(),
         };
-        let (nodes, symbols) = extract::extract(
+        let (syntax_elements, symbols) = extract::extract(
             trees.block.root_node(),
             source,
             limits,
@@ -317,7 +317,7 @@ impl SyntaxProvider for MarkdownSyntaxProvider {
         let syntax = SyntaxDocument::new(
             self.language.clone(),
             source.path.clone(),
-            nodes,
+            syntax_elements,
             symbols,
             trees.block.root_node().has_error(),
         )
@@ -327,11 +327,11 @@ impl SyntaxProvider for MarkdownSyntaxProvider {
         Ok(syntax.with_markdown_facts(markdown_facts))
     }
 
-    /// Portable structural facets for one block grammar node kind. Most
+    /// Portable structural facets for one block grammar syntax element kind. Most
     /// markdown kinds are prose structure no portable facet describes and
     /// carry none; the mapping covers the kinds with an honest portable
     /// reading.
-    fn node_facets(&self, kind: &str) -> Vec<NodeFacet> {
+    fn syntax_element_facets(&self, kind: &str) -> Vec<NodeFacet> {
         match kind {
             // The section declares its heading's name and the heading spells
             // it; a link reference definition introduces a label other
@@ -403,8 +403,10 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "must define node kind used by symbol extraction: \
-                               kind=no_such_kind")]
+    #[should_panic(
+        expected = "must define syntax_element kind used by symbol extraction: \
+                               kind=no_such_kind"
+    )]
     fn test_kind_resolution_refuses_a_kind_the_grammar_lacks() {
         let _ = kind_id(&markdown_grammar(), "no_such_kind");
     }
@@ -680,7 +682,7 @@ mod tests {
     }
 
     /// The pinned grammar never closes a section at a setext heading: a
-    /// loose one declares from its own node, spans only its own lines, has
+    /// loose one declares from its own syntax element, spans only its own lines, has
     /// no body, and files under the section that holds it.
     #[test]
     fn test_loose_setext_heading_files_under_its_holding_section() {
@@ -740,14 +742,17 @@ mod tests {
         assert!(!document.has_errors());
     }
 
-    /// A document with no headings emits no symbols; its nodes still serve.
+    /// A document with no headings emits no symbols; its syntax elements still serve.
     #[test]
-    fn test_document_without_headings_serves_nodes_and_no_symbols() {
+    fn test_document_without_headings_serves_syntax_elements_and_no_symbols() {
         let document = analyze("just prose\n\nmore prose\n");
         assert!(document.symbols().is_empty());
         assert!(!document.has_errors());
         assert!(
-            document.nodes().iter().any(|node| node.kind == "paragraph"),
+            document
+                .syntax_elements()
+                .iter()
+                .any(|syntax_element| syntax_element.kind == "paragraph"),
             "the parsed tree must still carry the prose structure"
         );
     }
@@ -773,7 +778,7 @@ mod tests {
     fn test_provider_reports_malformed_tree_without_dropping_facts() {
         let document = analyze("# Lone");
         assert!(document.has_errors());
-        assert!(!document.nodes().is_empty());
+        assert!(!document.syntax_elements().is_empty());
         assert!(document.symbols().is_empty());
     }
 
@@ -830,7 +835,7 @@ mod tests {
     }
 
     #[test]
-    fn test_provider_enforces_source_node_and_depth_limits() {
+    fn test_provider_enforces_source_syntax_element_and_depth_limits() {
         let bounded = |limits: SyntaxLimits, text: &str| {
             MarkdownSyntaxProvider::default().analyze(
                 SyntaxSource {
@@ -850,14 +855,14 @@ mod tests {
             rift_error::errors::syntax::source_too_large::SLUG
         );
 
-        let node_error = bounded(
+        let syntax_element_error = bounded(
             SyntaxLimits::new(100, 1, 10).expect("positive limits"),
             "# Over\n",
         )
-        .expect_err("node bound");
+        .expect_err("syntax element bound");
         assert_eq!(
-            node_error.slug(),
-            rift_error::errors::syntax::too_many_nodes::SLUG
+            syntax_element_error.slug(),
+            rift_error::errors::syntax::too_many_syntax_elements::SLUG
         );
 
         let depth_error = bounded(
@@ -890,27 +895,30 @@ mod tests {
     /// reads as `Literal`, an info string as `Annotation`, and prose
     /// structure carries none.
     #[test]
-    fn test_node_facets_classify_the_interpreted_kinds() {
+    fn test_syntax_element_facets_classify_the_interpreted_kinds() {
         let provider = MarkdownSyntaxProvider::default();
         for kind in [SECTION_KIND, ATX_HEADING_KIND, SETEXT_HEADING_KIND] {
             assert_eq!(
-                provider.node_facets(kind),
+                provider.syntax_element_facets(kind),
                 [NodeFacet::Declaration],
                 "kind {kind} must classify as a declaration"
             );
         }
         assert_eq!(
-            provider.node_facets("link_reference_definition"),
+            provider.syntax_element_facets("link_reference_definition"),
             [NodeFacet::Declaration]
         );
         for kind in ["fenced_code_block", "indented_code_block", "html_block"] {
             assert_eq!(
-                provider.node_facets(kind),
+                provider.syntax_element_facets(kind),
                 [NodeFacet::Literal],
                 "kind {kind} must classify as verbatim content"
             );
         }
-        assert_eq!(provider.node_facets("info_string"), [NodeFacet::Annotation]);
+        assert_eq!(
+            provider.syntax_element_facets("info_string"),
+            [NodeFacet::Annotation]
+        );
         for kind in [
             "document",
             "paragraph",
@@ -920,7 +928,7 @@ mod tests {
             "block_quote",
         ] {
             assert_eq!(
-                provider.node_facets(kind),
+                provider.syntax_element_facets(kind),
                 [],
                 "prose kind {kind} carries no portable facet"
             );

@@ -83,10 +83,10 @@ impl GraphQuery {
 }
 
 fn replace(term: &mut TermPattern, selected: &SymbolId, local: &NamedNode) {
-    if let TermPattern::NamedNode(node) = term
-        && node.as_str() == selected.as_str()
+    if let TermPattern::NamedNode(syntax_element) = term
+        && syntax_element.as_str() == selected.as_str()
     {
-        node.clone_from(local);
+        syntax_element.clone_from(local);
     }
 }
 

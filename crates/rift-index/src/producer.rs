@@ -1,7 +1,7 @@
 //! Facts an external producer emitted, entering a package publication.
 //!
 //! A producer addresses source the way its own tools do: by source unit and byte range.
-//! [`PublicationNodes`] resolves such a range to the node address every read uses, and
+//! [`PublicationSyntax`] resolves such a range to the syntax element address every read uses, and
 //! [`accept_producer_facts`] adds the producer's relationships and occurrences to the
 //! publication under that producer's name. [`FactExtractor`] is the interface an external
 //! extractor implements, and [`accept_extracted_facts`] runs one and imports its output.
@@ -16,9 +16,9 @@ use rift_protocol::producer::{
     ProducerOccurrence, ProducerRelationship,
 };
 use rift_protocol::read::{Relationship, SourceUnitId, SourceUnitSpan, SymbolId};
-use rift_syntax::{ByteRange, NodeMatch, SyntaxDocument, SyntaxLimits, SyntaxSource};
+use rift_syntax::{ByteRange, SyntaxDocument, SyntaxLimits, SyntaxMatch, SyntaxSource};
 
-use crate::located_node::{LocatedNode, NodeAddress};
+use crate::located_syntax_element::{LocatedSyntax, SyntaxAddress};
 
 mod extractor;
 
@@ -35,28 +35,28 @@ struct ParsedUnit<'publication> {
     declarations: Vec<Option<(rift_core::SymbolId, usize)>>,
 }
 
-/// Resolves byte ranges inside a publication's source units to node addresses.
+/// Resolves byte ranges inside a publication's source units to syntax element addresses.
 ///
 /// A declaration's address is its symbol and its ordinal among that symbol's declarations in
 /// publication order, the order a symbol read lists them. Each unit is parsed once, under
 /// `limits`, the first time a range names it.
-pub struct PublicationNodes<'publication> {
+pub struct PublicationSyntax<'publication> {
     publication: &'publication PackagePublication,
     limits: SyntaxLimits,
     addresses: BTreeMap<(&'publication str, u64, u64), (&'publication SymbolId, usize)>,
     parsed: BTreeMap<SourceUnitId, ParsedUnit<'publication>>,
 }
 
-impl std::fmt::Debug for PublicationNodes<'_> {
+impl std::fmt::Debug for PublicationSyntax<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("PublicationNodes")
+            .debug_struct("PublicationSyntax")
             .field("units_parsed", &self.parsed.len())
             .finish_non_exhaustive()
     }
 }
 
-impl<'publication> PublicationNodes<'publication> {
+impl<'publication> PublicationSyntax<'publication> {
     /// Prepares resolution over `publication`'s units, parsed under `limits`.
     #[must_use]
     pub fn new(publication: &'publication PackagePublication, limits: SyntaxLimits) -> Self {
@@ -82,19 +82,19 @@ impl<'publication> PublicationNodes<'publication> {
         }
     }
 
-    /// The node at `range` of `unit`: the innermost node spanning it exactly, or under
-    /// [`NodeMatch::Enclosing`] the innermost one containing it.
+    /// The syntax element at `range` of `unit`: the innermost syntax element spanning it exactly, or under
+    /// [`SyntaxMatch::Enclosing`] the innermost one containing it.
     ///
     /// # Errors
     /// Returns `producer_range_unresolved` when the publication carries no `unit`, its
-    /// retained source was cut, or no node answers `range`; the provider's refusal when the
+    /// retained source was cut, or no syntax element answers `range`; the provider's refusal when the
     /// retained source no longer parses.
-    pub fn node_at(
+    pub fn syntax_element_at(
         &mut self,
         unit: &SourceUnitId,
         range: ByteRange,
-        matching: NodeMatch,
-    ) -> Result<LocatedNode, RiftError> {
+        matching: SyntaxMatch,
+    ) -> Result<LocatedSyntax, RiftError> {
         if !self.parsed.contains_key(unit) {
             let parsed = self.parse(unit, range)?;
             self.parsed.insert(unit.clone(), parsed);
@@ -102,10 +102,14 @@ impl<'publication> PublicationNodes<'publication> {
         let located = self.parsed.get(unit).and_then(|parsed| {
             let declarations = parsed.declarations.as_slice();
             match &parsed.document {
-                Some(document) => {
-                    LocatedNode::in_document(document, parsed.source, declarations, range, matching)
-                }
-                None => LocatedNode::file(parsed.source, range, matching),
+                Some(document) => LocatedSyntax::in_document(
+                    document,
+                    parsed.source,
+                    declarations,
+                    range,
+                    matching,
+                ),
+                None => LocatedSyntax::file(parsed.source, range, matching),
             }
         });
         located.ok_or_else(|| unresolved(unit, range))
@@ -179,7 +183,7 @@ impl<'publication> PublicationNodes<'publication> {
 /// Every added relationship and occurrence names `facts.producer`, and the coverage entry of
 /// `facts.language` gains one entry per covered kind. A relationship that names only its
 /// `occurrence` starts at the symbol whose declaration encloses it; every range a fact names
-/// must resolve to a node of its unit. The coverage entry's `relationships` stay as package
+/// must resolve to a syntax element of its unit. The coverage entry's `relationships` stay as package
 /// analysis wrote them: an imported kind states who emitted its facts, never that they are
 /// complete.
 ///
@@ -195,7 +199,7 @@ impl<'publication> PublicationNodes<'publication> {
 /// the publication has no coverage for, a fact of a kind `facts.kinds` does not name, a kind
 /// already covered by this producer, a relationship naming neither `from` nor `occurrence`,
 /// or one naming only an `occurrence` outside every declaration; `producer_range_unresolved`
-/// for a range that resolves to no node.
+/// for a range that resolves to no syntax element.
 pub fn accept_producer_facts(
     mut publication: PackagePublication,
     facts: ProducerFacts,
@@ -215,14 +219,14 @@ pub fn accept_producer_facts(
     let (coverage, kinds) = admitted_kinds(&publication, &producer, &language, kinds)?;
     admit_counts(&kinds, relationships.len(), occurrences.len())?;
     let (relationships, occurrences) = {
-        let mut nodes = PublicationNodes::new(&publication, limits);
+        let mut syntax_elements = PublicationSyntax::new(&publication, limits);
         let relationships = relationships
             .into_iter()
-            .map(|relationship| resolve_relationship(&mut nodes, relationship, &producer))
+            .map(|relationship| resolve_relationship(&mut syntax_elements, relationship, &producer))
             .collect::<Result<Vec<_>, _>>()?;
         let occurrences = occurrences
             .into_iter()
-            .map(|occurrence| resolve_occurrence(&mut nodes, occurrence, &producer))
+            .map(|occurrence| resolve_occurrence(&mut syntax_elements, occurrence, &producer))
             .collect::<Result<Vec<_>, _>>()?;
         (relationships, occurrences)
     };
@@ -290,7 +294,7 @@ fn admit_counts(
 }
 
 fn resolve_relationship(
-    nodes: &mut PublicationNodes<'_>,
+    syntax_elements: &mut PublicationSyntax<'_>,
     relationship: ProducerRelationship,
     producer: &FactProducer,
 ) -> Result<Relationship, RiftError> {
@@ -306,14 +310,16 @@ fn resolve_relationship(
     } = relationship;
     let enclosing = occurrence
         .as_ref()
-        .map(|span| nodes.node_at(&span.unit, byte_range(span), NodeMatch::Enclosing))
+        .map(|span| {
+            syntax_elements.syntax_element_at(&span.unit, byte_range(span), SyntaxMatch::Enclosing)
+        })
         .transpose()?;
     let from = match (from, enclosing) {
         (Some(from), _) => from,
         (
             None,
-            Some(LocatedNode {
-                address: NodeAddress::Declaration { symbol, .. },
+            Some(LocatedSyntax {
+                address: SyntaxAddress::Declaration { symbol, .. },
                 ..
             }),
         ) => SymbolId(symbol.as_str().to_owned()),
@@ -334,7 +340,7 @@ fn resolve_relationship(
 }
 
 fn resolve_occurrence(
-    nodes: &mut PublicationNodes<'_>,
+    syntax_elements: &mut PublicationSyntax<'_>,
     occurrence: ProducerOccurrence,
     producer: &FactProducer,
 ) -> Result<PackageOccurrence, RiftError> {
@@ -344,7 +350,7 @@ fn resolve_occurrence(
         range,
     } = occurrence;
     let span = SourceUnitSpan { unit, range };
-    nodes.node_at(&span.unit, byte_range(&span), NodeMatch::Enclosing)?;
+    syntax_elements.syntax_element_at(&span.unit, byte_range(&span), SyntaxMatch::Enclosing)?;
     Ok(PackageOccurrence {
         symbol,
         unit: span.unit,

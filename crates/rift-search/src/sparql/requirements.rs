@@ -19,12 +19,12 @@ pub enum SymbolSelection<'query> {
     Identified(&'query str),
 }
 
-/// Captured syntax nodes for the selected physical declarations.
+/// Captured syntax elements for the selected physical declarations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct NodeSelection<'query> {
-    /// The logical symbols whose declarations supply the nodes.
+pub struct SyntaxSelection<'query> {
+    /// The logical symbols whose declarations supply the syntax elements.
     pub symbols: SymbolSelection<'query>,
-    /// Whether the pattern requests exact node source text.
+    /// Whether the pattern requests exact syntax element source text.
     pub source: bool,
 }
 
@@ -39,10 +39,10 @@ pub struct AdjacencyStep {
 
 /// The declaration item facts required by a reached-symbol pattern.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ReachedNodes {
+pub struct ReachedFacets {
     /// The query can inspect the exact declaration excerpt.
     pub source: bool,
-    /// The query can inspect grammar facts or the exact node declaration ordinal.
+    /// The query can inspect grammar facts or the exact syntax element declaration ordinal.
     pub syntax_metadata: bool,
 }
 
@@ -58,7 +58,7 @@ pub struct AdjacencySelection {
     /// Whether the pattern projects logical facts about reached symbols.
     pub symbol_details: bool,
     /// Declaration item facts selected for reached symbols.
-    pub nodes: Option<ReachedNodes>,
+    pub syntax_elements: Option<ReachedFacets>,
     /// Whether physical usage records and their evidence must also be projected.
     pub occurrences: Option<OccurrenceSelection>,
 }
@@ -136,9 +136,9 @@ impl GraphQuery {
         selection.or_else(|| self.symbol_only().then_some(SymbolSelection::All))
     }
 
-    /// Proves that a graph pattern needs only the syntax nodes of selected declarations.
+    /// Proves that a graph pattern needs only the syntax elements of selected declarations.
     #[must_use]
-    pub fn node_selection(&self) -> Option<NodeSelection<'_>> {
+    pub fn syntax_element_selection(&self) -> Option<SyntaxSelection<'_>> {
         let QueryExpression::Bgp { patterns } = query_pattern(self) else {
             return None;
         };
@@ -147,7 +147,7 @@ impl GraphQuery {
             .find(|triple| property(triple) == Some("of"))?;
         if !patterns.iter().any(|triple| {
             triple.subject == owner.subject
-                && (property(triple) == Some("index") || is_class(triple, "Node"))
+                && (property(triple) == Some("index") || is_class(triple, "SyntaxElement"))
         }) {
             return None;
         }
@@ -165,7 +165,7 @@ impl GraphQuery {
                     Some("of") if triple == owner => {}
                     Some("source") => source = true,
                     Some("range" | "index" | "declaration" | "kind" | "language") => {}
-                    _ if is_class(triple, "Node") => {}
+                    _ if is_class(triple, "SyntaxElement") => {}
                     _ => return None,
                 }
             } else if triple.subject == owner.object {
@@ -185,15 +185,15 @@ impl GraphQuery {
                 return None;
             }
         }
-        let symbols = if let TermPattern::NamedNode(node) = &owner.object {
-            rift_protocol::identity::SymbolIdentity::parse(node.as_str()).ok()?;
-            SymbolSelection::Identified(node.as_str())
+        let symbols = if let TermPattern::NamedNode(syntax_element) = &owner.object {
+            rift_protocol::identity::SymbolIdentity::parse(syntax_element.as_str()).ok()?;
+            SymbolSelection::Identified(syntax_element.as_str())
         } else if let Some(name) = name {
             SymbolSelection::Named(name)
         } else {
             SymbolSelection::All
         };
-        Some(NodeSelection { symbols, source })
+        Some(SyntaxSelection { symbols, source })
     }
 
     /// Finds a statically anchored path or physical usage selection.
@@ -241,10 +241,10 @@ impl GraphQuery {
         let (edges, details): (Vec<_>, Vec<_>) = triples
             .into_iter()
             .partition(|edge| property(edge).and_then(facet).is_some());
-        let (symbol_details, nodes) = endpoint_details(&edges, &details)?;
+        let (symbol_details, syntax_elements) = endpoint_details(&edges, &details)?;
         let mut selected = adjacency_patterns(&edges).or_else(|| layered_patterns(&edges))?;
         selected.symbol_details = symbol_details;
-        selected.nodes = nodes;
+        selected.syntax_elements = syntax_elements;
         Some(selected)
     }
 }
@@ -283,17 +283,17 @@ fn query_pattern(query: &GraphQuery) -> &QueryExpression {
 fn endpoint_details(
     edges: &[&TriplePattern],
     details: &[&TriplePattern],
-) -> Option<(bool, Option<ReachedNodes>)> {
+) -> Option<(bool, Option<ReachedFacets>)> {
     let endpoint = |term: &TermPattern| {
         edges
             .iter()
             .any(|edge| &edge.subject == term || &edge.object == term)
     };
-    let mut node_owner = details
+    let mut syntax_owner = details
         .iter()
         .filter(|detail| property(detail) == Some("of") && endpoint(&detail.object));
-    let owner = node_owner.next().copied();
-    if node_owner.next().is_some() {
+    let owner = syntax_owner.next().copied();
+    if syntax_owner.next().is_some() {
         return None;
     }
     let mut ranges = Vec::new();
@@ -315,7 +315,7 @@ fn endpoint_details(
         );
     }
     let mut symbols = false;
-    let mut nodes = ReachedNodes::default();
+    let mut syntax_elements = ReachedFacets::default();
     for &detail in details {
         let predicate = property(detail);
         if endpoint(&detail.subject)
@@ -326,10 +326,10 @@ fn endpoint_details(
         } else if let Some(owner) = owner.filter(|owner| detail.subject == owner.subject) {
             match predicate {
                 Some("of") if detail == owner => {}
-                Some("source") => nodes.source = true,
-                Some("declaration" | "kind" | "language") => nodes.syntax_metadata = true,
+                Some("source") => syntax_elements.source = true,
+                Some("declaration" | "kind" | "language") => syntax_elements.syntax_metadata = true,
                 Some("range" | "index") => {}
-                _ if is_class(detail, "Node") => {}
+                _ if is_class(detail, "SyntaxElement") => {}
                 _ => return None,
             }
         } else if !ranges.contains(&&detail.subject)
@@ -338,7 +338,7 @@ fn endpoint_details(
             return None;
         }
     }
-    Some((symbols, owner.map(|_| nodes)))
+    Some((symbols, owner.map(|_| syntax_elements)))
 }
 
 fn property(pattern: &TriplePattern) -> Option<&str> {
@@ -387,7 +387,7 @@ fn adjacency(
         steps: Vec::new(),
         depth,
         symbol_details: false,
-        nodes: None,
+        syntax_elements: None,
         occurrences: None,
     })
 }
@@ -447,7 +447,7 @@ fn adjacency_patterns(triples: &[&TriplePattern]) -> Option<AdjacencySelection> 
                     steps: Vec::new(),
                     depth: Some(depth),
                     symbol_details: false,
-                    nodes: None,
+                    syntax_elements: None,
                     occurrences: None,
                 });
             }
@@ -463,7 +463,7 @@ fn layered_adjacency(seed: SymbolId, steps: Vec<AdjacencyStep>) -> Option<Adjace
         depth: Some(u32::try_from(steps.len()).ok()?),
         steps,
         symbol_details: false,
-        nodes: None,
+        syntax_elements: None,
         occurrences: None,
     })
 }
@@ -606,7 +606,7 @@ fn usage_selection(
         steps: Vec::new(),
         depth: Some(1),
         symbol_details: false,
-        nodes: None,
+        syntax_elements: None,
         occurrences: Some(OccurrenceSelection {
             source,
             enclosing: usage_enclosing,

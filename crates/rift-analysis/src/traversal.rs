@@ -6,32 +6,32 @@ use rift_core::{LoopBudget, SymbolId};
 use rift_protocol::read::{GraphHop, SearchTraversal, TraversalDirection};
 
 /// One traversal walk's outcome: each discovered symbol with its shortest path, and whether
-/// the node bound stopped the walk before the reachable graph was exhausted.
+/// the syntax element bound stopped the walk before the reachable graph was exhausted.
 #[derive(Debug)]
 pub struct TraversalWalk {
     /// Each discovered symbol and its shortest path, in adjacency order.
     pub discovered: Vec<(SymbolId, Vec<GraphHop>)>,
-    /// Whether the node bound prevented discovery of a reachable symbol.
+    /// Whether the syntax element bound prevented discovery of a reachable symbol.
     pub truncated: bool,
 }
 
-/// Walks captured adjacency breadth-first from `seed`, honoring the depth and node bounds.
+/// Walks captured adjacency breadth-first from `seed`, honoring the depth and syntax element bounds.
 ///
 /// The caller supplies bounded adjacency in its established order, after applying the
 /// request's facet filter. Each pair carries the established next identity and its exact
 /// relationship evidence. The walk never reports `seed` itself and never requeues a
-/// discovered symbol. One `nodes_max` budget covers the whole walk.
+/// discovered symbol. One `symbols_max` budget covers the whole walk.
 #[must_use]
 pub fn walk_traversal_capped<Edges>(
     seed: &SymbolId,
     traversal: &SearchTraversal,
-    nodes_max: usize,
+    symbols_max: usize,
     mut edges: impl FnMut(&SymbolId, TraversalDirection) -> Edges,
 ) -> TraversalWalk
 where
     Edges: IntoIterator<Item = (SymbolId, GraphHop)>,
 {
-    let mut state = TraversalState::new(seed, nodes_max);
+    let mut state = TraversalState::new(seed, symbols_max);
     while let Some((current, path)) = state.next(traversal.depth) {
         state.record(&path, edges(&current, traversal.direction));
     }
@@ -48,14 +48,14 @@ where
 pub async fn walk_traversal_capped_async<Edges, Read>(
     seed: &SymbolId,
     traversal: &SearchTraversal,
-    nodes_max: usize,
+    symbols_max: usize,
     mut edges: impl FnMut(SymbolId, TraversalDirection) -> Read,
 ) -> Result<TraversalWalk, rift_error::RiftError>
 where
     Edges: IntoIterator<Item = (SymbolId, GraphHop)>,
     Read: std::future::Future<Output = Result<Edges, rift_error::RiftError>>,
 {
-    let mut state = TraversalState::new(seed, nodes_max);
+    let mut state = TraversalState::new(seed, symbols_max);
     while let Some((current, path)) = state.next(traversal.depth) {
         let adjacency = edges(current, traversal.direction).await?;
         state.record(&path, adjacency);
@@ -72,11 +72,11 @@ struct TraversalState {
 }
 
 impl TraversalState {
-    fn new(seed: &SymbolId, nodes_max: usize) -> Self {
+    fn new(seed: &SymbolId, symbols_max: usize) -> Self {
         Self {
             enqueued: BTreeSet::from([seed.clone()]),
             recorded: BTreeSet::from([seed.clone()]),
-            budget: LoopBudget::new(nodes_max),
+            budget: LoopBudget::new(symbols_max),
             queue: VecDeque::from([(seed.clone(), Vec::new())]),
             walk: TraversalWalk {
                 discovered: Vec::new(),
@@ -188,7 +188,10 @@ mod tests {
                 .map(|next| (next.clone(), hop(current, &next)))
                 .collect::<Vec<_>>()
         });
-        assert!(!walk.truncated, "cycles do not spend the node budget");
+        assert!(
+            !walk.truncated,
+            "cycles do not spend the syntax element budget"
+        );
         assert_eq!(
             walk.discovered.iter().map(|(id, _)| id).collect::<Vec<_>>(),
             [&first, &second, &last]
@@ -205,7 +208,7 @@ mod tests {
     }
 
     #[test]
-    fn callback_walk_reports_zero_exact_and_one_over_node_bounds() {
+    fn callback_walk_reports_zero_exact_and_one_over_symbol_bounds() {
         let seed = identity("seed");
         let first = identity("first");
         let second = identity("second");
@@ -232,14 +235,18 @@ mod tests {
             calls.set(calls.get() + 1);
             vec![(next.clone(), hop(current, &next))]
         });
-        assert_eq!(calls.get(), 1, "depth-bound nodes do not request adjacency");
+        assert_eq!(
+            calls.get(),
+            1,
+            "depth-bound syntax elements do not request adjacency"
+        );
         assert_eq!(walk.discovered.len(), 1);
         assert!(!walk.truncated);
         let empty = walk_traversal_capped(&seed, &request, 0, |_, _| Vec::new());
         assert!(empty.discovered.is_empty());
         assert!(
             !empty.truncated,
-            "an empty graph did not spend the node budget"
+            "an empty graph did not spend the syntax element budget"
         );
     }
 

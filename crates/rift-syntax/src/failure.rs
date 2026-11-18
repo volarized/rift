@@ -4,11 +4,14 @@ pub(crate) use rift_error::RiftError;
 use rift_error::errors;
 use tree_sitter::{Node, QueryError};
 
-pub(crate) fn position_overflow(node: Node<'_>, source: std::num::TryFromIntError) -> RiftError {
+pub(crate) fn position_overflow(
+    syntax_element: Node<'_>,
+    source: std::num::TryFromIntError,
+) -> RiftError {
     errors::syntax::position_overflow()
-        .node_kind(node.kind())
-        .start_byte(node.start_byte())
-        .end_byte(node.end_byte())
+        .syntax_element_kind(syntax_element.kind())
+        .start_byte(syntax_element.start_byte())
+        .end_byte(syntax_element.end_byte())
         .source(source)
         .error()
 }

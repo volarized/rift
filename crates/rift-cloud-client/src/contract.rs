@@ -45,7 +45,7 @@ const ENDPOINTS: [Endpoint; 7] = [
     Endpoint::Resolutions,
     Endpoint::Search,
     Endpoint::Symbols,
-    Endpoint::Nodes,
+    Endpoint::Facets,
     Endpoint::Patterns,
     Endpoint::Declarations,
 ];
@@ -56,7 +56,7 @@ pub(crate) enum Endpoint {
     Resolutions,
     Search,
     Symbols,
-    Nodes,
+    Facets,
     Patterns,
     Declarations,
 }
@@ -68,7 +68,7 @@ impl Endpoint {
             Self::Resolutions => "/v1/resolutions",
             Self::Search => "/v1/search",
             Self::Symbols => "/v1/symbols",
-            Self::Nodes => "/v1/nodes",
+            Self::Facets => "/v1/facets",
             Self::Patterns => "/v1/patterns",
             Self::Declarations => "/v1/declarations",
         }
@@ -80,7 +80,7 @@ impl Endpoint {
             Self::Resolutions
             | Self::Search
             | Self::Symbols
-            | Self::Nodes
+            | Self::Facets
             | Self::Patterns
             | Self::Declarations => Method::POST,
         }
@@ -92,7 +92,7 @@ impl Endpoint {
             Self::Resolutions => "resolvePackageContext",
             Self::Search => "searchPackages",
             Self::Symbols => "get_symbol",
-            Self::Nodes => "nodes",
+            Self::Facets => "facets",
             Self::Patterns => "searchPackagePatterns",
             Self::Declarations => "findDeclarations",
         }
@@ -102,7 +102,7 @@ impl Endpoint {
         let mut statuses = ERROR_STATUSES.into_iter().collect::<BTreeSet<_>>();
         statuses.insert(StatusCode::OK);
         statuses.insert(StatusCode::GATEWAY_TIMEOUT);
-        if matches!(self, Self::Symbols | Self::Nodes) {
+        if matches!(self, Self::Symbols | Self::Facets) {
             statuses.insert(StatusCode::NOT_FOUND);
         }
         if self == Self::Capabilities {
@@ -214,7 +214,7 @@ pub fn validate(path: &Path) -> Result<(), ContractError> {
     validate_security(&spec).map_err(&invalid)?;
     validate_operations(&spec).map_err(&invalid)?;
     validate_symbol_contract(&document).map_err(&invalid)?;
-    validate_nodes_contract(&document).map_err(&invalid)?;
+    validate_facets_contract(&document).map_err(&invalid)?;
     validate_search_contract(&document).map_err(&invalid)?;
     validate_bounds(&spec).map_err(&invalid)?;
     validate_optional_properties_omit_null(&document).map_err(&invalid)?;
@@ -475,28 +475,28 @@ fn validate_symbol_contract(document: &Value) -> Result<(), String> {
     Ok(())
 }
 
-/// Pins `/v1/nodes` to the shared node models and the source bound a symbol read pages by.
-fn validate_nodes_contract(document: &Value) -> Result<(), String> {
-    let operation = &document["paths"]["/v1/nodes"]["post"];
+/// Pins `/v1/facets` to the shared syntax element models and the source bound a symbol read pages by.
+fn validate_facets_contract(document: &Value) -> Result<(), String> {
+    let operation = &document["paths"]["/v1/facets"]["post"];
     if operation.get("parameters").is_some() {
-        return Err("POST /v1/nodes must not declare query selectors".to_owned());
+        return Err("POST /v1/facets must not declare query selectors".to_owned());
     }
     let request = &operation["requestBody"]["content"]["application/json"]["schema"];
-    if request != &json!({"$ref": "#/components/schemas/NodesParams"}) {
-        return Err("POST /v1/nodes request must use NodesParams".to_owned());
+    if request != &json!({"$ref": "#/components/schemas/FacetsParams"}) {
+        return Err("POST /v1/facets request must use FacetsParams".to_owned());
     }
     let response = &operation["responses"]["200"]["content"]["application/json"]["schema"];
-    if response != &json!({"$ref": "#/components/schemas/NodesResult"}) {
-        return Err("POST /v1/nodes 200 response must use NodesResult".to_owned());
+    if response != &json!({"$ref": "#/components/schemas/FacetsResult"}) {
+        return Err("POST /v1/facets 200 response must use FacetsResult".to_owned());
     }
     expect_bound(
         "x-rift-page-source-bytes-max",
         operation["x-rift-page-source-bytes-max"].as_u64(),
-        rift_protocol::read::NODES_SOURCE_BYTES_MAX,
+        rift_protocol::read::FACETS_SOURCE_BYTES_MAX,
     )?;
     expect_bound(
-        "NodesParams/node_cursor/maxLength",
-        document["components"]["schemas"]["NodesParams"]["properties"]["node_cursor"]["maxLength"]
+        "FacetsParams/facet_cursor/maxLength",
+        document["components"]["schemas"]["FacetsParams"]["properties"]["facet_cursor"]["maxLength"]
             .as_u64(),
         u64::try_from(crate::CURSOR_BYTES_MAX).map_err(|error| error.to_string())?,
     )
@@ -842,7 +842,9 @@ fn validate_shared_schemas(document: &Value) -> Result<(), String> {
     Ok(())
 }
 
-fn shared_schemas() -> serde_json::Map<String, Value> {
+/// Shared global API schemas derived from the Rust protocol models.
+#[must_use]
+pub fn shared_schemas() -> serde_json::Map<String, Value> {
     let mut settings = SchemaSettings::draft2020_12();
     settings.definitions_path = "/components/schemas".into();
     settings.meta_schema = None;
@@ -858,8 +860,8 @@ fn shared_schemas() -> serde_json::Map<String, Value> {
     let _ = generator.subschema_for::<rift_protocol::read::SearchTraversal>();
     let _ = generator.subschema_for::<rift_protocol::symbol_read::GetSymbolParams>();
     let _ = generator.subschema_for::<rift_protocol::symbol_read::GetSymbolResult>();
-    let _ = generator.subschema_for::<rift_protocol::read::NodesParams>();
-    let _ = generator.subschema_for::<rift_protocol::read::NodesResult>();
+    let _ = generator.subschema_for::<rift_protocol::read::FacetsParams>();
+    let _ = generator.subschema_for::<rift_protocol::read::FacetsResult>();
     let _ = generator.subschema_for::<rift_protocol::source_read::FindDeclarationsParams>();
     let _ = generator.subschema_for::<rift_protocol::source_read::FindDeclarationsResult>();
 

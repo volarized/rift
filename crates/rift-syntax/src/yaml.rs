@@ -30,8 +30,8 @@
 //! - An anchor or alias emits no symbol: an entry whose value is an alias
 //!   or carries an anchor is a normal entry via its key.
 //! - Nothing attaches in front of an entry, so `range` equals
-//!   `item_range`. An entry's `body_range` is the value node's span,
-//!   absent for a key with no value; a document's is its content node's
+//!   `item_range`. An entry's `body_range` is the value syntax element's span,
+//!   absent for a key with no value; a document's is its content syntax element's
 //!   span, absent for a bare `---`.
 //! - Entries carry no visibility and no portable symbol facet:
 //!   `visibility` stays `None` and `facets` stays empty.
@@ -54,9 +54,9 @@ use crate::provider::{SyntaxLimits, SyntaxProvider, SyntaxSource};
 /// Grammar spelling of a `document`.
 const DOCUMENT_KIND: &str = "document";
 /// Grammar spelling of a `block_node`, the wrapper around block content.
-const BLOCK_NODE_KIND: &str = "block_node";
+const BLOCK_SYNTAX_ELEMENT_KIND: &str = "block_node";
 /// Grammar spelling of a `flow_node`, the wrapper around flow content.
-const FLOW_NODE_KIND: &str = "flow_node";
+const FLOW_SYNTAX_ELEMENT_KIND: &str = "flow_node";
 /// Grammar spelling of a `block_mapping_pair` (`key: value`).
 const BLOCK_MAPPING_PAIR_KIND: &str = "block_mapping_pair";
 /// Grammar spelling of a `flow_pair` (`{key: value}`).
@@ -87,8 +87,8 @@ const ENTRY_QUALIFICATION_SEPARATOR: &str = " > ";
 #[derive(Debug)]
 struct YamlKinds {
     document: u16,
-    block_node: u16,
-    flow_node: u16,
+    block_syntax_element: u16,
+    flow_syntax_element: u16,
     block_mapping_pair: u16,
     flow_pair: u16,
     plain_scalar: u16,
@@ -110,8 +110,8 @@ impl YamlKinds {
     fn resolve(language: &tree_sitter::Language) -> Self {
         Self {
             document: kind_id(language, DOCUMENT_KIND),
-            block_node: kind_id(language, BLOCK_NODE_KIND),
-            flow_node: kind_id(language, FLOW_NODE_KIND),
+            block_syntax_element: kind_id(language, BLOCK_SYNTAX_ELEMENT_KIND),
+            flow_syntax_element: kind_id(language, FLOW_SYNTAX_ELEMENT_KIND),
             block_mapping_pair: kind_id(language, BLOCK_MAPPING_PAIR_KIND),
             flow_pair: kind_id(language, FLOW_PAIR_KIND),
             plain_scalar: kind_id(language, PLAIN_SCALAR_KIND),
@@ -124,12 +124,12 @@ impl YamlKinds {
     }
 }
 
-/// Resolves one node kind id, proving the pinned grammar defines it.
+/// Resolves one syntax element kind id, proving the pinned grammar defines it.
 fn kind_id(language: &tree_sitter::Language, kind: &str) -> u16 {
     let id = language.id_for_node_kind(kind, true);
     assert!(
         id != 0,
-        "pinned YAML grammar must define node kind used by symbol \
+        "pinned YAML grammar must define syntax_element kind used by symbol \
          extraction: kind={kind}"
     );
     id
@@ -150,7 +150,7 @@ fn field_id(language: &tree_sitter::Language, field: &str) -> NonZeroU16 {
 #[derive(Debug)]
 struct YamlRules {
     kinds: &'static YamlKinds,
-    /// Document node ids beside their 1-based ordinal, sorted by node id
+    /// Document syntax element ids beside their 1-based ordinal, sorted by syntax element id
     /// for lookup; empty for a stream of at most one document, where no
     /// document symbol exists.
     document_ordinals: Vec<(usize, usize)>,
@@ -179,26 +179,27 @@ impl YamlRules {
     }
 
     /// The key's scalar spelling: the scalar's bytes as authored, quotes
-    /// removed for a quoted scalar. `None` when `node` neither is nor
+    /// removed for a quoted scalar. `None` when `syntax element` neither is nor
     /// wraps a scalar.
-    fn scalar_spelling(&self, node: Node<'_>, text: &str) -> Option<String> {
-        if let Some(spelling) = self.direct_scalar_spelling(node, text) {
+    fn scalar_spelling(&self, syntax_element: Node<'_>, text: &str) -> Option<String> {
+        if let Some(spelling) = self.direct_scalar_spelling(syntax_element, text) {
             return Some(spelling);
         }
-        let mut cursor = node.walk();
-        node.named_children(&mut cursor)
+        let mut cursor = syntax_element.walk();
+        syntax_element
+            .named_children(&mut cursor)
             .find_map(|child| self.direct_scalar_spelling(child, text))
     }
 
-    /// The spelling when `node` itself is a scalar kind.
-    fn direct_scalar_spelling(&self, node: Node<'_>, text: &str) -> Option<String> {
-        let id = node.kind_id();
+    /// The spelling when `syntax element` itself is a scalar kind.
+    fn direct_scalar_spelling(&self, syntax_element: Node<'_>, text: &str) -> Option<String> {
+        let id = syntax_element.kind_id();
         let quoted = id == self.kinds.single_quote_scalar || id == self.kinds.double_quote_scalar;
         let scalar = quoted || id == self.kinds.plain_scalar || id == self.kinds.block_scalar;
         if !scalar {
             return None;
         }
-        let spelling = text.get(node.byte_range())?;
+        let spelling = text.get(syntax_element.byte_range())?;
         if quoted {
             return spelling
                 .get(1..spelling.len().saturating_sub(1))
@@ -252,7 +253,7 @@ impl YamlRules {
     }
 
     /// The declaration of one document in a multi-document stream, named by
-    /// its ordinal, with the content node's span as the body.
+    /// its ordinal, with the content syntax element's span as the body.
     fn document_declaration(&self, document: Node<'_>) -> Result<Option<Declaration>, RiftError> {
         let Some(ordinal) = self.document_ordinal(document) else {
             return Ok(None);
@@ -272,10 +273,11 @@ impl YamlRules {
     fn document_body_range(&self, document: Node<'_>) -> Result<Option<ByteRange>, RiftError> {
         let mut cursor = document.walk();
         let content = document.named_children(&mut cursor).find(|child| {
-            child.kind_id() == self.kinds.block_node || child.kind_id() == self.kinds.flow_node
+            child.kind_id() == self.kinds.block_syntax_element
+                || child.kind_id() == self.kinds.flow_syntax_element
         });
         match content {
-            Some(node) => extract::byte_range(node).map(Some),
+            Some(syntax_element) => extract::byte_range(syntax_element).map(Some),
             None => Ok(None),
         }
     }
@@ -287,33 +289,33 @@ impl GrammarRules for YamlRules {
         visited: Visited<'_, '_>,
         text: &str,
     ) -> Result<Option<Declaration>, RiftError> {
-        let node = visited.node();
-        let id = node.kind_id();
+        let syntax_element = visited.syntax_element();
+        let id = syntax_element.kind_id();
         if id == self.kinds.block_mapping_pair || id == self.kinds.flow_pair {
-            return self.entry_declaration(node, text);
+            return self.entry_declaration(syntax_element, text);
         }
         if id == self.kinds.document {
-            return self.document_declaration(node);
+            return self.document_declaration(syntax_element);
         }
         Ok(None)
     }
 
-    fn container_name(&self, node: Node<'_>, text: &str) -> Option<String> {
-        let id = node.kind_id();
+    fn container_name(&self, syntax_element: Node<'_>, text: &str) -> Option<String> {
+        let id = syntax_element.kind_id();
         if id == self.kinds.block_mapping_pair || id == self.kinds.flow_pair {
-            return self.entry_name(node, text);
+            return self.entry_name(syntax_element, text);
         }
         if id == self.kinds.document {
             return self
-                .document_ordinal(node)
+                .document_ordinal(syntax_element)
                 .map(|ordinal| ordinal.to_string());
         }
         None
     }
 
-    /// A declaration starts at its own node: nothing attaches in front.
+    /// A declaration starts at its own syntax element: nothing attaches in front.
     fn declaration_start(&self, visited: Visited<'_, '_>, _text: &str) -> usize {
-        visited.node().start_byte()
+        visited.syntax_element().start_byte()
     }
 
     fn qualification_separator(&self) -> &'static str {
@@ -362,12 +364,12 @@ impl SyntaxProvider for YamlSyntaxProvider {
             .parse(source.text, None)
             .ok_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())?;
         let rules = YamlRules::new(yaml_kinds(), tree.root_node());
-        let (nodes, symbols) =
+        let (syntax_elements, symbols) =
             extract::extract(tree.root_node(), source, limits, &self.language, &rules)?;
         Ok(SyntaxDocument::new(
             self.language.clone(),
             source.path.clone(),
-            nodes,
+            syntax_elements,
             symbols,
             tree.root_node().has_error(),
         )
@@ -375,10 +377,10 @@ impl SyntaxProvider for YamlSyntaxProvider {
         .with_syntax_limits(limits))
     }
 
-    /// Portable structural facets for one YAML grammar node kind. The
-    /// structural kinds - `stream`, node wrappers, mappings, sequences -
+    /// Portable structural facets for one YAML grammar syntax element kind. The
+    /// structural kinds - `stream`, syntax element wrappers, mappings, sequences -
     /// carry none.
-    fn node_facets(&self, kind: &str) -> Vec<NodeFacet> {
+    fn syntax_element_facets(&self, kind: &str) -> Vec<NodeFacet> {
         match kind {
             // The pair declares its key's name; a document declares its
             // ordinal in a multi-document stream; an anchor introduces a
@@ -398,7 +400,7 @@ impl SyntaxProvider for YamlSyntaxProvider {
             | "null_scalar" => vec![NodeFacet::Literal],
             // An alias is a written name referring to an anchor.
             "alias" => vec![NodeFacet::Identifier],
-            // A tag or directive qualifies the node or document it rides.
+            // A tag or directive qualifies the syntax element or document it rides.
             "tag" | "yaml_directive" | "tag_directive" | "reserved_directive" => {
                 vec![NodeFacet::Annotation]
             }
@@ -465,8 +467,10 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "must define node kind used by symbol extraction: \
-                               kind=no_such_kind")]
+    #[should_panic(
+        expected = "must define syntax_element kind used by symbol extraction: \
+                               kind=no_such_kind"
+    )]
     fn test_kind_resolution_refuses_a_kind_the_grammar_lacks() {
         let _ = kind_id(&yaml_grammar(), "no_such_kind");
     }
@@ -487,7 +491,7 @@ mod tests {
 
     /// Block and flow entries qualify through their key path with
     /// byte-exact spans: the whole pair for `range` and `item_range`, the
-    /// value node for `body_range`.
+    /// value syntax element for `body_range`.
     #[test]
     fn test_block_and_flow_entries_qualify_through_the_key_path() {
         let text = "server:\n  port: 8080\nflow: {a: 1, b: [2, 3]}\n";
@@ -699,7 +703,7 @@ mod tests {
     fn test_provider_reports_malformed_tree_without_dropping_facts() {
         let document = analyze("key: [unclosed\n");
         assert!(document.has_errors());
-        assert!(!document.nodes().is_empty());
+        assert!(!document.syntax_elements().is_empty());
     }
 
     /// CRLF sources keep byte-exact spans: names exclude `\r`, and every
@@ -731,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn test_provider_enforces_source_node_and_depth_limits() {
+    fn test_provider_enforces_source_syntax_element_and_depth_limits() {
         let bounded = |limits: SyntaxLimits, text: &str| {
             YamlSyntaxProvider::default().analyze(
                 SyntaxSource {
@@ -751,14 +755,14 @@ mod tests {
             rift_error::errors::syntax::source_too_large::SLUG
         );
 
-        let node_error = bounded(
+        let syntax_element_error = bounded(
             SyntaxLimits::new(100, 1, 10).expect("positive limits"),
             "a: 1\n",
         )
-        .expect_err("node bound");
+        .expect_err("syntax element bound");
         assert_eq!(
-            node_error.slug(),
-            rift_error::errors::syntax::too_many_nodes::SLUG
+            syntax_element_error.slug(),
+            rift_error::errors::syntax::too_many_syntax_elements::SLUG
         );
 
         let depth_error = bounded(
@@ -798,7 +802,7 @@ mod tests {
     /// `Literal`, an alias as `Identifier`, tags and directives as
     /// `Annotation`, and structure carries none.
     #[test]
-    fn test_node_facets_classify_the_interpreted_kinds() {
+    fn test_syntax_element_facets_classify_the_interpreted_kinds() {
         let provider = YamlSyntaxProvider::default();
         for kind in [
             BLOCK_MAPPING_PAIR_KIND,
@@ -807,7 +811,7 @@ mod tests {
             "anchor",
         ] {
             assert_eq!(
-                provider.node_facets(kind),
+                provider.syntax_element_facets(kind),
                 [NodeFacet::Declaration],
                 "kind {kind} must classify as a declaration"
             );
@@ -821,12 +825,15 @@ mod tests {
             "integer_scalar",
         ] {
             assert_eq!(
-                provider.node_facets(kind),
+                provider.syntax_element_facets(kind),
                 [NodeFacet::Literal],
                 "kind {kind} must classify as a literal value"
             );
         }
-        assert_eq!(provider.node_facets("alias"), [NodeFacet::Identifier]);
+        assert_eq!(
+            provider.syntax_element_facets("alias"),
+            [NodeFacet::Identifier]
+        );
         for kind in [
             "tag",
             "yaml_directive",
@@ -834,16 +841,19 @@ mod tests {
             "reserved_directive",
         ] {
             assert_eq!(
-                provider.node_facets(kind),
+                provider.syntax_element_facets(kind),
                 [NodeFacet::Annotation],
                 "kind {kind} must classify as an annotation"
             );
         }
-        assert_eq!(provider.node_facets("comment"), [NodeFacet::Comment]);
+        assert_eq!(
+            provider.syntax_element_facets("comment"),
+            [NodeFacet::Comment]
+        );
         for kind in [
             "stream",
-            BLOCK_NODE_KIND,
-            FLOW_NODE_KIND,
+            BLOCK_SYNTAX_ELEMENT_KIND,
+            FLOW_SYNTAX_ELEMENT_KIND,
             "block_mapping",
             "flow_mapping",
             "block_sequence",
@@ -851,7 +861,7 @@ mod tests {
             "flow_sequence",
         ] {
             assert_eq!(
-                provider.node_facets(kind),
+                provider.syntax_element_facets(kind),
                 [],
                 "structural kind {kind} carries no portable facet"
             );

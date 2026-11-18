@@ -100,7 +100,7 @@ pub struct PackageIdentity {
 pub type SourceUnitId = String;
 /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
 pub type SymbolId = String;
-/// Readable Symbol assembled from normalized Contributions. Source structure lives in Node
+/// Readable Symbol assembled from normalized Contributions. Source structure lives in `SyntaxElement`
 /// and is connected through Relationship.
 #[serde_with::skip_serializing_none]
 #[derive(
@@ -1267,7 +1267,7 @@ pub struct PackageSearchHit {
     /// One package as its package manager identifies it.
     #[validate(nested)]
     pub package: PackageIdentity,
-    /// Readable Symbol assembled from normalized Contributions. Source structure lives in Node
+    /// Readable Symbol assembled from normalized Contributions. Source structure lives in `SyntaxElement`
     /// and is connected through Relationship.
     #[validate(nested)]
     pub symbol: Symbol,
@@ -1350,7 +1350,7 @@ pub struct PackagePatternRequest {
 /// The smallest declaration whose range holds a match. A match no declaration holds carries none.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 pub struct PackagePatternDeclaration {
-    /// Readable Symbol assembled from normalized Contributions. Source structure lives in Node
+    /// Readable Symbol assembled from normalized Contributions. Source structure lives in `SyntaxElement`
     /// and is connected through Relationship.
     pub symbol: Symbol,
     /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
@@ -2810,7 +2810,7 @@ pub struct GetSymbolParams {
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub id: String,
     /// Requested projections. Omitted or empty requests none. A declaration's source is read
-    /// by `nodes` with `symbol`.
+    /// by `facets` with `symbol`.
     pub include: Option<Vec<GetSymbolInclude>>,
     /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
     #[validate(
@@ -3007,6 +3007,8 @@ impl<'de> serde::Deserialize<'de> for PositionEncoding {
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(default)]
 pub struct ReadWarning {
+    #[default(Some("object_unavailable".to_string()))]
+    pub code: Option<String>,
     /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. It names no revision: a read selects the revision whose bytes it answers. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
     pub unit: Option<String>,
     /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
@@ -3021,8 +3023,6 @@ pub struct ReadWarning {
     pub field: Option<String>,
     /// Enforced public field bound.
     pub bound: Option<u64>,
-    #[default(Some("object_unavailable".to_string()))]
-    pub code: Option<String>,
     /// Frameworks whose syntax depends on package or component context.
     pub framework: Option<SyntaxFramework>,
     /// The missing package version, configuration, or template source.
@@ -3312,6 +3312,17 @@ impl<'de> serde::Deserialize<'de> for RelationshipFacet {
 pub type RevisionId = String;
 /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
 pub type Revision = String;
+/// A copy of source from the catalog. The unit may belong to the project, a dependency, or
+/// the standard library; the excerpt preserves bytes as they were when the answer was
+/// produced.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct SourceExcerpt {
+    /// One byte range in a source-catalog unit.
+    pub span: SourceUnitSpan,
+    /// The source bytes returned by the request.
+    pub text: String,
+}
 /// One exact position in a source unit, at the release of a package or runtime unit.
 #[serde_with::skip_serializing_none]
 #[derive(
@@ -3801,10 +3812,7 @@ impl SearchUnavailable {
         })
     }
 }
-/// Lists syntax nodes with their source: every node of one `symbol`, or the nodes of the
-/// innermost declaration holding one `position` in one file, or of that file's unit when no
-/// declaration holds it. Each node carries its kind, range, source text, and place, including
-/// expressions smaller than a declaration.
+/// Reads every declaration of one symbol with its location, source, and syntax structure.
 #[serde_with::skip_serializing_none]
 #[derive(
     Debug,
@@ -3815,33 +3823,13 @@ impl SearchUnavailable {
     oas3_gen_support::Default
 )]
 #[serde(deny_unknown_fields)]
-pub struct NodesParams {
+pub struct FacetsParams {
     /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
-    pub symbol: Option<String>,
-    /// One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift
-    /// normalizes what it emits and what it accepts, and compares byte-for-byte. The empty path
-    /// names the root itself. Absolute paths, backslashes, control characters, empty segments,
-    /// and `.` or `..` segments are refused before the filesystem is touched. The limit is 1000
-    /// UTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal
-    /// fails the read that touches them with `content_unavailable`.
-    #[validate(
-        length(max = 1_000u64),
-        regex(path = "REGEX_DOCUMENTATION_LICENSE_FILE_PATH")
-    )]
-    pub path: Option<String>,
-    /// UTF-8 byte offset inside the declaration whose nodes the read lists - one position,
-    /// not a range; the nodes themselves carry the spans. The read lists the nodes of the
-    /// innermost declaration holding the node at the position, or of the file's unit when no
-    /// declaration holds it. A position inside a multi-byte character is valid; a position at
-    /// or past the file's byte length refuses.
-    #[validate(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
-    pub position: Option<u64>,
-    /// Continuation a preceding read returned, bound to the symbol or unit its answer listed
-    /// and the tree revision it read. The caller MUST send it with the selector of that read;
-    /// the server refuses it for another symbol or unit and once the tree has moved.
+    pub symbol: String,
+    /// Continuation returned by a preceding read of this symbol at the same revision.
     #[validate(length(min = 1u64, max = 4_096u64))]
-    pub node_cursor: Option<String>,
+    pub facet_cursor: Option<String>,
     /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
     #[validate(
         length(min = 1u64, max = 8_192u64),
@@ -3849,41 +3837,38 @@ pub struct NodesParams {
     )]
     pub revision: Option<String>,
 }
-/// The nodes a read selected, each with its source text and its place inside its symbol or
-/// unit.
+/// Declarations of one symbol, each with its location, source, and syntax structure.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
-pub struct NodesResult {
+pub struct FacetsResult {
     /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
-    pub symbol: Option<String>,
-    /// Nodes the read selected, in pre-order: per declaration, in the order a symbol read
-    /// lists them, or the unit's nodes from its file node on.
-    pub nodes: Vec<Node>,
-    /// Continuation for the rest of an answer whose nodes crossed its node count or source
-    /// byte bound. Absent when the answer holds the last node.
-    pub node_cursor: Option<String>,
+    pub symbol: String,
+    /// Declarations in symbol order, with each declaration's syntax elements in pre-order.
+    pub declarations: Vec<FacetDeclaration>,
+    /// Continues the declarations of this symbol at this revision.
+    pub facet_cursor: Option<String>,
     /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
     pub revision: String,
-    /// Warnings attached to this result. Absent when there is nothing to warn about.
+    /// Conditions affecting this answer. Absent when empty.
     #[default(Some(Default::default()))]
     pub warnings: Option<Vec<ReadWarning>>,
 }
-/// One node of a source unit's syntax tree, with its source text, addressed by its place inside
-/// a symbol. A node inside a declaration's item subtree is node `index` of declaration
-/// `declaration` of the symbol the read names; a node outside every declaration is node `index`
-/// of its `unit`. Indexes count in pre-order from 0 at the declaration's item node, or from 0 at
-/// the unit's file node, and skip the subtrees of nested declarations, whose nodes belong to the
-/// nested symbol. The address names a place at the read's revision: an edit renumbers the nodes
+/// One syntax element of a source unit's syntax tree, with its source text, addressed by its place inside
+/// a symbol. A syntax element inside a declaration's item subtree is syntax element `index` of declaration
+/// `declaration` of the symbol the read names; a syntax element outside every declaration is syntax element `index`
+/// of its `unit`. Indexes count in pre-order from 0 at the declaration's item syntax element, or from 0 at
+/// the unit's file syntax element, and skip the subtrees of nested declarations, whose syntax elements belong to the
+/// nested symbol. The address names a place at the read's revision: an edit renumbers the syntax elements
 /// after it.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
-pub struct Node {
-    /// Ordinal of the declaration holding this node among the declarations of the symbol the
-    /// read names, from 0 in the order a symbol read lists them. Absent for a node outside
-    /// every declaration: the file node, an import, a top-level statement.
+pub struct SyntaxElement {
+    /// Ordinal of the declaration holding this syntax element among the declarations of the symbol the
+    /// read names, from 0 in the order a symbol read lists them. Absent for a syntax element outside
+    /// every declaration: the file syntax element, an import, a top-level statement.
     pub declaration: Option<u64>,
-    /// Pre-order position of this node inside its declaration's item subtree, or inside its
-    /// unit when `declaration` is absent. The item node and the unit's file node are 0.
+    /// Pre-order position of this syntax element inside its declaration's item subtree, or inside its
+    /// unit when `declaration` is absent. The item syntax element and the unit's file syntax element are 0.
     pub index: u64,
     /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. It names no revision: a read selects the revision whose bytes it answers. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
     pub unit: String,
@@ -3901,13 +3886,13 @@ pub struct Node {
     /// another, so that `end` is never below `start` is asserted by the surface
     /// validation tests instead.
     pub range: TextRange,
-    /// The node's exact source text: the bytes `range` spans at the read's revision.
+    /// The syntax element's exact source text: the bytes `range` spans at the read's revision.
     pub source: String,
-    /// The node's named parts, including its function body and documentation. Absent when empty.
+    /// The syntax element's named parts, including its function body and documentation. Absent when empty.
     #[default(Some(Default::default()))]
-    pub regions: Option<Vec<NodeRegion>>,
-    /// `index` of the node this one is nested inside, in the same declaration or unit. Absent
-    /// for node 0.
+    pub regions: Option<Vec<FacetRegion>>,
+    /// `index` of the syntax element this one is nested inside, in the same declaration or unit. Absent
+    /// for syntax element 0.
     pub parent: Option<u64>,
     /// Facts a provider carries that the model has no field for, under a reverse-domain key.
     /// Keys and values use RFC 8785 canonical JSON. Consumers skip entries they do not
@@ -4035,11 +4020,11 @@ impl<'de> serde::Deserialize<'de> for NodeFacet {
         }
     }
 }
-/// One named part of a node, and the bytes it spans.
+/// One named part of a syntax element, and the bytes it spans.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
-pub struct NodeRegion {
-    /// One named part of a node. A language marks these out inside a declaration, so an
+pub struct FacetRegion {
+    /// One named part of a syntax element. A language marks these out inside a declaration, so an
     /// operation can address the body of a function without addressing its documentation.
     pub role: RegionRole,
     /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
@@ -4049,11 +4034,11 @@ pub struct NodeRegion {
     /// validation tests instead.
     pub range: TextRange,
 }
-/// One named part of a node. A language marks these out inside a declaration, so an
+/// One named part of a syntax element. A language marks these out inside a declaration, so an
 /// operation can address the body of a function without addressing its documentation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
 pub enum RegionRole {
-    /// The stretch that best identifies the node when presented.
+    /// The stretch that best identifies the syntax element when presented.
     #[default]
     Selection,
     /// The name being declared.
@@ -4062,11 +4047,11 @@ pub enum RegionRole {
     Header,
     /// The implementation, without documentation or header.
     Body,
-    /// The interior of the node without its delimiters.
+    /// The interior of the syntax element without its delimiters.
     Content,
     /// The doc comment attached to the declaration.
     Documentation,
-    /// The full extent including what surrounds the node proper.
+    /// The full extent including what surrounds the syntax element proper.
     Enclosing,
 }
 impl core::fmt::Display for RegionRole {
@@ -4174,7 +4159,7 @@ pub struct QuerySource {
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
 pub struct QuerySymbol {
-    /// Readable Symbol assembled from normalized Contributions. Source structure lives in Node
+    /// Readable Symbol assembled from normalized Contributions. Source structure lives in `SyntaxElement`
     /// and is connected through Relationship.
     pub symbol: Symbol,
     /// Physical declarations, preserving their association indices.
@@ -4353,6 +4338,29 @@ pub struct RelationshipSelection {
 }
 /// Complete lowercase SHA-256 digest of immutable source bytes.
 pub type SourceDigest = String;
+/// One facet: a declaration with its location, source, and syntax structure.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct FacetDeclaration {
+    /// Declaration ordinal in the symbol, from zero.
+    pub declaration: u64,
+    /// A provider-local kind preserving the construct name used by that language implementation.
+    pub kind: String,
+    /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
+    /// from whatever its toolchain counts in at its own boundary, so two toolchains' column
+    /// numbers arrive here on the same scale. No JSON Schema keyword can tie one field to
+    /// another, so that `end` is never below `start` is asserted by the surface
+    /// validation tests instead.
+    pub range: TextRange,
+    /// A copy of source from the catalog. The unit may belong to the project, a dependency, or
+    /// the standard library; the excerpt preserves bytes as they were when the answer was
+    /// produced.
+    pub source: SourceExcerpt,
+    /// Named regions supplied by the syntax provider.
+    pub regions: Option<Vec<FacetRegion>>,
+    /// The declaration's syntax structure.
+    pub syntax: Vec<SyntaxElement>,
+}
 /// Returns supported package managers, features, publication revisions, and active bounds.
 #[derive(Debug, Clone, validator::Validate, oas3_gen_support::Default)]
 pub struct GetCapabilitiesRequest {}
@@ -4947,119 +4955,119 @@ pub enum GetSymbolResponse {
     ///default: Unknown response
     Unknown,
 }
-/// Lists the syntax nodes of one package or runtime symbol with their source text, in the exact release its identity names: each declaration's item node, then the descendants that belong to that declaration and not to a declaration nested in it, outermost first per declaration. Every node's `unit` is a source unit of that release. The request carries `symbol` and MAY carry `node_cursor` and `revision`; the server refuses `path` and `position`. A page holds at most `page_limit_max` nodes and, beyond its first node, at most `x-rift-page-source-bytes-max` bytes of node source; `node_cursor` continues where the page stopped. A symbol the release does not declare answers 404.
+/// Reads every declaration of one package or runtime symbol with its location, exact source, and syntax structure. The request carries `symbol` and MAY carry `facet_cursor` and `revision`. Each declaration carries its syntax tree. The answer names the release it read. A page holds at most `page_limit_max` declarations and at least one whole declaration; beyond its first declaration, the syntax source stays within `x-rift-page-source-bytes-max`. The caller MUST return `facet_cursor` with the same symbol and revision. A symbol the release does not declare answers 404.
 #[derive(Debug, Clone, validator::Validate, oas3_gen_support::Default)]
-pub struct NodesRequest {
-    /// The package or runtime symbol whose nodes the request lists.
+pub struct FacetsRequest {
+    /// The package or runtime symbol whose facets the request reads.
     #[validate(nested)]
-    pub body: NodesParams,
+    pub body: FacetsParams,
 }
-impl NodesRequest {
+impl FacetsRequest {
     /// Parse the HTTP response into the response enum.
     pub async fn parse_response(
         req: reqwest::Response,
-    ) -> anyhow::Result<NodesResponse> {
+    ) -> anyhow::Result<FacetsResponse> {
         let status = req.status();
         if status == http::StatusCode::OK {
             let data = oas3_gen_support::Diagnostics::<
-                NodesResult,
+                FacetsResult,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(NodesResponse::Ok(data));
+            return Ok(FacetsResponse::Ok(data));
         }
         if status == http::StatusCode::BAD_REQUEST {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(NodesResponse::BadRequest(data));
+            return Ok(FacetsResponse::BadRequest(data));
         }
         if status == http::StatusCode::UNAUTHORIZED {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(NodesResponse::Unauthorized(data));
+            return Ok(FacetsResponse::Unauthorized(data));
         }
         if status == http::StatusCode::FORBIDDEN {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(NodesResponse::Forbidden(data));
+            return Ok(FacetsResponse::Forbidden(data));
         }
         if status == http::StatusCode::NOT_ACCEPTABLE {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(NodesResponse::NotAcceptable(data));
+            return Ok(FacetsResponse::NotAcceptable(data));
         }
         if status == http::StatusCode::PAYLOAD_TOO_LARGE {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(NodesResponse::ContentTooLarge(data));
+            return Ok(FacetsResponse::ContentTooLarge(data));
         }
         if status == http::StatusCode::UNSUPPORTED_MEDIA_TYPE {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(NodesResponse::UnsupportedMediaType(data));
+            return Ok(FacetsResponse::UnsupportedMediaType(data));
         }
         if status == http::StatusCode::TOO_MANY_REQUESTS {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(NodesResponse::TooManyRequests(data));
+            return Ok(FacetsResponse::TooManyRequests(data));
         }
         if status == http::StatusCode::INTERNAL_SERVER_ERROR {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(NodesResponse::InternalServerError(data));
+            return Ok(FacetsResponse::InternalServerError(data));
         }
         if status == http::StatusCode::BAD_GATEWAY {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(NodesResponse::BadGateway(data));
+            return Ok(FacetsResponse::BadGateway(data));
         }
         if status == http::StatusCode::SERVICE_UNAVAILABLE {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(NodesResponse::ServiceUnavailable(data));
+            return Ok(FacetsResponse::ServiceUnavailable(data));
         }
         if status == http::StatusCode::GATEWAY_TIMEOUT {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(NodesResponse::GatewayTimeout(data));
+            return Ok(FacetsResponse::GatewayTimeout(data));
         }
         if status == http::StatusCode::NOT_FOUND {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(NodesResponse::NotFound(data));
+            return Ok(FacetsResponse::NotFound(data));
         }
         let _ = req.bytes().await?;
-        return Ok(NodesResponse::Unknown);
+        return Ok(FacetsResponse::Unknown);
     }
 }
-/// Response types for nodes
+/// Response types for facets
 #[derive(Debug, Clone)]
-pub enum NodesResponse {
-    ///200: The symbol's nodes with their source text.
-    Ok(NodesResult),
+pub enum FacetsResponse {
+    ///200: The symbol's declarations with exact source and syntax structure.
+    Ok(FacetsResult),
     ///400: Request JSON, query parameters, or field relationships are invalid.
     BadRequest(ProblemDetails),
     ///401: Authentication is required or credentials are invalid.
@@ -5540,6 +5548,8 @@ impl<'de> serde::Deserialize<'de> for PackageSearchHitContributingField {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct DocumentationSourceIdentityProjectPath {
+    #[default("project".to_string())]
+    pub kind: String,
     /// One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift
     /// normalizes what it emits and what it accepts, and compares byte-for-byte. The empty path
     /// names the root itself. Absolute paths, backslashes, control characters, empty segments,
@@ -5551,8 +5561,6 @@ pub struct DocumentationSourceIdentityProjectPath {
         regex(path = "REGEX_DOCUMENTATION_LICENSE_FILE_PATH")
     )]
     pub path: String,
-    #[default("project".to_string())]
-    pub kind: String,
 }
 /// A source unit supplied by an exact package adapter.
 #[derive(
@@ -5566,14 +5574,14 @@ pub struct DocumentationSourceIdentityProjectPath {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct DocumentationSourceIdentitySourceUnitId {
+    #[default("package".to_string())]
+    pub kind: String,
     /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. It names no revision: a read selects the revision whose bytes it answers. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
     #[validate(
         length(min = 17u64, max = 8_192u64),
         regex(path = "REGEX_PACKAGE_SEARCH_HIT_UNIT")
     )]
     pub unit: String,
-    #[default("package".to_string())]
-    pub kind: String,
 }
 /// A valid identifier stored in the notebook.
 #[derive(
@@ -5587,11 +5595,11 @@ pub struct DocumentationSourceIdentitySourceUnitId {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct NotebookCellIdentityObject {
+    #[default("authored".to_string())]
+    pub kind: String,
     /// Identifier accepted by the notebook format.
     #[validate(length(min = 1u64))]
     pub id: String,
-    #[default("authored".to_string())]
-    pub kind: String,
 }
 /// The cell's zero-based position in its notebook.
 #[derive(
@@ -5605,11 +5613,11 @@ pub struct NotebookCellIdentityObject {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct NotebookCellIdentityObject2 {
+    #[default("indexed".to_string())]
+    pub kind: String,
     /// Position among every cell, including unselected cells.
     #[validate(range(min = 0))]
     pub index: u32,
-    #[default("indexed".to_string())]
-    pub kind: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
 pub enum PackageDocumentationHitContributingField {
@@ -5658,11 +5666,11 @@ impl<'de> serde::Deserialize<'de> for PackageDocumentationHitContributingField {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct SearchHitTargetDocumentationHit {
+    #[default("documentation".to_string())]
+    pub target: String,
     /// One documentation block projected from its existing content owner.
     #[validate(nested)]
     pub documentation: DocumentationHit,
-    #[default("documentation".to_string())]
-    pub target: String,
 }
 /// A symbol hit: the declaration a provider resolved.
 #[derive(
@@ -5676,12 +5684,12 @@ pub struct SearchHitTargetDocumentationHit {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct SearchHitTargetSymbol {
-    /// Readable Symbol assembled from normalized Contributions. Source structure lives in Node
+    #[default("symbol".to_string())]
+    pub target: String,
+    /// Readable Symbol assembled from normalized Contributions. Source structure lives in `SyntaxElement`
     /// and is connected through Relationship.
     #[validate(nested)]
     pub symbol: Symbol,
-    #[default("symbol".to_string())]
-    pub target: String,
 }
 /// A file hit: one entry of the tree, whether or not any provider reads it.
 #[serde_with::skip_serializing_none]
@@ -5696,6 +5704,8 @@ pub struct SearchHitTargetSymbol {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct SearchHitTargetObject {
+    #[default("file".to_string())]
+    pub target: String,
     /// Size in bytes.
     #[validate(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
     pub size: u64,
@@ -5703,8 +5713,6 @@ pub struct SearchHitTargetObject {
     /// Absent when empty.
     #[default(Some(Default::default()))]
     pub languages: Option<Vec<String>>,
-    #[default("file".to_string())]
-    pub target: String,
 }
 /// A commit hit: one commit the history store holds, matched by its message.
 #[derive(
@@ -5718,17 +5726,17 @@ pub struct SearchHitTargetObject {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct SearchHitTargetCommitHit {
+    #[default("commit".to_string())]
+    pub target: String,
     /// One commit whose message matched a commit search, as the history store holds it.
     #[validate(nested)]
     pub commit: CommitHit,
-    #[default("commit".to_string())]
-    pub target: String,
 }
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 pub struct PackageSearchItemVariant0 {
     /// One package as its package manager identifies it.
     pub package: PackageIdentity,
-    /// Readable Symbol assembled from normalized Contributions. Source structure lives in Node
+    /// Readable Symbol assembled from normalized Contributions. Source structure lives in `SyntaxElement`
     /// and is connected through Relationship.
     pub symbol: Symbol,
     /// The provider's qualified declaration name used for identifier ranking, with its original spelling.
@@ -5822,6 +5830,8 @@ pub struct PackageSearchItemVariant2 {
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct DeclarationPositionResultObject {
+    #[default("found".to_string())]
+    pub outcome: String,
     /// One exact position in a source unit, at the release of a package or runtime unit.
     pub position: SourcePosition,
     /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
@@ -5830,34 +5840,34 @@ pub struct DeclarationPositionResultObject {
     pub kind: String,
     /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
     pub revision: String,
-    #[default("found".to_string())]
-    pub outcome: String,
 }
 /// The complete facts of the position's release hold no declaration at this position.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct DeclarationPositionResultSourcePosition {
-    /// One exact position in a source unit, at the release of a package or runtime unit.
-    pub position: SourcePosition,
     #[default("missing".to_string())]
     pub outcome: String,
+    /// One exact position in a source unit, at the release of a package or runtime unit.
+    pub position: SourcePosition,
 }
 /// Presence or absence cannot be established at this exact position.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct DeclarationPositionResultObject2 {
+    #[default("unavailable".to_string())]
+    pub outcome: String,
     /// One exact position in a source unit, at the release of a package or runtime unit.
     pub position: SourcePosition,
     /// Why an exact selection cannot establish presence or definite absence.
     pub reason: SymbolUnavailableReason,
-    #[default("unavailable".to_string())]
-    pub outcome: String,
 }
 /// The exact identity was established, even when it has no source declarations.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct GetSymbolResultObject {
-    /// Readable Symbol assembled from normalized Contributions. Source structure lives in Node
+    #[default("found".to_string())]
+    pub outcome: String,
+    /// Readable Symbol assembled from normalized Contributions. Source structure lives in `SyntaxElement`
     /// and is connected through Relationship.
     pub symbol: Symbol,
     /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
@@ -5876,26 +5886,26 @@ pub struct GetSymbolResultObject {
     pub documentation: Option<DocumentationContext>,
     /// Projection cuts and other typed read warnings.
     pub warnings: Option<Vec<ReadWarning>>,
-    #[default("found".to_string())]
-    pub outcome: String,
 }
 /// The valid identity is absent from the completely searched exact selection.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct GetSymbolResultObject2 {
+    #[default("missing".to_string())]
+    pub outcome: String,
     /// Definite absence after a complete exact selection, with bounded alternatives.
     pub symbol_not_found: SymbolNotFound,
     /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
     pub revision: String,
     /// Warnings, including incomplete candidate work.
     pub warnings: Option<Vec<ReadWarning>>,
-    #[default("missing".to_string())]
-    pub outcome: String,
 }
 /// The exact selection cannot establish presence or absence.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct GetSymbolResultObject3 {
+    #[default("unavailable".to_string())]
+    pub outcome: String,
     /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     pub id: String,
     /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
@@ -5904,8 +5914,6 @@ pub struct GetSymbolResultObject3 {
     pub reason: SymbolUnavailableReason,
     /// Details and available partial-read warnings.
     pub warnings: Option<Vec<ReadWarning>>,
-    #[default("unavailable".to_string())]
-    pub outcome: String,
 }
 /// The commit brought the symbol into existence.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
@@ -5971,14 +5979,14 @@ pub struct HistoryEdgeSymbolId {
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct SearchUnavailableObject {
+    #[default("unavailable".to_string())]
+    pub outcome: String,
     /// Why an exact selection cannot establish presence or definite absence.
     pub reason: SymbolUnavailableReason,
     /// The immutable serving view and the expiry promised by its owner.
     pub view: Option<CapturedView>,
     /// Details and partial-read warnings.
     pub warnings: Option<Vec<ReadWarning>>,
-    #[default("unavailable".to_string())]
-    pub outcome: String,
 }
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(untagged)]

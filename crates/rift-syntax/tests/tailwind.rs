@@ -50,15 +50,15 @@ fn tailwind_static_classes_variants_and_dynamic_expressions_across_templates() {
                     .symbols
                     .iter()
                     .any(|symbol| symbol.kind == kind && symbol.name == name),
-                "{name}: {text}; nodes={:?}",
-                document.nodes()
+                "{name}: {text}; syntax_elements={:?}",
+                document.syntax_elements()
             );
         }
         if text.contains("selected") {
             assert!(
                 !facts.unresolved.is_empty(),
-                "dynamic classes: {text}; nodes={:?}; facts={facts:?}",
-                document.nodes()
+                "dynamic classes: {text}; syntax_elements={:?}; facts={facts:?}",
+                document.syntax_elements()
             );
         }
         assert!(facts.symbols.iter().all(|symbol| text
@@ -113,8 +113,8 @@ fn tailwind_version_specific_directives_and_theme_configuration_references() {
                 .symbols
                 .iter()
                 .any(|symbol| symbol.kind == kind && symbol.name == name),
-            "{kind}:{name}; facts={facts:?}; nodes={:?}",
-            document.nodes()
+            "{kind}:{name}; facts={facts:?}; syntax_elements={:?}",
+            document.syntax_elements()
         );
     }
     let reference = facts
@@ -158,12 +158,13 @@ fn tailwind_dynamic_class_strings_preserve_ranges_and_context_bound_refuses() {
         tailwind_symbols(source, &document, 4, SyntaxLimits::default()).expect("dynamic context");
     assert!(facts.symbols.is_empty());
     assert_eq!(facts.unresolved.len(), 1);
-    let limits = SyntaxLimits::new(text.len(), document.nodes().len(), 128).expect("bounds");
+    let limits =
+        SyntaxLimits::new(text.len(), document.syntax_elements().len(), 128).expect("bounds");
     assert_eq!(
         tailwind_symbols(source, &document, 4, limits)
             .expect_err("combined context bound")
             .slug(),
-        rift_error::errors::syntax::too_many_nodes::SLUG
+        rift_error::errors::syntax::too_many_syntax_elements::SLUG
     );
 }
 
@@ -199,12 +200,13 @@ fn tailwind_many_classes_refuse_before_exceeding_available_fact_slots() {
     let document = HtmlSyntaxProvider::default()
         .analyze(source, SyntaxLimits::default())
         .expect("HTML syntax");
-    let limits = SyntaxLimits::new(text.len(), document.nodes().len() + 1, 128).expect("bounds");
+    let limits =
+        SyntaxLimits::new(text.len(), document.syntax_elements().len() + 1, 128).expect("bounds");
     assert_eq!(
         tailwind_symbols(source, &document, 4, limits)
             .expect_err("one fact slot")
             .slug(),
-        rift_error::errors::syntax::too_many_nodes::SLUG
+        rift_error::errors::syntax::too_many_syntax_elements::SLUG
     );
 }
 
@@ -378,9 +380,9 @@ fn tailwind_screen_variant_keeps_version_and_escaped_configuration_unresolved() 
         .expect("CSS syntax");
     assert!(document.has_errors());
     let errors: Vec<_> = document
-        .nodes()
+        .syntax_elements()
         .iter()
-        .filter(|node| node.kind == "ERROR")
+        .filter(|syntax_element| syntax_element.kind == "ERROR")
         .collect();
     assert_eq!(errors.len(), 1);
     let start = usize::try_from(errors[0].range.start).expect("bounded source bytes");

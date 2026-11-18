@@ -284,35 +284,38 @@ fn the_pattern_max_length_is_the_search_pattern_bound() -> TestResult {
     Ok(())
 }
 
-/// The contract states the source bound a nodes page stops at and the cursor bound the
+/// The contract states the source bound a facets page stops at and the cursor bound the
 /// client enforces, and a drift in either fails validation.
 #[test]
-fn the_nodes_page_bounds_are_the_ones_the_client_enforces() -> TestResult {
+fn the_facets_page_bounds_are_the_ones_the_client_enforces() -> TestResult {
     let mut document = contract()?;
-    document["paths"]["/v1/nodes"]["post"]["x-rift-page-source-bytes-max"] = json!(2_097_152);
+    document["paths"]["/v1/facets"]["post"]["x-rift-page-source-bytes-max"] = json!(2_097_152);
     assert_invalid(&document, "x-rift-page-source-bytes-max")?;
 
     let mut document = contract()?;
-    document["components"]["schemas"]["NodesParams"]["properties"]["node_cursor"]["maxLength"] =
+    document["components"]["schemas"]["FacetsParams"]["properties"]["facet_cursor"]["maxLength"] =
         json!(8192);
-    assert_invalid(&document, "NodesParams/node_cursor/maxLength")?;
+    assert_invalid(&document, "FacetsParams/facet_cursor/maxLength")?;
 
     let mut document = contract()?;
-    document["paths"]["/v1/nodes"]["post"]["requestBody"]["content"]["application/json"]["schema"] =
+    document["paths"]["/v1/facets"]["post"]["requestBody"]["content"]["application/json"]["schema"] =
         json!({"$ref": "#/components/schemas/GetSymbolParams"});
-    assert_invalid(&document, "POST /v1/nodes request must use NodesParams")?;
+    assert_invalid(&document, "POST /v1/facets request must use FacetsParams")?;
 
     let mut document = contract()?;
-    document["paths"]["/v1/nodes"]["post"]["responses"]["200"]["content"]["application/json"]["schema"] =
+    document["paths"]["/v1/facets"]["post"]["responses"]["200"]["content"]["application/json"]["schema"] =
         json!({"$ref": "#/components/schemas/GetSymbolResult"});
     assert_invalid(
         &document,
-        "POST /v1/nodes 200 response must use NodesResult",
+        "POST /v1/facets 200 response must use FacetsResult",
     )?;
 
     let mut document = contract()?;
-    document["paths"]["/v1/nodes"]["post"]["parameters"] = json!([]);
-    assert_invalid(&document, "POST /v1/nodes must not declare query selectors")?;
+    document["paths"]["/v1/facets"]["post"]["parameters"] = json!([]);
+    assert_invalid(
+        &document,
+        "POST /v1/facets must not declare query selectors",
+    )?;
     Ok(())
 }
 
@@ -406,8 +409,8 @@ fn search_request_examples_carry_the_terms_and_identifiers_of_their_query() -> T
     Ok(())
 }
 
-fn decode_examples(node: &Value, checked: &mut usize) -> TestResult {
-    match node {
+fn decode_examples(syntax_element: &Value, checked: &mut usize) -> TestResult {
+    match syntax_element {
         Value::Object(object) => {
             if let (Some(schema), Some(examples)) = (
                 object.get("schema"),
@@ -493,9 +496,15 @@ fn decode_generated_response_example(reference: &str, value: Value) -> TestResul
         "#/components/schemas/PackagePatternPage" => {
             serde_json::from_value::<PackagePatternPage>(value)?;
         }
-        "#/components/schemas/NodesResult" => {
-            let result = serde_json::from_value::<rift_protocol::read::NodesResult>(value)?;
-            assert!(result.nodes.iter().all(|node| !node.unit.is_project()));
+        "#/components/schemas/FacetsResult" => {
+            let result = serde_json::from_value::<rift_protocol::read::FacetsResult>(value)?;
+            assert!(
+                result
+                    .declarations
+                    .iter()
+                    .flat_map(|declaration| &declaration.syntax)
+                    .all(|syntax_element| !syntax_element.unit.is_project())
+            );
         }
         "#/components/schemas/FindDeclarationsResult" => {
             serde_json::from_value::<rift_protocol::source_read::FindDeclarationsResult>(value)?;
@@ -504,7 +513,7 @@ fn decode_generated_response_example(reference: &str, value: Value) -> TestResul
         | "#/components/schemas/PackageSearchRequest"
         | "#/components/schemas/PackagePatternRequest"
         | "#/components/schemas/GetSymbolParams"
-        | "#/components/schemas/NodesParams"
+        | "#/components/schemas/FacetsParams"
         | "#/components/schemas/FindDeclarationsParams" => return Ok(false),
         other => return Err(format!("contract example names no generated type: {other}").into()),
     }
@@ -512,11 +521,11 @@ fn decode_generated_response_example(reference: &str, value: Value) -> TestResul
 }
 
 fn validate_examples(
-    node: &Value,
+    syntax_element: &Value,
     components: &Map<String, Value>,
     checked: &mut usize,
 ) -> TestResult {
-    match node {
+    match syntax_element {
         Value::Object(object) => {
             if let (Some(schema), Some(examples)) = (
                 object.get("schema"),

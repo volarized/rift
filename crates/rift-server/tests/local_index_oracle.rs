@@ -16,10 +16,7 @@ use rift_index::{
 use rift_protocol::{
     configuration::HistoryConfiguration,
     map::WorkspaceMap,
-    read::{
-        GetSymbolParams, GetSymbolResult, NodesParams, ReadWarning, SYMBOL_ALTERNATIVES_MAX,
-        SearchScope, SyntaxFramework,
-    },
+    read::{GetSymbolParams, GetSymbolResult, ReadWarning, SYMBOL_ALTERNATIVES_MAX, SearchScope},
 };
 use rift_server::ReadService;
 use tempfile::TempDir;
@@ -65,80 +62,6 @@ fn build(root: &Path) -> TestResult<ReadService> {
         &TextFileInclusion::default(),
         HistoryConfiguration::default(),
     )?)
-}
-
-#[test]
-fn unresolved_angular_template_urls_keep_source_nodes_and_path_owned_warnings() -> TestResult {
-    for template in ["https://example.test/view.html", "view.html?mode=preview"] {
-        let directory = tempfile::tempdir()?;
-        let source = format!(
-            "import {{ Component }} from '@angular/core';\n@Component({{ templateUrl: '{template}' }})\nexport class Beacon {{ label = '灯'; }}\n"
-        );
-        let plain = "<p class=\"flex\">灯{{title}}</p>";
-        fs::write(directory.path().join("component.ts"), &source)?;
-        fs::write(directory.path().join("view.html"), plain)?;
-        let service = build(directory.path())?;
-        let declaration = service.get_symbol(&GetSymbolParams {
-            name: "Beacon".to_owned(),
-            language: None,
-            scope: SearchScope::Local,
-            packages: Vec::new(),
-            include: Vec::new(),
-            limit: 10,
-            page_index: 0,
-            revision: None,
-        })?;
-        let hit = declaration.hits.first().ok_or("Beacon declaration")?;
-        assert_eq!(
-            hit.path.as_ref().ok_or("declaration path")?.0,
-            "component.ts"
-        );
-        let start = usize::try_from(hit.range.start)?;
-        let end = usize::try_from(hit.range.end)?;
-        let declared = source
-            .get(start..end)
-            .ok_or("declaration range inside the file")?;
-        assert!(declared.contains("class Beacon"), "{declared}");
-
-        let position = u64::try_from(source.find("灯").ok_or("Unicode source")?)?;
-        let nodes = service.nodes(&NodesParams::at(
-            rift_protocol::read::ProjectPath("component.ts".to_owned()),
-            position,
-        ))?;
-        assert!(!nodes.nodes.is_empty());
-        for node in &nodes.nodes {
-            assert_eq!(node.language.identity_segment(), "typescript");
-            let start = usize::try_from(node.range.start)?;
-            let end = usize::try_from(node.range.end)?;
-            assert_eq!(node.source, source[start..end]);
-        }
-        assert!(nodes.warnings.iter().any(|warning| matches!(
-            warning,
-            ReadWarning::FrameworkContextUnresolved {
-                unit,
-                framework: SyntaxFramework::Angular,
-                detail,
-            } if unit.0 == "rift://source/project/component.ts" && !detail.is_empty()
-        )));
-        let plain_nodes = service.nodes(&NodesParams::at(
-            rift_protocol::read::ProjectPath("view.html".to_owned()),
-            u64::try_from(plain.find("灯").ok_or("plain Unicode source")?)?,
-        ))?;
-        assert!(!plain_nodes.nodes.is_empty());
-        for node in &plain_nodes.nodes {
-            assert_eq!(node.language.identity_segment(), "html");
-            let start = usize::try_from(node.range.start)?;
-            let end = usize::try_from(node.range.end)?;
-            assert_eq!(node.source, plain[start..end]);
-        }
-        assert!(
-            !plain_nodes
-                .warnings
-                .iter()
-                .any(|warning| matches!(warning, ReadWarning::FrameworkContextUnresolved { .. }))
-        );
-    }
-    Ok(())
 }
 
 fn updated(previous: &ReadService, root: &Path) -> TestResult<ReadService> {

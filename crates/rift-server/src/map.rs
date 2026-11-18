@@ -307,7 +307,7 @@ fn module_tree(directory_counts: &BTreeMap<ProjectPath, FileSymbolCounts>) -> Ve
     }
     let mut modules: Vec<MapModule> = roots
         .into_iter()
-        .map(|root| module_node(root, directory_counts, &children_of, 1))
+        .map(|root| module_syntax_element(root, directory_counts, &children_of, 1))
         .collect();
     modules.truncate(MAP_MODULES_MAX);
     modules
@@ -316,7 +316,7 @@ fn module_tree(directory_counts: &BTreeMap<ProjectPath, FileSymbolCounts>) -> Ve
 /// Builds one [`MapModule`] and its children, recursing at most [`MAP_MODULE_DEPTH_MAX`]
 /// levels: `credit_directories` never inserts a directory deeper than that bound, so
 /// `children_of` never names a path recursion has not already reached by that depth.
-fn module_node(
+fn module_syntax_element(
     path: ProjectPath,
     counts: &BTreeMap<ProjectPath, FileSymbolCounts>,
     children_of: &BTreeMap<ProjectPath, Vec<ProjectPath>>,
@@ -326,19 +326,19 @@ fn module_node(
         depth <= MAP_MODULE_DEPTH_MAX,
         "module tree exceeds its depth bound: depth={depth}, path={path:?}"
     );
-    let node_counts = counts.get(&path).copied().unwrap_or_default();
+    let syntax_element_counts = counts.get(&path).copied().unwrap_or_default();
     let mut children: Vec<MapModule> = children_of
         .get(&path)
         .into_iter()
         .flatten()
         .cloned()
-        .map(|child| module_node(child, counts, children_of, depth + 1))
+        .map(|child| module_syntax_element(child, counts, children_of, depth + 1))
         .collect();
     children.truncate(MAP_MODULES_MAX);
     MapModule {
         path,
-        files: node_counts.files,
-        symbols: node_counts.symbols,
+        files: syntax_element_counts.files,
+        symbols: syntax_element_counts.symbols,
         children,
     }
 }

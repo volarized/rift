@@ -52,7 +52,7 @@ struct CapturedSymbol {
     declaration_ordinal: usize,
     container: Option<String>,
     kind: String,
-    node_kind: Option<String>,
+    syntax_element_kind: Option<String>,
     facets: Vec<SymbolFacet>,
     visibility: Option<String>,
     range: [u64; 2],
@@ -83,7 +83,7 @@ impl CapturedSymbol {
             declaration_ordinal: symbol.declaration_ordinal,
             container: symbol.container.clone(),
             kind: symbol.kind.to_owned(),
-            node_kind: symbol.node_kind.map(str::to_owned),
+            syntax_element_kind: symbol.syntax_element_kind.map(str::to_owned),
             facets: symbol.facets.clone(),
             visibility: symbol.visibility.clone(),
             range: captured_range(symbol.range),
@@ -111,9 +111,11 @@ impl CapturedSymbol {
             kind: names
                 .symbol_kind(&self.kind)
                 .expect("recorded provider kind"),
-            node_kind: self
-                .node_kind
-                .map(|kind| names.node_kind(&kind).expect("recorded node kind")),
+            syntax_element_kind: self.syntax_element_kind.map(|kind| {
+                names
+                    .syntax_element_kind(&kind)
+                    .expect("recorded syntax element kind")
+            }),
             facets: self.facets,
             visibility: self.visibility,
             range: restored_range(self.range),
@@ -159,7 +161,7 @@ impl CapturedFacts {
             analyzer_digest: identity.analyzer_digest.clone(),
             limits: [
                 identity.limits.source_bytes_max(),
-                identity.limits.syntax_nodes_max(),
+                identity.limits.syntax_elements_max(),
                 identity.limits.syntax_depth_max(),
             ]
             .map(|limit| u64::try_from(limit).expect("limit width")),

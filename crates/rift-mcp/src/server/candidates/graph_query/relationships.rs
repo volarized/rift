@@ -18,8 +18,8 @@ use rift_protocol::revision::Revision;
 use rift_protocol::search_read::SearchUnavailable;
 use rift_protocol::symbol_read::{CapturedView, SymbolUnavailableReason};
 use rift_search::sparql::{
-    AdjacencySelection, AdjacencyStep, GraphDatasetBuilder, GraphFact, GraphLimits, NodeLocation,
-    OccurrenceSelection, ReachedNodes, RevisionIri, SymbolAddress, SymbolRelation,
+    AdjacencySelection, AdjacencyStep, GraphDatasetBuilder, GraphFact, GraphLimits,
+    OccurrenceSelection, ReachedFacets, RevisionIri, SymbolAddress, SymbolRelation, SyntaxLocation,
 };
 
 use super::super::super::{RequestDeadline, ResolvedWorkspace, RiftMcp};
@@ -82,8 +82,8 @@ impl AcquiredAdjacency {
             })?;
         }
         let mut captured = BTreeSet::new();
-        if let Some(nodes) = selected.nodes {
-            captured = self.project_captured_declarations(dataset, nodes)?;
+        if let Some(syntax_elements) = selected.syntax_elements {
+            captured = self.project_captured_declarations(dataset, syntax_elements)?;
             for endpoint in self.local_endpoints() {
                 if !SymbolIdentity::parse(endpoint.as_str())?.owner().is_local()
                     && !captured.contains(endpoint)
@@ -95,7 +95,12 @@ impl AcquiredAdjacency {
         }
         for (id, target) in &self.installed {
             if !captured.contains(id) {
-                target.project(dataset, selected.nodes.map(|nodes| nodes.source))?;
+                target.project(
+                    dataset,
+                    selected
+                        .syntax_elements
+                        .map(|syntax_elements| syntax_elements.source),
+                )?;
             }
         }
         self.project_remote(dataset, selected)
@@ -160,9 +165,9 @@ impl AcquiredAdjacency {
     fn project_captured_declarations(
         &self,
         dataset: &mut GraphDatasetBuilder,
-        nodes: ReachedNodes,
+        syntax_elements: ReachedFacets,
     ) -> Result<BTreeSet<&SymbolId>, RiftError> {
-        if nodes.syntax_metadata && !self.pages.is_empty() {
+        if syntax_elements.syntax_metadata && !self.pages.is_empty() {
             return Err(coverage_failure());
         }
         let mut symbols = BTreeMap::new();
@@ -211,11 +216,11 @@ impl AcquiredAdjacency {
                 dataset.insert_declaration_excerpt(
                     id,
                     position,
-                    NodeLocation {
+                    SyntaxLocation {
                         unit,
                         range: &declaration.range,
                     },
-                    nodes.source.then_some(excerpt),
+                    syntax_elements.source.then_some(excerpt),
                 )?;
             }
         }
@@ -1020,7 +1025,9 @@ impl<'request> AdjacencyWalk<'request> {
         let incoming = step.direction == TraversalDirection::Incoming;
         if !self.configuration.enabled
             || (incoming && step.facet != RelationshipFacet::Calls)
-            || selected.nodes.is_some_and(|nodes| nodes.syntax_metadata)
+            || selected
+                .syntax_elements
+                .is_some_and(|syntax_elements| syntax_elements.syntax_metadata)
         {
             return Err(coverage_failure());
         }
@@ -1034,8 +1041,8 @@ impl<'request> AdjacencyWalk<'request> {
             step.direction,
             &[step.facet],
         )?;
-        let needs_source =
-            selected.nodes.is_some() || selected.occurrences.is_some_and(|usage| usage.source);
+        let needs_source = selected.syntax_elements.is_some()
+            || selected.occurrences.is_some_and(|usage| usage.source);
         let include: Vec<_> = needs_source
             .then_some(RelationshipInclude::Source)
             .into_iter()

@@ -216,39 +216,21 @@ def number(value: object, context: str) -> int:
     return value
 
 
-def unit_path(node: JsonObject) -> str | None:
-    """The project path a node's file `unit` names, its percent escapes decoded."""
-    unit = node.get("unit")
+def unit_path(element: JsonObject) -> str | None:
+    """The project path a element's file `unit` names, its percent escapes decoded."""
+    unit = element.get("unit")
     if not isinstance(unit, str) or not unit.startswith(FILE_PREFIX):
         return None
     return unquote(unit.removeprefix(FILE_PREFIX), errors="strict")
 
 
-def lists_position(
-    answer: JsonObject, nodes: list[JsonObject], unit: str, position: int
-) -> bool:
-    """Whether `nodes`, a position read's first page, hold every node its check reads.
-
-    A unit answer lists one file's nodes in preorder, so their starts never decrease: a
-    listed node starting past `position` means no later page covers it. A symbol answer
-    lists each declaration from its item node, so the item covering `position` in the
-    file at project path `unit` is the one item node the raw declaration check reads.
-    """
-
-    def span(node: JsonObject) -> tuple[int, int]:
-        bounds = object_value(node.get("range"), "node range")
-        return number(bounds.get("start"), "node start"), number(
-            bounds.get("end"), "node end"
-        )
-
-    if answer.get("symbol") is None:
-        return span(nodes[-1])[0] > position
-    return any(
-        node.get("index") == 0
-        and unit_path(node) == unit
-        and span(node)[0] <= position < span(node)[1]
-        for node in nodes
-    )
+def facet_syntax(answer: JsonObject) -> list[JsonObject]:
+    """Read the syntax structure carried by each declaration in a facets answer."""
+    return [
+        object_value(element, "syntax element")
+        for value in array_value(answer.get("declarations"), "facets declarations")
+        for element in array_value(object_value(value, "declaration").get("syntax"), "syntax")
+    ]
 
 
 def warnings(answer: JsonObject) -> list[JsonObject]:
@@ -630,19 +612,16 @@ def churn_answer(
 ) -> tuple[str, str]:
     """Require one probe declaration with source from a complete authored revision."""
     warnings(answer)
-    if tool in {"nodes", "symbol_nodes"}:
-        nodes = [
-            object_value(node, "probe node")
-            for node in array_value(answer.get("nodes"), "probe nodes")
-        ]
+    if tool == "facets":
+        elements = facet_syntax(answer)
         matches = [
-            node
-            for node in nodes
-            if node.get("index") == 0 and node.get("declaration") is not None
+            element
+            for element in elements
+            if element.get("index") == 0 and element.get("declaration") is not None
         ]
         require(
             answer.get("symbol") is not None and len(matches) == 1,
-            "nodes lost probe declaration",
+            "elements lost probe declaration",
         )
         hit = matches[0]
         require(

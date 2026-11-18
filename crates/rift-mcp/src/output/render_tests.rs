@@ -4,11 +4,10 @@ use rift_protocol::error::{
 };
 use rift_protocol::read::{
     CommitAuthor, DiagnosticContext, Digest, Documentation, DocumentationFormat, ExactKind,
-    Extensions, GetSymbolHit, GetSymbolResult, HistoryChange, HistoryCommit, HistoryEdge, Language,
-    Node, NodeFacet, NodeRegion, NodesResult, PackageIdentity, Pagination, ProjectPath,
-    ReadWarning, RegionRole, RelationshipFacet, RevisionId, Signature, SourceKind,
-    SourceLocationKind, SourceUnitId, Symbol, SymbolFacet, SymbolHistory, SymbolId, SymbolOrigin,
-    SymbolVersionKind, TextRange,
+    Extensions, FacetsResult, GetSymbolHit, GetSymbolResult, HistoryChange, HistoryCommit,
+    HistoryEdge, Language, PackageIdentity, Pagination, ProjectPath, ReadWarning,
+    RelationshipFacet, RevisionId, Signature, SourceKind, SourceLocationKind, SourceUnitId, Symbol,
+    SymbolFacet, SymbolHistory, SymbolId, SymbolOrigin, SymbolVersionKind, TextRange,
 };
 use rift_protocol::revision::Revision;
 use rift_protocol::search::{
@@ -241,22 +240,6 @@ fn stale_index() -> ReadWarning {
     }
 }
 
-fn node(index: u64, kind: &str, start: u64, end: u64) -> Node {
-    Node {
-        declaration: None,
-        index,
-        unit: SourceUnitId("rift://source/project/src/lib.rs".to_owned()),
-        language: rust(),
-        kind: ExactKind(kind.to_owned()),
-        facets: Vec::new(),
-        range: range(start, end),
-        source: String::new(),
-        regions: Vec::new(),
-        parent: None,
-        extensions: Extensions::default(),
-    }
-}
-
 /// Joins `lines` with a line feed after each, the way the writer ends every line.
 fn text(lines: &[&str]) -> String {
     let mut joined = lines.join("\n");
@@ -348,21 +331,7 @@ fn symbol_result(hits: Vec<GetSymbolHit>, page: Pagination) -> GetSymbolResult {
     }
 }
 
-/// A `nodes` answer whose nodes carry `source`, one text per node in order.
-fn nodes_result(mut nodes: Vec<Node>, source: Vec<&str>) -> NodesResult {
-    assert_eq!(nodes.len(), source.len(), "one source per fixture node");
-    for (node, text) in nodes.iter_mut().zip(source) {
-        text.clone_into(&mut node.source);
-    }
-    NodesResult {
-        symbol: None,
-        nodes,
-        node_cursor: None,
-        revision: tree_revision(),
-        warnings: Vec::new(),
-    }
-}
-
+/// A `facets` answer whose facets carry `source`, one text per syntax element in order.
 fn error_data(code: ErrorCode, message: &str) -> ErrorData {
     ErrorData {
         code,
@@ -1062,7 +1031,7 @@ fn readme_hit() -> SearchHit {
 }
 
 #[test]
-fn a_walk_hit_is_one_node_under_a_root_that_writes_its_identity() {
+fn a_walk_hit_is_one_symbol_under_a_root_that_writes_its_identity() {
     golden(
         &only_page(vec![run_hit()]),
         &[
@@ -1078,7 +1047,7 @@ fn a_walk_hit_is_one_node_under_a_root_that_writes_its_identity() {
 }
 
 #[test]
-fn paths_that_share_a_prefix_share_its_nodes_and_children_follow_answer_order() {
+fn paths_that_share_a_prefix_share_its_facets_and_children_follow_answer_order() {
     golden(
         &only_page(vec![reload_hit(), main_hit(), run_hit()]),
         &[
@@ -1306,16 +1275,16 @@ fn a_root_that_is_no_hit_is_one_line_at_its_identity() {
 }
 
 #[test]
-fn a_walk_node_whose_hit_is_not_a_symbol_writes_nothing() {
+fn a_walk_symbol_whose_hit_is_not_a_symbol_writes_nothing() {
     let mut out = TextWriter::new(1 << 10);
-    let mut lines = super::layout::Lines::node(&mut out, 0, None);
-    super::search::walk_node(&mut lines, &readme_hit(), super::walk::Labels::Root)
+    let mut lines = super::layout::Lines::walk_symbol(&mut out, 0, None);
+    super::search::walk_symbol(&mut lines, &readme_hit(), super::walk::Labels::Root)
         .expect("a hit that is not a symbol writes nothing");
     assert_eq!(out.finish(), Ok(String::new()));
 }
 
 #[test]
-fn two_walk_hits_that_reach_one_symbol_under_one_parent_each_get_a_node() {
+fn two_walk_hits_that_reach_one_symbol_under_one_parent_each_get_a_symbol() {
     let again = SearchHit {
         line: Some(21),
         ..run_hit()
@@ -1554,7 +1523,7 @@ fn an_outgoing_hop_moves_by_for_annotated_by_and_writes_calls_whole() {
 }
 
 #[test]
-fn a_node_without_a_location_writes_its_facts_without_in() {
+fn a_symbol_without_a_location_writes_its_facts_without_in() {
     let hit = SearchHit {
         line: None,
         path: None,
@@ -1578,12 +1547,12 @@ fn a_node_without_a_location_writes_its_facts_without_in() {
 #[test]
 fn copied_source_keeps_its_own_leading_spaces_and_empty_lines_after_the_indent() {
     let source = "  two spaces\n\n\tone tab\n    four spaces";
-    let node = SearchHit {
+    let walk_hit = SearchHit {
         source: Some(source.to_owned()),
         ..run_hit()
     };
     golden(
-        &only_page(vec![node]),
+        &only_page(vec![walk_hit]),
         &[
             "1 result",
             "\tat rift://symbol/local/rust/app/config/load_config",
@@ -1629,7 +1598,7 @@ fn no_line_of_a_sample_of_each_tool_starts_with_a_space() {
     let mut texts = vec![
         rendered(&example::<SearchResult>(0)),
         rendered(&example::<GetSymbolResult>(0)),
-        rendered(&example::<NodesResult>(0)),
+        rendered(&example::<FacetsResult>(0)),
         rendered(&error_data(ErrorCode::InternalError, "first")),
         rendered(&search_result(
             vec![readme_hit(), main_hit(), reload_hit()],
@@ -1678,7 +1647,7 @@ fn an_incoming_hop_reads_every_facet_as_the_table_says() {
 }
 
 #[test]
-fn a_node_writes_every_line_of_a_symbol_hit_at_its_further_line_indent() {
+fn a_symbol_writes_every_line_of_a_symbol_hit_at_its_further_line_indent() {
     let mut everything = signed_symbol(
         Some("rift://symbol/pkg/cargo/crates.io/serde@1.0.0/rust/serde/Config"),
         "Config",
@@ -1735,7 +1704,7 @@ fn a_node_writes_every_line_of_a_symbol_hit_at_its_further_line_indent() {
 }
 
 #[test]
-fn the_relationship_field_is_left_out_of_a_node_and_every_other_field_stays() {
+fn the_relationship_field_is_left_out_of_a_symbol_and_every_other_field_stays() {
     let only = SearchHit {
         score: Some(2.0),
         ..run_hit()
@@ -1933,7 +1902,7 @@ fn an_empty_source_of_a_symbol_hit_is_one_empty_line_after_the_blank_line() {
     assert!(with_empty.ends_with("rift://symbol/local/rust/app/a/A\n\n\n"));
 }
 
-// File, node, and documentation hits.
+// File, syntax element, and documentation hits.
 
 #[test]
 fn a_file_hit_writes_its_place_and_the_source_directly_under_it() {
@@ -2771,27 +2740,11 @@ fn a_search_value_holding_a_delimiter_is_quoted_and_others_stay_bare() {
 }
 
 #[test]
-fn a_node_kind_holding_a_delimiter_is_quoted_and_others_stay_bare() {
-    let answer = nodes_result(
-        vec![
-            node(0, "a | b", 0, 9),
-            node(1, "c: d", 1, 8),
-            node(2, "e:f·g", 2, 7),
-        ],
-        vec!["a", "b", "c"],
-    );
-    golden(
-        &answer,
-        &[
-            "3 nodes",
-            "\t\"a | b\" | bytes 0..9 | index 0",
-            "\tc: d | bytes 1..8 | index 1",
-            "\te:f·g | bytes 2..7 | index 2",
-            "",
-            "\t\ta",
-            REVISION_LINE,
-        ],
-    );
+fn a_syntax_element_kind_holding_a_delimiter_is_quoted() {
+    let mut answer = example::<FacetsResult>(0);
+    answer.declarations[0].syntax[0].kind = ExactKind("a | b".to_owned());
+    let text = rendered(&answer);
+    assert!(text.contains("\t\"a | b\" | bytes"), "{text}");
 }
 
 #[test]
@@ -3053,277 +3006,31 @@ fn control_characters_in_get_symbol_facts_are_escaped() {
     assert!(output.contains("\n\t\t\ta\\tb\n"), "{output}");
 }
 
-// Nodes answers.
+// Facets answers.
 
 #[test]
-fn a_declaration_summary_names_the_parts_and_keeps_their_addresses_in_structured_content() {
-    use rift_protocol::nodes_read::NodesToolResult;
-
-    let (summary, _) = super::nodes::select(example::<NodesResult>(0), None, 0);
-    assert_eq!(summary.declarations[0].parts[0].index, 3);
-    let output = rendered(&NodesToolResult::Summary(summary));
-    assert!(
-        output
-            .lines()
-            .any(|line| line == "\tStructure | field declaration list"),
-        "{output}"
-    );
-}
-
-fn outer_and_inner() -> NodesResult {
-    let outer = node(0, "function_item", 0, 20);
-    let mut inner = node(1, "identifier", 3, 9);
-    inner.parent = Some(outer.index);
-    nodes_result(vec![outer, inner], vec!["fn name() {}\n// tail", "name"])
-}
-
-/// A package symbol's nodes, which sit in a package source unit, write as a project symbol's
-/// do: the unit locates a node for a reader of the structured answer, and the text writes
-/// the same items and the item's source.
-#[test]
-fn a_package_symbol_answer_writes_like_a_project_symbol_answer() {
-    const PACKAGE_ID: &str = "rift://symbol/cargo/crates.io/demo/rust/demo/beacon";
-    let package_unit = rift_protocol::read::SourceUnitId(
-        "rift://source/cargo/crates.io/demo/src/lib.rs".to_owned(),
-    );
-    let mut item = node(0, "function_item", 26, 44);
-    item.declaration = Some(0);
-    let mut name = node(2, "identifier", 33, 39);
-    name.declaration = Some(0);
-    name.parent = Some(0);
-    let mut answer = nodes_result(vec![item, name], vec!["pub fn beacon() {}", "beacon"]);
-    answer.symbol = Some(SymbolId(PACKAGE_ID.to_owned()));
-    let project_text = rendered(&answer);
-    for node in &mut answer.nodes {
-        node.unit = package_unit.clone();
+fn facets_render_declaration_location_source_and_syntax() {
+    let answer = example::<FacetsResult>(0);
+    let text = rendered(&answer);
+    let declaration = &answer.declarations[0];
+    assert!(text.contains("Declaration 0 | struct_item"), "{text}");
+    assert!(text.contains("src/config.rs"), "{text}");
+    for line in declaration.source.text.lines() {
+        assert!(text.contains(line), "{text}");
     }
-    assert_eq!(rendered(&answer), project_text);
-    golden(
-        &answer,
-        &[
-            "2 nodes | rift://symbol/cargo/crates.io/demo/rust/demo/beacon",
-            "\tfunction_item | bytes 26..44 | declaration 0 | index 0",
-            "\tidentifier | bytes 33..39 | declaration 0 | index 2 | parent 0",
-            "",
-            "\t\tpub fn beacon() {}",
-            REVISION_LINE,
-        ],
-    );
+    for element in &declaration.syntax {
+        assert!(text.contains(&format!("index {}", element.index)), "{text}");
+    }
 }
 
 #[test]
-fn a_symbol_answer_writes_each_declaration_source_then_its_cursor() {
-    let mut first = node(0, "function_item", 0, 9);
-    first.declaration = Some(0);
-    let name = node(1, "identifier", 3, 4);
-    let mut second = node(0, "function_item", 20, 29);
-    second.declaration = Some(1);
-    let mut answer = nodes_result(
-        vec![first, name, second],
-        vec!["fn a() {}", "a", "fn a() {}"],
-    );
-    answer.node_cursor = Some("3.0123456789abcdef".to_owned());
-    answer.symbol = Some(SymbolId(A_ID.to_owned()));
-    golden(
-        &answer,
-        &[
-            "3 nodes | rift://symbol/local/rust/app/a/A",
-            "\tfunction_item | bytes 0..9 | declaration 0 | index 0",
-            "\tidentifier | bytes 3..4 | index 1",
-            "\tfunction_item | bytes 20..29 | declaration 1 | index 0",
-            "",
-            "\t\tfn a() {}",
-            "",
-            "\t\tfn a() {}",
-            "node_cursor 3.0123456789abcdef",
-            REVISION_LINE,
-        ],
-    );
-}
-
-#[test]
-fn an_empty_nodes_answer_writes_only_the_header() {
-    let answer = nodes_result(Vec::new(), Vec::new());
-    golden(&answer, &["0 nodes", REVISION_LINE]);
-}
-
-#[test]
-fn one_node_has_no_marker_and_its_excerpt_follows_a_blank_line() {
-    let answer = nodes_result(vec![node(1, "identifier", 3, 9)], vec!["name"]);
-    golden(
-        &answer,
-        &[
-            "1 node",
-            "\tidentifier | bytes 3..9 | index 1",
-            "",
-            "\tname",
-            REVISION_LINE,
-        ],
-    );
-}
-
-#[test]
-fn several_nodes_follow_each_other_without_a_blank_line_and_only_the_outermost_excerpt_is_written()
-{
-    let answer = outer_and_inner();
-    golden(
-        &answer,
-        &[
-            "2 nodes",
-            "\tfunction_item | bytes 0..20 | index 0 | 2 lines",
-            "\tidentifier | bytes 3..9 | index 1 | parent 0",
-            "",
-            "\t\tfn name() {}",
-            "\t\t// tail",
-            REVISION_LINE,
-        ],
-    );
-    assert!(
-        !rendered(&answer).contains("\t\tname\n"),
-        "the enclosed excerpt is not written"
-    );
-}
-
-#[test]
-fn a_node_names_its_symbol_its_regions_and_its_generated_and_test_facets() {
-    let mut item = node(0, "function_item", 0, 20);
-    item.declaration = Some(0);
-    item.facets = vec![
-        NodeFacet::Declaration,
-        NodeFacet::Test,
-        NodeFacet::Definition,
-        NodeFacet::Generated,
-    ];
-    item.regions = vec![
-        NodeRegion {
-            role: RegionRole::Name,
-            range: range(3, 4),
-        },
-        NodeRegion {
-            role: RegionRole::Body,
-            range: range(8, 20),
-        },
-    ];
-    let mut plain = node(1, "block", 9, 10);
-    plain.facets = vec![NodeFacet::Body, NodeFacet::Block];
-    golden(
-        &nodes_result(vec![item, plain], vec!["fn a() {\n    b\n}", "{"]),
-        &[
-            "2 nodes",
-            "\tfunction_item | bytes 0..20 | declaration 0 | index 0 | 3 lines | generated | test | name 3..4 | body 8..20",
-            "\tblock | bytes 9..10 | index 1",
-            "",
-            "\t\tfn a() {",
-            "\t\t    b",
-            "\t\t}",
-            REVISION_LINE,
-        ],
-    );
-}
-
-#[test]
-fn the_line_count_follows_the_excerpt_lines_and_not_its_trailing_line_feed() {
-    let nodes = vec![
-        node(0, "a", 0, 1),
-        node(1, "b", 1, 2),
-        node(2, "c", 2, 3),
-        node(3, "d", 3, 4),
-    ];
-    golden(
-        &nodes_result(nodes, vec!["", "x\n", "x\ny\n", "z"]),
-        &[
-            "4 nodes",
-            "\ta | bytes 0..1 | index 0",
-            "\tb | bytes 1..2 | index 1",
-            "\tc | bytes 2..3 | index 2 | 2 lines",
-            "\td | bytes 3..4 | index 3",
-            "",
-            "",
-            "",
-            "\t\tx",
-            "",
-            "",
-            "\t\tx",
-            "\t\ty",
-            "",
-            "",
-            "\t\tz",
-            REVISION_LINE,
-        ],
-    );
-}
-
-#[test]
-fn an_empty_innermost_excerpt_is_one_empty_line_after_the_blank_line() {
-    let answer = nodes_result(vec![node(0, "a", 0, 1)], vec![""]);
-    assert_eq!(
-        rendered(&answer),
-        text(&[
-            "1 node",
-            "\ta | bytes 0..1 | index 0",
-            "",
-            "",
-            REVISION_LINE
-        ])
-    );
-}
-
-#[test]
-fn warnings_leave_node_excerpts_unchanged() {
-    let mut answer = outer_and_inner();
-    answer.warnings = vec![stale_index()];
-    golden(
-        &answer,
-        &[
-            "2 nodes",
-            "\tfunction_item | bytes 0..20 | index 0 | 2 lines",
-            "\tidentifier | bytes 3..9 | index 1 | parent 0",
-            "",
-            "\t\tfn name() {}",
-            "\t\t// tail",
-            REVISION_LINE,
-        ],
-    );
-}
-
-#[test]
-fn an_excerpt_with_backticks_and_header_lines_stays_verbatim_under_the_node() {
-    let excerpt = "````rust\n```\n! stale_index\n2 nodes\n[1] fake\n\tnested\n````";
-    let nodes = vec![node(0, "a", 0, 9)];
-    let single = nodes_result(nodes, vec![excerpt]);
-    golden(
-        &single,
-        &[
-            "1 node",
-            "\ta | bytes 0..9 | index 0 | 7 lines",
-            "",
-            "\t````rust",
-            "\t```",
-            "\t! stale_index",
-            "\t2 nodes",
-            "\t[1] fake",
-            "\t\tnested",
-            "\t````",
-            REVISION_LINE,
-        ],
-    );
-    let two = nodes_result(
-        vec![node(0, "a", 0, 9), node(1, "b", 1, 9)],
-        vec![excerpt, "x"],
-    );
-    let output = rendered(&two);
-    assert_no_trailing_space(&output);
-    let block: Vec<&str> = output
-        .lines()
-        .skip(4)
-        .take_while(|line| !line.starts_with("revision "))
-        .collect();
-    assert_eq!(block.len(), 7);
-    let recovered: Vec<&str> = block
-        .iter()
-        .map(|line| line.strip_prefix("\t\t").unwrap_or(line))
-        .collect();
-    assert_eq!(recovered.join("\n"), excerpt);
+fn facets_render_empty_declarations_and_continuation() {
+    let mut answer = example::<FacetsResult>(0);
+    answer.declarations.clear();
+    answer.facet_cursor = Some("cursor".to_owned());
+    let text = rendered(&answer);
+    assert!(text.contains("No declaration source available."));
+    assert!(text.contains("facet_cursor cursor"));
 }
 
 #[test]
@@ -3587,9 +3294,8 @@ fn diagnostics_follow_the_message_and_the_limit_one_compiler_style_line_each() {
 
 #[test]
 fn identities_are_written_whole_and_hashes_are_cut() {
-    let symbol_id = "rift://symbol/local/rust/rift_server/read/ReadService/nodes";
+    let symbol_id = "rift://symbol/local/rust/rift_server/read/ReadService/facets";
     let unit = "rift://source/project/packages/@scope/name/package.json";
-    let file = "rift://source/project/src/dir%20name/lib.rs";
     let mut hit = search_hit(symbol_target(Some(symbol_id), "ReadService"));
     hit.unit = Some(source_unit(unit));
     let search = rendered(&only_page(vec![hit]));
@@ -3606,50 +3312,20 @@ fn identities_are_written_whole_and_hashes_are_cut() {
         get_symbol.lines().any(|line| line == entry(symbol_id)),
         "{get_symbol}"
     );
-    let mut node_item = node(0, "function_item", 0, 1);
-    node_item.unit = SourceUnitId(file.to_owned());
-    let mut node_answer = nodes_result(vec![node_item], vec!["x"]);
-    node_answer.symbol = Some(SymbolId(symbol_id.to_owned()));
-    let nodes = rendered(&node_answer);
+    let mut answer = example::<FacetsResult>(0);
+    answer.symbol = SymbolId(symbol_id.to_owned());
+    let facets = rendered(&answer);
     assert!(
-        nodes
+        facets
             .lines()
             .next()
             .is_some_and(|title| title.ends_with(symbol_id)),
-        "{nodes}"
+        "{facets}"
     );
     let mut commit = commit_hit();
     commit.revision = RevisionId("main^2".to_owned());
     let by_branch = rendered(&commit_answer(commit));
     assert!(by_branch.contains("\n\tmain^2 · "), "{by_branch}");
-}
-
-/// The authored `nodes` example, rendered unmodified.
-#[test]
-fn the_authored_nodes_example_renders_one_entry_per_node_and_the_outermost_source() {
-    golden(
-        &example::<NodesResult>(0),
-        &[
-            "12 nodes | rift://symbol/local/rust/app/config/Config",
-            "\tstruct_item | bytes 105..160 | declaration 0 | index 0 | 3 lines",
-            "\tvisibility_modifier | bytes 105..108 | declaration 0 | index 1 | parent 0",
-            "\ttype_identifier | bytes 116..122 | declaration 0 | index 2 | parent 0",
-            "\tfield_declaration_list | bytes 123..160 | declaration 0 | index 3 | parent 0 | 3 lines",
-            "\tfield_declaration | bytes 129..157 | declaration 0 | index 4 | parent 3",
-            "\tvisibility_modifier | bytes 129..132 | declaration 0 | index 5 | parent 4",
-            "\tfield_identifier | bytes 133..137 | declaration 0 | index 6 | parent 4",
-            "\tscoped_type_identifier | bytes 139..157 | declaration 0 | index 7 | parent 4",
-            "\tscoped_identifier | bytes 139..148 | declaration 0 | index 8 | parent 7",
-            "\tidentifier | bytes 139..142 | declaration 0 | index 9 | parent 8",
-            "\tidentifier | bytes 144..148 | declaration 0 | index 10 | parent 8",
-            "\ttype_identifier | bytes 150..157 | declaration 0 | index 11 | parent 7",
-            "",
-            "\t\tpub struct Config {",
-            "\t\t    pub root: std::path::PathBuf,",
-            "\t\t}",
-            AUTHORED_REVISION_LINE,
-        ],
-    );
 }
 
 // Limits.
@@ -3678,7 +3354,7 @@ fn an_answer_over_the_byte_limit_yields_no_text() {
 fn the_compact_text_of_every_authored_example_is_shorter_in_bytes_than_its_json_text() {
     assert_text_shorter_than_json::<SearchResult>();
     assert_text_shorter_than_json::<GetSymbolResult>();
-    assert_text_shorter_than_json::<NodesResult>();
+    assert_text_shorter_than_json::<FacetsResult>();
 }
 
 // StatsAlloc is used only by this ignored measurement; run it alone in a release build.
@@ -3845,7 +3521,7 @@ fn output_allocation_cost() {
 
     measure_allocations::<SearchResult>("search");
     measure_allocations::<GetSymbolResult>("get_symbol");
-    measure_allocations::<NodesResult>("nodes");
+    measure_allocations::<FacetsResult>("facets");
 }
 
 #[test]
@@ -4037,12 +3713,6 @@ fn another_unavailable_reason_keeps_its_name_and_no_progress() {
         "no progress warning survives: {warnings:?}"
     );
 }
-
-/// The `revision` line of an answer read at [`tree_revision`].
-const REVISION_LINE: &str = "revision rift://revision/tree/0000000000000000000000000000000000000000000000000000000000000000";
-
-/// The `revision` line of the authored `nodes` example.
-const AUTHORED_REVISION_LINE: &str = "revision rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11";
 
 fn tree_revision() -> rift_protocol::revision::Revision {
     rift_protocol::revision::Revision::tree(&"0".repeat(64)).expect("tree revision")

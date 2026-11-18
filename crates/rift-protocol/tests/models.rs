@@ -5,8 +5,8 @@
 
 use rift_protocol::error::ErrorData;
 use rift_protocol::read::{
-    Diagnostic, DiagnosticReliability, GetSymbolInclude, GetSymbolParams, GetSymbolResult,
-    NodesResult, ResultOrder, SearchParams, SearchParamsTarget, Severity,
+    Diagnostic, DiagnosticReliability, FacetsResult, GetSymbolInclude, GetSymbolParams,
+    GetSymbolResult, ResultOrder, SearchParams, SearchParamsTarget, Severity,
 };
 use rift_protocol::search::SearchResult;
 use schemars::schema_for;
@@ -64,15 +64,16 @@ fn response_model_examples_carry_no_null_or_empty_collection() {
         serde_json::to_value(schema_for!(GetSymbolResult)).expect("get_symbol_result schema");
     assert_examples_carry_no_null_or_empty(&get_symbol_result, "GetSymbolResult");
 
-    let nodes_result = serde_json::to_value(schema_for!(NodesResult)).expect("nodes_result schema");
-    assert_examples_carry_no_null_or_empty(&nodes_result, "NodesResult");
+    let facets_result =
+        serde_json::to_value(schema_for!(FacetsResult)).expect("facets_result schema");
+    assert_examples_carry_no_null_or_empty(&facets_result, "FacetsResult");
 
     let search_result =
         serde_json::to_value(schema_for!(SearchResult)).expect("search_result schema");
     assert_examples_carry_no_null_or_empty(&search_result, "SearchResult");
 }
 
-/// A `GetSymbolResult`, `NodesResult`, and `SearchResult` each deserialize from a minimal
+/// A `GetSymbolResult`, `FacetsResult`, and `SearchResult` each deserialize from a minimal
 /// JSON that omits `warnings` entirely, filling the field with its empty default -
 /// proving the serde side of the schema's `default: []` for a reader who never sends it.
 #[test]
@@ -83,11 +84,12 @@ fn paginated_read_results_deserialize_with_warnings_absent() -> TestResult {
     }))?;
     assert!(get_symbol.warnings.is_empty());
 
-    let nodes: NodesResult = serde_json::from_value(json!({
-        "nodes": [],
+    let facets: FacetsResult = serde_json::from_value(json!({
+        "symbol": "rift://symbol/local/rust/app/config/load_config",
+        "declarations": [],
         "revision": "rift://revision/git/1f2080e49da12fee4431e6872630509355cd62d1",
     }))?;
-    assert!(nodes.warnings.is_empty());
+    assert!(facets.warnings.is_empty());
 
     let search: SearchResult = serde_json::from_value(json!({
         "results": [],

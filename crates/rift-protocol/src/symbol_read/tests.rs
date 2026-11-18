@@ -48,7 +48,7 @@ fn exact_requests_validate_identity_and_reject_removed_fields() {
     assert_eq!(history.include, [GetSymbolInclude::History]);
     let source =
         serde_json::from_value::<GetSymbolParams>(json!({"id": ID, "include": ["source"]}))
-            .expect_err("a declaration's source is read by `nodes`, never through `include`");
+            .expect_err("a declaration's source is read by `facets`, never through `include`");
     assert!(
         source.to_string().contains("unknown variant `source`"),
         "{source}"

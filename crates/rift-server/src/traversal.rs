@@ -62,10 +62,10 @@ pub(crate) const TRAVERSAL_CAPABILITY: &str =
 /// Most distinct symbols one traversal may visit beyond `seed`. `RelationshipStore`'s
 /// adjacency lists are themselves sorted, so a walk that breaches this bound stops
 /// discovering new symbols and truncates the same way on every call over the same graph.
-pub(crate) const TRAVERSAL_NODES_MAX: usize = 10_000;
+pub(crate) const TRAVERSAL_SYMBOLS_MAX: usize = 10_000;
 
 /// What one traversal lane reports beside the hits it merged: the coverage the request asked
-/// for that no provider populates, and whether the walk stopped at its node bound.
+/// for that no provider populates, and whether the walk stopped at its syntax element bound.
 #[derive(Debug, Default)]
 pub(crate) struct TraversalReport {
     pub(crate) coverage_missing: Option<ReadWarning>,
@@ -78,7 +78,7 @@ pub(crate) struct TraversalReport {
 ///
 /// # Errors
 ///
-/// Returns `not_found` naming a seed that resolves to neither a relationship-store node nor
+/// Returns `not_found` naming a seed that resolves to neither a relationship-store syntax element nor
 /// a lexical declaration, and [`RiftError`] naming the engine capability when the seed
 /// resolves but neither the relationship store nor a configured language engine can answer
 /// for it.
@@ -112,7 +112,7 @@ pub(crate) fn collect_traversal_hits(
         store,
         &walked_seed,
         traversal,
-        TRAVERSAL_NODES_MAX,
+        TRAVERSAL_SYMBOLS_MAX,
         references,
     );
     let merge = WalkMerge {
@@ -168,7 +168,7 @@ pub(crate) fn merge_walk_hits(
             {
                 results.push(package_traversal_hit(declaration, path));
             }
-            // Any other graph node with no lexical declaration in this snapshot: the store
+            // Any other graph syntax element with no lexical declaration in this snapshot: the store
             // outlived the file it was built from. Skipping it is the same choice
             // `merge_symbol_hit` makes for a ranked unit whose declaration is likewise gone.
             continue;
@@ -181,7 +181,7 @@ pub(crate) fn merge_walk_hits(
     Ok(())
 }
 
-/// Whether this snapshot can start a walk at `identity`: a relationship-store node, or a
+/// Whether this snapshot can start a walk at `identity`: a relationship-store syntax element, or a
 /// lexical declaration the store simply holds no edge for. A real, isolated declaration is
 /// walkable; its walk finds nothing.
 pub(crate) fn walkable(reads: &ReadService, identity: &CoreSymbolId) -> Result<bool, RiftError> {
@@ -266,7 +266,7 @@ fn facet_gap_clause(facets: &[RelationshipFacet]) -> Option<String> {
 }
 
 /// Resolves a traversal's `seed`, refusing `not_found` naming it when the identity exists
-/// neither as a relationship-store node nor as a lexical declaration.
+/// neither as a relationship-store syntax element nor as a lexical declaration.
 fn resolve_traversal_seed(reads: &ReadService, seed: &SymbolId) -> Result<CoreSymbolId, RiftError> {
     let identity = CoreSymbolId::new(seed.0.clone()).map_err(|_error| {
         errors::server::read_not_found()
@@ -298,28 +298,28 @@ pub(crate) fn resolve_graph_symbol<'a>(
 /// narrowing that fits a walk under it.
 pub(crate) fn traversal_truncation_warning() -> ReadWarning {
     ReadWarning::TraversalTruncated {
-        visited: TRAVERSAL_NODES_MAX as u64,
+        visited: TRAVERSAL_SYMBOLS_MAX as u64,
         detail: format!(
-            "the traversal walk stopped at its {TRAVERSAL_NODES_MAX}-symbol bound; \
+            "the traversal walk stopped at its {TRAVERSAL_SYMBOLS_MAX}-symbol bound; \
              narrow facets, lower depth, or start from a less-connected seed to walk \
              the rest"
         ),
     }
 }
 
-/// Traversal under an explicit node cap for deterministic truncation tests.
+/// Traversal under an explicit symbol cap for deterministic truncation tests.
 #[cfg(test)]
 fn walk_traversal_capped(
     store: &RelationshipStore,
     seed: &CoreSymbolId,
     traversal: &SearchTraversal,
-    nodes_max: usize,
+    symbols_max: usize,
 ) -> TraversalWalk {
     walk_traversal_with_references(
         store,
         seed,
         traversal,
-        nodes_max,
+        symbols_max,
         &EngineReferences::default(),
     )
 }
@@ -329,15 +329,15 @@ fn walk_traversal_capped(
 /// already discovered, so every returned path is the shortest one `store` has to it.
 ///
 /// The walk never reports `seed` itself, since `SearchTraversal.seed` states the seed is
-/// never a hit. One `nodes_max` budget covers the whole walk.
+/// never a hit. One `symbols_max` budget covers the whole walk.
 pub(crate) fn walk_traversal_with_references(
     store: &RelationshipStore,
     seed: &CoreSymbolId,
     traversal: &SearchTraversal,
-    nodes_max: usize,
+    symbols_max: usize,
     references: &EngineReferences,
 ) -> TraversalWalk {
-    rift_index::walk_traversal_capped(seed, traversal, nodes_max, |current, direction| {
+    rift_index::walk_traversal_capped(seed, traversal, symbols_max, |current, direction| {
         combined_edges(store, current, references, direction)
             .into_iter()
             .filter(|edge| edge.eligible(&traversal.facets))
@@ -560,7 +560,7 @@ pub(crate) mod tests {
     use tempfile::TempDir;
 
     use super::{
-        CoreSymbolId, EngineReferences, GraphHop, Relationship, TRAVERSAL_NODES_MAX,
+        CoreSymbolId, EngineReferences, GraphHop, Relationship, TRAVERSAL_SYMBOLS_MAX,
         walk_traversal_capped,
     };
     use crate::read::ReadService;
@@ -793,7 +793,7 @@ pub(crate) mod tests {
         let leaf = graph_symbol_id(graph_identity("leaf").as_str());
         let request = traversal_request(&leaf, 1, vec![]);
         let discovered =
-            walk_traversal_capped(&store, &leaf, &request, TRAVERSAL_NODES_MAX).discovered;
+            walk_traversal_capped(&store, &leaf, &request, TRAVERSAL_SYMBOLS_MAX).discovered;
         let reached: Vec<&str> = discovered.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(
             reached,
@@ -818,7 +818,7 @@ pub(crate) mod tests {
         let helper = graph_symbol_id(graph_identity("helper").as_str());
         let reached = |facets: Vec<RelationshipFacet>| {
             let request = traversal_request(&helper, 1, facets);
-            walk_traversal_capped(&store, &helper, &request, TRAVERSAL_NODES_MAX)
+            walk_traversal_capped(&store, &helper, &request, TRAVERSAL_SYMBOLS_MAX)
                 .discovered
                 .into_iter()
                 .map(|(id, _)| id.as_str().to_owned())
@@ -843,7 +843,7 @@ pub(crate) mod tests {
         let leaf = graph_symbol_id(graph_identity("leaf").as_str());
         let request = traversal_request(&leaf, 2, vec![]);
         let discovered =
-            walk_traversal_capped(&store, &leaf, &request, TRAVERSAL_NODES_MAX).discovered;
+            walk_traversal_capped(&store, &leaf, &request, TRAVERSAL_SYMBOLS_MAX).discovered;
         let root_hits: Vec<_> = discovered
             .iter()
             .filter(|(id, _)| id.as_str() == graph_identity("root").as_str())
@@ -863,10 +863,10 @@ pub(crate) mod tests {
     }
 
     /// An explicit low cap truncates discovery deterministically, the way
-    /// `RelationshipStore::build_capped` truncates edges: already-enqueued nodes still drain,
-    /// but no new node is discovered once the budget is spent.
+    /// `RelationshipStore::build_capped` truncates edges: already-enqueued syntax elements still drain,
+    /// but no new syntax element is discovered once the budget is spent.
     #[test]
-    fn walk_traversal_capped_stops_discovering_new_nodes_past_its_bound() {
+    fn walk_traversal_capped_stops_discovering_new_symbols_past_its_bound() {
         let store = call_graph_store();
         let leaf = graph_symbol_id(graph_identity("leaf").as_str());
         let request = traversal_request(&leaf, 2, vec![]);
@@ -879,7 +879,7 @@ pub(crate) mod tests {
         assert_eq!(
             discovered.len(),
             2,
-            "a cap of 2 must discover exactly 2 new nodes: {discovered:?}"
+            "a cap of 2 must discover exactly 2 new symbols: {discovered:?}"
         );
         let reached: Vec<&str> = discovered.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(
@@ -900,7 +900,7 @@ pub(crate) mod tests {
         let loop_fn = graph_symbol_id(graph_identity("loop_fn").as_str());
         let request = traversal_request(&loop_fn, 2, vec![]);
         let discovered =
-            walk_traversal_capped(&store, &loop_fn, &request, TRAVERSAL_NODES_MAX).discovered;
+            walk_traversal_capped(&store, &loop_fn, &request, TRAVERSAL_SYMBOLS_MAX).discovered;
 
         let reached: Vec<&str> = discovered.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(
@@ -920,9 +920,9 @@ pub(crate) mod tests {
         let ReadWarning::TraversalTruncated { visited, detail } = warning else {
             panic!("expected the traversal truncation variant: {warning:?}");
         };
-        assert_eq!(visited, TRAVERSAL_NODES_MAX as u64);
+        assert_eq!(visited, TRAVERSAL_SYMBOLS_MAX as u64);
         assert!(
-            detail.contains(&TRAVERSAL_NODES_MAX.to_string()),
+            detail.contains(&TRAVERSAL_SYMBOLS_MAX.to_string()),
             "the detail names the bound: {detail}"
         );
     }
@@ -1045,7 +1045,7 @@ pub(crate) mod tests {
         // `root` has outgoing edges, and nothing arrives at it.
         let request = traversal_request(&root, 2, vec![]);
         let discovered =
-            walk_traversal_capped(&store, &root, &request, TRAVERSAL_NODES_MAX).discovered;
+            walk_traversal_capped(&store, &root, &request, TRAVERSAL_SYMBOLS_MAX).discovered;
         assert!(discovered.is_empty(), "{discovered:?}");
     }
 
@@ -1524,7 +1524,7 @@ pub(crate) mod tests {
             &store,
             &target,
             &request,
-            TRAVERSAL_NODES_MAX,
+            TRAVERSAL_SYMBOLS_MAX,
             &references,
         );
         assert_eq!(walk.discovered.len(), 1);
@@ -1566,7 +1566,7 @@ pub(crate) mod tests {
             &store,
             &caller,
             &request,
-            TRAVERSAL_NODES_MAX,
+            TRAVERSAL_SYMBOLS_MAX,
             &references,
         );
         assert_eq!(walk.discovered.len(), 1);

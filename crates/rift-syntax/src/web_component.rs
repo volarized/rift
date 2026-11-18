@@ -85,8 +85,8 @@ impl SyntaxProvider for VueSyntaxProvider {
         let document = analyze(&self.language, &vue_grammar(), source, limits, &[])?;
         crate::embedded::append(source, limits, &document)
     }
-    fn node_facets(&self, kind: &str) -> Vec<NodeFacet> {
-        node_facets(kind)
+    fn syntax_element_facets(&self, kind: &str) -> Vec<NodeFacet> {
+        syntax_element_facets(kind)
     }
 }
 
@@ -102,8 +102,8 @@ impl SyntaxProvider for SvelteSyntaxProvider {
         let document = analyze(&self.language, &svelte_grammar(), source, limits, &[])?;
         crate::embedded::append(source, limits, &document)
     }
-    fn node_facets(&self, kind: &str) -> Vec<NodeFacet> {
-        node_facets(kind)
+    fn syntax_element_facets(&self, kind: &str) -> Vec<NodeFacet> {
+        syntax_element_facets(kind)
     }
 }
 
@@ -119,8 +119,8 @@ impl SyntaxProvider for AngularSyntaxProvider {
         let document = analyze(&self.language, &angular_grammar(), source, limits, &[])?;
         crate::embedded::append(source, limits, &document)
     }
-    fn node_facets(&self, kind: &str) -> Vec<NodeFacet> {
-        node_facets(kind)
+    fn syntax_element_facets(&self, kind: &str) -> Vec<NodeFacet> {
+        syntax_element_facets(kind)
     }
 }
 
@@ -128,7 +128,7 @@ impl SyntaxProvider for AngularSyntaxProvider {
 ///
 /// # Errors
 ///
-/// Returns provider failures for source, node, and depth bounds, invalid ranges, or cancellation.
+/// Returns provider failures for source, syntax element, and depth bounds, invalid ranges, or cancellation.
 pub fn analyze_angular_included(
     source: SyntaxSource<'_>,
     limits: SyntaxLimits,
@@ -167,24 +167,24 @@ impl GrammarRules for ComponentRules {
     ) -> Result<Option<Declaration>, RiftError> {
         Ok(None)
     }
-    fn container_name(&self, _node: Node<'_>, _text: &str) -> Option<String> {
+    fn container_name(&self, _syntax_element: Node<'_>, _text: &str) -> Option<String> {
         None
     }
     fn declaration_start(&self, visited: Visited<'_, '_>, _text: &str) -> usize {
-        visited.node().start_byte()
+        visited.syntax_element().start_byte()
     }
     fn qualification_separator(&self) -> &'static str {
         "."
     }
 }
 
-fn node_facets(kind: &str) -> Vec<NodeFacet> {
+fn syntax_element_facets(kind: &str) -> Vec<NodeFacet> {
     match kind {
         "comment" => vec![NodeFacet::Comment],
         "attribute" | "directive_attribute" => vec![NodeFacet::Annotation],
         "interpolation" | "expression" | "pipe_call" => vec![NodeFacet::Expression],
         kind if kind.ends_with("_statement") || kind.ends_with("_block") => vec![NodeFacet::Block],
-        _ => crate::ecmascript::node_facets(kind),
+        _ => crate::ecmascript::syntax_element_facets(kind),
     }
 }
 
@@ -197,7 +197,7 @@ pub(crate) fn restored_symbol_kind(name: &str) -> Option<&'static str> {
 ///
 /// # Errors
 ///
-/// Returns provider failures for invalid ranges or when combined syntax crosses a node or depth bound.
+/// Returns provider failures for invalid ranges or when combined syntax crosses a syntax element or depth bound.
 pub fn append_angular_templates(
     source: SyntaxSource<'_>,
     limits: SyntaxLimits,
@@ -208,17 +208,17 @@ pub fn append_angular_templates(
     if document.source_digest() != Some(&rift_core::FileDigest::of(source.text.as_bytes())) {
         return errors::syntax::facts_range_invalid().fail();
     }
-    if document.nodes().len() > limits.syntax_nodes_max() {
-        return errors::syntax::too_many_nodes()
+    if document.syntax_elements().len() > limits.syntax_elements_max() {
+        return errors::syntax::too_many_syntax_elements()
             .path(source.path)
-            .syntax_nodes_max(limits.syntax_nodes_max())
+            .syntax_elements_max(limits.syntax_elements_max())
             .fail();
     }
     crate::embedded::admit_depth(source, limits, 0, document)?;
-    if ranges.len() > limits.syntax_nodes_max() {
-        return errors::syntax::too_many_nodes()
+    if ranges.len() > limits.syntax_elements_max() {
+        return errors::syntax::too_many_syntax_elements()
             .path(source.path)
-            .syntax_nodes_max(limits.syntax_nodes_max())
+            .syntax_elements_max(limits.syntax_elements_max())
             .fail();
     }
     let mut previous_end = 0;
@@ -229,7 +229,7 @@ pub fn append_angular_templates(
         }
         previous_end = range.end;
     }
-    let mut nodes = document.nodes().to_vec();
+    let mut syntax_elements = document.syntax_elements().to_vec();
     let mut has_errors = document.has_errors();
     let mut symbols = document.symbols().to_vec();
     symbols.extend_from_slice(document.facts().left_out_symbols());
@@ -239,10 +239,11 @@ pub fn append_angular_templates(
         if range.start == range.end {
             continue;
         }
-        let parent = containing_node(document, *range)
+        let parent = containing_syntax_element(document, *range)
             .ok_or_else(|| errors::syntax::facts_range_invalid().error())?;
-        let depth = crate::embedded::node_depth(document, parent) + 1;
-        let remaining = crate::embedded::remaining_limits(source, limits, nodes.len(), depth)?;
+        let depth = crate::embedded::syntax_element_depth(document, parent) + 1;
+        let remaining =
+            crate::embedded::remaining_limits(source, limits, syntax_elements.len(), depth)?;
         let template = analyze_angular_included(source, remaining, *range)
             .map_err(|error| crate::embedded::aggregate_error(error, source, limits))?;
         crate::embedded::admit_depth(source, limits, depth, &template)?;
@@ -252,21 +253,21 @@ pub fn append_angular_templates(
                 template.left_out_declaration_count() - template.facts().left_out_symbols().len(),
             )
             .ok_or_else(|| {
-                errors::syntax::too_many_nodes()
+                errors::syntax::too_many_syntax_elements()
                     .path(source.path)
-                    .syntax_nodes_max(limits.syntax_nodes_max())
+                    .syntax_elements_max(limits.syntax_elements_max())
                     .error()
             })?;
         symbols.extend_from_slice(template.symbols());
         symbols.extend_from_slice(template.facts().left_out_symbols());
-        crate::embedded::append_nodes(&mut nodes, &template, parent);
+        crate::embedded::append_syntax_elements(&mut syntax_elements, &template, parent);
     }
-    crate::embedded::order_nodes(&mut nodes);
+    crate::embedded::order_syntax_elements(&mut syntax_elements);
     symbols.sort_by_key(|symbol| symbol.range.start);
     Ok(SyntaxDocument::new(
         document.language().clone(),
         source.path.clone(),
-        nodes,
+        syntax_elements,
         symbols,
         has_errors,
     )
@@ -276,16 +277,16 @@ pub fn append_angular_templates(
     .with_framework_context())
 }
 
-fn containing_node(document: &SyntaxDocument, range: crate::ByteRange) -> Option<usize> {
+fn containing_syntax_element(document: &SyntaxDocument, range: crate::ByteRange) -> Option<usize> {
     let mut index = document
-        .nodes()
-        .partition_point(|node| node.range.start <= range.start)
+        .syntax_elements()
+        .partition_point(|syntax_element| syntax_element.range.start <= range.start)
         .checked_sub(1)?;
     loop {
-        let node = &document.nodes()[index];
-        if node.range.start <= range.start && range.end <= node.range.end {
+        let syntax_element = &document.syntax_elements()[index];
+        if syntax_element.range.start <= range.start && range.end <= syntax_element.range.end {
             return Some(index);
         }
-        index = node.parent?;
+        index = syntax_element.parent?;
     }
 }

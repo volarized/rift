@@ -44,7 +44,7 @@ impl Scope {
         original: Option<&str>,
     ) {
         if symbol.kind != "macro"
-            || symbol.node_kind != Some("macro_definition")
+            || symbol.syntax_element_kind != Some("macro_definition")
             || original != Some(file.source)
             || file.syntax.has_errors()
             || text_range(file.source, symbol.item_range).is_none()
@@ -639,7 +639,7 @@ fn macro_export_attribute(file: &SelectedFile<'_>, range: ByteRange) -> bool {
     (source.trim() == "#[macro_export]" || local)
         && file.syntax.symbols().iter().any(|symbol| {
             symbol.kind == "macro"
-                && symbol.node_kind == Some("macro_definition")
+                && symbol.syntax_element_kind == Some("macro_definition")
                 && (local || symbol.visibility.as_deref() == Some("pub"))
                 && symbol.range.start <= range.start
                 && range.end <= symbol.item_range.start
@@ -790,7 +790,7 @@ impl Context<'_> {
             || !defining.syntax.symbols().iter().any(|symbol| {
                 symbol.name == name
                     && symbol.kind == "macro"
-                    && symbol.node_kind == Some("macro_definition")
+                    && symbol.syntax_element_kind == Some("macro_definition")
                     && symbol.item_range == *range
             })
             || path.as_str().rsplit_once('/').map(|(parent, _)| parent)

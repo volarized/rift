@@ -1,4 +1,4 @@
-//! Shapes that place many siblings under one node analyze in time linear in their size.
+//! Shapes that place many siblings under one syntax element analyze in time linear in their size.
 //!
 //! Tree-sitter's `Node::child`, `Node::prev_sibling`, and `Node::parent` search again from the
 //! first child or from the root on every call, so a walk or a rule stepping through siblings
@@ -35,7 +35,7 @@ const GROWTH_FACTOR: u16 = 8;
 /// and below it for a quadratic one, before the test mistakes one for the other.
 ///
 /// On an Apple M-series debug build every shape measured 7.9 to 8.3, while a macos-15 runner
-/// measured a Rust wide node at 11.73, its larger file analyzing 1.47 times slower per line.
+/// measured a Rust wide syntax element at 11.73, its larger file analyzing 1.47 times slower per line.
 /// A quadratic walk never runs alone: the measured ratio is 8 and 64 averaged by how the
 /// smaller file's time splits between linear work, tree-sitter's own parse included, and the
 /// walk. The walk crosses the bound once it takes more than a quarter of that time and reaches
@@ -53,23 +53,23 @@ const REPEATS: usize = 3;
 /// The time one analysis of the smaller file takes at least, once calibrated.
 ///
 /// A stall that lands on every larger run adds its length divided by the smaller run's time
-/// to the ratio. A TOML wide node whose smaller file analyzed in 3.0 ms measured 11.8 on a
+/// to the ratio. A TOML wide syntax element whose smaller file analyzed in 3.0 ms measured 11.8 on a
 /// busy machine, each 23.6 ms larger run stalled to 35.5 ms; the quiet machine measured 8.1.
 /// At twenty milliseconds the same stall adds 0.6, and only a stall past about 290 ms on
 /// every larger run reaches [`ratio_max`].
 const SMALL_RUN_MIN: Duration = Duration::from_millis(20);
 
 /// Doublings of a shape's starting count calibration takes at most: sixteen times the
-/// start, which the fastest shape on an Apple M-series debug build, a JSON wide node at
+/// start, which the fastest shape on an Apple M-series debug build, a JSON wide syntax element at
 /// 1.25 ms per thousand lines, needs to reach [`SMALL_RUN_MIN`].
 const CALIBRATION_DOUBLINGS_MAX: usize = 4;
 
-/// Lines in the smallest calibrated wide-node file, each one more child of the same node.
+/// Lines in the smallest calibrated wide-syntax element file, each one more child of the same syntax element.
 ///
 /// Reading each child with `Node::child` measured 59.4 to 62.2 at this count for every
-/// language whose grammar keeps the lines as direct children of one node; [`wide_line`] names
+/// language whose grammar keeps the lines as direct children of one syntax element; [`wide_line`] names
 /// the two whose grammars do not.
-const WIDE_NODE_LINES_MIN: usize = 1_000;
+const WIDE_SYNTAX_ELEMENT_LINES_MIN: usize = 1_000;
 
 /// Doc comment lines in front of the one declaration in the smallest calibrated
 /// attached-run file. Reading each child with `Node::child` measured 51.2 to 59.6 at this
@@ -87,8 +87,8 @@ const HEADINGS_MIN: usize = 4_000;
 ///
 /// Tree-sitter's own parse carries most of this shape's time, so matching each link to its
 /// block with a scan over every block measured 15.6 at 4,000 definitions and 23.6 to 23.9 at
-/// this count. Its larger file of 240,002 nodes is the largest round count the default syntax
-/// node bound admits, and under the scan the test already runs 44 of the 60 seconds nextest
+/// this count. Its larger file of 240,002 syntax elements is the largest round count the default syntax
+/// syntax element bound admits, and under the scan the test already runs 44 of the 60 seconds nextest
 /// allows it.
 ///
 /// Against [`ratio_max`], 22.63, that scan clears the bound by 4 to 6 percent, so this test
@@ -96,28 +96,28 @@ const HEADINGS_MIN: usize = 4_000;
 /// the bound, so the thin margin weakens detection and never fails a linear run.
 const REFERENCE_DEFINITIONS_MIN: usize = 10_000;
 
-/// One line of the wide-node file for `language`: a construct the grammar places as one more
-/// child of the same node. Panics when a registered provider names a language this table has
+/// One line of the wide-syntax element file for `language`: a construct the grammar places as one more
+/// child of the same syntax element. Panics when a registered provider names a language this table has
 /// no entry for, which tells the next implementer to add one.
 ///
-/// The markdown and TOML grammars place no run of lines directly under one node. TOML ends
+/// The markdown and TOML grammars place no run of lines directly under one syntax element. TOML ends
 /// every line with a newline its rules collect in a `repeat`, and markdown builds blocks, list
 /// items, and table rows from `repeat` rules too. Tree-sitter nests each repetition in hidden
-/// repeat nodes such as `document_repeat1`, and `Node::child` steps over a hidden node by its
+/// repeat syntax elements such as `document_repeat1`, and `Node::child` steps over a hidden syntax element by its
 /// child count. Every spelling tried in those two languages, comments and values inside a TOML
 /// array, markdown list items and table rows among them, measured 8.5 to 9.1 under that walk,
 /// so for them this shape checks linear extraction only.
 fn wide_line(language: &Language) -> &'static str {
     match language.name.as_str() {
         "rust" | "javascript" | "typescript" | "json" | "jsonc" | "c" | "cpp" => {
-            "// wide node comment line\n"
+            "// wide syntax element comment line\n"
         }
-        "python" | "cython" | "yaml" | "toml" => "# wide node comment line\n",
+        "python" | "cython" | "yaml" | "toml" => "# wide syntax element comment line\n",
         "markdown" => "***\n\n",
-        "html" | "vue" | "svelte" => "<!-- wide node comment line -->\n",
-        "css" => "/* wide node comment line */\n",
+        "html" | "vue" | "svelte" => "<!-- wide syntax element comment line -->\n",
+        "css" => "/* wide syntax element comment line */\n",
         name => panic!(
-            "a registered provider has no wide node line: language={name}, dialect={:?}",
+            "a registered provider has no wide syntax element line: language={name}, dialect={:?}",
             language.dialect
         ),
     }
@@ -128,10 +128,11 @@ fn wide_line(language: &Language) -> &'static str {
 /// registered provider names a language this table has no entry for.
 fn attached_run(language: &Language) -> Option<(&'static str, &'static str)> {
     match language.name.as_str() {
-        "rust" => Some(("/// wide node doc line\n", "fn wide() {}\n")),
-        "javascript" | "typescript" => {
-            Some(("/** wide node doc line */\n", "function wide() {}\n"))
-        }
+        "rust" => Some(("/// wide syntax element doc line\n", "fn wide() {}\n")),
+        "javascript" | "typescript" => Some((
+            "/** wide syntax element doc line */\n",
+            "function wide() {}\n",
+        )),
         "python" | "json" | "jsonc" | "yaml" | "toml" | "markdown" | "html" | "css" | "vue"
         | "svelte" | "c" | "cpp" | "cython" => None,
         name => panic!(
@@ -162,7 +163,7 @@ fn timed_analysis(provider: &dyn SyntaxProvider, text: &str) -> (SyntaxDocument,
 /// takes [`SMALL_RUN_MIN`], at most [`CALIBRATION_DOUBLINGS_MAX`] times.
 ///
 /// A doubling that would carry the larger file past the default limits' source bytes or
-/// syntax nodes is not taken. One run at `lines_min` goes first and counts for nothing, so
+/// syntax elements is not taken. One run at `lines_min` goes first and counts for nothing, so
 /// first-use setup lands on no timed run.
 fn calibrated_lines(
     provider: &dyn SyntaxProvider,
@@ -177,8 +178,9 @@ fn calibrated_lines(
         let text = build(lines);
         let (document, elapsed) = timed_analysis(provider, &text);
         let bytes_fit = text.len() * next_large <= limits.source_bytes_max();
-        let nodes_fit = document.nodes().len() * next_large <= limits.syntax_nodes_max();
-        if elapsed >= SMALL_RUN_MIN || !(bytes_fit && nodes_fit) {
+        let syntax_elements_fit =
+            document.syntax_elements().len() * next_large <= limits.syntax_elements_max();
+        if elapsed >= SMALL_RUN_MIN || !(bytes_fit && syntax_elements_fit) {
             return lines;
         }
         lines *= 2;
@@ -222,17 +224,17 @@ fn analyze_linearly(
 }
 
 #[test]
-fn every_provider_reads_a_node_with_many_children_in_linear_time() {
+fn every_provider_reads_a_syntax_element_with_many_children_in_linear_time() {
     for provider in registry::providers() {
         let language = provider.language();
         let line = wide_line(language);
         let build = |count| line.repeat(count);
-        let (document, lines) = analyze_linearly(provider, build, WIDE_NODE_LINES_MIN);
+        let (document, lines) = analyze_linearly(provider, build, WIDE_SYNTAX_ELEMENT_LINES_MIN);
         assert!(
-            document.nodes().len() > lines,
-            "every generated line must reach the walk as a node: language={language:?}, \
-             nodes={}, lines={lines}",
-            document.nodes().len(),
+            document.syntax_elements().len() > lines,
+            "every generated line must reach the walk as a syntax_element: language={language:?}, \
+             syntax_elements={}, lines={lines}",
+            document.syntax_elements().len(),
         );
     }
 }
@@ -246,11 +248,11 @@ fn native_function_prototypes_analyze_in_linear_time() {
             |count| {
                 format!(
                     "{}{}",
-                    "// wide node comment line\n".repeat(count),
+                    "// wide syntax element comment line\n".repeat(count),
                     "int wide(void);\n".repeat(count),
                 )
             },
-            WIDE_NODE_LINES_MIN,
+            WIDE_SYNTAX_ELEMENT_LINES_MIN,
         );
         assert_eq!(document.symbols().len(), lines);
         assert!(

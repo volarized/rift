@@ -34,7 +34,7 @@ impl SyntaxProvider for CssSyntaxProvider {
     ) -> Result<SyntaxDocument, RiftError> {
         analyze(source, limits, &[])
     }
-    fn node_facets(&self, kind: &str) -> Vec<NodeFacet> {
+    fn syntax_element_facets(&self, kind: &str) -> Vec<NodeFacet> {
         match kind {
             "rule_set" | "declaration" | "at_rule" => vec![NodeFacet::Declaration],
             "block" => vec![NodeFacet::Block],
@@ -102,15 +102,19 @@ struct CssRules {
     kinds: &'static CssKinds,
 }
 impl CssRules {
-    fn named_child<'tree>(&self, node: Node<'tree>) -> Option<(Node<'tree>, &'static str)> {
-        let (wanted, kind) = match node.kind_id() {
+    fn named_child<'tree>(
+        &self,
+        syntax_element: Node<'tree>,
+    ) -> Option<(Node<'tree>, &'static str)> {
+        let (wanted, kind) = match syntax_element.kind_id() {
             id if id == self.kinds.rule => (self.kinds.selectors, SELECTOR),
             id if id == self.kinds.declaration => (self.kinds.property, PROPERTY),
             id if id == self.kinds.at_rule => (self.kinds.keyword, AT_RULE),
             _ => return None,
         };
-        let mut cursor = node.walk();
-        node.named_children(&mut cursor)
+        let mut cursor = syntax_element.walk();
+        syntax_element
+            .named_children(&mut cursor)
             .find(|child| child.kind_id() == wanted)
             .map(|child| (child, kind))
     }
@@ -121,7 +125,7 @@ impl GrammarRules for CssRules {
         visited: Visited<'_, '_>,
         text: &str,
     ) -> Result<Option<Declaration>, RiftError> {
-        let Some((child, kind)) = self.named_child(visited.node()) else {
+        let Some((child, kind)) = self.named_child(visited.syntax_element()) else {
             return Ok(None);
         };
         let Some(name) = text.get(child.byte_range()).filter(|name| !name.is_empty()) else {
@@ -137,19 +141,19 @@ impl GrammarRules for CssRules {
             documentation_ranges: Vec::new(),
         }))
     }
-    fn container_name(&self, node: Node<'_>, text: &str) -> Option<String> {
-        if node.kind_id() != self.kinds.rule {
+    fn container_name(&self, syntax_element: Node<'_>, text: &str) -> Option<String> {
+        if syntax_element.kind_id() != self.kinds.rule {
             return None;
         }
-        self.named_child(node)
+        self.named_child(syntax_element)
             .and_then(|(child, _)| text.get(child.byte_range()))
             .map(str::to_owned)
     }
     fn declaration_start(&self, visited: Visited<'_, '_>, _: &str) -> usize {
-        visited.node().start_byte()
+        visited.syntax_element().start_byte()
     }
-    fn name_range(&self, node: Node<'_>) -> Result<Option<crate::ByteRange>, RiftError> {
-        self.named_child(node)
+    fn name_range(&self, syntax_element: Node<'_>) -> Result<Option<crate::ByteRange>, RiftError> {
+        self.named_child(syntax_element)
             .map(|(child, _)| extract::byte_range(child))
             .transpose()
     }

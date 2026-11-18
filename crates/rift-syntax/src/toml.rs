@@ -39,9 +39,9 @@
 //!   pair or table it precedes, outside both, and so stays with the file.
 //! - Nothing else attaches in front of a pair, table, or table array
 //!   element, so `range` equals `item_range`.
-//! - A table or table array element has no wrapping node for the pairs it
+//! - A table or table array element has no wrapping syntax element for the pairs it
 //!   holds, so its `body_range` is always absent; a pair's `body_range` is
-//!   its value node's span.
+//!   its value syntax element's span.
 //! - Members carry no visibility and no portable symbol facet: `visibility`
 //!   stays `None` and `facets` stays empty.
 //! - `signatures` and `documentation` stay empty for every member and every
@@ -107,11 +107,11 @@ const QUOTE_BYTE_WIDTH: usize = 1;
 
 /// Numeric grammar ids for every kind the extraction walk compares, resolved
 /// once so each decision compares integers. The pinned grammar declares no
-/// fields, so this table holds no field ids. `node_facets` classifies the
+/// fields, so this table holds no field ids. `syntax_element_facets` classifies the
 /// value-literal kinds (`string`, `integer`, and the rest) by their kind
 /// name directly, so this table holds none of those - the same split the
 /// JSON provider draws between `pair`/`string`, which extraction consults,
-/// and `"number"`/`"true"`/`"false"`/`"null"`, which `node_facets` matches
+/// and `"number"`/`"true"`/`"false"`/`"null"`, which `syntax_element_facets` matches
 /// by name alone.
 #[derive(Debug)]
 struct TomlKinds {
@@ -145,12 +145,12 @@ impl TomlKinds {
     }
 }
 
-/// Resolves one node kind id, proving the pinned grammar defines it.
+/// Resolves one syntax element kind id, proving the pinned grammar defines it.
 fn kind_id(language: &tree_sitter::Language, kind: &str) -> u16 {
     let id = language.id_for_node_kind(kind, true);
     assert!(
         id != 0,
-        "pinned TOML grammar must define node kind used by symbol \
+        "pinned TOML grammar must define syntax_element kind used by symbol \
          extraction: kind={kind}"
     );
     id
@@ -173,14 +173,14 @@ impl TomlRules {
 
     /// One key segment's spelling: a `bare_key`'s bytes, or a `quoted_key`'s
     /// bytes between its quotes, escapes kept as authored. `None` for a
-    /// node that is neither.
-    fn key_segment_spelling(&self, node: Node<'_>, text: &str) -> Option<String> {
-        let id = node.kind_id();
+    /// syntax element that is neither.
+    fn key_segment_spelling(&self, syntax_element: Node<'_>, text: &str) -> Option<String> {
+        let id = syntax_element.kind_id();
         if id == self.kinds.bare_key {
-            return text.get(node.byte_range()).map(str::to_owned);
+            return text.get(syntax_element.byte_range()).map(str::to_owned);
         }
         if id == self.kinds.quoted_key {
-            let spelling = text.get(node.byte_range())?;
+            let spelling = text.get(syntax_element.byte_range())?;
             let inner_start = QUOTE_BYTE_WIDTH;
             let inner_end = spelling.len().saturating_sub(QUOTE_BYTE_WIDTH);
             return spelling.get(inner_start..inner_end).map(str::to_owned);
@@ -196,12 +196,14 @@ impl TomlRules {
         let mut segments = Vec::new();
         let mut pending = vec![key];
         let mut cursor = key.walk();
-        while let Some(node) = pending.pop() {
-            if node.kind_id() == self.kinds.dotted_key {
-                extract::push_named_children(&mut pending, &mut cursor, node, |child| child);
+        while let Some(syntax_element) = pending.pop() {
+            if syntax_element.kind_id() == self.kinds.dotted_key {
+                extract::push_named_children(&mut pending, &mut cursor, syntax_element, |child| {
+                    child
+                });
                 continue;
             }
-            if let Some(segment) = self.key_segment_spelling(node, text) {
+            if let Some(segment) = self.key_segment_spelling(syntax_element, text) {
                 segments.push(segment);
             }
         }
@@ -238,9 +240,10 @@ impl TomlRules {
 
     /// A table or table array element's header key: the first named child
     /// of a key kind, filtered the same way a pair's children are.
-    fn header_key<'tree>(&self, node: Node<'tree>) -> Option<Node<'tree>> {
-        let mut cursor = node.walk();
-        node.named_children(&mut cursor)
+    fn header_key<'tree>(&self, syntax_element: Node<'tree>) -> Option<Node<'tree>> {
+        let mut cursor = syntax_element.walk();
+        syntax_element
+            .named_children(&mut cursor)
             .find(|child| self.is_key_kind(child.kind_id()))
     }
 
@@ -268,10 +271,10 @@ impl TomlRules {
 
     /// The declaration of one table or table array element, named from its
     /// header key. Neither grammar kind wraps its member pairs in a body
-    /// node, so the declaration carries no `body_range`.
-    fn table_declaration(&self, node: Node<'_>, text: &str) -> Option<Declaration> {
+    /// syntax element, so the declaration carries no `body_range`.
+    fn table_declaration(&self, syntax_element: Node<'_>, text: &str) -> Option<Declaration> {
         let name = self
-            .header_key(node)
+            .header_key(syntax_element)
             .and_then(|key| self.key_name(key, text))?;
         Some(Declaration {
             name,
@@ -291,34 +294,34 @@ impl GrammarRules for TomlRules {
         visited: Visited<'_, '_>,
         text: &str,
     ) -> Result<Option<Declaration>, RiftError> {
-        let node = visited.node();
-        let id = node.kind_id();
+        let syntax_element = visited.syntax_element();
+        let id = syntax_element.kind_id();
         if id == self.kinds.pair {
-            return self.pair_declaration(node, text);
+            return self.pair_declaration(syntax_element, text);
         }
         if id == self.kinds.table || id == self.kinds.table_array_element {
-            return Ok(self.table_declaration(node, text));
+            return Ok(self.table_declaration(syntax_element, text));
         }
         Ok(None)
     }
 
-    fn container_name(&self, node: Node<'_>, text: &str) -> Option<String> {
-        let id = node.kind_id();
+    fn container_name(&self, syntax_element: Node<'_>, text: &str) -> Option<String> {
+        let id = syntax_element.kind_id();
         if id == self.kinds.pair {
-            let (key, _value) = self.pair_children(node);
+            let (key, _value) = self.pair_children(syntax_element);
             return key.and_then(|key| self.key_name(key, text));
         }
         if id == self.kinds.table || id == self.kinds.table_array_element {
             return self
-                .header_key(node)
+                .header_key(syntax_element)
                 .and_then(|key| self.key_name(key, text));
         }
         None
     }
 
-    /// A declaration starts at its own node: nothing attaches in front.
+    /// A declaration starts at its own syntax element: nothing attaches in front.
     fn declaration_start(&self, visited: Visited<'_, '_>, _text: &str) -> usize {
-        visited.node().start_byte()
+        visited.syntax_element().start_byte()
     }
 
     fn qualification_separator(&self) -> &'static str {
@@ -369,12 +372,12 @@ impl SyntaxProvider for TomlSyntaxProvider {
         let rules = TomlRules {
             kinds: toml_kinds(),
         };
-        let (nodes, symbols) =
+        let (syntax_elements, symbols) =
             extract::extract(tree.root_node(), source, limits, &self.language, &rules)?;
         Ok(SyntaxDocument::new(
             self.language.clone(),
             source.path.clone(),
-            nodes,
+            syntax_elements,
             symbols,
             tree.root_node().has_error(),
         )
@@ -382,10 +385,10 @@ impl SyntaxProvider for TomlSyntaxProvider {
         .with_syntax_limits(limits))
     }
 
-    /// Portable structural facets for one TOML grammar node kind. The
+    /// Portable structural facets for one TOML grammar syntax element kind. The
     /// structural kinds - `document`, `array`, `inline_table`, key segments
     /// - carry none.
-    fn node_facets(&self, kind: &str) -> Vec<NodeFacet> {
+    fn syntax_element_facets(&self, kind: &str) -> Vec<NodeFacet> {
         match kind {
             // A pair declares its key's name; a table or table array
             // element declares its header key's name.
@@ -474,7 +477,7 @@ mod tests {
         assert_eq!(
             values,
             vec![None, None],
-            "a value node is neither a bare key nor a quoted key, so it spells no segment"
+            "a value syntax element is neither a bare key nor a quoted key, so it spells no segment"
         );
     }
 
@@ -499,8 +502,10 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "must define node kind used by symbol extraction: \
-                               kind=no_such_kind")]
+    #[should_panic(
+        expected = "must define syntax_element kind used by symbol extraction: \
+                               kind=no_such_kind"
+    )]
     fn test_kind_resolution_refuses_a_kind_the_grammar_lacks() {
         let _ = kind_id(&toml_grammar(), "no_such_kind");
     }
@@ -514,7 +519,7 @@ mod tests {
 
     /// A table's pairs qualify through its header key, and a bare pair
     /// before any table stays at the top level. Spans: the whole pair or
-    /// table for `range` and `item_range`, the value node for a pair's
+    /// table for `range` and `item_range`, the value syntax element for a pair's
     /// `body_range`, and no `body_range` for the table.
     #[test]
     fn test_table_members_qualify_through_the_header_key_with_exact_spans() {
@@ -549,7 +554,7 @@ mod tests {
                 .all(|symbol| symbol.range == symbol.item_range
                     && symbol.facets.is_empty()
                     && symbol.visibility.is_none()),
-            "every declaration spans its own node and carries no facets and \
+            "every declaration spans its own syntax_element and carries no facets and \
              no visibility"
         );
         assert_eq!(document.symbols()[0].kind, "member");
@@ -641,7 +646,7 @@ mod tests {
     }
 
     /// A standalone leading comment stays a sibling of the pair or table it
-    /// precedes: it widens neither node's own span.
+    /// precedes: it widens neither syntax element's own span.
     #[test]
     fn test_a_leading_comment_on_its_own_line_stays_with_the_file() {
         let text = "# leading comment\nport = 8080\n";
@@ -684,7 +689,7 @@ mod tests {
     }
 
     /// A pair with no value at all - unlike JSON's `{"broken": }`, which
-    /// still yields a `pair` node - parses as an `ERROR` node wrapping the
+    /// still yields a `pair` syntax element - parses as an `ERROR` syntax element wrapping the
     /// bare key and `=`, not a `pair`: no `member` symbol names it. A
     /// well-formed pair after it still emits, so the malformed line drops
     /// only its own name, not the rest of the file's facts.
@@ -692,7 +697,7 @@ mod tests {
     fn test_a_pair_with_no_value_emits_no_symbol_but_keeps_later_facts() {
         let document = analyze("port = \nhost = \"a\"\n");
         assert!(document.has_errors());
-        assert!(!document.nodes().is_empty());
+        assert!(!document.syntax_elements().is_empty());
         let names = document
             .symbols()
             .iter()
@@ -704,7 +709,7 @@ mod tests {
     /// CRLF sources keep byte-exact spans. The pinned grammar's line-ending
     /// scanner folds a lone trailing `\r` into the preceding pair's own
     /// span while leaving the `\n` outside it, so a pair's range on a CRLF
-    /// line runs one byte past its LF-only counterpart; the value node's
+    /// line runs one byte past its LF-only counterpart; the value syntax element's
     /// own span still excludes both.
     #[test]
     fn test_crlf_source_keeps_byte_exact_ranges() {
@@ -721,7 +726,7 @@ mod tests {
     }
 
     #[test]
-    fn test_provider_enforces_source_node_and_depth_limits() {
+    fn test_provider_enforces_source_syntax_element_and_depth_limits() {
         let bounded = |limits: SyntaxLimits, text: &str| {
             TomlSyntaxProvider::default().analyze(
                 SyntaxSource {
@@ -741,14 +746,14 @@ mod tests {
             rift_error::errors::syntax::source_too_large::SLUG
         );
 
-        let node_error = bounded(
+        let syntax_element_error = bounded(
             SyntaxLimits::new(100, 1, 10).expect("positive limits"),
             "a = 1\n",
         )
-        .expect_err("node bound");
+        .expect_err("syntax element bound");
         assert_eq!(
-            node_error.slug(),
-            rift_error::errors::syntax::too_many_nodes::SLUG
+            syntax_element_error.slug(),
+            rift_error::errors::syntax::too_many_syntax_elements::SLUG
         );
 
         let depth_error = bounded(
@@ -772,11 +777,11 @@ mod tests {
     /// The declaring kinds carry the `Declaration` facet, value kinds read
     /// as `Literal`, a comment as `Comment`, and structure carries none.
     #[test]
-    fn test_node_facets_classify_the_interpreted_kinds() {
+    fn test_syntax_element_facets_classify_the_interpreted_kinds() {
         let provider = TomlSyntaxProvider::default();
         for kind in [PAIR_KIND, TABLE_KIND, TABLE_ARRAY_ELEMENT_KIND] {
             assert_eq!(
-                provider.node_facets(kind),
+                provider.syntax_element_facets(kind),
                 [NodeFacet::Declaration],
                 "kind {kind} must classify as a declaration"
             );
@@ -792,12 +797,15 @@ mod tests {
             OFFSET_DATE_TIME_KIND,
         ] {
             assert_eq!(
-                provider.node_facets(kind),
+                provider.syntax_element_facets(kind),
                 [NodeFacet::Literal],
                 "kind {kind} must classify as a literal value"
             );
         }
-        assert_eq!(provider.node_facets(COMMENT_KIND), [NodeFacet::Comment]);
+        assert_eq!(
+            provider.syntax_element_facets(COMMENT_KIND),
+            [NodeFacet::Comment]
+        );
         for kind in [
             "document",
             "array",
@@ -806,7 +814,7 @@ mod tests {
             DOTTED_KEY_KIND,
         ] {
             assert_eq!(
-                provider.node_facets(kind),
+                provider.syntax_element_facets(kind),
                 [],
                 "structural kind {kind} carries no portable facet"
             );

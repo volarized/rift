@@ -168,7 +168,7 @@ pub struct PackageOccurrence {
     pub symbol: SymbolId,
     /// The unit carrying the occurrence.
     pub unit: SourceUnitId,
-    /// The occurrence's byte range inside its unit. It resolves to a syntax node of the
+    /// The occurrence's byte range inside its unit. It resolves to a syntax element of the
     /// unit.
     pub range: TextRange,
     /// The external producer that found the occurrence. Absent when the built-in analyzer
@@ -225,11 +225,11 @@ pub struct PackageSymbol {
     pub unit: SourceUnitId,
     /// The declaration's byte range inside its unit.
     pub range: TextRange,
-    /// The grammar kind of the declaration's item node, the syntax node spanning `range`,
-    /// as `function_item`. Absent when the syntax provider names no item node for the
+    /// The grammar kind of the declaration's item syntax element, the syntax element spanning `range`,
+    /// as `function_item`. Absent when the syntax provider names no item syntax element for the
     /// declaration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub node_kind: Option<String>,
+    pub syntax_element_kind: Option<String>,
     /// The one-based line the declaration starts on.
     pub line: u64,
     /// Entries in the logical object's signature array supplied by this binding.

@@ -23,7 +23,7 @@ use rift_protocol::configuration::{
 use rift_protocol::error as wire;
 use rift_protocol::lock::ProductIdentity;
 use rift_protocol::read::{
-    Digest, GetSymbolResult, Language, NodesParams, NodesResult, Pagination, ProjectPath,
+    Digest, FacetsParams, FacetsResult, GetSymbolResult, Language, Pagination, ProjectPath,
     ReadWarning, SearchParams, SearchResult, SearchScope, TraversalDirection,
 };
 use rift_protocol::revision::Revision;
@@ -77,63 +77,6 @@ use crate::validation::{
     WatchWorkspace, capture_prepared_workspace, configuration_fingerprint, read_published,
     run_index_supervisor, workspace_watcher,
 };
-
-/// Namespace that distinguishes a declaration continuation from a syntax continuation.
-const NODE_SUMMARY_CURSOR: &str = "summary/";
-
-/// Most exact pages one summary read can scan when a declaration spans pages.
-const SUMMARY_PAGES_MAX: usize = 4;
-
-struct SummaryCursor {
-    skip: usize,
-    tag: String,
-    exact: Option<String>,
-}
-
-impl SummaryCursor {
-    fn parse(cursor: &str) -> Result<Self, ToolFailure> {
-        let mut fields = cursor
-            .strip_prefix(NODE_SUMMARY_CURSOR)
-            .ok_or_else(invalid_summary_cursor)?
-            .splitn(3, '/');
-        let skip = fields
-            .next()
-            .and_then(|value| value.parse().ok())
-            .ok_or_else(invalid_summary_cursor)?;
-        let tag = fields
-            .next()
-            .filter(|tag| tag.len() == 16)
-            .ok_or_else(invalid_summary_cursor)?;
-        let exact = fields.next().ok_or_else(invalid_summary_cursor)?;
-        Ok(Self {
-            skip,
-            tag: tag.to_owned(),
-            exact: (!exact.is_empty()).then(|| exact.to_owned()),
-        })
-    }
-
-    fn tag(params: &NodesParams, revision: &Revision) -> String {
-        let bytes = serde_json::to_vec(&(params, revision))
-            .unwrap_or_else(|error| unreachable!("node selector serializes: {error}"));
-        let digest = rift_core::FileDigest::of(&bytes);
-        data_encoding::HEXLOWER.encode(&digest.as_bytes()[..8])
-    }
-
-    fn mint(skip: usize, tag: &str, exact: Option<&str>) -> String {
-        format!(
-            "{NODE_SUMMARY_CURSOR}{skip}/{tag}/{}",
-            exact.unwrap_or_default()
-        )
-    }
-}
-
-fn invalid_summary_cursor() -> ToolFailure {
-    errors::server::read_invalid()
-        .field("node_cursor")
-        .violation("send the cursor with the selector and view that returned it")
-        .mcp()
-        .tool_failure(wire::ErrorPhase::Read)
-}
 
 /// Vector candidates one file may contribute to a fused ranking.
 ///
@@ -944,16 +887,16 @@ impl ResolvedWorkspace {
     }
 }
 
-fn nodes_preparing_failure(resolved: &ResolvedWorkspace) -> ToolFailure {
-    crate::output::log_warnings(&nodes_preparing_warnings(resolved));
+fn facets_preparing_failure(resolved: &ResolvedWorkspace) -> ToolFailure {
+    crate::output::log_warnings(&facets_preparing_warnings(resolved));
     errors::server::read_unavailable()
-        .operation("node read")
+        .operation("facets read")
         .detail("the selected source is still being prepared")
         .mcp()
         .tool_failure(wire::ErrorPhase::Read)
 }
 
-/// Whether `symbol` belongs to a package or a runtime release, whose nodes the global API
+/// Whether `symbol` belongs to a package or a runtime release, whose facets the global API
 /// serves: the project index holds no facts of such a symbol.
 fn is_release_symbol(symbol: &rift_protocol::read::SymbolId) -> Result<bool, ToolFailure> {
     let identity = rift_protocol::identity::SymbolIdentity::parse(symbol.as_str())
@@ -961,7 +904,7 @@ fn is_release_symbol(symbol: &rift_protocol::read::SymbolId) -> Result<bool, Too
     Ok(!identity.owner().is_local())
 }
 
-fn nodes_preparing_warnings(resolved: &ResolvedWorkspace) -> Vec<ReadWarning> {
+fn facets_preparing_warnings(resolved: &ResolvedWorkspace) -> Vec<ReadWarning> {
     let mut warnings = Vec::new();
     if let Some(stale) = resolved.stale.clone() {
         warnings.push(stale);
@@ -996,7 +939,7 @@ impl ReadAnswer for SearchResult {
     }
 }
 
-impl ReadAnswer for NodesResult {
+impl ReadAnswer for FacetsResult {
     fn warnings_mut(&mut self) -> &mut Vec<ReadWarning> {
         &mut self.warnings
     }
@@ -1815,7 +1758,7 @@ fn ready_in(files: u64, prepared: u64, total: u64) -> WireDuration {
 /// default model from the hub. A hermetic suite must not write into the developer's own
 /// Hugging Face cache, and on a runner with no network a default-on tier would spend its
 /// whole retry budget inside a detached task nobody waits on. The standard library version
-/// probes run by default too, and answer from the machine's own `rustc` and `node`, so
+/// probes run by default too, and answer from the machine's own `rustc` and `syntax element`, so
 /// `resolution = "static"` keeps a fixture's package context on its pins alone. The
 /// integration suites declare the same tables from `tests/hermetic_search.rs`: a unit test
 /// and an integration test are two crates, and one value shared between them would have to
@@ -2417,7 +2360,7 @@ impl RiftMcp {
     /// revision it read, and `declaration_cursor` continues its declarations at that revision.
     /// A complete exact miss returns `symbol_not_found` and up to three alternatives.
     /// An unavailable selection returns its typed cause. A found symbol carries its facts and
-    /// each declaration's location; `nodes` with `symbol` reads a declaration's source. Use
+    /// each declaration's location; `facets` with `symbol` reads a declaration's source. Use
     /// `search` for discovery.
     #[tool]
     async fn get_symbol(
@@ -3414,162 +3357,34 @@ impl RiftMcp {
         u32::try_from(self.limits.results_max()).unwrap_or(u32::MAX)
     }
 
-    /// Reads the selected symbol's declarations with their source and structure. A UTF-8
-    /// byte `position` selects its enclosing declaration, or a source excerpt if none holds
-    /// it. Use `scope` to select a registered project or profile for a path read.
-    /// Send `syntax: true` for the full syntax tree, including individual tokens. Use the
-    /// returned `node_cursor` with the same selector to continue declarations or syntax.
-    /// A node's `index` and `parent` address nodes
-    /// within the same declaration or source unit.
+    /// Reads every declaration of `symbol` with its location, source, and syntax structure.
+    /// The result includes each declaration's syntax tree.
+    /// Use `facet_cursor` with the same symbol and revision to continue declarations.
     /// Use `revision` to read a commit or release, or to pin the served working tree.
     #[tool]
-    async fn nodes(
+    async fn facets(
         &self,
-        Parameters(selected): Parameters<crate::parameters::NodesToolParams>,
-    ) -> Result<Json<rift_protocol::nodes_read::NodesToolResult>, ToolFailure> {
-        let (params, scope, syntax) = selected.split();
-        if scope.is_some_and(|scope| {
-            scope != SearchScope::Local
-                || params.symbol.is_some()
-                || params.path.is_none()
-                || params.position.is_none()
-        }) {
-            return Err(errors::mcp::parameter_invalid()
-                .tool("nodes")
-                .field("scope")
-                .accepted("a path in the project this server serves")
-                .mcp()
-                .tool_failure(wire::ErrorPhase::Read));
-        }
-        let mut params = params;
-        let (summary, exact) = match params.node_cursor.take() {
-            Some(cursor) if cursor.starts_with(NODE_SUMMARY_CURSOR) => {
-                if syntax {
-                    return Err(invalid_summary_cursor());
-                }
-                (Some(SummaryCursor::parse(&cursor)?), None)
-            }
-            exact => (None, exact),
-        };
-        if syntax || exact.is_some() {
-            params.node_cursor = exact;
-            let Json(result) = self.read_nodes(params).await?;
-            return Ok(Json(rift_protocol::nodes_read::NodesToolResult::Syntax(
-                result,
-            )));
-        }
-        let deadline = self.request_deadline().await;
-        tokio::time::timeout_at(deadline.at(), self.read_node_summary(params, summary))
-            .await
-            .map_err(|_| {
-                errors::server::read_unavailable()
-                    .operation("nodes")
-                    .detail("the declaration summary reached the request deadline")
-                    .mcp()
-                    .tool_failure(wire::ErrorPhase::Read)
-            })?
-            .map(rift_protocol::nodes_read::NodesToolResult::Summary)
-            .map(Json)
+        Parameters(params): Parameters<FacetsParams>,
+    ) -> Result<Json<FacetsResult>, ToolFailure> {
+        self.read_facets(params).await
     }
 
-    async fn read_node_summary(
-        &self,
-        params: NodesParams,
-        continuation: Option<SummaryCursor>,
-    ) -> Result<rift_protocol::nodes_read::NodesSummary, ToolFailure> {
-        let mut exact = params.clone();
-        let mut skip = 0;
-        if let Some(cursor) = &continuation {
-            exact.node_cursor.clone_from(&cursor.exact);
-            skip = cursor.skip;
-        }
-        for page in 0..SUMMARY_PAGES_MAX {
-            let Json(result) = Box::pin(self.read_nodes(exact.clone())).await?;
-            let tag = SummaryCursor::tag(&params, &result.revision);
-            if continuation
-                .as_ref()
-                .is_some_and(|cursor| cursor.tag != tag)
-            {
-                return Err(invalid_summary_cursor());
-            }
-            let next = result.node_cursor.clone();
-            let (mut summary, remaining) =
-                crate::output::select_nodes(result, params.position, skip);
-            if summary.excerpt.is_some() {
-                return Ok(summary);
-            }
-            if summary.declarations.is_empty()
-                && let Some(ref cursor) = next
-                && page + 1 < SUMMARY_PAGES_MAX
-            {
-                exact.node_cursor = Some(cursor.clone());
-                skip = 0;
-                continue;
-            }
-            summary.node_cursor = if let Some(offset) = remaining {
-                Some(SummaryCursor::mint(
-                    offset,
-                    &tag,
-                    exact.node_cursor.as_deref(),
-                ))
-            } else {
-                next.as_deref()
-                    .map(|cursor| SummaryCursor::mint(0, &tag, Some(cursor)))
-            };
-            return Ok(summary);
-        }
-        unreachable!("the last exact page returns its summary")
-    }
-
-    async fn read_nodes(&self, params: NodesParams) -> Result<Json<NodesResult>, ToolFailure> {
-        if let Some(symbol) = &params.symbol
-            && is_release_symbol(symbol)?
-        {
-            return self.global_nodes(&params).await;
+    async fn read_facets(&self, params: FacetsParams) -> Result<Json<FacetsResult>, ToolFailure> {
+        if is_release_symbol(&params.symbol)? {
+            return self.global_facets(&params).await;
         }
         let git = params.revision.as_ref().and_then(Revision::git_revision);
         if git.is_some() {
-            return self.read_at(git, move |reads| reads.nodes(&params)).await;
+            return self.read_at(git, move |reads| reads.facets(&params)).await;
         }
         let deadline = self.request_deadline().await;
         let resolved = self
             .published_workspace(wire::ErrorPhase::Read, deadline)
             .await?;
-        let preparation = resolved.published.preparation.as_ref();
-        let path = params
-            .path
-            .as_ref()
-            .map(|path| rift_core::ProjectPath::new(path.0.clone()))
-            .transpose()
-            .map_err(|error| {
-                errors::server::read_invalid()
-                    .field("path")
-                    .violation(error.detail())
-                    .cause(error)
-                    .mcp()
-                    .tool_failure(wire::ErrorPhase::Read)
-            })?;
-        if preparation.is_some_and(|preparation| preparation.total.is_none()) {
-            return Err(nodes_preparing_failure(&resolved));
+        if resolved.published.preparation.is_some() {
+            return Err(facets_preparing_failure(&resolved));
         }
-        // A complete batch clears `preparation`; retained selected paths therefore carry
-        // the warning used by a deadline answer.
-        let selected = path.filter(|path| {
-            preparation.is_some_and(|preparation| {
-                preparation
-                    .map_source_paths
-                    .iter()
-                    .any(|(selected, _)| selected.as_str() == path.as_str())
-            })
-        });
-        if selected.is_some_and(|path| resolved.published.reads.file_record(&path).is_none()) {
-            return self
-                .targeted_nodes_read(&resolved, deadline, move |reads| {
-                    reads.nodes_for_preparation(&params)
-                })
-                .await;
-        }
-        self.current_tree_read(&resolved, false, move |reads| reads.nodes(&params))
+        self.current_tree_read(&resolved, false, move |reads| reads.facets(&params))
             .await
     }
 
@@ -3697,44 +3512,6 @@ impl RiftMcp {
             answer.warnings_mut().push(warning);
         }
         Ok(Json(answer))
-    }
-
-    /// Reads one selected source path while the rest of its workspace is still preparing.
-    /// Worker admission and parsing spend the same deadline as publication validation.
-    async fn targeted_nodes_read(
-        &self,
-        resolved: &ResolvedWorkspace,
-        deadline: RequestDeadline,
-        operation: impl FnOnce(&ReadService) -> Result<NodesResult, RiftError> + Send + 'static,
-    ) -> Result<Json<NodesResult>, ToolFailure> {
-        resolved
-            .published
-            .configuration
-            .accepted_for_tool(wire::ErrorPhase::Read)?;
-        let reads = Arc::clone(&resolved.published.reads);
-        let cancellation = self.validation.cancellation.child_token();
-        let timed_cancellation = cancellation.clone();
-        let work = self.blocking.run_with_cancellation(
-            "targeted node read",
-            cancellation,
-            move |cancellation| {
-                if cancellation.is_cancelled() {
-                    return errors::server::read_cancelled().fail();
-                }
-                operation(&reads)
-            },
-        );
-        match tokio::time::timeout_at(deadline.at(), work).await {
-            Ok(Ok(mut answer)) => {
-                answer.warnings.extend(nodes_preparing_warnings(resolved));
-                Ok(Json(answer))
-            }
-            Ok(Err(error)) => error.mcp().tool_failure(wire::ErrorPhase::Read).fail(),
-            Err(_) => {
-                timed_cancellation.cancel();
-                Err(nodes_preparing_failure(resolved))
-            }
-        }
     }
 
     /// Returns one atomically published index and configuration policy.
@@ -4727,7 +4504,7 @@ impl ServerHandler for RiftMcp {
 
 /// The `initialize` instructions of a server reading its workspace.
 const WORKSPACE_INSTRUCTIONS: &str = "Read the current workspace: get_symbol and search find \
-     declarations, nodes lists syntax nodes at a byte position. \
+     declarations, facets reads every declaration of a symbol with its source and syntax structure. \
      The rift://workspace resource reads effective configuration \
      and source files. `rift server logs` reads the server's recorded diagnostics, \
      including while a tool refuses.";
@@ -4736,7 +4513,7 @@ const WORKSPACE_INSTRUCTIONS: &str = "Read the current workspace: get_symbol and
 /// reads the global index of package and runtime releases, not a workspace.
 const GLOBAL_INSTRUCTIONS: &str = "Read the global index of package and runtime releases: \
      search finds their declarations, naming releases with `:packages` in `SERVICE :search`; \
-     get_symbol reads one symbol at a release `revision`; nodes lists its syntax nodes.";
+     get_symbol reads one symbol at a release `revision`; facets reads its declarations with source and syntax structure.";
 
 /// The engine pool held across requests, replaced when accepted LSP configuration changes.
 ///
@@ -5339,9 +5116,7 @@ done
         VectorSearchConfiguration,
     };
     use rift_protocol::lock::ProductIdentity;
-    use rift_protocol::read::{
-        Digest, NodesParams, NodesResult, ReadWarning, SearchParams, SearchResult,
-    };
+    use rift_protocol::read::{ReadWarning, SearchParams, SearchResult};
     use rift_ranking::{RankingInputKind, RankingWeights};
     use rift_search::{ModelSource, RevisionScoped, VectorReadiness};
     use rift_server::{LspProcessKey, StoreAnswer};
@@ -5354,7 +5129,7 @@ done
 
     use crate::validation::RebuildRequest;
 
-    use super::{BlockingExecutor, Parameters, RequestDeadline, RiftMcp, ToolFailure};
+    use super::{BlockingExecutor, Parameters, RequestDeadline, RiftMcp};
     use crate::storage::WorkspaceStorage;
     use crate::validation::lexical_double::StoreDouble;
     use crate::validation::{
@@ -5453,33 +5228,22 @@ done
         }
     }
 
-    async fn call_nodes(
+    async fn call_facets(
         client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
-        path: &str,
     ) -> TestResult<CallToolResult> {
-        let request = CallToolRequestParams::new("nodes").with_arguments(arguments(
-            &json!({"path": path, "position": 8, "syntax": true}),
+        let request = CallToolRequestParams::new("facets").with_arguments(arguments(
+            &json!({"symbol": "rift://symbol/local/rust/beacon"}),
         )?);
         Ok(client.call_tool(request).await?)
     }
 
-    async fn served_nodes(
-        client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
-        path: &str,
-    ) -> TestResult<NodesResult> {
-        let answer = call_nodes(client, path).await?;
-        Ok(serde_json::from_value(
-            answer.structured_content.ok_or("structured node answer")?,
-        )?)
-    }
-
-    fn assert_preparing_nodes_refusal(answer: &CallToolResult) -> TestResult {
+    fn assert_preparing_facets_refusal(answer: &CallToolResult) -> TestResult {
         assert_eq!(answer.is_error, Some(true));
         assert!(answer.structured_content.is_none());
         let [content] = answer.content.as_slice() else {
-            return Err("node read refusal has one content block".into());
+            return Err("facets read refusal has one content block".into());
         };
-        let text = &content.as_text().ok_or("node read refusal is text")?.text;
+        let text = &content.as_text().ok_or("facets read refusal is text")?.text;
         assert!(
             text.contains("temporarily_unavailable · retry same_request"),
             "{text}"
@@ -5487,27 +5251,6 @@ done
         assert!(text.contains("rift.server.read_unavailable"), "{text}");
         assert!(!text.contains("local_index_preparing"), "{text}");
         Ok(())
-    }
-
-    fn cold_nodes(
-        root: &std::path::Path,
-        configuration: &crate::validation::ConfigurationState,
-        params: &NodesParams,
-    ) -> TestResult<NodesResult> {
-        let limits = configuration.index_limits(WorkspaceIndexLimits::default())?;
-        let visibility = configuration.source_visibility();
-        let text_inclusion = configuration.text_inclusion();
-        let languages = configuration.language_file_selections();
-        let reads = rift_server::ReadService::build_with_languages(
-            root,
-            limits,
-            &visibility,
-            &text_inclusion,
-            &languages,
-            configuration.history_configuration(),
-            configuration.dependencies_configuration(),
-        )?;
-        Ok(reads.nodes(params)?)
     }
 
     async fn assert_answers_before_discovery(
@@ -5534,25 +5277,8 @@ done
             let value = preparation_resource(client, uri).await?;
             assert!(value.get("warnings").is_none());
         }
-        let before_discovery = call_nodes(client, "src/lib.rs").await?;
-        assert_preparing_nodes_refusal(&before_discovery)?;
-        let invalid = client
-            .call_tool(
-                CallToolRequestParams::new("nodes")
-                    .with_arguments(arguments(&json!({"path": "../outside.rs", "position": 8}))?),
-            )
-            .await?;
-        let text = assert_error_result(&invalid, "invalid_request")?;
-        assert!(
-            text.contains("the request does not match the documented form: field path"),
-            "{text}"
-        );
-        assert!(
-            text.lines().any(|line| {
-                line.starts_with("\t\t") && line.contains("project path contains a dot segment")
-            }),
-            "{text}"
-        );
+        let before_discovery = call_facets(client).await?;
+        assert_preparing_facets_refusal(&before_discovery)?;
         Ok(())
     }
 
@@ -5586,9 +5312,8 @@ done
         assert_eq!(map["modules"][0]["files"], 1);
         assert_eq!(map["modules"][0]["symbols"], 0);
 
-        let nodes = served_nodes(&client, "src/lib.rs").await?;
-        assert!(!nodes.nodes.is_empty());
-        assert!(nodes.warnings.is_empty());
+        let facets = call_facets(&client).await?;
+        assert_preparing_facets_refusal(&facets)?;
 
         let answer = client.call_tool(request.clone()).await?;
         let partial: SearchResult = serde_json::from_value(
@@ -5607,9 +5332,6 @@ done
         )));
 
         crate::validation::prepare_initial_workspace_from(&assembled.context, initial).await?;
-        let complete_nodes = served_nodes(&client, "src/lib.rs").await?;
-        assert_eq!(nodes.nodes, complete_nodes.nodes);
-        assert!(complete_nodes.warnings.is_empty());
         let answer = client.call_tool(request).await?;
         let complete: SearchResult = serde_json::from_value(
             answer
@@ -5658,7 +5380,7 @@ done
         assert_eq!(
             sources,
             [
-                "nodes",
+                "facets",
                 "rift://map",
                 "rift://workspace",
                 "search_retrieval"
@@ -5824,199 +5546,6 @@ done
         Ok(())
     }
 
-    #[tokio::test]
-    async fn targeted_nodes_warn_until_workspace_declaration_acceptance_finishes() -> TestResult {
-        use std::fmt::Write as _;
-
-        let directory = tempfile::tempdir()?;
-        let mut source = String::new();
-        for number in 0..6_000 {
-            writeln!(source, "pub fn function_{number}() {{}}")?;
-        }
-        fs::write(directory.path().join("a.rs"), &source)?;
-        fs::write(directory.path().join("b.rs"), &source)?;
-        super::hermetic_workspace(directory.path(), "[source]\ndeclarations = 10000\n")?;
-        let assembled = RiftMcp::assemble(
-            super::absolute_root(directory.path())?,
-            WorkspaceIndexLimits::default(),
-            None,
-            crate::identity::BuildCheckout::Unversioned,
-            unwatched,
-            LexicalLane::spawn,
-            None,
-        )
-        .await?;
-        let initial = crate::validation::discover_initial_workspace(&assembled.context)
-            .await?
-            .ok_or("discovery was cancelled")?;
-        let params: NodesParams = serde_json::from_value(json!({"path": "b.rs", "position": 8}))?;
-        let answer = assembled.server.read_nodes(params.clone()).await?.0;
-        assert!(!answer.nodes.is_empty());
-        assert!(answer.warnings.iter().any(|warning| matches!(
-            warning,
-            ReadWarning::LocalIndexPreparing {
-                prepared: 0,
-                total: Some(3),
-                ..
-            }
-        )));
-        crate::validation::prepare_initial_workspace_from(&assembled.context, initial).await?;
-        let error = assembled
-            .server
-            .read_nodes(params)
-            .await
-            .err()
-            .ok_or("the complete index must refuse a path beyond its declaration bound")?;
-        assert_eq!(
-            rmcp::ErrorData::from(error).data.ok_or("typed refusal")?["code"],
-            "content_unavailable"
-        );
-        let published = Arc::clone(&assembled.server.published.read().await.current);
-        assert!(published.preparation.is_none());
-        assert!(matches!(
-            published.reads.file_warning(&CoreProjectPath::new("b.rs")?),
-            Some(rift_index::WorkspaceIndexWarning::DeclarationsBeyondBound(
-                _
-            ))
-        ));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn nodes_deadline_cancels_queued_targeted_parse_and_answers_preparing() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::create_dir(directory.path().join("src"))?;
-        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
-        super::hermetic_workspace(
-            directory.path(),
-            "[server]\nreadiness_timeout = \"1s\"\nworker_queue_timeout = \"2s\"\n",
-        )?;
-        let assembled = RiftMcp::assemble(
-            super::absolute_root(directory.path())?,
-            WorkspaceIndexLimits::default(),
-            None,
-            crate::identity::BuildCheckout::Unversioned,
-            unwatched,
-            LexicalLane::spawn,
-            None,
-        )
-        .await?;
-        let server = assembled.server.clone();
-        crate::validation::discover_initial_workspace(&assembled.context)
-            .await?
-            .ok_or("initial discovery was cancelled")?;
-        let published = Arc::clone(&server.published.read().await.current);
-        let configuration = published.configuration.clone();
-        let params: NodesParams =
-            serde_json::from_value(json!({"path": "src/lib.rs", "position": 8}))?;
-        let expected = cold_nodes(directory.path(), &configuration, &params)?;
-        server.force_capture(|current| {
-            Ok((
-                current.reads.workspace_digests(),
-                current.configuration.fingerprint,
-            ))
-        });
-        let permits_max = u32::try_from(server.blocking.operations.available_permits())?;
-        assert!(permits_max > 0, "worker pool has an admission permit");
-        let held = Arc::clone(&server.blocking.operations)
-            .acquire_many_owned(permits_max)
-            .await?;
-
-        assert_queued_nodes_timeout(server, params, expected, permits_max, held).await
-    }
-
-    async fn assert_queued_nodes_timeout(
-        server: RiftMcp,
-        params: NodesParams,
-        expected: NodesResult,
-        permits_max: u32,
-        held: tokio::sync::OwnedSemaphorePermit,
-    ) -> TestResult {
-        let published = Arc::clone(&server.published.read().await.current);
-        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
-        let serving_server = server.clone();
-        let serving = tokio::spawn(async move {
-            let service = serving_server
-                .serve(server_transport)
-                .await
-                .expect("server initializes");
-            service.waiting().await.expect("server stops")
-        });
-        let client = ().serve(client_transport).await?;
-        let response = tokio::time::timeout(
-            Duration::from_millis(1_500),
-            call_nodes(&client, "src/lib.rs"),
-        )
-        .await;
-        if response.is_err() {
-            drop(held);
-            let _ = tokio::time::timeout(Duration::from_secs(3), client.cancel()).await;
-            let _ = tokio::time::timeout(Duration::from_secs(3), serving).await;
-            return Err("queued nodes request must spend its 1s deadline".into());
-        }
-        assert_preparing_nodes_refusal(&response??)?;
-        assert_stale_nodes_timeout_warning(&server, &published, params.clone()).await?;
-        drop(held);
-        let after_timeout = Arc::clone(&server.published.read().await.current);
-        assert!(Arc::ptr_eq(&published, &after_timeout));
-        let permits =
-            Arc::clone(&server.blocking.operations).try_acquire_many_owned(permits_max)?;
-        drop(permits);
-        let retried =
-            tokio::time::timeout(Duration::from_secs(3), served_nodes(&client, "src/lib.rs"))
-                .await??;
-        let mut expected = expected;
-        // The targeted parse answers at its own partial tree; every other field matches.
-        expected.revision = retried.revision.clone();
-        assert_eq!(retried, expected);
-        tokio::time::timeout(Duration::from_secs(3), client.cancel()).await??;
-        tokio::time::timeout(Duration::from_secs(3), serving).await??;
-        Ok(())
-    }
-
-    async fn assert_stale_nodes_timeout_warning(
-        server: &RiftMcp,
-        published: &Arc<PublishedWorkspace>,
-        params: NodesParams,
-    ) -> TestResult {
-        let stale_warning = ReadWarning::StaleIndex {
-            index_tree_revision: Digest("11111111".to_owned()),
-            captured_tree_revision: Digest("22222222".to_owned()),
-            detail: "captured source moved".to_owned(),
-        };
-        let stale = super::ResolvedWorkspace {
-            published: Arc::clone(published),
-            stale: Some(stale_warning.clone()),
-            capture_elapsed: Duration::ZERO,
-        };
-        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
-        let stale_answer = server
-            .targeted_nodes_read(
-                &stale,
-                RequestDeadline::starting(Duration::from_millis(20)),
-                {
-                    let params = params.clone();
-                    move |reads| reads.nodes_for_preparation(&params)
-                },
-            )
-            .await
-            .err()
-            .ok_or("stale preparation must refuse")?;
-        assert_node_failure(&stale_answer);
-        let records = drain.queued_records();
-        for code in ["stale_index", "local_index_preparing"] {
-            assert!(
-                records.iter().any(|record| {
-                    record.message() == "read warning"
-                        && serde_json::from_str::<serde_json::Value>(record.fields())
-                            .is_ok_and(|fields| fields["warning_code"] == code)
-                }),
-                "{code}: {records:?}"
-            );
-        }
-        Ok(())
-    }
-
     #[test]
     fn package_and_runtime_symbols_are_release_symbols_and_project_symbols_are_not() -> TestResult {
         for (id, released) in [
@@ -6030,82 +5559,6 @@ done
         }
         let malformed = rift_protocol::read::SymbolId("rift://symbol/".to_owned());
         assert!(super::is_release_symbol(&malformed).is_err());
-        Ok(())
-    }
-
-    fn assert_node_failure(answer: &ToolFailure) {
-        let ToolFailure::Registered(failure, _) = answer else {
-            panic!("node readiness refusal must have a registered error");
-        };
-        assert_eq!(
-            failure.registered().slug(),
-            errors::server::read_unavailable::SLUG
-        );
-    }
-
-    #[tokio::test]
-    async fn nodes_deadline_keeps_an_admitted_parse_owned_until_it_finishes() -> TestResult {
-        let (_directory, assembled) = starting_fixture().await?;
-        crate::validation::discover_initial_workspace(&assembled.context)
-            .await?
-            .ok_or("initial discovery was cancelled")?;
-        let server = assembled.server.clone();
-        let published = Arc::clone(&server.published.read().await.current);
-        let resolved = super::ResolvedWorkspace::current(Arc::clone(&published), Duration::ZERO);
-        let params: NodesParams =
-            serde_json::from_value(json!({"path": "src/lib.rs", "position": 8}))?;
-        let permits_max = u32::try_from(server.blocking.operations.available_permits())?;
-        assert!(permits_max > 0, "worker pool has an admission permit");
-        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
-        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
-        let deadline = RequestDeadline::starting(Duration::from_secs(1));
-        let worker_server = server.clone();
-        let read = tokio::spawn(async move {
-            worker_server
-                .targeted_nodes_read(&resolved, deadline, move |reads| {
-                    started_tx.send(()).expect("test waits for admitted work");
-                    release_rx
-                        .recv_timeout(Duration::from_secs(5))
-                        .expect("test releases admitted work");
-                    reads.nodes_for_preparation(&params)
-                })
-                .await
-        });
-        tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(2)))
-            .await??;
-        let joined = tokio::time::timeout(Duration::from_secs(2), read).await??;
-        let refusal = joined
-            .err()
-            .ok_or("admitted nodes must refuse at its deadline")?;
-        assert_node_failure(&refusal);
-        assert_eq!(
-            u32::try_from(server.blocking.operations.available_permits())?,
-            permits_max - 1,
-        );
-        assert!(Arc::ptr_eq(
-            &published,
-            &server.published.read().await.current
-        ));
-
-        release_tx
-            .send(())
-            .expect("admitted work still waits at gate");
-        let permits = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if let Ok(permit) =
-                    Arc::clone(&server.blocking.operations).try_acquire_many_owned(permits_max)
-                {
-                    break permit;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await?;
-        drop(permits);
-        assert!(Arc::ptr_eq(
-            &published,
-            &server.published.read().await.current
-        ));
         Ok(())
     }
 
@@ -7542,7 +6995,7 @@ done
                 .iter()
                 .map(|tool| tool.name.as_ref())
                 .collect::<Vec<_>>(),
-            ["feedback", "get_symbol", "nodes", "search"]
+            ["facets", "feedback", "get_symbol", "search"]
         );
         assert!(tools.iter().all(|tool| tool.output_schema.is_some()));
 
@@ -7587,35 +7040,33 @@ done
             json!([{"symbol": {"type":"iri", "value":id}}])
         );
 
-        let nodes = client
+        let facets = client
             .call_tool(
-                CallToolRequestParams::new("nodes")
-                    .with_arguments(arguments(&json!({"path": "lib.rs", "position": 8}))?),
+                CallToolRequestParams::new("facets")
+                    .with_arguments(arguments(&json!({"symbol": id}))?),
             )
             .await?;
-        let structured = nodes
+        let structured = facets
             .structured_content
-            .ok_or("nodes must return structured content")?;
+            .ok_or("facets must return structured content")?;
         let item = &structured["declarations"][0];
         assert_eq!(item["kind"], json!("function_item"), "{structured}");
         assert_eq!(item["declaration"], json!(0), "{structured}");
         assert_eq!(item["source"]["text"], "pub fn beacon() {}");
         assert_eq!(structured["symbol"], json!(id), "{structured}");
-        assert!(structured.get("nodes").is_none());
+        assert!(structured.get("facets").is_none());
 
-        let syntax = client
-            .call_tool(
-                CallToolRequestParams::new("nodes").with_arguments(arguments(&json!({
-                    "path": "lib.rs", "position": 8, "syntax": true
-                }))?),
-            )
-            .await?
-            .structured_content
-            .ok_or("nodes must return structured syntax")?;
-        assert_eq!(syntax["nodes"][0]["index"], 0, "{syntax}");
-        assert_eq!(syntax["nodes"][0]["source"], item["source"]["text"]);
-        assert_eq!(syntax["revision"], structured["revision"]);
-
+        assert_eq!(item["syntax"][0]["index"], 0, "{structured}");
+        assert_eq!(item["syntax"][0]["source"], item["source"]["text"]);
+        for field in ["path", "position", "scope", "syntax"] {
+            let request = json!({"symbol": id, field: true});
+            let response = client
+                .call_tool(
+                    CallToolRequestParams::new("facets").with_arguments(arguments(&request)?),
+                )
+                .await?;
+            assert_eq!(response.is_error, Some(true), "{field}: {response:?}");
+        }
         client.cancel().await?;
         server_task.await?;
         Ok(())
@@ -9093,7 +8544,7 @@ done
             let round = rounds.fetch_add(1, Ordering::Relaxed);
             fs::write(
                 root.join("lib.rs"),
-                format!("pub fn beacon{round}() {{}}\n"),
+                format!("pub fn beacon() {{ let value = {round}; }}\n"),
             )
             .expect("the fixture write must land");
             captured_tree(&root, current)
@@ -9130,17 +8581,17 @@ done
         Ok(())
     }
 
-    /// The same condition on a node listing: the listing answers from the publication and
+    /// The same condition on a syntax element listing: the listing answers from the publication and
     /// carries the same warning.
     #[tokio::test]
-    async fn a_node_listing_whose_tree_keeps_moving_answers_stale() -> TestResult {
-        let (directory, server) = fixture().await?;
+    async fn a_facets_read_whose_tree_keeps_moving_answers_stale() -> TestResult {
+        let (directory, server, id) = canonical_fixture().await?;
         capture_a_tree_that_keeps_moving(&server, directory.path());
-        let params = serde_json::from_value(json!({"path": "lib.rs", "position": 8}))?;
+        let params = serde_json::from_value(json!({"symbol": id}))?;
 
-        let answer = tokio::time::timeout(RECONCILED_READ_MAX, server.read_nodes(params))
+        let answer = tokio::time::timeout(RECONCILED_READ_MAX, server.read_facets(params))
             .await
-            .map_err(|_| "a node listing whose tree keeps moving must answer within the bound")??
+            .map_err(|_| "a facets listing whose tree keeps moving must answer within the bound")??
             .0;
 
         let (_index, _captured, detail) = stale_index_of(&answer.warnings)?;
@@ -11110,17 +10561,18 @@ done
             declarations[0].path.as_ref().map(|path| path.0.as_str()),
             Some("src/blob.rs")
         );
-        let nodes = server
-            .read_nodes(rift_protocol::read::NodesParams::of(id.clone()))
+        let facets = server
+            .read_facets(rift_protocol::read::FacetsParams::of(id.clone()))
             .await?
             .0;
-        assert_eq!(nodes.symbol.as_ref(), Some(&id), "{nodes:?}");
+        assert_eq!(&facets.symbol, &id, "{facets:?}");
         assert!(
-            nodes
-                .nodes
+            facets
+                .declarations
                 .first()
-                .is_some_and(|node| node.index == 0 && node.source.contains("BLOB")),
-            "{nodes:?}"
+                .is_some_and(|declaration| declaration.declaration == 0
+                    && declaration.source.text.contains("BLOB")),
+            "{facets:?}"
         );
         assert!(search_symbols(&server, "HUGE").await?.results.is_empty());
         Ok(())

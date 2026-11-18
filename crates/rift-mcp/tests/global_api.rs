@@ -1,10 +1,10 @@
 //! A fixture global API on a loopback port.
 //!
-//! It answers the capability, resolution, symbol, nodes, search, and pattern endpoints
+//! It answers the capability, resolution, symbol, syntax elements, search, and pattern endpoints
 //! `rift-cloud-client` reads, and records every request it receives. Its collection holds
 //! one package, [`COLLECTED`], whose `src/lib.rs` declares [`DECLARATIONS`]; a symbol
-//! request answers the declaration it names, a nodes request that declaration's syntax
-//! nodes, a search request the declarations its
+//! request answers the declaration it names, a syntax elements request that declaration's syntax
+//! syntax elements, a search request the declarations its
 //! identifiers match, and a pattern request the matches of its pattern in that file, so
 //! each answer passes the client's own validation. The
 //! collected release also answers, as the nearest release, an exact `demo` entry at another
@@ -152,7 +152,7 @@ pub(crate) enum SymbolFixture {
 pub(crate) enum Hold {
     /// The resolution endpoint's answer.
     Resolution(Duration),
-    /// The symbol, nodes, and search endpoints' answers.
+    /// The symbol, syntax elements, and search endpoints' answers.
     Read(Duration),
     /// The declarations endpoint's answer.
     Declarations(Duration),
@@ -230,7 +230,7 @@ impl FixtureState {
         }
     }
 
-    /// Waits out the read hold, when the fixture holds symbol, nodes, and search answers.
+    /// Waits out the read hold, when the fixture holds symbol, syntax elements, and search answers.
     async fn hold_read(&self) {
         if let Some(Hold::Read(delay)) = self.options.hold {
             tokio::time::sleep(delay).await;
@@ -384,11 +384,11 @@ async fn global_handler(
         state.hold_read().await;
         return state.response(symbols(options.symbol, &body));
     }
-    if path.ends_with("/nodes") {
+    if path.ends_with("/facets") {
         state.hold_read().await;
-        return symbol_nodes(&body).map_or_else(
+        return symbol_facets(&body).map_or_else(
             || problem_response(StatusCode::NOT_FOUND),
-            |nodes| state.response(nodes),
+            |syntax_elements| state.response(syntax_elements),
         );
     }
     if path.ends_with("/patterns") {
@@ -447,7 +447,7 @@ fn capabilities(options: &FixtureOptions) -> Value {
         "symbol_documentation",
         "patterns",
         "declarations",
-        "nodes",
+        "facets",
     ]
     .into_iter()
     .filter(|feature| !withheld.contains(feature))
@@ -701,13 +701,13 @@ fn release_revision(id: &str) -> Value {
     )
 }
 
-/// The nodes of the collected declaration `request` names, as a symbol read of
-/// [`COLLECTED_SOURCE`] lists them: the item node, then its visibility, name, parameters,
+/// The syntax elements of the collected declaration `request` names, as a symbol read of
+/// [`COLLECTED_SOURCE`] lists them: the item syntax element, then its visibility, name, parameters,
 /// and body, in the fixture's view when the request names one. `None` for any other symbol.
-fn symbol_nodes(request: &Value) -> Option<Value> {
+fn symbol_facets(request: &Value) -> Option<Value> {
     let id = request["symbol"].as_str()?;
     if id == named_identity(&NAMED_POSITIONS[0]) {
-        return Some(runtime_nodes(request));
+        return Some(runtime_facets(request));
     }
     let name = DECLARATIONS
         .into_iter()
@@ -721,26 +721,35 @@ fn symbol_nodes(request: &Value) -> Option<Value> {
         ("parameters", "pub fn ".len() + name.len(), "()"),
         ("block", item.len() - "{}".len(), "{}"),
     ];
-    let nodes = parts
+    let syntax_elements = parts
         .into_iter()
         .enumerate()
         .map(|(index, (kind, offset, source))| {
-            let node_start = start + offset;
-            let mut node = json!({
+            let syntax_element_start = start + offset;
+            let mut syntax_element = json!({
                 "declaration": 0, "index": index, "unit": COLLECTED_UNIT, "language": "rust",
                 "kind": kind,
-                "range": {"start": node_start, "end": node_start + source.len()},
+                "range": {"start": syntax_element_start, "end": syntax_element_start + source.len()},
                 "source": source,
             });
             if index == 0 {
-                node["facets"] = json!(["declaration", "definition"]);
+                syntax_element["facets"] = json!(["declaration", "definition"]);
             } else {
-                node["parent"] = json!(0);
+                syntax_element["parent"] = json!(0);
             }
-            node
+            syntax_element
         })
         .collect::<Vec<_>>();
-    Some(json!({"symbol": id, "nodes": nodes, "revision": release_revision(id)}))
+    Some(facet_answer(id, &release_revision(id), &syntax_elements))
+}
+
+fn facet_answer(id: &str, revision: &Value, syntax: &[Value]) -> Value {
+    let root = &syntax[0];
+    json!({"symbol":id,"revision":revision,"declarations":[{
+        "declaration":root["declaration"],"kind":root["kind"],"range":root["range"],
+        "source":{"span":{"unit":root["unit"],"range":root["range"]},"text":root["source"]},
+        "syntax":syntax
+    }]})
 }
 
 /// The byte range of the runtime `len` declaration in the embedded standard library stub.
@@ -755,18 +764,22 @@ fn runtime_declaration() -> (usize, usize) {
     (start, end)
 }
 
-/// The item node of the runtime `len` declaration, carrying the embedded standard library
+/// The item syntax element of the runtime `len` declaration, carrying the embedded standard library
 /// stub's own bytes at its range, at the release the request names.
-fn runtime_nodes(request: &Value) -> Value {
+fn runtime_facets(request: &Value) -> Value {
     let builtins = python_runtime::builtins();
     let (start, end) = runtime_declaration();
     let source = &builtins[start..end];
-    let mut answer = json!({"symbol": named_identity(&NAMED_POSITIONS[0]), "nodes": [{
-        "declaration": 0, "index": 0,
-        "unit": named_unit(&NAMED_POSITIONS[0]), "language": "python",
-        "kind": "function_definition", "facets": ["declaration", "definition"],
-        "range": {"start": start, "end": end}, "source": source,
-    }], "revision": release_revision(&named_identity(&NAMED_POSITIONS[0]))});
+    let mut answer = facet_answer(
+        &named_identity(&NAMED_POSITIONS[0]),
+        &release_revision(&named_identity(&NAMED_POSITIONS[0])),
+        &[json!({
+            "declaration": 0, "index": 0,
+            "unit": named_unit(&NAMED_POSITIONS[0]), "language": "python",
+            "kind": "function_definition", "facets": ["declaration", "definition"],
+            "range": {"start": start, "end": end}, "source": source,
+        })],
+    );
     if let Some(revision) = request.get("revision") {
         answer["revision"] = revision.clone();
     }

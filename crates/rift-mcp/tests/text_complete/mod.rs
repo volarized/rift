@@ -1,7 +1,7 @@
 //! Checks of the compact text of a tool result against its structured content.
 //!
 //! The text is a curated layout that leaves the normal state implicit, so [`layout`] checks
-//! what the layout promises for each tool: `search`, `get_symbol`, and `nodes`. The layout
+//! what the layout promises for each tool: `search`, `get_symbol`, and `facets`. The layout
 //! rules live in `crates/rift-mcp/src/output/render.rs` and `render/*.rs`.
 
 mod layout;
@@ -15,7 +15,7 @@ const SEARCH_TOOL: &str = "search";
 /// Name of the tool whose answer the layout check handles second.
 const GET_SYMBOL_TOOL: &str = "get_symbol";
 /// Name of the tool whose answer the layout check handles third.
-const NODES_TOOL: &str = "nodes";
+const FACETS_TOOL: &str = "facets";
 
 /// Panics unless the text of a successful `tool` result states what its form promises.
 ///
@@ -57,33 +57,32 @@ fn text_states(tool: &str, result: &CallToolResult) -> Result<(), String> {
             canonical_text_states(text, structured)
         }
         GET_SYMBOL_TOOL => layout::text_states(Tool::GetSymbol, text, structured),
-        NODES_TOOL if structured.get("declarations").is_some() => {
-            nodes_summary_text_states(text, structured)
+        FACETS_TOOL if structured.get("declarations").is_some() => {
+            syntax_elements_summary_text_states(text, structured)
         }
-        NODES_TOOL => layout::text_states(Tool::Nodes, text, structured),
+        FACETS_TOOL => syntax_elements_summary_text_states(text, structured),
         other => Err(format!("no text check for the tool `{other}`")),
     };
     verdict.map_err(|failure| format!("{failure}\n--- text ---\n{text}"))
 }
 
-/// Checks that a compact nodes read carries its exact excerpt and named structure.
-fn nodes_summary_text_states(text: &str, structured: &serde_json::Value) -> Result<(), String> {
+/// Checks that a compact syntax elements read carries its exact excerpt and named structure.
+fn syntax_elements_summary_text_states(
+    text: &str,
+    structured: &serde_json::Value,
+) -> Result<(), String> {
+    token(text, &structured["symbol"], "symbol")?;
     let declarations = structured["declarations"]
         .as_array()
         .ok_or("declarations")?;
     for declaration in declarations {
         source_lines(text, &declaration["source"]["text"], "\t")?;
         token(text, &declaration["kind"], "declaration kind")?;
-        if let Some(parts) = declaration["parts"].as_array() {
-            for part in parts {
-                let kind = part["kind"].as_str().ok_or("part kind")?.replace('_', " ");
-                let shown = text
-                    .lines()
-                    .filter_map(|line| line.strip_prefix("\tStructure | "))
-                    .any(|line| line.split(" | ").any(|fact| fact == kind));
-                if !shown {
-                    return Err(format!("missing part {kind}"));
-                }
+        for element in declaration["syntax"].as_array().ok_or("syntax structure")? {
+            token(text, &element["kind"], "syntax kind")?;
+            let index = element["index"].as_u64().ok_or("syntax index")?;
+            if !text.contains(&format!("index {index}")) {
+                return Err(format!("missing syntax index {index}"));
             }
         }
     }
@@ -123,8 +122,8 @@ fn canonical_text_states(text: &str, structured: &serde_json::Value) -> Result<(
             if let Some(source) = declaration.get("source") {
                 source_lines(text, source, "\t\t")?;
             }
-            if let Some(node) = declaration.get("node") {
-                token(text, node, "declaration node")?;
+            if let Some(syntax_element) = declaration.get("syntax_element") {
+                token(text, syntax_element, "declaration syntax element")?;
             }
         }
         if let Some(history) = structured.get("history") {
@@ -354,17 +353,18 @@ mod tests {
 
     #[test]
     fn a_result_without_structured_content_or_text_is_refused() {
-        let no_structured = CallToolResult::success(vec![ContentBlock::text("0 nodes\n")]);
+        let no_structured =
+            CallToolResult::success(vec![ContentBlock::text("0 syntax elements\n")]);
         let no_content = CallToolResult::success(Vec::new());
-        assert!(text_states(NODES_TOOL, &no_structured).is_err());
-        assert!(text_states(NODES_TOOL, &no_content).is_err());
+        assert!(text_states(FACETS_TOOL, &no_structured).is_err());
+        assert!(text_states(FACETS_TOOL, &no_content).is_err());
     }
 
     #[test]
     fn a_non_text_block_is_refused() {
         let mut result = CallToolResult::success(vec![ContentBlock::image("AAAA", "image/png")]);
-        result.structured_content = Some(json!({ "nodes": [], "source": [] }));
-        assert!(text_states(NODES_TOOL, &result).is_err());
+        result.structured_content = Some(json!({ "facets": [], "source": [] }));
+        assert!(text_states(FACETS_TOOL, &result).is_err());
     }
 
     #[test]
@@ -379,9 +379,16 @@ mod tests {
         assert_eq!(text_states(SEARCH_TOOL, &search), Ok(()));
         assert!(text_states("other", &search).is_err());
         assert!(text_states(GET_SYMBOL_TOOL, &search).is_err());
-        assert!(text_states(NODES_TOOL, &search).is_err());
-        let nodes = result_of("0 nodes\n", json!({ "nodes": [], "source": [] }));
-        assert_eq!(text_states(NODES_TOOL, &nodes), Ok(()));
+        assert!(text_states(FACETS_TOOL, &search).is_err());
+        let syntax_elements = result_of(
+            "rift://symbol/local/rust/app/beacon\nNo declaration source available.\n",
+            json!({
+                "symbol": "rift://symbol/local/rust/app/beacon",
+                "declarations": [],
+                "revision": "rift://revision/tree/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }),
+        );
+        assert_eq!(text_states(FACETS_TOOL, &syntax_elements), Ok(()));
         let answer = result_of(
             "true\n",
             json!({
@@ -390,7 +397,7 @@ mod tests {
                 "warnings": []
             }),
         );
-        assert!(text_states(NODES_TOOL, &answer).is_err());
+        assert!(text_states(FACETS_TOOL, &answer).is_err());
         assert_eq!(text_states(SEARCH_TOOL, &answer), Ok(()));
     }
 
@@ -399,13 +406,13 @@ mod tests {
         let structured = json!({
             "answer": { "result": "boolean", "value": true },
             "pagination": { "page_index": 0, "total_pages": 1 },
-            "view": { "id": "claims.nodes", "expires_at": "2030-01-01T00:15:00Z" }
+            "view": { "id": "claims.syntax_elements", "expires_at": "2030-01-01T00:15:00Z" }
         });
         assert_eq!(
             text_states(SEARCH_TOOL, &result_of("true\n", structured.clone())),
             Ok(())
         );
-        let with_view = "true\nview claims.nodes · expires 2030-01-01T00:15:00Z\n";
+        let with_view = "true\nview claims.syntax_elements · expires 2030-01-01T00:15:00Z\n";
         assert!(text_states(SEARCH_TOOL, &result_of(with_view, structured)).is_err());
     }
 

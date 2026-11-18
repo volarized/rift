@@ -124,7 +124,7 @@ pub struct DeclaredKey {
 
 impl DeclaredKey {
     /// Member names from the document root to the key, such as
-    /// `["providers", "syntax", "max_nodes"]`.
+    /// `["providers", "syntax", "max_syntax_elements"]`.
     #[must_use]
     pub fn path(&self) -> &[String] {
         &self.path
@@ -177,24 +177,27 @@ pub fn declared_named_keys(schema: &Value, table: &str, names: &[&str]) -> Vec<D
     )
 }
 
-/// Every key below the `pending` starting nodes, each paired with its path.
+/// Every key below the `pending` starting facets, each paired with its path.
 fn walked_keys<'schema>(
     schema: &'schema Value,
     mut pending: Vec<(&'schema Value, Vec<String>)>,
 ) -> Vec<DeclaredKey> {
     let mut keys = Vec::new();
-    while let Some((node, path)) = pending.pop() {
+    while let Some((syntax_element, path)) = pending.pop() {
         if keys.len() == DECLARED_KEYS_MAX {
             break;
         }
-        match node.get(keyword::PROPERTIES).and_then(Value::as_object) {
+        match syntax_element
+            .get(keyword::PROPERTIES)
+            .and_then(Value::as_object)
+        {
             Some(members) if path.len() < DECLARED_KEY_DEPTH_MAX => {
                 push_members(&mut pending, schema, members, &path);
             }
             Some(_) => {}
-            None if path.is_empty() || is_named_table(node) => {}
+            None if path.is_empty() || is_named_table(syntax_element) => {}
             None => keys.push(DeclaredKey {
-                textual: is_textual(node),
+                textual: is_textual(syntax_element),
                 path,
             }),
         }
@@ -229,25 +232,26 @@ fn push_members<'schema>(
 
 /// Whether a schema is a table whose members the caller names: an object
 /// with no fixed member and a schema for every other one.
-fn is_named_table(node: &Value) -> bool {
-    node.get(keyword::ADDITIONAL_PROPERTIES)
+fn is_named_table(syntax_element: &Value) -> bool {
+    syntax_element
+        .get(keyword::ADDITIONAL_PROPERTIES)
         .is_some_and(Value::is_object)
 }
 
 /// Whether every value a schema accepts is text: its type is `string`, or it
 /// is a closed set of strings, or each of its union's branches is textual.
-fn is_textual(node: &Value) -> bool {
-    let branches = value_branches(node);
+fn is_textual(syntax_element: &Value) -> bool {
+    let branches = value_branches(syntax_element);
     if !branches.is_empty() {
         return branches.into_iter().all(is_textual);
     }
-    if let Some(values) = node.get(keyword::ENUM).and_then(Value::as_array) {
+    if let Some(values) = syntax_element.get(keyword::ENUM).and_then(Value::as_array) {
         return values.iter().all(Value::is_string);
     }
-    if let Some(constant) = node.get(keyword::CONST) {
+    if let Some(constant) = syntax_element.get(keyword::CONST) {
         return constant.is_string();
     }
-    match node.get(keyword::TYPE) {
+    match syntax_element.get(keyword::TYPE) {
         Some(Value::String(kind)) => kind == keyword::STRING,
         Some(Value::Array(kinds)) => kinds
             .iter()
@@ -366,21 +370,21 @@ impl ExpectedShape {
 #[must_use]
 pub fn expected_shape(schema: &Value, path: &[DocumentStep<'_>]) -> ExpectedShape {
     let root = schema;
-    let mut node = resolved(root, schema);
-    let mut example = declared_value(node);
+    let mut syntax_element = resolved(root, schema);
+    let mut example = declared_value(syntax_element);
     let mut followed = 0;
     for step in path {
-        let Some(reached) = declared_member(node, *step) else {
+        let Some(reached) = declared_member(syntax_element, *step) else {
             break;
         };
-        node = resolved(root, reached);
+        syntax_element = resolved(root, reached);
         followed += 1;
-        if let Some(found) = declared_value(node).or_else(|| declared_value(reached)) {
+        if let Some(found) = declared_value(syntax_element).or_else(|| declared_value(reached)) {
             example = Some(found);
         }
     }
     ExpectedShape {
-        accepted: accepted_members(node),
+        accepted: accepted_members(syntax_element),
         example: example.cloned(),
         followed,
     }
@@ -389,17 +393,17 @@ pub fn expected_shape(schema: &Value, path: &[DocumentStep<'_>]) -> ExpectedShap
 /// The schema one step reaches, before its reference is resolved, or `None`
 /// where the schema declares no such step.
 fn declared_member<'schema>(
-    node: &'schema Value,
+    syntax_element: &'schema Value,
     step: DocumentStep<'_>,
 ) -> Option<&'schema Value> {
     match step {
-        DocumentStep::Member(name) => node.get(keyword::PROPERTIES)?.get(name),
-        DocumentStep::Element => node.get(keyword::ITEMS),
+        DocumentStep::Member(name) => syntax_element.get(keyword::PROPERTIES)?.get(name),
+        DocumentStep::Element => syntax_element.get(keyword::ITEMS),
     }
 }
 
-/// The schema `node` stands for: its `$ref` target, or the one branch of its
-/// `anyOf` or `oneOf` that is not the null one, or `node` itself.
+/// The schema `syntax element` stands for: its `$ref` target, or the one branch of its
+/// `anyOf` or `oneOf` that is not the null one, or `syntax element` itself.
 ///
 /// An optional member is spelled as a union of its own schema and the null
 /// one, so unwrapping that union reaches the member's real shape. A union with
@@ -409,27 +413,30 @@ fn declared_member<'schema>(
 /// The walk is bounded by [`SCHEMA_REFERENCES_MAX`]: a model that refers to
 /// itself is a legal schema, and a caller reaches this walk by sending one bad
 /// value, so an unbounded one would hand every caller a way to stall a read.
-/// A schema deeper than the bound answers with the last node reached, which
+/// A schema deeper than the bound answers with the last syntax element reached, which
 /// states less than the target would and never less than nothing.
-fn resolved<'schema>(root: &'schema Value, node: &'schema Value) -> &'schema Value {
-    let mut node = node;
+fn resolved<'schema>(root: &'schema Value, syntax_element: &'schema Value) -> &'schema Value {
+    let mut syntax_element = syntax_element;
     for _ in 0..SCHEMA_REFERENCES_MAX {
-        if let Some(target) = referenced(root, node) {
-            node = target;
+        if let Some(target) = referenced(root, syntax_element) {
+            syntax_element = target;
             continue;
         }
-        match value_branches(node).as_slice() {
-            [branch] => node = branch,
-            _ => return node,
+        match value_branches(syntax_element).as_slice() {
+            [branch] => syntax_element = branch,
+            _ => return syntax_element,
         }
     }
-    node
+    syntax_element
 }
 
 /// The definition one schema's `$ref` names, where it names one this document
 /// carries.
-fn referenced<'schema>(root: &'schema Value, node: &'schema Value) -> Option<&'schema Value> {
-    let name = node
+fn referenced<'schema>(
+    root: &'schema Value,
+    syntax_element: &'schema Value,
+) -> Option<&'schema Value> {
+    let name = syntax_element
         .get(keyword::REF)
         .and_then(Value::as_str)?
         .strip_prefix("#/$defs/")?;
@@ -438,10 +445,10 @@ fn referenced<'schema>(root: &'schema Value, node: &'schema Value) -> Option<&'s
 
 /// The branches of a union that declare a value, the null branch left out.
 /// Empty for a schema that is no union.
-fn value_branches(node: &Value) -> Vec<&Value> {
+fn value_branches(syntax_element: &Value) -> Vec<&Value> {
     [keyword::ANY_OF, keyword::ONE_OF]
         .into_iter()
-        .filter_map(|keyword| node.get(keyword))
+        .filter_map(|keyword| syntax_element.get(keyword))
         .filter_map(Value::as_array)
         .flatten()
         .filter(|branch| !is_null_schema(branch))
@@ -457,33 +464,37 @@ fn is_null_schema(branch: &Value) -> bool {
 /// default it holds when the key is absent. A default is a value the schema
 /// accepts by construction, so it stands where no example is authored; a
 /// `null` default states absence and states no value at all.
-fn declared_value(node: &Value) -> Option<&Value> {
-    if let Some(example) = node
+fn declared_value(syntax_element: &Value) -> Option<&Value> {
+    if let Some(example) = syntax_element
         .get(keyword::EXAMPLES)
         .and_then(Value::as_array)
         .and_then(|examples| examples.first())
     {
         return Some(example);
     }
-    node.get(keyword::DEFAULT).filter(|value| !value.is_null())
+    syntax_element
+        .get(keyword::DEFAULT)
+        .filter(|value| !value.is_null())
 }
 
 /// What one schema accepts, sorted: an object's member names, or the values of
 /// a closed set, however that set is spelled. Empty where the schema states
 /// neither.
-fn accepted_members(node: &Value) -> Vec<String> {
-    let mut accepted: Vec<String> =
-        if let Some(properties) = node.get(keyword::PROPERTIES).and_then(Value::as_object) {
-            properties.keys().cloned().collect()
-        } else if let Some(values) = node.get(keyword::ENUM).and_then(Value::as_array) {
-            string_values(values.iter())
-        } else {
-            string_values(
-                value_branches(node)
-                    .into_iter()
-                    .filter_map(|branch| branch.get(keyword::CONST)),
-            )
-        };
+fn accepted_members(syntax_element: &Value) -> Vec<String> {
+    let mut accepted: Vec<String> = if let Some(properties) = syntax_element
+        .get(keyword::PROPERTIES)
+        .and_then(Value::as_object)
+    {
+        properties.keys().cloned().collect()
+    } else if let Some(values) = syntax_element.get(keyword::ENUM).and_then(Value::as_array) {
+        string_values(values.iter())
+    } else {
+        string_values(
+            value_branches(syntax_element)
+                .into_iter()
+                .filter_map(|branch| branch.get(keyword::CONST)),
+        )
+    };
     accepted.sort();
     accepted
 }
@@ -533,39 +544,39 @@ const NAMED_SUBSCHEMA_KEYWORDS: [&str; 3] = [
 /// once, so the work is bounded by the size of `schema`.
 pub fn strip_optional_null_arms(schema: &mut Map<String, Value>) {
     let mut pending = vec![schema];
-    while let Some(node) = pending.pop() {
-        strip_unrequired_null_arms(node);
-        pending.extend(subschemas(node));
+    while let Some(syntax_element) = pending.pop() {
+        strip_unrequired_null_arms(syntax_element);
+        pending.extend(subschemas(syntax_element));
     }
 }
 
 /// Removes response diagnostics from the MCP view of shared result schemas.
 pub fn strip_response_warnings(schema: &mut Map<String, Value>) {
     let mut pending = vec![schema];
-    while let Some(node) = pending.pop() {
-        if let Some(properties) = node
+    while let Some(syntax_element) = pending.pop() {
+        if let Some(properties) = syntax_element
             .get_mut(keyword::PROPERTIES)
             .and_then(Value::as_object_mut)
         {
             properties.remove("warnings");
         }
-        if let Some(required) = node
+        if let Some(required) = syntax_element
             .get_mut(keyword::REQUIRED)
             .and_then(Value::as_array_mut)
         {
             required.retain(|name| name.as_str() != Some("warnings"));
             if required.is_empty() {
-                node.remove(keyword::REQUIRED);
+                syntax_element.remove(keyword::REQUIRED);
             }
         }
-        pending.extend(subschemas(node));
+        pending.extend(subschemas(syntax_element));
     }
 }
 
 /// The subschemas one schema object holds directly.
-fn subschemas(node: &mut Map<String, Value>) -> Vec<&mut Map<String, Value>> {
+fn subschemas(syntax_element: &mut Map<String, Value>) -> Vec<&mut Map<String, Value>> {
     let mut found = Vec::new();
-    for (name, value) in node {
+    for (name, value) in syntax_element {
         let name = name.as_str();
         if SINGLE_SUBSCHEMA_KEYWORDS.contains(&name) {
             found.extend(value.as_object_mut());
@@ -1666,29 +1677,6 @@ pub fn require_search_selector(schema: &mut Schema) {
     );
 }
 
-/// A [`NodesParams`](crate::read::NodesParams) selects its nodes through exactly one of
-/// `symbol` or `path` with `position`, and `node_cursor` continues a `symbol` read alone.
-/// The server enforces each rule, so the schema states them for a validating caller.
-pub fn require_one_node_selector(schema: &mut Schema) {
-    use crate::read::NodesParams;
-    let symbol = property!(NodesParams, symbol);
-    let path = property!(NodesParams, path);
-    let position = property!(NodesParams, position);
-    append(
-        schema,
-        described(
-            "nodes selects a symbol, or a path with a position",
-            one_of(vec![
-                merged(vec![
-                    requires(&[symbol]),
-                    not(any_of(vec![requires(&[path]), requires(&[position])])),
-                ]),
-                merged(vec![requires(&[path, position]), not(requires(&[symbol]))]),
-            ]),
-        ),
-    );
-}
-
 /// A [`SearchTraversal`](crate::search::SearchTraversal) names the declaration its walk
 /// starts at through `seed`, and no walk rides beside `change`: the language engine lane
 /// that resolves references serves the current tree alone, and the walk from a
@@ -1787,12 +1775,18 @@ pub fn get_symbol_hit_addresses_one_location(schema: &mut Schema) {
     append(schema, one_of(vec![requires(&[path]), requires(&[unit])]));
 }
 
-/// A [`Node`](crate::read::Node) states `default: []` on `facets` and `regions`, and
+/// A [`SyntaxElement`](crate::read::SyntaxElement) states `default: []` on `facets` and `regions`, and
 /// `default: {}` on `extensions`.
-pub fn declare_node_empty_defaults(schema: &mut Schema) {
-    use crate::read::Node;
-    declare_empty_array_defaults(schema, &[property!(Node, facets), property!(Node, regions)]);
-    declare_empty_object_defaults(schema, &[property!(Node, extensions)]);
+pub fn declare_syntax_element_empty_defaults(schema: &mut Schema) {
+    use crate::read::SyntaxElement;
+    declare_empty_array_defaults(
+        schema,
+        &[
+            property!(SyntaxElement, facets),
+            property!(SyntaxElement, regions),
+        ],
+    );
+    declare_empty_object_defaults(schema, &[property!(SyntaxElement, extensions)]);
 }
 
 /// A [`Symbol`](crate::read::Symbol) states `default: []` on its collection fields,
@@ -1874,11 +1868,11 @@ pub fn declare_get_symbol_result_empty_defaults(schema: &mut Schema) {
     declare_empty_array_defaults(schema, &[property!(GetSymbolResult, warnings)]);
 }
 
-/// A [`NodesResult`](crate::read::NodesResult) states `default: []` on `warnings`. `nodes`
+/// A [`FacetsResult`](crate::read::FacetsResult) states `default: []` on `warnings`. `facets`
 /// and `source` are the tool's own answer and stay required.
-pub fn declare_nodes_result_empty_defaults(schema: &mut Schema) {
-    use crate::read::NodesResult;
-    declare_empty_array_defaults(schema, &[property!(NodesResult, warnings)]);
+pub fn declare_facets_result_empty_defaults(schema: &mut Schema) {
+    use crate::read::FacetsResult;
+    declare_empty_array_defaults(schema, &[property!(FacetsResult, warnings)]);
 }
 
 /// A [`SearchHit`] states `default: []` on `matched_by`.
@@ -2183,10 +2177,10 @@ mod tests {
         null_type || null_branch
     }
 
-    /// Every property below `node` that its object does not require and whose schema
+    /// Every property below `syntax element` that its object does not require and whose schema
     /// accepts `null` beside another value, named by the path to it.
-    fn optional_null_properties(node: &Value, path: &str, found: &mut Vec<String>) {
-        match node {
+    fn optional_null_properties(syntax_element: &Value, path: &str, found: &mut Vec<String>) {
+        match syntax_element {
             Value::Object(object) => {
                 let required = object.get("required").and_then(Value::as_array);
                 let properties = object.get("properties").and_then(Value::as_object);
@@ -2381,12 +2375,12 @@ mod tests {
     fn a_schema_that_refers_to_itself_stops_at_the_reference_bound() {
         let cyclic = json!({
             "type": "object",
-            "properties": {"node": {"$ref": "#/$defs/Node"}},
+            "properties": {"syntax_element": {"$ref": "#/$defs/SyntaxElement"}},
             "$defs": {
-                "Node": {"$ref": "#/$defs/Node"}
+                "SyntaxElement": {"$ref": "#/$defs/SyntaxElement"}
             }
         });
-        let shape = expected_shape(&cyclic, &[DocumentStep::Member("node")]);
+        let shape = expected_shape(&cyclic, &[DocumentStep::Member("syntax_element")]);
         assert_eq!(shape.followed(), 1);
         assert!(shape.accepted().is_empty());
         assert_eq!(shape.example(), None);
@@ -2839,8 +2833,8 @@ mod tests {
         let object = json!({});
         assert_default_cases(vec![
             (
-                "Node",
-                serde_json::to_value(schema_for!(crate::read::Node)).expect("schema"),
+                "SyntaxElement",
+                serde_json::to_value(schema_for!(crate::read::SyntaxElement)).expect("schema"),
                 vec![
                     ("facets", array.clone()),
                     ("regions", array.clone()),
@@ -2898,8 +2892,8 @@ mod tests {
                 vec![("warnings", array.clone())],
             ),
             (
-                "NodesResult",
-                serde_json::to_value(schema_for!(crate::read::NodesResult)).expect("schema"),
+                "FacetsResult",
+                serde_json::to_value(schema_for!(crate::read::FacetsResult)).expect("schema"),
                 vec![("warnings", array)],
             ),
         ]);
@@ -2978,8 +2972,8 @@ mod tests {
                 &["revision"],
             ),
             (
-                "NodesParams",
-                serde_json::to_value(schema_for!(crate::read::NodesParams)).expect("schema"),
+                "FacetsParams",
+                serde_json::to_value(schema_for!(crate::read::FacetsParams)).expect("schema"),
                 &["revision"],
             ),
             (
@@ -3074,7 +3068,7 @@ mod tests {
                 .map(super::DeclaredKey::is_textual)
         };
         assert_eq!(find("providers.syntax.max_file"), Some(true));
-        assert_eq!(find("providers.syntax.max_nodes"), Some(false));
+        assert_eq!(find("providers.syntax.max_syntax_elements"), Some(false));
         assert_eq!(find("dependencies.resolution"), Some(true));
         assert_eq!(find("search.vector.embedding"), Some(false));
         assert_eq!(find("server.port_range.min"), Some(false));

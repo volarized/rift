@@ -32,14 +32,16 @@ fn ambient_modules_keep_literal_scope_and_commonjs_exports_keep_statement_ranges
         .iter()
         .find(|symbol| symbol.kind == "namespace")
         .expect("ambient module");
-    assert_eq!(module.node_kind, Some("module"));
+    assert_eq!(module.syntax_element_kind, Some("module"));
     let declaration = document
-        .nodes()
+        .syntax_elements()
         .iter()
-        .find(|node| node.kind == "module" && node.range == module.item_range)
-        .expect("original module declaration node");
+        .find(|syntax_element| {
+            syntax_element.kind == "module" && syntax_element.range == module.item_range
+        })
+        .expect("original module declaration syntax element");
     let statement = document
-        .nodes()
+        .syntax_elements()
         .get(declaration.parent.expect("ambient parent"))
         .expect("original ambient statement");
     assert_eq!(statement.kind, "ambient_declaration");
@@ -223,10 +225,10 @@ fn empty_exports_are_recorded_and_export_walk_keeps_existing_bounds() {
             },
             SyntaxLimits::new(100, 2, 10).expect("positive limits"),
         )
-        .expect_err("node bound");
+        .expect_err("syntax element bound");
     assert_eq!(
         error.slug(),
-        rift_error::errors::syntax::too_many_nodes::SLUG
+        rift_error::errors::syntax::too_many_syntax_elements::SLUG
     );
 }
 

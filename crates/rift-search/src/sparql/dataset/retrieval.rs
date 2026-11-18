@@ -40,19 +40,19 @@ impl GraphDatasetBuilder {
                 self.limits.triples_max(),
             )?;
             if let Some(view) = &result.view {
-                let view_node = child(&id.clone().into(), "view", 0);
+                let view_syntax_element = child(&id.clone().into(), "view", 0);
                 triples.push(Triple::new(
                     id.clone(),
                     vocabulary("view"),
-                    view_node.clone(),
+                    view_syntax_element.clone(),
                 ));
                 triples.push(Triple::new(
-                    view_node.clone(),
+                    view_syntax_element.clone(),
                     vocabulary("id"),
                     Literal::from(view.id.as_str().to_owned()),
                 ));
                 triples.push(Triple::new(
-                    view_node,
+                    view_syntax_element,
                     vocabulary("expires_at"),
                     Literal::from(view.expires_at.clone()),
                 ));
@@ -202,7 +202,7 @@ fn emit(
             if value.starts_with("rift://")
                 && matches!(
                     key,
-                    "id" | "unit" | "container" | "symbol" | "node" | "evidence"
+                    "id" | "unit" | "container" | "symbol" | "syntax_element" | "evidence"
                 ) =>
         {
             named(&value)?.into()

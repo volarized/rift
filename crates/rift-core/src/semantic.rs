@@ -543,7 +543,7 @@ impl ContributionRelationship {
         self
     }
 
-    /// Retains the exact source occurrence, including an optional supplied node.
+    /// Retains the exact source occurrence, including an optional supplied syntax element.
     #[must_use]
     pub fn with_occurrence(mut self, occurrence: DeclarationBinding) -> Self {
         self.occurrence = Some(occurrence);

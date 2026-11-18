@@ -121,7 +121,7 @@ fn checked_names(file: &SelectedFile<'_>) -> BTreeSet<String> {
         .symbols()
         .iter()
         .filter(|symbol| {
-            symbol.node_kind == Some("assignment_expression")
+            symbol.syntax_element_kind == Some("assignment_expression")
                 && bindings.iter().any(|binding| {
                     binding.kind == SyntaxExportKind::Named
                         && binding.source.is_none()

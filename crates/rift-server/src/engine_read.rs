@@ -26,7 +26,7 @@ use crate::callee::{
 use crate::engine::{EnginePool, EngineSlot, OutgoingAnswer, SessionFuture};
 use crate::read::{ReadService, RiftError, symbol_id};
 use crate::traversal::{
-    TRAVERSAL_NODES_MAX, engine_facet, resolve_graph_symbol, validate_traversal,
+    TRAVERSAL_SYMBOLS_MAX, engine_facet, resolve_graph_symbol, validate_traversal,
     walk_traversal_with_references,
 };
 
@@ -255,7 +255,7 @@ fn reachable_reference_source(
         store,
         seed,
         &prior,
-        TRAVERSAL_NODES_MAX,
+        TRAVERSAL_SYMBOLS_MAX,
         &EngineReferences::default(),
     )
     .discovered;
@@ -311,7 +311,7 @@ fn reference_source<'source>(
 ///
 /// Only current-tree symbol traversals that name no facet, or name the engine facet of
 /// their direction, consult engines: `references` incoming, `calls` outgoing.
-/// The traversal's existing depth and node bounds also bound engine requests. Each
+/// The traversal's existing depth and syntax element bounds also bound engine requests. Each
 /// exchange uses the selected engine's retry and restart policy. The caller applies
 /// its request deadline and validates the captured tree again before using the result.
 /// Engines without references support leave the indexed answer unchanged.
@@ -410,7 +410,7 @@ pub async fn resolve_engine_references(
             reads.relationships(),
             &seed,
             &step,
-            TRAVERSAL_NODES_MAX,
+            TRAVERSAL_SYMBOLS_MAX,
             &references,
         )
         .discovered
@@ -430,7 +430,7 @@ async fn extend_references(
     deadline: Instant,
 ) -> Result<Option<ReadWarning>, RiftError> {
     let stored: usize = references.incoming.values().map(Vec::len).sum();
-    let mut remaining = TRAVERSAL_NODES_MAX - stored;
+    let mut remaining = TRAVERSAL_SYMBOLS_MAX - stored;
     for identity in pending {
         if !requested.insert(identity.clone()) {
             continue;
@@ -461,7 +461,7 @@ async fn extend_references(
                 language,
                 format!(
                     "the engines answered more incoming references than the \
-                     {TRAVERSAL_NODES_MAX}-node traversal bound carries"
+                     {TRAVERSAL_SYMBOLS_MAX}-symbol traversal bound carries"
                 ),
             )));
         };
@@ -620,7 +620,7 @@ async fn extend_callees(
 ) -> Result<Option<ReadWarning>, RiftError> {
     let stored: usize = references.outgoing.values().map(Vec::len).sum::<usize>()
         + references.package_callees.len();
-    let mut remaining = TRAVERSAL_NODES_MAX - stored;
+    let mut remaining = TRAVERSAL_SYMBOLS_MAX - stored;
     for identity in pending {
         if !requested.insert(identity.clone()) {
             continue;
@@ -664,7 +664,7 @@ async fn extend_callees(
                 language,
                 format!(
                     "the engines answered more outgoing calls than the \
-                     {TRAVERSAL_NODES_MAX}-node traversal bound carries"
+                     {TRAVERSAL_SYMBOLS_MAX}-symbol traversal bound carries"
                 ),
             )));
         };
@@ -836,7 +836,7 @@ async fn calls_on_engine(
                             ));
                         }
                     }
-                    if calls.len() > TRAVERSAL_NODES_MAX {
+                    if calls.len() > TRAVERSAL_SYMBOLS_MAX {
                         return Ok(Some(CalleeReport {
                             calls: Err(calls.len()),
                             encoding,
@@ -878,7 +878,7 @@ fn map_callees(
     let calls =
         report.calls.map_err(|observed| {
             errors::server::read_engine_answer().operation("engine calls").detail(format!(
-                "outgoing calls {observed} exceed the {TRAVERSAL_NODES_MAX}-node traversal bound"
+                "outgoing calls {observed} exceed the {TRAVERSAL_SYMBOLS_MAX}-symbol traversal bound"
             )).error()
         })?;
     let mut mapped = MappedCallees {
@@ -1087,7 +1087,7 @@ fn map_graph_calls(
         for range in call.from_ranges {
             locations = locations
                 .checked_add(1)
-                .filter(|count| *count <= TRAVERSAL_NODES_MAX)
+                .filter(|count| *count <= TRAVERSAL_SYMBOLS_MAX)
                 .ok_or_else(unavailable)?;
             let start = index.byte_offset(report.encoding, range.start)?;
             let end = index.byte_offset(report.encoding, range.end)?;
@@ -1186,7 +1186,7 @@ pub async fn installed_graph_calls(
                     return Err(graph_call_coverage());
                 }
                 let calls = session.outgoing_calls(item.clone()).await?;
-                if calls.len() > TRAVERSAL_NODES_MAX {
+                if calls.len() > TRAVERSAL_SYMBOLS_MAX {
                     return Err(graph_call_coverage());
                 }
                 Ok(Some(CalleeReport { calls: Ok(calls), encoding }))
@@ -1410,7 +1410,7 @@ async fn references_on_engine(
                     PositionEncoding::Utf16 => utf16,
                 };
                 let mut locations = session.references(&path, position).await?;
-                if locations.len() > TRAVERSAL_NODES_MAX {
+                if locations.len() > TRAVERSAL_SYMBOLS_MAX {
                     return Ok(ReferenceReport {
                         locations: Err(locations.len()),
                         encoding,
@@ -1520,7 +1520,7 @@ fn captured_references(
     let mut complete = true;
     for (position, (binding, range, digest, _)) in reads.index().static_usages(identity).enumerate()
     {
-        if position == TRAVERSAL_NODES_MAX {
+        if position == TRAVERSAL_SYMBOLS_MAX {
             complete = false;
             break;
         }
@@ -1572,7 +1572,7 @@ fn merge_reference_occurrences(
             occurrence.source.range.end,
         );
         occurrences.insert((key.0.clone(), key.1, key.2), occurrence);
-        if occurrences.len() > TRAVERSAL_NODES_MAX {
+        if occurrences.len() > TRAVERSAL_SYMBOLS_MAX {
             return Err(graph_reference_coverage());
         }
     }
@@ -1601,7 +1601,7 @@ async fn engine_graph_references(
     } else {
         reads
             .index()
-            .symbols_by_identity_page(&identity, 0, count.min(TRAVERSAL_NODES_MAX))?
+            .symbols_by_identity_page(&identity, 0, count.min(TRAVERSAL_SYMBOLS_MAX))?
     };
     if total == 0 || declarations.len() != total {
         return Err(unavailable());
@@ -1660,7 +1660,7 @@ async fn engine_graph_references(
             if excluded.contains(&key) || found.contains_key(&key) {
                 continue;
             }
-            if found.len() == TRAVERSAL_NODES_MAX {
+            if found.len() == TRAVERSAL_SYMBOLS_MAX {
                 return Err(unavailable());
             }
             let enclosing = if let Some(symbol) = file.enclosing_symbol(key.1, key.2) {
@@ -1702,7 +1702,7 @@ fn map_references(
     report: ReferenceReport,
     workspace_root: &std::path::Path,
 ) -> Result<Vec<GraphHop>, RiftError> {
-    let locations = report.locations.map_err(|observed| errors::server::read_engine_answer().operation("engine references").detail(format!("reference locations {observed} exceed the {TRAVERSAL_NODES_MAX}-node traversal bound")).error())?;
+    let locations = report.locations.map_err(|observed| errors::server::read_engine_answer().operation("engine references").detail(format!("reference locations {observed} exceed the {TRAVERSAL_SYMBOLS_MAX}-symbol traversal bound")).error())?;
     let root = TreeRoot::new(workspace_root).map_err(|error| {
         errors::server::read_task()
             .operation("reference root conversion")
@@ -2073,7 +2073,7 @@ mod tests {
         Ok(())
     }
 
-    /// A callee range the served bytes do not hold, and an answer past the node bound, are
+    /// A callee range the served bytes do not hold, and an answer past the syntax element bound, are
     /// the engine answer faults that degrade a walk rather than refuse it.
     #[test]
     fn callee_mapping_names_an_unmappable_answer_an_engine_answer_fault() -> TestResult {
@@ -2084,7 +2084,7 @@ mod tests {
         let caller = rift_core::SymbolId::new(symbol(&reads, "beacon").0)?;
         for calls in [
             Ok(vec![item(past_the_line.clone(), "beacon")]),
-            Err(super::TRAVERSAL_NODES_MAX + 1),
+            Err(super::TRAVERSAL_SYMBOLS_MAX + 1),
         ] {
             let report = CalleeReport {
                 calls,
@@ -2451,7 +2451,7 @@ mod tests {
             assert!(map_references(&reads, &seed, report, directory.path()).is_err());
         }
         let overflow = ReferenceReport {
-            locations: Err(super::TRAVERSAL_NODES_MAX + 1),
+            locations: Err(super::TRAVERSAL_SYMBOLS_MAX + 1),
             encoding: PositionEncoding::Utf16,
             full: true,
         };
@@ -2629,7 +2629,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let reads = reads(directory.path())?;
-        let count = super::TRAVERSAL_NODES_MAX + 1;
+        let count = super::TRAVERSAL_SYMBOLS_MAX + 1;
         let locations = vec![location(directory.path(), "lib.rs", 0, 7, 13); count];
         let responses = (1..=2)
             .map(|id| {
@@ -2711,7 +2711,7 @@ mod tests {
             full: true,
         };
         let edge = map_references(&reads, &target, report, directory.path())?.remove(0);
-        let prior_edges = (0..super::TRAVERSAL_NODES_MAX)
+        let prior_edges = (0..super::TRAVERSAL_SYMBOLS_MAX)
             .map(|index| {
                 let mut edge = edge.clone();
                 edge.relationship.from =
@@ -3205,16 +3205,16 @@ done
         Ok(())
     }
 
-    /// One declaration's outgoing calls past the node bound drop the engine's whole
+    /// One declaration's outgoing calls past the syntax element bound drop the engine's whole
     /// contribution, with the warning naming the count, before any callee is mapped.
     #[cfg(unix)]
     #[tokio::test]
-    async fn outgoing_calls_past_the_node_bound_drop_the_engine_contribution() -> TestResult {
+    async fn outgoing_calls_past_the_symbol_bound_drop_the_engine_contribution() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let reads = reads(directory.path())?;
         let engine = tempfile::tempdir()?;
-        let count = super::TRAVERSAL_NODES_MAX + 1;
+        let count = super::TRAVERSAL_SYMBOLS_MAX + 1;
         let range = json!({"start":{"line":0,"character":7},"end":{"line":0,"character":13}});
         let callee = json!({"name":"beacon","kind":12,"uri":"file:///elsewhere/lib.rs","range":range,"selectionRange":range});
         let calls = engine.path().join("calls.json");
@@ -3364,7 +3364,7 @@ done
         let reads = reads(directory.path())?;
         let caller = rift_core::SymbolId::new(symbol(&reads, "caller").0)?;
         let prior = rift_core::SymbolId::new(symbol(&reads, "beacon").0)?;
-        let prior_edges = (0..super::TRAVERSAL_NODES_MAX)
+        let prior_edges = (0..super::TRAVERSAL_SYMBOLS_MAX)
             .map(|index| {
                 let end = SymbolId(format!("rift://symbol/python/prior.py/callee_{index}"));
                 super::call_hop(&SymbolId(prior.as_str().to_owned()), end)

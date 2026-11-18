@@ -1480,7 +1480,7 @@
         },
         "range": {
           "$ref": "#/$defs/TextRange",
-          "description": "The occurrence's byte range inside its unit. It resolves to a syntax node of the\nunit."
+          "description": "The occurrence's byte range inside its unit. It resolves to a syntax element of the\nunit."
         },
         "symbol": {
           "$ref": "#/$defs/SymbolId",
@@ -1566,10 +1566,6 @@
           "minimum": 0,
           "type": "integer"
         },
-        "node_kind": {
-          "description": "The grammar kind of the declaration's item node, the syntax node spanning `range`,\nas `function_item`. Absent when the syntax provider names no item node for the\ndeclaration.",
-          "type": "string"
-        },
         "origin": {
           "$ref": "#/$defs/SymbolOrigin",
           "description": "Where the declaration came from: the package, and whether it was authored."
@@ -1603,6 +1599,10 @@
         "symbol": {
           "$ref": "#/$defs/SymbolId",
           "description": "The declaration's identity."
+        },
+        "syntax_element_kind": {
+          "description": "The grammar kind of the declaration's item syntax element, the syntax element spanning `range`,\nas `function_item`. Absent when the syntax provider names no item syntax element for the\ndeclaration.",
+          "type": "string"
         },
         "type_indices": {
           "description": "Entries in the logical object's type array supplied by this binding.",
@@ -1740,7 +1740,7 @@
         },
         "occurrence": {
           "$ref": "#/$defs/SourceUnitSpan",
-          "description": "Exact physical occurrence when this edge was read from source, independent of\nwhether the provider supplied a source node."
+          "description": "Exact physical occurrence when this edge was read from source, independent of\nwhether the provider supplied a source syntax element."
         },
         "producer": {
           "$ref": "#/$defs/FactProducer",
@@ -2759,7 +2759,7 @@
     "objects": {
       "description": "Every normalized logical object, including objects omitted from public directories.\nUnresolved objects retain their facts with no ID. Artifact consumers enforce aggregate\nand complete-record byte bounds before parsing and restoration. Public directories\napply the public character bound separately.",
       "items": {
-        "description": "Readable Symbol assembled from normalized Contributions. Source structure lives in Node\nand is connected through Relationship.",
+        "description": "Readable Symbol assembled from normalized Contributions. Source structure lives in `SyntaxElement`\nand is connected through Relationship.",
         "properties": {
           "container": {
             "$ref": "#/$defs/SymbolId",

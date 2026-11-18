@@ -21,7 +21,7 @@ pub enum FeedbackDetail {
 #[serde(deny_unknown_fields)]
 #[schemars(extend("rift:since" = "v0.0.79"))]
 #[schemars(example = serde_json::json!({
-    "text": "The nodes tool returned an empty result for a symbol it found.",
+    "text": "The facets tool returned an empty result for a symbol it found.",
     "include_details": ["os", "rift_version"]
 }))]
 pub struct FeedbackParams {

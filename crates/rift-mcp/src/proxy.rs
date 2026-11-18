@@ -3134,7 +3134,7 @@ mod tests {
         };
         assert_ne!(result.is_error, Some(true));
         let invalid = client
-            .call_tool(super::CallToolRequestParams::new("nodes").with_arguments(
+            .call_tool(super::CallToolRequestParams::new("facets").with_arguments(
                 serde_json::from_value(json!({"path": "../outside.rs", "position": 0}))?,
             ))
             .await?;
@@ -3378,7 +3378,7 @@ mod tests {
                 .is_some_and(|cursor| cursor == SECOND_PAGE_CURSOR);
             if second {
                 return std::future::ready(Ok(ListToolsResult::with_all_items(vec![
-                    upstream_tool("nodes"),
+                    upstream_tool("facets"),
                 ])));
             }
             let mut first = ListToolsResult::with_all_items(vec![upstream_tool("search")]);
@@ -3521,7 +3521,7 @@ mod tests {
         let proxied = proxied_client(OutputPolicy::Text).await?;
         let tools = proxied.client.list_all_tools().await?;
         let names: Vec<_> = tools.iter().map(|tool| tool.name.as_ref()).collect();
-        assert_eq!(names, ["search", "nodes"], "every page must be listed");
+        assert_eq!(names, ["search", "facets"], "every page must be listed");
         assert!(
             tools.iter().all(|tool| tool.output_schema.is_none()),
             "text output must list no output schema on any page: {tools:?}"
@@ -4009,11 +4009,11 @@ mod tests {
         ))
     }
 
-    /// A package or runtime symbol's nodes go to the primary server, which reads them from the
+    /// A package or runtime symbol's syntax elements go to the primary server, which reads them from the
     /// global API: the proxy forwards the request as written, and a captured global view
     /// dispatches it with its identity untouched.
     #[tokio::test]
-    async fn a_package_nodes_symbol_reaches_the_primary_server_unchanged() -> TestResult {
+    async fn a_package_syntax_elements_symbol_reaches_the_primary_server_unchanged() -> TestResult {
         let primary = tempfile::tempdir()?;
         let extra = tempfile::tempdir()?;
         let proxy = extra_profile_proxy(primary.path(), extra.path())?;
@@ -4021,33 +4021,33 @@ mod tests {
             "rift://symbol/cargo/crates.io/demo/rust/demo/beacon",
             "rift://symbol/stdlib/cpython/python/builtins/len",
         ] {
-            let request = CallToolRequestParams::new("nodes").with_arguments(
-                serde_json::from_value(json!({"symbol": id, "node_cursor": "1.ab"}))?,
+            let request = CallToolRequestParams::new("facets").with_arguments(
+                serde_json::from_value(json!({"symbol": id, "facet_cursor": "1.ab"}))?,
             );
             assert!(std::ptr::eq(
                 proxy.call_backend(&request)?,
                 &raw const proxy
             ));
             assert!(proxy.routed_read(&request).await?.is_none());
-            let upstream = super::candidates::dispatch_nodes_request(&request, "global")?;
+            let upstream = super::candidates::dispatch_facets_request(&request, "global")?;
             assert_eq!(upstream.arguments, request.arguments);
         }
         Ok(())
     }
 
     #[tokio::test]
-    async fn a_nodes_symbol_selects_its_owner_backend_and_dispatches_a_local_identity() -> TestResult
-    {
+    async fn a_syntax_elements_symbol_selects_its_owner_backend_and_dispatches_a_local_identity()
+    -> TestResult {
         let primary = tempfile::tempdir()?;
         let extra = tempfile::tempdir()?;
         let proxy = extra_profile_proxy(primary.path(), extra.path())?;
         let id = "rift://symbol/local@cloud:docs/rust/app/beacon";
-        let request = CallToolRequestParams::new("nodes").with_arguments(serde_json::from_value(
-            json!({"symbol": id, "node_cursor": "2.ab"}),
+        let request = CallToolRequestParams::new("facets").with_arguments(serde_json::from_value(
+            json!({"symbol": id, "facet_cursor": "2.ab"}),
         )?);
 
         let backend = proxy.call_backend(&request)?;
-        let upstream = super::candidates::dispatch_nodes_request(&request, "cloud:docs")?;
+        let upstream = super::candidates::dispatch_facets_request(&request, "cloud:docs")?;
 
         assert_eq!(
             backend.root.as_ref(),
@@ -4058,24 +4058,24 @@ mod tests {
             arguments.get("symbol"),
             Some(&json!("rift://symbol/local/rust/app/beacon"))
         );
-        assert_eq!(arguments.get("node_cursor"), Some(&json!("2.ab")));
-        let primary_request = CallToolRequestParams::new("nodes").with_arguments(
+        assert_eq!(arguments.get("facet_cursor"), Some(&json!("2.ab")));
+        let primary_request = CallToolRequestParams::new("facets").with_arguments(
             serde_json::from_value(json!({"symbol": "rift://symbol/local/rust/app/beacon"}))?,
         );
         assert!(std::ptr::eq(
             proxy.call_backend(&primary_request)?,
             &raw const proxy
         ));
-        let position = CallToolRequestParams::new("nodes").with_arguments(serde_json::from_value(
+        let position = CallToolRequestParams::new("facets").with_arguments(serde_json::from_value(
             json!({"path": "lib.rs", "position": 0}),
         )?);
         assert!(proxy.routed_read(&position).await?.is_none());
         assert!(proxy.routed_read(&primary_request).await?.is_none());
-        let malformed = CallToolRequestParams::new("nodes").with_arguments(serde_json::from_value(
-            json!({"symbol": id, "position": "zero"}),
-        )?);
-        let error = super::candidates::dispatch_nodes_request(&malformed, "cloud:docs")
-            .expect_err("arguments outside the nodes form refuse");
+        let malformed = CallToolRequestParams::new("facets").with_arguments(
+            serde_json::from_value(json!({"symbol": id, "position": "zero"}))?,
+        );
+        let error = super::candidates::dispatch_facets_request(&malformed, "cloud:docs")
+            .expect_err("arguments outside the facets form refuse");
         assert_eq!(error.slug(), errors::mcp::parameter_invalid::SLUG);
         Ok(())
     }
@@ -5214,7 +5214,7 @@ mod tests {
 
         let response = answered
             .client
-            .call_tool_once(CallToolRequestParams::new("nodes"))
+            .call_tool_once(CallToolRequestParams::new("facets"))
             .await?;
 
         assert!(
@@ -5238,7 +5238,7 @@ mod tests {
         let client = &answered.client;
 
         let called = client
-            .call_tool_once(CallToolRequestParams::new("nodes"))
+            .call_tool_once(CallToolRequestParams::new("facets"))
             .await;
         let read = client
             .read_resource_once(ReadResourceRequestParams::new(TWO_CONTENT_URI))

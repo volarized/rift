@@ -77,7 +77,7 @@ async fn proxy_keeps_dependency_call_paths_and_original_source_bytes() -> TestRe
     let statement = format!(
         "SELECT ?symbol ?name ?unit ?start ?end ?source {{ \
           <{seed}> :calls/:calls/:calls ?symbol . ?symbol :name ?name . \
-          ?node :of ?symbol; :index 0; :source ?source; :range [ :unit ?unit; :start ?start; :end ?end ] }}"
+          ?syntax_element :of ?symbol; :index 0; :source ?source; :range [ :unit ?unit; :start ?start; :end ?end ] }}"
     );
     let answer = proxied_call(&client, "search", &json!({"query":statement})).await?;
     let projected = row(&answer)?;

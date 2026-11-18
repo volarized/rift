@@ -9,13 +9,14 @@ use rift_error::RiftError;
 use rift_protocol::index::{PackagePublication, RelationshipCoverage};
 use rift_protocol::producer::{FactKind, FactProducer, ProducerFacts};
 use rift_protocol::read::{Language, PackageIdentity, RelationshipFacet, SourceUnitId};
-use rift_syntax::{ByteRange, NodeMatch, SyntaxLimits};
+use rift_syntax::{ByteRange, SyntaxLimits, SyntaxMatch};
 use serde_json::{Value, json};
 
 use super::{
-    ExtractionInput, FactExtractor, PublicationNodes, accept_extracted_facts, accept_producer_facts,
+    ExtractionInput, FactExtractor, PublicationSyntax, accept_extracted_facts,
+    accept_producer_facts,
 };
-use crate::located_node::NodeAddress;
+use crate::located_syntax_element::SyntaxAddress;
 
 const SOURCE: &str =
     "def echo(value):\n    return value\n\ndef shout(value):\n    return echo(value)\n";
@@ -136,42 +137,42 @@ fn refusal(publication: PackagePublication, facts: ProducerFacts) -> String {
 #[test]
 fn a_range_resolves_to_its_place_inside_the_enclosing_declaration() {
     let publication = click();
-    let mut nodes = PublicationNodes::new(&publication, SyntaxLimits::default());
+    let mut syntax_elements = PublicationSyntax::new(&publication, SyntaxLimits::default());
     let call = ByteRange {
         start: CALL.0,
         end: CALL.1,
     };
-    let located = nodes
-        .node_at(&unit(&publication), call, NodeMatch::Exact)
+    let located = syntax_elements
+        .syntax_element_at(&unit(&publication), call, SyntaxMatch::Exact)
         .expect("resolved call");
     assert_eq!(located.range, call);
     assert!(
         matches!(
             &located.address,
-            NodeAddress::Declaration { symbol, declaration: 0, index } if symbol.as_str() == SHOUT && *index > 0
+            SyntaxAddress::Declaration { symbol, declaration: 0, index } if symbol.as_str() == SHOUT && *index > 0
         ),
         "{located:?}"
     );
-    let echo = nodes
-        .node_at(
+    let echo = syntax_elements
+        .syntax_element_at(
             &unit(&publication),
             ByteRange { start: 0, end: 16 },
-            NodeMatch::Enclosing,
+            SyntaxMatch::Enclosing,
         )
         .expect("resolved declaration");
     assert!(
-        matches!(&echo.address, NodeAddress::Declaration { symbol, index: 0, .. } if symbol.as_str() == ECHO),
+        matches!(&echo.address, SyntaxAddress::Declaration { symbol, index: 0, .. } if symbol.as_str() == ECHO),
         "{echo:?}"
     );
-    let between = nodes
-        .node_at(
+    let between = syntax_elements
+        .syntax_element_at(
             &unit(&publication),
             ByteRange { start: 34, end: 35 },
-            NodeMatch::Enclosing,
+            SyntaxMatch::Enclosing,
         )
         .expect("resolved module");
     assert!(
-        matches!(between.address, NodeAddress::Unit { .. }),
+        matches!(between.address, SyntaxAddress::Unit { .. }),
         "{between:?}"
     );
     let text_unit = publication
@@ -180,59 +181,59 @@ fn a_range_resolves_to_its_place_inside_the_enclosing_declaration() {
         .find(|record| record.unit.0.ends_with("notes.txt"))
         .map(|record| record.unit.clone())
         .expect("notes unit");
-    let file = nodes
-        .node_at(
+    let file = syntax_elements
+        .syntax_element_at(
             &text_unit,
             ByteRange { start: 0, end: 4 },
-            NodeMatch::Enclosing,
+            SyntaxMatch::Enclosing,
         )
-        .expect("a text unit answers its file node");
-    assert_eq!(file.address, NodeAddress::Unit { index: 0 });
+        .expect("a text unit answers its file syntax element");
+    assert_eq!(file.address, SyntaxAddress::Unit { index: 0 });
     assert!(
-        format!("{nodes:?}").contains("units_parsed: 2"),
-        "{nodes:?}"
+        format!("{syntax_elements:?}").contains("units_parsed: 2"),
+        "{syntax_elements:?}"
     );
 }
 
 #[test]
 fn a_range_that_resolves_to_nothing_is_refused() {
     let publication = click();
-    let mut nodes = PublicationNodes::new(&publication, SyntaxLimits::default());
+    let mut syntax_elements = PublicationSyntax::new(&publication, SyntaxLimits::default());
     let past = u64::try_from(SOURCE.len()).expect("length") + 1;
-    let outside = nodes
-        .node_at(
+    let outside = syntax_elements
+        .syntax_element_at(
             &unit(&publication),
             ByteRange {
                 start: 0,
                 end: past,
             },
-            NodeMatch::Enclosing,
+            SyntaxMatch::Enclosing,
         )
         .expect_err("range past the unit");
     assert!(
         outside
             .to_string()
-            .contains("resolves to no node of its source unit"),
+            .contains("resolves to no syntax element of its source unit"),
         "{outside}"
     );
     let missing = SourceUnitId(format!("{}.missing", unit(&publication).0));
-    let absent = nodes
-        .node_at(
+    let absent = syntax_elements
+        .syntax_element_at(
             &missing,
             ByteRange { start: 0, end: 1 },
-            NodeMatch::Enclosing,
+            SyntaxMatch::Enclosing,
         )
         .expect_err("unit the publication does not carry");
     assert!(absent.to_string().contains(".missing"), "{absent}");
     let mut cut = publication.clone();
     cut.units[0].source_complete = false;
-    let mut nodes = PublicationNodes::new(&cut, SyntaxLimits::default());
+    let mut syntax_elements = PublicationSyntax::new(&cut, SyntaxLimits::default());
     assert!(
-        nodes
-            .node_at(
+        syntax_elements
+            .syntax_element_at(
                 &unit(&cut),
                 ByteRange { start: 0, end: 1 },
-                NodeMatch::Enclosing
+                SyntaxMatch::Enclosing
             )
             .is_err(),
         "a cut source resolves nothing"
@@ -303,7 +304,7 @@ fn producer_facts_naming_a_symbol_keep_it_and_still_resolve_their_range() {
             }],
         }),
     );
-    assert!(refusal(publication, facts).contains("resolves to no node"));
+    assert!(refusal(publication, facts).contains("resolves to no syntax element"));
     let publication = click();
     let covered_only = facts_with_kinds(&publication, &["occurrences"]);
     let accepted = accept_producer_facts(publication, covered_only, SyntaxLimits::default())

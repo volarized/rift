@@ -2,8 +2,8 @@
 
 mod cache;
 pub mod contract;
+mod facets;
 mod failure;
-mod nodes;
 mod pattern;
 pub mod relationships;
 mod response;

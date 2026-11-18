@@ -65,12 +65,12 @@ def name_request(name: str) -> JsonObject:
 
 
 def declaration_request(name: str) -> JsonObject:
-    """Select a named symbol and its item node from the captured graph."""
+    """Select a named symbol and its item element from the captured graph."""
     value = quoted(name)
     return {
         "query": f"""SELECT ?symbol ?name ?language ?unit ?source ?start ?end {{
           ?symbol a :Symbol; :name {value}; :name ?name; :language ?language .
-          ?node :of ?symbol; :index 0; :source ?source;
+          ?element :of ?symbol; :index 0; :source ?source;
                 :range [ :unit ?unit; :start ?start; :end ?end ] .
         }}"""
     }

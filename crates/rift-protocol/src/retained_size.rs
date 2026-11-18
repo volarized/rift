@@ -444,7 +444,7 @@ pub fn retained_arc_material<V: ?Sized, T: GetSizeTracker>(
     (bytes, tracker)
 }
 
-/// Counts retained map nodes and owned key and value heap material.
+/// Counts retained map syntax elements and owned key and value heap material.
 #[must_use]
 pub fn retained_map_material<K: GetSize + Ord, V, T: GetSizeTracker>(
     values: &std::collections::BTreeMap<K, V>,
@@ -461,15 +461,15 @@ pub fn retained_map_material<K: GetSize + Ord, V, T: GetSizeTracker>(
     (bytes, tracker)
 }
 
-// Rust 1.98 alloc::collections::btree::node: 11 key/value slots, a parent
-// pointer, two u16 fields, and at most 12 child pointers per allocated node.
+// Rust 1.98 alloc::collections::btree::syntax element: 11 key/value slots, a parent
+// pointer, two u16 fields, and at most 12 child pointers per allocated syntax element.
 // Each field is rounded to the largest field alignment before summation.
-// Charging one full internal node per entry plus one root overcharges empty
-// slots and leaf nodes; it does not claim allocator or resident-memory size.
-/// Conservative material occupied by the nodes of a retained `BTreeMap` or `BTreeSet`.
+// Charging one full internal syntax element per entry plus one root overcharges empty
+// slots and leaf syntax elements; it does not claim allocator or resident-memory size.
+/// Conservative material occupied by the syntax elements of a retained `BTreeMap` or `BTreeSet`.
 ///
-/// This bound uses the pinned Rust node layout and includes unused node slots.
-/// Every non-root node retains at least five entries; one root is counted separately.
+/// This bound uses the pinned Rust syntax element layout and includes unused syntax element slots.
+/// Every non-root syntax element retains at least five entries; one root is counted separately.
 /// Overflow returns `usize::MAX`, so a finite admission budget refuses it.
 #[must_use]
 pub fn btree_material_bytes<K, V>(len: usize) -> usize {
@@ -484,7 +484,7 @@ pub fn btree_material_bytes<K, V>(len: usize) -> usize {
         std::mem::size_of::<V>().saturating_mul(11),
         std::mem::size_of::<usize>().saturating_mul(12),
     ];
-    let node = fields.into_iter().try_fold(0usize, |total, field| {
+    let syntax_element = fields.into_iter().try_fold(0usize, |total, field| {
         field
             .checked_add(alignment - 1)
             .map(|padded| padded / alignment * alignment)
@@ -492,7 +492,9 @@ pub fn btree_material_bytes<K, V>(len: usize) -> usize {
     });
     (len / 5)
         .checked_add(1)
-        .and_then(|nodes| node.and_then(|node| nodes.checked_mul(node)))
+        .and_then(|syntax_elements| {
+            syntax_element.and_then(|syntax_element| syntax_elements.checked_mul(syntax_element))
+        })
         .unwrap_or(usize::MAX)
 }
 
@@ -678,7 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_maps_count_distinct_nodes_and_shared_value_material_once() {
+    fn retained_maps_count_distinct_syntax_elements_and_shared_value_material_once() {
         let value = std::sync::Arc::new(vec![0u8; 4096]);
         let first: std::collections::BTreeMap<u32, _> = (0..12)
             .map(|key| (key, std::sync::Arc::clone(&value)))
@@ -690,11 +692,11 @@ mod tests {
         let (first_bytes, tracker) =
             retained_map_material(&first, get_size2::StandardTracker::new(), measure);
         let (second_bytes, _) = retained_map_material(&second, tracker, measure);
-        let nodes = btree_material_bytes::<u32, std::sync::Arc<Vec<u8>>>(12);
+        let syntax_elements = btree_material_bytes::<u32, std::sync::Arc<Vec<u8>>>(12);
         let value_bytes =
             std::mem::size_of::<Vec<u8>>() + 2 * std::mem::size_of::<usize>() + value.capacity();
-        assert_eq!(first_bytes, nodes + value_bytes);
-        assert_eq!(second_bytes, nodes);
+        assert_eq!(first_bytes, syntax_elements + value_bytes);
+        assert_eq!(second_bytes, syntax_elements);
         assert_ne!(first_bytes, usize::MAX);
     }
 

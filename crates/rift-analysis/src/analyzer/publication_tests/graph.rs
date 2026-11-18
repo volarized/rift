@@ -563,7 +563,7 @@ fn assert_foreign_facts_retained(publication: &PackagePublication) {
 }
 
 #[test]
-fn portable_relationships_keep_two_original_call_sites_without_nodes() {
+fn portable_relationships_keep_two_original_call_sites_without_syntax_elements() {
     let fixture = GraphFixture::new();
     let first = SOURCE.find("finish();").expect("first call");
     let second = SOURCE.rfind("finish();").expect("second call");

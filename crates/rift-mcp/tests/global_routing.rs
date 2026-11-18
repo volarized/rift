@@ -220,7 +220,7 @@ async fn request_deadline_bounds_global_resolution() -> TestResult {
 const READ_DELAY: Duration = Duration::from_secs(10);
 
 /// A package read the request deadline cuts short discards the remote lane: symbol and full-text `search` each answer the project hits alone, with the timeout warning, well before
-/// the held page would have arrived, and `nodes` of a package symbol, which has no project
+/// the held page would have arrived, and `facets` of a package symbol, which has no project
 /// answer, refuses as temporarily unavailable.
 #[tokio::test]
 async fn request_deadline_bounds_the_remote_package_read() -> TestResult {
@@ -274,13 +274,13 @@ async fn request_deadline_bounds_the_remote_package_read() -> TestResult {
     let symbol = global_api::collected_identity(SymbolFixture::Valid, "beacon");
     let refused = failed_call(
         client
-            .call_tool(tool_request("nodes", &json!({"symbol": symbol})))
+            .call_tool(tool_request("facets", &json!({"symbol": symbol})))
             .await,
     )?;
     let elapsed = started.elapsed();
     assert!(
         elapsed < READ_DELAY,
-        "nodes: the request deadline must end the read wait: elapsed={elapsed:?}"
+        "facets: the request deadline must end the read wait: elapsed={elapsed:?}"
     );
     assert_eq!(
         refused.code,
@@ -782,7 +782,7 @@ async fn successful_search_uses_remote_phases_without_local_request_fields() -> 
     Ok(())
 }
 
-/// A package `get_symbol` or `nodes` read naming no revision reads the release the
+/// A package `get_symbol` or `facets` read naming no revision reads the release the
 /// workspace's dependencies pin, and its answer reports that release.
 #[tokio::test]
 async fn a_package_symbol_read_names_the_release_the_workspace_pins() -> TestResult {
@@ -798,9 +798,9 @@ async fn a_package_symbol_read_names_the_release_the_workspace_pins() -> TestRes
     let release = "rift://revision/cargo/crates.io/demo@1.0.0";
     let read = call_tool(&client, "get_symbol", json!({"id": id})).await?;
     assert_eq!(read["revision"], release, "{read:#}");
-    let nodes = call_tool(&client, "nodes", json!({"symbol": id})).await?;
-    assert_eq!(nodes["revision"], release, "{nodes:#}");
-    for endpoint in ["/v1/symbols", "/v1/nodes"] {
+    let syntax_elements = call_tool(&client, "facets", json!({"symbol": id})).await?;
+    assert_eq!(syntax_elements["revision"], release, "{syntax_elements:#}");
+    for endpoint in ["/v1/symbols", "/v1/facets"] {
         let asked = fixture
             .requests()
             .await
@@ -817,11 +817,11 @@ async fn a_package_symbol_read_names_the_release_the_workspace_pins() -> TestRes
     Ok(())
 }
 
-/// The nodes of a package symbol come from the global API in the shape a project symbol's
-/// nodes take: the package's `beacon` and the project's `beacon` share each node's identity,
-/// kind, and source, and differ in the unit and offsets that locate them.
+/// Package and project facets use the same shape. Their syntax elements share declaration
+/// ordinals, indexes, kinds, and source, and differ in the unit and offsets that locate them.
 #[tokio::test]
-async fn package_symbol_nodes_come_from_the_global_api_in_the_project_shape() -> TestResult {
+async fn package_symbol_syntax_elements_come_from_the_global_api_in_the_project_shape() -> TestResult
+{
     let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
     let configuration = format!(
         "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
@@ -831,7 +831,7 @@ async fn package_symbol_nodes_come_from_the_global_api_in_the_project_shape() ->
     let workspace = served_dependent_workspace(Some(&configuration)).await?;
     let (directory, client, server_task) = workspace.served;
     let id = global_api::collected_identity(SymbolFixture::Valid, "beacon");
-    let package = call_tool(&client, "nodes", json!({"symbol": id, "syntax": true})).await?;
+    let package = call_tool(&client, "facets", json!({"symbol": id})).await?;
     let found = search_symbols(
         &client,
         json!({"query": "beacon", "scope": "local", "target": "symbol"}),
@@ -844,59 +844,35 @@ async fn package_symbol_nodes_come_from_the_global_api_in_the_project_shape() ->
         .find(|hit| hit["hit"]["symbol"]["name"] == "beacon")
         .and_then(|hit| hit["hit"]["symbol"]["id"].as_str())
         .ok_or("the project declares beacon")?;
-    let local_request = json!({"symbol": local_id, "syntax": true});
-    let local = call_tool(&client, "nodes", local_request).await?;
+    let local_request = json!({"symbol": local_id});
+    let local = call_tool(&client, "facets", local_request).await?;
 
-    let package_nodes = package["nodes"].as_array().ok_or("package nodes")?;
-    let local_nodes = local["nodes"].as_array().ok_or("project nodes")?;
-    assert_eq!(
-        package_nodes.len(),
-        local_nodes.len(),
-        "{package:#}\n{local:#}"
-    );
-    for (package_node, local_node) in package_nodes.iter().zip(local_nodes) {
-        for field in [
-            "declaration",
-            "index",
-            "parent",
-            "kind",
-            "language",
-            "source",
-            "facets",
-        ] {
-            assert_eq!(
-                package_node[field], local_node[field],
-                "{field}: {package:#}"
-            );
-        }
-        assert_eq!(package_node["unit"], COLLECTED_UNIT, "{package:#}");
-        assert_eq!(
-            local_node["unit"], "rift://source/project/src/lib.rs",
-            "{local:#}"
-        );
-    }
+    assert_matching_facet_syntax(&package, &local)?;
     assert_eq!(package["symbol"], json!(id), "{package:#}");
     assert_eq!(
-        package_nodes[0]["source"], "pub fn beacon() {}",
+        package["declarations"][0]["source"]["text"], "pub fn beacon() {}",
         "{package:#}"
     );
 
     let at_release = call_tool(
         &client,
-        "nodes",
-        json!({"symbol": id, "revision": package["revision"], "syntax": true}),
+        "facets",
+        json!({"symbol": id, "revision": package["revision"]}),
     )
     .await?;
     assert_eq!(
         at_release["revision"], package["revision"],
         "{at_release:#}"
     );
-    assert_eq!(at_release["nodes"], package["nodes"], "{at_release:#}");
+    assert_eq!(
+        at_release["declarations"][0]["syntax"], package["declarations"][0]["syntax"],
+        "{at_release:#}"
+    );
 
     let absent = global_api::collected_identity(SymbolFixture::Valid, "absent");
     let refused = failed_call(
         client
-            .call_tool(tool_request("nodes", &json!({"symbol": absent})))
+            .call_tool(tool_request("facets", &json!({"symbol": absent})))
             .await,
     )?;
     assert_eq!(
@@ -909,7 +885,7 @@ async fn package_symbol_nodes_come_from_the_global_api_in_the_project_shape() ->
     let at_revision = failed_call(
         client
             .call_tool(tool_request(
-                "nodes",
+                "facets",
                 &json!({"symbol": id, "revision": "rift://revision/git/main"}),
             ))
             .await,
@@ -923,6 +899,48 @@ async fn package_symbol_nodes_come_from_the_global_api_in_the_project_shape() ->
     drop(directory);
     client.cancel().await?;
     server_task.await?;
+    Ok(())
+}
+
+/// Package and project declarations retain the same syntax structure and source.
+fn assert_matching_facet_syntax(package: &Value, local: &Value) -> TestResult {
+    let package_syntax_elements = package["declarations"][0]["syntax"]
+        .as_array()
+        .ok_or("package facets")?;
+    let local_syntax_elements = local["declarations"][0]["syntax"]
+        .as_array()
+        .ok_or("project facets")?;
+    assert_eq!(
+        package_syntax_elements.len(),
+        local_syntax_elements.len(),
+        "{package:#}\n{local:#}"
+    );
+    for (package_syntax_element, local_syntax_element) in
+        package_syntax_elements.iter().zip(local_syntax_elements)
+    {
+        for field in [
+            "declaration",
+            "index",
+            "parent",
+            "kind",
+            "language",
+            "source",
+            "facets",
+        ] {
+            assert_eq!(
+                package_syntax_element[field], local_syntax_element[field],
+                "{field}: {package:#}"
+            );
+        }
+        assert_eq!(
+            package_syntax_element["unit"], COLLECTED_UNIT,
+            "{package:#}"
+        );
+        assert_eq!(
+            local_syntax_element["unit"], "rift://source/project/src/lib.rs",
+            "{local:#}"
+        );
+    }
     Ok(())
 }
 

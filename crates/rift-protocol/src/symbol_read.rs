@@ -123,7 +123,7 @@ pub struct GetSymbolParams {
     #[schemars(with = "crate::identity::SymbolIdentity")]
     pub id: SymbolId,
     /// Requested projections. Omitted or empty requests none. A declaration's source is read
-    /// by `nodes` with `symbol`.
+    /// by `facets` with `symbol`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<GetSymbolInclude>,
     /// The revision to read. A git revision reads that commit of a project, a tree

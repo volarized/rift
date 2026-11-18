@@ -141,11 +141,11 @@ fn matched_facts(
     Ok(facts)
 }
 
-/// Writes the node of a relationship walk that is `hit`: the lines of a symbol hit behind
+/// Writes the syntax element of a relationship walk that is `hit`: the lines of a symbol hit behind
 /// `labels`, without the `relationship` field among its matched fields, which the tree states.
 ///
 /// A hit whose target is not a symbol writes nothing.
-pub(super) fn walk_node(
+pub(super) fn walk_symbol(
     lines: &mut Lines<'_>,
     hit: &SearchHit,
     labels: walk::Labels,
@@ -174,8 +174,8 @@ fn labeled(label: Option<&str>, text: &str) -> String {
 /// Writes the symbol hit: declaration, facts with the `matched` fields, identity, summary,
 /// change, source.
 ///
-/// A node under the root of a relationship walk has its head line already and writes the
-/// declaration below it. A node of a walk writes the facts and the identity behind the words
+/// A symbol under the root of a relationship walk has its head line already and writes the
+/// declaration below it. A symbol of a walk writes the facts and the identity behind the words
 /// of `labels`.
 fn symbol_hit(
     lines: &mut Lines<'_>,

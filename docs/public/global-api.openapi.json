@@ -49,7 +49,7 @@
                         "symbol_documentation",
                         "patterns",
                         "declarations",
-                        "nodes",
+                        "facets",
                         "relationships"
                       ],
                       "publication_format": "rift-package-index-v2",
@@ -1916,11 +1916,11 @@
         "x-rift-response-body-bytes-max": 33554432
       }
     },
-    "/v1/nodes": {
+    "/v1/facets": {
       "post": {
-        "operationId": "nodes",
-        "summary": "List the nodes of one package or runtime symbol.",
-        "description": "Lists the syntax nodes of one package or runtime symbol with their source text, in the exact release its identity names: each declaration's item node, then the descendants that belong to that declaration and not to a declaration nested in it, outermost first per declaration. Every node's `unit` is a source unit of that release. The request carries `symbol` and MAY carry `node_cursor` and `revision`; the server refuses `path` and `position`. A page holds at most `page_limit_max` nodes and, beyond its first node, at most `x-rift-page-source-bytes-max` bytes of node source; `node_cursor` continues where the page stopped. A symbol the release does not declare answers 404.",
+        "operationId": "facets",
+        "summary": "Read every declaration of one package or runtime symbol.",
+        "description": "Reads every declaration of one package or runtime symbol with its location, exact source, and syntax structure. The request carries `symbol` and MAY carry `facet_cursor` and `revision`. Each declaration carries its syntax tree. The answer names the release it read. A page holds at most `page_limit_max` declarations and at least one whole declaration; beyond its first declaration, the syntax source stays within `x-rift-page-source-bytes-max`. The caller MUST return `facet_cursor` with the same symbol and revision. A symbol the release does not declare answers 404.",
         "security": [
           {},
           {
@@ -1928,12 +1928,12 @@
           }
         ],
         "requestBody": {
-          "description": "The package or runtime symbol whose nodes the request lists.",
+          "description": "The package or runtime symbol whose facets the request reads.",
           "required": true,
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/NodesParams"
+                "$ref": "#/components/schemas/FacetsParams"
               },
               "examples": {
                 "symbol": {
@@ -1948,235 +1948,256 @@
         },
         "responses": {
           "200": {
-            "description": "The symbol's nodes with their source text.",
+            "description": "The symbol's declarations with exact source and syntax structure.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/NodesResult"
+                  "$ref": "#/components/schemas/FacetsResult"
                 },
                 "examples": {
                   "symbol": {
                     "value": {
                       "symbol": "rift://symbol/cargo/crates.io/itoa/rust/itoa/Buffer",
-                      "nodes": [
-                        {
-                          "declaration": 0,
-                          "index": 0,
-                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
-                          "language": "rust",
-                          "kind": "struct_item",
-                          "facets": [
-                            "declaration",
-                            "definition"
-                          ],
-                          "range": {
-                            "start": 2357,
-                            "end": 2427
-                          },
-                          "source": "pub struct Buffer {\n    bytes: [MaybeUninit<u8>; i128::MAX_STR_LEN],\n}",
-                          "regions": []
-                        },
-                        {
-                          "declaration": 0,
-                          "index": 1,
-                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
-                          "language": "rust",
-                          "kind": "visibility_modifier",
-                          "facets": [],
-                          "range": {
-                            "start": 2357,
-                            "end": 2360
-                          },
-                          "source": "pub",
-                          "regions": [],
-                          "parent": 0
-                        },
-                        {
-                          "declaration": 0,
-                          "index": 2,
-                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
-                          "language": "rust",
-                          "kind": "type_identifier",
-                          "facets": [],
-                          "range": {
-                            "start": 2368,
-                            "end": 2374
-                          },
-                          "source": "Buffer",
-                          "regions": [],
-                          "parent": 0
-                        },
-                        {
-                          "declaration": 0,
-                          "index": 3,
-                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
-                          "language": "rust",
-                          "kind": "field_declaration_list",
-                          "facets": [],
-                          "range": {
-                            "start": 2375,
-                            "end": 2427
-                          },
-                          "source": "{\n    bytes: [MaybeUninit<u8>; i128::MAX_STR_LEN],\n}",
-                          "regions": [],
-                          "parent": 0
-                        },
-                        {
-                          "declaration": 0,
-                          "index": 4,
-                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
-                          "language": "rust",
-                          "kind": "field_declaration",
-                          "facets": [
-                            "declaration",
-                            "definition"
-                          ],
-                          "range": {
-                            "start": 2381,
-                            "end": 2424
-                          },
-                          "source": "bytes: [MaybeUninit<u8>; i128::MAX_STR_LEN]",
-                          "regions": [],
-                          "parent": 3
-                        },
-                        {
-                          "declaration": 0,
-                          "index": 5,
-                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
-                          "language": "rust",
-                          "kind": "field_identifier",
-                          "facets": [],
-                          "range": {
-                            "start": 2381,
-                            "end": 2386
-                          },
-                          "source": "bytes",
-                          "regions": [],
-                          "parent": 4
-                        },
-                        {
-                          "declaration": 0,
-                          "index": 6,
-                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
-                          "language": "rust",
-                          "kind": "array_type",
-                          "facets": [],
-                          "range": {
-                            "start": 2388,
-                            "end": 2424
-                          },
-                          "source": "[MaybeUninit<u8>; i128::MAX_STR_LEN]",
-                          "regions": [],
-                          "parent": 4
-                        },
-                        {
-                          "declaration": 0,
-                          "index": 7,
-                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
-                          "language": "rust",
-                          "kind": "generic_type",
-                          "facets": [],
-                          "range": {
-                            "start": 2389,
-                            "end": 2404
-                          },
-                          "source": "MaybeUninit<u8>",
-                          "regions": [],
-                          "parent": 6
-                        },
-                        {
-                          "declaration": 0,
-                          "index": 8,
-                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
-                          "language": "rust",
-                          "kind": "type_identifier",
-                          "facets": [],
-                          "range": {
-                            "start": 2389,
-                            "end": 2400
-                          },
-                          "source": "MaybeUninit",
-                          "regions": [],
-                          "parent": 7
-                        },
-                        {
-                          "declaration": 0,
-                          "index": 9,
-                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
-                          "language": "rust",
-                          "kind": "type_arguments",
-                          "facets": [],
-                          "range": {
-                            "start": 2400,
-                            "end": 2404
-                          },
-                          "source": "<u8>",
-                          "regions": [],
-                          "parent": 7
-                        },
-                        {
-                          "declaration": 0,
-                          "index": 10,
-                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
-                          "language": "rust",
-                          "kind": "primitive_type",
-                          "facets": [],
-                          "range": {
-                            "start": 2401,
-                            "end": 2403
-                          },
-                          "source": "u8",
-                          "regions": [],
-                          "parent": 9
-                        },
-                        {
-                          "declaration": 0,
-                          "index": 11,
-                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
-                          "language": "rust",
-                          "kind": "scoped_identifier",
-                          "facets": [],
-                          "range": {
-                            "start": 2406,
-                            "end": 2423
-                          },
-                          "source": "i128::MAX_STR_LEN",
-                          "regions": [],
-                          "parent": 6
-                        },
-                        {
-                          "declaration": 0,
-                          "index": 12,
-                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
-                          "language": "rust",
-                          "kind": "identifier",
-                          "facets": [],
-                          "range": {
-                            "start": 2406,
-                            "end": 2410
-                          },
-                          "source": "i128",
-                          "regions": [],
-                          "parent": 11
-                        },
-                        {
-                          "declaration": 0,
-                          "index": 13,
-                          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
-                          "language": "rust",
-                          "kind": "identifier",
-                          "facets": [],
-                          "range": {
-                            "start": 2412,
-                            "end": 2423
-                          },
-                          "source": "MAX_STR_LEN",
-                          "regions": [],
-                          "parent": 11
-                        }
-                      ],
                       "revision": "rift://revision/cargo/crates.io/itoa@1.0.18",
-                      "warnings": []
+                      "warnings": [],
+                      "declarations": [
+                        {
+                          "declaration": 0,
+                          "kind": "struct_item",
+                          "range": {
+                            "start": 2357,
+                            "end": 2427
+                          },
+                          "source": {
+                            "span": {
+                              "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                              "range": {
+                                "start": 2357,
+                                "end": 2427
+                              }
+                            },
+                            "text": "pub struct Buffer {\n    bytes: [MaybeUninit<u8>; i128::MAX_STR_LEN],\n}"
+                          },
+                          "syntax": [
+                            {
+                              "declaration": 0,
+                              "index": 0,
+                              "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                              "language": "rust",
+                              "kind": "struct_item",
+                              "facets": [
+                                "declaration",
+                                "definition"
+                              ],
+                              "range": {
+                                "start": 2357,
+                                "end": 2427
+                              },
+                              "source": "pub struct Buffer {\n    bytes: [MaybeUninit<u8>; i128::MAX_STR_LEN],\n}",
+                              "regions": []
+                            },
+                            {
+                              "declaration": 0,
+                              "index": 1,
+                              "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                              "language": "rust",
+                              "kind": "visibility_modifier",
+                              "facets": [],
+                              "range": {
+                                "start": 2357,
+                                "end": 2360
+                              },
+                              "source": "pub",
+                              "regions": [],
+                              "parent": 0
+                            },
+                            {
+                              "declaration": 0,
+                              "index": 2,
+                              "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                              "language": "rust",
+                              "kind": "type_identifier",
+                              "facets": [],
+                              "range": {
+                                "start": 2368,
+                                "end": 2374
+                              },
+                              "source": "Buffer",
+                              "regions": [],
+                              "parent": 0
+                            },
+                            {
+                              "declaration": 0,
+                              "index": 3,
+                              "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                              "language": "rust",
+                              "kind": "field_declaration_list",
+                              "facets": [],
+                              "range": {
+                                "start": 2375,
+                                "end": 2427
+                              },
+                              "source": "{\n    bytes: [MaybeUninit<u8>; i128::MAX_STR_LEN],\n}",
+                              "regions": [],
+                              "parent": 0
+                            },
+                            {
+                              "declaration": 0,
+                              "index": 4,
+                              "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                              "language": "rust",
+                              "kind": "field_declaration",
+                              "facets": [
+                                "declaration",
+                                "definition"
+                              ],
+                              "range": {
+                                "start": 2381,
+                                "end": 2424
+                              },
+                              "source": "bytes: [MaybeUninit<u8>; i128::MAX_STR_LEN]",
+                              "regions": [],
+                              "parent": 3
+                            },
+                            {
+                              "declaration": 0,
+                              "index": 5,
+                              "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                              "language": "rust",
+                              "kind": "field_identifier",
+                              "facets": [],
+                              "range": {
+                                "start": 2381,
+                                "end": 2386
+                              },
+                              "source": "bytes",
+                              "regions": [],
+                              "parent": 4
+                            },
+                            {
+                              "declaration": 0,
+                              "index": 6,
+                              "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                              "language": "rust",
+                              "kind": "array_type",
+                              "facets": [],
+                              "range": {
+                                "start": 2388,
+                                "end": 2424
+                              },
+                              "source": "[MaybeUninit<u8>; i128::MAX_STR_LEN]",
+                              "regions": [],
+                              "parent": 4
+                            },
+                            {
+                              "declaration": 0,
+                              "index": 7,
+                              "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                              "language": "rust",
+                              "kind": "generic_type",
+                              "facets": [],
+                              "range": {
+                                "start": 2389,
+                                "end": 2404
+                              },
+                              "source": "MaybeUninit<u8>",
+                              "regions": [],
+                              "parent": 6
+                            },
+                            {
+                              "declaration": 0,
+                              "index": 8,
+                              "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                              "language": "rust",
+                              "kind": "type_identifier",
+                              "facets": [],
+                              "range": {
+                                "start": 2389,
+                                "end": 2400
+                              },
+                              "source": "MaybeUninit",
+                              "regions": [],
+                              "parent": 7
+                            },
+                            {
+                              "declaration": 0,
+                              "index": 9,
+                              "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                              "language": "rust",
+                              "kind": "type_arguments",
+                              "facets": [],
+                              "range": {
+                                "start": 2400,
+                                "end": 2404
+                              },
+                              "source": "<u8>",
+                              "regions": [],
+                              "parent": 7
+                            },
+                            {
+                              "declaration": 0,
+                              "index": 10,
+                              "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                              "language": "rust",
+                              "kind": "primitive_type",
+                              "facets": [],
+                              "range": {
+                                "start": 2401,
+                                "end": 2403
+                              },
+                              "source": "u8",
+                              "regions": [],
+                              "parent": 9
+                            },
+                            {
+                              "declaration": 0,
+                              "index": 11,
+                              "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                              "language": "rust",
+                              "kind": "scoped_identifier",
+                              "facets": [],
+                              "range": {
+                                "start": 2406,
+                                "end": 2423
+                              },
+                              "source": "i128::MAX_STR_LEN",
+                              "regions": [],
+                              "parent": 6
+                            },
+                            {
+                              "declaration": 0,
+                              "index": 12,
+                              "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                              "language": "rust",
+                              "kind": "identifier",
+                              "facets": [],
+                              "range": {
+                                "start": 2406,
+                                "end": 2410
+                              },
+                              "source": "i128",
+                              "regions": [],
+                              "parent": 11
+                            },
+                            {
+                              "declaration": 0,
+                              "index": 13,
+                              "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
+                              "language": "rust",
+                              "kind": "identifier",
+                              "facets": [],
+                              "range": {
+                                "start": 2412,
+                                "end": 2423
+                              },
+                              "source": "MAX_STR_LEN",
+                              "regions": [],
+                              "parent": 11
+                            }
+                          ],
+                          "regions": []
+                        }
+                      ]
                     }
                   }
                 }
@@ -2983,6 +3004,13 @@
         ]
       },
       "SymbolId": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 8192,
+        "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$",
+        "not": {
+          "pattern": "/\\.{1,2}(?:/|$)"
+        },
         "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.",
         "examples": [
           "rift://symbol/local/rust/app/parser/parse",
@@ -2991,14 +3019,7 @@
           "rift://symbol/local@cloud:docs/typescript/page/beacon",
           "rift://symbol/npm/npmjs.org/@types/node/typescript/node/buffer/Buffer",
           "rift://symbol/stdlib/cpython/python/builtins/len"
-        ],
-        "maxLength": 8192,
-        "minLength": 1,
-        "not": {
-          "pattern": "/\\.{1,2}(?:/|$)"
-        },
-        "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$",
-        "type": "string"
+        ]
       },
       "Symbol": {
         "type": "object",
@@ -3092,7 +3113,7 @@
           "name",
           "kind"
         ],
-        "description": "Readable Symbol assembled from normalized Contributions. Source structure lives in Node\nand is connected through Relationship."
+        "description": "Readable Symbol assembled from normalized Contributions. Source structure lives in `SyntaxElement`\nand is connected through Relationship."
       },
       "SymbolOrigin": {
         "type": "object",
@@ -5067,13 +5088,13 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "path": {
-                "$ref": "#/components/schemas/ProjectPath",
-                "description": "Path relative to the workspace root."
-              },
               "kind": {
                 "type": "string",
                 "const": "project"
+              },
+              "path": {
+                "$ref": "#/components/schemas/ProjectPath",
+                "description": "Path relative to the workspace root."
               }
             },
             "required": [
@@ -5086,13 +5107,13 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "unit": {
-                "$ref": "#/components/schemas/SourceUnitId",
-                "description": "Canonical package source identity."
-              },
               "kind": {
                 "type": "string",
                 "const": "package"
+              },
+              "unit": {
+                "$ref": "#/components/schemas/SourceUnitId",
+                "description": "Canonical package source identity."
               }
             },
             "required": [
@@ -5196,13 +5217,13 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "id": {
-                "type": "string",
-                "description": "Identifier accepted by the notebook format."
-              },
               "kind": {
                 "type": "string",
                 "const": "authored"
+              },
+              "id": {
+                "type": "string",
+                "description": "Identifier accepted by the notebook format."
               }
             },
             "required": [
@@ -5215,15 +5236,15 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "kind": {
+                "type": "string",
+                "const": "indexed"
+              },
               "index": {
                 "type": "integer",
                 "format": "uint32",
                 "minimum": 0,
                 "description": "Position among every cell, including unselected cells."
-              },
-              "kind": {
-                "type": "string",
-                "const": "indexed"
               }
             },
             "required": [
@@ -5487,13 +5508,13 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "documentation": {
-                "$ref": "#/components/schemas/DocumentationHit",
-                "description": "Block, source, and collector revision answering this match."
-              },
               "target": {
                 "type": "string",
                 "const": "documentation"
+              },
+              "documentation": {
+                "$ref": "#/components/schemas/DocumentationHit",
+                "description": "Block, source, and collector revision answering this match."
               }
             },
             "required": [
@@ -5506,13 +5527,13 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "symbol": {
-                "$ref": "#/components/schemas/Symbol",
-                "description": "The declaration that matched."
-              },
               "target": {
                 "type": "string",
                 "const": "symbol"
+              },
+              "symbol": {
+                "$ref": "#/components/schemas/Symbol",
+                "description": "The declaration that matched."
               }
             },
             "required": [
@@ -5525,6 +5546,10 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "target": {
+                "type": "string",
+                "const": "file"
+              },
               "size": {
                 "type": "integer",
                 "format": "uint64",
@@ -5539,10 +5564,6 @@
                 },
                 "description": "Distinct `Language` values that read this file, sorted by name and dialect.\nAbsent when empty.",
                 "default": []
-              },
-              "target": {
-                "type": "string",
-                "const": "file"
               }
             },
             "required": [
@@ -5555,13 +5576,13 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "commit": {
-                "$ref": "#/components/schemas/CommitHit",
-                "description": "The commit that matched."
-              },
               "target": {
                 "type": "string",
                 "const": "commit"
+              },
+              "commit": {
+                "$ref": "#/components/schemas/CommitHit",
+                "description": "The commit that matched."
               }
             },
             "required": [
@@ -5715,7 +5736,7 @@
             "description": "The symbol the edge points at. One Rift cannot read carries the `external` origin;\nthe edge is the same either way."
           },
           "occurrence": {
-            "description": "Exact physical occurrence when this edge was read from source, independent of\nwhether the provider supplied a source node.",
+            "description": "Exact physical occurrence when this edge was read from source, independent of\nwhether the provider supplied a source syntax element.",
             "$ref": "#/components/schemas/SourceUnitSpan"
           },
           "derivation": {
@@ -5898,6 +5919,10 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "outcome": {
+                "type": "string",
+                "const": "found"
+              },
               "position": {
                 "$ref": "#/components/schemas/SourcePosition",
                 "description": "Submitted position, unchanged."
@@ -5913,10 +5938,6 @@
               "revision": {
                 "$ref": "#/components/schemas/Revision",
                 "description": "The release of the declaration's owner that `id` answers in. It differs from\nthe position's release when a proved stub mapping names a runtime declaration."
-              },
-              "outcome": {
-                "type": "string",
-                "const": "found"
               }
             },
             "required": [
@@ -5932,13 +5953,13 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "position": {
-                "$ref": "#/components/schemas/SourcePosition",
-                "description": "Submitted position, unchanged."
-              },
               "outcome": {
                 "type": "string",
                 "const": "missing"
+              },
+              "position": {
+                "$ref": "#/components/schemas/SourcePosition",
+                "description": "Submitted position, unchanged."
               }
             },
             "required": [
@@ -5951,6 +5972,10 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "outcome": {
+                "type": "string",
+                "const": "unavailable"
+              },
               "position": {
                 "$ref": "#/components/schemas/SourcePosition",
                 "description": "Submitted position, unchanged."
@@ -5958,10 +5983,6 @@
               "reason": {
                 "$ref": "#/components/schemas/SymbolUnavailableReason",
                 "description": "Typed cause of unavailability."
-              },
-              "outcome": {
-                "type": "string",
-                "const": "unavailable"
               }
             },
             "required": [
@@ -6054,7 +6075,7 @@
             "items": {
               "$ref": "#/components/schemas/GetSymbolInclude"
             },
-            "description": "Requested projections. Omitted or empty requests none. A declaration's source is read\nby `nodes` with `symbol`."
+            "description": "Requested projections. Omitted or empty requests none. A declaration's source is read\nby `facets` with `symbol`."
           },
           "revision": {
             "description": "The revision to read. A git revision reads that commit of a project, a tree\nrevision reads the served working tree, and a release revision selects the release\nof a package or runtime `id`'s owner. Omitted reads the served working tree, or for\na package the version the workspace's dependencies pin, else the newest collected\nrelease. The server refuses a tree revision once the index serves another tree.",
@@ -6079,6 +6100,7 @@
           "id"
         ],
         "description": "Reads one exact logical symbol obtained from discovery or another read.",
+        "rift:since": "v0.0.4",
         "examples": [
           {
             "id": "rift://symbol/local/rust/app/parser/parse",
@@ -6086,8 +6108,7 @@
               "documentation"
             ]
           }
-        ],
-        "rift:since": "v0.0.4"
+        ]
       },
       "GetSymbolResult": {
         "oneOf": [
@@ -6095,6 +6116,10 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "outcome": {
+                "type": "string",
+                "const": "found"
+              },
               "symbol": {
                 "$ref": "#/components/schemas/Symbol",
                 "description": "One logical symbol. Its established `id` is required by read validation."
@@ -6131,10 +6156,6 @@
                   "$ref": "#/components/schemas/ReadWarning"
                 },
                 "description": "Projection cuts and other typed read warnings."
-              },
-              "outcome": {
-                "type": "string",
-                "const": "found"
               }
             },
             "required": [
@@ -6149,6 +6170,10 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "outcome": {
+                "type": "string",
+                "const": "missing"
+              },
               "symbol_not_found": {
                 "$ref": "#/components/schemas/SymbolNotFound",
                 "description": "Definite exact miss and its actual structural candidates."
@@ -6163,10 +6188,6 @@
                   "$ref": "#/components/schemas/ReadWarning"
                 },
                 "description": "Warnings, including incomplete candidate work."
-              },
-              "outcome": {
-                "type": "string",
-                "const": "missing"
               }
             },
             "required": [
@@ -6180,6 +6201,10 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "outcome": {
+                "type": "string",
+                "const": "unavailable"
+              },
               "id": {
                 "$ref": "#/components/schemas/SymbolIdentity",
                 "description": "The requested exact canonical identity."
@@ -6198,10 +6223,6 @@
                   "$ref": "#/components/schemas/ReadWarning"
                 },
                 "description": "Details and available partial-read warnings."
-              },
-              "outcome": {
-                "type": "string",
-                "const": "unavailable"
               }
             },
             "required": [
@@ -6215,8 +6236,8 @@
         "description": "Exactly one logical object, definite absence, or explicit selection unavailability.",
         "examples": [
           {
-            "id": "rift://symbol/local/rust/app/parser/parse",
             "outcome": "unavailable",
+            "id": "rift://symbol/local/rust/app/parser/parse",
             "reason": "insufficient_coverage"
           }
         ]
@@ -6289,6 +6310,10 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "code": {
+                "type": "string",
+                "const": "object_unavailable"
+              },
               "unit": {
                 "description": "Physical source unit, paired with `range`, or absent for a source-less object.",
                 "$ref": "#/components/schemas/SourceUnitId"
@@ -6312,10 +6337,6 @@
                 "format": "uint64",
                 "minimum": 1,
                 "description": "Enforced public field bound."
-              },
-              "code": {
-                "type": "string",
-                "const": "object_unavailable"
               }
             },
             "required": [
@@ -6330,6 +6351,10 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "code": {
+                "type": "string",
+                "const": "framework_context_unresolved"
+              },
               "unit": {
                 "$ref": "#/components/schemas/SourceUnitId",
                 "description": "The source whose framework context is unresolved."
@@ -6342,10 +6367,6 @@
                 "type": "string",
                 "description": "The missing package version, configuration, or template source.",
                 "maxLength": 4096
-              },
-              "code": {
-                "type": "string",
-                "const": "framework_context_unresolved"
               }
             },
             "required": [
@@ -6360,6 +6381,10 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "code": {
+                "type": "string",
+                "const": "symbol_not_found"
+              },
               "name": {
                 "type": "string",
                 "description": "The declaration name the caller requested.",
@@ -6378,10 +6403,6 @@
                 "type": "string",
                 "description": "Why closest declarations could not be selected within the work bound.\nAbsent when every selected declaration was compared or scope is `global`.",
                 "maxLength": 4096
-              },
-              "code": {
-                "type": "string",
-                "const": "symbol_not_found"
               }
             },
             "required": [
@@ -6395,13 +6416,13 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "warning": {
-                "$ref": "#/components/schemas/DocumentationWarning",
-                "description": "Bounded source identity, stage, failure label, and omitted count."
-              },
               "code": {
                 "type": "string",
                 "const": "documentation"
+              },
+              "warning": {
+                "$ref": "#/components/schemas/DocumentationWarning",
+                "description": "Bounded source identity, stage, failure label, and omitted count."
               }
             },
             "required": [
@@ -6414,14 +6435,14 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "code": {
+                "type": "string",
+                "const": "documentation_unavailable"
+              },
               "detail": {
                 "type": "string",
                 "description": "Which documentation was left out and the bound it crossed - prose for a\nreader; nothing keys on it.",
                 "maxLength": 4096
-              },
-              "code": {
-                "type": "string",
-                "const": "documentation_unavailable"
               }
             },
             "required": [
@@ -6434,6 +6455,10 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "code": {
+                "type": "string",
+                "const": "stale_index"
+              },
               "index_tree_revision": {
                 "$ref": "#/components/schemas/Digest",
                 "description": "Tree revision the published index covers."
@@ -6446,10 +6471,6 @@
                 "type": "string",
                 "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
                 "maxLength": 4096
-              },
-              "code": {
-                "type": "string",
-                "const": "stale_index"
               }
             },
             "required": [
@@ -6464,6 +6485,10 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "code": {
+                "type": "string",
+                "const": "vector_index_preparing"
+              },
               "prepared": {
                 "type": "integer",
                 "format": "uint64",
@@ -6484,10 +6509,6 @@
                 "type": "string",
                 "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
                 "maxLength": 4096
-              },
-              "code": {
-                "type": "string",
-                "const": "vector_index_preparing"
               }
             },
             "required": [
@@ -6503,6 +6524,10 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "code": {
+                "type": "string",
+                "const": "local_index_preparing"
+              },
               "prepared": {
                 "type": "integer",
                 "format": "uint64",
@@ -6525,10 +6550,6 @@
                 "type": "string",
                 "description": "Why the local index is preparing - prose for a reader; nothing keys on it.",
                 "maxLength": 4096
-              },
-              "code": {
-                "type": "string",
-                "const": "local_index_preparing"
               }
             },
             "required": [
@@ -6542,14 +6563,14 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "code": {
+                "type": "string",
+                "const": "vector_ranking_unavailable"
+              },
               "detail": {
                 "type": "string",
                 "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
                 "maxLength": 4096
-              },
-              "code": {
-                "type": "string",
-                "const": "vector_ranking_unavailable"
               }
             },
             "required": [
@@ -6562,14 +6583,14 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "code": {
+                "type": "string",
+                "const": "lexical_ranking_unavailable"
+              },
               "detail": {
                 "type": "string",
                 "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
                 "maxLength": 4096
-              },
-              "code": {
-                "type": "string",
-                "const": "lexical_ranking_unavailable"
               }
             },
             "required": [
@@ -6582,15 +6603,15 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "code": {
+                "type": "string",
+                "const": "query_narrowed"
+              },
               "terms_max": {
                 "type": "integer",
                 "format": "uint64",
                 "minimum": 0,
                 "description": "Terms and quoted phrases the query was cut to: the server's bound on one\nparsed query."
-              },
-              "code": {
-                "type": "string",
-                "const": "query_narrowed"
               }
             },
             "required": [
@@ -6603,15 +6624,15 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "code": {
+                "type": "string",
+                "const": "lexical_ranking_truncated"
+              },
               "matches_max": {
                 "type": "integer",
                 "format": "uint64",
                 "minimum": 0,
                 "description": "Units the ranking stopped at: the server's bound on one lexical ranking."
-              },
-              "code": {
-                "type": "string",
-                "const": "lexical_ranking_truncated"
               }
             },
             "required": [
@@ -6624,15 +6645,15 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "code": {
+                "type": "string",
+                "const": "results_truncated"
+              },
               "results_max": {
                 "type": "integer",
                 "format": "uint64",
                 "minimum": 0,
                 "description": "The bound the read stopped at: the server's limit on both the candidates one\nread ranks and the hits it returns."
-              },
-              "code": {
-                "type": "string",
-                "const": "results_truncated"
               }
             },
             "required": [
@@ -6645,6 +6666,10 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "code": {
+                "type": "string",
+                "const": "pattern_matches_truncated"
+              },
               "matches_per_file": {
                 "type": "integer",
                 "format": "uint64",
@@ -6658,10 +6683,6 @@
                 },
                 "description": "The files cut at the bound.",
                 "maxItems": 8
-              },
-              "code": {
-                "type": "string",
-                "const": "pattern_matches_truncated"
               }
             },
             "required": [
@@ -6675,6 +6696,10 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "code": {
+                "type": "string",
+                "const": "pattern_index_preparing"
+              },
               "prepared": {
                 "type": "integer",
                 "format": "uint64",
@@ -6691,10 +6716,6 @@
                 "type": "string",
                 "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
                 "maxLength": 4096
-              },
-              "code": {
-                "type": "string",
-                "const": "pattern_index_preparing"
               }
             },
             "required": [
@@ -6709,6 +6730,10 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "code": {
+                "type": "string",
+                "const": "source_unavailable"
+              },
               "unit": {
                 "description": "The file the warning names. Absent on the one warning that counts the files\npast `SOURCE_WARNINGS_MAX`.",
                 "$ref": "#/components/schemas/SourceUnitId"
@@ -6717,10 +6742,6 @@
                 "type": "string",
                 "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
                 "maxLength": 4096
-              },
-              "code": {
-                "type": "string",
-                "const": "source_unavailable"
               }
             },
             "required": [
@@ -6733,6 +6754,10 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "code": {
+                "type": "string",
+                "const": "large_file_skipped"
+              },
               "skipped": {
                 "type": "integer",
                 "format": "uint64",
@@ -6743,10 +6768,6 @@
                 "type": "string",
                 "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
                 "maxLength": 4096
-              },
-              "code": {
-                "type": "string",
-                "const": "large_file_skipped"
               }
             },
             "required": [
@@ -6760,6 +6781,10 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "code": {
+                "type": "string",
+                "const": "large_file_unparsed"
+              },
               "files": {
                 "type": "array",
                 "items": {
@@ -6772,10 +6797,6 @@
                 "type": "string",
                 "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
                 "maxLength": 4096
-              },
-              "code": {
-                "type": "string",
-                "const": "large_file_unparsed"
               }
             },
             "required": [
@@ -6789,6 +6810,10 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "code": {
+                "type": "string",
+                "const": "lockfile_excluded"
+              },
               "files": {
                 "type": "array",
                 "items": {
@@ -6801,10 +6826,6 @@
                 "type": "string",
                 "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
                 "maxLength": 4096
-              },
-              "code": {
-                "type": "string",
-                "const": "lockfile_excluded"
               }
             },
             "required": [
@@ -6818,6 +6839,10 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "code": {
+                "type": "string",
+                "const": "symbol_disagreement"
+              },
               "symbol": {
                 "$ref": "#/components/schemas/SymbolId",
                 "description": "The symbol whose presentation facts disagree."
@@ -6834,10 +6859,6 @@
                 "type": "string",
                 "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
                 "maxLength": 4096
-              },
-              "code": {
-                "type": "string",
-                "const": "symbol_disagreement"
               }
             },
             "required": [
@@ -6852,6 +6873,10 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "code": {
+                "type": "string",
+                "const": "traversal_truncated"
+              },
               "visited": {
                 "type": "integer",
                 "format": "uint64",
@@ -6862,10 +6887,6 @@
                 "type": "string",
                 "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
                 "maxLength": 4096
-              },
-              "code": {
-                "type": "string",
-                "const": "traversal_truncated"
               }
             },
             "required": [
@@ -6873,12 +6894,16 @@
               "visited",
               "detail"
             ],
-            "description": "A traversal walk stopped at its node bound before exhausting the reachable graph,\nso hits reachable beyond the bound are missing from this answer. Narrow the walk -\na tighter `facets` list, a smaller `depth`, or a less-connected seed - to fit it\nunder the bound."
+            "description": "A traversal walk stopped at its symbol bound before exhausting the reachable graph,\nso hits reachable beyond the bound are missing from this answer. Narrow the walk -\na tighter `facets` list, a smaller `depth`, or a less-connected seed - to fit it\nunder the bound."
           },
           {
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "code": {
+                "type": "string",
+                "const": "relationship_coverage_missing"
+              },
               "facets": {
                 "type": "array",
                 "items": {
@@ -6890,10 +6915,6 @@
                 "type": "string",
                 "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
                 "maxLength": 4096
-              },
-              "code": {
-                "type": "string",
-                "const": "relationship_coverage_missing"
               }
             },
             "required": [
@@ -6906,6 +6927,10 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "code": {
+                "type": "string",
+                "const": "engine_analysis_unavailable"
+              },
               "language": {
                 "description": "The seed declaration's language, whose engine's answer was dropped.",
                 "$ref": "#/components/schemas/Language"
@@ -6914,22 +6939,22 @@
                 "type": "string",
                 "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
                 "maxLength": 4096
-              },
-              "code": {
-                "type": "string",
-                "const": "engine_analysis_unavailable"
               }
             },
             "required": [
               "code",
               "detail"
             ],
-            "description": "A language engine serves the seed's language, and this read carries none of its\nedges: the engine answered about bytes the served revision does not carry, answered\nmore than the walk's node bound holds, or was still analyzing when\n`[server] readiness_timeout` was spent. The indexed relationships stand; whatever\nthe engine resolves on top of them is missing. The warning states that an engine's\nanalysis is absent from this answer; it never states that the seed has no such\nneighbor. An engine still analyzing keeps loading, and a later read, served from a\nrevision the engine has caught up with or sent once it reads ready, carries the\nengine's edges again."
+            "description": "A language engine serves the seed's language, and this read carries none of its\nedges: the engine answered about bytes the served revision does not carry, answered\nmore than the walk's symbol bound holds, or was still analyzing when\n`[server] readiness_timeout` was spent. The indexed relationships stand; whatever\nthe engine resolves on top of them is missing. The warning states that an engine's\nanalysis is absent from this answer; it never states that the seed has no such\nneighbor. An engine still analyzing keeps loading, and a later read, served from a\nrevision the engine has caught up with or sent once it reads ready, carries the\nengine's edges again."
           },
           {
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "code": {
+                "type": "string",
+                "const": "callees_dropped"
+              },
               "callees": {
                 "type": "integer",
                 "format": "uint64",
@@ -6940,10 +6965,6 @@
                 "type": "string",
                 "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
                 "maxLength": 4096
-              },
-              "code": {
-                "type": "string",
-                "const": "callees_dropped"
               }
             },
             "required": [
@@ -6957,6 +6978,10 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "code": {
+                "type": "string",
+                "const": "engine_readiness_unconfirmed"
+              },
               "processes": {
                 "type": "array",
                 "items": {
@@ -6969,10 +6994,6 @@
                 "type": "string",
                 "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
                 "maxLength": 4096
-              },
-              "code": {
-                "type": "string",
-                "const": "engine_readiness_unconfirmed"
               }
             },
             "required": [
@@ -6986,6 +7007,10 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "code": {
+                "type": "string",
+                "const": "history_store_filling"
+              },
               "analyzed": {
                 "type": "integer",
                 "format": "uint64",
@@ -7002,10 +7027,6 @@
                 "type": "string",
                 "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
                 "maxLength": 4096
-              },
-              "code": {
-                "type": "string",
-                "const": "history_store_filling"
               }
             },
             "required": [
@@ -7020,6 +7041,10 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "code": {
+                "type": "string",
+                "const": "change_truncated"
+              },
               "paths_max": {
                 "type": "integer",
                 "format": "uint64",
@@ -7030,10 +7055,6 @@
                 "type": "string",
                 "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
                 "maxLength": 4096
-              },
-              "code": {
-                "type": "string",
-                "const": "change_truncated"
               }
             },
             "required": [
@@ -7061,13 +7082,13 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "failure_class": {
-                "$ref": "#/components/schemas/GlobalFailureClass",
-                "description": "Bounded class of the global API failure."
-              },
               "code": {
                 "type": "string",
                 "const": "global_api_unavailable"
+              },
+              "failure_class": {
+                "$ref": "#/components/schemas/GlobalFailureClass",
+                "description": "Bounded class of the global API failure."
               }
             },
             "required": [
@@ -7080,13 +7101,13 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "failure_class": {
-                "$ref": "#/components/schemas/GlobalFailureClass",
-                "description": "Bounded class of the incompatible publication."
-              },
               "code": {
                 "type": "string",
                 "const": "global_publication_incompatible"
+              },
+              "failure_class": {
+                "$ref": "#/components/schemas/GlobalFailureClass",
+                "description": "Bounded class of the incompatible publication."
               }
             },
             "required": [
@@ -7099,13 +7120,13 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "failure_class": {
-                "$ref": "#/components/schemas/GlobalFailureClass",
-                "description": "Bounded class of the invalid response."
-              },
               "code": {
                 "type": "string",
                 "const": "global_response_invalid"
+              },
+              "failure_class": {
+                "$ref": "#/components/schemas/GlobalFailureClass",
+                "description": "Bounded class of the invalid response."
               }
             },
             "required": [
@@ -7118,6 +7139,10 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "code": {
+                "type": "string",
+                "const": "global_page_warning"
+              },
               "warning_code": {
                 "$ref": "#/components/schemas/GlobalPageWarningCode",
                 "description": "Stable condition code returned by the global package service, or\n`capability_unavailable` for a feature its capabilities do not advertise."
@@ -7126,10 +7151,6 @@
                 "type": "string",
                 "description": "Optional bounded explanation returned by the global package service, or the\nfeature its capabilities do not advertise.",
                 "maxLength": 12431
-              },
-              "code": {
-                "type": "string",
-                "const": "global_page_warning"
               }
             },
             "required": [
@@ -7142,13 +7163,13 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "package": {
-                "$ref": "#/components/schemas/PackageIdentity",
-                "description": "The exact package absent from the global publication."
-              },
               "code": {
                 "type": "string",
                 "const": "package_absent"
+              },
+              "package": {
+                "$ref": "#/components/schemas/PackageIdentity",
+                "description": "The exact package absent from the global publication."
               }
             },
             "required": [
@@ -7161,13 +7182,13 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "entry": {
-                "$ref": "#/components/schemas/PackageContextEntry",
-                "description": "The declared requirement absent from the global publication."
-              },
               "code": {
                 "type": "string",
                 "const": "package_requirement_absent"
+              },
+              "entry": {
+                "$ref": "#/components/schemas/PackageContextEntry",
+                "description": "The declared requirement absent from the global publication."
               }
             },
             "required": [
@@ -7180,6 +7201,10 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "code": {
+                "type": "string",
+                "const": "package_substituted"
+              },
               "entry": {
                 "$ref": "#/components/schemas/PackageContextEntry",
                 "description": "The dependency context entry, as the workspace's manifests and lockfiles state it."
@@ -7187,10 +7212,6 @@
               "package": {
                 "$ref": "#/components/schemas/PackageIdentity",
                 "description": "The collected release that answers for `entry`."
-              },
-              "code": {
-                "type": "string",
-                "const": "package_substituted"
               }
             },
             "required": [
@@ -7204,6 +7225,10 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "code": {
+                "type": "string",
+                "const": "package_unavailable"
+              },
               "entry": {
                 "$ref": "#/components/schemas/PackageContextEntry",
                 "description": "The dependency context entry, as the workspace's manifests and lockfiles state\nit; its `availability` names the kind."
@@ -7212,10 +7237,6 @@
                 "type": "string",
                 "description": "Why no global package index answers for the entry, for a reader.",
                 "maxLength": 4096
-              },
-              "code": {
-                "type": "string",
-                "const": "package_unavailable"
               }
             },
             "required": [
@@ -7229,6 +7250,10 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "code": {
+                "type": "string",
+                "const": "package_context_degraded"
+              },
               "resolver": {
                 "type": "string",
                 "description": "What degraded: a resolver by its manager name, `cargo`, `uv`, `npm`, or `bun`, a\nstandard library entry, `stdlib/rust`, `stdlib/node`, or `stdlib/python`, or the\npackage manager whose held or requested entries left past the entry bound, such\nas `pypi`.",
@@ -7238,10 +7263,6 @@
                 "type": "string",
                 "description": "What the resolver could not do - prose for a reader; nothing keys on it.",
                 "maxLength": 4096
-              },
-              "code": {
-                "type": "string",
-                "const": "package_context_degraded"
               }
             },
             "required": [
@@ -7457,8 +7478,8 @@
             "description": "Canonical physical source unit, independent of the logical symbol owner."
           },
           "revision": {
-            "$ref": "#/components/schemas/Revision",
-            "description": "The release of the unit's package or runtime owner whose bytes hold the position, as\n`rift://revision/cargo/crates.io/demo@1.0.0`. Present exactly when the unit has such an\nowner: a custom resolver's unit names no release."
+            "description": "The release of the unit's package or runtime owner whose bytes hold the position, as\n`rift://revision/cargo/crates.io/demo@1.0.0`. Present exactly when the unit has such an\nowner: a custom resolver's unit names no release.",
+            "$ref": "#/components/schemas/Revision"
           },
           "line": {
             "type": "integer",
@@ -7814,6 +7835,13 @@
         "description": "The co-change edges a symbol history left out, counted per bound."
       },
       "SymbolIdentity": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 8192,
+        "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$",
+        "not": {
+          "pattern": "/\\.{1,2}(?:/|$)"
+        },
         "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.",
         "examples": [
           "rift://symbol/local/rust/app/parser/parse",
@@ -7822,14 +7850,7 @@
           "rift://symbol/local@cloud:docs/typescript/page/beacon",
           "rift://symbol/npm/npmjs.org/@types/node/typescript/node/buffer/Buffer",
           "rift://symbol/stdlib/cpython/python/builtins/len"
-        ],
-        "maxLength": 8192,
-        "minLength": 1,
-        "not": {
-          "pattern": "/\\.{1,2}(?:/|$)"
-        },
-        "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$",
-        "type": "string"
+        ]
       },
       "SymbolMatchContext": {
         "description": "The structural parts compared when an alternative was selected.",
@@ -8590,6 +8611,10 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+              "outcome": {
+                "type": "string",
+                "const": "unavailable"
+              },
               "reason": {
                 "$ref": "#/components/schemas/SymbolUnavailableReason",
                 "description": "The existing typed cause of selection unavailability."
@@ -8604,10 +8629,6 @@
                   "$ref": "#/components/schemas/ReadWarning"
                 },
                 "description": "Details and partial-read warnings."
-              },
-              "outcome": {
-                "type": "string",
-                "const": "unavailable"
               }
             },
             "required": [
@@ -8619,295 +8640,267 @@
         ],
         "description": "The captured selection cannot serve this search or pattern request."
       },
-      "NodesParams": {
+      "FacetsParams": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "symbol": {
-            "description": "The symbol whose nodes the read lists: each declaration's item node, then the\ndescendants that belong to that declaration and not to a declaration nested in it,\noutermost first per declaration. A package or runtime symbol's nodes come from the\nglobal API. The caller MUST omit `path` and `position` beside it.",
-            "$ref": "#/components/schemas/SymbolId"
+            "$ref": "#/components/schemas/SymbolId",
+            "description": "The symbol whose declarations the server reads. A package or runtime symbol is read\nthrough the global API."
           },
-          "path": {
-            "description": "Project-relative file to inspect. The caller MUST send it together with `position`.",
-            "$ref": "#/components/schemas/ProjectPath"
-          },
-          "position": {
-            "type": "integer",
-            "format": "uint64",
-            "minimum": 0,
-            "description": "UTF-8 byte offset inside the declaration whose nodes the read lists - one position,\nnot a range; the nodes themselves carry the spans. The read lists the nodes of the\ninnermost declaration holding the node at the position, or of the file's unit when no\ndeclaration holds it. A position inside a multi-byte character is valid; a position at\nor past the file's byte length refuses.",
-            "maximum": 9007199254740991
-          },
-          "node_cursor": {
+          "facet_cursor": {
             "type": "string",
-            "description": "Continuation a preceding read returned, bound to the symbol or unit its answer listed\nand the tree revision it read. The caller MUST send it with the selector of that read;\nthe server refuses it for another symbol or unit and once the tree has moved.",
+            "description": "Continuation returned by a preceding read of this symbol at the same revision.",
             "minLength": 1,
             "maxLength": 4096
           },
           "revision": {
-            "description": "The revision to read: a git revision reads that commit, a tree revision the served\nworking tree, and a release revision selects the release of a package or runtime\n`symbol`'s owner. Omitted reads the served working tree, or for a package the version\nthe workspace's dependencies pin, else the newest collected release. The server refuses\na git revision when the workspace has no version-control repository, and a tree\nrevision once the index serves another tree.",
+            "description": "The revision to read. Omitted reads the served working tree, or the selected package\nor runtime release. The server refuses a tree revision once the index serves another tree.",
             "$ref": "#/components/schemas/Revision"
           }
         },
-        "description": "Lists syntax nodes with their source: every node of one `symbol`, or the nodes of the\ninnermost declaration holding one `position` in one file, or of that file's unit when no\ndeclaration holds it. Each node carries its kind, range, source text, and place, including\nexpressions smaller than a declaration.",
+        "required": [
+          "symbol"
+        ],
+        "description": "Reads every declaration of one symbol with its location, source, and syntax structure.",
         "rift:since": "v0.0.4",
         "examples": [
           {
             "symbol": "rift://symbol/local/rust/app/config/load_config"
-          },
-          {
-            "path": "src/config.rs",
-            "position": 338
-          }
-        ],
-        "allOf": [
-          {
-            "oneOf": [
-              {
-                "required": [
-                  "symbol"
-                ],
-                "not": {
-                  "anyOf": [
-                    {
-                      "required": [
-                        "path"
-                      ]
-                    },
-                    {
-                      "required": [
-                        "position"
-                      ]
-                    }
-                  ]
-                }
-              },
-              {
-                "required": [
-                  "path",
-                  "position"
-                ],
-                "not": {
-                  "required": [
-                    "symbol"
-                  ]
-                }
-              }
-            ],
-            "description": "nodes selects a symbol, or a path with a position"
           }
         ]
       },
-      "NodesResult": {
+      "FacetsResult": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "symbol": {
-            "description": "The symbol whose declarations hold the listed nodes: the requested one for a `symbol`\nread, the innermost declaration's symbol for a `position` read. Absent when the nodes\nbelong to a unit outside every declaration.",
-            "$ref": "#/components/schemas/SymbolId"
+            "$ref": "#/components/schemas/SymbolId",
+            "description": "The symbol whose declarations this answer carries."
           },
-          "nodes": {
+          "declarations": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/Node"
+              "$ref": "#/components/schemas/FacetDeclaration"
             },
-            "description": "Nodes the read selected, in pre-order: per declaration, in the order a symbol read\nlists them, or the unit's nodes from its file node on."
+            "description": "Declarations in symbol order, with each declaration's syntax elements in pre-order."
           },
-          "node_cursor": {
+          "facet_cursor": {
             "type": "string",
-            "description": "Continuation for the rest of an answer whose nodes crossed its node count or source\nbyte bound. Absent when the answer holds the last node."
+            "description": "Continues the declarations of this symbol at this revision."
           },
           "revision": {
             "$ref": "#/components/schemas/Revision",
-            "description": "The revision this answer was read at: a commit, a release, or a working tree."
+            "description": "The revision this answer was read at."
           },
           "warnings": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/ReadWarning"
             },
-            "description": "Warnings attached to this result. Absent when there is nothing to warn about.",
+            "description": "Conditions affecting this answer. Absent when empty.",
             "default": []
           }
         },
         "required": [
-          "nodes",
+          "symbol",
+          "declarations",
           "revision"
         ],
-        "description": "The nodes a read selected, each with its source text and its place inside its symbol or\nunit.",
+        "description": "Declarations of one symbol, each with its location, source, and syntax structure.",
         "examples": [
           {
             "symbol": "rift://symbol/local/rust/app/config/Config",
-            "nodes": [
+            "declarations": [
               {
                 "declaration": 0,
-                "index": 0,
-                "unit": "rift://source/project/src/config.rs",
-                "language": "rust",
                 "kind": "struct_item",
-                "facets": [
-                  "declaration",
-                  "definition"
-                ],
                 "range": {
-                  "start": 105,
-                  "end": 160
+                  "end": 160,
+                  "start": 105
                 },
-                "source": "pub struct Config {\n    pub root: std::path::PathBuf,\n}"
-              },
-              {
-                "declaration": 0,
-                "index": 1,
-                "unit": "rift://source/project/src/config.rs",
-                "language": "rust",
-                "kind": "visibility_modifier",
-                "range": {
-                  "start": 105,
-                  "end": 108
+                "source": {
+                  "span": {
+                    "unit": "rift://source/project/src/config.rs",
+                    "range": {
+                      "end": 160,
+                      "start": 105
+                    }
+                  },
+                  "text": "pub struct Config {\n    pub root: std::path::PathBuf,\n}"
                 },
-                "source": "pub",
-                "parent": 0
-              },
-              {
-                "declaration": 0,
-                "index": 2,
-                "unit": "rift://source/project/src/config.rs",
-                "language": "rust",
-                "kind": "type_identifier",
-                "range": {
-                  "start": 116,
-                  "end": 122
-                },
-                "source": "Config",
-                "parent": 0
-              },
-              {
-                "declaration": 0,
-                "index": 3,
-                "unit": "rift://source/project/src/config.rs",
-                "language": "rust",
-                "kind": "field_declaration_list",
-                "range": {
-                  "start": 123,
-                  "end": 160
-                },
-                "source": "{\n    pub root: std::path::PathBuf,\n}",
-                "parent": 0
-              },
-              {
-                "declaration": 0,
-                "index": 4,
-                "unit": "rift://source/project/src/config.rs",
-                "language": "rust",
-                "kind": "field_declaration",
-                "facets": [
-                  "declaration",
-                  "definition"
-                ],
-                "range": {
-                  "start": 129,
-                  "end": 157
-                },
-                "source": "pub root: std::path::PathBuf",
-                "parent": 3
-              },
-              {
-                "declaration": 0,
-                "index": 5,
-                "unit": "rift://source/project/src/config.rs",
-                "language": "rust",
-                "kind": "visibility_modifier",
-                "range": {
-                  "start": 129,
-                  "end": 132
-                },
-                "source": "pub",
-                "parent": 4
-              },
-              {
-                "declaration": 0,
-                "index": 6,
-                "unit": "rift://source/project/src/config.rs",
-                "language": "rust",
-                "kind": "field_identifier",
-                "range": {
-                  "start": 133,
-                  "end": 137
-                },
-                "source": "root",
-                "parent": 4
-              },
-              {
-                "declaration": 0,
-                "index": 7,
-                "unit": "rift://source/project/src/config.rs",
-                "language": "rust",
-                "kind": "scoped_type_identifier",
-                "range": {
-                  "start": 139,
-                  "end": 157
-                },
-                "source": "std::path::PathBuf",
-                "parent": 4
-              },
-              {
-                "declaration": 0,
-                "index": 8,
-                "unit": "rift://source/project/src/config.rs",
-                "language": "rust",
-                "kind": "scoped_identifier",
-                "range": {
-                  "start": 139,
-                  "end": 148
-                },
-                "source": "std::path",
-                "parent": 7
-              },
-              {
-                "declaration": 0,
-                "index": 9,
-                "unit": "rift://source/project/src/config.rs",
-                "language": "rust",
-                "kind": "identifier",
-                "range": {
-                  "start": 139,
-                  "end": 142
-                },
-                "source": "std",
-                "parent": 8
-              },
-              {
-                "declaration": 0,
-                "index": 10,
-                "unit": "rift://source/project/src/config.rs",
-                "language": "rust",
-                "kind": "identifier",
-                "range": {
-                  "start": 144,
-                  "end": 148
-                },
-                "source": "path",
-                "parent": 8
-              },
-              {
-                "declaration": 0,
-                "index": 11,
-                "unit": "rift://source/project/src/config.rs",
-                "language": "rust",
-                "kind": "type_identifier",
-                "range": {
-                  "start": 150,
-                  "end": 157
-                },
-                "source": "PathBuf",
-                "parent": 7
+                "syntax": [
+                  {
+                    "declaration": 0,
+                    "facets": [
+                      "declaration",
+                      "definition"
+                    ],
+                    "index": 0,
+                    "kind": "struct_item",
+                    "language": "rust",
+                    "range": {
+                      "end": 160,
+                      "start": 105
+                    },
+                    "source": "pub struct Config {\n    pub root: std::path::PathBuf,\n}",
+                    "unit": "rift://source/project/src/config.rs"
+                  },
+                  {
+                    "declaration": 0,
+                    "index": 1,
+                    "kind": "visibility_modifier",
+                    "language": "rust",
+                    "parent": 0,
+                    "range": {
+                      "end": 108,
+                      "start": 105
+                    },
+                    "source": "pub",
+                    "unit": "rift://source/project/src/config.rs"
+                  },
+                  {
+                    "declaration": 0,
+                    "index": 2,
+                    "kind": "type_identifier",
+                    "language": "rust",
+                    "parent": 0,
+                    "range": {
+                      "end": 122,
+                      "start": 116
+                    },
+                    "source": "Config",
+                    "unit": "rift://source/project/src/config.rs"
+                  },
+                  {
+                    "declaration": 0,
+                    "index": 3,
+                    "kind": "field_declaration_list",
+                    "language": "rust",
+                    "parent": 0,
+                    "range": {
+                      "end": 160,
+                      "start": 123
+                    },
+                    "source": "{\n    pub root: std::path::PathBuf,\n}",
+                    "unit": "rift://source/project/src/config.rs"
+                  },
+                  {
+                    "declaration": 0,
+                    "facets": [
+                      "declaration",
+                      "definition"
+                    ],
+                    "index": 4,
+                    "kind": "field_declaration",
+                    "language": "rust",
+                    "parent": 3,
+                    "range": {
+                      "end": 157,
+                      "start": 129
+                    },
+                    "source": "pub root: std::path::PathBuf",
+                    "unit": "rift://source/project/src/config.rs"
+                  },
+                  {
+                    "declaration": 0,
+                    "index": 5,
+                    "kind": "visibility_modifier",
+                    "language": "rust",
+                    "parent": 4,
+                    "range": {
+                      "end": 132,
+                      "start": 129
+                    },
+                    "source": "pub",
+                    "unit": "rift://source/project/src/config.rs"
+                  },
+                  {
+                    "declaration": 0,
+                    "index": 6,
+                    "kind": "field_identifier",
+                    "language": "rust",
+                    "parent": 4,
+                    "range": {
+                      "end": 137,
+                      "start": 133
+                    },
+                    "source": "root",
+                    "unit": "rift://source/project/src/config.rs"
+                  },
+                  {
+                    "declaration": 0,
+                    "index": 7,
+                    "kind": "scoped_type_identifier",
+                    "language": "rust",
+                    "parent": 4,
+                    "range": {
+                      "end": 157,
+                      "start": 139
+                    },
+                    "source": "std::path::PathBuf",
+                    "unit": "rift://source/project/src/config.rs"
+                  },
+                  {
+                    "declaration": 0,
+                    "index": 8,
+                    "kind": "scoped_identifier",
+                    "language": "rust",
+                    "parent": 7,
+                    "range": {
+                      "end": 148,
+                      "start": 139
+                    },
+                    "source": "std::path",
+                    "unit": "rift://source/project/src/config.rs"
+                  },
+                  {
+                    "declaration": 0,
+                    "index": 9,
+                    "kind": "identifier",
+                    "language": "rust",
+                    "parent": 8,
+                    "range": {
+                      "end": 142,
+                      "start": 139
+                    },
+                    "source": "std",
+                    "unit": "rift://source/project/src/config.rs"
+                  },
+                  {
+                    "declaration": 0,
+                    "index": 10,
+                    "kind": "identifier",
+                    "language": "rust",
+                    "parent": 8,
+                    "range": {
+                      "end": 148,
+                      "start": 144
+                    },
+                    "source": "path",
+                    "unit": "rift://source/project/src/config.rs"
+                  },
+                  {
+                    "declaration": 0,
+                    "index": 11,
+                    "kind": "type_identifier",
+                    "language": "rust",
+                    "parent": 7,
+                    "range": {
+                      "end": 157,
+                      "start": 150
+                    },
+                    "source": "PathBuf",
+                    "unit": "rift://source/project/src/config.rs"
+                  }
+                ]
               }
             ],
             "revision": "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11"
           }
         ]
       },
-      "Node": {
+      "SyntaxElement": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
@@ -8915,27 +8908,27 @@
             "type": "integer",
             "format": "uint64",
             "minimum": 0,
-            "description": "Ordinal of the declaration holding this node among the declarations of the symbol the\nread names, from 0 in the order a symbol read lists them. Absent for a node outside\nevery declaration: the file node, an import, a top-level statement.",
+            "description": "Ordinal of the declaration holding this syntax element among the declarations of the symbol the\nread names, from 0 in the order a symbol read lists them. Absent for a syntax element outside\nevery declaration: the file syntax element, an import, a top-level statement.",
             "maximum": 9007199254740991
           },
           "index": {
             "type": "integer",
             "format": "uint64",
             "minimum": 0,
-            "description": "Pre-order position of this node inside its declaration's item subtree, or inside its\nunit when `declaration` is absent. The item node and the unit's file node are 0.",
+            "description": "Pre-order position of this syntax element inside its declaration's item subtree, or inside its\nunit when `declaration` is absent. The item syntax element and the unit's file syntax element are 0.",
             "maximum": 9007199254740991
           },
           "unit": {
             "$ref": "#/components/schemas/SourceUnitId",
-            "description": "The source unit the node is written in: a project file, as\n`rift://source/project/src/lib.rs`, or a package or runtime source unit for a node of\na package or runtime symbol. It names no revision; the answer's `revision` does."
+            "description": "The source unit the syntax element is written in: a project file, as\n`rift://source/project/src/lib.rs`, or a package or runtime source unit for a syntax element of\na package or runtime symbol. It names no revision; the answer's `revision` does."
           },
           "language": {
             "$ref": "#/components/schemas/Language",
-            "description": "The grammar that produced this node. It belongs to the identity because two\nproviders can produce different trees over the same file bytes."
+            "description": "The grammar that produced this syntax element. It belongs to the identity because two\nproviders can produce different trees over the same file bytes."
           },
           "kind": {
             "$ref": "#/components/schemas/ExactKind",
-            "description": "What the node is in the provider's vocabulary, such as `fn_item`, `mapping.key`, or\n`selector.class`."
+            "description": "What the syntax element is in the provider's vocabulary, such as `fn_item`, `mapping.key`, or\n`selector.class`."
           },
           "facets": {
             "type": "array",
@@ -8951,21 +8944,21 @@
           },
           "source": {
             "type": "string",
-            "description": "The node's exact source text: the bytes `range` spans at the read's revision."
+            "description": "The syntax element's exact source text: the bytes `range` spans at the read's revision."
           },
           "regions": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/NodeRegion"
+              "$ref": "#/components/schemas/FacetRegion"
             },
-            "description": "The node's named parts, including its function body and documentation. Absent when empty.",
+            "description": "The syntax element's named parts, including its function body and documentation. Absent when empty.",
             "default": []
           },
           "parent": {
             "type": "integer",
             "format": "uint64",
             "minimum": 0,
-            "description": "`index` of the node this one is nested inside, in the same declaration or unit. Absent\nfor node 0.",
+            "description": "`index` of the syntax element this one is nested inside, in the same declaration or unit. Absent\nfor syntax element 0.",
             "maximum": 9007199254740991
           },
           "extensions": {
@@ -8982,7 +8975,7 @@
           "range",
           "source"
         ],
-        "description": "One node of a source unit's syntax tree, with its source text, addressed by its place inside\na symbol. A node inside a declaration's item subtree is node `index` of declaration\n`declaration` of the symbol the read names; a node outside every declaration is node `index`\nof its `unit`. Indexes count in pre-order from 0 at the declaration's item node, or from 0 at\nthe unit's file node, and skip the subtrees of nested declarations, whose nodes belong to the\nnested symbol. The address names a place at the read's revision: an edit renumbers the nodes\nafter it."
+        "description": "One syntax element of a source unit's syntax tree, with its source text, addressed by its place inside\na symbol. A syntax element inside a declaration's item subtree is syntax element `index` of declaration\n`declaration` of the symbol the read names; a syntax element outside every declaration is syntax element `index`\nof its `unit`. Indexes count in pre-order from 0 at the declaration's item syntax element, or from 0 at\nthe unit's file syntax element, and skip the subtrees of nested declarations, whose syntax elements belong to the\nnested symbol. The address names a place at the read's revision: an edit renumbers the syntax elements\nafter it."
       },
       "NodeFacet": {
         "description": "Portable structural facets, so a filter can ask for bodies or imports without knowing the\ngrammar that produced them.",
@@ -9028,27 +9021,27 @@
           "Belongs to test code."
         ]
       },
-      "NodeRegion": {
+      "FacetRegion": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "role": {
             "$ref": "#/components/schemas/RegionRole",
-            "description": "Which part of the node this is."
+            "description": "Which part of the syntax element this is."
           },
           "range": {
             "$ref": "#/components/schemas/TextRange",
-            "description": "Offsets into the file, on the same scale as `Node.range`."
+            "description": "Offsets into the file, on the same scale as `SyntaxElement.range`."
           }
         },
         "required": [
           "role",
           "range"
         ],
-        "description": "One named part of a node, and the bytes it spans."
+        "description": "One named part of a syntax element, and the bytes it spans."
       },
       "RegionRole": {
-        "description": "One named part of a node. A language marks these out inside a declaration, so an\noperation can address the body of a function without addressing its documentation.",
+        "description": "One named part of a syntax element. A language marks these out inside a declaration, so an\noperation can address the body of a function without addressing its documentation.",
         "type": "string",
         "enum": [
           "selection",
@@ -9060,13 +9053,13 @@
           "enclosing"
         ],
         "x-enum-descriptions": [
-          "The stretch that best identifies the node when presented.",
+          "The stretch that best identifies the syntax element when presented.",
           "The name being declared.",
           "The declaration up to where the body starts.",
           "The implementation, without documentation or header.",
-          "The interior of the node without its delimiters.",
+          "The interior of the syntax element without its delimiters.",
           "The doc comment attached to the declaration.",
-          "The full extent including what surrounds the node proper."
+          "The full extent including what surrounds the syntax element proper."
         ]
       },
       "FactProducer": {
@@ -9516,6 +9509,52 @@
         "maxLength": 64,
         "pattern": "^[0-9a-f]{64}$",
         "description": "Complete lowercase SHA-256 digest of immutable source bytes."
+      },
+      "FacetDeclaration": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "declaration": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "description": "Declaration ordinal in the symbol, from zero."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ExactKind",
+            "description": "Kind of the declaration in the provider's vocabulary."
+          },
+          "range": {
+            "$ref": "#/components/schemas/TextRange",
+            "description": "Full byte range in the source unit."
+          },
+          "source": {
+            "$ref": "#/components/schemas/SourceExcerpt",
+            "description": "The declaration's location and exact source."
+          },
+          "regions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FacetRegion"
+            },
+            "description": "Named regions supplied by the syntax provider."
+          },
+          "syntax": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SyntaxElement"
+            },
+            "description": "The declaration's syntax structure."
+          }
+        },
+        "required": [
+          "declaration",
+          "kind",
+          "range",
+          "source",
+          "syntax"
+        ],
+        "description": "One facet: a declaration with its location, source, and syntax structure."
       }
     },
     "headers": {

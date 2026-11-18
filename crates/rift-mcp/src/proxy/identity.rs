@@ -158,17 +158,12 @@ pub(super) fn qualify_hit(hit: &mut SearchHit, backend: &str) -> Result<(), Rift
     Ok(())
 }
 
-pub(super) fn qualify_nodes(
-    result: &mut rift_protocol::nodes_read::NodesToolResult,
+pub(super) fn qualify_facets(
+    result: &mut rift_protocol::read::FacetsResult,
     backend: &str,
 ) -> Result<(), RiftError> {
-    use rift_protocol::nodes_read::NodesToolResult;
-    let (symbol, warnings) = match result {
-        NodesToolResult::Summary(summary) => (&mut summary.symbol, &mut summary.warnings),
-        NodesToolResult::Syntax(syntax) => (&mut syntax.symbol, &mut syntax.warnings),
-    };
-    qualify_optional(symbol, backend)?;
-    qualify_warnings(warnings, backend)
+    qualify_id(&mut result.symbol, backend)?;
+    qualify_warnings(&mut result.warnings, backend)
 }
 
 pub(super) fn qualify_search(

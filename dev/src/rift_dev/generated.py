@@ -42,12 +42,13 @@ def generate(check: bool) -> None:
     if check:
         schema_export("--check", "docs", "plugins/claude").run()
         schema_export("--check", "--analyzer-manifest", ".").run()
-        schema_export("--global-contract", "docs").run()
+        schema_export("--check", "--global-contract", "docs").run()
         check_client()
         check_cli_help()
     else:
         schema_export("docs", "plugins/claude").run()
         schema_export("--analyzer-manifest", ".").run()
+        schema_export("--global-contract", "docs").run()
         write_client(CLIENT)
         CLI_HELP.write_text(cli_help(), encoding="utf-8")
 

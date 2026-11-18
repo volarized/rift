@@ -158,10 +158,10 @@ pub const HISTORY_RELEASE_PATTERN_BYTES_MAX: usize = 256;
 pub const SYNTAX_FILE_BYTES_DEFAULT: u64 = 4 << 20;
 /// Bytes `providers.syntax.max_file` may hold, at most.
 pub const SYNTAX_FILE_BYTES_MAX: u64 = 64 << 20;
-/// Syntax nodes one source may produce when `providers.syntax.max_nodes` is absent.
-pub const SYNTAX_NODES_DEFAULT: u64 = 250_000;
-/// Syntax nodes `providers.syntax.max_nodes` may allow, at most.
-pub const SYNTAX_NODES_MAX: u64 = 100_000_000;
+/// Syntax syntax elements one source may produce when `providers.syntax.max_syntax_elements` is absent.
+pub const SYNTAX_ELEMENTS_DEFAULT: u64 = 250_000;
+/// Syntax syntax elements `providers.syntax.max_syntax_elements` may allow, at most.
+pub const SYNTAX_ELEMENTS_MAX: u64 = 100_000_000;
 /// Nesting one source may reach when `providers.syntax.max_depth` is absent.
 pub const SYNTAX_DEPTH_DEFAULT: u64 = 512;
 /// Nesting `providers.syntax.max_depth` may allow, at most.
@@ -1194,7 +1194,7 @@ pub struct ProvidersConfiguration {
 }
 
 /// The `[providers.syntax]` table. A syntax provider's cost scales with the
-/// source it parses, so each source is bounded by size, node count, and
+/// source it parses, so each source is bounded by size, syntax element count, and
 /// nesting depth; a source past any bound is left out of the index.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1202,9 +1202,9 @@ pub struct ProvidersConfiguration {
 pub struct SyntaxConfiguration {
     /// Bytes of one source a provider parses, 1b to 64mb.
     pub max_file: ByteSize,
-    /// Syntax nodes one source may produce.
+    /// Syntax syntax elements one source may produce.
     #[schemars(range(min = 1, max = 100_000_000))]
-    pub max_nodes: u64,
+    pub max_syntax_elements: u64,
     /// Nesting one source's syntax tree may reach.
     #[schemars(range(min = 1, max = 65_536))]
     pub max_depth: u64,
@@ -1242,7 +1242,7 @@ impl Default for SyntaxConfiguration {
     fn default() -> Self {
         Self {
             max_file: ByteSize::from_bytes(SYNTAX_FILE_BYTES_DEFAULT),
-            max_nodes: SYNTAX_NODES_DEFAULT,
+            max_syntax_elements: SYNTAX_ELEMENTS_DEFAULT,
             max_depth: SYNTAX_DEPTH_DEFAULT,
             frameworks: Vec::new(),
         }
@@ -1261,10 +1261,10 @@ impl SyntaxConfiguration {
                 SYNTAX_FILE_BYTES_MAX,
             ),
             (
-                "providers.syntax.max_nodes",
-                self.max_nodes,
+                "providers.syntax.max_syntax_elements",
+                self.max_syntax_elements,
                 1,
-                SYNTAX_NODES_MAX,
+                SYNTAX_ELEMENTS_MAX,
             ),
             (
                 "providers.syntax.max_depth",
@@ -4261,8 +4261,8 @@ mod tests {
                 "providers.syntax.max_file",
             ),
             (
-                |syntax| syntax.max_nodes = SYNTAX_NODES_MAX + 1,
-                "providers.syntax.max_nodes",
+                |syntax| syntax.max_syntax_elements = SYNTAX_ELEMENTS_MAX + 1,
+                "providers.syntax.max_syntax_elements",
             ),
             (|syntax| syntax.max_depth = 0, "providers.syntax.max_depth"),
         ];
@@ -4284,7 +4284,7 @@ mod tests {
         let mut configuration = WorkspaceConfiguration::default();
         configuration.providers.syntax = SyntaxConfiguration {
             max_file: ByteSize::from_bytes(SYNTAX_FILE_BYTES_MAX),
-            max_nodes: SYNTAX_NODES_MAX,
+            max_syntax_elements: SYNTAX_ELEMENTS_MAX,
             max_depth: SYNTAX_DEPTH_MAX,
             frameworks: Vec::new(),
         };

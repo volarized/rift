@@ -604,14 +604,14 @@ mod tests {
                 .iter()
                 .find(|entry| entry.name == "python")
                 .expect("Python library");
-            let node = answer
+            let syntax_element = answer
                 .entries
                 .iter()
                 .find(|entry| entry.name == "node")
                 .expect("Node library");
             assert_eq!(python.version.as_deref(), exact.then_some("3.12.3"));
             assert_eq!(
-                node.requirement.as_deref(),
+                syntax_element.requirement.as_deref(),
                 Some(if exact { ">=22" } else { ">=0" })
             );
         }

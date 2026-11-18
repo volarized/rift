@@ -253,7 +253,7 @@ mod tests {
             .with_source_witness(source.text))
         }
 
-        fn node_facets(&self, _kind: &str) -> Vec<NodeFacet> {
+        fn syntax_element_facets(&self, _kind: &str) -> Vec<NodeFacet> {
             Vec::new()
         }
     }

@@ -108,9 +108,9 @@ SELECT ?symbol ?kind {
 }
 ```
 
-A symbol's IRI is its canonical identity. A graph node relates to its symbol through `:of`
+A symbol's IRI is its canonical identity. A syntax element relates to its symbol through `:of`
 and can carry a `:range` and `:source`. Pass the symbol IRI to `get_symbol` for its declarations,
-or to `nodes` for its syntax and source at a selected revision.
+or to `facets` for its syntax and source at a selected revision.
 
 ### Full-text search [#search-fulltext]
 
@@ -277,7 +277,7 @@ Use `include` to select optional projections:
 | `history` | The logical symbol's history edges: the commits that touched it and the symbols changed beside it |
 
 The options combine; an omitted or empty `include` adds neither. A declaration's source comes
-from [`nodes`](#tool-nodes) with the symbol's `id`.
+from [`facets`](#tool-facets) with the symbol's `id`.
 
 `history` answers edges from the symbol. The commit edges come first, newest first, each naming
 its commit as a `rift://revision/git/<commit>` revision with the commit's author and the path the
@@ -343,53 +343,26 @@ A malformed identity is refused before lookup:
 `outcome: "unavailable"` with its typed reason, rather than a definite miss.
 See the [symbol reference](/docs/developer/protocol/mcp#tool-get_symbol) for bounds and refusals.
 
-## Nodes [#tool-nodes]
+## Facets [#tool-facets]
 
-`nodes` reads a symbol's declarations with their source and structure. Use a symbol identity or a
-position inside a declaration. The answer shows the declaration's source before its parts and
-gives byte ranges for a precise edit target.
+`facets` reads every declaration of a symbol with its location, source, and syntax structure.
+The agent passes the symbol identity returned by `search` or `get_symbol`:
 
-To read the `Config` struct of the sample project, the agent passes its symbol identity:
+<ReadExample name="symbol-facets" />
 
-<ReadExample name="symbol-nodes" />
+Each declaration carries exact source and its syntax tree.
+`declaration` is its ordinal among the symbol's declarations. A syntax element's `index`
+is its pre-order position within that declaration, from the root at 0; `parent` names the
+index of the element around it. Nested declarations have their own facets.
 
-The summary shows a source excerpt and selected syntax parts for each declaration. Use
-`syntax: true` to read every node, down to each identifier. If the answer includes
-`node_cursor`, send it back with the same selector to continue declarations or syntax.
-
-For a package or runtime symbol found through `SERVICE :search` with `:scope "global"`, Rift reads
-the declaration from the global API at the release `revision` names, such as
-`rift://revision/cargo/crates.io/demo@1.0.0`, or at the version your project's dependencies pin when the
-request names none. Each node's `unit` names a source unit of the package, such as
+For a package or runtime symbol, Rift reads the global API at the release `revision`
+names, or at the version the project's dependencies pin when the request names none.
+The declaration's `source.span.unit` names its source unit, such as
 `rift://source/cargo/crates.io/demo/src/lib.rs`.
 
-<Callout type="info">
-
-The position is a UTF-8 byte offset, rather than a line or character number.
-
-</Callout>
-
-In the sample `src/config.rs`, byte `338` lies inside the `parse_config` call. With `syntax: true`,
-the position selects the syntax tree of `load_config`, the declaration holding it:
-
-<ReadExample name="local-nodes" />
-
-The answer names the symbol once, and each node carries its address inside it:
-
-- `declaration` is the declaration's ordinal among the symbol's declarations, and `index` is the
-  node's place inside that declaration, from the declaration's own node at 0: `334..353`, the
-  `parse_config(&text)` call, is node 25 of `load_config`.
-- `parent` is the index of the node around it: the call's parent, node 13, is the function body.
-- A node has no identity of its own. Its address names its place in the current code, so the
-  agent reads again after an edit before using it.
-
-A byte outside every declaration, such as one in an import, returns a source excerpt around
-that position. With `syntax: true`, the same position selects the file's nodes, starting with
-the file node at index 0.
-
-The agent chooses the range it needs and applies the change with its own editing tools.
-After the file changes, it should read again before using its ranges for another edit.
-See the [nodes reference](/docs/developer/protocol/mcp#tool-nodes) for the response shape and supported files.
+If the answer includes `facet_cursor`, send it with the same symbol and revision to
+continue declarations. After an edit, read again before using the returned byte ranges.
+See the [facets reference](/docs/developer/protocol/mcp#tool-facets) for the response shape.
 
 ## Feedback [#tool-feedback]
 
@@ -405,7 +378,7 @@ conversation, show the user that excerpt and get approval to send it in this rep
 
 ```json
 {
-  "text": "The nodes tool returned an empty result for a symbol it found.",
+  "text": "The facets tool returned an empty result for a symbol it found.",
   "include_details": ["os", "rift_version"]
 }
 ```
@@ -443,7 +416,7 @@ The [result content reference](/docs/developer/protocol/mcp#result-content) defi
 <Accordions>
 <Accordion title="Earlier revisions" id="revision-reads">
 
-Every `get_symbol` and `nodes` answer names the revision it was read at, such as
+Every `get_symbol` and `facets` answer names the revision it was read at, such as
 `rift://revision/tree/<digest>` for the working tree the index serves. The agent can read older
 project code by adding `revision` to either tool. For example, this reads the function from
 `main` without changing the working tree:

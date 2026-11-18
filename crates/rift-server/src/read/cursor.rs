@@ -91,7 +91,7 @@ mod tests {
             );
         }
         for malformed in ["3", "x.0123456789abcdef", ""] {
-            assert!(offset(malformed, "node_cursor", "key", "rev-a").is_err());
+            assert!(offset(malformed, "facet_cursor", "key", "rev-a").is_err());
         }
     }
 }

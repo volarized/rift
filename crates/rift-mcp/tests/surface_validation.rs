@@ -13,7 +13,7 @@ mod python_runtime_environment;
 // This binary serves its own fixture and uses `workspace_client` only to wait for map readiness.
 #[expect(dead_code, reason = "the relative-root helpers serve other suites")]
 mod workspace_client;
-// The text checks of `nodes`, `search`, and `get_symbol` results, and their own tests; this
+// The text checks of `facets`, `search`, and `get_symbol` results, and their own tests; this
 // binary alone declares it.
 mod text_complete;
 
@@ -93,8 +93,8 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
             include.is_some_and(|entries| entries.contains(&Value::from("history")));
         for hit in structured["declarations"].as_array().into_iter().flatten() {
             assert!(
-                hit.get("source").is_none() && hit.get("node").is_none(),
-                "a declaration carries no source and no node address; `nodes` reads them: \
+                hit.get("source").is_none() && hit.get("syntax_element").is_none(),
+                "a declaration carries no source and no syntax_element address; `facets` reads them: \
                  {request:#} {hit:#}"
             );
             if !expects_history {
@@ -149,7 +149,7 @@ fn request_reaches_dependencies(name: &str, request: &Value) -> Option<bool> {
             SymbolOwner::Package { .. } | SymbolOwner::Runtime { .. }
         ));
     }
-    if name == "nodes" {
+    if name == "facets" {
         return Some(request["symbol"].as_str().is_some_and(|id| {
             SymbolIdentity::parse(id).is_ok_and(|identity| {
                 matches!(
@@ -210,8 +210,8 @@ fn exact_request_owner_controls_source_resolvers_and_refuses_malformed_identity(
     );
     assert_eq!(
         request_reaches_dependencies(
-            "nodes",
-            &json!({"query":"SELECT ?node { ?node a :Node; :unit <rift://source/project/lib.rs> }"})
+            "facets",
+            &json!({"query":"SELECT ?syntax_element { ?syntax_element a :SyntaxElement; :unit <rift://source/project/lib.rs> }"})
         ),
         Some(false)
     );
@@ -408,7 +408,7 @@ async fn absent_request(
 }
 
 /// A workspace whose `[search] default_scope` is `global` lists `search`, `get_symbol`, and
-/// `nodes` examples that read a package release, each one valid against its input schema; a
+/// `facets` examples that read a package release, each one valid against its input schema; a
 /// workspace reading `local` lists the declared project examples.
 #[tokio::test]
 async fn tools_list_examples_follow_the_default_scope() -> TestResult {
@@ -435,7 +435,7 @@ async fn tools_list_examples_follow_the_default_scope() -> TestResult {
         let client = ().serve(client_transport).await?;
         workspace_client::await_workspace_ready(&client).await?;
         let tools = client.list_all_tools().await?;
-        for name in ["search", "get_symbol", "nodes"] {
+        for name in ["search", "get_symbol", "facets"] {
             let tool = tools
                 .iter()
                 .find(|tool| tool.name == name)
@@ -765,7 +765,7 @@ impl CorpusArms {
     fn observe(&mut self, structured: &Value) {
         self.dependency_units += dependency_unit_count(&structured["declarations"]);
         self.search_dependency_units += dependency_unit_count(&structured["answer"]["bindings"]);
-        for identity in node_units(structured) {
+        for identity in source_units(structured) {
             if identity.contains('@') && !identity.contains("%40") {
                 self.literal_at_identities += 1;
             }
@@ -808,7 +808,9 @@ impl CorpusArms {
         );
         assert!(
             self.literal_at_identities > 0 && self.escaped_identities > 0,
-            "literal @ and percent-encoded node identities remain valid"
+            "literal @ and percent-encoded source identities remain valid: {}/{}",
+            self.literal_at_identities,
+            self.escaped_identities,
         );
         for form in ["bindings", "boolean", "graph"] {
             assert!(
@@ -827,22 +829,30 @@ impl CorpusArms {
     }
 }
 
-/// Every file identity one answer's nodes carry under `unit`: the identity whose path the
-/// server encodes, since a node's own identity is a content digest with no path.
-fn node_units(structured: &Value) -> Vec<String> {
+/// Every source identity one answer's syntax elements carry under `unit`.
+fn source_units(structured: &Value) -> Vec<String> {
     let mut found = Vec::new();
     let mut pending = vec![structured];
     while let Some(value) = pending.pop() {
         match value {
             Value::Object(members) => {
                 for (key, member) in members {
-                    match member {
-                        Value::String(identity)
-                            if key == "unit" && identity.starts_with("rift://source/project/") =>
+                    let identity = match member {
+                        Value::String(identity) => Some(identity.as_str()),
+                        Value::Object(term)
+                            if term.get("type").and_then(Value::as_str) == Some("iri") =>
                         {
-                            found.push(identity.clone());
+                            term.get("value").and_then(Value::as_str)
                         }
-                        _ => pending.push(member),
+                        _ => None,
+                    };
+                    if key == "unit"
+                        && let Some(identity) = identity
+                        && identity.starts_with("rift://source/project/")
+                    {
+                        found.push(identity.to_owned());
+                    } else {
+                        pending.push(member);
                     }
                 }
             }
@@ -1498,8 +1508,12 @@ async fn reads_report_their_revision_and_a_moved_tree_refuses() -> TestResult {
         .to_owned();
     assert!(tree.starts_with("rift://revision/tree/"), "{current:#}");
     let pinned = json!({ "symbol": id, "revision": tree });
-    let nodes = structured_answer(&client, "nodes", &pinned).await?;
-    assert_eq!(nodes["revision"], json!(tree), "{nodes:#}");
+    let syntax_elements = structured_answer(&client, "facets", &pinned).await?;
+    assert_eq!(
+        syntax_elements["revision"],
+        json!(tree),
+        "{syntax_elements:#}"
+    );
     let at_main = json!({ "id": id, "revision": "rift://revision/git/main" });
     let committed = structured_answer(&client, "get_symbol", &at_main).await?;
     let commit = committed["revision"].as_str().ok_or("commit revision")?;
@@ -1513,7 +1527,9 @@ async fn reads_report_their_revision_and_a_moved_tree_refuses() -> TestResult {
     let moved =
         json!({ "symbol": id, "revision": format!("rift://revision/tree/{}", "0".repeat(64)) });
     let refused = workspace_client::failed_call(
-        client.call_tool(tools_call_request("nodes", &moved)?).await,
+        client
+            .call_tool(tools_call_request("facets", &moved)?)
+            .await,
     )?;
     assert_eq!(
         refused.code,
@@ -1679,10 +1695,10 @@ fn has_null_arm(property: &Value) -> bool {
     null_type || null_branch
 }
 
-/// Every property below `node` that its object does not require and whose schema
+/// Every property below `syntax element` that its object does not require and whose schema
 /// accepts `null` beside another value, named by the path to it.
-fn optional_null_properties(node: &Value, path: &str, found: &mut Vec<String>) {
-    match node {
+fn optional_null_properties(syntax_element: &Value, path: &str, found: &mut Vec<String>) {
+    match syntax_element {
         Value::Object(object) => {
             let required = object.get("required").and_then(Value::as_array);
             let properties = object.get("properties").and_then(Value::as_object);

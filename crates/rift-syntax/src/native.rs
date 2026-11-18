@@ -58,12 +58,12 @@ impl SyntaxProvider for NativeSyntaxProvider {
             cython: self.shipped == ShippedLanguage::Cython,
             depth_max: limits.syntax_depth_max(),
             carriers: RefCell::new(BTreeMap::new()),
-            carriers_left: Cell::new(limits.syntax_nodes_max()),
+            carriers_left: Cell::new(limits.syntax_elements_max()),
             cython_functions: RefCell::new(BTreeMap::new()),
         };
         crate::parse::document(source, limits, &self.language, &grammar, &rules, &[])
     }
-    fn node_facets(&self, kind: &str) -> Vec<NodeFacet> {
+    fn syntax_element_facets(&self, kind: &str) -> Vec<NodeFacet> {
         match kind {
             "function_definition"
             | "class_definition"
@@ -214,74 +214,86 @@ impl NativeKinds {
             .collect()
     }
 
-    fn declared_name<'tree>(&self, node: Node<'tree>, depth_max: usize) -> Option<Node<'tree>> {
-        if self.declaration_identifiers.contains(&node.kind_id()) {
-            return Some(node);
+    fn declared_name<'tree>(
+        &self,
+        syntax_element: Node<'tree>,
+        depth_max: usize,
+    ) -> Option<Node<'tree>> {
+        if self
+            .declaration_identifiers
+            .contains(&syntax_element.kind_id())
+        {
+            return Some(syntax_element);
         }
-        if let Some(name) = node.child_by_field_id(self.name.get()) {
+        if let Some(name) = syntax_element.child_by_field_id(self.name.get()) {
             return Some(name);
         }
         if let Some(declarator) = self
             .declarator
-            .and_then(|field| node.child_by_field_id(field.get()))
+            .and_then(|field| syntax_element.child_by_field_id(field.get()))
         {
             return self.declarator_name(declarator, depth_max);
         }
-        let mut cursor = node.walk();
-        node.named_children(&mut cursor).find_map(|child| {
-            if Some(child.kind_id()) == self.typed_name {
-                child.child_by_field_id(self.name.get())
-            } else if child.kind_id() == self.identifier {
-                Some(child)
-            } else {
-                child.child_by_field_id(self.name.get())
-            }
-        })
+        let mut cursor = syntax_element.walk();
+        syntax_element
+            .named_children(&mut cursor)
+            .find_map(|child| {
+                if Some(child.kind_id()) == self.typed_name {
+                    child.child_by_field_id(self.name.get())
+                } else if child.kind_id() == self.identifier {
+                    Some(child)
+                } else {
+                    child.child_by_field_id(self.name.get())
+                }
+            })
     }
 
     fn declarator_name<'tree>(
         &self,
-        mut node: Node<'tree>,
+        mut syntax_element: Node<'tree>,
         depth_max: usize,
     ) -> Option<Node<'tree>> {
         for _ in 0..depth_max {
-            if self.declaration_identifiers.contains(&node.kind_id()) {
-                return Some(node);
+            if self
+                .declaration_identifiers
+                .contains(&syntax_element.kind_id())
+            {
+                return Some(syntax_element);
             }
-            if let Some(name) = node.child_by_field_id(self.name.get()) {
+            if let Some(name) = syntax_element.child_by_field_id(self.name.get()) {
                 return Some(name);
             }
-            node = self
+            syntax_element = self
                 .declarator
-                .and_then(|field| node.child_by_field_id(field.get()))
-                .or_else(|| node.named_child(0))?;
+                .and_then(|field| syntax_element.child_by_field_id(field.get()))
+                .or_else(|| syntax_element.named_child(0))?;
         }
         None
     }
 
     fn function_declaration(&self, name: Node<'_>, carrier: Node<'_>, depth_max: usize) -> bool {
-        let mut node = carrier;
+        let mut syntax_element = carrier;
         let mut function = false;
         for _ in 0..depth_max {
-            if node == name {
+            if syntax_element == name {
                 return function;
             }
-            if Some(node.kind_id()) == self.function_declarator {
+            if Some(syntax_element.kind_id()) == self.function_declarator {
                 function = true;
-            } else if self.value_declarators.contains(&node.kind_id()) {
+            } else if self.value_declarators.contains(&syntax_element.kind_id()) {
                 function = false;
             }
-            let Some(child) = node
+            let Some(child) = syntax_element
                 .child_by_field_id(self.name.get())
                 .or_else(|| {
                     self.declarator
-                        .and_then(|field| node.child_by_field_id(field.get()))
+                        .and_then(|field| syntax_element.child_by_field_id(field.get()))
                 })
-                .or_else(|| node.named_child(0))
+                .or_else(|| syntax_element.named_child(0))
             else {
                 return false;
             };
-            node = child;
+            syntax_element = child;
         }
         false
     }
@@ -309,19 +321,19 @@ struct NativeRules {
 }
 
 impl NativeRules {
-    fn declaration_kind(&self, node: Node<'_>) -> Option<&'static str> {
+    fn declaration_kind(&self, syntax_element: Node<'_>) -> Option<&'static str> {
         self.kinds
             .declarations
             .iter()
-            .find_map(|(id, kind)| (*id == node.kind_id()).then_some(*kind))
+            .find_map(|(id, kind)| (*id == syntax_element.kind_id()).then_some(*kind))
     }
 
     fn declaration_parent<'tree>(&self, visited: Visited<'_, 'tree>) -> Option<Node<'tree>> {
-        let node = visited.node();
-        if self.declaration_kind(node).is_some() {
+        let syntax_element = visited.syntax_element();
+        if self.declaration_kind(syntax_element).is_some() {
             return None;
         }
-        let parent = visited.parent()?.node();
+        let parent = visited.parent()?.syntax_element();
         let kind = self.declaration_kind(parent)?;
         if !matches!(kind, VARIABLE | TYPE) {
             return None;
@@ -330,7 +342,7 @@ impl NativeRules {
         let owned = carriers
             .entry(parent.id())
             .or_insert_with(|| self.additional_carriers(parent));
-        owned.contains(&node.id()).then_some(parent)
+        owned.contains(&syntax_element.id()).then_some(parent)
     }
 
     fn additional_carriers(&self, parent: Node<'_>) -> BTreeSet<usize> {
@@ -366,8 +378,8 @@ impl NativeRules {
         carriers
     }
 
-    fn follows_comma(&self, node: Node<'_>) -> bool {
-        let mut sibling = node.prev_sibling();
+    fn follows_comma(&self, syntax_element: Node<'_>) -> bool {
+        let mut sibling = syntax_element.prev_sibling();
         for _ in 0..self.depth_max {
             let Some(previous) = sibling else {
                 return false;
@@ -383,15 +395,19 @@ impl NativeRules {
         false
     }
 
-    fn declaration_name<'tree>(&self, node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+    fn declaration_name<'tree>(
+        &self,
+        syntax_element: Node<'tree>,
+        kind: &str,
+    ) -> Option<Node<'tree>> {
         if kind == INCLUDE {
             return self
                 .kinds
                 .path
-                .and_then(|field| node.child_by_field_id(field.get()))
-                .or_else(|| node.named_child(0));
+                .and_then(|field| syntax_element.child_by_field_id(field.get()))
+                .or_else(|| syntax_element.named_child(0));
         }
-        self.kinds.declared_name(node, self.depth_max)
+        self.kinds.declared_name(syntax_element, self.depth_max)
     }
 }
 
@@ -401,25 +417,26 @@ impl GrammarRules for NativeRules {
         visited: Visited<'_, '_>,
         text: &str,
     ) -> Result<Option<Declaration>, RiftError> {
-        let carrier = visited.node();
-        let node = self.declaration_parent(visited).unwrap_or(carrier);
-        let Some(mut kind) = self.declaration_kind(node) else {
+        let carrier = visited.syntax_element();
+        let syntax_element = self.declaration_parent(visited).unwrap_or(carrier);
+        let Some(mut kind) = self.declaration_kind(syntax_element) else {
             return Ok(None);
         };
-        let Some(name_node) = self.declaration_name(carrier, kind) else {
+        let Some(name_syntax_element) = self.declaration_name(carrier, kind) else {
             return Ok(None);
         };
         let Some(name) = text
-            .get(name_node.byte_range())
+            .get(name_syntax_element.byte_range())
             .filter(|name| !name.is_empty())
         else {
             return Ok(None);
         };
         if self.cython && kind == VARIABLE {
             let mut functions = self.cython_functions.borrow_mut();
-            let function = functions.entry(node.id()).or_insert_with(|| {
-                let mut cursor = node.walk();
-                node.named_children(&mut cursor)
+            let function = functions.entry(syntax_element.id()).or_insert_with(|| {
+                let mut cursor = syntax_element.walk();
+                syntax_element
+                    .named_children(&mut cursor)
                     .any(|child| Some(child.kind_id()) == self.kinds.c_function)
             });
             if *function {
@@ -428,7 +445,7 @@ impl GrammarRules for NativeRules {
         } else if kind == VARIABLE
             && self
                 .kinds
-                .function_declaration(name_node, carrier, self.depth_max)
+                .function_declaration(name_syntax_element, carrier, self.depth_max)
         {
             kind = FUNCTION;
         }
@@ -441,7 +458,7 @@ impl GrammarRules for NativeRules {
         let body_range = self
             .kinds
             .body
-            .and_then(|field| node.child_by_field_id(field.get()))
+            .and_then(|field| syntax_element.child_by_field_id(field.get()))
             .map(extract::byte_range)
             .transpose()?;
         Ok(Some(Declaration {
@@ -454,28 +471,29 @@ impl GrammarRules for NativeRules {
             documentation_ranges: Vec::new(),
         }))
     }
-    fn container_name(&self, node: Node<'_>, text: &str) -> Option<String> {
+    fn container_name(&self, syntax_element: Node<'_>, text: &str) -> Option<String> {
         self.kinds
             .scopes
-            .contains(&node.kind_id())
+            .contains(&syntax_element.kind_id())
             .then(|| {
                 self.kinds
-                    .declared_name(node, self.depth_max)
+                    .declared_name(syntax_element, self.depth_max)
                     .and_then(|name| text.get(name.byte_range()))
                     .map(str::to_owned)
             })
             .flatten()
     }
     fn declaration_start(&self, visited: Visited<'_, '_>, _: &str) -> usize {
-        self.declaration_node(visited).start_byte()
+        self.declaration_syntax_element(visited).start_byte()
     }
 
-    fn declaration_node<'tree>(&self, visited: Visited<'_, 'tree>) -> Node<'tree> {
-        self.declaration_parent(visited).unwrap_or(visited.node())
+    fn declaration_syntax_element<'tree>(&self, visited: Visited<'_, 'tree>) -> Node<'tree> {
+        self.declaration_parent(visited)
+            .unwrap_or(visited.syntax_element())
     }
-    fn name_range(&self, node: Node<'_>) -> Result<Option<crate::ByteRange>, RiftError> {
+    fn name_range(&self, syntax_element: Node<'_>) -> Result<Option<crate::ByteRange>, RiftError> {
         self.kinds
-            .declared_name(node, self.depth_max)
+            .declared_name(syntax_element, self.depth_max)
             .map(extract::byte_range)
             .transpose()
     }

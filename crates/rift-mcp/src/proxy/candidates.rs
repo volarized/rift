@@ -17,7 +17,7 @@ use super::RiftProxy;
 
 mod read;
 #[cfg(test)]
-pub(in crate::proxy) use read::dispatch_nodes_request;
+pub(in crate::proxy) use read::dispatch_facets_request;
 
 #[derive(Debug)]
 pub(super) enum CandidateAnswer {

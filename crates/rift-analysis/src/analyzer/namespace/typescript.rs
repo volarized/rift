@@ -729,7 +729,7 @@ fn declaration_anchors_with_public(
     let mut paths: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut anchors = BTreeMap::new();
     for symbol in syntax.symbols().iter().filter(|symbol| {
-        symbol.node_kind != Some("assignment_expression")
+        symbol.syntax_element_kind != Some("assignment_expression")
             || symbol.facets.contains(&SymbolFacet::Public)
             || public.contains(&symbol.qualified_name)
     }) {

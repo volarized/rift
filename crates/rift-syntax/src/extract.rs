@@ -1,9 +1,9 @@
 //! The bounded tree walk every provider's `analyze` shares.
 //!
 //! The walk is grammar-agnostic. Per-language decisions - what counts as a
-//! declaration, which node opens a nesting scope, where an attached span
+//! declaration, which syntax element opens a nesting scope, where an attached span
 //! starts - come from the grammar's [`GrammarRules`], so a new language
-//! plugs in without touching the walk or its node and depth budgets.
+//! plugs in without touching the walk or its syntax element and depth budgets.
 
 use std::sync::Arc;
 
@@ -12,11 +12,11 @@ use rift_protocol::read::{Documentation, Extensions, Language, Signature, Symbol
 use tree_sitter::{Node, TreeCursor};
 
 use crate::SyntaxNames;
-use crate::document::{ByteRange, SyntaxNode, SyntaxSymbol};
+use crate::document::{ByteRange, SyntaxElement, SyntaxSymbol};
 use crate::failure::{RiftError, position_overflow};
 use crate::provider::{SyntaxLimits, SyntaxSource};
 
-/// Pushes one worklist entry per named child of `node`, reversed, so a
+/// Pushes one worklist entry per named child of `syntax element`, reversed, so a
 /// worklist that pops from its end visits the children in source order.
 ///
 /// `cursor` steps from each child to its next sibling, so the work is linear
@@ -27,49 +27,49 @@ use crate::provider::{SyntaxLimits, SyntaxSource};
 pub(crate) fn push_named_children<'tree, T>(
     pending: &mut Vec<T>,
     cursor: &mut TreeCursor<'tree>,
-    node: Node<'tree>,
+    syntax_element: Node<'tree>,
     entry: impl FnMut(Node<'tree>) -> T,
 ) {
     let first_child = pending.len();
-    pending.extend(node.named_children(cursor).map(entry));
+    pending.extend(syntax_element.named_children(cursor).map(entry));
     pending[first_child..].reverse();
 }
 
-/// The nodes the walk has visited, each with its parent and previous named
+/// The syntax elements the walk has visited, each with its parent and previous named
 /// sibling.
 ///
 /// Tree-sitter's `Node::parent`, `Node::prev_sibling`, and `Node::next_sibling`
 /// search again from the root or from the parent's first child on every call,
 /// so a rule stepping through a run of siblings with them is quadratic in the
-/// run's length. The walk visits every named node once, children in source
+/// run's length. The walk visits every named syntax element once, children in source
 /// order, and records both as it goes, so each step is one lookup.
 #[derive(Debug, Default)]
 pub(crate) struct Visits<'tree> {
-    /// Every visited node, by visit index.
-    nodes: Vec<Node<'tree>>,
-    /// Each visited node's parent.
+    /// Every visited syntax element, by visit index.
+    syntax_elements: Vec<Node<'tree>>,
+    /// Each visited syntax element's parent.
     parents: Vec<Option<usize>>,
-    /// Each visited node's previous sibling, when that sibling is named.
+    /// Each visited syntax element's previous sibling, when that sibling is named.
     previous_siblings: Vec<Option<usize>>,
-    /// Each visited node's most recently visited child.
+    /// Each visited syntax element's most recently visited child.
     last_children: Vec<Option<usize>>,
 }
 
 impl<'tree> Visits<'tree> {
-    /// Records one visited node and returns its visit index.
+    /// Records one visited syntax element and returns its visit index.
     ///
-    /// A node's parent is visited before it and its earlier siblings are
+    /// A syntax element's parent is visited before it and its earlier siblings are
     /// visited before it, so the parent's most recently visited child is the
     /// previous named sibling whenever no anonymous token stands between.
     fn visit(
         &mut self,
-        node: Node<'tree>,
+        syntax_element: Node<'tree>,
         parent: Option<usize>,
         follows_named_sibling: bool,
     ) -> usize {
-        let index = self.nodes.len();
+        let index = self.syntax_elements.len();
         let previous_child = parent.and_then(|parent| self.last_children[parent].replace(index));
-        self.nodes.push(node);
+        self.syntax_elements.push(syntax_element);
         self.parents.push(parent);
         self.previous_siblings
             .push(previous_child.filter(|_| follows_named_sibling));
@@ -77,7 +77,7 @@ impl<'tree> Visits<'tree> {
         index
     }
 
-    /// The visited node at `index`.
+    /// The visited syntax element at `index`.
     fn visited(&self, index: usize) -> Visited<'_, 'tree> {
         Visited {
             visits: self,
@@ -86,7 +86,7 @@ impl<'tree> Visits<'tree> {
     }
 }
 
-/// One visited node, with the parent and previous named sibling the walk
+/// One visited syntax element, with the parent and previous named sibling the walk
 /// recorded for it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Visited<'walk, 'tree> {
@@ -95,18 +95,18 @@ pub(crate) struct Visited<'walk, 'tree> {
 }
 
 impl<'tree> Visited<'_, 'tree> {
-    /// The visited node.
-    pub(crate) fn node(self) -> Node<'tree> {
-        self.visits.nodes[self.index]
+    /// The visited syntax element.
+    pub(crate) fn syntax_element(self) -> Node<'tree> {
+        self.visits.syntax_elements[self.index]
     }
 
-    /// The node's parent; `None` for the root.
+    /// The syntax element's parent; `None` for the root.
     pub(crate) fn parent(self) -> Option<Self> {
         self.visits.parents[self.index].map(|index| self.visits.visited(index))
     }
 
-    /// The sibling immediately before the node, when that sibling is named;
-    /// `None` when the node comes first or an anonymous token precedes it.
+    /// The sibling immediately before the syntax element, when that sibling is named;
+    /// `None` when the syntax element comes first or an anonymous token precedes it.
     pub(crate) fn previous_sibling(self) -> Option<Self> {
         self.visits.previous_siblings[self.index].map(|index| self.visits.visited(index))
     }
@@ -114,7 +114,7 @@ impl<'tree> Visited<'_, 'tree> {
 
 /// Per-grammar decisions the shared walk delegates.
 pub(crate) trait GrammarRules {
-    /// Export binding recorded at this visited node, when the grammar supplies one.
+    /// Export binding recorded at this visited syntax element, when the grammar supplies one.
     fn export_binding(
         &self,
         _visited: Visited<'_, '_>,
@@ -123,7 +123,7 @@ pub(crate) trait GrammarRules {
     ) -> Result<Option<crate::SyntaxExportBinding>, RiftError> {
         Ok(None)
     }
-    /// The declaration facts behind the visited node; `None` for a node that
+    /// The declaration facts behind the visited syntax element; `None` for a syntax element that
     /// declares nothing.
     ///
     /// # Errors
@@ -136,25 +136,25 @@ pub(crate) trait GrammarRules {
         text: &str,
     ) -> Result<Option<Declaration>, RiftError>;
 
-    /// The name child declarations nest under; `None` when `node` opens no
+    /// The name child declarations nest under; `None` when `syntax element` opens no
     /// scope.
-    fn container_name(&self, node: Node<'_>, text: &str) -> Option<String>;
+    fn container_name(&self, syntax_element: Node<'_>, text: &str) -> Option<String>;
 
-    /// The qualification declarations under this node take.
-    fn child_qualification(&self, node: Node<'_>, text: &str, parent: &str) -> String {
-        self.container_name(node, text).map_or_else(
+    /// The qualification declarations under this syntax element take.
+    fn child_qualification(&self, syntax_element: Node<'_>, text: &str, parent: &str) -> String {
+        self.container_name(syntax_element, text).map_or_else(
             || parent.to_owned(),
             |name| qualify(self.qualification_separator(), parent, &name),
         )
     }
 
-    /// Byte offset where the visited node's whole declaration starts,
+    /// Byte offset where the visited syntax element's whole declaration starts,
     /// attached attributes and doc comments included.
     fn declaration_start(&self, visited: Visited<'_, '_>, text: &str) -> usize;
 
     /// The whole declaration that contains the visited declaration name.
-    fn declaration_node<'tree>(&self, visited: Visited<'_, 'tree>) -> Node<'tree> {
-        visited.node()
+    fn declaration_syntax_element<'tree>(&self, visited: Visited<'_, 'tree>) -> Node<'tree> {
+        visited.syntax_element()
     }
 
     /// Whether the declaration renders a callable signature.
@@ -163,7 +163,7 @@ pub(crate) trait GrammarRules {
     }
 
     /// The grammar's exact declaration name field, absent for providers without one.
-    fn name_range(&self, _node: Node<'_>) -> Result<Option<ByteRange>, RiftError> {
+    fn name_range(&self, _syntax_element: Node<'_>) -> Result<Option<ByteRange>, RiftError> {
         Ok(None)
     }
 
@@ -211,16 +211,17 @@ pub(crate) struct Declaration {
     pub(crate) documentation_ranges: Vec<ByteRange>,
 }
 
-/// Converts one node's span to the wire byte width.
-pub(crate) fn byte_range(node: Node<'_>) -> Result<ByteRange, RiftError> {
-    let start =
-        u64::try_from(node.start_byte()).map_err(|source| position_overflow(node, source))?;
-    let end = u64::try_from(node.end_byte()).map_err(|source| position_overflow(node, source))?;
+/// Converts one syntax element's span to the wire byte width.
+pub(crate) fn byte_range(syntax_element: Node<'_>) -> Result<ByteRange, RiftError> {
+    let start = u64::try_from(syntax_element.start_byte())
+        .map_err(|source| position_overflow(syntax_element, source))?;
+    let end = u64::try_from(syntax_element.end_byte())
+        .map_err(|source| position_overflow(syntax_element, source))?;
     Ok(ByteRange { start, end })
 }
 
-/// Walks the parsed tree once, collecting named nodes and declarations
-/// within the configured node and depth budgets.
+/// Walks the parsed tree once, collecting named syntax elements and declarations
+/// within the configured syntax element and depth budgets.
 ///
 /// # Errors
 ///
@@ -232,18 +233,19 @@ pub(crate) fn extract(
     limits: SyntaxLimits,
     language: &Language,
     rules: &dyn GrammarRules,
-) -> Result<(Vec<SyntaxNode>, Vec<SyntaxSymbol>), RiftError> {
-    let (nodes, symbols, _) = extract_with_export_bindings(root, source, limits, language, rules)?;
-    Ok((nodes, symbols))
+) -> Result<(Vec<SyntaxElement>, Vec<SyntaxSymbol>), RiftError> {
+    let (syntax_elements, symbols, _) =
+        extract_with_export_bindings(root, source, limits, language, rules)?;
+    Ok((syntax_elements, symbols))
 }
 
 pub(crate) type Extraction = (
-    Vec<SyntaxNode>,
+    Vec<SyntaxElement>,
     Vec<SyntaxSymbol>,
     Vec<crate::SyntaxExportBinding>,
 );
 
-/// Records export bindings in the same bounded tree walk as nodes and declarations.
+/// Records export bindings in the same bounded tree walk as syntax elements and declarations.
 pub(crate) fn extract_with_export_bindings(
     root: Node<'_>,
     source: SyntaxSource<'_>,
@@ -270,12 +272,12 @@ pub(crate) fn extract_with_capture(
         grammar,
         "a syntax provider must parse with its shipped grammar",
     );
-    let mut nodes = Vec::new();
+    let mut syntax_elements = Vec::new();
     let mut symbols = Vec::new();
     let mut export_bindings = Vec::new();
     let mut visits = Visits::default();
     let mut pending = vec![Queued {
-        node: root,
+        syntax_element: root,
         parent: None,
         qualification: String::new(),
         depth: 0,
@@ -284,7 +286,7 @@ pub(crate) fn extract_with_capture(
     let mut cursor = root.walk();
     while let Some(queued) = pending.pop() {
         let Queued {
-            node,
+            syntax_element,
             parent,
             qualification,
             depth,
@@ -297,27 +299,27 @@ pub(crate) fn extract_with_capture(
                 .fail();
         }
         assert!(
-            nodes.len() < limits.syntax_nodes_max(),
-            "the enqueue guard must keep the walker below the node bound: \
-             nodes={}, syntax_nodes_max={}",
-            nodes.len(),
-            limits.syntax_nodes_max(),
+            syntax_elements.len() < limits.syntax_elements_max(),
+            "the enqueue guard must keep the walker below the syntax_element bound: \
+             syntax_elements={}, syntax_elements_max={}",
+            syntax_elements.len(),
+            limits.syntax_elements_max(),
         );
 
-        let node_index = visits.visit(node, parent, follows_named_sibling);
-        let range = byte_range(node)?;
-        nodes.push(SyntaxNode {
+        let syntax_element_index = visits.visit(syntax_element, parent, follows_named_sibling);
+        let range = byte_range(syntax_element)?;
+        syntax_elements.push(SyntaxElement {
             kind: grammar
-                .node_kind_for_id(node.kind_id())
-                .expect("a parsed node kind belongs to its shipped grammar"),
+                .node_kind_for_id(syntax_element.kind_id())
+                .expect("a parsed syntax element kind belongs to its shipped grammar"),
             range,
             parent,
-            has_error: node.is_error() || node.is_missing(),
+            has_error: syntax_element.is_error() || syntax_element.is_missing(),
         });
 
-        let visited = visits.visited(node_index);
+        let visited = visits.visited(syntax_element_index);
         if let Some(capture) = capture.as_deref_mut() {
-            capture.record(node)?;
+            capture.record(syntax_element)?;
         }
         if let Some(binding) = rules.export_binding(visited, text, &qualification)? {
             export_bindings.push(binding);
@@ -333,55 +335,57 @@ pub(crate) fn extract_with_capture(
                 grammar,
             )?);
         }
-        let child_qualification = rules.child_qualification(node, text, &qualification);
+        let child_qualification = rules.child_qualification(syntax_element, text, &qualification);
 
-        if pending.len() + nodes.len() + node.named_child_count() > limits.syntax_nodes_max() {
-            return errors::syntax::too_many_nodes()
+        if pending.len() + syntax_elements.len() + syntax_element.named_child_count()
+            > limits.syntax_elements_max()
+        {
+            return errors::syntax::too_many_syntax_elements()
                 .path(source.path)
-                .syntax_nodes_max(limits.syntax_nodes_max())
+                .syntax_elements_max(limits.syntax_elements_max())
                 .fail();
         }
         queue_children(
             &mut pending,
             &mut cursor,
-            node,
-            node_index,
+            syntax_element,
+            syntax_element_index,
             &child_qualification,
             depth + 1,
         );
     }
-    Ok((nodes, symbols, export_bindings))
+    Ok((syntax_elements, symbols, export_bindings))
 }
 
-/// One node the walk has queued, with what its visit needs from its parent.
+/// One syntax element the walk has queued, with what its visit needs from its parent.
 struct Queued<'tree> {
-    node: Node<'tree>,
+    syntax_element: Node<'tree>,
     /// The parent's visit index; `None` for the root.
     parent: Option<usize>,
-    /// The qualification declarations under this node take.
+    /// The qualification declarations under this syntax element take.
     qualification: String,
     depth: usize,
-    /// Whether a named sibling immediately precedes this node.
+    /// Whether a named sibling immediately precedes this syntax element.
     follows_named_sibling: bool,
 }
 
-/// Queues `node`'s named children so they pop in source order, each marked
+/// Queues `syntax element`'s named children so they pop in source order, each marked
 /// with whether a named sibling immediately precedes it. The anonymous
 /// children are read only to set that mark.
 fn queue_children<'tree>(
     pending: &mut Vec<Queued<'tree>>,
     cursor: &mut TreeCursor<'tree>,
-    node: Node<'tree>,
+    syntax_element: Node<'tree>,
     parent: usize,
     qualification: &str,
     depth: usize,
 ) {
     let first_child = pending.len();
     let mut follows_named_sibling = false;
-    for child in node.children(cursor) {
+    for child in syntax_element.children(cursor) {
         if child.is_named() {
             pending.push(Queued {
-                node: child,
+                syntax_element: child,
                 parent: Some(parent),
                 qualification: qualification.to_owned(),
                 depth,
@@ -405,11 +409,11 @@ fn qualified_symbol(
     rules: &dyn GrammarRules,
     grammar: &'static tree_sitter::Language,
 ) -> Result<SyntaxSymbol, RiftError> {
-    let visited_node = visited.node();
-    let node = rules.declaration_node(visited);
-    let item_range = byte_range(node)?;
+    let visited_syntax_element = visited.syntax_element();
+    let syntax_element = rules.declaration_syntax_element(visited);
+    let item_range = byte_range(syntax_element)?;
     let start = rules.declaration_start(visited, text);
-    let start = u64::try_from(start).map_err(|source| position_overflow(node, source))?;
+    let start = u64::try_from(start).map_err(|source| position_overflow(syntax_element, source))?;
     let signatures: Vec<Signature> = rules
         .renders_signature(visited)
         .then(|| callable_signature(&declaration, item_range, text, language))
@@ -426,7 +430,7 @@ fn qualified_symbol(
         container: (!qualification.is_empty()).then(|| qualification.to_owned()),
         name: declaration.name,
         kind: declaration.kind,
-        node_kind: grammar.node_kind_for_id(node.kind_id()),
+        syntax_element_kind: grammar.node_kind_for_id(syntax_element.kind_id()),
         facets: declaration.facets,
         visibility: declaration.visibility,
         range: ByteRange {
@@ -434,7 +438,7 @@ fn qualified_symbol(
             end: item_range.end,
         },
         item_range,
-        name_range: rules.name_range(visited_node)?,
+        name_range: rules.name_range(visited_syntax_element)?,
         body_range: declaration.body_range,
         signatures: Arc::from(signatures),
         documentation: Arc::from(declaration.documentation),
@@ -523,7 +527,7 @@ mod tests {
     use crate::provider::{SyntaxLimits, SyntaxSource};
     use crate::{ShippedLanguage, SyntaxNames};
 
-    /// Rules that compare every visited node's recorded parent and previous
+    /// Rules that compare every visited syntax element's recorded parent and previous
     /// sibling with the ones tree-sitter computes itself, and declare nothing.
     #[derive(Debug)]
     struct LinkOracle {
@@ -537,36 +541,38 @@ mod tests {
             visited: Visited<'_, '_>,
             text: &str,
         ) -> Result<Option<Declaration>, RiftError> {
-            let node = visited.node();
-            let spelling = text.get(node.byte_range()).unwrap_or_default();
+            let syntax_element = visited.syntax_element();
+            let spelling = text.get(syntax_element.byte_range()).unwrap_or_default();
             assert_eq!(
-                self.names.grammar().node_kind_for_id(node.kind_id()),
-                Some(node.kind()),
-                "the retained grammar must preserve the parsed node's spelling: text={spelling:?}",
+                self.names
+                    .grammar()
+                    .node_kind_for_id(syntax_element.kind_id()),
+                Some(syntax_element.kind()),
+                "the retained grammar must preserve the parsed syntax element's spelling: text={spelling:?}",
             );
             assert_eq!(
-                visited.parent().map(Visited::node),
-                node.parent(),
+                visited.parent().map(Visited::syntax_element),
+                syntax_element.parent(),
                 "the recorded parent must be tree-sitter's parent: kind={}, text={spelling:?}",
-                node.kind(),
+                syntax_element.kind(),
             );
             assert_eq!(
-                visited.previous_sibling().map(Visited::node),
-                node.prev_sibling().filter(Node::is_named),
+                visited.previous_sibling().map(Visited::syntax_element),
+                syntax_element.prev_sibling().filter(Node::is_named),
                 "the recorded previous sibling must be tree-sitter's previous sibling when \
                  that sibling is named: kind={}, text={spelling:?}",
-                node.kind(),
+                syntax_element.kind(),
             );
             self.compared.set(self.compared.get() + 1);
             Ok(None)
         }
 
-        fn container_name(&self, _node: Node<'_>, _text: &str) -> Option<String> {
+        fn container_name(&self, _syntax_element: Node<'_>, _text: &str) -> Option<String> {
             None
         }
 
         fn declaration_start(&self, visited: Visited<'_, '_>, _text: &str) -> usize {
-            visited.node().start_byte()
+            visited.syntax_element().start_byte()
         }
 
         fn qualification_separator(&self) -> &'static str {
@@ -574,9 +580,9 @@ mod tests {
         }
     }
 
-    /// Walks `text` parsed with `grammar` and returns how many nodes the
+    /// Walks `text` parsed with `grammar` and returns how many syntax elements the
     /// oracle compared.
-    fn compared_nodes(
+    fn compared_syntax_elements(
         grammar: &tree_sitter::Language,
         shipped: ShippedLanguage,
         text: &str,
@@ -658,11 +664,11 @@ mod tests {
             ),
         ];
         for (grammar, shipped, text) in &fixtures {
-            let compared = compared_nodes(grammar, *shipped, text);
+            let compared = compared_syntax_elements(grammar, *shipped, text);
             let name = shipped.language().name;
             assert!(
                 compared > 10,
-                "the oracle must compare the fixture's nodes: language={name}, \
+                "the oracle must compare the fixture's syntax_elements: language={name}, \
                  compared={compared}"
             );
         }

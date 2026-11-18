@@ -17,8 +17,8 @@
 //! An edge's `facet` is [`role_facet`]'s mapping of the reference's [`ReferenceRole`].
 //!
 //! An edge's `occurrence` is the reference's own [`DeclarationBinding`]: unit, byte range, and
-//! an optional syntax node. Every provider that publishes a reference today constructs its
-//! binding with `node: None`, so the node arm is populated by no production path.
+//! an optional syntax element. Every provider that publishes a reference today constructs its
+//! binding with `syntax element: None`, so the syntax element arm is populated by no production path.
 //!
 //! Building stops at [`RELATIONSHIP_EDGES_MAX`] edges; [`RelationshipStore::is_complete`] and
 //! [`RelationshipStore::dropped_edges`] report the truncation.
@@ -92,8 +92,8 @@ impl RelationshipEdge {
         self.facet
     }
 
-    /// Where the reference occurred: unit, byte range, and syntax node when the binding
-    /// provider supplied one. No production binding supplies a node (module doc).
+    /// Where the reference occurred: unit, byte range, and syntax element when the binding
+    /// provider supplied one. No production binding supplies a syntax element (module doc).
     #[must_use]
     pub const fn occurrence(&self) -> &DeclarationBinding {
         &self.occurrence

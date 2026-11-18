@@ -269,7 +269,7 @@ fn test_declaration_limit_preserves_default_and_uses_configured_bound() {
 #[test]
 fn test_configuration_and_environment_declaration_limits_reach_analysis() {
     let document = "[source]\nfiles = 2000\nworkspace_size = \"32mb\"\ndeclarations = 10000\n\
-                    [providers.syntax]\nmax_file = \"8mb\"\nmax_nodes = 4000000\nmax_depth = 512\n";
+                    [providers.syntax]\nmax_file = \"8mb\"\nmax_syntax_elements = 4000000\nmax_depth = 512\n";
     let accepted = accept_configuration::<WorkspaceConfiguration>(
         Some(document),
         &ConfigurationEnvironment::default(),
@@ -292,7 +292,7 @@ fn test_configuration_and_environment_declaration_limits_reach_analysis() {
         ("RIFT_SOURCE_FILES", "3000"),
         ("RIFT_SOURCE_WORKSPACE_SIZE", "64mb"),
         ("RIFT_PROVIDERS_SYNTAX_MAX_FILE", "16mb"),
-        ("RIFT_PROVIDERS_SYNTAX_MAX_NODES", "5000000"),
+        ("RIFT_PROVIDERS_SYNTAX_MAX_SYNTAX_ELEMENTS", "5000000"),
         ("RIFT_PROVIDERS_SYNTAX_MAX_DEPTH", "1024"),
     ]);
     let accepted = accept_configuration::<WorkspaceConfiguration>(Some(document), &environment)
