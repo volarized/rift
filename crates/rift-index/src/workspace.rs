@@ -805,7 +805,9 @@ impl WorkspaceSourcePolicy {
             GitignorePolicy::Ignore,
         ) {
             check_cancelled(cancelled)?;
-            let entry = entry.map_err(|error| walk_error(&self.root, error))?;
+            let Some(entry) = walked_entry(&self.root, entry)? else {
+                continue;
+            };
             let file_type = entry.file_type();
             if file_type.is_some_and(|file_type| file_type.is_dir()) {
                 if entry.depth() > self.limits.directory_depth_max {
@@ -4465,7 +4467,9 @@ impl WorkspaceIndex {
             GitignorePolicy::Ignore,
         );
         for entry in walker {
-            let entry = entry.map_err(|error| walk_error(&self.root, error))?;
+            let Some(entry) = walked_entry(&self.root, entry)? else {
+                continue;
+            };
             let file_type = entry.file_type();
             if file_type.is_some_and(|file_type| file_type.is_dir()) {
                 if entry.depth() > self.limits.directory_depth_max {
@@ -4541,7 +4545,9 @@ impl WorkspaceIndex {
             GitignorePolicy::Ignore,
         );
         for entry in walker {
-            let entry = entry.map_err(|error| walk_error(&self.root, error))?;
+            let Some(entry) = walked_entry(&self.root, entry)? else {
+                continue;
+            };
             let file_type = entry.file_type();
             if file_type.is_some_and(|file_type| file_type.is_dir()) {
                 if entry.depth() > self.limits.directory_depth_max {
@@ -5243,7 +5249,9 @@ fn discover_cancellable(
     let mut discovered = DiscoveredPaths::default();
     for entry in source_walk(root, limits.directory_depth_max, gitignore) {
         check_cancelled(cancelled)?;
-        let entry = entry.map_err(|error| walk_error(root, error))?;
+        let Some(entry) = walked_entry(root, entry)? else {
+            continue;
+        };
         let Some(path) = walked_file(&entry, limits.directory_depth_max)? else {
             continue;
         };
@@ -5295,7 +5303,9 @@ fn discover_forced(
         .collect();
     for entry in forced_walk(root, limits.directory_depth_max, reach) {
         check_cancelled(cancelled)?;
-        let entry = entry.map_err(|error| walk_error(root, error))?;
+        let Some(entry) = walked_entry(root, entry)? else {
+            continue;
+        };
         let Some(path) = walked_file(&entry, limits.directory_depth_max)? else {
             continue;
         };
@@ -5383,7 +5393,9 @@ impl GitignoreChain {
         let mut ignore_files = inputs.len();
         for entry in source_walk(root, limits.directory_depth_max, GitignorePolicy::Ignore) {
             check_cancelled(cancelled)?;
-            let entry = entry.map_err(|error| walk_error(root, error))?;
+            let Some(entry) = walked_entry(root, entry)? else {
+                continue;
+            };
             let path = entry.path();
             if !entry
                 .file_type()
@@ -6323,6 +6335,30 @@ fn walk_source_path(error: &ignore::Error) -> Option<PathBuf> {
         ignore::Error::Loop { child, .. } => Some(child.clone()),
         _ => None,
     }
+}
+
+/// One walk step's entry, or `None` for an entry a concurrent removal took below `root`.
+///
+/// A directory its parent listed and that is gone before the walk opens it is absent from
+/// the tree, as a walk started after the removal finds it, so the walk goes on without it.
+/// A missing root, and every other walk failure, still refuses.
+fn walked_entry(
+    root: &Path,
+    entry: Result<DirEntry, ignore::Error>,
+) -> Result<Option<DirEntry>, RiftError> {
+    match entry {
+        Ok(entry) => Ok(Some(entry)),
+        Err(error) if removed_below(root, &error) => Ok(None),
+        Err(error) => Err(walk_error(root, error)),
+    }
+}
+
+/// Whether `error` reports a path strictly below `root` that no longer exists.
+fn removed_below(root: &Path, error: &ignore::Error) -> bool {
+    error
+        .io_error()
+        .is_some_and(|source| source.kind() == std::io::ErrorKind::NotFound)
+        && walk_source_path(error).is_some_and(|path| path != root && path.starts_with(root))
 }
 
 fn walk_error(root: &Path, error: ignore::Error) -> RiftError {
@@ -14702,6 +14738,82 @@ mod tests {
                 errors::index::workspace_cancelled::SLUG,
                 "the check after {passed} passed checks"
             );
+        }
+    }
+
+    /// A directory removed while a capture walks the tree leaves the capture, whichever
+    /// check the removal lands at: a walk that meets the listed directory gone treats it
+    /// as absent, and the capture answers the tree without it rather than refusing with
+    /// a filesystem failure. Regression for the root workspace read refused with
+    /// `storage_failure` naming a build directory deleted beside the server.
+    #[test]
+    fn test_visible_capture_drops_a_directory_removed_during_the_walk() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        fn workspace() -> tempfile::TempDir {
+            let directory = tempfile::tempdir().expect("workspace");
+            let root = directory.path();
+            for (path, text) in [
+                ("a/kept.rs", "pub fn first() {}\n"),
+                ("b/nested/gone.rs", "pub fn removed() {}\n"),
+                ("c/kept.rs", "pub fn last() {}\n"),
+            ] {
+                let path = root.join(path);
+                fs::create_dir_all(path.parent().expect("fixture parent")).expect("directory");
+                fs::write(path, text).expect("source");
+            }
+            directory
+        }
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let text = TextFileInclusion::default();
+        let languages = LanguageFileSelections::default();
+        let last = LastCapture::default();
+        let checks = AtomicUsize::new(0);
+        let counted = || {
+            checks.fetch_add(1, Ordering::SeqCst);
+            false
+        };
+        let directory = workspace();
+        capture_visible_digests_with_languages_cancellable(
+            directory.path(),
+            limits,
+            &visibility,
+            &text,
+            &languages,
+            &last,
+            &counted,
+        )
+        .expect("an undisturbed visible capture completes");
+        let made = checks.load(Ordering::SeqCst);
+        let kept = ProjectPath::new("a/kept.rs").expect("kept path");
+        for passed in 0..made {
+            let directory = workspace();
+            let removed = directory.path().join("b");
+            let checks = AtomicUsize::new(0);
+            let done = AtomicBool::new(false);
+            let removing = || {
+                if checks.fetch_add(1, Ordering::SeqCst) == passed
+                    && !done.swap(true, Ordering::SeqCst)
+                {
+                    fs::remove_dir_all(&removed).expect("remove the directory mid-walk");
+                }
+                false
+            };
+            let (indexed, visible, _) = capture_visible_digests_with_languages_cancellable(
+                directory.path(),
+                limits,
+                &visibility,
+                &text,
+                &languages,
+                &last,
+                &removing,
+            )
+            .unwrap_or_else(|error| {
+                panic!("a removal at check {passed} refused the capture: {error:?}")
+            });
+            assert!(indexed.get(&kept).is_some(), "check {passed}: {indexed:?}");
+            assert!(visible.get(&kept).is_some(), "check {passed}: {visible:?}");
         }
     }
 
