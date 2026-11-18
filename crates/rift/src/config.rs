@@ -24,7 +24,7 @@ pub(super) enum ConfigCommand {
         #[arg(long = "telemetry.disabled", action = ArgAction::Set, require_equals = true, value_name = "BOOL", required_unless_present = "language", conflicts_with = "language")]
         telemetry_disabled: Option<bool>,
         #[command(flatten)]
-        lsp: lsp::LspSetOptions,
+        lsp: Box<lsp::LspSetOptions>,
         /// Write ~/.rift/config.toml; a user disable applies to every project.
         #[arg(long, conflicts_with = "language")]
         user: bool,
@@ -197,7 +197,7 @@ mod tests {
         run(
             &ConfigCommand::Set {
                 telemetry_disabled: Some(true),
-                lsp: lsp::LspSetOptions::default(),
+                lsp: Box::default(),
                 user: false,
             },
             root.path(),
@@ -215,7 +215,7 @@ mod tests {
                 run(
                     &ConfigCommand::Set {
                         telemetry_disabled: Some(true),
-                        lsp: lsp::LspSetOptions::default(),
+                        lsp: Box::default(),
                         user: true
                     },
                     root.path(),
@@ -234,7 +234,7 @@ mod tests {
         let home = tempfile::tempdir()?;
         let command = ConfigCommand::Set {
             telemetry_disabled: Some(true),
-            lsp: lsp::LspSetOptions::default(),
+            lsp: Box::default(),
             user: true,
         };
         let ConfigOutcome::Written(path) = run(&command, root.path(), Some(home.path()))? else {

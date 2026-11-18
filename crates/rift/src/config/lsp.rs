@@ -33,6 +33,9 @@ pub(crate) struct LspSetOptions {
     /// Installation layout selecting an installed language server without an executable path.
     #[arg(long, requires = "language", conflicts_with = "lsp_program", value_parser = ["cargo", "bun", "npm", "uv"])]
     pub(super) lsp_package_manager: Option<String>,
+    /// Engine this build serves in process, selected without an executable.
+    #[arg(long, requires = "language", conflicts_with_all = ["lsp_program", "lsp_package_manager"], value_parser = ["ty"])]
+    pub(super) lsp_embedded: Option<String>,
     /// Literal process argument, repeated for additional arguments.
     #[arg(long, require_equals = true, requires = "lsp_program")]
     pub(super) lsp_argument: Vec<String>,
@@ -58,8 +61,9 @@ impl LspSetOptions {
         let (selector, value) = match (
             self.lsp_program.as_deref(),
             self.lsp_package_manager.as_deref(),
+            self.lsp_embedded.as_deref(),
         ) {
-            (Some(program), None) => {
+            (Some(program), None, None) => {
                 let mut command = Array::new();
                 command.push(program);
                 for argument in &self.lsp_argument {
@@ -67,13 +71,16 @@ impl LspSetOptions {
                 }
                 ("command", Value::Array(command))
             }
-            (None, Some(manager)) if self.lsp_argument.is_empty() => {
+            (None, Some(manager), None) if self.lsp_argument.is_empty() => {
                 ("package_manager", Value::from(manager))
+            }
+            (None, None, Some(engine)) if self.lsp_argument.is_empty() => {
+                ("embedded", Value::from(engine))
             }
             _ => {
                 return Err(invalid(
                     path,
-                    "supply exactly one of --lsp-program and --lsp-package-manager with --language",
+                    "supply exactly one of --lsp-program, --lsp-package-manager, and --lsp-embedded with --language",
                 ));
             }
         };

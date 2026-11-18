@@ -353,8 +353,8 @@ impl ReadService {
             .items
             .into_iter()
             .filter_map(|recommendation| {
-                let crate::LspRecommendationStatus::Available { command, .. } =
-                    recommendation.status
+                let (crate::LspRecommendationStatus::Available { command, .. }
+                | crate::LspRecommendationStatus::Embedded { command, .. }) = recommendation.status
                 else {
                     return None;
                 };

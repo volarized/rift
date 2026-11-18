@@ -730,8 +730,10 @@ starts no language server or package installation.
 Cargo selects `rust-analyzer`, using the project's pinned Rust toolchain when available.
 Bun and npm select the installed native TypeScript language server, then
 `typescript-language-server` from `node_modules/.bin` before `PATH`. uv selects `ty`, then
-`pyright-langserver`, from the project's `.venv` before `PATH`. A missing executable leaves
-the recommendation unavailable.
+`pyright-langserver`, from the project's `.venv` before `PATH`. Without either executable,
+Python selects the [embedded engine](#language-engines) the build carries, with
+`--lsp-embedded=ty`. For any other language, a missing executable leaves the recommendation
+unavailable.
 
 The recommendation command reads each directly registered project's own configuration and
 visible files. Registered names must resolve to distinct directories, each different from the
@@ -757,6 +759,13 @@ rift config set --language=typescript --profile=docs --profile-root=docs --lsp-p
 A profile accepts repeated `--include` and `--exclude` patterns relative to its root. Omitted
 patterns preserve the profile's existing language filters. The command writes the profile in
 the root `rift.toml`. Each repository uses one configuration file.
+
+`--lsp-embedded=ty` writes `embedded` instead and selects the engine the build carries for
+Python:
+
+```sh
+rift config set --language=python --lsp-embedded=ty
+```
 
 A custom process remains available through `--lsp-program`. Repeat `--lsp-argument` for each
 literal argument:
