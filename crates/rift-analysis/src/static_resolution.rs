@@ -19,7 +19,7 @@ use rift_syntax::{
     StaticFacts, SyntaxFacts, SyntaxSymbol,
 };
 
-use crate::NamespaceInput;
+use crate::{EnclosingDefinitions, NamespaceInput};
 
 /// One file from the same selection as the normalized graph.
 #[derive(Debug)]
@@ -160,6 +160,7 @@ struct File<'source> {
     by_name: Bindings<'source>,
     by_range: BTreeMap<ByteRange, Option<&'source SyntaxSymbol>>,
     by_qualified_name: BTreeMap<&'source str, Option<&'source SyntaxSymbol>>,
+    callables: EnclosingDefinitions<&'source SyntaxSymbol>,
     assignments: AssignmentTargets<'source>,
 }
 
@@ -215,6 +216,7 @@ impl<'source> File<'source> {
             by_name: BTreeMap::new(),
             by_range: BTreeMap::new(),
             by_qualified_name: BTreeMap::new(),
+            callables: EnclosingDefinitions::new([]),
             assignments: AssignmentTargets::default(),
         };
         file.index_bindings(work)?;
@@ -240,6 +242,8 @@ impl<'source> File<'source> {
     }
 
     fn index_symbols(&mut self, work: &mut Work) -> Option<()> {
+        let mut callables = Vec::new();
+        let python = self.document.facts.language().name == "python";
         for symbol in self.document.facts.symbols() {
             if !work.charge() {
                 return None;
@@ -248,6 +252,9 @@ impl<'source> File<'source> {
                 .entry(&symbol.qualified_name)
                 .and_modify(|entry| *entry = None)
                 .or_insert(Some(symbol));
+            if python && symbol.kinds.contains(&SymbolKind::Callable) {
+                callables.push((symbol.range.start, symbol.range.end, symbol));
+            }
             if let Some(range) = symbol.name_range {
                 self.by_range
                     .entry(range)
@@ -255,7 +262,15 @@ impl<'source> File<'source> {
                     .or_insert(Some(symbol));
             }
         }
+        self.callables = EnclosingDefinitions::new(callables);
         Some(())
+    }
+
+    fn enclosing_callable(&self, range: ByteRange) -> Option<Target<'source>> {
+        Some(Target {
+            file: self.document,
+            symbol: *self.callables.resolve(range.start, range.end)?,
+        })
     }
 
     fn text(&self, range: ByteRange) -> Option<&'source str> {
@@ -399,16 +414,7 @@ impl<'source> Index<'source> {
             if !work.charge() {
                 return;
             }
-            let target = self.call_target(file, call, work);
-            let occurrence = target.and_then(|target| {
-                self.occurrence(
-                    file,
-                    call.range,
-                    call.callee_range,
-                    ReferenceRole::Call,
-                    target,
-                )
-            });
+            let occurrence = self.call_occurrence(file, call, work);
             if occurrence
                 .as_ref()
                 .is_none_or(|occurrence| !matches!(occurrence.target, NormalizedTarget::Symbol(_)))
@@ -439,6 +445,38 @@ impl<'source> Index<'source> {
         if !work.exhausted {
             result.analyzed_sources += 1;
         }
+    }
+
+    fn call_occurrence(
+        &self,
+        file: &File<'source>,
+        call: &StaticCall,
+        work: &mut Work,
+    ) -> Option<StaticOccurrence> {
+        let target = self.call_target(file, call, work)?;
+        let mut occurrence = self.occurrence(
+            file,
+            call.range,
+            call.callee_range,
+            ReferenceRole::Call,
+            target,
+        )?;
+        if file.document.facts.language().name == "python"
+            && let Some(caller) = file.enclosing_callable(call.range)
+        {
+            let caller = self.occurrence(
+                file,
+                call.range,
+                call.callee_range,
+                ReferenceRole::Call,
+                caller,
+            )?;
+            let NormalizedTarget::Symbol(caller) = caller.target else {
+                return None;
+            };
+            occurrence.edge_from = Some(caller);
+        }
+        Some(occurrence)
     }
 
     fn edge_heritage_occurrence(

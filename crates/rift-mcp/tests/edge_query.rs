@@ -13,6 +13,78 @@ use serde_json::json;
 use workspace_client::{TestResult, captured_seed, query_after_population, served_workspace};
 
 #[tokio::test]
+async fn test_python_declarations_include_locals_empty_modules_and_project_files() -> TestResult {
+    let files = [
+        ("pkg/empty.py", ""),
+        (
+            "docs_src/tutorial.py",
+            "class Item: pass\ndef build():\n    visited: list[Item] = []\n",
+        ),
+        (
+            "pyproject.toml",
+            "[build-system]\nrequires=['pdm-backend']\nbuild-backend='pdm.backend'\n",
+        ),
+    ];
+    let (_directory, client, task) = served_workspace(&files, None).await?;
+    for (name, path, identity) in [
+        (
+            "Item",
+            "docs_src/tutorial.py",
+            "rift://symbol/local/python/docs_src/tutorial/Item",
+        ),
+        (
+            "visited",
+            "docs_src/tutorial.py",
+            "rift://symbol/local/python/docs_src/tutorial/build/visited",
+        ),
+    ] {
+        assert_eq!(captured_seed(&client, name, path).await?, identity);
+    }
+    let params = QueryParams {
+        query: "ASK { <rift://symbol/local/python/pkg/empty> a :Symbol }".to_owned(),
+        language: QueryLanguage::Sparql,
+        page: 1,
+        max_results: 10,
+        revision: None,
+    };
+    let answer = query_after_population(&client, &params).await?;
+    assert_eq!(answer["answer"], json!({"result":"boolean", "value":true}));
+    let symbol = rift_protocol::read::SymbolId("rift://symbol/local/python/pkg/empty".to_owned());
+    let params = rift_protocol::read::FacetsParams::of(symbol);
+    let request = workspace_client::tool_request("facets", &serde_json::to_value(params)?);
+    let facets = workspace_client::call_retrying_acceptance(&client, request).await?;
+    assert_eq!(facets["pagination"]["total"], json!(1), "{facets}");
+    assert_eq!(facets["declarations"][0]["source"]["text"], json!(""));
+    assert_eq!(
+        facets["declarations"][0]["range"],
+        json!({"start":0,"end":0})
+    );
+    client.cancel().await?;
+    task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_python_local_initializer_calls_start_at_the_enclosing_callable() -> TestResult {
+    let source = "def leaf(): return 1\ndef root():\n    value: int = leaf()\n    return value\n";
+    let (_directory, client, task) = served_workspace(&[("main.py", source)], None).await?;
+    let root = captured_seed(&client, "root", "main.py").await?;
+    let leaf = captured_seed(&client, "leaf", "main.py").await?;
+    let params = QueryParams {
+        query: format!("ASK {{ <{root}> :calls <{leaf}> }}"),
+        language: QueryLanguage::Sparql,
+        page: 1,
+        max_results: 10,
+        revision: None,
+    };
+    let answer = query_after_population(&client, &params).await?;
+    assert_eq!(answer["answer"], json!({"result":"boolean", "value":true}));
+    client.cancel().await?;
+    task.await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_edge_static_calls_agree_in_both_directions_and_with_flows() -> TestResult {
     let source = "export function root() { leaf(); }\nfunction leaf() { return 'zebraquartz'; }\n";
     let (_directory, client, task) = served_workspace(&[("entry.mjs", source)], None).await?;

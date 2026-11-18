@@ -1241,7 +1241,11 @@ mod tests {
             "{witness:?}"
         );
 
-        std::fs::write(root.join("unestablished.py"), "def might_call(): pass\n")?;
+        std::fs::create_dir(root.join("invalid-directory"))?;
+        std::fs::write(
+            root.join("invalid-directory/unestablished.py"),
+            "def might_call(): pass\n",
+        )?;
         let incomplete = RiftMcp::build_settled(&root, limits).await?;
         let response = incomplete
             .graph_query(query)

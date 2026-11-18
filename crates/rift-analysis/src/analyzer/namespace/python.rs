@@ -89,9 +89,6 @@ pub(super) fn local_module(input: &NamespaceInput<'_>, path: &str) -> Option<Vec
                     .is_some_and(|tail| tail.starts_with('/'))
         })
         .max_by_key(|(parent, _)| parent.len());
-    if metadata.is_some_and(|(_, source)| config(source, input.syntax()).is_some()) {
-        return None;
-    }
     let parent = metadata.map_or("", |(parent, _)| parent);
     let relative = if parent.is_empty() {
         path

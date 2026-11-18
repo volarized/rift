@@ -102,6 +102,23 @@ fn test_edge_python_calls_follow_local_and_import_bindings() {
 }
 
 #[test]
+fn test_python_calls_in_local_initializers_keep_the_enclosing_callable() {
+    let source = "def leaf(): return 1\ndef root():\n    value: int = leaf()\n    def nested():\n        other = leaf()\n    return leaf()\n";
+    let result = resolution("python", &[("main.py", source)], &[], WORK_MAX);
+    let callers = calls(&result, "main.py")
+        .map(|call| call.edge_from.as_ref().map(rift_core::SymbolId::as_str))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        callers,
+        [
+            Some("rift://symbol/local/python/main/root"),
+            Some("rift://symbol/local/python/main/root/nested"),
+            Some("rift://symbol/local/python/main/root"),
+        ]
+    );
+}
+
+#[test]
 fn test_edge_python_imports_keep_relative_bindings_and_reject_dotted_module_shadows() {
     let result = resolution(
         "python",

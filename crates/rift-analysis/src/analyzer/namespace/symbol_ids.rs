@@ -254,3 +254,18 @@ fn python_local_package_fallback_keeps_captured_roots_for_other_packages() {
         ["pkg", "main", "beacon"]
     );
 }
+
+#[test]
+fn python_project_files_outside_distribution_keep_local_identity() {
+    let found = prepared(
+        &[("docs_src/tutorial.py", "class Item:\n    pass\n")],
+        &[(
+            "pyproject.toml",
+            "[build-system]\nrequires=['pdm-backend']\nbuild-backend='pdm.backend'\n[tool.pdm.build]\nsource-includes=['docs_src/']\n",
+        )],
+    );
+    assert_eq!(
+        identity(&found, "docs_src/tutorial.py", "Item").qualified_path(),
+        ["docs_src", "tutorial", "Item"]
+    );
+}

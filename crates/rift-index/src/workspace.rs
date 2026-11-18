@@ -12963,13 +12963,13 @@ mod tests {
             first.semantics.graph().source_revision(),
             second.semantics.graph().source_revision()
         );
-        assert!(
+        assert_eq!(
             second
                 .semantics
                 .assembled(&provider)
-                .expect("retained unproved facts")
-                .identity()
-                .is_none()
+                .expect("retained project facts")
+                .identity(),
+            Some(&identity)
         );
         assert_eq!(
             first
@@ -13003,7 +13003,7 @@ mod tests {
     }
 
     #[test]
-    fn captured_pdm_hook_preserves_unproved_source_facts() {
+    fn captured_pdm_hook_preserves_project_source_identity() {
         let root = tempfile::tempdir().expect("workspace");
         fs::create_dir(root.path().join("fastapi")).expect("package directory");
         let source = "def serve():\n    return 1\n";
@@ -13017,15 +13017,16 @@ mod tests {
             .capture_build_paths(root.path(), WorkspaceIndexLimits::default(), &|| false)
             .expect("present hook observation");
         let hooked = built_contents(root.path(), contents, WorkspaceIndexLimits::default(), None)
-            .expect("hook keeps unproved facts");
+            .expect("hook keeps project facts");
         let provider = symbol_identity("python", "fastapi/__init__.py", "serve");
-        assert!(
+        assert_eq!(
             hooked
                 .semantics
                 .assembled(&provider)
                 .expect("retained facts")
                 .identity()
-                .is_none()
+                .map(rift_core::SymbolId::as_str),
+            Some("rift://symbol/local/python/fastapi/serve")
         );
     }
 
@@ -13139,7 +13140,7 @@ mod tests {
     }
 
     #[test]
-    fn captured_static_modules_require_complete_configuration_observations() {
+    fn captured_static_modules_keep_project_identity_with_unknown_configuration() {
         let root = tempfile::tempdir().expect("workspace");
         let source = "def serve():\n    return 1\n";
         let metadata = "[build-system]\nrequires=['setuptools==80.9.0']\nbuild-backend='setuptools.build_meta'\n[tool.setuptools]\npy-modules=['main']\n";
@@ -13154,13 +13155,14 @@ mod tests {
             None,
         )
         .expect("unknown observations preserve facts");
-        assert!(
+        assert_eq!(
             unknown
                 .semantics
                 .assembled(&provider)
                 .expect("retained facts")
                 .identity()
-                .is_none()
+                .map(rift_core::SymbolId::as_str),
+            Some("rift://symbol/local/python/main/serve")
         );
         contents
             .capture_build_paths(root.path(), WorkspaceIndexLimits::default(), &|| false)
@@ -13184,13 +13186,14 @@ mod tests {
         contents.build_paths.remove(&key);
         let unknown = built_contents(root.path(), contents, WorkspaceIndexLimits::default(), None)
             .expect("unknown configuration preserves facts");
-        assert!(
+        assert_eq!(
             unknown
                 .semantics
                 .assembled(&provider)
                 .expect("retained facts")
                 .identity()
-                .is_none()
+                .map(rift_core::SymbolId::as_str),
+            Some("rift://symbol/local/python/main/serve")
         );
     }
 
