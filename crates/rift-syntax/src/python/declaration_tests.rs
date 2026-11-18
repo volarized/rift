@@ -407,3 +407,52 @@ fn test_python_member_accesses_keep_assignment_roles() {
         ]
     );
 }
+
+#[test]
+fn test_python_rebindings_keep_the_declared_variable_scope() {
+    let text = "shared = 0\ndef root():\n    active = False\n    def finish():\n        nonlocal active\n        active = True\n    def publish():\n        global shared\n        shared = 1\n";
+    let document = analyze(text);
+    for (name, qualified, container) in [
+        ("active", "root.active", Some("root")),
+        ("shared", "shared", None),
+    ] {
+        let declarations = document
+            .symbols()
+            .iter()
+            .filter(|symbol| symbol.name == name)
+            .collect::<Vec<_>>();
+        assert_eq!(declarations.len(), 2);
+        for (ordinal, symbol) in declarations.into_iter().enumerate() {
+            assert_eq!(symbol.qualified_name, qualified);
+            assert_eq!(symbol.container.as_deref(), container);
+            assert_eq!(symbol.declaration_ordinal, ordinal);
+        }
+    }
+}
+
+#[test]
+fn test_python_rebindings_keep_class_members_and_skip_class_scopes() {
+    let source = "shared = 0\nclass Holder:\n    global shared\n    shared = 1\n    def run(self):\n        self.shared = 2\ndef root():\n    value = 0\n    class Inner:\n        value = 1\n        def run(self):\n            nonlocal value\n            value = 2\n";
+    let document = analyze(source);
+    let values = document
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.name == "value")
+        .map(|symbol| symbol.qualified_name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(values, ["root.value", "root.Inner.value", "root.value"]);
+    let shared = document
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.name == "shared")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        shared
+            .iter()
+            .map(|symbol| symbol.qualified_name.as_str())
+            .collect::<Vec<_>>(),
+        ["shared", "shared", "Holder.shared"]
+    );
+    assert!(!shared[1].kinds.contains(&SymbolKind::Member));
+    assert!(shared[2].kinds.contains(&SymbolKind::Member));
+}

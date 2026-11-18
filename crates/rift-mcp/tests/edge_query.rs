@@ -15,6 +15,48 @@ use serde_json::json;
 use workspace_client::{TestResult, captured_seed, query_after_population, served_workspace};
 
 #[tokio::test]
+async fn test_python_rebindings_share_the_existing_symbol_facets() -> TestResult {
+    let source = "shared = 0\ndef root():\n    active = False\n    def finish():\n        nonlocal active\n        active = True\n    def publish():\n        global shared\n        shared = 1\n";
+    let (_directory, client, task) = served_workspace(&[("main.py", source)], None).await?;
+    for expected in [
+        "rift://symbol/local/python/main/root/active",
+        "rift://symbol/local/python/main/shared",
+    ] {
+        let query = QueryParams {
+            query: format!("ASK {{ <{expected}> a :Symbol }}"),
+            language: QueryLanguage::Sparql,
+            ..Default::default()
+        };
+        let answer = query_after_population(&client, &query).await?;
+        assert_eq!(
+            answer["answer"],
+            json!({"result":"boolean", "value":true}),
+            "{answer}"
+        );
+        let params = rift_protocol::read::FacetsParams::of(rift_protocol::read::SymbolId(
+            expected.to_owned(),
+        ));
+        let request = workspace_client::tool_request("facets", &serde_json::to_value(params)?);
+        let facets = workspace_client::call_retrying_acceptance(&client, request).await?;
+        assert_eq!(facets["pagination"]["total"], json!(2), "{facets}");
+    }
+    let params = QueryParams {
+        query: "ASK { <rift://symbol/local/python/main/root/finish/active> a :Symbol }".to_owned(),
+        language: QueryLanguage::Sparql,
+        ..Default::default()
+    };
+    let answer = query_after_population(&client, &params).await?;
+    assert_eq!(
+        answer["answer"],
+        json!({"result":"boolean", "value":false}),
+        "{answer}"
+    );
+    client.cancel().await?;
+    task.await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_python_static_member_edges_are_read_through_sparql() -> TestResult {
     let source = "import models\nclass Base:\n    value: int = 0\n    def run(self): pass\nclass Child(Base):\n    def run(self, value: models.Value) -> models.Value:\n        self.value = value\n        self.value += 1\n        return models.current\n";
     let files = [

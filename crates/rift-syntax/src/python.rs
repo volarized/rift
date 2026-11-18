@@ -41,6 +41,7 @@ use crate::failure::RiftError;
 use crate::provider::{SyntaxLimits, SyntaxProvider, SyntaxSource};
 
 mod overload;
+mod variable_scopes;
 
 #[cfg(test)]
 mod declaration_tests;
@@ -1190,6 +1191,8 @@ impl SyntaxProvider for PythonSyntaxProvider {
         }
         rules.attach_assigned_docs(&mut symbols);
         attach_attribute_docs(&rules, tree.root_node(), source.text, &mut symbols)?;
+        let static_facts = capture.finish();
+        variable_scopes::apply(&mut symbols, &static_facts, source.text, limits)?;
         Ok(SyntaxDocument::new(
             self.language.clone(),
             source.path.clone(),
@@ -1199,7 +1202,7 @@ impl SyntaxProvider for PythonSyntaxProvider {
         )
         .with_export_bindings(export_bindings)
         .with_source_witness(source.text)
-        .with_static_facts(Some(capture.finish()))
+        .with_static_facts(Some(static_facts))
         .with_syntax_limits(limits))
     }
 
