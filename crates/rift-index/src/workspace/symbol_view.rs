@@ -80,7 +80,10 @@ impl WorkspaceIndex {
             documentation: Arc::clone(&self.documentation),
             documents: Arc::from(self.index_documents()),
             limits: self.limits,
-            identity_complete: self.warnings.is_empty(),
+            identity_complete: !self
+                .warnings
+                .iter()
+                .any(super::WorkspaceIndexWarning::leaves_declarations_out),
             retained_bytes: 0,
         };
         view.retained_bytes = retained_size::measure(&view);
