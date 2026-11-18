@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use rift_core::{FileDigest, ProjectPath, SymbolId};
+use rift_core::{ProjectPath, SymbolId};
 use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
 use rift_protocol::read::SymbolKind;
 use rift_syntax::{ByteRange, LogicalDeclaration, SyntaxExportKind, SyntaxFacts, SyntaxSymbol};
@@ -205,7 +205,7 @@ fn export_bindings(
     (exports, unresolved)
 }
 
-pub(super) fn conflicting_export_identities(exports: &[ExportBinding]) -> BTreeSet<String> {
+pub(crate) fn conflicting_export_identities(exports: &[ExportBinding]) -> BTreeSet<String> {
     let mut targets = BTreeMap::<&str, Option<&SymbolId>>::new();
     for export in exports {
         match targets.entry(export.identity.as_str()) {
@@ -274,11 +274,11 @@ fn selected_source_is_valid(input: &NamespaceInput<'_>, file: &SelectedFile<'_>)
     matches!(
         file.syntax.language().name.as_str(),
         "typescript" | "javascript"
-    ) && file.syntax.source_digest() == Some(&FileDigest::of(file.source.as_bytes()))
+    ) && file.syntax.source_digest().is_some()
         && input
             .files()
             .iter()
-            .any(|source| source.path() == file.path && source.text() == file.source)
+            .any(|source| source.path() == file.path && source.text().len() == file.source.len())
 }
 
 fn captured_metadata(input: &NamespaceInput<'_>) -> Option<PackageMetadata> {
@@ -288,9 +288,7 @@ fn captured_metadata(input: &NamespaceInput<'_>) -> Option<PackageMetadata> {
         .chain(input.context_sources())
         .filter(|source| source.path().as_str() == "package.json");
     let source = sources.next()?;
-    if source.text().len() > input.syntax().source_bytes_max()
-        || sources.any(|other| other.text() != source.text())
-    {
+    if source.text().len() > input.syntax().source_bytes_max() || sources.next().is_some() {
         return None;
     }
     let metadata: PackageMetadata = serde_json::from_str(source.text()).ok()?;
@@ -758,7 +756,18 @@ fn declaration_anchors_with_public(
             anchors.insert(symbol.qualified_name.clone(), identity);
         }
     }
-    super::retain_valid_declarations(input, file, anchors)
+    let mut anchors = super::retain_valid_declarations(input, file, anchors);
+    if let Some(module) = module
+        && let Ok(identity) = SymbolIdentity::new(
+            input.owner().clone(),
+            syntax.language().clone(),
+            vec![module.to_owned()],
+        )
+        && let Ok(identity) = SymbolId::new(identity.wire_identity())
+    {
+        anchors.insert(".".to_owned(), identity);
+    }
+    anchors
 }
 
 fn defining_name(symbol: &SyntaxSymbol) -> String {

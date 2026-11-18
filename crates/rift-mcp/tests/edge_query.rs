@@ -13,6 +13,53 @@ use serde_json::json;
 use workspace_client::{TestResult, captured_seed, query_after_population, served_workspace};
 
 #[tokio::test]
+async fn test_typescript_static_facts_are_read_through_sparql() -> TestResult {
+    let files = [
+        (
+            "entry.ts",
+            "import * as core from './index.js';\ninterface Value {}\ninterface Task extends Value {}\nclass Derived extends core.Base<Value> { run(input: Value): Value { this.value = core.value; this.leaf(); return this.value; } }\nexport function root() { core.leaf(); new core.Base(); }",
+        ),
+        ("index.ts", "export * from './base.js';"),
+        (
+            "base.ts",
+            "export const value = 1;\nexport function leaf() {}\nexport class Base<T> { value: T; leaf() {} run(input: T): T { return input; } }",
+        ),
+    ];
+    let (_directory, client, task) = served_workspace(&files, None).await?;
+    let derived = captured_seed(&client, "Derived", "entry.ts").await?;
+    let root = captured_seed(&client, "root", "entry.ts").await?;
+    let run = captured_seed(&client, "run", "entry.ts").await?;
+    for query in [
+        format!("ASK {{ <{derived}> :extends ?base . ?base :name 'Base' }}"),
+        format!("ASK {{ <{derived}> :contains ?member . ?member :name 'run' }}"),
+        format!("ASK {{ <{root}> :calls ?target . ?target :name 'leaf' }}"),
+        format!("ASK {{ <{run}> :overrides ?target }}"),
+        format!("ASK {{ <{run}> :reads ?target . ?target :name 'value' }}"),
+        format!("ASK {{ <{run}> :writes ?target . ?target :name 'value' }}"),
+        format!("ASK {{ <{run}> :hasType ?target . ?target :name 'Value' }}"),
+        "ASK { ?symbol :imports ?target }".into(),
+        "ASK { ?alias :name 'leaf'; :aliases ?target . ?target :name 'leaf' }".into(),
+    ] {
+        let params = QueryParams {
+            query,
+            language: QueryLanguage::Sparql,
+            page: 1,
+            max_results: 10,
+            revision: None,
+        };
+        let answer = query_after_population(&client, &params).await?;
+        assert_eq!(
+            answer["answer"],
+            json!({"result":"boolean", "value":true}),
+            "{params:?}: {answer}"
+        );
+    }
+    client.cancel().await?;
+    task.await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_edge_static_calls_agree_in_both_directions_and_with_flows() -> TestResult {
     let source = "export function root() { leaf(); }\nfunction leaf() { return 'zebraquartz'; }\n";
     let (_directory, client, task) = served_workspace(&[("entry.mjs", source)], None).await?;

@@ -116,7 +116,9 @@ impl WorkspaceSemantics {
         let mut paths = BTreeSet::new();
         for document in documents {
             if !paths.insert(document.path())
-                || captured.get(document.path()).copied() != Some(document.source())
+                || captured
+                    .get(document.path())
+                    .is_none_or(|source| source.len() != document.source().len())
             {
                 return errors::analysis::package_input_identity_invalid().fail();
             }
@@ -141,9 +143,14 @@ impl WorkspaceSemantics {
             .iter()
             .map(|document| &document.placement)
             .collect::<Vec<_>>();
-        let mut aliases = placed_aliases(&namespace, &selected, &placements, || {
-            errors::analysis::package_input_identity_invalid().error()
-        })?;
+        let mut aliases = placed_aliases(
+            &input,
+            &mut namespace,
+            &selected,
+            &placements,
+            declarations_max,
+            || errors::analysis::package_input_identity_invalid().error(),
+        )?;
         let mut outside_namespaces = BTreeSet::new();
         for document in &mut placed {
             let path = document.path.as_str();

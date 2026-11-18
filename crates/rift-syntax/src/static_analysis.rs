@@ -23,6 +23,15 @@ pub struct StaticCall {
     pub callee: StaticCallee,
 }
 
+/// One authored value access or type reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticReference {
+    /// Name or member expression naming the target.
+    pub target: ByteRange,
+    /// The source operation on that target.
+    pub role: rift_core::ReferenceRole,
+}
+
 /// Syntactic form of the callee in a captured call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaticCallee {
@@ -30,6 +39,8 @@ pub enum StaticCallee {
     Direct,
     /// Language-qualified path.
     Qualified,
+    /// Explicit constructor invocation.
+    Constructor,
     /// Named member on a simple receiver.
     Member {
         /// Receiver expression.
@@ -129,6 +140,14 @@ pub struct StaticInherentImpl {
 /// Collections retained by static syntax capture.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StaticFactsParts {
+    /// Value accesses and type references.
+    pub references: Vec<StaticReference>,
+    /// Runtime function expressions and their enclosing value ranges.
+    pub function_values: Vec<(ByteRange, ByteRange)>,
+    /// Function expressions that establish their own receiver.
+    pub function_scopes: Vec<ByteRange>,
+    /// Static class initialization blocks.
+    pub static_blocks: Vec<ByteRange>,
     /// Class and implementation headers.
     pub heritage_edges: Vec<HeritageEdge>,
     /// Authored calls.
@@ -152,6 +171,29 @@ pub struct StaticFactsParts {
 pub struct StaticFacts(StaticFactsParts);
 
 impl StaticFacts {
+    /// Captured value accesses and type references.
+    #[must_use]
+    pub fn references(&self) -> &[StaticReference] {
+        &self.0.references
+    }
+    /// Runtime function expressions and their enclosing value ranges.
+    #[must_use]
+    pub fn function_values(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.function_values
+    }
+
+    /// Function expressions that establish their own receiver.
+    #[must_use]
+    pub fn function_scopes(&self) -> &[ByteRange] {
+        &self.0.function_scopes
+    }
+
+    /// Static class initialization blocks.
+    #[must_use]
+    pub fn static_blocks(&self) -> &[ByteRange] {
+        &self.0.static_blocks
+    }
+
     /// Captured class and implementation edges.
     #[must_use]
     pub fn heritage_edges(&self) -> &[HeritageEdge] {
@@ -217,6 +259,10 @@ impl StaticFacts {
 
     pub(crate) fn retained_bytes(&self) -> usize {
         [
+            vector_capacity(&self.0.references),
+            vector_capacity(&self.0.function_values),
+            vector_capacity(&self.0.function_scopes),
+            vector_capacity(&self.0.static_blocks),
             vector_capacity(&self.0.heritage_edges),
             vector_capacity(&self.0.calls),
             vector_capacity(&self.0.bindings),
@@ -232,6 +278,10 @@ impl StaticFacts {
 
     pub(crate) fn validate(&self, source: &str, limits: SyntaxLimits) -> Result<(), RiftError> {
         let lengths = [
+            self.references().len(),
+            self.function_values().len(),
+            self.function_scopes().len(),
+            self.static_blocks().len(),
             self.heritage_edges().len(),
             self.calls().len(),
             self.bindings().len(),
@@ -264,6 +314,21 @@ impl StaticFacts {
                 )
         });
         let calls = self.calls().iter().all(|call| call.valid(valid));
+        let references = self.references().iter().all(|reference| {
+            valid(reference.target)
+                && matches!(
+                    reference.role,
+                    rift_core::ReferenceRole::Read
+                        | rift_core::ReferenceRole::Write
+                        | rift_core::ReferenceRole::Type
+                )
+        });
+        let functions = self
+            .function_values()
+            .iter()
+            .all(|(range, value)| valid(*range) && valid(*value) && contains(*value, *range))
+            && self.function_scopes().iter().copied().all(valid)
+            && self.static_blocks().iter().copied().all(valid);
         let bindings = self.bindings().iter().all(|binding| binding.valid(valid));
         let reexports = self
             .reexports()
@@ -276,6 +341,8 @@ impl StaticFacts {
         });
         let conditional = self.conditional_items().iter().copied().all(valid);
         if !(edges
+            && references
+            && functions
             && calls
             && bindings
             && reexports
@@ -295,7 +362,10 @@ impl StaticCall {
         let inside = |range| valid(range) && contains(self.callee_range, range);
         let member = match self.callee {
             StaticCallee::Member { receiver, member } => inside(receiver) && inside(member),
-            StaticCallee::Direct | StaticCallee::Qualified | StaticCallee::Unsupported => true,
+            StaticCallee::Direct
+            | StaticCallee::Qualified
+            | StaticCallee::Constructor
+            | StaticCallee::Unsupported => true,
         };
         valid(self.range)
             && inside(self.callee_range)

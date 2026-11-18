@@ -182,6 +182,9 @@ fn one(metadata: &str, path: &str, source: &str) -> BTreeMap<String, SymbolId> {
     )
     .remove(path)
     .unwrap_or_default()
+    .into_iter()
+    .filter(|(name, _)| name != ".")
+    .collect()
 }
 
 #[test]
