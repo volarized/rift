@@ -4,7 +4,7 @@ use crate::read::{ExactKind, FacetRegion, SourceExcerpt, SyntaxElement, TextRang
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// One kind: a declaration with its location, source, and syntax structure.
+/// One facet: a declaration with its location, source, and syntax structure.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FacetDeclaration {
