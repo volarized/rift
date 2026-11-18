@@ -77,7 +77,7 @@ pub(crate) fn serve_global_examples(tools: &mut [rmcp::model::Tool]) {
         let examples = match tool.name.as_ref() {
             "search" => json!([{ "query": GLOBAL_EXAMPLE_SEARCH }]),
             "get_symbol" => json!([
-                { "id": GLOBAL_EXAMPLE_SYMBOL, "include": ["documentation"] },
+                { "id": GLOBAL_EXAMPLE_SYMBOL, "include": {"documentation": true} },
                 { "id": GLOBAL_EXAMPLE_SYMBOL, "revision": GLOBAL_EXAMPLE_REVISION },
             ]),
             "facets" => json!([

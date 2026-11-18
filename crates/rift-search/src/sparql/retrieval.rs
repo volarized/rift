@@ -1,7 +1,5 @@
 //! Selects existing retrieval producers from explicit local SERVICE patterns.
 
-use std::collections::BTreeSet;
-
 use oxrdf::{
     NamedNode,
     vocab::{rdf, xsd},
@@ -129,7 +127,10 @@ fn prepare_flow_request(request: &mut SearchParams) -> Result<usize, RiftError> 
     request.scope = SearchScope::Local;
     request.target = SearchParamsTarget::Symbol;
     request.limit = Some(FLOW_RANKED_ROWS_MAX);
-    request.include = Some(vec![SearchInclude::Score]);
+    request.include = SearchInclude {
+        score: true,
+        ..SearchInclude::default()
+    };
     usize::try_from(limit).map_err(|error| invalid(&error.to_string()))
 }
 
@@ -138,7 +139,7 @@ fn request(
     flows: bool,
 ) -> Result<(SearchParams, ScopeChoice), RiftError> {
     let mut fields = Map::new();
-    let mut include = BTreeSet::new();
+    let mut include = Map::new();
     let mut pending = vec![(inner, true)];
     while let Some((pattern, required)) = pending.pop() {
         match pattern {
@@ -151,7 +152,7 @@ fn request(
                         continue;
                     };
                     if matches!(key, "source" | "score") {
-                        include.insert(key.to_owned());
+                        include.insert(key.to_owned(), Value::Bool(true));
                     }
                     if flows
                         && INPUT_FIELDS.contains(&key)
@@ -222,10 +223,7 @@ fn request(
         }
     }
     if !include.is_empty() && !fields.contains_key("include") {
-        fields.insert(
-            "include".to_owned(),
-            Value::Array(include.into_iter().map(Value::String).collect()),
-        );
+        fields.insert("include".to_owned(), Value::Object(include));
     }
     let scope_choice = if flows || fields.contains_key(SCOPE_FIELD) {
         ScopeChoice::Service
@@ -328,8 +326,11 @@ mod tests {
         assert_eq!(selection.request.target, SearchParamsTarget::Symbol);
         assert_eq!(selection.request.query.as_deref(), Some("middleware"));
         assert_eq!(
-            selection.request.include.as_deref(),
-            Some([SearchInclude::Score].as_slice())
+            selection.request.include,
+            SearchInclude {
+                score: true,
+                ..SearchInclude::default()
+            }
         );
         Ok(())
     }

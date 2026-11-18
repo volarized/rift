@@ -117,20 +117,23 @@ fn error_data_deserializes_with_diagnostics_and_causes_absent() -> TestResult {
 #[test]
 fn get_symbol_params_fill_documented_defaults() -> TestResult {
     let params: GetSymbolParams = serde_json::from_value(json!({ "name": "ReadService" }))?;
-    assert_eq!(params.include, Vec::<GetSymbolInclude>::new());
+    assert_eq!(params.include, GetSymbolInclude::default());
     assert_eq!(params.limit, 5);
     Ok(())
 }
 
-/// `include: ["history", "documentation"]` decodes to both entries.
+/// `include: {"history": true, "documentation": true}` decodes to both members.
 #[test]
-fn get_symbol_params_include_explicit_both_carries_both_entries() -> TestResult {
+fn get_symbol_params_include_explicit_both_carries_both_members() -> TestResult {
     let params: GetSymbolParams = serde_json::from_value(
-        json!({ "name": "ReadService", "include": ["history", "documentation"] }),
+        json!({ "name": "ReadService", "include": {"history": true, "documentation": true} }),
     )?;
     assert_eq!(
         params.include,
-        vec![GetSymbolInclude::History, GetSymbolInclude::Documentation]
+        GetSymbolInclude {
+            documentation: true,
+            history: true,
+        }
     );
     Ok(())
 }

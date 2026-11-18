@@ -1,9 +1,7 @@
 use std::collections::BTreeMap;
 
 use rift_error::{RiftError, errors};
-use rift_protocol::read::{
-    ReadWarning, SearchHit, SearchHitTarget, SearchInclude, SearchParams, SearchResult,
-};
+use rift_protocol::read::{ReadWarning, SearchHit, SearchHitTarget, SearchParams, SearchResult};
 use rift_protocol::symbol_read::CapturedView;
 use rift_ranking::{
     DocumentIdentity, QueryPhase, RankingInput, RankingInputKind, RankingWeights, fuse,
@@ -132,11 +130,7 @@ pub(crate) fn merge_candidate_pools(
             results_max,
         );
     }
-    let include_score = params
-        .include
-        .as_deref()
-        .unwrap_or_default()
-        .contains(&SearchInclude::Score);
+    let include_score = params.include.score;
     let mut hits = ranked
         .candidates()
         .iter()

@@ -277,28 +277,37 @@ pub struct GetSymbolHit {
     /// The 1-based source line where the declaration begins.
     #[schemars(range(min = 1_u64))]
     pub line: u64,
-    /// The symbol's timeline, present when `include` names `history`.
+    /// The symbol's timeline, present when `include.history` is `true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<SymbolHistory>,
-    /// Exact documentation references, present only when `include` names `documentation`.
+    /// Exact documentation references, present only when `include.documentation` is `true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub documentation: Option<crate::documentation::DocumentationContext>,
 }
 
-/// One optional `get_symbol` hit field the caller may opt into through `include`.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum GetSymbolInclude {
-    /// The hit's version-control timeline.
-    History,
-    /// Bounded documentation referring to the exact declaration.
-    Documentation,
+/// The optional `get_symbol` projections the caller opts into. An omitted member is `false`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+#[schemars(example = serde_json::json!({"documentation": true}))]
+pub struct GetSymbolInclude {
+    /// Attaches bounded documentation referring to the exact declaration.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub documentation: bool,
+    /// Attaches the symbol's version-control timeline.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub history: bool,
+}
+
+impl GetSymbolInclude {
+    /// Whether the caller opted into no projection.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        !self.documentation && !self.history
+    }
 }
 
 /// Gets declarations by name, with each declaration's location and the projections
-/// `include` names.
+/// `include` selects.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(extend("rift:since" = "v0.0.4"))]
@@ -306,7 +315,7 @@ pub enum GetSymbolInclude {
     {
         "name": "ReadService",
         "language": "rust",
-        "include": ["history"],
+        "include": {"history": true},
         "limit": 5,
         "page_index": 0
     },
@@ -359,10 +368,10 @@ pub struct GetSymbolParams {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 64))]
     pub packages: Vec<RequestedPackage>,
-    /// Optional hit fields to attach: `history`, `documentation`. Omitted or empty attaches
-    /// neither. A declaration's source is read by `facets` with `symbol`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub include: Vec<GetSymbolInclude>,
+    /// Optional hit fields to attach. Omitted attaches neither `history` nor
+    /// `documentation`. A declaration's source is read by `facets` with `symbol`.
+    #[serde(default, skip_serializing_if = "GetSymbolInclude::is_empty")]
+    pub include: GetSymbolInclude,
     /// Most hits to return in one page, at most 10,000; the server refuses a larger
     /// `limit` naming the field. The server's result bound caps the set itself, and an
     /// answer whose set reached it warns `results_truncated`.
@@ -3360,7 +3369,7 @@ mod tests {
         );
     }
 
-    /// An omitted `include` attaches no projection: the schema advertises no default list,
+    /// An omitted `include` attaches no projection: the schema advertises no default object,
     /// and the decoded request carries none.
     #[test]
     fn get_symbol_params_include_omitted_attaches_nothing() {
@@ -3383,18 +3392,18 @@ mod tests {
         );
     }
 
-    /// `include: ["source"]` names no `GetSymbolInclude` member: a declaration's source is
-    /// read by `facets`. A request naming it is refused at deserialization, and the refusal
-    /// names the accepted values.
+    /// `include: {"source": true}` names no `GetSymbolInclude` member: a declaration's source
+    /// is read by `facets`. A request naming it is refused at deserialization, and the refusal
+    /// names the accepted members.
     #[test]
     fn get_symbol_include_refuses_source_and_names_the_accepted_values() {
         let error = serde_json::from_value::<GetSymbolParams>(
-            json!({"name": "Beacon", "include": ["source"]}),
+            json!({"name": "Beacon", "include": {"source": true}}),
         )
-        .expect_err("`source` is no include entry");
+        .expect_err("`source` is no include member");
         let message = error.to_string();
         assert!(
-            message.contains("unknown variant `source`")
+            message.contains("unknown field `source`")
                 && message.contains("history")
                 && message.contains("documentation"),
             "{message}"

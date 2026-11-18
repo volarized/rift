@@ -1271,7 +1271,7 @@ pub(crate) mod tests {
         let params: SearchParams = serde_json::from_value(json!({
             "query": "ranch_b ranch_a",
             "target": "symbol",
-            "include": ["score"],
+            "include": {"score": true},
             "traversal": {
                 "seed": graph_identity("leaf").as_str()
             }

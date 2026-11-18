@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use reqwest::{StatusCode, Url};
 use rift_error::{RiftError, errors};
-use rift_protocol::feedback::{FeedbackDetail, FeedbackParams, FeedbackResult};
+use rift_protocol::feedback::{FeedbackParams, FeedbackResult};
 use serde::Serialize;
 
 pub(crate) const TOOL_NAME: &str = "feedback";
@@ -31,15 +31,10 @@ struct Details {
 
 impl From<FeedbackParams> for Report {
     fn from(params: FeedbackParams) -> Self {
-        let details = (!params.include_details.is_empty()).then(|| Details {
-            os: params
-                .include_details
-                .contains(&FeedbackDetail::Os)
-                .then_some(std::env::consts::OS),
-            rift_version: params
-                .include_details
-                .contains(&FeedbackDetail::RiftVersion)
-                .then_some(env!("CARGO_PKG_VERSION")),
+        let include = params.include;
+        let details = (!include.is_empty()).then(|| Details {
+            os: include.os.then_some(std::env::consts::OS),
+            rift_version: include.rift_version.then_some(env!("CARGO_PKG_VERSION")),
         });
         Self {
             text: params.text,
@@ -170,13 +165,13 @@ mod tests {
     fn report_only_carries_selected_diagnostics() -> TestResult {
         let text = "  Unexpected result: λ\n";
         for (requested, expected) in [
-            (vec![], json!({"text": text})),
+            (json!({}), json!({"text": text})),
             (
-                vec!["os"],
+                json!({"os": true, "rift_version": false}),
                 json!({"text": text, "details": {"os": std::env::consts::OS}}),
             ),
             (
-                vec!["rift_version", "os"],
+                json!({"rift_version": true, "os": true}),
                 json!({"text": text, "details": {
                     "os": std::env::consts::OS,
                     "rift_version": env!("CARGO_PKG_VERSION")
@@ -184,7 +179,7 @@ mod tests {
             ),
         ] {
             let params = serde_json::from_value::<FeedbackParams>(
-                json!({"text": text, "include_details": requested}),
+                json!({"text": text, "include": requested}),
             )?;
             assert_eq!(serde_json::to_value(Report::from(params))?, expected);
         }

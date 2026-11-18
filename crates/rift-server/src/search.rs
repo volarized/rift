@@ -36,8 +36,8 @@ use rift_index::{
 use rift_protocol::read::{
     CHANGE_BASE_FIELD, CHANGE_HEAD_FIELD, MatchedField, PathPattern, PathSelector,
     ProjectPath as WireProjectPath, ReadWarning, ResultOrder, RevisionId, SOURCE_WARNINGS_MAX,
-    SearchChange, SearchHit, SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget,
-    SearchResult, SearchScope, SearchTraversal, Symbol, SymbolId,
+    SearchChange, SearchHit, SearchHitTarget, SearchParams, SearchParamsTarget, SearchResult,
+    SearchScope, SearchTraversal, Symbol, SymbolId,
 };
 use rift_ranking::{
     DocumentIdentity, DocumentKind, DocumentLocation, FileRowFrequencies, FusedCandidate,
@@ -761,10 +761,9 @@ impl HitPayloads {
     }
 
     fn requested(params: &SearchParams) -> Self {
-        let include = params.include.as_deref().unwrap_or_default();
         Self {
-            source: include.contains(&SearchInclude::Source),
-            score: include.contains(&SearchInclude::Score),
+            source: params.include.source,
+            score: params.include.score,
             defer_line: true,
         }
     }
@@ -2305,7 +2304,7 @@ impl Tower {
         for order in ["relevance", "identity", "path"] {
             let mut request = json!({
                 "query": "page", "target": "symbol", "limit": 10,
-                "order": order, "include": ["source", "score"],
+                "order": order, "include": {"source": true, "score": true},
                 "paths": {"force_include": ["forced.rs"]}
             });
             let full = service.search(&serde_json::from_value(request.clone())?, &store)?;
@@ -2464,7 +2463,7 @@ impl Tower {
         let params: SearchParams = serde_json::from_value(json!({
             "query": "Beacon",
             "limit": 4,
-            "include": ["score"]
+            "include": {"score": true}
         }))?;
         let result = service.search(&params, &store)?;
         let documentation: Vec<_> = result
@@ -2812,7 +2811,7 @@ impl Tower {
         let params: SearchParams = serde_json::from_value(json!({
             "query": "Beacon",
             "target": "symbol",
-            "include": ["source"],
+            "include": {"source": true},
             "limit": 1
         }))?;
         let answer = service.search(&params, &StoreAnswer::identifier_only())?;
@@ -2889,7 +2888,7 @@ impl Tower {
             "query": "beacon",
             "target": "symbol",
             "limit": 10,
-            "include": ["score"]
+            "include": {"score": true}
         }))?;
         let result = service.search(&params, &StoreAnswer::identifier_only())?;
         let scores: Vec<Option<f64>> = result.results.iter().map(|hit| hit.score).collect();
@@ -3144,7 +3143,7 @@ impl Tower {
         let params: SearchParams = serde_json::from_value(json!({
             "query": "lookout marker",
             "target": "file",
-            "include": ["source"]
+            "include": {"source": true}
         }))?;
         let value = serde_json::to_value(service.search(&params, &store)?)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
@@ -4588,8 +4587,9 @@ impl Tower {
     async fn search_answers_every_identity_the_store_ranked() -> TestResult {
         let (directory, service) = fixture()?;
         let store = answered(&directory.path().join("search.db"), &service, "Beacon").await?;
-        let params: SearchParams =
-            serde_json::from_value(json!({"query": "Beacon", "include": ["score"], "limit": 50}))?;
+        let params: SearchParams = serde_json::from_value(
+            json!({"query": "Beacon", "include": {"score": true}, "limit": 50}),
+        )?;
         let answer = service.search(&params, &store)?;
         let identities = hit_identities(&answer);
         for input in store.precise() {

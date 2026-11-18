@@ -76,7 +76,7 @@ fn mixed_search_request() -> PackageSearchRequest {
 
 fn mixed_symbol_request() -> GetSymbolParams {
     let mut request = symbol_request();
-    request.include = vec![GetSymbolInclude::Documentation];
+    request.include.documentation = true;
     request
 }
 
@@ -229,7 +229,7 @@ async fn native_http_stored_context_refuses_wrong_targets_revisions_and_duplicat
 fn request() -> PackageSearchRequest {
     let mut value = search_request();
     value.target = Some(PackageSearchRequestTarget::Documentation);
-    value.include = Some(vec!["source".to_owned()]);
+    value.include = Some(crate::PackageSearchRequestInclude { source: Some(true) });
     value
 }
 
@@ -377,7 +377,7 @@ async fn symbol_context_matches_requested_symbol_and_revision() {
         .await
         .expect("valid context");
     let mut absent = request.clone();
-    absent.include.clear();
+    absent.include = GetSymbolInclude::default();
     assert!(
         canonical_symbol_response(value.clone(), &absent, SOURCE_BYTES_MAX)
             .await

@@ -88,9 +88,7 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
         "{context}: {structured:#}"
     );
     if name == "get_symbol" {
-        let include = request.get("include").and_then(Value::as_array);
-        let expects_history =
-            include.is_some_and(|entries| entries.contains(&Value::from("history")));
+        let expects_history = request["include"]["history"] == Value::Bool(true);
         for hit in structured["declarations"].as_array().into_iter().flatten() {
             assert!(
                 hit.get("source").is_none() && hit.get("syntax_element").is_none(),
@@ -400,7 +398,7 @@ async fn absent_request(
         rift_protocol::read::Language::from_identity_segment(language)?,
         path,
     )?;
-    let mut request = json!({"id":missing.wire_identity(),"include":[]});
+    let mut request = json!({"id":missing.wire_identity(),"include":{}});
     if let Some(revision) = revision {
         request["revision"] = json!(format!("rift://revision/git/{revision}"));
     }
@@ -596,7 +594,7 @@ async fn get_symbol_configured_work_preserves_named_miss_and_exact_hits() -> Tes
     let result = client
         .call_tool(tools_call_request(
             "get_symbol",
-            &json!({"id":exact_id,"include":[]}),
+            &json!({"id":exact_id,"include":{}}),
         )?)
         .await?;
     assert!(!result.is_error.unwrap_or(false));
@@ -722,9 +720,9 @@ async fn get_symbol_miss_uses_requested_revision_and_remote_matches_clear_the_wa
     assert_eq!(answer["symbol"]["id"], remote["id"]);
     assert!(answer.get("symbol_not_found").is_none());
     for request in [
-        json!({"query":"helper_beacon","scope":"global","include":[]}),
-        json!({"query":"helper_beacon","scope":"all","include":[]}),
-        json!({"query":"helper_beacon","scope":"all","include":[],"limit":1,"page_index":100}),
+        json!({"query":"helper_beacon","scope":"global","include":{}}),
+        json!({"query":"helper_beacon","scope":"all","include":{}}),
+        json!({"query":"helper_beacon","scope":"all","include":{},"limit":1,"page_index":100}),
     ] {
         let request = serde_json::to_value(workspace_client::query::retrieval(
             &serde_json::from_value(request.clone())?,
@@ -1024,7 +1022,7 @@ async fn assert_complete_remote_binding(
     let (_complete, complete_client, complete_task) =
         served_fixture_with_setup(None, None, false, true).await?;
     let request = workspace_client::query::retrieval(&serde_json::from_value(json!({
-        "query":"helper_beacon", "scope":"global", "include":["source"]
+        "query":"helper_beacon", "scope":"global", "include":{"source": true}
     }))?)?;
     let request = serde_json::to_value(request)?;
     let (input, output) = validators.get("search").ok_or("search validators")?;

@@ -54,7 +54,7 @@ async fn served_tool_failures_are_completed_error_results() -> TestResult {
         ("facets", json!({ "path": "missing.rs", "position": 0 })),
         (
             "get_symbol",
-            json!({ "name": "beacon", "include": ["history"] }),
+            json!({ "name": "beacon", "include": {"history": true} }),
         ),
         (
             "get_symbol",
@@ -134,7 +134,7 @@ async fn failing_observed_symbol_error(
     let (client, server_task) = workspace_client::served_root(root).await?;
     let answer = workspace_client::search_after_population(
         &client,
-        &json!({"query": "beacon", "target": "symbol", "include": ["source"]}),
+        &json!({"query": "beacon", "target": "symbol", "include": {"source": true}}),
     )
     .await?;
     let results = answer["results"]
@@ -195,7 +195,8 @@ async fn symbol_history_without_a_repository_names_the_remedy() -> TestResult {
         hermetic_search::HERMETIC_TABLES,
     )?;
     let failure =
-        failing_observed_symbol_error(directory.path(), json!({ "include": ["history"] })).await?;
+        failing_observed_symbol_error(directory.path(), json!({ "include": {"history": true} }))
+            .await?;
     assert_eq!(failure.code, ErrorCode::CapabilityUnavailable);
     assert_eq!(failure.retry, RetryDirective::OperatorAction);
     let message = &failure.message;
@@ -206,8 +207,8 @@ async fn symbol_history_without_a_repository_names_the_remedy() -> TestResult {
     Ok(())
 }
 
-/// `get_symbol` serves no declaration source: `include: ["source"]` names no projection,
-/// so the served schema refuses it like any unknown value, naming the accepted ones.
+/// `get_symbol` serves no declaration source: `include: {"source": true}` names no
+/// projection, so the served schema refuses it like any unknown member.
 #[tokio::test]
 async fn symbol_source_include_is_refused_as_an_unknown_value() -> TestResult {
     let directory = tempfile::tempdir()?;
@@ -217,7 +218,8 @@ async fn symbol_source_include_is_refused_as_an_unknown_value() -> TestResult {
         hermetic_search::HERMETIC_TABLES,
     )?;
     let failure =
-        failing_observed_symbol_error(directory.path(), json!({ "include": ["source"] })).await?;
+        failing_observed_symbol_error(directory.path(), json!({ "include": {"source": true} }))
+            .await?;
     assert_eq!(failure.code, ErrorCode::InvalidRequest);
     assert_eq!(failure.retry, RetryDirective::Never);
     let message = &failure.message;
@@ -248,7 +250,8 @@ async fn symbol_history_with_history_disabled_is_refused() -> TestResult {
         ),
     )?;
     let failure =
-        failing_observed_symbol_error(directory.path(), json!({ "include": ["history"] })).await?;
+        failing_observed_symbol_error(directory.path(), json!({ "include": {"history": true} }))
+            .await?;
     assert_eq!(failure.code, ErrorCode::CapabilityUnavailable);
     let message = &failure.message;
     assert!(

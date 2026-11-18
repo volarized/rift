@@ -3,9 +3,7 @@ use rift_error::RiftError;
 
 use rift_protocol::{
     identity::{SymbolIdentity, SymbolOwner},
-    read::{
-        GetSymbolInclude, Language, PAGE_LIMIT_MAX, SourceKind, SourceLocationKind, SymbolOrigin,
-    },
+    read::{Language, PAGE_LIMIT_MAX, SourceKind, SourceLocationKind, SymbolOrigin},
     symbol_read::{GetSymbolParams, GetSymbolResult},
 };
 
@@ -35,7 +33,7 @@ impl GlobalClient {
             }
             validate_request(request)?;
             let capabilities = self.get_capabilities().await?;
-            if request.include.contains(&GetSymbolInclude::Documentation)
+            if request.include.documentation
                 && !supports_feature(&capabilities, SYMBOL_DOCUMENTATION_FEATURE)
             {
                 return Err(failure::configuration_invalid(
@@ -186,9 +184,9 @@ fn valid_result(
                         })
                     })
                 })
-                && (history.is_none() || request.include.contains(&GetSymbolInclude::History))
+                && (history.is_none() || request.include.history)
                 && documentation.as_ref().is_none_or(|context| {
-                    request.include.contains(&GetSymbolInclude::Documentation)
+                    request.include.documentation
                         && valid_documentation(
                             context,
                             &request.id,

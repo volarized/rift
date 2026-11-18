@@ -2377,9 +2377,8 @@ impl RiftMcp {
         result
     }
 
-    /// Evaluate SPARQL over captured code facts. Use `SERVICE :search` for text and regex
-    /// retrieval and `SERVICE :flows` for call paths around ranked symbols. Continue a
-    /// paged answer with its `next_query`.
+    /// Performs search across the index using a query language. `language` names the query
+    /// language and defaults to `sparql`.
     #[tool(name = "search")]
     async fn search_query(
         &self,
@@ -5465,7 +5464,7 @@ done
         let client = ().serve(client_transport).await?;
         let request =
             CallToolRequestParams::new("search_retrieval").with_arguments(arguments(&json!({
-                "pattern": "beacon", "target": "symbol", "scope": "local", "include": ["source"]
+                "pattern": "beacon", "target": "symbol", "scope": "local", "include": {"source": true}
             }))?);
         let answer = client.call_tool(request.clone()).await?;
         let partial: SearchResult = serde_json::from_value(
@@ -5885,7 +5884,7 @@ done
     /// Reads physical declarations through the public pattern search without requiring identity.
     async fn search_symbols(server: &RiftMcp, name: &str) -> Result<SearchResult, rmcp::ErrorData> {
         let params = serde_json::from_value(json!({
-            "pattern": name, "target": "symbol", "scope": "local", "include": ["source"]
+            "pattern": name, "target": "symbol", "scope": "local", "include": {"source": true}
         }))
         .expect("test search parameters must deserialize");
         server
@@ -8118,7 +8117,7 @@ done
         let published = current_publication(server).await;
         let id = captured_traversal_seed(&published.reads, "beacon")?;
         let params = serde_json::from_value(json!({
-            "id": id, "include": ["history"]
+            "id": id, "include": {"history": true}
         }))?;
         let answer = tokio::time::timeout(
             UNWAITED_READ_MAX,

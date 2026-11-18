@@ -960,7 +960,7 @@ async fn test_global_prose_search_preserves_broad_full_text_order() -> TestResul
             "query": global_api::BROAD_BODY_MATCH_QUERY,
             "scope": "global",
             "limit": limit,
-            "include": ["source", "score"]
+            "include": {"source": true, "score": true}
         });
         let answer = call_tool(&client, "search", request).await?;
         let results = answer["results"]
@@ -1068,7 +1068,7 @@ async fn a_page_stopped_at_the_body_bound_answers_without_following_its_cursor()
     let answer = call_tool(
         &client,
         "search",
-        json!({"query":"helper_beacon demo","scope":"global","include":["source"]}),
+        json!({"query":"helper_beacon demo","scope":"global","include":{"source": true}}),
     )
     .await?;
     assert!(
@@ -1177,7 +1177,7 @@ async fn a_package_scoped_pattern_answers_package_matches_from_one_request() -> 
             "pattern": r"fn helper_\w+",
             "scope": "global",
             "target": "all",
-            "include": ["source"]
+            "include": {"source": true}
         }),
     )
     .await?;
@@ -1238,7 +1238,7 @@ async fn a_package_scoped_pattern_answers_package_matches_from_one_request() -> 
             &json!({
                 "pattern": r"fn helper_\w+",
                 "packages": [{"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"}],
-                "include": ["source"]
+                "include": {"source": true}
             }),
             &json!({
                 "pattern": r"fn \w*beacon",
@@ -2378,7 +2378,7 @@ async fn an_unadvertised_feature_answers_project_hits_with_capability_unavailabl
         client
             .call_tool(tool_request(
                 "get_symbol",
-                &json!({"id": id, "include": ["documentation"]}),
+                &json!({"id": id, "include": {"documentation": true}}),
             ))
             .await,
     )?;
@@ -2458,7 +2458,7 @@ async fn a_pattern_beside_packages_matches_the_requested_release() -> TestResult
             "pattern": r"fn helper_\w+",
             "scope": "global",
             "target": "all",
-            "include": ["source"],
+            "include": {"source": true},
             "packages": [{"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"}]
         }),
     )
@@ -2479,7 +2479,7 @@ async fn a_pattern_beside_packages_matches_the_requested_release() -> TestResult
         [json!({
             "pattern": r"fn helper_\w+",
             "packages": [{"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"}],
-            "include": ["source"]
+            "include": {"source": true}
         })]
     );
     drop(directory);
@@ -2494,7 +2494,7 @@ async fn test_identifier_case_precedes_documentation_frequency() -> TestResult {
     let source = "/// searchHit searchHit searchHit searchHit\npub fn SearchHit() {}\npub fn searchHit() {}\n";
     let (_directory, client, server_task) =
         served_workspace(&[("src/lib.rs", source)], None).await?;
-    let request = json!({"query": "searchHit", "limit": 1, "include": ["source"]});
+    let request = json!({"query": "searchHit", "limit": 1, "include": {"source": true}});
     let answer = workspace_client::search_after_population(&client, &request).await?;
     assert_eq!(
         answer["results"][0]["hit"]["symbol"]["name"], "searchHit",
@@ -2562,7 +2562,7 @@ async fn test_identifier_case_pairs_rank_exact_spelling_through_mcp() -> TestRes
             assert_original_identifier(&client, scope, name).await?;
         }
         let args =
-            json!({"query": "SEARCHHIT", "scope": scope, "limit": 10, "include": ["source"]});
+            json!({"query": "SEARCHHIT", "scope": scope, "limit": 10, "include": {"source": true}});
         let answer = call_tool(&client, "search", args).await?;
         let hits = answer["results"]
             .as_array()
@@ -2621,7 +2621,7 @@ async fn assert_original_identifier(
     scope: &str,
     name: &str,
 ) -> TestResult {
-    let args = json!({"query": name, "scope": scope, "limit": 1, "include": ["source"]});
+    let args = json!({"query": name, "scope": scope, "limit": 1, "include": {"source": true}});
     let answer = call_tool(client, "search", args).await?;
     let hits = answer["results"]
         .as_array()
@@ -2704,7 +2704,7 @@ fn case_search_request(query: &str) -> TestResult<rift_cloud_client::PackageSear
                 .map(|candidate| candidate.text().to_owned())
                 .collect(),
         ),
-        include: Some(vec!["source".to_owned()]),
+        include: Some(rift_cloud_client::PackageSearchRequestInclude { source: Some(true) }),
         packages: Some(vec![rift_cloud_client::PackageIdentity {
             manager: "cargo".to_owned(),
             registry: "crates.io".to_owned(),
@@ -2726,7 +2726,8 @@ async fn test_qualified_identifier_case_ranks_original_spelling() -> TestResult 
     let (_directory, client, server_task) =
         served_workspace(&[("src/lib.rs", source)], None).await?;
     for name in ["createProgram", "createprogram"] {
-        let args = json!({"query": format!("Vault::{name}"), "limit": 1, "include": ["source"]});
+        let args =
+            json!({"query": format!("Vault::{name}"), "limit": 1, "include": {"source": true}});
         let answer = call_tool(&client, "search", args).await?;
         assert_eq!(
             answer["results"][0]["hit"]["symbol"]["name"], name,

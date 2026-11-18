@@ -115,17 +115,17 @@ pub struct CapturedView {
 #[serde(deny_unknown_fields)]
 #[schemars(extend("rift:since" = "v0.0.4"))]
 #[schemars(extend("examples" = [
-    {"id": "rift://symbol/local/rust/app/parser/parse", "include": ["documentation"]}
+    {"id": "rift://symbol/local/rust/app/parser/parse", "include": {"documentation": true}}
 ]))]
 pub struct GetSymbolParams {
     /// Canonical identity. Ownership and language come from this address.
     #[serde(deserialize_with = "deserialize_symbol_id")]
     #[schemars(with = "crate::identity::SymbolIdentity")]
     pub id: SymbolId,
-    /// Requested projections. Omitted or empty requests none. A declaration's source is read
-    /// by `facets` with `symbol`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub include: Vec<GetSymbolInclude>,
+    /// Requested projections. Omitted requests none. A declaration's source is read by
+    /// `facets` with `symbol`.
+    #[serde(default, skip_serializing_if = "GetSymbolInclude::is_empty")]
+    pub include: GetSymbolInclude,
     /// The revision to read. A git revision reads that commit of a project, a tree
     /// revision reads the served working tree, and a release revision selects the release
     /// of a package or runtime `id`'s owner. Omitted reads the served working tree, or for

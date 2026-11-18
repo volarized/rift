@@ -2452,42 +2452,45 @@
       "description": "Sends a feedback report over HTTPS to the public Rift intake, or to the intake that\n`RIFT_FEEDBACK_URL` names in the server's environment. The server sends the\ncaller's text and any selected diagnostic fields. The caller MUST omit secrets,\npersonal data, and private source material. The caller MUST obtain the user's\napproval for any exact conversation excerpt before including it in a report.",
       "input_schema": {
         "$defs": {
-          "FeedbackDetail": {
-            "description": "One optional detail the caller may send with a feedback report.",
-            "oneOf": [
+          "FeedbackInclude": {
+            "additionalProperties": false,
+            "description": "The diagnostic fields the caller elects to send with a feedback report. An omitted member\nis `false`.",
+            "examples": [
               {
-                "const": "os",
-                "description": "Operating system name, such as `linux`.",
-                "type": "string"
-              },
-              {
-                "const": "rift_version",
-                "description": "Rift's package version, such as `0.0.78`.",
-                "type": "string"
+                "os": true,
+                "rift_version": true
               }
-            ]
+            ],
+            "properties": {
+              "os": {
+                "default": false,
+                "description": "Sends the operating system name, such as `linux`.",
+                "type": "boolean"
+              },
+              "rift_version": {
+                "default": false,
+                "description": "Sends Rift's package version, such as `0.0.78`.",
+                "type": "boolean"
+              }
+            },
+            "type": "object"
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "additionalProperties": false,
         "examples": [
           {
-            "include_details": [
-              "os",
-              "rift_version"
-            ],
+            "include": {
+              "os": true,
+              "rift_version": true
+            },
             "text": "The facets tool returned an empty result for a symbol it found."
           }
         ],
         "properties": {
-          "include_details": {
-            "description": "Diagnostic fields to send alongside `text`. Omitted or empty sends no diagnostic fields.",
-            "items": {
-              "$ref": "#/$defs/FeedbackDetail"
-            },
-            "maxItems": 2,
-            "type": "array",
-            "uniqueItems": true
+          "include": {
+            "$ref": "#/$defs/FeedbackInclude",
+            "description": "Diagnostic fields to send alongside `text`. Omitted sends no diagnostic field."
           },
           "text": {
             "description": "Report text sent verbatim. The caller MUST send nonblank text of at most 4096 UTF-8 bytes.",
@@ -2529,19 +2532,24 @@
       "input_schema": {
         "$defs": {
           "GetSymbolInclude": {
-            "description": "One optional `get_symbol` hit field the caller may opt into through `include`.",
-            "oneOf": [
+            "additionalProperties": false,
+            "description": "The optional `get_symbol` projections the caller opts into. An omitted member is `false`.",
+            "examples": [
               {
-                "const": "history",
-                "description": "The hit's version-control timeline.",
-                "type": "string"
-              },
-              {
-                "const": "documentation",
-                "description": "Bounded documentation referring to the exact declaration.",
-                "type": "string"
+                "documentation": true
               }
-            ]
+            ],
+            "properties": {
+              "documentation": {
+                "description": "Attaches bounded documentation referring to the exact declaration.",
+                "type": "boolean"
+              },
+              "history": {
+                "description": "Attaches the symbol's version-control timeline.",
+                "type": "boolean"
+              }
+            },
+            "type": "object"
           },
           "Revision": {
             "description": "One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.",
@@ -2582,9 +2590,9 @@
         "examples": [
           {
             "id": "rift://symbol/local/rust/app/parser/parse",
-            "include": [
-              "documentation"
-            ]
+            "include": {
+              "documentation": true
+            }
           }
         ],
         "properties": {
@@ -2607,11 +2615,8 @@
             "description": "Canonical identity. Ownership and language come from this address."
           },
           "include": {
-            "description": "Requested projections. Omitted or empty requests none. A declaration's source is read\nby `facets` with `symbol`.",
-            "items": {
-              "$ref": "#/$defs/GetSymbolInclude"
-            },
-            "type": "array"
+            "$ref": "#/$defs/GetSymbolInclude",
+            "description": "Requested projections. Omitted requests none. A declaration's source is read by\n`facets` with `symbol`."
           },
           "revision": {
             "$ref": "#/$defs/Revision",
@@ -6116,7 +6121,7 @@
       }
     },
     {
-      "description": "Evaluate SPARQL over captured code facts. Use `SERVICE :search` for text and regex\nretrieval and `SERVICE :flows` for call paths around ranked symbols. Continue a\npaged answer with its `next_query`.",
+      "description": "Performs search across the index using a query language. `language` names the query\nlanguage and defaults to `sparql`.",
       "input_schema": {
         "$defs": {
           "QueryLanguage": {
@@ -6145,10 +6150,10 @@
           "language": {
             "$ref": "#/$defs/QueryLanguage",
             "default": "sparql",
-            "description": "Currently, only SPARQL is supported."
+            "description": "The language of `query`. Omitted, `sparql`, the only language the server evaluates."
           },
           "query": {
-            "description": "Query text.",
+            "description": "Query text in `language`. A SPARQL query uses `SERVICE :search` for text and regex\nretrieval and `SERVICE :flows` for call paths around ranked symbols.",
             "type": "string"
           }
         },

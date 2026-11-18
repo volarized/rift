@@ -1027,9 +1027,7 @@ fn matched_declarations(
 }
 
 fn includes_source(request: &Value) -> bool {
-    request["include"]
-        .as_array()
-        .is_some_and(|fields| fields.iter().any(|field| field == "source"))
+    request["include"]["source"] == Value::Bool(true)
 }
 
 /// The wire spelling of `class`, and the field it was proved against.

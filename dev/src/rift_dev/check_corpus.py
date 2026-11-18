@@ -263,9 +263,9 @@ def corpus_request(parameters: JsonObject) -> JsonObject:
     columns = list(CORPUS_COLUMNS)
     if parameters.get("target") == "file":
         columns.extend(("target", "size"))
-    for include in array_value(parameters.get("include", []), "retrieval include"):
-        field = string_value(include, "retrieval field")
-        if field in {"source", "score"}:
+    include = object_value(parameters.get("include", {}), "retrieval include")
+    for field in ("source", "score"):
+        if include.get(field) is True:
             columns.append(field)
     return retrieval_request(parameters, columns)
 
@@ -1331,7 +1331,7 @@ class Corpus:
                 "query": "corpus_probe",
                 "target": "symbol",
                 "paths": {"include": [PROBE_PATH]},
-                "include": ["source"],
+                "include": {"source": True},
                 "limit": 5,
             }
         )
@@ -1720,7 +1720,7 @@ class Corpus:
                 answer = await settled_local(
                     client,
                     "get_symbol",
-                    {"id": identity, "include": ["history"]},
+                    {"id": identity, "include": {"history": True}},
                 )
                 require(answer.get("outcome") == "found", "shallow class was not found")
                 require(

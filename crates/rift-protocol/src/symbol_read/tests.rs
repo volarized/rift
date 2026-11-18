@@ -41,18 +41,27 @@ fn exact_requests_validate_identity_and_reject_removed_fields() {
     assert_eq!(request.declaration_cursor, None);
     assert_eq!(request.revision, None);
     let empty: GetSymbolParams =
-        serde_json::from_value(json!({"id": ID, "include": []})).expect("valid fixture");
+        serde_json::from_value(json!({"id": ID, "include": {}})).expect("valid fixture");
     assert!(empty.include.is_empty());
     let history: GetSymbolParams =
-        serde_json::from_value(json!({"id": ID, "include": ["history"]})).expect("valid fixture");
-    assert_eq!(history.include, [GetSymbolInclude::History]);
+        serde_json::from_value(json!({"id": ID, "include": {"history": true}}))
+            .expect("valid fixture");
+    assert_eq!(
+        history.include,
+        GetSymbolInclude {
+            history: true,
+            ..GetSymbolInclude::default()
+        }
+    );
     let source =
-        serde_json::from_value::<GetSymbolParams>(json!({"id": ID, "include": ["source"]}))
+        serde_json::from_value::<GetSymbolParams>(json!({"id": ID, "include": {"source": true}}))
             .expect_err("a declaration's source is read by `facets`, never through `include`");
     assert!(
-        source.to_string().contains("unknown variant `source`"),
+        source.to_string().contains("unknown field `source`"),
         "{source}"
     );
+    serde_json::from_value::<GetSymbolParams>(json!({"id": ID, "include": ["history"]}))
+        .expect_err("`include` is an object, never an array");
 
     for field in [
         "name",

@@ -1207,13 +1207,6 @@ fn test_request_relationships_are_validated_before_transport() {
         "prefix",
     );
     let mut search = search_request();
-    search.include = Some(vec!["score".to_owned()]);
-    assert_registered_field(
-        &(validate_search_request(&search)).expect_err("registered refusal"),
-        "rift.client.request_invalid",
-        "include",
-    );
-    let mut search = search_request();
     search.phase = Some(PackageSearchRequestPhase::Broad);
     assert_registered_field(
         &(validate_search_request(&search)).expect_err("registered refusal"),
@@ -1283,7 +1276,7 @@ async fn test_documentation_request_requires_advertised_capability() {
     assert!(validate_search_request_for_capabilities(&request, 20, None, &capabilities).is_ok());
 
     let mut symbol = symbol_request();
-    symbol.include = vec![GetSymbolInclude::Documentation];
+    symbol.include.documentation = true;
     let (server, client) = operation_client(OperationFixture::Valid).await;
     let error = client
         .get_symbol(&symbol)
@@ -3131,7 +3124,7 @@ async fn test_fixture_enforces_active_server_bounds() {
 
     let (server, client) = operation_client(OperationFixture::TightSourceBound).await;
     let mut request = search_request();
-    request.include = Some(vec!["source".to_owned()]);
+    request.include = Some(crate::PackageSearchRequestInclude { source: Some(true) });
     assert_registered_field(
         &(client.search_packages(&request, 20, None).await).expect_err("registered refusal"),
         "rift.client.response_invalid",
@@ -3166,16 +3159,16 @@ fn generated_exact_symbol_shapes_keep_shared_requests_and_typed_outcomes() {
     use rift_protocol::symbol_read::{GetSymbolParams, GetSymbolResult};
     const ID: &str = "rift://symbol/cargo/crates.io/tokio/rust/tokio/Beacon";
     let request: GetSymbolParams = serde_json::from_value(json!({
-        "id": ID, "include": ["history", "documentation"], "declaration_limit": 5,
+        "id": ID, "include": {"history": true, "documentation": true}, "declaration_limit": 5,
     }))
     .expect("shared request");
     let wire = serde_json::to_value(&request).expect("shared request encoding");
     let generated = crate::generated::GetSymbolParams {
         id: request.id.as_str().to_owned(),
-        include: Some(vec![
-            crate::generated::GetSymbolInclude::History,
-            crate::generated::GetSymbolInclude::Documentation,
-        ]),
+        include: Some(crate::generated::GetSymbolInclude {
+            documentation: Some(true),
+            history: Some(true),
+        }),
         declaration_limit: Some(request.declaration_limit),
         declaration_cursor: request.declaration_cursor.clone(),
         revision: request.revision.as_ref().map(ToString::to_string),
@@ -3186,7 +3179,13 @@ fn generated_exact_symbol_shapes_keep_shared_requests_and_typed_outcomes() {
     );
     assert_eq!(generated.id, request.id.as_str());
     assert_eq!(generated.declaration_limit, Some(5));
-    assert_eq!(generated.include.expect("requested includes").len(), 2);
+    assert_eq!(
+        generated.include,
+        Some(crate::generated::GetSymbolInclude {
+            documentation: Some(true),
+            history: Some(true),
+        })
+    );
     for value in [
         json!({"outcome": "found", "symbol": {"id": ID, "language": "rust", "name": "Beacon", "kind": "struct"}, "revision": "rift://revision/cargo/crates.io/tokio@1.50.0", "declarations": []}),
         json!({"outcome": "missing", "symbol_not_found": {"id": ID, "alternatives": []}, "revision": "rift://revision/cargo/crates.io/tokio@1.50.0"}),

@@ -1193,9 +1193,8 @@ pub struct PackageSearchRequest {
     /// Identifier candidates of `query`, in the order Rift extracts them. The server refuses a request whose list differs from the candidates it extracts from `query`.
     #[validate(length(max = 16u64))]
     pub identifiers: Option<Vec<String>>,
-    /// Optional fields to include.
-    #[validate(length(max = 1u64))]
-    pub include: Option<Vec<String>>,
+    /// Optional fields to include. An omitted member is `false`.
+    pub include: Option<PackageSearchRequestInclude>,
     /// Selected exact package versions. Omitted or empty, use the newest collected stable version of each package, or its newest prerelease when no stable version is collected.
     #[validate(length(max = 20_000u64), nested)]
     pub packages: Option<Vec<PackageIdentity>>,
@@ -1343,9 +1342,8 @@ pub struct PackagePatternRequest {
     /// Selected exact package versions. Omitted or empty, use the newest collected stable version of each package, or its newest prerelease when no stable version is collected.
     #[validate(length(max = 20_000u64), nested)]
     pub packages: Option<Vec<PackageIdentity>>,
-    /// Optional fields to include.
-    #[validate(length(max = 1u64))]
-    pub include: Option<Vec<String>>,
+    /// Optional fields to include. An omitted member is `false`.
+    pub include: Option<PackagePatternRequestInclude>,
 }
 /// The smallest declaration whose range holds a match. A match no declaration holds carries none.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
@@ -1361,7 +1359,7 @@ pub struct PackagePatternDeclaration {
     pub range: TextRange,
     /// One-based source line containing the declaration.
     pub line: i64,
-    /// The declaration's source, when the request includes `source`.
+    /// The declaration's source, when `include.source` is `true`.
     pub source: Option<String>,
     /// Additional properties not defined in the schema.
     #[serde(flatten)]
@@ -1386,7 +1384,7 @@ pub struct PackagePatternHit {
     pub size: i64,
     /// The smallest declaration whose range holds a match. A match no declaration holds carries none.
     pub declaration: Option<PackagePatternDeclaration>,
-    /// The line where the match begins, without its line ending, when the request includes `source`.
+    /// The line where the match begins, without its line ending, when `include.source` is `true`.
     pub source: Option<String>,
     /// Additional properties not defined in the schema.
     #[serde(flatten)]
@@ -2170,13 +2168,13 @@ pub struct SearchHit {
     pub hit: SearchHitTarget,
     /// The ranking value attached to this hit and used to merge duplicate hits.
     /// Exact original identifier spelling ranks before this value under `relevance`.
-    /// Present on the wire when `include` names `score`; comparable within one answer
+    /// Present on the wire when `include.score` is `true`; comparable within one answer
     /// and nowhere else.
     pub score: Option<f64>,
     /// Which indexed fields produced the match. Absent when empty.
     #[default(Some(Default::default()))]
     pub matched_by: Option<Vec<MatchedField>>,
-    /// The source text around the hit, requested with `include: ["source"]`. Covers the
+    /// The source text around the hit, requested with `include: {"source": true}`. Covers the
     /// hit's `range`; a caller that needs the range already has it there.
     pub source: Option<String>,
     /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
@@ -2760,39 +2758,15 @@ pub struct FindDeclarationsResult {
     /// Typed read warnings, including explicit partial coverage.
     pub warnings: Option<Vec<ReadWarning>>,
 }
-/// One optional `get_symbol` hit field the caller may opt into through `include`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
-pub enum GetSymbolInclude {
-    /// The hit's version-control timeline.
-    #[serde(rename = "history")]
-    #[default]
-    History,
-    /// Bounded documentation referring to the exact declaration.
-    #[serde(rename = "documentation")]
-    Documentation,
-}
-impl core::fmt::Display for GetSymbolInclude {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::History => write!(f, "history"),
-            Self::Documentation => write!(f, "documentation"),
-        }
-    }
-}
-impl<'de> serde::Deserialize<'de> for GetSymbolInclude {
-    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        match s.to_ascii_lowercase().as_str() {
-            "history" => Ok(GetSymbolInclude::History),
-            "documentation" => Ok(GetSymbolInclude::Documentation),
-            _ => {
-                Err(serde::de::Error::unknown_variant(&s, &["history", "documentation"]))
-            }
-        }
-    }
+/// The optional `get_symbol` projections the caller opts into. An omitted member is `false`.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, PartialEq, Serialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct GetSymbolInclude {
+    /// Attaches bounded documentation referring to the exact declaration.
+    pub documentation: Option<bool>,
+    /// Attaches the symbol's version-control timeline.
+    pub history: Option<bool>,
 }
 /// Reads one exact logical symbol obtained from discovery or another read.
 #[serde_with::skip_serializing_none]
@@ -2809,9 +2783,8 @@ pub struct GetSymbolParams {
     /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub id: String,
-    /// Requested projections. Omitted or empty requests none. A declaration's source is read
-    /// by `facets` with `symbol`.
-    pub include: Option<Vec<GetSymbolInclude>>,
+    /// The optional `get_symbol` projections the caller opts into. An omitted member is `false`.
+    pub include: Option<GetSymbolInclude>,
     /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
     #[validate(
         length(min = 1u64, max = 8_192u64),
@@ -4211,32 +4184,13 @@ pub struct RelationshipGroup {
     /// Provider exhausted this subject's adjacency under the selected exact domain.
     pub complete: bool,
 }
-/// An optional projection of records in a relationship page.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
-pub enum RelationshipInclude {
-    /// Exact UTF-8 bytes of the selected source units.
-    #[serde(rename = "source")]
-    #[default]
-    Source,
-}
-impl core::fmt::Display for RelationshipInclude {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Source => write!(f, "source"),
-        }
-    }
-}
-impl<'de> serde::Deserialize<'de> for RelationshipInclude {
-    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        match s.to_ascii_lowercase().as_str() {
-            "source" => Ok(RelationshipInclude::Source),
-            _ => Err(serde::de::Error::unknown_variant(&s, &["source"])),
-        }
-    }
+/// The optional projections of records in a relationship page. An omitted member is `false`.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, PartialEq, Serialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct RelationshipInclude {
+    /// Attaches the exact UTF-8 bytes of the selected source units.
+    pub source: Option<bool>,
 }
 /// One physical usage projected from an original selected-publication record.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
@@ -4305,9 +4259,8 @@ pub struct RelationshipSearchRequest {
     /// Exact eligible runtime domain, retaining compiler or runtime versions.
     #[validate(length(min = 1u64, max = 20_000u64), nested)]
     pub runtimes: Option<Vec<RuntimeIdentity>>,
-    /// Requested exact projections; source bytes use the same selected publication.
-    #[validate(length(max = 1u64))]
-    pub include: Option<Vec<String>>,
+    /// The optional projections of records in a relationship page. An omitted member is `false`.
+    pub include: Option<RelationshipInclude>,
     /// A service-issued key for one immutable view in one serving context.
     #[validate(
         length(min = 3u64, max = 4_096u64),
@@ -5420,6 +5373,14 @@ impl<'de> serde::Deserialize<'de> for WarningCode {
         }
     }
 }
+/// Optional fields to include. An omitted member is `false`.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, PartialEq, Serialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct PackageSearchRequestInclude {
+    /// Attaches the declaration's source to each hit.
+    pub source: Option<bool>,
+}
 /// Ranking phase to execute.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
 pub enum PackageSearchRequestPhase {
@@ -5535,6 +5496,14 @@ impl<'de> serde::Deserialize<'de> for PackageSearchHitContributingField {
             _ => Ok(PackageSearchHitContributingField::Unknown),
         }
     }
+}
+/// Optional fields to include. An omitted member is `false`.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, PartialEq, Serialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct PackagePatternRequestInclude {
+    /// Attaches the line where each match begins and the source of its enclosing declaration.
+    pub source: Option<bool>,
 }
 /// A visible workspace file.
 #[derive(
@@ -5790,13 +5759,13 @@ pub struct PackageSearchItemVariant2 {
     pub hit: PackageSearchItemVariant2Hit,
     /// The ranking value attached to this hit and used to merge duplicate hits.
     /// Exact original identifier spelling ranks before this value under `relevance`.
-    /// Present on the wire when `include` names `score`; comparable within one answer
+    /// Present on the wire when `include.score` is `true`; comparable within one answer
     /// and nowhere else.
     pub score: Option<f64>,
     /// Which indexed fields produced the match. Absent when empty.
     #[default(Some(Default::default()))]
     pub matched_by: Option<Vec<MatchedField>>,
-    /// The source text around the hit, requested with `include: ["source"]`. Covers the
+    /// The source text around the hit, requested with `include: {"source": true}`. Covers the
     /// hit's `range`; a caller that needs the range already has it there.
     pub source: Option<String>,
     /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts

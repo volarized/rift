@@ -14,8 +14,9 @@ use rift_cloud_client::{
     Config, DECLARATION_POSITIONS_MAX, GlobalClient, PACKAGES_MAX,
     PackageAvailability as WireAvailability, PackageContextEntry as WireContextEntry,
     PackageDeclarationRequestPositionEncoding, PackageIdentity as WirePackageIdentity,
-    PackagePatternMatch, PackagePatternRequest, PackageResolutionRequest, PackageSearchCandidate,
-    PackageSearchRequest, PackageSearchRequestPhase, PackageSearchRequestTarget,
+    PackagePatternMatch, PackagePatternRequest, PackagePatternRequestInclude,
+    PackageResolutionRequest, PackageSearchCandidate, PackageSearchRequest,
+    PackageSearchRequestInclude, PackageSearchRequestPhase, PackageSearchRequestTarget,
     PreparedPackageResolutionRequest, QueryTerm, Warning, WarningCode,
 };
 use rift_dependency::DependencyContext;
@@ -24,7 +25,7 @@ use rift_protocol::configuration::GlobalConfiguration;
 use rift_protocol::dependencies::{PackageAvailability, PackageContextEntry, RequestedPackage};
 use rift_protocol::read::{
     DEPENDENCY_WARNINGS_MAX, ExactKind, GlobalFailureClass, GlobalPageWarningCode, PackageIdentity,
-    Pagination, ReadWarning, ResultOrder, SearchHit, SearchHitTarget, SearchInclude, SearchParams,
+    Pagination, ReadWarning, ResultOrder, SearchHit, SearchHitTarget, SearchParams,
     SearchParamsTarget, SearchResult, SearchScope, SymbolId,
 };
 use rift_ranking::{
@@ -854,7 +855,8 @@ pub(crate) async fn package_patterns(
     let request = PackagePatternRequest {
         pattern,
         packages: Some(packages.to_vec()),
-        include: includes_source(params).then(|| vec!["source".to_owned()]),
+        include: includes_source(params)
+            .then_some(PackagePatternRequestInclude { source: Some(true) }),
     };
     let page = client
         .search_package_patterns(&request, rift_cloud_client::PAGE_LIMIT_MAX, None)
@@ -876,11 +878,7 @@ pub(crate) struct GlobalPatternMatches {
 }
 
 fn includes_source(params: &SearchParams) -> bool {
-    params
-        .include
-        .as_deref()
-        .unwrap_or_default()
-        .contains(&SearchInclude::Source)
+    params.include.source
 }
 
 fn page_warnings(warnings: Vec<Warning>) -> Vec<ReadWarning> {
@@ -939,7 +937,8 @@ fn search_request(
                 .map(|candidate| candidate.text().to_owned())
                 .collect(),
         ),
-        include: includes_source(params).then(|| vec!["source".to_owned()]),
+        include: includes_source(params)
+            .then_some(PackageSearchRequestInclude { source: Some(true) }),
         packages: Some(packages.to_vec()),
         phase: Some(match phase {
             QueryPhase::Precise => PackageSearchRequestPhase::Precise,
@@ -1084,11 +1083,7 @@ pub(crate) fn merge_search(
         let broad_ranked = fuse(&[broad_input], MERGE_WEIGHTS, QueryPhase::Broad, keep_max);
         ranked.append_phase(broad_ranked, keep_max);
     }
-    let include_score = params
-        .include
-        .as_deref()
-        .unwrap_or_default()
-        .contains(&SearchInclude::Score);
+    let include_score = params.include.score;
     let mut ordered = ranked
         .candidates()
         .iter()
@@ -1805,7 +1800,7 @@ mod tests {
     fn search_request_preserves_query_members_and_phase() {
         let params: rift_protocol::read::SearchParams = serde_json::from_value(serde_json::json!({
             "query": "load config",
-            "include": ["source"]
+            "include": {"source": true}
         }))
         .expect("search fixture is valid");
         let query = ParsedQuery::parse("load config").expect("query fixture is valid");
@@ -1823,7 +1818,10 @@ mod tests {
                 .iter()
                 .all(|term| term.prefix)
         );
-        assert_eq!(broad.include, Some(vec!["source".to_owned()]));
+        assert_eq!(
+            broad.include,
+            Some(rift_cloud_client::PackageSearchRequestInclude { source: Some(true) })
+        );
     }
 
     #[test]
@@ -1850,16 +1848,16 @@ mod tests {
             );
         }
         let mut params: rift_protocol::symbol_read::GetSymbolParams = authored_example();
-        params.include = vec![
-            rift_protocol::read::GetSymbolInclude::History,
-            rift_protocol::read::GetSymbolInclude::Documentation,
-        ];
+        params.include = rift_protocol::read::GetSymbolInclude {
+            documentation: true,
+            history: true,
+        };
         let encoded = serde_json::to_value(&params).expect("canonical symbol request");
         assert_eq!(encoded["id"], params.id.as_str());
         assert!(encoded.get("name").is_none());
         assert_eq!(
             encoded["include"],
-            serde_json::json!(["history", "documentation"])
+            serde_json::json!({"documentation": true, "history": true})
         );
     }
 
