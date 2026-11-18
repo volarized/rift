@@ -2,7 +2,7 @@
 //!
 //! A producer addresses source the way its own tools do: by source unit and byte range.
 //! [`PublicationSyntax`] resolves such a range to the syntax element address every read uses, and
-//! [`accept_producer_facts`] adds the producer's relationships and occurrences to the
+//! [`accept_producer_facts`] adds the producer's edges and occurrences to the
 //! publication under that producer's name. [`FactExtractor`] is the interface an external
 //! extractor implements, and [`accept_extracted_facts`] runs one and imports its output.
 
@@ -12,10 +12,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use rift_error::{RiftError, errors};
 use rift_protocol::index::{PACKAGE_SYMBOLS_CEILING, PackageOccurrence, PackagePublication};
 use rift_protocol::producer::{
-    FactCoverage, FactKind, FactProducer, PRODUCER_FACTS_FORMAT_REVISION, ProducerFacts,
-    ProducerOccurrence, ProducerRelationship,
+    FactCoverage, FactKind, FactProducer, PRODUCER_FACTS_FORMAT_REVISION, ProducerEdge,
+    ProducerFacts, ProducerOccurrence,
 };
-use rift_protocol::read::{Relationship, SourceUnitId, SourceUnitSpan, SymbolId};
+use rift_protocol::read::{Edge, SourceUnitId, SourceUnitSpan, SymbolId};
 use rift_syntax::{ByteRange, SyntaxDocument, SyntaxLimits, SyntaxMatch, SyntaxSource};
 
 use crate::located_syntax_element::{LocatedSyntax, SyntaxAddress};
@@ -24,7 +24,7 @@ mod extractor;
 
 pub use extractor::{ExtractionInput, FactExtractor, accept_extracted_facts};
 
-/// Relationships and occurrences one [`accept_producer_facts`] call adds, together: the
+/// Edges and occurrences one [`accept_producer_facts`] call adds, together: the
 /// declaration ceiling a publication supports.
 pub const PRODUCER_FACTS_MAX: u32 = PACKAGE_SYMBOLS_CEILING;
 
@@ -180,15 +180,15 @@ impl<'publication> PublicationSyntax<'publication> {
 
 /// Adds one producer's facts to `publication`.
 ///
-/// Every added relationship and occurrence names `facts.producer`, and the coverage entry of
-/// `facts.language` gains one entry per covered kind. A relationship that names only its
+/// Every added edge and occurrence names `facts.producer`, and the coverage entry of
+/// `facts.language` gains one entry per covered kind. An edge that names only its
 /// `occurrence` starts at the symbol whose declaration encloses it; every range a fact names
-/// must resolve to a syntax element of its unit. The coverage entry's `relationships` stay as package
+/// must resolve to a syntax element of its unit. The coverage entry's `edges` stay as package
 /// analysis wrote them: an imported kind states who emitted its facts, never that they are
 /// complete.
 ///
-/// The added relationships follow the built-in ones, sorted by `from`, `to`, `kind`,
-/// occurrence unit and range, `derivation`, `facets`, then `confidence`, so the order the
+/// The added edges follow the built-in ones, sorted by `from`, `to`, `kind`,
+/// occurrence unit and range, `derivation`, `kinds`, then `confidence`, so the order the
 /// producer emitted them in does not reach the publication's bytes. Occurrences are kept in
 /// unit, range, and symbol order. The publication is checked whole with
 /// [`PackagePublication::validate_facts`] before it is returned.
@@ -197,7 +197,7 @@ impl<'publication> PublicationSyntax<'publication> {
 /// Returns `producer_fact_invalid` for a `format` other than
 /// [`PRODUCER_FACTS_FORMAT_REVISION`], more than [`PRODUCER_FACTS_MAX`] facts, a language
 /// the publication has no coverage for, a fact of a kind `facts.kinds` does not name, a kind
-/// already covered by this producer, a relationship naming neither `from` nor `occurrence`,
+/// already covered by this producer, an edge naming neither `from` nor `occurrence`,
 /// or one naming only an `occurrence` outside every declaration; `producer_range_unresolved`
 /// for a range that resolves to no syntax element.
 pub fn accept_producer_facts(
@@ -210,29 +210,29 @@ pub fn accept_producer_facts(
         producer,
         language,
         kinds,
-        relationships,
+        edges,
         occurrences,
     } = facts;
     if format != PRODUCER_FACTS_FORMAT_REVISION {
         return Err(invalid("format", "unsupported"));
     }
     let (coverage, kinds) = admitted_kinds(&publication, &producer, &language, kinds)?;
-    admit_counts(&kinds, relationships.len(), occurrences.len())?;
-    let (relationships, occurrences) = {
+    admit_counts(&kinds, edges.len(), occurrences.len())?;
+    let (edges, occurrences) = {
         let mut syntax_elements = PublicationSyntax::new(&publication, limits);
-        let relationships = relationships
+        let edges = edges
             .into_iter()
-            .map(|relationship| resolve_relationship(&mut syntax_elements, relationship, &producer))
+            .map(|edge| resolve_edge(&mut syntax_elements, edge, &producer))
             .collect::<Result<Vec<_>, _>>()?;
         let occurrences = occurrences
             .into_iter()
             .map(|occurrence| resolve_occurrence(&mut syntax_elements, occurrence, &producer))
             .collect::<Result<Vec<_>, _>>()?;
-        (relationships, occurrences)
+        (edges, occurrences)
     };
-    let built_in = publication.relationships.len();
-    publication.relationships.extend(relationships);
-    publication.relationships[built_in..].sort_by(canonical_order);
+    let built_in = publication.edges.len();
+    publication.edges.extend(edges);
+    publication.edges[built_in..].sort_by(canonical_order);
     publication.occurrences.extend(occurrences);
     publication.occurrences.sort_by(|left, right| {
         (&left.unit, left.range.start, left.range.end, &left.symbol).cmp(&(
@@ -278,14 +278,14 @@ fn admitted_kinds(
 
 fn admit_counts(
     kinds: &BTreeSet<FactKind>,
-    relationships: usize,
+    edges: usize,
     occurrences: usize,
 ) -> Result<(), RiftError> {
     let bound = usize::try_from(PRODUCER_FACTS_MAX).unwrap_or(usize::MAX);
-    if relationships.saturating_add(occurrences) > bound {
+    if edges.saturating_add(occurrences) > bound {
         return Err(invalid("facts", "length"));
     }
-    let uncovered = (relationships > 0 && !kinds.contains(&FactKind::Relationships))
+    let uncovered = (edges > 0 && !kinds.contains(&FactKind::Edges))
         || (occurrences > 0 && !kinds.contains(&FactKind::Occurrences));
     if uncovered {
         return Err(invalid("kinds", "uncovered"));
@@ -293,21 +293,21 @@ fn admit_counts(
     Ok(())
 }
 
-fn resolve_relationship(
+fn resolve_edge(
     syntax_elements: &mut PublicationSyntax<'_>,
-    relationship: ProducerRelationship,
+    edge: ProducerEdge,
     producer: &FactProducer,
-) -> Result<Relationship, RiftError> {
-    let ProducerRelationship {
+) -> Result<Edge, RiftError> {
+    let ProducerEdge {
         from,
         kind,
-        facets,
+        kinds,
         to,
         occurrence,
         derivation,
         confidence,
         extensions,
-    } = relationship;
+    } = edge;
     let enclosing = occurrence
         .as_ref()
         .map(|span| {
@@ -323,13 +323,13 @@ fn resolve_relationship(
                 ..
             }),
         ) => SymbolId(symbol.as_str().to_owned()),
-        (None, Some(_)) => return Err(invalid("relationships.occurrence", "outside_declaration")),
-        (None, None) => return Err(invalid("relationships.from", "missing")),
+        (None, Some(_)) => return Err(invalid("edges.occurrence", "outside_declaration")),
+        (None, None) => return Err(invalid("edges.from", "missing")),
     };
-    Ok(Relationship {
+    Ok(Edge {
         from,
         kind,
-        facets,
+        kinds,
         to,
         occurrence,
         derivation,
@@ -359,10 +359,10 @@ fn resolve_occurrence(
     })
 }
 
-/// The order of one producer's imported relationships. Two edges equal under it differ only
+/// The order of one producer's imported edges. Two edges equal under it differ only
 /// in their extensions and keep the order the producer wrote them.
-fn canonical_order(left: &Relationship, right: &Relationship) -> Ordering {
-    fn span(edge: &Relationship) -> Option<(&SourceUnitId, u64, u64)> {
+fn canonical_order(left: &Edge, right: &Edge) -> Ordering {
+    fn span(edge: &Edge) -> Option<(&SourceUnitId, u64, u64)> {
         edge.occurrence
             .as_ref()
             .map(|span| (&span.unit, span.range.start, span.range.end))
@@ -371,7 +371,7 @@ fn canonical_order(left: &Relationship, right: &Relationship) -> Ordering {
         .cmp(&(&right.from, &right.to, &right.kind))
         .then_with(|| span(left).cmp(&span(right)))
         .then_with(|| left.derivation.cmp(&right.derivation))
-        .then_with(|| left.facets.cmp(&right.facets))
+        .then_with(|| left.kinds.cmp(&right.kinds))
         .then_with(|| match (left.confidence, right.confidence) {
             (Some(left), Some(right)) => left.total_cmp(&right),
             (left, right) => left.is_some().cmp(&right.is_some()),

@@ -805,7 +805,7 @@ mod tests {
                         "symbol": { "id": "rift://symbol/rust/src/d.rs/d", "name": "d" }
                     },
                     "score": 1.5,
-                    "matched_by": ["relationship", "name"],
+                    "matched_by": ["edge", "name"],
                     "source": "pub fn d() {\n    2\n}",
                     "line": 30,
                     "path": "src/d.rs",
@@ -813,19 +813,19 @@ mod tests {
                     "traversal_path": [
                         {
                             "direction": "outgoing",
-                            "relationship": {
+                            "edge": {
                                 "from": "rift://symbol/rust/src/m.rs/main",
                                 "to": "rift://symbol/rust/src/b.rs/b",
-                                "facets": ["calls"],
+                                "kinds": ["calls"],
                                 "derivation": "resolution"
                             }
                         },
                         {
                             "direction": "outgoing",
-                            "relationship": {
+                            "edge": {
                                 "from": "rift://symbol/rust/src/b.rs/b",
                                 "to": "rift://symbol/rust/src/d.rs/d",
-                                "facets": ["calls", "has_type"],
+                                "kinds": ["calls", "has_type"],
                                 "derivation": "heuristic"
                             }
                         }
@@ -1110,13 +1110,13 @@ mod tests {
     }
 
     /// A hop over the edge `from` to `to`, followed in `direction`.
-    fn hop(direction: &str, (from, to): (&str, &str), facets: &[&str], derivation: &str) -> Value {
+    fn hop(direction: &str, (from, to): (&str, &str), kinds: &[&str], derivation: &str) -> Value {
         json!({
             "direction": direction,
-            "relationship": {
+            "edge": {
                 "from": id_of(from),
                 "to": id_of(to),
-                "facets": facets,
+                "kinds": kinds,
                 "derivation": derivation
             }
         })
@@ -1170,12 +1170,12 @@ mod tests {
         page_of(&[
             file,
             named_hit("load_config", 10, &["name"], Vec::new()),
-            named_hit("run", 20, &["relationship"], vec![to_run()]),
+            named_hit("run", 20, &["edge"], vec![to_run()]),
             scored(
                 named_hit(
                     "main",
                     9,
-                    &["relationship", "name"],
+                    &["edge", "name"],
                     vec![
                         to_run(),
                         hop("incoming", ("main", "run"), &["calls"], "syntax"),
@@ -1186,7 +1186,7 @@ mod tests {
             named_hit(
                 "reload_config",
                 41,
-                &["relationship"],
+                &["edge"],
                 vec![hop(
                     "incoming",
                     ("reload_config", "load_config"),
@@ -1197,7 +1197,7 @@ mod tests {
             named_hit(
                 "parse",
                 4,
-                &["relationship"],
+                &["edge"],
                 vec![
                     hop("outgoing", ("serve", "handler"), &["calls"], "resolution"),
                     hop(
@@ -1295,7 +1295,7 @@ mod tests {
     }
 
     #[test]
-    fn a_wrong_relationship_word_is_refused() -> Result<(), String> {
+    fn a_wrong_edge_word_is_refused() -> Result<(), String> {
         walk_refusal(
             "\t\t↳ referenced\n",
             "\t\t↳ calls\n",
@@ -1352,7 +1352,7 @@ mod tests {
         )?;
         let mut answer = walk_answer();
         let hit = &mut answer["results"][4];
-        hit["matched_by"] = json!(["relationship", "name"]);
+        hit["matched_by"] = json!(["edge", "name"]);
         hit.as_object_mut()
             .ok_or("the hit must be an object")?
             .retain(|key, _| key != "path" && key != "line");
@@ -1548,7 +1548,7 @@ mod tests {
             named_hit(
                 "x",
                 line,
-                &["relationship"],
+                &["edge"],
                 vec![hop("incoming", ("x", "root"), &["calls"], "resolution")],
             )
         };
@@ -1578,10 +1578,10 @@ mod tests {
     }
 
     #[test]
-    fn a_symbol_leaves_out_the_relationship_field_and_keeps_the_others() -> Result<(), String> {
+    fn a_symbol_leaves_out_the_edge_field_and_keeps_the_others() -> Result<(), String> {
         walk_refusal(
             "in src/main.rs:9 · name",
-            "in src/main.rs:9 · relationship, name",
+            "in src/main.rs:9 · edge, name",
             "$.results[3]",
         )?;
         walk_refusal(
@@ -1717,8 +1717,8 @@ mod tests {
     }
 
     #[test]
-    fn a_hop_reads_a_facet_by_its_direction() {
-        // Direction, facet, head line words, and whether the declaration line starts with `by `.
+    fn a_hop_reads_a_kind_by_its_direction() {
+        // Direction, kind, head line words, and whether the declaration line starts with `by `.
         let cases = [
             ("incoming", "has_type", "type of", false),
             ("incoming", "annotated_by", "annotates", false),
@@ -1730,34 +1730,34 @@ mod tests {
             ("outgoing", "mixes_in", "mixes in", false),
             ("outgoing", "calls", "calls", false),
         ];
-        for (direction, facet, words, by) in cases {
+        for (direction, kind, words, by) in cases {
             let answer = page_of(&[named_hit(
                 "x",
                 1,
-                &["relationship"],
-                vec![hop(direction, ("x", "x"), &[facet], "resolution")],
+                &["edge"],
+                vec![hop(direction, ("x", "x"), &[kind], "resolution")],
             )]);
             let word = if by { "by " } else { "" };
             let text = format!(
                 "1 result\n\tat rift://symbol/rust/src/x.rs/x\n\n\t\t↳ {words}\n\t\t\t{word}fn x()\n\t\t\tin src/x.rs:1\n\t\t\tat rift://symbol/rust/src/x.rs/x\n"
             );
-            assert_eq!(text_states(Tool::Search, &text, &answer), Ok(()), "{facet}");
+            assert_eq!(text_states(Tool::Search, &text, &answer), Ok(()), "{kind}");
             let wrong = text.replace(words, "touches");
             assert!(
                 text_states(Tool::Search, &wrong, &answer).is_err(),
-                "{facet}"
+                "{kind}"
             );
         }
     }
 
     #[test]
-    fn several_facets_move_by_only_when_every_phrase_ends_in_it() {
-        let hit = |facets: &[&str]| {
+    fn several_kinds_move_by_only_when_every_phrase_ends_in_it() {
+        let hit = |kinds: &[&str]| {
             page_of(&[named_hit(
                 "x",
                 1,
-                &["relationship"],
-                vec![hop("incoming", ("x", "root"), facets, "resolution")],
+                &["edge"],
+                vec![hop("incoming", ("x", "root"), kinds, "resolution")],
             )])
         };
         let all = "1 result\n\tat rift://symbol/rust/src/root.rs/root\n\n\t\t↳ called, referenced\n\t\t\tby fn x()\n\t\t\tin src/x.rs:1\n\t\t\tat rift://symbol/rust/src/x.rs/x\n";

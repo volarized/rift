@@ -933,7 +933,7 @@ mod tests {
     use rift_core::SourceVisibility;
     use rift_error::RiftError;
     use rift_index::WorkspaceIndexLimits;
-    use rift_protocol::read::{Language, NodeFacet};
+    use rift_protocol::read::{Language, SyntaxKind};
     use rift_syntax::{ByteRange, RustSyntaxProvider};
 
     use super::*;
@@ -956,7 +956,7 @@ mod tests {
             container: None,
             kind: "function",
             syntax_element_kind: None,
-            facets: Vec::new(),
+            kinds: Vec::new(),
             visibility: None,
             range,
             item_range: item,
@@ -1176,8 +1176,8 @@ mod tests {
             self.inner.analyze(source, limits)
         }
 
-        fn syntax_element_facets(&self, kind: &str) -> Vec<NodeFacet> {
-            self.inner.syntax_element_facets(kind)
+        fn syntax_element_kinds(&self, kind: &str) -> Vec<SyntaxKind> {
+            self.inner.syntax_element_kinds(kind)
         }
     }
 

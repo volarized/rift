@@ -85,21 +85,21 @@ async def check_embedded_references(client: Client, root: Path) -> None:
 
 
 async def check_mixed_references_unavailable(client: Client) -> None:
-    """Require complete relationship acquisition to refuse an unserved language."""
+    """Require complete edge acquisition to refuse an unserved language."""
     answer = await client.call(
         "search", {"query": "SELECT ?caller ?target { ?caller :references ?target }"}
     )
     require(
         answer.get("outcome") == "unavailable"
         and answer.get("reason") == "insufficient_coverage",
-        f"unserved Rust relationships returned a complete answer: {answer}",
+        f"unserved Rust edges returned a complete answer: {answer}",
     )
 
 
 async def check_python_references(
     binary: Path, base: Path, telemetry: Collector
 ) -> None:
-    """Read relationship metadata from a complete served Python workspace."""
+    """Read edge metadata from a complete served Python workspace."""
     root = base / "python"
     root.mkdir()
     with Repo.init(root):

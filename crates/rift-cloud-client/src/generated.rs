@@ -101,7 +101,7 @@ pub type SourceUnitId = String;
 /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
 pub type SymbolId = String;
 /// Readable Symbol assembled from normalized Contributions. Source structure lives in `SyntaxElement`
-/// and is connected through Relationship.
+/// and is connected through Edge.
 #[serde_with::skip_serializing_none]
 #[derive(
     Debug,
@@ -128,9 +128,9 @@ pub struct Symbol {
     #[validate(length(min = 1u64), regex(path = "REGEX_SYMBOL_KIND"))]
     pub kind: String,
     /// Portable classification for cross-language queries, absent when empty. The local
-    /// kinds `trait` and `interface` can both carry the `type` facet.
+    /// kinds `trait` and `interface` can both carry the `type` kind.
     #[default(Some(Default::default()))]
-    pub facets: Option<Vec<SymbolFacet>>,
+    pub kinds: Option<Vec<SymbolKind>>,
     /// Where a symbol belongs and how its declaration came to exist. Source location and
     /// generation are separate: generated code can belong to the project or to a dependency.
     /// Absent from `Symbol` entirely when it says a project declaration, authored, with no
@@ -357,10 +357,10 @@ impl<'de> serde::Deserialize<'de> for DocumentationFormat {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
 pub struct Extensions {}
-/// One portable category a symbol falls into. Kinds are language-specific; facets are
-/// shared, so a filter written once applies to every served language.
+/// One portable category a symbol falls into, shared across served languages.
+/// The language-specific `kind` names the declaration in its provider's vocabulary.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
-pub enum SymbolFacet {
+pub enum SymbolKind {
     /// A named scope that groups declarations.
     #[serde(rename = "namespace")]
     #[default]
@@ -453,7 +453,7 @@ pub enum SymbolFacet {
     #[serde(rename = "generator")]
     Generator,
 }
-impl core::fmt::Display for SymbolFacet {
+impl core::fmt::Display for SymbolKind {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Namespace => write!(f, "namespace"),
@@ -489,43 +489,43 @@ impl core::fmt::Display for SymbolFacet {
         }
     }
 }
-impl<'de> serde::Deserialize<'de> for SymbolFacet {
+impl<'de> serde::Deserialize<'de> for SymbolKind {
     fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
         match s.to_ascii_lowercase().as_str() {
-            "namespace" => Ok(SymbolFacet::Namespace),
-            "module" => Ok(SymbolFacet::Module),
-            "type" => Ok(SymbolFacet::TypeType),
-            "value" => Ok(SymbolFacet::Value),
-            "callable" => Ok(SymbolFacet::Callable),
-            "member" => Ok(SymbolFacet::Member),
-            "member_container" => Ok(SymbolFacet::MemberContainer),
-            "parameter" => Ok(SymbolFacet::Parameter),
-            "type_parameter" => Ok(SymbolFacet::TypeParameter),
-            "constructible" => Ok(SymbolFacet::Constructible),
-            "extensible" => Ok(SymbolFacet::Extensible),
-            "implementable" => Ok(SymbolFacet::Implementable),
-            "macro" => Ok(SymbolFacet::Macro),
-            "test" => Ok(SymbolFacet::Test),
-            "annotation" => Ok(SymbolFacet::Annotation),
-            "extension" => Ok(SymbolFacet::Extension),
-            "variant" => Ok(SymbolFacet::Variant),
-            "enumeration" => Ok(SymbolFacet::Enumeration),
-            "alias" => Ok(SymbolFacet::Alias),
-            "property" => Ok(SymbolFacet::Property),
-            "abstract" => Ok(SymbolFacet::Abstract),
-            "constructor" => Ok(SymbolFacet::Constructor),
-            "static" => Ok(SymbolFacet::Static),
-            "mutable" => Ok(SymbolFacet::Mutable),
-            "public" => Ok(SymbolFacet::Public),
-            "deprecated" => Ok(SymbolFacet::Deprecated),
-            "entrypoint" => Ok(SymbolFacet::Entrypoint),
-            "operator" => Ok(SymbolFacet::Operator),
-            "async" => Ok(SymbolFacet::Async),
-            "generator" => Ok(SymbolFacet::Generator),
+            "namespace" => Ok(SymbolKind::Namespace),
+            "module" => Ok(SymbolKind::Module),
+            "type" => Ok(SymbolKind::TypeType),
+            "value" => Ok(SymbolKind::Value),
+            "callable" => Ok(SymbolKind::Callable),
+            "member" => Ok(SymbolKind::Member),
+            "member_container" => Ok(SymbolKind::MemberContainer),
+            "parameter" => Ok(SymbolKind::Parameter),
+            "type_parameter" => Ok(SymbolKind::TypeParameter),
+            "constructible" => Ok(SymbolKind::Constructible),
+            "extensible" => Ok(SymbolKind::Extensible),
+            "implementable" => Ok(SymbolKind::Implementable),
+            "macro" => Ok(SymbolKind::Macro),
+            "test" => Ok(SymbolKind::Test),
+            "annotation" => Ok(SymbolKind::Annotation),
+            "extension" => Ok(SymbolKind::Extension),
+            "variant" => Ok(SymbolKind::Variant),
+            "enumeration" => Ok(SymbolKind::Enumeration),
+            "alias" => Ok(SymbolKind::Alias),
+            "property" => Ok(SymbolKind::Property),
+            "abstract" => Ok(SymbolKind::Abstract),
+            "constructor" => Ok(SymbolKind::Constructor),
+            "static" => Ok(SymbolKind::Static),
+            "mutable" => Ok(SymbolKind::Mutable),
+            "public" => Ok(SymbolKind::Public),
+            "deprecated" => Ok(SymbolKind::Deprecated),
+            "entrypoint" => Ok(SymbolKind::Entrypoint),
+            "operator" => Ok(SymbolKind::Operator),
+            "async" => Ok(SymbolKind::Async),
+            "generator" => Ok(SymbolKind::Generator),
             _ => {
                 Err(
                     serde::de::Error::unknown_variant(
@@ -1113,8 +1113,8 @@ pub struct Capabilities {
     pub bounds: CapabilityBounds,
     /// Documentation revision used for documentation reads.
     pub documentation_revision: Option<String>,
-    /// Complete relationship operations supported by existing collected facts. Absence establishes no supported operation.
-    pub relationship_capabilities: Option<Vec<RelationshipCapability>>,
+    /// Complete edge operations supported by existing collected facts. Absence establishes no supported operation.
+    pub edge_capabilities: Option<Vec<EdgeCapability>>,
     /// Additional properties not defined in the schema.
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
@@ -1165,7 +1165,7 @@ pub struct PackageResolutionResponse {
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
 }
-/// A lexical package declaration search or a bounded relationship walk.
+/// A lexical package declaration search or a bounded edge walk.
 #[serde_with::skip_serializing_none]
 #[derive(
     Debug,
@@ -1177,10 +1177,10 @@ pub struct PackageResolutionResponse {
 )]
 #[serde(deny_unknown_fields)]
 pub struct PackageSearchRequest {
-    /// A bounded relationship walk starting at one symbol.
+    /// A bounded edge walk starting at one symbol.
     ///
     /// From `seed`, the server visits its neighbors, then their neighbors, up to `depth` hops,
-    /// following `direction` and narrowed to `facets`; each reached symbol keeps the shortest
+    /// following `direction` and narrowed to `kinds`; each reached symbol keeps the shortest
     /// path the walk found to it.
     #[validate(nested)]
     pub traversal: Option<SearchTraversal>,
@@ -1267,7 +1267,7 @@ pub struct PackageSearchHit {
     #[validate(nested)]
     pub package: PackageIdentity,
     /// Readable Symbol assembled from normalized Contributions. Source structure lives in `SyntaxElement`
-    /// and is connected through Relationship.
+    /// and is connected through Edge.
     #[validate(nested)]
     pub symbol: Symbol,
     /// The provider's qualified declaration name used for identifier ranking, with its original spelling.
@@ -1349,7 +1349,7 @@ pub struct PackagePatternRequest {
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 pub struct PackagePatternDeclaration {
     /// Readable Symbol assembled from normalized Contributions. Source structure lives in `SyntaxElement`
-    /// and is connected through Relationship.
+    /// and is connected through Edge.
     pub symbol: Symbol,
     /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
     /// from whatever its toolchain counts in at its own boundary, so two toolchains' column
@@ -2204,7 +2204,7 @@ pub struct SearchHit {
         regex(path = "REGEX_PACKAGE_SEARCH_HIT_UNIT")
     )]
     pub unit: Option<String>,
-    /// Shortest relationship path to this hit, present when a traversal reached it,
+    /// Shortest edge path to this hit, present when a traversal reached it,
     /// including a hit also matched lexically.
     #[validate(length(min = 1u64, max = 2u64), nested)]
     pub traversal_path: Option<Vec<GraphHop>>,
@@ -2217,10 +2217,10 @@ pub struct SearchHit {
     #[validate(nested)]
     pub change: Option<SymbolChange>,
 }
-/// A bounded relationship walk starting at one symbol.
+/// A bounded edge walk starting at one symbol.
 ///
 /// From `seed`, the server visits its neighbors, then their neighbors, up to `depth` hops,
-/// following `direction` and narrowed to `facets`; each reached symbol keeps the shortest
+/// following `direction` and narrowed to `kinds`; each reached symbol keeps the shortest
 /// path the walk found to it.
 #[serde_with::skip_serializing_none]
 #[derive(
@@ -2240,10 +2240,10 @@ pub struct SearchTraversal {
     /// engine supplies the edges of both: its references for `incoming`, its call hierarchy for
     /// `outgoing`.
     pub direction: Option<TraversalDirection>,
-    /// Portable relationship facets eligible for the walk. Omitted or empty, every facet is
+    /// Portable edge kinds eligible for the walk. Omitted or empty, every kind is
     /// eligible.
     #[validate(length(max = 29u64))]
-    pub facets: Option<Vec<RelationshipFacet>>,
+    pub kinds: Option<Vec<EdgeKind>>,
     /// Hops the walk may take from `seed`. The server accepts 1 or 2. Omitted, 1.
     #[validate(range(min = 1, max = 2))]
     #[default(Some(1u64))]
@@ -2359,9 +2359,9 @@ pub enum MatchedField {
     /// The project-relative path matched.
     #[serde(rename = "path")]
     Path,
-    /// A relationship traversal reached the hit.
-    #[serde(rename = "relationship")]
-    Relationship,
+    /// An edge traversal reached the hit.
+    #[serde(rename = "edge")]
+    Edge,
     /// A comparison `change` named found the declaration changed.
     #[serde(rename = "change")]
     Change,
@@ -2375,7 +2375,7 @@ impl core::fmt::Display for MatchedField {
             Self::Content => write!(f, "content"),
             Self::Ranked => write!(f, "ranked"),
             Self::Path => write!(f, "path"),
-            Self::Relationship => write!(f, "relationship"),
+            Self::Edge => write!(f, "edge"),
             Self::Change => write!(f, "change"),
         }
     }
@@ -2393,7 +2393,7 @@ impl<'de> serde::Deserialize<'de> for MatchedField {
             "content" => Ok(MatchedField::Content),
             "ranked" => Ok(MatchedField::Ranked),
             "path" => Ok(MatchedField::Path),
-            "relationship" => Ok(MatchedField::Relationship),
+            "edge" => Ok(MatchedField::Edge),
             "change" => Ok(MatchedField::Change),
             _ => {
                 Err(
@@ -2406,7 +2406,7 @@ impl<'de> serde::Deserialize<'de> for MatchedField {
                             "content",
                             "ranked",
                             "path",
-                            "relationship",
+                            "edge",
                             "change",
                         ],
                     ),
@@ -2415,7 +2415,7 @@ impl<'de> serde::Deserialize<'de> for MatchedField {
         }
     }
 }
-/// One auditable step in a search traversal. `relationship` retains its occurrence and
+/// One auditable step in a search traversal. `edge` retains its occurrence and
 /// derivation; `direction` records how the walk followed it.
 #[derive(
     Debug,
@@ -2431,8 +2431,8 @@ pub struct GraphHop {
     /// One directed edge between two symbols. Its occurrence is where it was read from, and its
     /// derivation is how much the provider knew when it was read.
     #[validate(nested)]
-    pub relationship: Relationship,
-    /// How one path step followed its directed relationship.
+    pub edge: Edge,
+    /// How one path step followed its directed edge.
     pub direction: HopDirection,
 }
 /// Which edge direction a search traversal walks from each visited symbol. A language
@@ -2441,12 +2441,12 @@ pub struct GraphHop {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
 pub enum TraversalDirection {
     /// Walks edges arriving at each visited symbol: the references a language engine
-    /// resolves to it, each hop carrying the `references` facet.
+    /// resolves to it, each hop carrying the `references` kind.
     #[serde(rename = "incoming")]
     #[default]
     Incoming,
     /// Walks edges leaving each visited symbol: the calls a language engine's call
-    /// hierarchy names for it, each hop carrying the `calls` facet.
+    /// hierarchy names for it, each hop carrying the `calls` kind.
     #[serde(rename = "outgoing")]
     Outgoing,
 }
@@ -2515,7 +2515,7 @@ pub struct CommitHit {
     /// Whether the commit changed more paths than `paths` lists.
     pub paths_truncated: bool,
 }
-/// How one path step followed its directed relationship.
+/// How one path step followed its directed edge.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
 pub enum HopDirection {
     /// The walk followed the edge from source to target.
@@ -2560,7 +2560,7 @@ impl<'de> serde::Deserialize<'de> for HopDirection {
     oas3_gen_support::Default
 )]
 #[serde(deny_unknown_fields)]
-pub struct Relationship {
+pub struct Edge {
     /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub from: String,
@@ -2570,7 +2570,7 @@ pub struct Relationship {
     /// Portable classification, so a query for `imports` finds local kinds such as `import`
     /// and `use` alike.
     #[validate(length(min = 1u64))]
-    pub facets: Vec<RelationshipFacet>,
+    pub kinds: Vec<EdgeKind>,
     /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub to: String,
@@ -2580,7 +2580,7 @@ pub struct Relationship {
     /// How this edge was established. Every edge reaches Rift from a provider, and this field
     /// records whether the provider resolved the edge semantically, read it from syntax, or
     /// inferred it.
-    pub derivation: RelationshipDerivation,
+    pub derivation: EdgeDerivation,
     /// How likely a `heuristic` edge is to hold, from 0 to 1. Absent for any other
     /// derivation.
     #[validate(range(min = 0.0, max = 1.0))]
@@ -2598,7 +2598,7 @@ pub struct Relationship {
 /// records whether the provider resolved the edge semantically, read it from syntax, or
 /// inferred it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
-pub enum RelationshipDerivation {
+pub enum EdgeDerivation {
     /// The provider resolved the edge semantically, so a consumer may act on it directly.
     #[serde(rename = "resolution")]
     #[default]
@@ -2610,7 +2610,7 @@ pub enum RelationshipDerivation {
     #[serde(rename = "heuristic")]
     Heuristic,
 }
-impl core::fmt::Display for RelationshipDerivation {
+impl core::fmt::Display for EdgeDerivation {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Resolution => write!(f, "resolution"),
@@ -2619,16 +2619,16 @@ impl core::fmt::Display for RelationshipDerivation {
         }
     }
 }
-impl<'de> serde::Deserialize<'de> for RelationshipDerivation {
+impl<'de> serde::Deserialize<'de> for EdgeDerivation {
     fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
         match s.to_ascii_lowercase().as_str() {
-            "resolution" => Ok(RelationshipDerivation::Resolution),
-            "syntax" => Ok(RelationshipDerivation::Syntax),
-            "heuristic" => Ok(RelationshipDerivation::Heuristic),
+            "resolution" => Ok(EdgeDerivation::Resolution),
+            "syntax" => Ok(EdgeDerivation::Syntax),
+            "heuristic" => Ok(EdgeDerivation::Heuristic),
             _ => {
                 Err(
                     serde::de::Error::unknown_variant(
@@ -3039,9 +3039,9 @@ pub struct ReadWarning {
     pub providers: Option<Vec<String>>,
     /// Symbols the walk visited before it stopped, equal to the bound it hit.
     pub visited: Option<u64>,
-    /// The requested facets no lane populates, in the request's own order,
-    /// deduplicated. Absent when every requested facet has a lane.
-    pub facets: Option<Vec<RelationshipFacet>>,
+    /// The requested kinds no lane populates, in the request's own order,
+    /// deduplicated. Absent when every requested kind has a lane.
+    pub kinds: Option<Vec<EdgeKind>>,
     /// A language name and its optional dialect, joined by `:`. `sql` and `sql:postgresql` are two languages with two symbol spaces.
     pub language: Option<String>,
     /// Edges the walk dropped over every depth, one per call the engine named.
@@ -3073,9 +3073,9 @@ pub struct ReadWarning {
     pub resolver: Option<String>,
 }
 /// One portable category an edge falls into. The local kinds `import` and `use` can share
-/// the `imports` facet, which lets one query cross languages.
+/// the `imports` kind, which lets one query cross languages.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
-pub enum RelationshipFacet {
+pub enum EdgeKind {
     /// The source contains the target within its scope.
     #[serde(rename = "contains")]
     #[default]
@@ -3165,7 +3165,7 @@ pub enum RelationshipFacet {
     #[serde(rename = "binds")]
     Binds,
 }
-impl core::fmt::Display for RelationshipFacet {
+impl core::fmt::Display for EdgeKind {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Contains => write!(f, "contains"),
@@ -3200,42 +3200,42 @@ impl core::fmt::Display for RelationshipFacet {
         }
     }
 }
-impl<'de> serde::Deserialize<'de> for RelationshipFacet {
+impl<'de> serde::Deserialize<'de> for EdgeKind {
     fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
         match s.to_ascii_lowercase().as_str() {
-            "contains" => Ok(RelationshipFacet::Contains),
-            "declares" => Ok(RelationshipFacet::Declares),
-            "augments" => Ok(RelationshipFacet::Augments),
-            "references" => Ok(RelationshipFacet::References),
-            "calls" => Ok(RelationshipFacet::Calls),
-            "constructs" => Ok(RelationshipFacet::Constructs),
-            "reads" => Ok(RelationshipFacet::Reads),
-            "writes" => Ok(RelationshipFacet::Writes),
-            "imports" => Ok(RelationshipFacet::Imports),
-            "exports" => Ok(RelationshipFacet::Exports),
-            "extends" => Ok(RelationshipFacet::Extends),
-            "implements" => Ok(RelationshipFacet::Implements),
-            "has_type" => Ok(RelationshipFacet::HasType),
-            "overrides" => Ok(RelationshipFacet::Overrides),
-            "aliases" => Ok(RelationshipFacet::Aliases),
-            "generates" => Ok(RelationshipFacet::Generates),
-            "depends_on" => Ok(RelationshipFacet::DependsOn),
-            "annotated_by" => Ok(RelationshipFacet::AnnotatedBy),
-            "throws" => Ok(RelationshipFacet::Throws),
-            "catches" => Ok(RelationshipFacet::Catches),
-            "bounded_by" => Ok(RelationshipFacet::BoundedBy),
-            "instantiates" => Ok(RelationshipFacet::Instantiates),
-            "specializes" => Ok(RelationshipFacet::Specializes),
-            "overloads" => Ok(RelationshipFacet::Overloads),
-            "mixes_in" => Ok(RelationshipFacet::MixesIn),
-            "embeds" => Ok(RelationshipFacet::Embeds),
-            "tests" => Ok(RelationshipFacet::Tests),
-            "configures" => Ok(RelationshipFacet::Configures),
-            "binds" => Ok(RelationshipFacet::Binds),
+            "contains" => Ok(EdgeKind::Contains),
+            "declares" => Ok(EdgeKind::Declares),
+            "augments" => Ok(EdgeKind::Augments),
+            "references" => Ok(EdgeKind::References),
+            "calls" => Ok(EdgeKind::Calls),
+            "constructs" => Ok(EdgeKind::Constructs),
+            "reads" => Ok(EdgeKind::Reads),
+            "writes" => Ok(EdgeKind::Writes),
+            "imports" => Ok(EdgeKind::Imports),
+            "exports" => Ok(EdgeKind::Exports),
+            "extends" => Ok(EdgeKind::Extends),
+            "implements" => Ok(EdgeKind::Implements),
+            "has_type" => Ok(EdgeKind::HasType),
+            "overrides" => Ok(EdgeKind::Overrides),
+            "aliases" => Ok(EdgeKind::Aliases),
+            "generates" => Ok(EdgeKind::Generates),
+            "depends_on" => Ok(EdgeKind::DependsOn),
+            "annotated_by" => Ok(EdgeKind::AnnotatedBy),
+            "throws" => Ok(EdgeKind::Throws),
+            "catches" => Ok(EdgeKind::Catches),
+            "bounded_by" => Ok(EdgeKind::BoundedBy),
+            "instantiates" => Ok(EdgeKind::Instantiates),
+            "specializes" => Ok(EdgeKind::Specializes),
+            "overloads" => Ok(EdgeKind::Overloads),
+            "mixes_in" => Ok(EdgeKind::MixesIn),
+            "embeds" => Ok(EdgeKind::Embeds),
+            "tests" => Ok(EdgeKind::Tests),
+            "configures" => Ok(EdgeKind::Configures),
+            "binds" => Ok(EdgeKind::Binds),
             _ => {
                 Err(
                     serde::de::Error::unknown_variant(
@@ -3852,7 +3852,7 @@ pub struct SyntaxElement {
     /// Portable structural classification, so a query can ask for bodies or imports without
     /// knowing the grammar that produced them. Absent when empty.
     #[default(Some(Default::default()))]
-    pub facets: Option<Vec<NodeFacet>>,
+    pub kinds: Option<Vec<SyntaxKind>>,
     /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
     /// from whatever its toolchain counts in at its own boundary, so two toolchains' column
     /// numbers arrive here on the same scale. No JSON Schema keyword can tie one field to
@@ -3872,10 +3872,10 @@ pub struct SyntaxElement {
     /// implement.
     pub extensions: Option<serde_json::Value>,
 }
-/// Portable structural facets, so a filter can ask for bodies or imports without knowing the
+/// Portable structural kinds, so a filter can ask for bodies or imports without knowing the
 /// grammar that produced them.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
-pub enum NodeFacet {
+pub enum SyntaxKind {
     /// Introduces a name.
     #[default]
     Declaration,
@@ -3914,7 +3914,7 @@ pub enum NodeFacet {
     /// Belongs to test code.
     Test,
 }
-impl core::fmt::Display for NodeFacet {
+impl core::fmt::Display for SyntaxKind {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Declaration => write!(f, "declaration"),
@@ -3938,31 +3938,31 @@ impl core::fmt::Display for NodeFacet {
         }
     }
 }
-impl<'de> serde::Deserialize<'de> for NodeFacet {
+impl<'de> serde::Deserialize<'de> for SyntaxKind {
     fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
         match s.to_ascii_lowercase().as_str() {
-            "declaration" => Ok(NodeFacet::Declaration),
-            "definition" => Ok(NodeFacet::Definition),
-            "body" => Ok(NodeFacet::Body),
-            "block" => Ok(NodeFacet::Block),
-            "statement" => Ok(NodeFacet::Statement),
-            "expression" => Ok(NodeFacet::Expression),
-            "type_expression" => Ok(NodeFacet::TypeExpression),
-            "import" => Ok(NodeFacet::Import),
-            "export" => Ok(NodeFacet::Export),
-            "parameter" => Ok(NodeFacet::Parameter),
-            "argument" => Ok(NodeFacet::Argument),
-            "annotation" => Ok(NodeFacet::Annotation),
-            "comment" => Ok(NodeFacet::Comment),
-            "identifier" => Ok(NodeFacet::Identifier),
-            "literal" => Ok(NodeFacet::Literal),
-            "pattern" => Ok(NodeFacet::Pattern),
-            "generated" => Ok(NodeFacet::Generated),
-            "test" => Ok(NodeFacet::Test),
+            "declaration" => Ok(SyntaxKind::Declaration),
+            "definition" => Ok(SyntaxKind::Definition),
+            "body" => Ok(SyntaxKind::Body),
+            "block" => Ok(SyntaxKind::Block),
+            "statement" => Ok(SyntaxKind::Statement),
+            "expression" => Ok(SyntaxKind::Expression),
+            "type_expression" => Ok(SyntaxKind::TypeExpression),
+            "import" => Ok(SyntaxKind::Import),
+            "export" => Ok(SyntaxKind::Export),
+            "parameter" => Ok(SyntaxKind::Parameter),
+            "argument" => Ok(SyntaxKind::Argument),
+            "annotation" => Ok(SyntaxKind::Annotation),
+            "comment" => Ok(SyntaxKind::Comment),
+            "identifier" => Ok(SyntaxKind::Identifier),
+            "literal" => Ok(SyntaxKind::Literal),
+            "pattern" => Ok(SyntaxKind::Pattern),
+            "generated" => Ok(SyntaxKind::Generated),
+            "test" => Ok(SyntaxKind::Test),
             _ => {
                 Err(
                     serde::de::Error::unknown_variant(
@@ -4114,8 +4114,8 @@ pub struct QueryOccurrence {
     /// One byte range in a source-catalog unit.
     pub source: SourceUnitSpan,
     /// One portable category an edge falls into. The local kinds `import` and `use` can share
-    /// the `imports` facet, which lets one query cross languages.
-    pub facet: RelationshipFacet,
+    /// the `imports` kind, which lets one query cross languages.
+    pub kind: EdgeKind,
 }
 /// Selected source bytes, when their projection was requested.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
@@ -4133,21 +4133,21 @@ pub struct QuerySource {
 #[serde(deny_unknown_fields)]
 pub struct QuerySymbol {
     /// Readable Symbol assembled from normalized Contributions. Source structure lives in `SyntaxElement`
-    /// and is connected through Relationship.
+    /// and is connected through Edge.
     pub symbol: Symbol,
     /// Physical declarations, preserving their association indices.
     pub declarations: Vec<SymbolDeclaration>,
 }
-/// Positive count bounds for one raw relationship operation.
+/// Positive count bounds for one raw edge operation.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
-pub struct RelationshipBounds {
+pub struct EdgeBounds {
     /// Most subjects in one request.
     pub max_seeds: u64,
-    /// Most selected facets in one request.
-    pub max_facets: u64,
-    /// Most relationship projections in one group.
-    pub max_relationships: u64,
+    /// Most selected kinds in one request.
+    pub max_kinds: u64,
+    /// Most edge projections in one group.
+    pub max_edges: u64,
     /// Most occurrence projections in one group.
     pub max_occurrences: u64,
     /// Most original symbol records in one page.
@@ -4155,79 +4155,79 @@ pub struct RelationshipBounds {
     /// Most original source units in one page.
     pub max_sources: u64,
 }
-/// One relationship operation the reader establishes from its existing collected facts.
+/// One edge operation the reader establishes from its existing collected facts.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
-pub struct RelationshipCapability {
+pub struct EdgeCapability {
     /// Which edge direction a search traversal walks from each visited symbol. A language
     /// engine supplies the edges of both: its references for `incoming`, its call hierarchy for
     /// `outgoing`.
     pub direction: TraversalDirection,
-    /// Facets whose complete selected-domain reads the reader supports.
-    pub facets: Vec<RelationshipFacet>,
-    /// Positive count bounds for one raw relationship operation.
-    pub bounds: Option<RelationshipBounds>,
+    /// Kinds whose complete selected-domain reads the reader supports.
+    pub kinds: Vec<EdgeKind>,
+    /// Positive count bounds for one raw edge operation.
+    pub bounds: Option<EdgeBounds>,
 }
-/// Original relationship records for one requested subject on this page.
+/// Original edge records for one requested subject on this page.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
-pub struct RelationshipGroup {
+pub struct EdgeGroup {
     /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     pub seed: String,
     /// Original records, preserving parallel edges, evidence and occurrences.
-    pub relationships: Vec<RelationshipRecord>,
+    pub edges: Vec<EdgeRecord>,
     /// Physical usages, including recursive and file-level locations without a caller symbol.
-    /// Page limits count distinct original record identities across relationships and usages.
+    /// Page limits count distinct original record identities across edges and usages.
     /// Multiple projections of one original record consume one slot; independent records
     /// consume separate slots even when their payloads or locations are equal.
-    pub occurrences: Option<Vec<RelationshipOccurrence>>,
+    pub occurrences: Option<Vec<EdgeOccurrence>>,
     /// Provider exhausted this subject's adjacency under the selected exact domain.
     pub complete: bool,
 }
-/// The optional projections of records in a relationship page. An omitted member is `false`.
+/// The optional projections of records in an edge page. An omitted member is `false`.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Serialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
-pub struct RelationshipInclude {
+pub struct EdgeInclude {
     /// Attaches the exact UTF-8 bytes of the selected source units.
     pub source: Option<bool>,
 }
 /// One physical usage projected from an original selected-publication record.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
-pub struct RelationshipOccurrence {
-    /// Opaque full identity of one original relationship record within its selected publication.
+pub struct EdgeOccurrence {
+    /// Opaque full identity of one original edge record within its selected publication.
     pub id: String,
-    /// Opaque full identity of one original relationship record within its selected publication.
-    pub relationship: Option<String>,
+    /// Opaque full identity of one original edge record within its selected publication.
+    pub edge: Option<String>,
     /// One physical reference or call supplied by a selected provider.
     pub occurrence: QueryOccurrence,
 }
-/// One original relationship record, independent of equal endpoint or evidence payloads.
+/// One original edge record, independent of equal endpoint or evidence payloads.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
-pub struct RelationshipRecord {
-    /// Opaque full identity of one original relationship record within its selected publication.
+pub struct EdgeRecord {
+    /// Opaque full identity of one original edge record within its selected publication.
     pub id: String,
     /// One directed edge between two symbols. Its occurrence is where it was read from, and its
     /// derivation is how much the provider knew when it was read.
-    pub relationship: Relationship,
+    pub edge: Edge,
 }
-/// Opaque full identity of one original relationship record within its selected publication.
-pub type RelationshipRecordId = String;
-/// One raw relationship page from an immutable selected publication.
+/// Opaque full identity of one original edge record within its selected publication.
+pub type EdgeRecordId = String;
+/// One raw edge page from an immutable selected publication.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
-pub struct RelationshipSearchPage {
+pub struct EdgeSearchPage {
     /// One authoritative group for every requested subject, in request order.
-    pub groups: Vec<RelationshipGroup>,
+    pub groups: Vec<EdgeGroup>,
     /// Exact symbols reached by this page. Identical captured records may repeat across pages;
     /// conflicting records are refused.
     pub symbols: Option<Vec<QuerySymbol>>,
     /// Physical source catalog and requested bytes for reached declarations and occurrences.
     /// Identical captured records may repeat across pages; conflicting records are refused.
     pub sources: Option<Vec<QuerySource>>,
-    /// Opaque continuation bound to subjects, direction, facets and selected domain.
+    /// Opaque continuation bound to subjects, direction, kinds and selected domain.
     pub next_cursor: Option<String>,
     /// Existing warnings retained without treating missing facts as complete empty.
     pub warnings: Option<Vec<ReadWarning>>,
@@ -4238,7 +4238,7 @@ pub struct RelationshipSearchPage {
     /// The immutable serving view and the expiry promised by its owner.
     pub view: CapturedView,
 }
-/// The exclusive raw relationship request on the existing search endpoint.
+/// The exclusive raw edge request on the existing search endpoint.
 #[serde_with::skip_serializing_none]
 #[derive(
     Debug,
@@ -4249,18 +4249,18 @@ pub struct RelationshipSearchPage {
     oas3_gen_support::Default
 )]
 #[serde(deny_unknown_fields)]
-pub struct RelationshipSearchRequest {
+pub struct EdgeSearchRequest {
     /// One incoming or outgoing adjacency selection, without ranking or path projection.
     #[validate(nested)]
-    pub relationships: RelationshipSelection,
+    pub edges: EdgeSelection,
     /// Exact eligible package domain. Required unless `view` retains that domain.
     #[validate(length(min = 1u64, max = 20_000u64), nested)]
     pub packages: Option<Vec<PackageIdentity>>,
     /// Exact eligible runtime domain, retaining compiler or runtime versions.
     #[validate(length(min = 1u64, max = 20_000u64), nested)]
     pub runtimes: Option<Vec<RuntimeIdentity>>,
-    /// The optional projections of records in a relationship page. An omitted member is `false`.
-    pub include: Option<RelationshipInclude>,
+    /// The optional projections of records in an edge page. An omitted member is `false`.
+    pub include: Option<EdgeInclude>,
     /// A service-issued key for one immutable view in one serving context.
     #[validate(
         length(min = 3u64, max = 4_096u64),
@@ -4278,7 +4278,7 @@ pub struct RelationshipSearchRequest {
     oas3_gen_support::Default
 )]
 #[serde(deny_unknown_fields)]
-pub struct RelationshipSelection {
+pub struct EdgeSelection {
     /// Established subjects whose complete adjacency is required.
     #[validate(length(min = 1u64))]
     pub seeds: Vec<String>,
@@ -4286,12 +4286,12 @@ pub struct RelationshipSelection {
     /// engine supplies the edges of both: its references for `incoming`, its call hierarchy for
     /// `outgoing`.
     pub direction: TraversalDirection,
-    /// Portable relationship facets. Empty selects every available facet.
-    pub facets: Vec<RelationshipFacet>,
+    /// Portable edge kinds. Empty selects every available kind.
+    pub kinds: Vec<EdgeKind>,
 }
 /// Complete lowercase SHA-256 digest of immutable source bytes.
 pub type SourceDigest = String;
-/// One facet: a declaration with its location, source, and syntax structure.
+/// One kind: a declaration with its location, source, and syntax structure.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
 pub struct FacetDeclaration {
@@ -4408,7 +4408,7 @@ pub enum GetCapabilitiesResponse {
     Ok(Capabilities),
     ///304: The cached capability representation has not changed.
     NotModified,
-    ///400: Request JSON, query parameters, or field relationships are invalid.
+    ///400: Request JSON, query parameters, or field edges are invalid.
     BadRequest(ProblemDetails),
     ///401: Authentication is required or credentials are invalid.
     Unauthorized(ProblemDetails),
@@ -4535,7 +4535,7 @@ impl ResolvePackageContextRequest {
 pub enum ResolvePackageContextResponse {
     ///200: Resolution result accounting for every submitted entry.
     Ok(PackageResolutionResponse),
-    ///400: Request JSON, query parameters, or field relationships are invalid.
+    ///400: Request JSON, query parameters, or field edges are invalid.
     BadRequest(ProblemDetails),
     ///401: Authentication is required or credentials are invalid.
     Unauthorized(ProblemDetails),
@@ -4563,21 +4563,21 @@ pub enum ResolvePackageContextResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, oas3_gen_support::Default)]
 #[serde(untagged)]
 pub enum SearchRequestBody {
-    /// A lexical package declaration search or a bounded relationship walk.
+    /// A lexical package declaration search or a bounded edge walk.
     #[default]
     Package(PackageSearchRequest),
-    /// The exclusive raw relationship request on the existing search endpoint.
-    Relationship(RelationshipSearchRequest),
+    /// The exclusive raw edge request on the existing search endpoint.
+    Edge(EdgeSearchRequest),
 }
 impl SearchRequestBody {
-    /// A lexical package declaration search or a bounded relationship walk.
+    /// A lexical package declaration search or a bounded edge walk.
     pub fn package() -> Self {
         Self::Package(PackageSearchRequest::default())
     }
-    /// The exclusive raw relationship request on the existing search endpoint.
-    pub fn relationship(relationships: RelationshipSelection) -> Self {
-        Self::Relationship(RelationshipSearchRequest {
-            relationships,
+    /// The exclusive raw edge request on the existing search endpoint.
+    pub fn edge(edges: EdgeSelection) -> Self {
+        Self::Edge(EdgeSearchRequest {
+            edges,
             ..Default::default()
         })
     }
@@ -4723,9 +4723,9 @@ impl SearchPackagesRequest {
 /// Response types for searchPackages
 #[derive(Debug, Clone)]
 pub enum SearchPackagesResponse {
-    ///200: One ranked package declaration page or one complete relationship page.
+    ///200: One ranked package declaration page or one complete edge page.
     Ok(Search200Response),
-    ///400: Request JSON, query parameters, or field relationships are invalid.
+    ///400: Request JSON, query parameters, or field edges are invalid.
     BadRequest(ProblemDetails),
     ///401: Authentication is required or credentials are invalid.
     Unauthorized(ProblemDetails),
@@ -4879,7 +4879,7 @@ impl GetSymbolRequest {
 pub enum GetSymbolResponse {
     ///200: One exact logical symbol.
     Ok(GetSymbolResult),
-    ///400: Request JSON, query parameters, or field relationships are invalid.
+    ///400: Request JSON, query parameters, or field edges are invalid.
     BadRequest(ProblemDetails),
     ///401: Authentication is required or credentials are invalid.
     Unauthorized(ProblemDetails),
@@ -5021,7 +5021,7 @@ impl FacetsRequest {
 pub enum FacetsResponse {
     ///200: The symbol's declarations with exact source and syntax structure.
     Ok(FacetsResult),
-    ///400: Request JSON, query parameters, or field relationships are invalid.
+    ///400: Request JSON, query parameters, or field edges are invalid.
     BadRequest(ProblemDetails),
     ///401: Authentication is required or credentials are invalid.
     Unauthorized(ProblemDetails),
@@ -5174,7 +5174,7 @@ impl SearchPackagePatternsRequest {
 pub enum SearchPackagePatternsResponse {
     ///200: One page of pattern matches.
     Ok(PackagePatternPage),
-    ///400: Request JSON, query parameters, or field relationships are invalid.
+    ///400: Request JSON, query parameters, or field edges are invalid.
     BadRequest(ProblemDetails),
     ///401: Authentication is required or credentials are invalid.
     Unauthorized(ProblemDetails),
@@ -5305,7 +5305,7 @@ impl FindDeclarationsRequest {
 pub enum FindDeclarationsResponse {
     ///200: Ordered outcomes for every submitted position.
     Ok(FindDeclarationsResult),
-    ///400: Request JSON, query parameters, or field relationships are invalid.
+    ///400: Request JSON, query parameters, or field edges are invalid.
     BadRequest(ProblemDetails),
     ///401: Authentication is required or credentials are invalid.
     Unauthorized(ProblemDetails),
@@ -5656,7 +5656,7 @@ pub struct SearchHitTargetSymbol {
     #[default("symbol".to_string())]
     pub target: String,
     /// Readable Symbol assembled from normalized Contributions. Source structure lives in `SyntaxElement`
-    /// and is connected through Relationship.
+    /// and is connected through Edge.
     #[validate(nested)]
     pub symbol: Symbol,
 }
@@ -5706,7 +5706,7 @@ pub struct PackageSearchItemVariant0 {
     /// One package as its package manager identifies it.
     pub package: PackageIdentity,
     /// Readable Symbol assembled from normalized Contributions. Source structure lives in `SyntaxElement`
-    /// and is connected through Relationship.
+    /// and is connected through Edge.
     pub symbol: Symbol,
     /// The provider's qualified declaration name used for identifier ranking, with its original spelling.
     pub qualified_name: String,
@@ -5785,7 +5785,7 @@ pub struct PackageSearchItemVariant2 {
     pub path: Option<String>,
     /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. It names no revision: a read selects the revision whose bytes it answers. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
     pub unit: Option<String>,
-    /// Shortest relationship path to this hit, present when a traversal reached it,
+    /// Shortest edge path to this hit, present when a traversal reached it,
     /// including a hit also matched lexically.
     pub traversal_path: Option<Vec<GraphHop>>,
     /// Number of edges in `traversal_path`. It is present exactly when `traversal_path` is
@@ -5837,7 +5837,7 @@ pub struct GetSymbolResultObject {
     #[default("found".to_string())]
     pub outcome: String,
     /// Readable Symbol assembled from normalized Contributions. Source structure lives in `SyntaxElement`
-    /// and is connected through Relationship.
+    /// and is connected through Edge.
     pub symbol: Symbol,
     /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
     pub revision: String,
@@ -5963,7 +5963,7 @@ pub enum Search200Response {
     /// One ranked page of package declarations. A page **MUST NOT** take the response past `response_body_bytes_max`: the server stops it before the first item that would, and the page carries the items that fit, `next_cursor` at the first item left out, and a `result_truncated` warning. The server **MUST** retain the captured view and its original expiry on every page, including an empty page.
     #[default]
     Package(PackageSearchPage),
-    /// One raw relationship page from an immutable selected publication.
-    Relationship(RelationshipSearchPage),
+    /// One raw edge page from an immutable selected publication.
+    Edge(EdgeSearchPage),
 }
 

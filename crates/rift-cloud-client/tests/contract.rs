@@ -420,35 +420,34 @@ fn decode_examples(syntax_element: &Value, checked: &mut usize) -> TestResult {
                     let value = example
                         .get("value")
                         .ok_or("a contract example must carry a value")?;
-                    let decoded = if let Some(reference) =
-                        schema.get("$ref").and_then(Value::as_str)
-                    {
-                        decode_generated_response_example(reference, value.clone())?
-                    } else if schema
-                        == &json!({"oneOf":[
-                            {"$ref":"#/components/schemas/PackageSearchPage"},
-                            {"$ref":"#/components/schemas/RelationshipSearchPage"}
-                        ]})
-                    {
-                        let generated: rift_cloud_client::Search200Response =
-                            serde_json::from_value(value.clone())?;
-                        match generated {
-                            rift_cloud_client::Search200Response::Package(_) => {
-                                decode_generated_response_example(
-                                    "#/components/schemas/PackageSearchPage",
-                                    value.clone(),
-                                )?;
+                    let decoded =
+                        if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+                            decode_generated_response_example(reference, value.clone())?
+                        } else if schema
+                            == &json!({"oneOf":[
+                                {"$ref":"#/components/schemas/PackageSearchPage"},
+                                {"$ref":"#/components/schemas/EdgeSearchPage"}
+                            ]})
+                        {
+                            let generated: rift_cloud_client::Search200Response =
+                                serde_json::from_value(value.clone())?;
+                            match generated {
+                                rift_cloud_client::Search200Response::Package(_) => {
+                                    decode_generated_response_example(
+                                        "#/components/schemas/PackageSearchPage",
+                                        value.clone(),
+                                    )?;
+                                }
+                                rift_cloud_client::Search200Response::Edge(_) => {
+                                    let page: rift_protocol::edge_read::EdgeSearchPage =
+                                        serde_json::from_value(value.clone())?;
+                                    assert!(page.groups.iter().all(|group| group.complete));
+                                }
                             }
-                            rift_cloud_client::Search200Response::Relationship(_) => {
-                                let page: rift_protocol::relationship_read::RelationshipSearchPage =
-                                    serde_json::from_value(value.clone())?;
-                                assert!(page.groups.iter().all(|group| group.complete));
-                            }
-                        }
-                        true
-                    } else {
-                        false
-                    };
+                            true
+                        } else {
+                            false
+                        };
                     if decoded {
                         *checked += 1;
                     }

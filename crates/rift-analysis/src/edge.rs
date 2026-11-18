@@ -1,7 +1,7 @@
 //! Bidirectional symbol reference adjacency, derived once from one [`NormalizedGraph`].
 //!
-//! [`RelationshipStore::build`] walks [`NormalizedGraph::references`] once and emits one
-//! [`RelationshipEdge`] per reference target a provider resolved to an established symbol
+//! [`EdgeStore::build`] walks [`NormalizedGraph::references`] once and emits one
+//! [`Edge`] per reference target a provider resolved to an established symbol
 //! (`NormalizedTarget::Symbol`); a target the graph could not resolve
 //! (`NormalizedTarget::Contribution`) contributes no edge. `NormalizedGraph::references`
 //! carries resolution alone, so every edge's derivation is resolution - that fact lives
@@ -14,54 +14,54 @@
 //! occurrence against it. A reference with no enclosing definition in its unit - an import at
 //! module scope, for instance - contributes no edge.
 //!
-//! An edge's `facet` is [`role_facet`]'s mapping of the reference's [`ReferenceRole`].
+//! An edge's `kind` is [`role_kind`]'s mapping of the reference's [`ReferenceRole`].
 //!
 //! An edge's `occurrence` is the reference's own [`DeclarationBinding`]: unit, byte range, and
 //! an optional syntax element. Every provider that publishes a reference today constructs its
 //! binding with `syntax element: None`, so the syntax element arm is populated by no production path.
 //!
-//! Building stops at [`RELATIONSHIP_EDGES_MAX`] edges; [`RelationshipStore::is_complete`] and
-//! [`RelationshipStore::dropped_edges`] report the truncation.
+//! Building stops at [`EDGES_MAX`] edges; [`EdgeStore::is_complete`] and
+//! [`EdgeStore::dropped_edges`] report the truncation.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use rift_core::{DeclarationBinding, LoopBudget, ReferenceRole, SourceUnitId, SymbolId};
-use rift_protocol::read::RelationshipFacet;
+use rift_protocol::read::EdgeKind;
 use rift_provider::{NormalizedGraph, NormalizedReference, NormalizedTarget};
 
 use crate::EnclosingDefinitions;
 use crate::static_resolution::StaticOccurrence;
 
-/// Most edges one [`RelationshipStore`] holds across both directions combined.
+/// Most edges one [`EdgeStore`] holds across both directions combined.
 ///
 /// The publication set a build normalizes is already bounded by
 /// [`PublicationLimits`](rift_provider::PublicationLimits), so this cap sits above what any
 /// accepted publication can carry. It bounds the store's own construction work and memory
 /// against a graph built outside those limits.
-pub const RELATIONSHIP_EDGES_MAX: usize = 10_000_000;
+pub const EDGES_MAX: usize = 10_000_000;
 
 /// One resolved reference edge: the enclosing definition a reference occurred in, the
 /// established symbol it resolved to, and the reference's portable category.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RelationshipEdge {
+pub struct Edge {
     from: SymbolId,
     to: SymbolId,
-    facet: RelationshipFacet,
+    kind: EdgeKind,
     occurrence: DeclarationBinding,
     static_callee: Option<rift_syntax::ByteRange>,
 }
 
-impl RelationshipEdge {
+impl Edge {
     /// Projects this resolved reference with its physical occurrence.
     #[must_use]
-    pub fn to_protocol(&self) -> rift_protocol::read::Relationship {
-        rift_protocol::read::Relationship {
+    pub fn to_protocol(&self) -> rift_protocol::read::Edge {
+        rift_protocol::read::Edge {
             producer: None,
             from: rift_protocol::read::SymbolId(self.from.as_str().to_owned()),
             to: rift_protocol::read::SymbolId(self.to.as_str().to_owned()),
-            kind: rift_protocol::read::ExactKind(self.facet.as_ref().to_owned()),
-            facets: vec![self.facet],
+            kind: rift_protocol::read::ExactKind(self.kind.as_ref().to_owned()),
+            kinds: vec![self.kind],
             occurrence: Some(rift_protocol::read::SourceUnitSpan {
                 unit: rift_protocol::read::SourceUnitId(self.occurrence.unit().to_string()),
                 range: rift_protocol::read::TextRange {
@@ -69,7 +69,7 @@ impl RelationshipEdge {
                     end: self.occurrence.range().end(),
                 },
             }),
-            derivation: rift_protocol::read::RelationshipDerivation::Resolution,
+            derivation: rift_protocol::read::EdgeDerivation::Resolution,
             confidence: None,
             extensions: rift_protocol::read::Extensions::default(),
         }
@@ -88,8 +88,8 @@ impl RelationshipEdge {
 
     /// The edge's portable category, derived from the reference's role.
     #[must_use]
-    pub const fn facet(&self) -> RelationshipFacet {
-        self.facet
+    pub const fn kind(&self) -> EdgeKind {
+        self.kind
     }
 
     /// Where the reference occurred: unit, byte range, and syntax element when the binding
@@ -156,19 +156,19 @@ impl UnitDefinitions {
     }
 }
 
-/// Maps one reference's portable [`ReferenceRole`] onto the wire [`RelationshipFacet`] this
+/// Maps one reference's portable [`ReferenceRole`] onto the wire [`EdgeKind`] this
 /// store's edges carry. `Unknown` - a provider exposing no sharper role - and every role this
-/// mapping has no sharper facet for falls back to `References`, the facet's general-mention
+/// mapping has no sharper kind for falls back to `References`, the kind's general-mention
 /// sense.
-const fn role_facet(role: ReferenceRole) -> RelationshipFacet {
+const fn role_kind(role: ReferenceRole) -> EdgeKind {
     match role {
-        ReferenceRole::Definition => RelationshipFacet::Declares,
-        ReferenceRole::Read => RelationshipFacet::Reads,
-        ReferenceRole::Write => RelationshipFacet::Writes,
-        ReferenceRole::Import => RelationshipFacet::Imports,
-        ReferenceRole::Call => RelationshipFacet::Calls,
-        ReferenceRole::Type => RelationshipFacet::HasType,
-        ReferenceRole::Unknown => RelationshipFacet::References,
+        ReferenceRole::Definition => EdgeKind::Declares,
+        ReferenceRole::Read => EdgeKind::Reads,
+        ReferenceRole::Write => EdgeKind::Writes,
+        ReferenceRole::Import => EdgeKind::Imports,
+        ReferenceRole::Call => EdgeKind::Calls,
+        ReferenceRole::Type => EdgeKind::HasType,
+        ReferenceRole::Unknown => EdgeKind::References,
     }
 }
 
@@ -178,31 +178,31 @@ const fn role_facet(role: ReferenceRole) -> RelationshipFacet {
 fn reference_edges<'graph>(
     reference: &'graph NormalizedReference,
     from: &'graph SymbolId,
-    facet: RelationshipFacet,
-) -> impl Iterator<Item = RelationshipEdge> + 'graph {
+    kind: EdgeKind,
+) -> impl Iterator<Item = Edge> + 'graph {
     reference.targets().iter().filter_map(move |target| {
         let NormalizedTarget::Symbol(to) = target else {
             return None;
         };
-        Some(RelationshipEdge {
+        Some(Edge {
             from: from.clone(),
             to: to.clone(),
-            facet,
+            kind,
             occurrence: reference.binding().clone(),
             static_callee: None,
         })
     })
 }
 
-/// Orders two edges sharing one adjacency-list key by their other endpoint, then facet, then
+/// Orders two edges sharing one adjacency-list key by their other endpoint, then kind, then
 /// occurrence position - so an outgoing list (constant `from`) orders by `to` and an
 /// incoming list (constant `to`) orders by `from`, and two edges to the same neighbor from
 /// different call sites still land in a stable order.
-fn edge_order(left: &RelationshipEdge, right: &RelationshipEdge) -> Ordering {
+fn edge_order(left: &Edge, right: &Edge) -> Ordering {
     (
         &left.from,
         &left.to,
-        left.facet,
+        left.kind,
         left.occurrence.unit(),
         left.occurrence.range().start(),
         left.occurrence.range().end(),
@@ -210,7 +210,7 @@ fn edge_order(left: &RelationshipEdge, right: &RelationshipEdge) -> Ordering {
         .cmp(&(
             &right.from,
             &right.to,
-            right.facet,
+            right.kind,
             right.occurrence.unit(),
             right.occurrence.range().start(),
             right.occurrence.range().end(),
@@ -219,16 +219,16 @@ fn edge_order(left: &RelationshipEdge, right: &RelationshipEdge) -> Ordering {
 
 /// Bidirectional symbol reference adjacency for one normalized graph.
 ///
-/// See the module doc for what an edge carries and how `from`, `facet`, and truncation are
+/// See the module doc for what an edge carries and how `from`, `kind`, and truncation are
 /// derived.
 #[derive(Debug, PartialEq, Eq)]
-pub struct RelationshipStore {
-    outgoing: BTreeMap<SymbolId, Vec<RelationshipEdge>>,
-    incoming: BTreeMap<SymbolId, Vec<RelationshipEdge>>,
+pub struct EdgeStore {
+    outgoing: BTreeMap<SymbolId, Vec<Edge>>,
+    incoming: BTreeMap<SymbolId, Vec<Edge>>,
     dropped_edges: u64,
 }
 
-impl get_size2::GetSize for RelationshipEdge {
+impl get_size2::GetSize for Edge {
     fn get_size(&self) -> usize {
         std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
     }
@@ -257,7 +257,7 @@ impl get_size2::GetSize for RelationshipEdge {
     }
 }
 
-impl get_size2::GetSize for RelationshipStore {
+impl get_size2::GetSize for EdgeStore {
     fn get_size(&self) -> usize {
         std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
     }
@@ -282,7 +282,7 @@ impl get_size2::GetSize for RelationshipStore {
     }
 }
 
-impl RelationshipStore {
+impl EdgeStore {
     pub(crate) fn add_static(
         &mut self,
         graph: &NormalizedGraph,
@@ -296,7 +296,7 @@ impl RelationshipStore {
         let existing = self.outgoing.values().map(Vec::len).sum::<usize>();
         let mut remaining = edges_max.saturating_sub(existing);
         let mut changed = false;
-        let mut admitted = BTreeMap::<&SymbolId, Vec<RelationshipEdge>>::new();
+        let mut admitted = BTreeMap::<&SymbolId, Vec<Edge>>::new();
         for occurrence in occurrences {
             let NormalizedTarget::Symbol(to) = &occurrence.target else {
                 continue;
@@ -304,10 +304,10 @@ impl RelationshipStore {
             let Some(from) = enclosing.resolve(&occurrence.binding) else {
                 continue;
             };
-            let edge = RelationshipEdge {
+            let edge = Edge {
                 from: from.clone(),
                 to: to.clone(),
-                facet: role_facet(occurrence.role),
+                kind: role_kind(occurrence.role),
                 occurrence: occurrence.binding.clone(),
                 static_callee: Some(occurrence.callee_range),
             };
@@ -348,10 +348,10 @@ impl RelationshipStore {
     }
 
     /// Builds the adjacency from every reference in `graph`, capped at
-    /// [`RELATIONSHIP_EDGES_MAX`].
+    /// [`EDGES_MAX`].
     #[must_use]
     pub fn build(graph: &NormalizedGraph) -> Self {
-        Self::build_capped(graph, RELATIONSHIP_EDGES_MAX)
+        Self::build_capped(graph, EDGES_MAX)
     }
 
     /// Builds adjacency under the caller's edge cap, reporting every omitted edge.
@@ -359,16 +359,16 @@ impl RelationshipStore {
     #[must_use]
     pub fn build_capped(graph: &NormalizedGraph, edges_max: usize) -> Self {
         let enclosing = UnitDefinitions::build(graph);
-        let mut outgoing: BTreeMap<SymbolId, Vec<RelationshipEdge>> = BTreeMap::new();
-        let mut incoming: BTreeMap<SymbolId, Vec<RelationshipEdge>> = BTreeMap::new();
+        let mut outgoing: BTreeMap<SymbolId, Vec<Edge>> = BTreeMap::new();
+        let mut incoming: BTreeMap<SymbolId, Vec<Edge>> = BTreeMap::new();
         let mut budget = LoopBudget::new(edges_max);
         let mut dropped_edges: u64 = 0;
         for reference in graph.references() {
             let Some(from) = enclosing.resolve(reference.binding()) else {
                 continue;
             };
-            let facet = role_facet(reference.role());
-            for edge in reference_edges(reference, from, facet) {
+            let kind = role_kind(reference.role());
+            for edge in reference_edges(reference, from, kind) {
                 match budget.consume() {
                     Ok(()) => {
                         outgoing
@@ -396,13 +396,13 @@ impl RelationshipStore {
 
     /// Edges starting at `from`, in deterministic order. Empty when `from` has none.
     #[must_use]
-    pub fn outgoing(&self, from: &SymbolId) -> &[RelationshipEdge] {
+    pub fn outgoing(&self, from: &SymbolId) -> &[Edge] {
         self.outgoing.get(from).map_or(&[], Vec::as_slice)
     }
 
     /// Edges pointing at `to`, in deterministic order. Empty when `to` has none.
     #[must_use]
-    pub fn incoming(&self, to: &SymbolId) -> &[RelationshipEdge] {
+    pub fn incoming(&self, to: &SymbolId) -> &[Edge] {
         self.incoming.get(to).map_or(&[], Vec::as_slice)
     }
 
@@ -442,7 +442,7 @@ mod tests {
         NormalizedGraph, Normalizer, ProviderPublication, PublicationLimits, PublicationSet,
     };
 
-    use super::{ReferenceRole, RelationshipFacet, RelationshipStore, role_facet};
+    use super::{EdgeKind, EdgeStore, ReferenceRole, role_kind};
 
     fn provider(value: &str) -> ProviderId {
         ProviderId::new(value).expect("fixture provider identity")
@@ -574,19 +574,19 @@ mod tests {
     }
 
     #[test]
-    fn role_facet_maps_every_reference_role() {
+    fn role_kind_maps_every_reference_role() {
         let cases = [
-            (ReferenceRole::Definition, RelationshipFacet::Declares),
-            (ReferenceRole::Read, RelationshipFacet::Reads),
-            (ReferenceRole::Write, RelationshipFacet::Writes),
-            (ReferenceRole::Import, RelationshipFacet::Imports),
-            (ReferenceRole::Call, RelationshipFacet::Calls),
-            (ReferenceRole::Type, RelationshipFacet::HasType),
-            (ReferenceRole::Unknown, RelationshipFacet::References),
+            (ReferenceRole::Definition, EdgeKind::Declares),
+            (ReferenceRole::Read, EdgeKind::Reads),
+            (ReferenceRole::Write, EdgeKind::Writes),
+            (ReferenceRole::Import, EdgeKind::Imports),
+            (ReferenceRole::Call, EdgeKind::Calls),
+            (ReferenceRole::Type, EdgeKind::HasType),
+            (ReferenceRole::Unknown, EdgeKind::References),
         ];
         for (role, expected) in cases {
             assert_eq!(
-                role_facet(role),
+                role_kind(role),
                 expected,
                 "role {role:?} maps to {expected:?}"
             );
@@ -611,7 +611,7 @@ mod tests {
             ),
             reference("beta_ref_alpha", occurrence, ReferenceRole::Call, "alpha"),
         ];
-        let store = RelationshipStore::build(&graph(contributions));
+        let store = EdgeStore::build(&graph(contributions));
 
         let beta = symbol(fixture_symbol("beta").as_str());
         let alpha = symbol(fixture_symbol("alpha").as_str());
@@ -622,7 +622,7 @@ mod tests {
         assert_eq!(outgoing[0], incoming[0]);
         assert_eq!(outgoing[0].from(), &beta);
         assert_eq!(outgoing[0].to(), &alpha);
-        assert_eq!(outgoing[0].facet(), RelationshipFacet::Calls);
+        assert_eq!(outgoing[0].kind(), EdgeKind::Calls);
         assert!(store.is_complete());
         assert_eq!(store.dropped_edges(), 0);
     }
@@ -656,7 +656,7 @@ mod tests {
                 "helper",
             ),
         ];
-        let store = RelationshipStore::build(&graph(contributions));
+        let store = EdgeStore::build(&graph(contributions));
 
         let outer = symbol(fixture_symbol("outer").as_str());
         let inner = symbol(fixture_symbol("inner").as_str());
@@ -689,7 +689,7 @@ mod tests {
                 "alpha",
             ),
         ];
-        let store = RelationshipStore::build(&graph(contributions));
+        let store = EdgeStore::build(&graph(contributions));
 
         let alpha = symbol("rift://symbol/rust/src/lib.rs/alpha");
         assert!(store.incoming(&alpha).is_empty());
@@ -697,9 +697,9 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_reference_target_yields_no_relationship_edge() {
+    fn unresolved_reference_target_yields_no_edge_edge() {
         let caller = symbol("rift://symbol/rust/src/lib.rs/caller");
-        let store = RelationshipStore::build(&graph(vec![
+        let store = EdgeStore::build(&graph(vec![
             definition(
                 "caller",
                 "rift://symbol/rust/src/lib.rs/caller",
@@ -738,10 +738,7 @@ mod tests {
             reference("beta_ref_alpha", occurrence, ReferenceRole::Call, "alpha"),
         ];
         let normalized = graph(contributions);
-        assert_eq!(
-            RelationshipStore::build(&normalized),
-            RelationshipStore::build(&normalized)
-        );
+        assert_eq!(EdgeStore::build(&normalized), EdgeStore::build(&normalized));
     }
 
     #[test]
@@ -778,7 +775,7 @@ mod tests {
                 "gamma",
             ),
         ];
-        let store = super::RelationshipStore::build_capped(&graph(contributions), 1);
+        let store = super::EdgeStore::build_capped(&graph(contributions), 1);
 
         assert!(!store.is_complete());
         assert_eq!(store.dropped_edges(), 1);
@@ -802,7 +799,7 @@ mod tests {
             ),
             reference("self_ref", occurrence, ReferenceRole::Call, "recurse"),
         ];
-        let store = RelationshipStore::build(&graph(contributions));
+        let store = EdgeStore::build(&graph(contributions));
 
         let recurse = symbol(fixture_symbol("recurse").as_str());
         let outgoing = store.outgoing(&recurse);
@@ -841,7 +838,7 @@ mod tests {
                 "callee",
             ),
         ];
-        let store = RelationshipStore::build(&graph(contributions));
+        let store = EdgeStore::build(&graph(contributions));
 
         let from_symbol = symbol(fixture_symbol("caller").as_str());
         let to_symbol = symbol(fixture_symbol("callee").as_str());
@@ -856,7 +853,7 @@ mod tests {
         assert_eq!(
             positions,
             vec![5, 20],
-            "edges sharing endpoint and facet order by occurrence position"
+            "edges sharing endpoint and kind order by occurrence position"
         );
     }
 }

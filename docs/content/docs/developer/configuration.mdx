@@ -195,7 +195,7 @@ respect_gitignore = true
 files = 100000
 workspace_size = "512mb"
 declarations = 1000000
-relationships = 10000000
+edges = 10000000
 directory_depth = 64
 ```
 
@@ -235,7 +235,7 @@ leaves the rest out, and reports each one as an unavailable source naming this k
 holds a full index in about 5 GiB, which is room for a workspace twice the size of the largest
 Rift is tested against - raise it on a machine with memory to spare, lower it on one without.
 
-`relationships` bounds relationship edges retained together, 1 to 500000000. The index keeps the
+`edges` bounds edges retained together, 1 to 500000000. The index keeps the
 edges that fit and counts the omitted edges. `directory_depth` bounds the directory levels scanned
 below the workspace root, 1 to 4096; a deeper directory refuses the rebuild naming this key.
 
@@ -411,7 +411,7 @@ the other dependency keys.
 ## Package collection
 
 Exact-package collection separates input and parsing bounds from publication capacity.
-[`[source]`](#source) bounds selected files, source bytes, declarations, and relationships;
+[`[source]`](#source) bounds selected files, source bytes, declarations, and edges;
 [`[providers.syntax]`](#providers) bounds each syntax parse; [`[documentation]`](#documentation)
 bounds collected documentation. `[package]` bounds the records that analysis publishes:
 
@@ -547,8 +547,8 @@ max_source = "1mb"
 max_symbols = 10000
 max_sources = 10000
 max_seeds = 64
-max_facets = 16
-max_relationships = 1000
+max_kinds = 16
+max_edges = 1000
 max_occurrences = 1000
 capabilities_ttl = "15m"
 resolution_ttl = "15m"
@@ -571,9 +571,9 @@ failure_ttl = "30s"
 - `max_source` caps one source payload, including documentation source and excerpts, 1b to 64mb,
   default `1mb`; the client applies the smaller of this value and the source bound the global
   API advertises. Documentation excerpts also keep their separate response bound
-- `max_symbols` and `max_sources` cap original symbol and source records per relationship page
-- `max_seeds` and `max_facets` cap selected subjects and facets per relationship request
-- `max_relationships` and `max_occurrences` cap relationship and occurrence projections per group.
+- `max_symbols` and `max_sources` cap original symbol and source records per edge page
+- `max_seeds` and `max_kinds` cap selected subjects and kinds per edge request
+- `max_edges` and `max_occurrences` cap edge and occurrence projections per group.
   The client applies the smaller of each positive count and the bound the global API advertises
 - `capabilities_ttl` and `resolution_ttl` default to `"15m"` and accept `1m` to `24h`
 - `failure_ttl` defaults to `"30s"` and accepts `1s` to `1h`

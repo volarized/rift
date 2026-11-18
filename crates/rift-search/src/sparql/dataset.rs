@@ -181,7 +181,7 @@ pub enum GraphFact<'a> {
         /// The original record key within the selected provider and revision.
         key: &'a str,
         /// Target, enclosing symbol and source span.
-        occurrence: &'a rift_protocol::relationship_read::QueryOccurrence,
+        occurrence: &'a rift_protocol::edge_read::QueryOccurrence,
         /// Exact source bytes at this occurrence, when acquired.
         source: Option<&'a str>,
     },
@@ -488,7 +488,7 @@ impl GraphFact<'_> {
                     VocabularyClass::Occurrence,
                 );
                 out.link(&target, Property::Usages, usage.clone());
-                out.literal(&usage, Property::Kind, occurrence.facet.as_ref());
+                out.literal(&usage, Property::Kind, occurrence.kind.as_ref());
                 out.location(&usage, &occurrence.source.unit, &occurrence.source.range)?;
                 if let Some(source) = source {
                     out.literal(&usage, Property::Source, source);

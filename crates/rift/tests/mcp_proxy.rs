@@ -355,7 +355,7 @@ async fn repository_workspace_reads(
     let symbol_id = workspace_client::captured_seed(client, name, "lib.rs").await?;
     let syntax_elements = proxied_call(client, "facets", &json!({"symbol":symbol_id}))
         .await
-        .map_err(|error| format!("facets: {error:?}"))?;
+        .map_err(|error| format!("kinds: {error:?}"))?;
     assert!(
         position_source(&syntax_elements).is_some_and(|source| source.contains(name)),
         "{syntax_elements}"

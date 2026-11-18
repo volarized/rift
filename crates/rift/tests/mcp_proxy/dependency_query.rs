@@ -51,7 +51,7 @@ fn row(answer: &Value) -> TestResult<&Value> {
 async fn proxy_keeps_dependency_call_paths_and_original_source_bytes() -> TestResult {
     let fixture = GlobalFixture::start_with(FixtureOptions {
         python_collection: true,
-        withheld_features: &["declarations", "relationships"],
+        withheld_features: &["declarations", "edges"],
         ..FixtureOptions::default()
     })
     .await?;

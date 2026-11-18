@@ -859,6 +859,253 @@
         }
       ]
     },
+    "Edge": {
+      "additionalProperties": false,
+      "description": "One directed edge between two symbols. Its occurrence is where it was read from, and its\nderivation is how much the provider knew when it was read.",
+      "properties": {
+        "confidence": {
+          "description": "How likely a `heuristic` edge is to hold, from 0 to 1. Absent for any other\nderivation.",
+          "format": "double",
+          "maximum": 1,
+          "minimum": 0,
+          "type": "number"
+        },
+        "derivation": {
+          "$ref": "#/$defs/EdgeDerivation",
+          "description": "How this edge was established."
+        },
+        "extensions": {
+          "$ref": "#/$defs/Extensions",
+          "default": {},
+          "description": "Edge facts the model has no field for, namespaced by the provider that emitted them.\nAbsent when empty."
+        },
+        "from": {
+          "$ref": "#/$defs/SymbolId",
+          "description": "The symbol the edge starts at."
+        },
+        "kind": {
+          "$ref": "#/$defs/ExactKind",
+          "description": "What the edge is in this provider's vocabulary, such as `import`, `use`, or\n`implements`."
+        },
+        "kinds": {
+          "description": "Portable classification, so a query for `imports` finds local kinds such as `import`\nand `use` alike.",
+          "items": {
+            "$ref": "#/$defs/EdgeKind"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "occurrence": {
+          "$ref": "#/$defs/SourceUnitSpan",
+          "description": "Exact physical occurrence when this edge was read from source, independent of\nwhether the provider supplied a source syntax element."
+        },
+        "producer": {
+          "$ref": "#/$defs/FactProducer",
+          "description": "The external producer that emitted the edge, named by a package publication that\ncarries its facts. Absent for an edge Rift's own analysis produced."
+        },
+        "to": {
+          "$ref": "#/$defs/SymbolId",
+          "description": "The symbol the edge points at. One Rift cannot read carries the `external` origin;\nthe edge is the same either way."
+        }
+      },
+      "required": [
+        "from",
+        "kind",
+        "kinds",
+        "to",
+        "derivation"
+      ],
+      "type": "object"
+    },
+    "EdgeCoverage": {
+      "additionalProperties": false,
+      "description": "Coverage of one edge kind within a selected language.",
+      "properties": {
+        "complete": {
+          "description": "Whether every edge in the accepted scope was captured.",
+          "type": "boolean"
+        },
+        "kind": {
+          "$ref": "#/$defs/EdgeKind",
+          "description": "Edge kind this coverage describes."
+        }
+      },
+      "required": [
+        "kind",
+        "complete"
+      ],
+      "type": "object"
+    },
+    "EdgeDerivation": {
+      "description": "How this edge was established. Every edge reaches Rift from a provider, and this field\nrecords whether the provider resolved the edge semantically, read it from syntax, or\ninferred it.",
+      "oneOf": [
+        {
+          "const": "resolution",
+          "description": "The provider resolved the edge semantically, so a consumer may act on it directly.",
+          "type": "string"
+        },
+        {
+          "const": "syntax",
+          "description": "The edge was read from syntax alone, without semantic resolution.",
+          "type": "string"
+        },
+        {
+          "const": "heuristic",
+          "description": "The edge is a guess, qualified by `confidence`.",
+          "type": "string"
+        }
+      ]
+    },
+    "EdgeKind": {
+      "description": "One portable category an edge falls into. The local kinds `import` and `use` can share\nthe `imports` kind, which lets one query cross languages.",
+      "oneOf": [
+        {
+          "const": "contains",
+          "description": "The source contains the target within its scope.",
+          "type": "string"
+        },
+        {
+          "const": "declares",
+          "description": "The source declares the target.",
+          "type": "string"
+        },
+        {
+          "const": "augments",
+          "description": "The source adds to a declaration made elsewhere.",
+          "type": "string"
+        },
+        {
+          "const": "references",
+          "description": "The source mentions the target.",
+          "type": "string"
+        },
+        {
+          "const": "calls",
+          "description": "The source invokes the target.",
+          "type": "string"
+        },
+        {
+          "const": "constructs",
+          "description": "The source creates an instance of the target.",
+          "type": "string"
+        },
+        {
+          "const": "reads",
+          "description": "The source reads the target's value.",
+          "type": "string"
+        },
+        {
+          "const": "writes",
+          "description": "The source assigns to the target.",
+          "type": "string"
+        },
+        {
+          "const": "imports",
+          "description": "The source brings the target into scope.",
+          "type": "string"
+        },
+        {
+          "const": "exports",
+          "description": "The source exposes the target outside its unit.",
+          "type": "string"
+        },
+        {
+          "const": "extends",
+          "description": "The source inherits from the target.",
+          "type": "string"
+        },
+        {
+          "const": "implements",
+          "description": "The source fulfils the target's interface.",
+          "type": "string"
+        },
+        {
+          "const": "has_type",
+          "description": "The source is typed by the target.",
+          "type": "string"
+        },
+        {
+          "const": "overrides",
+          "description": "The source replaces the target inherited from a supertype.",
+          "type": "string"
+        },
+        {
+          "const": "aliases",
+          "description": "The source is another name for the target.",
+          "type": "string"
+        },
+        {
+          "const": "generates",
+          "description": "The source produces the target as generated code.",
+          "type": "string"
+        },
+        {
+          "const": "depends_on",
+          "description": "The source requires the target to build or run.",
+          "type": "string"
+        },
+        {
+          "const": "annotated_by",
+          "description": "The source carries the target as an annotation.",
+          "type": "string"
+        },
+        {
+          "const": "throws",
+          "description": "The source can raise the target.",
+          "type": "string"
+        },
+        {
+          "const": "catches",
+          "description": "The source handles the target when raised.",
+          "type": "string"
+        },
+        {
+          "const": "bounded_by",
+          "description": "The source's type parameter is constrained by the target.",
+          "type": "string"
+        },
+        {
+          "const": "instantiates",
+          "description": "The source applies concrete arguments to the generic target.",
+          "type": "string"
+        },
+        {
+          "const": "specializes",
+          "description": "The source is a specialization of the generic target.",
+          "type": "string"
+        },
+        {
+          "const": "overloads",
+          "description": "The source and target are separately dispatched forms of one name.",
+          "type": "string"
+        },
+        {
+          "const": "mixes_in",
+          "description": "The source incorporates the target as a mixin.",
+          "type": "string"
+        },
+        {
+          "const": "embeds",
+          "description": "The source embeds the target within its own definition.",
+          "type": "string"
+        },
+        {
+          "const": "tests",
+          "description": "The source exercises the target as a test.",
+          "type": "string"
+        },
+        {
+          "const": "configures",
+          "description": "The source supplies configuration for the target.",
+          "type": "string"
+        },
+        {
+          "const": "binds",
+          "description": "The source binds a name or value to the target.",
+          "type": "string"
+        }
+      ]
+    },
     "ExactKind": {
       "description": "A provider-local kind preserving the construct name used by that language implementation.",
       "pattern": "^[A-Za-z][A-Za-z0-9._-]*$",
@@ -896,7 +1143,7 @@
     },
     "FactCoverage": {
       "additionalProperties": false,
-      "description": "One fact kind a publication carries for one language, and the producer of those facts.\n\nAn entry states that its producer emitted facts of this kind for this language. It makes\nno claim that the producer found every fact of the kind, for any producer: whether a\nlanguage's relationships are complete is stated by the coverage entry's `relationships`\nalone. A kind no entry names was not produced. Two producers of one kind take two entries.",
+      "description": "One fact kind a publication carries for one language, and the producer of those facts.\n\nAn entry states that its producer emitted facts of this kind for this language. It makes\nno claim that the producer found every fact of the kind, for any producer: whether a\nlanguage's edges are complete is stated by the coverage entry's `edges`\nalone. A kind no entry names was not produced. Two producers of one kind take two entries.",
       "properties": {
         "kind": {
           "$ref": "#/$defs/FactKind",
@@ -916,8 +1163,8 @@
       "description": "One kind of fact a publication may carry beside its declarations.",
       "oneOf": [
         {
-          "const": "relationships",
-          "description": "Edges between two symbols, in `relationships`.",
+          "const": "edges",
+          "description": "Edges between two symbols, in `edges`.",
           "type": "string"
         },
         {
@@ -1299,11 +1546,18 @@
     },
     "PackageCoverage": {
       "additionalProperties": false,
-      "description": "Independent coverage of one selected language and its relationship facets.",
+      "description": "Independent coverage of one selected language and its edge kinds.",
       "properties": {
         "applicability_complete": {
           "description": "Selected artifact and platform or export conditions establish this scope.",
           "type": "boolean"
+        },
+        "edges": {
+          "description": "Coverage of each edge kind, independent of identity lookup.",
+          "items": {
+            "$ref": "#/$defs/EdgeCoverage"
+          },
+          "type": "array"
         },
         "facts": {
           "description": "The fact kinds produced for this language, each with its producer. An entry makes no\ncompleteness claim, and a kind no entry names was not produced.",
@@ -1323,13 +1577,6 @@
         "language": {
           "$ref": "#/$defs/Language",
           "description": "Language this coverage describes."
-        },
-        "relationships": {
-          "description": "Coverage of each relationship facet, independent of identity lookup.",
-          "items": {
-            "$ref": "#/$defs/RelationshipCoverage"
-          },
-          "type": "array"
         }
       },
       "required": [
@@ -1337,7 +1584,7 @@
         "inventory_complete",
         "identity_complete",
         "applicability_complete",
-        "relationships",
+        "edges",
         "facts"
       ],
       "type": "object"
@@ -1702,253 +1949,6 @@
       "pattern": "^(?:(?:[^\\\\\\u0000-\\u001F\\u007F/.][^\\\\\\u0000-\\u001F\\u007F/]*|\\.\\.[^\\\\\\u0000-\\u001F\\u007F/]+|\\.[^\\\\\\u0000-\\u001F\\u007F/.r][^\\\\\\u0000-\\u001F\\u007F/]*|\\.r(?:[^\\\\\\u0000-\\u001F\\u007F/i][^\\\\\\u0000-\\u001F\\u007F/]*|i(?:[^\\\\\\u0000-\\u001F\\u007F/f][^\\\\\\u0000-\\u001F\\u007F/]*|f(?:[^\\\\\\u0000-\\u001F\\u007F/t][^\\\\\\u0000-\\u001F\\u007F/]*|t[^\\\\\\u0000-\\u001F\\u007F/]+)?)?)?)(?:/(?:\\.*[^\\\\\\u0000-\\u001F\\u007F/.][^\\\\\\u0000-\\u001F\\u007F/]*|\\.{3,}))*)?$",
       "type": "string"
     },
-    "Relationship": {
-      "additionalProperties": false,
-      "description": "One directed edge between two symbols. Its occurrence is where it was read from, and its\nderivation is how much the provider knew when it was read.",
-      "properties": {
-        "confidence": {
-          "description": "How likely a `heuristic` edge is to hold, from 0 to 1. Absent for any other\nderivation.",
-          "format": "double",
-          "maximum": 1,
-          "minimum": 0,
-          "type": "number"
-        },
-        "derivation": {
-          "$ref": "#/$defs/RelationshipDerivation",
-          "description": "How this edge was established."
-        },
-        "extensions": {
-          "$ref": "#/$defs/Extensions",
-          "default": {},
-          "description": "Edge facts the model has no field for, namespaced by the provider that emitted them.\nAbsent when empty."
-        },
-        "facets": {
-          "description": "Portable classification, so a query for `imports` finds local kinds such as `import`\nand `use` alike.",
-          "items": {
-            "$ref": "#/$defs/RelationshipFacet"
-          },
-          "minItems": 1,
-          "type": "array"
-        },
-        "from": {
-          "$ref": "#/$defs/SymbolId",
-          "description": "The symbol the edge starts at."
-        },
-        "kind": {
-          "$ref": "#/$defs/ExactKind",
-          "description": "What the edge is in this provider's vocabulary, such as `import`, `use`, or\n`implements`."
-        },
-        "occurrence": {
-          "$ref": "#/$defs/SourceUnitSpan",
-          "description": "Exact physical occurrence when this edge was read from source, independent of\nwhether the provider supplied a source syntax element."
-        },
-        "producer": {
-          "$ref": "#/$defs/FactProducer",
-          "description": "The external producer that emitted the edge, named by a package publication that\ncarries its facts. Absent for an edge Rift's own analysis produced."
-        },
-        "to": {
-          "$ref": "#/$defs/SymbolId",
-          "description": "The symbol the edge points at. One Rift cannot read carries the `external` origin;\nthe edge is the same either way."
-        }
-      },
-      "required": [
-        "from",
-        "kind",
-        "facets",
-        "to",
-        "derivation"
-      ],
-      "type": "object"
-    },
-    "RelationshipCoverage": {
-      "additionalProperties": false,
-      "description": "Coverage of one relationship facet within a selected language.",
-      "properties": {
-        "complete": {
-          "description": "Whether every relationship in the accepted scope was captured.",
-          "type": "boolean"
-        },
-        "facet": {
-          "$ref": "#/$defs/RelationshipFacet",
-          "description": "Relationship facet this coverage describes."
-        }
-      },
-      "required": [
-        "facet",
-        "complete"
-      ],
-      "type": "object"
-    },
-    "RelationshipDerivation": {
-      "description": "How this edge was established. Every edge reaches Rift from a provider, and this field\nrecords whether the provider resolved the edge semantically, read it from syntax, or\ninferred it.",
-      "oneOf": [
-        {
-          "const": "resolution",
-          "description": "The provider resolved the edge semantically, so a consumer may act on it directly.",
-          "type": "string"
-        },
-        {
-          "const": "syntax",
-          "description": "The edge was read from syntax alone, without semantic resolution.",
-          "type": "string"
-        },
-        {
-          "const": "heuristic",
-          "description": "The edge is a guess, qualified by `confidence`.",
-          "type": "string"
-        }
-      ]
-    },
-    "RelationshipFacet": {
-      "description": "One portable category an edge falls into. The local kinds `import` and `use` can share\nthe `imports` facet, which lets one query cross languages.",
-      "oneOf": [
-        {
-          "const": "contains",
-          "description": "The source contains the target within its scope.",
-          "type": "string"
-        },
-        {
-          "const": "declares",
-          "description": "The source declares the target.",
-          "type": "string"
-        },
-        {
-          "const": "augments",
-          "description": "The source adds to a declaration made elsewhere.",
-          "type": "string"
-        },
-        {
-          "const": "references",
-          "description": "The source mentions the target.",
-          "type": "string"
-        },
-        {
-          "const": "calls",
-          "description": "The source invokes the target.",
-          "type": "string"
-        },
-        {
-          "const": "constructs",
-          "description": "The source creates an instance of the target.",
-          "type": "string"
-        },
-        {
-          "const": "reads",
-          "description": "The source reads the target's value.",
-          "type": "string"
-        },
-        {
-          "const": "writes",
-          "description": "The source assigns to the target.",
-          "type": "string"
-        },
-        {
-          "const": "imports",
-          "description": "The source brings the target into scope.",
-          "type": "string"
-        },
-        {
-          "const": "exports",
-          "description": "The source exposes the target outside its unit.",
-          "type": "string"
-        },
-        {
-          "const": "extends",
-          "description": "The source inherits from the target.",
-          "type": "string"
-        },
-        {
-          "const": "implements",
-          "description": "The source fulfils the target's interface.",
-          "type": "string"
-        },
-        {
-          "const": "has_type",
-          "description": "The source is typed by the target.",
-          "type": "string"
-        },
-        {
-          "const": "overrides",
-          "description": "The source replaces the target inherited from a supertype.",
-          "type": "string"
-        },
-        {
-          "const": "aliases",
-          "description": "The source is another name for the target.",
-          "type": "string"
-        },
-        {
-          "const": "generates",
-          "description": "The source produces the target as generated code.",
-          "type": "string"
-        },
-        {
-          "const": "depends_on",
-          "description": "The source requires the target to build or run.",
-          "type": "string"
-        },
-        {
-          "const": "annotated_by",
-          "description": "The source carries the target as an annotation.",
-          "type": "string"
-        },
-        {
-          "const": "throws",
-          "description": "The source can raise the target.",
-          "type": "string"
-        },
-        {
-          "const": "catches",
-          "description": "The source handles the target when raised.",
-          "type": "string"
-        },
-        {
-          "const": "bounded_by",
-          "description": "The source's type parameter is constrained by the target.",
-          "type": "string"
-        },
-        {
-          "const": "instantiates",
-          "description": "The source applies concrete arguments to the generic target.",
-          "type": "string"
-        },
-        {
-          "const": "specializes",
-          "description": "The source is a specialization of the generic target.",
-          "type": "string"
-        },
-        {
-          "const": "overloads",
-          "description": "The source and target are separately dispatched forms of one name.",
-          "type": "string"
-        },
-        {
-          "const": "mixes_in",
-          "description": "The source incorporates the target as a mixin.",
-          "type": "string"
-        },
-        {
-          "const": "embeds",
-          "description": "The source embeds the target within its own definition.",
-          "type": "string"
-        },
-        {
-          "const": "tests",
-          "description": "The source exercises the target as a test.",
-          "type": "string"
-        },
-        {
-          "const": "configures",
-          "description": "The source supplies configuration for the target.",
-          "type": "string"
-        },
-        {
-          "const": "binds",
-          "description": "The source binds a name or value to the target.",
-          "type": "string"
-        }
-      ]
-    },
     "Revision": {
       "description": "One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.",
       "examples": [
@@ -2188,8 +2188,26 @@
       ],
       "type": "object"
     },
-    "SymbolFacet": {
-      "description": "One portable category a symbol falls into. Kinds are language-specific; facets are\nshared, so a filter written once applies to every served language.",
+    "SymbolId": {
+      "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.",
+      "examples": [
+        "rift://symbol/local/rust/app/parser/parse",
+        "rift://symbol/local@cloud/rust/app/load",
+        "rift://symbol/local:docs/typescript/page/beacon",
+        "rift://symbol/local@cloud:docs/typescript/page/beacon",
+        "rift://symbol/npm/npmjs.org/@types/node/typescript/node/buffer/Buffer",
+        "rift://symbol/stdlib/cpython/python/builtins/len"
+      ],
+      "maxLength": 8192,
+      "minLength": 1,
+      "not": {
+        "pattern": "/\\.{1,2}(?:/|$)"
+      },
+      "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$",
+      "type": "string"
+    },
+    "SymbolKind": {
+      "description": "One portable category a symbol falls into, shared across served languages.\nThe language-specific `kind` names the declaration in its provider's vocabulary.",
       "oneOf": [
         {
           "const": "namespace",
@@ -2342,24 +2360,6 @@
           "type": "string"
         }
       ]
-    },
-    "SymbolId": {
-      "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.",
-      "examples": [
-        "rift://symbol/local/rust/app/parser/parse",
-        "rift://symbol/local@cloud/rust/app/load",
-        "rift://symbol/local:docs/typescript/page/beacon",
-        "rift://symbol/local@cloud:docs/typescript/page/beacon",
-        "rift://symbol/npm/npmjs.org/@types/node/typescript/node/buffer/Buffer",
-        "rift://symbol/stdlib/cpython/python/builtins/len"
-      ],
-      "maxLength": 8192,
-      "minLength": 1,
-      "not": {
-        "pattern": "/\\.{1,2}(?:/|$)"
-      },
-      "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$",
-      "type": "string"
     },
     "SymbolOrigin": {
       "description": "Where a symbol belongs and how its declaration came to exist. Source location and\ngeneration are separate: generated code can belong to the project or to a dependency.\nAbsent from `Symbol` entirely when it says a project declaration, authored, with no\npackage.",
@@ -2744,6 +2744,13 @@
       "maxItems": 55000000,
       "type": "array"
     },
+    "edges": {
+      "description": "Normalized edges, preserving their source occurrences and derivation. An\nedge an external producer wrote names it in `producer`.",
+      "items": {
+        "$ref": "#/$defs/Edge"
+      },
+      "type": "array"
+    },
     "format_revision": {
       "description": "The publication shape this document follows. A consumer refuses a revision it does\nnot know.",
       "format": "uint32",
@@ -2759,7 +2766,7 @@
     "objects": {
       "description": "Every normalized logical object, including objects omitted from public directories.\nUnresolved objects retain their facts with no ID. Artifact consumers enforce aggregate\nand complete-record byte bounds before parsing and restoration. Public directories\napply the public character bound separately.",
       "items": {
-        "description": "Readable Symbol assembled from normalized Contributions. Source structure lives in `SyntaxElement`\nand is connected through Relationship.",
+        "description": "Readable Symbol assembled from normalized Contributions. Source structure lives in `SyntaxElement`\nand is connected through Edge.",
         "properties": {
           "container": {
             "$ref": "#/$defs/SymbolId",
@@ -2783,14 +2790,6 @@
             "default": {},
             "description": "Language-specific facts with no portable equivalent, namespaced by the provider that\nemitted them. Absent when empty."
           },
-          "facets": {
-            "default": [],
-            "description": "Portable classification for cross-language queries, absent when empty. The local\nkinds `trait` and `interface` can both carry the `type` facet.",
-            "items": {
-              "$ref": "#/$defs/SymbolFacet"
-            },
-            "type": "array"
-          },
           "id": {
             "$ref": "#/$defs/SymbolId",
             "description": "Unique identifier of this Symbol across the whole workspace. Absent for an\nunestablished symbol: no accepted evidence, or more than one, established its\nidentity."
@@ -2798,6 +2797,14 @@
           "kind": {
             "$ref": "#/$defs/ExactKind",
             "description": "What this symbol is in the provider's vocabulary, such as `trait`, `function`, or\n`table`."
+          },
+          "kinds": {
+            "default": [],
+            "description": "Portable classification for cross-language queries, absent when empty. The local\nkinds `trait` and `interface` can both carry the `type` kind.",
+            "items": {
+              "$ref": "#/$defs/SymbolKind"
+            },
+            "type": "array"
           },
           "language": {
             "$ref": "#/$defs/Language",
@@ -2865,13 +2872,6 @@
       "$ref": "#/$defs/SymbolOwner",
       "description": "Defining package, runtime, or compiler owner. It names no version: every symbol id\nand source unit of the publication carries this owner across releases."
     },
-    "relationships": {
-      "description": "Normalized relationships, preserving their source occurrences and derivation. A\nrelationship an external producer wrote names it in `producer`.",
-      "items": {
-        "$ref": "#/$defs/Relationship"
-      },
-      "type": "array"
-    },
     "revision": {
       "$ref": "#/$defs/Revision",
       "description": "The one release this publication analyzed, a release revision of `owner`, as\n`rift://revision/cargo/crates.io/demo@1.0.0`."
@@ -2907,7 +2907,7 @@
     "units",
     "objects",
     "declarations",
-    "relationships",
+    "edges",
     "coverage",
     "documents",
     "documentation"

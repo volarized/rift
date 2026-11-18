@@ -31,7 +31,7 @@ fn syntax_element_json(index: u64, kind: &str, start: u64, source: &str) -> Valu
 /// then the item's own descendants.
 pub(super) fn facets_response_json() -> Value {
     let mut item = syntax_element_json(0, "function_item", 26, "pub fn beacon() {}");
-    item["facets"] = json!(["declaration", "definition"]);
+    item["kinds"] = json!(["declaration", "definition"]);
     facet_response(&[
         item,
         syntax_element_json(2, "identifier", 33, "beacon"),

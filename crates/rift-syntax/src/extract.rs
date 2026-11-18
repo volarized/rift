@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use rift_error::errors;
-use rift_protocol::read::{Documentation, Extensions, Language, Signature, SymbolFacet};
+use rift_protocol::read::{Documentation, Extensions, Language, Signature, SymbolKind};
 use tree_sitter::{Node, TreeCursor};
 
 use crate::SyntaxNames;
@@ -198,7 +198,7 @@ pub(crate) struct Declaration {
     /// The provider's kind word, carried on the wire unchanged.
     pub(crate) kind: &'static str,
     /// Portable categories, in the grammar's declared order.
-    pub(crate) facets: Vec<SymbolFacet>,
+    pub(crate) kinds: Vec<SymbolKind>,
     /// Authored visibility spelling; `None` when the language states none.
     pub(crate) visibility: Option<String>,
     /// The implementation part's span; `None` for a declaration without one.
@@ -398,7 +398,7 @@ fn queue_children<'tree>(
 }
 
 /// Places one rendered declaration in the file's symbol space: qualification,
-/// container, the attachment-extended span, and the signature its facets and
+/// container, the attachment-extended span, and the signature its kinds and
 /// body range derive.
 fn qualified_symbol(
     declaration: Declaration,
@@ -431,7 +431,7 @@ fn qualified_symbol(
         name: declaration.name,
         kind: declaration.kind,
         syntax_element_kind: grammar.node_kind_for_id(syntax_element.kind_id()),
-        facets: declaration.facets,
+        kinds: declaration.kinds,
         visibility: declaration.visibility,
         range: ByteRange {
             start,
@@ -463,7 +463,7 @@ fn bodyless_display(item: &str) -> &str {
 }
 
 /// One rendered callable form for a declaration the grammar marks
-/// [`SymbolFacet::Callable`]: the source text from the declaration's own item
+/// [`SymbolKind::Callable`]: the source text from the declaration's own item
 /// start to where its implementation begins, trimmed of trailing whitespace.
 /// A declaration with no implementation - a trait method with no body, an
 /// interface method signature, a TypeScript overload - renders its whole item
@@ -471,7 +471,7 @@ fn bodyless_display(item: &str) -> &str {
 /// callable.
 ///
 /// This is the one place `signatures` is derived: every provider's grammar
-/// already states whether a kind is callable (`Declaration::facets`) and
+/// already states whether a kind is callable (`Declaration::kinds`) and
 /// where its implementation starts (`Declaration::body_range`), so deriving
 /// the header here, once, keeps a match on language out of this walk.
 pub(crate) fn callable_signature(
@@ -480,7 +480,7 @@ pub(crate) fn callable_signature(
     text: &str,
     language: &Language,
 ) -> Option<Signature> {
-    if !declaration.facets.contains(&SymbolFacet::Callable) {
+    if !declaration.kinds.contains(&SymbolKind::Callable) {
         return None;
     }
     let start = usize::try_from(item_range.start).ok()?;

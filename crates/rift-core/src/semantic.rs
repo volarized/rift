@@ -9,7 +9,7 @@ use std::sync::Arc;
 use rift_error::{RiftError, errors};
 pub use rift_protocol::read::{
     Documentation, DocumentationFormat, ExactKind, ExtensionKey, ExtensionValue, Extensions,
-    Language, PackageIdentity, Signature, SourceKind, SourceLocation, SymbolFacet, TypeBinding,
+    Language, PackageIdentity, Signature, SourceKind, SourceLocation, SymbolKind, TypeBinding,
 };
 
 use crate::{
@@ -235,7 +235,7 @@ pub struct PortableSymbolFacts {
     name: String,
     qualified_name: String,
     kind: ExactKind,
-    facets: Vec<SymbolFacet>,
+    kinds: Vec<SymbolKind>,
     container: Option<ContributionReference>,
     modifiers: Vec<String>,
     visibility: Option<String>,
@@ -259,7 +259,7 @@ impl PortableSymbolFacts {
             name: name.into(),
             qualified_name: qualified_name.into(),
             kind,
-            facets: Vec::new(),
+            kinds: Vec::new(),
             container: None,
             modifiers: Vec::new(),
             visibility: None,
@@ -270,10 +270,10 @@ impl PortableSymbolFacts {
         }
     }
 
-    /// Sets portable facets.
+    /// Sets portable kinds.
     #[must_use]
-    pub fn facets(mut self, facets: Vec<SymbolFacet>) -> Self {
-        self.facets = facets;
+    pub fn kinds(mut self, kinds: Vec<SymbolKind>) -> Self {
+        self.kinds = kinds;
         self
     }
 
@@ -364,10 +364,10 @@ impl PortableSymbolFacts {
         &self.kind
     }
 
-    /// Returns portable facets.
+    /// Returns portable kinds.
     #[must_use]
-    pub fn symbol_facets(&self) -> &[SymbolFacet] {
-        &self.facets
+    pub fn symbol_kinds(&self) -> &[SymbolKind] {
+        &self.kinds
     }
 
     /// Returns containing symbol reference.
@@ -497,9 +497,9 @@ impl SemanticReference {
     }
 }
 
-/// Portable relationship kind.
+/// Portable edge kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RelationshipKind {
+pub enum EdgeKind {
     /// Source references target.
     Reference,
     /// Source defines target.
@@ -512,19 +512,19 @@ pub enum RelationshipKind {
     Alias,
 }
 
-/// One relationship declared by a provider.
+/// One edge declared by a provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContributionRelationship {
-    kind: RelationshipKind,
+pub struct ContributionEdge {
+    kind: EdgeKind,
     target: ContributionReference,
-    derivation: Option<rift_protocol::read::RelationshipDerivation>,
+    derivation: Option<rift_protocol::read::EdgeDerivation>,
     occurrence: Option<DeclarationBinding>,
 }
 
-impl ContributionRelationship {
-    /// Creates one relationship.
+impl ContributionEdge {
+    /// Creates one edge.
     #[must_use]
-    pub const fn new(kind: RelationshipKind, target: ContributionReference) -> Self {
+    pub const fn new(kind: EdgeKind, target: ContributionReference) -> Self {
         Self {
             kind,
             target,
@@ -537,7 +537,7 @@ impl ContributionRelationship {
     #[must_use]
     pub const fn with_derivation(
         mut self,
-        derivation: rift_protocol::read::RelationshipDerivation,
+        derivation: rift_protocol::read::EdgeDerivation,
     ) -> Self {
         self.derivation = Some(derivation);
         self
@@ -552,19 +552,19 @@ impl ContributionRelationship {
 
     /// The supplied derivation. Absent means the provider did not establish it.
     #[must_use]
-    pub const fn derivation(&self) -> Option<rift_protocol::read::RelationshipDerivation> {
+    pub const fn derivation(&self) -> Option<rift_protocol::read::EdgeDerivation> {
         self.derivation
     }
 
-    /// The supplied physical occurrence. Source-less relationships have no occurrence.
+    /// The supplied physical occurrence. Source-less edges have no occurrence.
     #[must_use]
     pub const fn occurrence(&self) -> Option<&DeclarationBinding> {
         self.occurrence.as_ref()
     }
 
-    /// Returns portable relationship kind.
+    /// Returns portable edge kind.
     #[must_use]
-    pub const fn kind(&self) -> RelationshipKind {
+    pub const fn kind(&self) -> EdgeKind {
         self.kind
     }
 
@@ -586,7 +586,7 @@ pub struct Contribution {
     identity_anchor: Option<SymbolId>,
     equivalence: Vec<EquivalenceEvidence>,
     references: Vec<SemanticReference>,
-    relationships: Vec<ContributionRelationship>,
+    edges: Vec<ContributionEdge>,
     namespaced: Extensions,
     namespaced_material_bytes: usize,
 }
@@ -601,7 +601,7 @@ impl PartialEq for Contribution {
             && self.identity_anchor == other.identity_anchor
             && self.equivalence == other.equivalence
             && self.references == other.references
-            && self.relationships == other.relationships
+            && self.edges == other.edges
             && self.namespaced == other.namespaced
     }
 }
@@ -631,7 +631,7 @@ impl Contribution {
                 identity_anchor: None,
                 equivalence: Vec::new(),
                 references: Vec::new(),
-                relationships: Vec::new(),
+                edges: Vec::new(),
                 namespaced: Extensions(std::collections::BTreeMap::new()),
                 namespaced_material_bytes: 0,
             },
@@ -655,7 +655,7 @@ impl Contribution {
                 identity_anchor: None,
                 equivalence: Vec::new(),
                 references: Vec::new(),
-                relationships: Vec::new(),
+                edges: Vec::new(),
                 namespaced: Extensions(std::collections::BTreeMap::new()),
                 namespaced_material_bytes: 0,
             },
@@ -710,10 +710,10 @@ impl Contribution {
         &self.references
     }
 
-    /// Returns declared relationships.
+    /// Returns declared edges.
     #[must_use]
-    pub fn relationships(&self) -> &[ContributionRelationship] {
-        &self.relationships
+    pub fn edges(&self) -> &[ContributionEdge] {
+        &self.edges
     }
 
     /// Returns provider-specific facts.
@@ -758,10 +758,10 @@ impl ContributionBuilder {
         self
     }
 
-    /// Sets declared relationships.
+    /// Sets declared edges.
     #[must_use]
-    pub fn relationships(mut self, relationships: Vec<ContributionRelationship>) -> Self {
-        self.contribution.relationships = relationships;
+    pub fn edges(mut self, edges: Vec<ContributionEdge>) -> Self {
+        self.contribution.edges = edges;
         self
     }
 
@@ -890,7 +890,7 @@ pub enum ContributionViolation {
     InvalidNamespaceVersion,
     /// Reference targets are empty, duplicated, or oversized.
     InvalidReference,
-    /// Portable facets contain duplicates.
+    /// Portable kinds contain duplicates.
     DuplicateFact,
     /// Normalized record state, identity, or members disagree.
     InvalidRecord,
@@ -904,7 +904,7 @@ fn validate_contribution(contribution: &Contribution) -> Result<(), RiftError> {
     validate_source_and_origin(contribution)?;
     validate_evidence(contribution)?;
     if contribution.references.len() > CONTRIBUTION_FACTS_MAX
-        || contribution.relationships.len() > CONTRIBUTION_FACTS_MAX
+        || contribution.edges.len() > CONTRIBUTION_FACTS_MAX
     {
         return errors::core::contribution_too_many_facts()
             .field("references")
@@ -940,7 +940,7 @@ fn validate_portable_facts(facts: &PortableSymbolFacts) -> Result<(), RiftError>
             .fail();
     }
     let counts = [
-        facts.facets.len(),
+        facts.kinds.len(),
         facts.modifiers.len(),
         facts.types.len(),
         facts.signatures.len(),
@@ -954,10 +954,10 @@ fn validate_portable_facts(facts: &PortableSymbolFacts) -> Result<(), RiftError>
             .field("facts")
             .fail();
     }
-    let unique: BTreeSet<_> = facts.facets.iter().copied().collect();
-    if unique.len() != facts.facets.len() {
+    let unique: BTreeSet<_> = facts.kinds.iter().copied().collect();
+    if unique.len() != facts.kinds.len() {
         return errors::core::contribution_duplicate_fact()
-            .field("facts.facets")
+            .field("facts.kinds")
             .fail();
     }
     Ok(())
@@ -1104,15 +1104,15 @@ mod tests {
 
     use rift_protocol::read::{
         ExactKind, ExtensionKey, ExtensionValue, Extensions, Language, SourceKind, SourceLocation,
-        SymbolFacet,
+        SymbolKind,
     };
     use serde_json::json;
 
     use super::{
         CONTRIBUTION_EVIDENCE_MAX, CONTRIBUTION_FACTS_MAX, CONTRIBUTION_NAMESPACE_BYTES_MAX,
-        CONTRIBUTION_NAMESPACES_MAX, Contribution, ContributionKey, ContributionOrigin,
-        ContributionReference, ContributionRelationship, EquivalenceEvidence, PortableSymbolFacts,
-        ReferenceRole, RelationshipKind, SemanticReference, SourceApplicability, SourceRange,
+        CONTRIBUTION_NAMESPACES_MAX, Contribution, ContributionEdge, ContributionKey,
+        ContributionOrigin, ContributionReference, EdgeKind, EquivalenceEvidence,
+        PortableSymbolFacts, ReferenceRole, SemanticReference, SourceApplicability, SourceRange,
         SymbolRecord, SymbolResolution,
     };
     use crate::{
@@ -1166,7 +1166,7 @@ mod tests {
             "Beacon",
             ExactKind("struct".to_owned()),
         )
-        .facets(vec![SymbolFacet::Type, SymbolFacet::Public])
+        .kinds(vec![SymbolKind::Type, SymbolKind::Public])
         .visibility("pub")
         .signatures(Vec::new())
         .documentation(Vec::new())
@@ -1215,8 +1215,8 @@ mod tests {
         assert_eq!(facts.qualified_name(), "Beacon");
         assert_eq!(facts.kind().0, "struct");
         assert_eq!(
-            facts.symbol_facets(),
-            &[SymbolFacet::Type, SymbolFacet::Public]
+            facts.symbol_kinds(),
+            &[SymbolKind::Type, SymbolKind::Public]
         );
         assert_eq!(facts.visibility_spelling(), Some("pub"));
         assert!(facts.signatures_slice().is_empty());
@@ -1427,8 +1427,8 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_facets_are_refused() {
-        let duplicate = facts().facets(vec![SymbolFacet::Type, SymbolFacet::Type]);
+    fn duplicate_kinds_are_refused() {
+        let duplicate = facts().kinds(vec![SymbolKind::Type, SymbolKind::Type]);
         let error = Contribution::builder(
             ContributionKey::new(
                 provider("syntax"),
@@ -1440,7 +1440,7 @@ mod tests {
             ContributionOrigin::new(None, SourceKind::Synthetic).expect("synthetic origin"),
         )
         .build()
-        .expect_err("duplicate facets");
+        .expect_err("duplicate kinds");
         assert_eq!(
             error.slug().as_str(),
             "rift.core.contribution_duplicate_fact"
@@ -1514,7 +1514,7 @@ mod tests {
         let error = Contribution::builder(
             ContributionKey::new(provider("docs"), publication(1), provider_symbol("Beacon")),
             SourceApplicability::Independent,
-            facts().facets(vec![SymbolFacet::Type; CONTRIBUTION_FACTS_MAX + 1]),
+            facts().kinds(vec![SymbolKind::Type; CONTRIBUTION_FACTS_MAX + 1]),
             ContributionOrigin::new(None, SourceKind::Synthetic).expect("synthetic origin"),
         )
         .build()
@@ -1618,7 +1618,7 @@ mod tests {
     }
 
     #[test]
-    fn references_and_relationships_are_validated_and_retained() {
+    fn references_and_edges_are_validated_and_retained() {
         let target = ContributionReference::new(provider("syntax"), provider_symbol("Beacon"));
         let binding =
             super::DeclarationBinding::new(source_unit(), SourceRange::new(20, 26).expect("range"));
@@ -1635,7 +1635,7 @@ mod tests {
 
         let reference = SemanticReference::new(binding, ReferenceRole::Call, vec![target.clone()])
             .expect("reference");
-        let relationship = ContributionRelationship::new(RelationshipKind::Implementation, target);
+        let edge = ContributionEdge::new(EdgeKind::Implementation, target);
         let value = Contribution::builder(
             ContributionKey::new(
                 provider("native"),
@@ -1647,26 +1647,23 @@ mod tests {
             ContributionOrigin::new(None, SourceKind::Synthetic).expect("origin"),
         )
         .references(vec![reference])
-        .relationships(vec![relationship])
+        .edges(vec![edge])
         .build()
         .expect("contribution");
         assert_eq!(value.references()[0].role(), ReferenceRole::Call);
-        assert_eq!(
-            value.relationships()[0].kind(),
-            RelationshipKind::Implementation
-        );
+        assert_eq!(value.edges()[0].kind(), EdgeKind::Implementation);
     }
 
     #[test]
-    fn reference_and_relationship_counts_accept_the_bound_and_refuse_one_more() {
+    fn reference_and_edge_counts_accept_the_bound_and_refuse_one_more() {
         // Issue #535: both collections must retain the count-bound refusal evidence.
         let target = ContributionReference::new(provider("syntax"), provider_symbol("Beacon"));
         let binding =
             super::DeclarationBinding::new(source_unit(), SourceRange::new(20, 26).expect("range"));
         let reference = SemanticReference::new(binding, ReferenceRole::Call, vec![target.clone()])
             .expect("reference");
-        let relationship = ContributionRelationship::new(RelationshipKind::Implementation, target);
-        let build = |references, relationships| {
+        let edge = ContributionEdge::new(EdgeKind::Implementation, target);
+        let build = |references, edges| {
             Contribution::fact_builder(
                 ContributionKey::new(
                     provider("native"),
@@ -1677,21 +1674,21 @@ mod tests {
                 ContributionOrigin::new(None, SourceKind::Synthetic).expect("origin"),
             )
             .references(references)
-            .relationships(relationships)
+            .edges(edges)
             .build()
         };
         let accepted = build(
             vec![reference.clone(); CONTRIBUTION_FACTS_MAX],
-            vec![relationship.clone(); CONTRIBUTION_FACTS_MAX],
+            vec![edge.clone(); CONTRIBUTION_FACTS_MAX],
         )
         .expect("counts at the bound are accepted");
         assert_eq!(accepted.references().len(), CONTRIBUTION_FACTS_MAX);
-        assert_eq!(accepted.relationships().len(), CONTRIBUTION_FACTS_MAX);
-        for (references, relationships) in [
+        assert_eq!(accepted.edges().len(), CONTRIBUTION_FACTS_MAX);
+        for (references, edges) in [
             (vec![reference; CONTRIBUTION_FACTS_MAX + 1], Vec::new()),
-            (Vec::new(), vec![relationship; CONTRIBUTION_FACTS_MAX + 1]),
+            (Vec::new(), vec![edge; CONTRIBUTION_FACTS_MAX + 1]),
         ] {
-            let error = build(references, relationships).expect_err("count exceeds the bound");
+            let error = build(references, edges).expect_err("count exceeds the bound");
             assert_eq!(
                 error.slug().as_str(),
                 "rift.core.contribution_too_many_facts"

@@ -56,8 +56,8 @@ use crate::change_set::{FileDigest, FileRecord, PathChanges, WorkspaceDigests, t
 use crate::chunk::text_chunks;
 use crate::content_cache::WorkspaceContentCache;
 use crate::documentation::NotebookFiles;
+use crate::edge::EdgeStore;
 use crate::language::{ClassifiedPath, WorkspaceLanguagePolicy};
-use crate::relationship::RelationshipStore;
 use crate::semantic::{BuiltSemantics, WorkspaceSemantics};
 use rift_analysis::{DocumentationSelection, ForceIncludeReach, PathMatcher, PathVerdict};
 
@@ -76,7 +76,7 @@ pub struct WorkspaceIndexLimits {
     file_bytes_max: usize,
     workspace_bytes_max: usize,
     declarations_max: usize,
-    relationships_max: usize,
+    edges_max: usize,
     revision_tree_entries_max: usize,
     directory_depth_max: usize,
     results_max: usize,
@@ -108,7 +108,7 @@ impl WorkspaceIndexLimits {
             file_bytes_max,
             workspace_bytes_max,
             declarations_max: WORKSPACE_DECLARATIONS_MAX_DEFAULT,
-            relationships_max: usize::try_from(rift_protocol::source::SOURCE_RELATIONSHIPS_DEFAULT)
+            edges_max: usize::try_from(rift_protocol::source::SOURCE_EDGES_DEFAULT)
                 .unwrap_or(usize::MAX),
             revision_tree_entries_max: usize::try_from(
                 rift_protocol::configuration::HISTORY_TREE_ENTRIES_DEFAULT,
@@ -178,7 +178,7 @@ impl WorkspaceIndexLimits {
             self.file_bytes_max,
             self.workspace_bytes_max,
             self.declarations_max,
-            self.relationships_max,
+            self.edges_max,
             self.revision_tree_entries_max,
             self.directory_depth_max,
             self.results_max,
@@ -303,22 +303,18 @@ impl WorkspaceIndexLimits {
         self.declarations_max
     }
 
-    /// Returns maximum relationship edges held by the adjacency index.
+    /// Returns maximum edges held by the adjacency index.
     #[must_use]
-    pub const fn relationships_max(self) -> usize {
-        self.relationships_max
+    pub const fn edges_max(self) -> usize {
+        self.edges_max
     }
 
-    /// Applies caller-selected relationship capacity.
+    /// Applies caller-selected edge capacity.
     ///
     /// # Errors
     /// Returns a registered error for zero capacity.
-    pub fn with_relationships(self, relationships_max: usize) -> Result<Self, RiftError> {
-        Self {
-            relationships_max,
-            ..self
-        }
-        .validated()
+    pub fn with_edges(self, edges_max: usize) -> Result<Self, RiftError> {
+        Self { edges_max, ..self }.validated()
     }
 
     /// Returns maximum bytes accepted for one source file.
@@ -409,7 +405,7 @@ impl Default for WorkspaceIndexLimits {
             file_bytes_max: registry::file_bytes_max_default(),
             workspace_bytes_max: WORKSPACE_BYTES_MAX_DEFAULT,
             declarations_max: WORKSPACE_DECLARATIONS_MAX_DEFAULT,
-            relationships_max: usize::try_from(rift_protocol::source::SOURCE_RELATIONSHIPS_DEFAULT)
+            edges_max: usize::try_from(rift_protocol::source::SOURCE_EDGES_DEFAULT)
                 .unwrap_or(usize::MAX),
             revision_tree_entries_max: usize::try_from(
                 rift_protocol::configuration::HISTORY_TREE_ENTRIES_DEFAULT,
@@ -3776,8 +3772,8 @@ impl WorkspaceIndex {
 
     /// Returns the symbol reference adjacency built from this index's normalized graph.
     #[must_use]
-    pub fn relationships(&self) -> &RelationshipStore {
-        self.semantics.relationships()
+    pub fn edges(&self) -> &EdgeStore {
+        self.semantics.edges()
     }
 
     /// Resolved physical usages of one established target in this publication.
@@ -4818,10 +4814,10 @@ fn captured_project_semantics(
             phase = "WorkspaceSemantics::build_project_facts",
             files = 0,
             {
-                WorkspaceSemantics::build_project_facts_with_relationships(
+                WorkspaceSemantics::build_project_facts_with_edges(
                     std::iter::empty(),
                     limits.declarations_max(),
-                    limits.relationships_max(),
+                    limits.edges_max(),
                     revision,
                     previous,
                 )
@@ -4873,7 +4869,7 @@ fn captured_project_semantics(
         operation = "WorkspaceSemantics::build_project_facts",
         phase = "WorkspaceSemantics::build_project_facts",
         files = documents.len(),
-        { prepared.build(limits.relationships_max(), previous) }
+        { prepared.build(limits.edges_max(), previous) }
     )
     .map(|built| ProjectSemanticsAdmission::Built(Box::new(built)))
 }
@@ -11874,7 +11870,7 @@ mod tests {
             errors::index::workspace_provider().fail()
         }
 
-        fn syntax_element_facets(&self, _kind: &str) -> Vec<rift_protocol::read::NodeFacet> {
+        fn syntax_element_kinds(&self, _kind: &str) -> Vec<rift_protocol::read::SyntaxKind> {
             Vec::new()
         }
     }
@@ -14098,7 +14094,7 @@ mod tests {
             index.normalized_graph().references().is_empty(),
             "the syntax publication carries declarations alone"
         );
-        assert!(index.relationships().is_empty());
+        assert!(index.edges().is_empty());
     }
 
     #[test]

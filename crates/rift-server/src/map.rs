@@ -13,11 +13,10 @@ use rift_core::{Contribution, ProviderId, SymbolRecord};
 use rift_dependency::DependencyContext;
 use rift_index::WorkspaceIndex;
 use rift_protocol::map::{
-    MAP_DOCS_MAX, MAP_ENTRY_POINTS_MAX, MAP_HUBS_MAX, MAP_MODULE_DEPTH_MAX,
-    MAP_MODULE_RELATIONSHIPS_MAX, MAP_MODULES_MAX, MAP_PACKAGES_MAX, MapHub, MapLanguage,
-    MapModule, MapModuleRelationship, WorkspaceMap,
+    MAP_DOCS_MAX, MAP_ENTRY_POINTS_MAX, MAP_HUBS_MAX, MAP_MODULE_DEPTH_MAX, MAP_MODULE_EDGES_MAX,
+    MAP_MODULES_MAX, MAP_PACKAGES_MAX, MapHub, MapLanguage, MapModule, MapModuleEdge, WorkspaceMap,
 };
-use rift_protocol::read::{Digest, Language, Pagination, ProjectPath, SymbolFacet, SymbolId};
+use rift_protocol::read::{Digest, Language, Pagination, ProjectPath, SymbolId, SymbolKind};
 use rift_protocol::workspace::WORKSPACE_LANGUAGE_SUMMARIES_MAX;
 use rift_provider::{NormalizedGraph, NormalizedTarget, SymbolAssembler};
 use rift_syntax::ShippedLanguage;
@@ -108,7 +107,7 @@ pub(crate) fn build_workspace_map(
         hubs: hubs(graph, &records_by_identity),
         entry_points: entry_points(graph),
         docs: docs(index),
-        module_relationships: module_relationships(graph, &unit_paths, &records_by_identity),
+        module_edges: module_edges(graph, &unit_paths, &records_by_identity),
         packages,
         recommendations: Vec::new(),
         warnings: Vec::new(),
@@ -158,7 +157,7 @@ pub(crate) fn build_preparation_map(
         hubs: Vec::new(),
         entry_points: Vec::new(),
         docs: Vec::new(),
-        module_relationships: Vec::new(),
+        module_edges: Vec::new(),
         packages: Vec::new(),
         recommendations: Vec::new(),
         warnings: Vec::new(),
@@ -222,7 +221,7 @@ fn owning_module(path: &CoreProjectPath) -> Option<ProjectPath> {
 }
 
 /// The modules this revision resolved a reference between, ranked by that count descending
-/// with the two paths breaking ties, capped at [`MAP_MODULE_RELATIONSHIPS_MAX`].
+/// with the two paths breaking ties, capped at [`MAP_MODULE_EDGES_MAX`].
 ///
 /// Every entry is a resolved reference: no heuristic and no historical correlation
 /// contributes one. A reference whose source or target is not project-located contributes
@@ -230,11 +229,11 @@ fn owning_module(path: &CoreProjectPath) -> Option<ProjectPath> {
 /// `packages`. A pair whose two sides fold to one module is dropped, because a module
 /// referencing itself says nothing about structure. The tally rides the pass over
 /// `graph.references()` the ranking already makes, so it adds no walk.
-fn module_relationships(
+fn module_edges(
     graph: &NormalizedGraph,
     unit_paths: &BTreeMap<CoreSourceUnitId, CoreProjectPath>,
     records_by_identity: &BTreeMap<&CoreSymbolId, &SymbolRecord>,
-) -> Vec<MapModuleRelationship> {
+) -> Vec<MapModuleEdge> {
     let mut counts: BTreeMap<(ProjectPath, ProjectPath), u64> = BTreeMap::new();
     for reference in graph.references() {
         let Some(from) = unit_paths
@@ -262,10 +261,10 @@ fn module_relationships(
     }
     let mut ranked: Vec<((ProjectPath, ProjectPath), u64)> = counts.into_iter().collect();
     ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-    ranked.truncate(MAP_MODULE_RELATIONSHIPS_MAX);
+    ranked.truncate(MAP_MODULE_EDGES_MAX);
     ranked
         .into_iter()
-        .map(|((from, to), references)| MapModuleRelationship {
+        .map(|((from, to), references)| MapModuleEdge {
             from,
             to,
             references,
@@ -343,7 +342,7 @@ fn module_syntax_element(
     }
 }
 
-/// Symbols carrying the [`SymbolFacet::Entrypoint`] facet, in identity order, capped at
+/// Symbols carrying the [`SymbolKind::Entrypoint`] facet, in identity order, capped at
 /// [`MAP_ENTRY_POINTS_MAX`]. The identity string files a symbol under its language then its
 /// declaring path, so sorting it orders entries by path within each language.
 fn entry_points(graph: &NormalizedGraph) -> Vec<SymbolId> {
@@ -357,7 +356,7 @@ fn entry_points(graph: &NormalizedGraph) -> Vec<SymbolId> {
                 .iter()
                 .filter_map(|key| graph.contribution(key))
                 .filter_map(Contribution::facts)
-                .any(|facts| facts.symbol_facets().contains(&SymbolFacet::Entrypoint));
+                .any(|facts| facts.symbol_kinds().contains(&SymbolKind::Entrypoint));
             is_entrypoint.then(|| SymbolId(identity.as_str().to_owned()))
         })
         .collect();
@@ -368,7 +367,7 @@ fn entry_points(graph: &NormalizedGraph) -> Vec<SymbolId> {
 
 /// The most-referenced symbols, ranked by reference count descending with identity breaking
 /// ties, capped at [`MAP_HUBS_MAX`]. `records_by_identity` is the caller's one index over the
-/// graph's established identities, shared with [`module_relationships`]. A candidate whose
+/// graph's established identities, shared with [`module_edges`]. A candidate whose
 /// record cannot be assembled - no established identity, or no provider ever contributed
 /// portable facts for it - is skipped
 /// rather than reported with a guessed kind; ranking continues past it toward the next
@@ -453,7 +452,7 @@ mod tests {
     };
     use rift_index::WorkspaceIndexLimits;
     use rift_protocol::configuration::HistoryConfiguration;
-    use rift_protocol::map::{MAP_HUBS_MAX, MapModuleRelationship, WorkspaceMap};
+    use rift_protocol::map::{MAP_HUBS_MAX, MapModuleEdge, WorkspaceMap};
     use rift_protocol::read::{Digest, ProjectPath};
     use rift_provider::{
         NormalizedGraph, NormalizedReference, NormalizedTarget, Normalizer, ProviderPublication,
@@ -493,7 +492,7 @@ mod tests {
     /// listing; a symbol nested four directories deep proves depth folding; `README.md` at the
     /// root and `docs/guide.md` prove the docs filter and that a root-level file earns no module
     /// entry. No provider publishes a resolved reference, so the calls in this source reach the
-    /// map as neither hub nor module relationship.
+    /// map as neither hub nor module edge.
     fn fixture() -> TestResult<(TempDir, ReadService)> {
         let directory = tempfile::tempdir()?;
         fs::write(
@@ -548,7 +547,7 @@ mod tests {
         assert!(map.modules.iter().all(|module| module.symbols == 0));
         assert!(map.hubs.is_empty());
         assert!(map.entry_points.is_empty());
-        assert!(map.module_relationships.is_empty());
+        assert!(map.module_edges.is_empty());
         Ok(())
     }
 
@@ -661,7 +660,7 @@ mod tests {
 
     /// Normalizes one hand-built publication into the graph `build_workspace_map` reads. No
     /// shipped provider publishes a resolved reference, so a served workspace cannot supply the
-    /// graph the hub ranking and the module-relationship fold act on.
+    /// graph the hub ranking and the module-edge fold act on.
     fn published_graph(
         definitions: &[Definition<'_>],
         fact_less: &[Definition<'_>],
@@ -732,7 +731,7 @@ mod tests {
         )
     }
 
-    /// The unit-to-path map `module_relationships` folds a reference through, for the units a
+    /// The unit-to-path map `module_edges` folds a reference through, for the units a
     /// hand-built graph declares in.
     fn unit_paths(paths: &[&str]) -> TestResult<BTreeMap<SourceUnitId, rift_core::ProjectPath>> {
         paths
@@ -741,7 +740,7 @@ mod tests {
             .collect()
     }
 
-    /// Every identity a graph's references resolve to. A test expecting no relationship checks
+    /// Every identity a graph's references resolve to. A test expecting no edge checks
     /// this first: an empty answer over a graph that resolves nothing proves nothing.
     fn resolved_targets(graph: &NormalizedGraph) -> Vec<SymbolId> {
         graph
@@ -772,17 +771,11 @@ mod tests {
         Ok(listed)
     }
 
-    /// The module pairs one relationship list names, with each pair's reference count.
-    fn pairs(relationships: &[MapModuleRelationship]) -> Vec<(&str, &str, u64)> {
-        relationships
+    /// The module pairs one edge list names, with each pair's reference count.
+    fn pairs(edges: &[MapModuleEdge]) -> Vec<(&str, &str, u64)> {
+        edges
             .iter()
-            .map(|relationship| {
-                (
-                    relationship.from.0.as_str(),
-                    relationship.to.0.as_str(),
-                    relationship.references,
-                )
-            })
+            .map(|edge| (edge.from.0.as_str(), edge.to.0.as_str(), edge.references))
             .collect()
     }
 
@@ -1013,7 +1006,7 @@ mod tests {
         assert!(map.hubs.is_empty());
         assert!(map.entry_points.is_empty());
         assert!(map.docs.is_empty());
-        assert!(map.module_relationships.is_empty());
+        assert!(map.module_edges.is_empty());
 
         let value = serde_json::to_value(&map)?;
         for field in [
@@ -1022,7 +1015,7 @@ mod tests {
             "hubs",
             "entry_points",
             "docs",
-            "module_relationships",
+            "module_edges",
         ] {
             assert!(value.get(field).is_none(), "field={field}");
         }
@@ -1141,56 +1134,53 @@ mod tests {
     }
 
     #[test]
-    fn a_resolved_reference_crossing_two_modules_becomes_one_relationship() -> TestResult {
+    fn a_resolved_reference_crossing_two_modules_becomes_one_edge() -> TestResult {
         let graph = crossing_graph(ONE_CROSSING_CALL)?;
         let records = super::records_by_identity(&graph);
-        let relationships =
-            super::module_relationships(&graph, &unit_paths(CROSSING_UNITS)?, &records);
-        assert_eq!(pairs(&relationships), [("src", "src/inner", 1)]);
+        let edges = super::module_edges(&graph, &unit_paths(CROSSING_UNITS)?, &records);
+        assert_eq!(pairs(&edges), [("src", "src/inner", 1)]);
         Ok(())
     }
 
     #[test]
-    fn every_relationship_endpoint_names_a_listed_module() -> TestResult {
+    fn every_edge_endpoint_names_a_listed_module() -> TestResult {
         let graph = crossing_graph(ONE_CROSSING_CALL)?;
         let records = super::records_by_identity(&graph);
-        let relationships =
-            super::module_relationships(&graph, &unit_paths(CROSSING_UNITS)?, &records);
+        let edges = super::module_edges(&graph, &unit_paths(CROSSING_UNITS)?, &records);
         let listed = listed_modules(CROSSING_UNITS)?;
         assert!(
-            !relationships.is_empty(),
-            "the crossing graph answers one relationship to check"
+            !edges.is_empty(),
+            "the crossing graph answers one edge to check"
         );
-        for relationship in &relationships {
+        for edge in &edges {
             assert!(
-                listed.contains(&relationship.from.0),
+                listed.contains(&edge.from.0),
                 "from={} listed={listed:?}",
-                relationship.from.0
+                edge.from.0
             );
             assert!(
-                listed.contains(&relationship.to.0),
+                listed.contains(&edge.to.0),
                 "to={} listed={listed:?}",
-                relationship.to.0
+                edge.to.0
             );
         }
         Ok(())
     }
 
     #[test]
-    fn several_references_over_one_pair_answer_as_one_relationship() -> TestResult {
+    fn several_references_over_one_pair_answer_as_one_edge() -> TestResult {
         let graph = crossing_graph(&[
             ("first_call_helper", "src/lib.rs", (10, 20), "helper"),
             ("second_call_helper", "src/lib.rs", (20, 30), "helper"),
         ])?;
         let records = super::records_by_identity(&graph);
-        let relationships =
-            super::module_relationships(&graph, &unit_paths(CROSSING_UNITS)?, &records);
-        assert_eq!(pairs(&relationships), [("src", "src/inner", 2)]);
+        let edges = super::module_edges(&graph, &unit_paths(CROSSING_UNITS)?, &records);
+        assert_eq!(pairs(&edges), [("src", "src/inner", 2)]);
         Ok(())
     }
 
     #[test]
-    fn a_reference_inside_one_module_is_no_relationship() -> TestResult {
+    fn a_reference_inside_one_module_is_no_edge() -> TestResult {
         let graph = resolved_graph(
             &[
                 (
@@ -1209,15 +1199,14 @@ mod tests {
             &[("beacon_calls_helper", "src/lib.rs", (30, 40), "helper")],
         )?;
         let records = super::records_by_identity(&graph);
-        let relationships =
-            super::module_relationships(&graph, &unit_paths(&["src/lib.rs"])?, &records);
+        let edges = super::module_edges(&graph, &unit_paths(&["src/lib.rs"])?, &records);
         assert!(
             !resolved_targets(&graph).is_empty(),
             "the reference must resolve, or an empty answer proves nothing"
         );
         assert!(
-            relationships.is_empty(),
-            "a module referencing itself says nothing about structure: {relationships:?}"
+            edges.is_empty(),
+            "a module referencing itself says nothing about structure: {edges:?}"
         );
         Ok(())
     }
@@ -1243,46 +1232,42 @@ mod tests {
         )?;
         let records = super::records_by_identity(&graph);
         let paths = unit_paths(&["lib.rs", "inner/mod.rs"])?;
-        let relationships = super::module_relationships(&graph, &paths, &records);
+        let edges = super::module_edges(&graph, &paths, &records);
         assert!(
             !resolved_targets(&graph).is_empty(),
             "the reference must resolve, or an empty answer proves nothing"
         );
         assert!(
-            relationships.is_empty(),
-            "a file directly at the workspace root belongs to no listed module: {relationships:?}"
+            edges.is_empty(),
+            "a file directly at the workspace root belongs to no listed module: {edges:?}"
         );
         Ok(())
     }
 
     #[test]
-    fn module_relationships_are_stable_across_two_builds_of_one_tree() -> TestResult {
+    fn module_edges_are_stable_across_two_builds_of_one_tree() -> TestResult {
         let first_graph = crossing_graph(ONE_CROSSING_CALL)?;
         let second_graph = crossing_graph(ONE_CROSSING_CALL)?;
         let first_records = super::records_by_identity(&first_graph);
         let second_records = super::records_by_identity(&second_graph);
-        let first =
-            super::module_relationships(&first_graph, &unit_paths(CROSSING_UNITS)?, &first_records);
-        let second = super::module_relationships(
-            &second_graph,
-            &unit_paths(CROSSING_UNITS)?,
-            &second_records,
-        );
+        let first = super::module_edges(&first_graph, &unit_paths(CROSSING_UNITS)?, &first_records);
+        let second =
+            super::module_edges(&second_graph, &unit_paths(CROSSING_UNITS)?, &second_records);
         assert!(
             !first.is_empty(),
-            "the crossing graph answers one relationship to compare"
+            "the crossing graph answers one edge to compare"
         );
         assert_eq!(first, second);
         Ok(())
     }
 
     #[test]
-    fn a_graph_with_no_resolved_reference_answers_with_no_relationship() -> TestResult {
+    fn a_graph_with_no_resolved_reference_answers_with_no_edge() -> TestResult {
         let graph = fact_less_target_graph()?;
         let unit_paths = BTreeMap::new();
         let records = super::records_by_identity(&graph);
         assert!(
-            super::module_relationships(&graph, &unit_paths, &records).is_empty(),
+            super::module_edges(&graph, &unit_paths, &records).is_empty(),
             "a reference whose source unit maps to no project path contributes nothing"
         );
         Ok(())
@@ -1293,7 +1278,7 @@ mod tests {
     /// whose source plainly calls across two modules. The ranking and the fold themselves stay
     /// proven over the hand-built graphs above.
     #[test]
-    fn a_served_workspace_answers_no_hub_and_no_module_relationship() -> TestResult {
+    fn a_served_workspace_answers_no_hub_and_no_module_edge() -> TestResult {
         let (_directory, map) = served_map(CROSSING_FILES)?;
         assert!(
             map.hubs.is_empty(),
@@ -1301,9 +1286,9 @@ mod tests {
             map.hubs
         );
         assert!(
-            map.module_relationships.is_empty(),
+            map.module_edges.is_empty(),
             "no provider publishes a resolved reference, so no module pair is joined: {:?}",
-            map.module_relationships
+            map.module_edges
         );
         Ok(())
     }

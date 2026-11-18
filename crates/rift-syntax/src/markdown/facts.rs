@@ -112,7 +112,7 @@ pub struct MarkdownReferenceCandidate {
 
 mod retained_size;
 
-/// Markdown structure and relationship facts from one syntax document.
+/// Markdown structure and edge facts from one syntax document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkdownFacts {
     blocks: Vec<MarkdownBlockFact>,
@@ -818,7 +818,7 @@ fn required_kind(language: &tree_sitter::Language, kind: &str) -> u16 {
 /// names.
 #[derive(Debug, Clone, Copy)]
 struct ElementBound {
-    /// Facets this walk may take: the configured bound less the syntax elements earlier
+    /// Syntax elements this walk may take: the configured bound less the syntax elements earlier
     /// trees of the same source already took.
     remaining: usize,
     /// The configured `syntax_elements_max`.

@@ -22,7 +22,7 @@ use std::num::NonZeroU16;
 use std::sync::OnceLock;
 
 use rift_error::errors;
-use rift_protocol::read::{Documentation, DocumentationFormat, Language, NodeFacet, SymbolFacet};
+use rift_protocol::read::{Documentation, DocumentationFormat, Language, SymbolKind, SyntaxKind};
 use tree_sitter::{Node, Parser};
 
 use crate::document::SyntaxDocument;
@@ -203,7 +203,7 @@ impl PythonRules {
         syntax_element: Node<'_>,
         text: &str,
         kind: &'static str,
-        facets: Vec<SymbolFacet>,
+        kinds: Vec<SymbolKind>,
     ) -> Result<Option<Declaration>, RiftError> {
         let Some(name) = self.field_name(syntax_element, text) else {
             return Ok(None);
@@ -216,7 +216,7 @@ impl PythonRules {
         Ok(Some(Declaration {
             name,
             kind,
-            facets,
+            kinds,
             visibility: None,
             body_range,
             documentation,
@@ -239,7 +239,7 @@ impl PythonRules {
         Some(Declaration {
             name: name.to_owned(),
             kind: VARIABLE_KIND_WORD,
-            facets: vec![SymbolFacet::Value],
+            kinds: vec![SymbolKind::Value],
             visibility: None,
             body_range: None,
             documentation: Vec::new(),
@@ -301,7 +301,7 @@ impl GrammarRules for PythonRules {
                 syntax_element,
                 text,
                 FUNCTION_KIND_WORD,
-                vec![SymbolFacet::Value, SymbolFacet::Callable],
+                vec![SymbolKind::Value, SymbolKind::Callable],
             );
         }
         if syntax_element.kind_id() == self.kinds.class {
@@ -309,7 +309,7 @@ impl GrammarRules for PythonRules {
                 syntax_element,
                 text,
                 CLASS_KIND_WORD,
-                vec![SymbolFacet::Type],
+                vec![SymbolKind::Type],
             );
         }
         if syntax_element.kind_id() == self.kinds.assignment {
@@ -410,21 +410,21 @@ impl SyntaxProvider for PythonSyntaxProvider {
         .with_syntax_limits(limits))
     }
 
-    fn syntax_element_facets(&self, kind: &str) -> Vec<NodeFacet> {
-        let mut facets = Vec::new();
+    fn syntax_element_kinds(&self, kind: &str) -> Vec<SyntaxKind> {
+        let mut kinds = Vec::new();
         if kind.ends_with("_definition") {
-            facets.extend([NodeFacet::Declaration, NodeFacet::Definition]);
+            kinds.extend([SyntaxKind::Declaration, SyntaxKind::Definition]);
         }
         if kind == BLOCK_KIND {
-            facets.push(NodeFacet::Block);
+            kinds.push(SyntaxKind::Block);
         }
         if kind.ends_with("_statement") {
-            facets.push(NodeFacet::Statement);
+            kinds.push(SyntaxKind::Statement);
         }
         if kind.contains("comment") {
-            facets.push(NodeFacet::Comment);
+            kinds.push(SyntaxKind::Comment);
         }
-        facets
+        kinds
     }
 }
 
@@ -479,11 +479,11 @@ mod tests {
         let document = analyze("def serve():\n    pass\n\nclass Widget:\n    pass\n");
         let function = symbol(&document, "serve");
         assert_eq!(function.kind, "function");
-        assert_eq!(function.facets, [SymbolFacet::Value, SymbolFacet::Callable]);
+        assert_eq!(function.kinds, [SymbolKind::Value, SymbolKind::Callable]);
         assert_eq!(function.visibility, None);
         let class = symbol(&document, "Widget");
         assert_eq!(class.kind, "class");
-        assert_eq!(class.facets, [SymbolFacet::Type]);
+        assert_eq!(class.kinds, [SymbolKind::Type]);
     }
 
     #[test]
@@ -633,7 +633,7 @@ mod tests {
             "LIMIT = 16\n\nclass Widget:\n    retries = 2\n    def open(self):\n        local = 1\n",
         );
         assert_eq!(symbol(&document, "LIMIT").kind, "variable");
-        assert_eq!(symbol(&document, "LIMIT").facets, [SymbolFacet::Value]);
+        assert_eq!(symbol(&document, "LIMIT").kinds, [SymbolKind::Value]);
         assert_eq!(symbol(&document, "Widget.retries").kind, "variable");
         assert!(
             !document
@@ -682,22 +682,22 @@ mod tests {
     }
 
     #[test]
-    fn test_syntax_element_facets_cover_definitions_blocks_statements_and_comments() {
+    fn test_syntax_element_kinds_cover_definitions_blocks_statements_and_comments() {
         let provider = PythonSyntaxProvider::default();
         assert_eq!(
-            provider.syntax_element_facets("function_definition"),
-            [NodeFacet::Declaration, NodeFacet::Definition]
+            provider.syntax_element_kinds("function_definition"),
+            [SyntaxKind::Declaration, SyntaxKind::Definition]
         );
-        assert_eq!(provider.syntax_element_facets("block"), [NodeFacet::Block]);
+        assert_eq!(provider.syntax_element_kinds("block"), [SyntaxKind::Block]);
         assert_eq!(
-            provider.syntax_element_facets("expression_statement"),
-            [NodeFacet::Statement]
+            provider.syntax_element_kinds("expression_statement"),
+            [SyntaxKind::Statement]
         );
         assert_eq!(
-            provider.syntax_element_facets("comment"),
-            [NodeFacet::Comment]
+            provider.syntax_element_kinds("comment"),
+            [SyntaxKind::Comment]
         );
-        assert_eq!(provider.syntax_element_facets("identifier"), []);
+        assert_eq!(provider.syntax_element_kinds("identifier"), []);
     }
 
     #[test]

@@ -717,9 +717,9 @@
             "min": "1s"
           }
         },
-        "max_facets": {
-          "default": 16,
-          "description": "Most selected facets in one global relationship request.",
+        "max_edges": {
+          "default": 1000,
+          "description": "Most edge projections in one global edge group.",
           "format": "uint64",
           "minimum": 1,
           "type": "integer"
@@ -732,16 +732,16 @@
           "minimum": 1,
           "type": "integer"
         },
-        "max_occurrences": {
-          "default": 1000,
-          "description": "Most occurrence projections in one global relationship group.",
+        "max_kinds": {
+          "default": 16,
+          "description": "Most selected kinds in one global edge request.",
           "format": "uint64",
           "minimum": 1,
           "type": "integer"
         },
-        "max_relationships": {
+        "max_occurrences": {
           "default": 1000,
-          "description": "Most relationship projections in one global relationship group.",
+          "description": "Most occurrence projections in one global edge group.",
           "format": "uint64",
           "minimum": 1,
           "type": "integer"
@@ -766,7 +766,7 @@
         },
         "max_seeds": {
           "default": 64,
-          "description": "Most subjects in one global relationship request.",
+          "description": "Most subjects in one global edge request.",
           "format": "uint64",
           "minimum": 1,
           "type": "integer"
@@ -782,14 +782,14 @@
         },
         "max_sources": {
           "default": 10000,
-          "description": "Most original source units in one global relationship page.",
+          "description": "Most original source units in one global edge page.",
           "format": "uint64",
           "minimum": 1,
           "type": "integer"
         },
         "max_symbols": {
           "default": 10000,
-          "description": "Most original symbol records in one global relationship page.",
+          "description": "Most original symbol records in one global edge page.",
           "format": "uint64",
           "minimum": 1,
           "type": "integer"
@@ -1569,11 +1569,11 @@
           "default": {
             "declarations": 1000000,
             "directory_depth": 64,
+            "edges": 10000000,
             "exclude": [],
             "files": 100000,
             "force_include": [],
             "include": [],
-            "relationships": 10000000,
             "respect_gitignore": true,
             "workspace_size": "512mb"
           },
@@ -2031,6 +2031,14 @@
           "minimum": 1,
           "type": "integer"
         },
+        "edges": {
+          "default": 10000000,
+          "description": "Most edges held together, 1 to 500000000.",
+          "format": "uint64",
+          "maximum": 500000000,
+          "minimum": 1,
+          "type": "integer"
+        },
         "exclude": {
           "default": [],
           "description": "Exact file paths or globs dropped from visibility, in [`PathPattern`] syntax. A match\nhere is dropped even when `include` also matches it.",
@@ -2065,14 +2073,6 @@
           },
           "maxItems": 512,
           "type": "array"
-        },
-        "relationships": {
-          "default": 10000000,
-          "description": "Most relationship edges held together, 1 to 500000000.",
-          "format": "uint64",
-          "maximum": 500000000,
-          "minimum": 1,
-          "type": "integer"
         },
         "respect_gitignore": {
           "default": true,
@@ -2359,10 +2359,10 @@
         "enabled": true,
         "endpoint": "https://api.volar.sh/rift/rest",
         "failure_ttl": "30s",
-        "max_facets": 16,
+        "max_edges": 1000,
         "max_in_flight": 4,
+        "max_kinds": 16,
         "max_occurrences": 1000,
-        "max_relationships": 1000,
         "max_request": "4mb",
         "max_response": "32mb",
         "max_seeds": 64,
@@ -2575,11 +2575,11 @@
       "default": {
         "declarations": 1000000,
         "directory_depth": 64,
+        "edges": 10000000,
         "exclude": [],
         "files": 100000,
         "force_include": [],
         "include": [],
-        "relationships": 10000000,
         "respect_gitignore": true,
         "workspace_size": "512mb"
       },

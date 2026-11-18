@@ -70,7 +70,7 @@ impl RiftMcp {
         within_deadline(
             deadline,
             "facets",
-            self.global.symbol_facets(&configuration, &selected),
+            self.global.symbol_kinds(&configuration, &selected),
         )
         .await
         .map(Json)

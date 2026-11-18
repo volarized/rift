@@ -62,7 +62,7 @@ fn identity(service: &ReadService, name: &str) -> TestResult<SymbolId> {
     Ok(symbol_id(service.index(), matched)?.ok_or("established identity")?)
 }
 
-fn symbol_facets(service: &ReadService, id: &SymbolId) -> Result<FacetsResult, RiftError> {
+fn symbol_kinds(service: &ReadService, id: &SymbolId) -> Result<FacetsResult, RiftError> {
     service.facets(&FacetsParams::of(id.clone()))
 }
 
@@ -70,7 +70,7 @@ fn symbol_facets(service: &ReadService, id: &SymbolId) -> Result<FacetsResult, R
 fn each_facet_carries_declaration_source_and_syntax_structure() -> TestResult {
     let (_directory, service) = rust_service()?;
     let id = identity(&service, "dim")?;
-    let answer = symbol_facets(&service, &id)?;
+    let answer = symbol_kinds(&service, &id)?;
     assert_eq!(answer.symbol, id);
     assert_eq!(answer.declarations.len(), 1);
     let declaration = &answer.declarations[0];
@@ -111,8 +111,8 @@ fn each_facet_carries_declaration_source_and_syntax_structure() -> TestResult {
 #[test]
 fn nested_declarations_keep_their_own_syntax_structure() -> TestResult {
     let (_directory, service) = rust_service()?;
-    let module = symbol_facets(&service, &identity(&service, "lamp")?)?;
-    let function = symbol_facets(&service, &identity(&service, "light")?)?;
+    let module = symbol_kinds(&service, &identity(&service, "lamp")?)?;
+    let function = symbol_kinds(&service, &identity(&service, "light")?)?;
     assert!(module.declarations[0].source.text.contains("pub fn light"));
     assert!(
         !module.declarations[0]

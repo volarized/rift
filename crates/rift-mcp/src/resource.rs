@@ -255,7 +255,7 @@ mod tests {
             hubs: Vec::new(),
             entry_points: Vec::new(),
             docs: Vec::new(),
-            module_relationships: Vec::new(),
+            module_edges: Vec::new(),
             packages: Vec::new(),
             recommendations: Vec::new(),
             warnings: Vec::new(),

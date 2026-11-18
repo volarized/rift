@@ -4,12 +4,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-use lsp_types::{DocumentSymbol, DocumentSymbolResponse, Range, SymbolInformation, SymbolKind};
+use lsp_types::{
+    DocumentSymbol, DocumentSymbolResponse, Range, SymbolInformation, SymbolKind as LspSymbolKind,
+};
 use rift_core::{
     Contribution, ContributionKey, ContributionOrigin, ContributionReference, DeclarationBinding,
     EquivalenceEvidence, ExactKind, ExtensionKey, ExtensionValue, Extensions, Language,
     PortableSymbolFacts, ProviderId, ProviderRevision, ProviderSymbolId, SourceApplicability,
-    SourceKind, SourceLocation, SourceRange, SourceRevision, SourceUnitId, SymbolFacet,
+    SourceKind, SourceLocation, SourceRange, SourceRevision, SourceUnitId, SymbolKind,
     TreeRevision,
 };
 use rift_provider::{
@@ -185,7 +187,7 @@ impl LspContributionAdapter {
                 symbol.qualified_name,
                 ExactKind(kind_name(symbol.kind).to_owned()),
             )
-            .facets(kind_facets(symbol.kind));
+            .kinds(symbol_kinds(symbol.kind));
             if let Some(parent) = symbol.parent {
                 facts = facts.container(ContributionReference::new(
                     self.provider.clone(),
@@ -299,7 +301,7 @@ struct PendingSymbol {
     parent: Option<LspResultAddress>,
     name: String,
     qualified_name: String,
-    kind: SymbolKind,
+    kind: LspSymbolKind,
     selection_range: Range,
     data: Value,
 }
@@ -380,73 +382,73 @@ fn flat_symbols(symbols: &[SymbolInformation]) -> Vec<PendingSymbol> {
         .collect()
 }
 
-fn kind_name(kind: SymbolKind) -> &'static str {
-    if kind == SymbolKind::FILE {
+fn kind_name(kind: LspSymbolKind) -> &'static str {
+    if kind == LspSymbolKind::FILE {
         "file"
-    } else if kind == SymbolKind::MODULE {
+    } else if kind == LspSymbolKind::MODULE {
         "module"
-    } else if kind == SymbolKind::NAMESPACE {
+    } else if kind == LspSymbolKind::NAMESPACE {
         "namespace"
-    } else if kind == SymbolKind::PACKAGE {
+    } else if kind == LspSymbolKind::PACKAGE {
         "package"
-    } else if kind == SymbolKind::CLASS {
+    } else if kind == LspSymbolKind::CLASS {
         "class"
-    } else if kind == SymbolKind::METHOD {
+    } else if kind == LspSymbolKind::METHOD {
         "method"
-    } else if kind == SymbolKind::PROPERTY {
+    } else if kind == LspSymbolKind::PROPERTY {
         "property"
-    } else if kind == SymbolKind::FIELD {
+    } else if kind == LspSymbolKind::FIELD {
         "field"
-    } else if kind == SymbolKind::CONSTRUCTOR {
+    } else if kind == LspSymbolKind::CONSTRUCTOR {
         "constructor"
-    } else if kind == SymbolKind::ENUM {
+    } else if kind == LspSymbolKind::ENUM {
         "enum"
-    } else if kind == SymbolKind::INTERFACE {
+    } else if kind == LspSymbolKind::INTERFACE {
         "interface"
-    } else if kind == SymbolKind::FUNCTION {
+    } else if kind == LspSymbolKind::FUNCTION {
         "function"
-    } else if kind == SymbolKind::VARIABLE {
+    } else if kind == LspSymbolKind::VARIABLE {
         "variable"
-    } else if kind == SymbolKind::CONSTANT {
+    } else if kind == LspSymbolKind::CONSTANT {
         "constant"
-    } else if kind == SymbolKind::STRUCT {
+    } else if kind == LspSymbolKind::STRUCT {
         "struct"
-    } else if kind == SymbolKind::TYPE_PARAMETER {
+    } else if kind == LspSymbolKind::TYPE_PARAMETER {
         "type_parameter"
     } else {
         "symbol"
     }
 }
 
-fn kind_facets(kind: SymbolKind) -> Vec<SymbolFacet> {
+fn symbol_kinds(kind: LspSymbolKind) -> Vec<SymbolKind> {
     if [
-        SymbolKind::CLASS,
-        SymbolKind::ENUM,
-        SymbolKind::INTERFACE,
-        SymbolKind::STRUCT,
-        SymbolKind::TYPE_PARAMETER,
+        LspSymbolKind::CLASS,
+        LspSymbolKind::ENUM,
+        LspSymbolKind::INTERFACE,
+        LspSymbolKind::STRUCT,
+        LspSymbolKind::TYPE_PARAMETER,
     ]
     .contains(&kind)
     {
-        vec![SymbolFacet::Type]
+        vec![SymbolKind::Type]
     } else if [
-        SymbolKind::METHOD,
-        SymbolKind::CONSTRUCTOR,
-        SymbolKind::FUNCTION,
+        LspSymbolKind::METHOD,
+        LspSymbolKind::CONSTRUCTOR,
+        LspSymbolKind::FUNCTION,
     ]
     .contains(&kind)
     {
-        vec![SymbolFacet::Callable, SymbolFacet::Value]
+        vec![SymbolKind::Callable, SymbolKind::Value]
     } else if [
-        SymbolKind::MODULE,
-        SymbolKind::NAMESPACE,
-        SymbolKind::PACKAGE,
+        LspSymbolKind::MODULE,
+        LspSymbolKind::NAMESPACE,
+        LspSymbolKind::PACKAGE,
     ]
     .contains(&kind)
     {
-        vec![SymbolFacet::Namespace]
+        vec![SymbolKind::Namespace]
     } else {
-        vec![SymbolFacet::Value]
+        vec![SymbolKind::Value]
     }
 }
 
@@ -465,7 +467,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use lsp_types::{
-        DocumentSymbol, DocumentSymbolResponse, Position, Range, SymbolKind, SymbolTag,
+        DocumentSymbol, DocumentSymbolResponse, Position, Range, SymbolKind as LspSymbolKind,
+        SymbolTag,
     };
     use rift_core::{
         Language, ProviderId, ProviderRevision, SourcePath, SourceResolverId, SourceRevision,
@@ -502,7 +505,7 @@ mod tests {
         DocumentSymbol {
             name: "Beacon".to_owned(),
             detail: Some("struct Beacon".to_owned()),
-            kind: SymbolKind::STRUCT,
+            kind: LspSymbolKind::STRUCT,
             tags: None,
             deprecated: None,
             range: Range::new(Position::new(0, 0), Position::new(0, 14)),
@@ -510,7 +513,7 @@ mod tests {
             children: Some(vec![DocumentSymbol {
                 name: "new".to_owned(),
                 detail: Some("fn new() -> Beacon".to_owned()),
-                kind: SymbolKind::FUNCTION,
+                kind: LspSymbolKind::FUNCTION,
                 tags: Some(vec![SymbolTag::DEPRECATED]),
                 deprecated: None,
                 range: Range::new(Position::new(0, 7), Position::new(0, 13)),
@@ -556,47 +559,47 @@ mod tests {
     }
 
     #[test]
-    fn every_supported_symbol_kind_maps_to_its_stable_name_and_facets() {
+    fn every_supported_symbol_kind_maps_to_its_stable_name_and_kinds() {
         let names = [
-            (SymbolKind::FILE, "file"),
-            (SymbolKind::MODULE, "module"),
-            (SymbolKind::NAMESPACE, "namespace"),
-            (SymbolKind::PACKAGE, "package"),
-            (SymbolKind::CLASS, "class"),
-            (SymbolKind::METHOD, "method"),
-            (SymbolKind::PROPERTY, "property"),
-            (SymbolKind::FIELD, "field"),
-            (SymbolKind::CONSTRUCTOR, "constructor"),
-            (SymbolKind::ENUM, "enum"),
-            (SymbolKind::INTERFACE, "interface"),
-            (SymbolKind::FUNCTION, "function"),
-            (SymbolKind::VARIABLE, "variable"),
-            (SymbolKind::CONSTANT, "constant"),
-            (SymbolKind::STRUCT, "struct"),
-            (SymbolKind::TYPE_PARAMETER, "type_parameter"),
-            (SymbolKind::STRING, "symbol"),
+            (LspSymbolKind::FILE, "file"),
+            (LspSymbolKind::MODULE, "module"),
+            (LspSymbolKind::NAMESPACE, "namespace"),
+            (LspSymbolKind::PACKAGE, "package"),
+            (LspSymbolKind::CLASS, "class"),
+            (LspSymbolKind::METHOD, "method"),
+            (LspSymbolKind::PROPERTY, "property"),
+            (LspSymbolKind::FIELD, "field"),
+            (LspSymbolKind::CONSTRUCTOR, "constructor"),
+            (LspSymbolKind::ENUM, "enum"),
+            (LspSymbolKind::INTERFACE, "interface"),
+            (LspSymbolKind::FUNCTION, "function"),
+            (LspSymbolKind::VARIABLE, "variable"),
+            (LspSymbolKind::CONSTANT, "constant"),
+            (LspSymbolKind::STRUCT, "struct"),
+            (LspSymbolKind::TYPE_PARAMETER, "type_parameter"),
+            (LspSymbolKind::STRING, "symbol"),
         ];
         for (kind, expected) in names {
             assert_eq!(super::kind_name(kind), expected);
         }
         assert_eq!(
-            super::kind_facets(SymbolKind::CLASS),
-            vec![rift_core::SymbolFacet::Type]
+            super::symbol_kinds(LspSymbolKind::CLASS),
+            vec![rift_core::SymbolKind::Type]
         );
         assert_eq!(
-            super::kind_facets(SymbolKind::FUNCTION),
+            super::symbol_kinds(LspSymbolKind::FUNCTION),
             vec![
-                rift_core::SymbolFacet::Callable,
-                rift_core::SymbolFacet::Value
+                rift_core::SymbolKind::Callable,
+                rift_core::SymbolKind::Value
             ]
         );
         assert_eq!(
-            super::kind_facets(SymbolKind::MODULE),
-            vec![rift_core::SymbolFacet::Namespace]
+            super::symbol_kinds(LspSymbolKind::MODULE),
+            vec![rift_core::SymbolKind::Namespace]
         );
         assert_eq!(
-            super::kind_facets(SymbolKind::PROPERTY),
-            vec![rift_core::SymbolFacet::Value]
+            super::symbol_kinds(LspSymbolKind::PROPERTY),
+            vec![rift_core::SymbolKind::Value]
         );
     }
 
@@ -605,7 +608,7 @@ mod tests {
     fn flat_answer_keeps_container_name_and_location_data() {
         let response = DocumentSymbolResponse::Flat(vec![lsp_types::SymbolInformation {
             name: "new".to_owned(),
-            kind: SymbolKind::METHOD,
+            kind: LspSymbolKind::METHOD,
             tags: Some(vec![SymbolTag::DEPRECATED]),
             deprecated: Some(true),
             location: lsp_types::Location {

@@ -6,9 +6,9 @@ use rift_core::{ContributionOrigin, ProjectPath, SourceKind, SourceLocation};
 use std::cell::Cell;
 
 use rift_error::RiftError;
-use rift_protocol::index::{PackagePublication, RelationshipCoverage};
+use rift_protocol::index::{EdgeCoverage, PackagePublication};
 use rift_protocol::producer::{FactKind, FactProducer, ProducerFacts};
-use rift_protocol::read::{Language, PackageIdentity, RelationshipFacet, SourceUnitId};
+use rift_protocol::read::{EdgeKind, Language, PackageIdentity, SourceUnitId};
 use rift_syntax::{ByteRange, SyntaxLimits, SyntaxMatch};
 use serde_json::{Value, json};
 
@@ -83,7 +83,7 @@ fn facts(publication: &PackagePublication, body: Value) -> ProducerFacts {
         "format": 1,
         "producer": {"name": "demo-indexer", "revision": "0.6.1"},
         "language": "python",
-        "kinds": ["relationships", "occurrences"],
+        "kinds": ["edges", "occurrences"],
     });
     let Value::Object(lists) = body else {
         panic!("fact lists must be an object: {body}");
@@ -101,16 +101,16 @@ fn call_facts(publication: &PackagePublication) -> ProducerFacts {
     facts(
         publication,
         json!({
-            "relationships": [{
+            "edges": [{
                 "kind": "call",
-                "facets": ["calls"],
+                "kinds": ["calls"],
                 "to": ECHO,
                 "occurrence": {"unit": "UNIT", "range": {"start": CALL.0, "end": CALL.1}},
                 "derivation": "resolution",
             }, {
                 "from": SHOUT,
                 "kind": "reference",
-                "facets": ["references"],
+                "kinds": ["references"],
                 "to": ECHO,
                 "derivation": "heuristic",
                 "confidence": 0.5,
@@ -243,12 +243,12 @@ fn a_range_that_resolves_to_nothing_is_refused() {
 #[test]
 fn producer_facts_enter_the_publication_under_their_producer() {
     let publication = click();
-    let before = publication.relationships.len();
+    let before = publication.edges.len();
     let facts = call_facts(&publication);
     let producer = facts.producer.clone();
     let accepted =
         accept_producer_facts(publication, facts, SyntaxLimits::default()).expect("accepted");
-    let added = &accepted.relationships[before..];
+    let added = &accepted.edges[before..];
     assert_eq!(added.len(), 2);
     assert_eq!(
         added[0].from.as_str(),
@@ -278,8 +278,8 @@ fn producer_facts_enter_the_publication_under_their_producer() {
             .all(|occurrence| occurrence.producer.as_ref() == Some(&producer))
     );
     let coverage = &accepted.coverage[0];
-    assert!(coverage.covers(FactKind::Relationships, None));
-    assert!(coverage.covers(FactKind::Relationships, Some(&producer)));
+    assert!(coverage.covers(FactKind::Edges, None));
+    assert!(coverage.covers(FactKind::Edges, Some(&producer)));
     assert!(coverage.covers(FactKind::Occurrences, Some(&producer)));
     accepted.validate_facts().expect("facts agree");
     let wire = serde_json::to_string(&accepted).expect("serialize");
@@ -293,11 +293,11 @@ fn producer_facts_naming_a_symbol_keep_it_and_still_resolve_their_range() {
     let facts = facts(
         &publication,
         json!({
-            "kinds": ["relationships"],
-            "relationships": [{
+            "kinds": ["edges"],
+            "edges": [{
                 "from": SHOUT,
                 "kind": "call",
-                "facets": ["calls"],
+                "kinds": ["calls"],
                 "to": ECHO,
                 "occurrence": {"unit": "UNIT", "range": {"start": 0, "end": 200}},
                 "derivation": "resolution",
@@ -329,8 +329,8 @@ fn producer_facts_outside_their_coverage_or_address_are_refused() {
             "field language, violation uncovered",
         ),
         (
-            json!({"kinds": ["occurrences"], "relationships": [{
-                "from": SHOUT, "kind": "call", "facets": ["calls"], "to": ECHO,
+            json!({"kinds": ["occurrences"], "edges": [{
+                "from": SHOUT, "kind": "call", "kinds": ["calls"], "to": ECHO,
                 "derivation": "resolution",
             }]}),
             "field kinds, violation uncovered",
@@ -340,17 +340,17 @@ fn producer_facts_outside_their_coverage_or_address_are_refused() {
             "field kinds, violation duplicate",
         ),
         (
-            json!({"relationships": [{
-                "kind": "call", "facets": ["calls"], "to": ECHO, "derivation": "resolution",
+            json!({"edges": [{
+                "kind": "call", "kinds": ["calls"], "to": ECHO, "derivation": "resolution",
             }]}),
-            "field relationships.from, violation missing",
+            "field edges.from, violation missing",
         ),
         (
-            json!({"relationships": [{
-                "kind": "call", "facets": ["calls"], "to": ECHO, "derivation": "resolution",
+            json!({"edges": [{
+                "kind": "call", "kinds": ["calls"], "to": ECHO, "derivation": "resolution",
                 "occurrence": {"unit": "UNIT", "range": {"start": 34, "end": 35}},
             }]}),
-            "field relationships.occurrence, violation outside_declaration",
+            "field edges.occurrence, violation outside_declaration",
         ),
     ];
     for (body, expected) in cases {
@@ -391,30 +391,30 @@ fn accept_producer_facts_refuses_another_format() {
 }
 
 #[test]
-fn accept_producer_facts_leaves_relationship_coverage_unchanged() {
+fn accept_producer_facts_leaves_edge_coverage_unchanged() {
     let mut publication = click();
-    publication.coverage[0].relationships = vec![
-        RelationshipCoverage {
-            facet: RelationshipFacet::Calls,
+    publication.coverage[0].edges = vec![
+        EdgeCoverage {
+            kind: EdgeKind::Calls,
             complete: true,
         },
-        RelationshipCoverage {
-            facet: RelationshipFacet::References,
+        EdgeCoverage {
+            kind: EdgeKind::References,
             complete: false,
         },
     ];
-    let before = serde_json::to_string(&publication.coverage[0].relationships).expect("before");
+    let before = serde_json::to_string(&publication.coverage[0].edges).expect("before");
     let facts = call_facts(&publication);
     let accepted =
         accept_producer_facts(publication, facts, SyntaxLimits::default()).expect("accepted");
-    let after = serde_json::to_string(&accepted.coverage[0].relationships).expect("after");
+    let after = serde_json::to_string(&accepted.coverage[0].edges).expect("after");
     assert_eq!(after, before);
 }
 
 #[test]
-fn producer_extensions_reach_the_stored_relationship() {
+fn producer_extensions_reach_the_stored_edge() {
     let publication = click();
-    let before = publication.relationships.len();
+    let before = publication.edges.len();
     let extension = json!({"dev.demo-indexer.precision": {
         "version": 1,
         "data": {"class": "compiler binding", "observation": 17},
@@ -422,16 +422,16 @@ fn producer_extensions_reach_the_stored_relationship() {
     let facts = facts(
         &publication,
         json!({
-            "kinds": ["relationships"],
-            "relationships": [{
-                "from": SHOUT, "kind": "call", "facets": ["calls"], "to": ECHO,
+            "kinds": ["edges"],
+            "edges": [{
+                "from": SHOUT, "kind": "call", "kinds": ["calls"], "to": ECHO,
                 "derivation": "resolution", "extensions": extension,
             }],
         }),
     );
     let accepted =
         accept_producer_facts(publication, facts, SyntaxLimits::default()).expect("accepted");
-    let stored = &accepted.relationships[before];
+    let stored = &accepted.edges[before];
     assert_eq!(
         serde_json::to_value(&stored.extensions).expect("extensions"),
         extension
@@ -439,15 +439,15 @@ fn producer_extensions_reach_the_stored_relationship() {
     accepted.validate_facts().expect("facts agree");
     let wire = serde_json::to_string(&accepted).expect("serialize");
     let read: PackagePublication = serde_json::from_str(&wire).expect("deserialize");
-    assert_eq!(read.relationships[before].extensions, stored.extensions);
+    assert_eq!(read.edges[before].extensions, stored.extensions);
 }
 
 #[test]
-fn imported_relationships_do_not_depend_on_emission_order() {
+fn imported_edges_do_not_depend_on_emission_order() {
     let publication = click();
     let forward = call_facts(&publication);
     let mut reversed = forward.clone();
-    reversed.relationships.reverse();
+    reversed.edges.reverse();
     let first = accept_producer_facts(publication.clone(), forward, SyntaxLimits::default())
         .expect("forward");
     let second = accept_producer_facts(publication.clone(), reversed, SyntaxLimits::default())
@@ -456,11 +456,11 @@ fn imported_relationships_do_not_depend_on_emission_order() {
         rift_protocol::canonical::canonical_json(accepted).expect("canonical publication")
     };
     assert_eq!(canonical(&first), canonical(&second));
-    let built_in = publication.relationships.len();
+    let built_in = publication.edges.len();
     assert_eq!(
-        first.relationships[..built_in],
-        publication.relationships[..],
-        "built-in relationships keep their order"
+        first.edges[..built_in],
+        publication.edges[..],
+        "built-in edges keep their order"
     );
 }
 

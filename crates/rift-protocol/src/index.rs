@@ -24,8 +24,8 @@ use crate::documentation::DocumentationIndex;
 use crate::identity::SymbolOwner;
 use crate::producer::{FactCoverage, FactKind, FactProducer};
 use crate::read::{
-    Digest, Language, ProjectPath, Relationship, RelationshipFacet, SourceUnitId, Symbol, SymbolId,
-    SymbolOrigin, TextRange,
+    Digest, Edge, EdgeKind, Language, ProjectPath, SourceUnitId, Symbol, SymbolId, SymbolOrigin,
+    TextRange,
 };
 use crate::revision::Revision;
 
@@ -105,9 +105,9 @@ pub struct PackagePublication {
     /// Established source bindings, in symbol, unit and range order.
     #[schemars(length(max = 50_000_000))]
     pub declarations: Vec<PackageSymbol>,
-    /// Normalized relationships, preserving their source occurrences and derivation. A
-    /// relationship an external producer wrote names it in `producer`.
-    pub relationships: Vec<Relationship>,
+    /// Normalized edges, preserving their source occurrences and derivation. An
+    /// edge an external producer wrote names it in `producer`.
+    pub edges: Vec<Edge>,
     /// Places a unit's source names a symbol, in unit, range, and symbol order. Absent when
     /// no producer covered occurrences.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -130,7 +130,7 @@ pub struct PackagePublication {
     pub warnings: Vec<PackageAnalysisWarning>,
 }
 
-/// Independent coverage of one selected language and its relationship facets.
+/// Independent coverage of one selected language and its edge kinds.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PackageCoverage {
@@ -142,8 +142,8 @@ pub struct PackageCoverage {
     pub identity_complete: bool,
     /// Selected artifact and platform or export conditions establish this scope.
     pub applicability_complete: bool,
-    /// Coverage of each relationship facet, independent of identity lookup.
-    pub relationships: Vec<RelationshipCoverage>,
+    /// Coverage of each edge kind, independent of identity lookup.
+    pub edges: Vec<EdgeCoverage>,
     /// The fact kinds produced for this language, each with its producer. An entry makes no
     /// completeness claim, and a kind no entry names was not produced.
     pub facts: Vec<FactCoverage>,
@@ -177,13 +177,13 @@ pub struct PackageOccurrence {
     pub producer: Option<FactProducer>,
 }
 
-/// Coverage of one relationship facet within a selected language.
+/// Coverage of one edge kind within a selected language.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct RelationshipCoverage {
-    /// Relationship facet this coverage describes.
-    pub facet: RelationshipFacet,
-    /// Whether every relationship in the accepted scope was captured.
+pub struct EdgeCoverage {
+    /// Edge kind this coverage describes.
+    pub kind: EdgeKind,
+    /// Whether every edge in the accepted scope was captured.
     pub complete: bool,
 }
 

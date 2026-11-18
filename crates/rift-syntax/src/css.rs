@@ -3,7 +3,7 @@
 use crate::extract::{self, Declaration, GrammarRules, Visited};
 use crate::{ShippedLanguage, SyntaxDocument, SyntaxLimits, SyntaxProvider, SyntaxSource};
 use rift_error::RiftError;
-use rift_protocol::read::{Language, NodeFacet};
+use rift_protocol::read::{Language, SyntaxKind};
 use std::sync::OnceLock;
 use tree_sitter::{Language as Grammar, Node, Range};
 
@@ -34,13 +34,13 @@ impl SyntaxProvider for CssSyntaxProvider {
     ) -> Result<SyntaxDocument, RiftError> {
         analyze(source, limits, &[])
     }
-    fn syntax_element_facets(&self, kind: &str) -> Vec<NodeFacet> {
+    fn syntax_element_kinds(&self, kind: &str) -> Vec<SyntaxKind> {
         match kind {
-            "rule_set" | "declaration" | "at_rule" => vec![NodeFacet::Declaration],
-            "block" => vec![NodeFacet::Block],
-            "comment" => vec![NodeFacet::Comment],
+            "rule_set" | "declaration" | "at_rule" => vec![SyntaxKind::Declaration],
+            "block" => vec![SyntaxKind::Block],
+            "comment" => vec![SyntaxKind::Comment],
             "string_value" | "integer_value" | "float_value" | "color_value" => {
-                vec![NodeFacet::Literal]
+                vec![SyntaxKind::Literal]
             }
             _ => Vec::new(),
         }
@@ -134,7 +134,7 @@ impl GrammarRules for CssRules {
         Ok(Some(Declaration {
             name: name.to_owned(),
             kind,
-            facets: Vec::new(),
+            kinds: Vec::new(),
             visibility: None,
             body_range: None,
             documentation: Vec::new(),

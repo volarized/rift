@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rift_core::SymbolId as CoreSymbolId;
 use rift_protocol::read::{
-    RelationshipFacet, SourceUnitId, SourceUnitSpan, SymbolId, TextRange, TraversalDirection,
+    EdgeKind, SourceUnitId, SourceUnitSpan, SymbolId, TextRange, TraversalDirection,
 };
 
 use crate::ReadService;
@@ -16,7 +16,7 @@ use super::{CallCorroboration, CallDestination, CallProvider, GraphCalls};
 pub(super) struct CapturedCalls<'read> {
     reads: &'read ReadService,
     direction: TraversalDirection,
-    edges: Vec<&'read rift_index::RelationshipEdge>,
+    edges: Vec<&'read rift_index::Edge>,
     truncated: bool,
 }
 
@@ -26,14 +26,14 @@ impl<'read> CapturedCalls<'read> {
         seed: &CoreSymbolId,
         direction: TraversalDirection,
     ) -> Self {
-        let store = reads.relationships();
+        let store = reads.edges();
         let adjacent = match direction {
             TraversalDirection::Incoming => store.incoming(seed),
             TraversalDirection::Outgoing => store.outgoing(seed),
         };
-        let mut calls = adjacent.iter().filter(|edge| {
-            edge.facet() == RelationshipFacet::Calls && edge.static_callee().is_some()
-        });
+        let mut calls = adjacent
+            .iter()
+            .filter(|edge| edge.kind() == EdgeKind::Calls && edge.static_callee().is_some());
         let edges = calls.by_ref().take(TRAVERSAL_SYMBOLS_MAX).collect();
         Self {
             reads,

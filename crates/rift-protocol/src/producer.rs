@@ -3,7 +3,7 @@
 //! The built-in analyzer and external producers both write facts into a
 //! [`PackagePublication`](crate::index::PackagePublication). An external producer is an
 //! extraction program outside Rift that reads one language's source and emits
-//! relationships or occurrences; a fact it wrote names it through [`FactProducer`], and a
+//! edges or occurrences; a fact it wrote names it through [`FactProducer`], and a
 //! fact the built-in analyzer wrote names no producer.
 
 use std::fmt;
@@ -13,8 +13,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::read::{
-    ExactKind, Extensions, Language, RelationshipDerivation, RelationshipFacet, SourceUnitId,
-    SourceUnitSpan, SymbolId, TextRange,
+    EdgeDerivation, EdgeKind, ExactKind, Extensions, Language, SourceUnitId, SourceUnitSpan,
+    SymbolId, TextRange,
 };
 
 /// Format of the [`ProducerFacts`] input this build imports.
@@ -227,8 +227,8 @@ pub struct FactProducer {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum FactKind {
-    /// Edges between two symbols, in `relationships`.
-    Relationships,
+    /// Edges between two symbols, in `edges`.
+    Edges,
     /// Places a unit's source names a symbol, in `occurrences`.
     Occurrences,
 }
@@ -237,7 +237,7 @@ pub enum FactKind {
 ///
 /// An entry states that its producer emitted facts of this kind for this language. It makes
 /// no claim that the producer found every fact of the kind, for any producer: whether a
-/// language's relationships are complete is stated by the coverage entry's `relationships`
+/// language's edges are complete is stated by the coverage entry's `edges`
 /// alone. A kind no entry names was not produced. Two producers of one kind take two entries.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -270,7 +270,7 @@ pub struct ProducerFacts {
     pub kinds: Vec<FactKind>,
     /// Edges the producer found.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub relationships: Vec<ProducerRelationship>,
+    pub edges: Vec<ProducerEdge>,
     /// Places the producer found a unit's source naming a symbol.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub occurrences: Vec<ProducerOccurrence>,
@@ -279,7 +279,7 @@ pub struct ProducerFacts {
 /// One edge an external producer found.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProducerRelationship {
+pub struct ProducerEdge {
     /// The symbol the edge starts at. Absent when the producer named only `occurrence`:
     /// the importer then starts the edge at the declaration enclosing it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -287,14 +287,14 @@ pub struct ProducerRelationship {
     /// What the edge is in the producer's vocabulary, such as `call`.
     pub kind: ExactKind,
     /// Portable classification of the edge.
-    pub facets: Vec<RelationshipFacet>,
+    pub kinds: Vec<EdgeKind>,
     /// The symbol the edge points at.
     pub to: SymbolId,
     /// Where the edge was read from. Required when `from` is absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub occurrence: Option<SourceUnitSpan>,
     /// How the producer established the edge.
-    pub derivation: RelationshipDerivation,
+    pub derivation: EdgeDerivation,
     /// How likely a `heuristic` edge is to hold, from 0 to 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<f64>,

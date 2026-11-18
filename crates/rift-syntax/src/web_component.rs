@@ -1,7 +1,7 @@
 //! Vue, Svelte, and Angular template syntax with original source ranges.
 
 use rift_error::{RiftError, errors};
-use rift_protocol::read::{Language, NodeFacet};
+use rift_protocol::read::{Language, SyntaxKind};
 use tree_sitter::{Node, Range};
 
 use crate::extract::{Declaration, GrammarRules, Visited};
@@ -85,8 +85,8 @@ impl SyntaxProvider for VueSyntaxProvider {
         let document = analyze(&self.language, &vue_grammar(), source, limits, &[])?;
         crate::embedded::append(source, limits, &document)
     }
-    fn syntax_element_facets(&self, kind: &str) -> Vec<NodeFacet> {
-        syntax_element_facets(kind)
+    fn syntax_element_kinds(&self, kind: &str) -> Vec<SyntaxKind> {
+        syntax_element_kinds(kind)
     }
 }
 
@@ -102,8 +102,8 @@ impl SyntaxProvider for SvelteSyntaxProvider {
         let document = analyze(&self.language, &svelte_grammar(), source, limits, &[])?;
         crate::embedded::append(source, limits, &document)
     }
-    fn syntax_element_facets(&self, kind: &str) -> Vec<NodeFacet> {
-        syntax_element_facets(kind)
+    fn syntax_element_kinds(&self, kind: &str) -> Vec<SyntaxKind> {
+        syntax_element_kinds(kind)
     }
 }
 
@@ -119,8 +119,8 @@ impl SyntaxProvider for AngularSyntaxProvider {
         let document = analyze(&self.language, &angular_grammar(), source, limits, &[])?;
         crate::embedded::append(source, limits, &document)
     }
-    fn syntax_element_facets(&self, kind: &str) -> Vec<NodeFacet> {
-        syntax_element_facets(kind)
+    fn syntax_element_kinds(&self, kind: &str) -> Vec<SyntaxKind> {
+        syntax_element_kinds(kind)
     }
 }
 
@@ -178,13 +178,13 @@ impl GrammarRules for ComponentRules {
     }
 }
 
-fn syntax_element_facets(kind: &str) -> Vec<NodeFacet> {
+fn syntax_element_kinds(kind: &str) -> Vec<SyntaxKind> {
     match kind {
-        "comment" => vec![NodeFacet::Comment],
-        "attribute" | "directive_attribute" => vec![NodeFacet::Annotation],
-        "interpolation" | "expression" | "pipe_call" => vec![NodeFacet::Expression],
-        kind if kind.ends_with("_statement") || kind.ends_with("_block") => vec![NodeFacet::Block],
-        _ => crate::ecmascript::syntax_element_facets(kind),
+        "comment" => vec![SyntaxKind::Comment],
+        "attribute" | "directive_attribute" => vec![SyntaxKind::Annotation],
+        "interpolation" | "expression" | "pipe_call" => vec![SyntaxKind::Expression],
+        kind if kind.ends_with("_statement") || kind.ends_with("_block") => vec![SyntaxKind::Block],
+        _ => crate::ecmascript::syntax_element_kinds(kind),
     }
 }
 

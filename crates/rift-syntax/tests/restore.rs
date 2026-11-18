@@ -1878,13 +1878,13 @@ fn literal_macro_functions_keep_original_header_body_and_restore() {
     assert_eq!(spawn.visibility.as_deref(), Some("pub"));
     assert!(
         spawn
-            .facets
-            .contains(&rift_protocol::read::SymbolFacet::Callable)
+            .kinds
+            .contains(&rift_protocol::read::SymbolKind::Callable)
     );
     assert!(
         spawn
-            .facets
-            .contains(&rift_protocol::read::SymbolFacet::Public)
+            .kinds
+            .contains(&rift_protocol::read::SymbolKind::Public)
     );
     let body = spawn.body_range.expect("original body");
     let start = usize::try_from(spawn.item_range.start).expect("start");

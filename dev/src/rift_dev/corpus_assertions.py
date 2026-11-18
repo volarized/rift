@@ -612,7 +612,7 @@ def churn_answer(
 ) -> tuple[str, str]:
     """Require one probe declaration with source from a complete authored revision."""
     warnings(answer)
-    if tool == "facets":
+    if tool == "kinds":
         elements = facet_syntax(answer)
         matches = [
             element

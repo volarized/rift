@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use rift_core::{FileDigest, ProjectPath, is_portable_name};
-use rift_protocol::read::{Documentation, Language, Signature, SymbolFacet};
+use rift_protocol::read::{Documentation, Language, Signature, SymbolKind};
 
 use crate::markdown::MarkdownFacts;
 
@@ -106,7 +106,7 @@ pub struct SyntaxSymbol {
     pub syntax_element_kind: Option<&'static str>,
     /// Portable categories this declaration falls into, in the provider's
     /// declared order.
-    pub facets: Vec<SymbolFacet>,
+    pub kinds: Vec<SymbolKind>,
     /// Authored visibility spelling, such as `pub(crate)`; `None` when the
     /// language states no visibility.
     pub visibility: Option<String>,
@@ -791,7 +791,7 @@ mod tests {
             container: None,
             kind: "mapping_entry",
             syntax_element_kind: None,
-            facets: Vec::new(),
+            kinds: Vec::new(),
             visibility: None,
             range,
             item_range: range,

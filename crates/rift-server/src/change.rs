@@ -1984,13 +1984,13 @@ mod tests {
         let error = fixture
             .search(&json!({
                 "change": {"base": "baseline"},
-                "traversal": {"direction": "incoming", "facets": ["calls"]}
+                "traversal": {"direction": "incoming", "kinds": ["calls"]}
             }))
             .expect_err("a walk beside a comparison must refuse");
 
         assert_eq!(error.slug(), errors::server::read_unsupported::SLUG);
         assert!(error.context().any(|(key, value)| {
-            key == "capability" && value == "relationship traversal beside a comparison"
+            key == "capability" && value == "edge traversal beside a comparison"
         }));
         Ok(())
     }

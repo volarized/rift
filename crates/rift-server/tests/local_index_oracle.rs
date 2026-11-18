@@ -1,6 +1,6 @@
 //! Compare incremental and cold read-service facts after file replacement and restore.
 //!
-//! Keep complete file digests, index documents, documentation metadata, and relationship
+//! Keep complete file digests, index documents, documentation metadata, and edge
 //! reads in equality checks; the fixture must retain live files named only by the earlier tree.
 
 use std::collections::BTreeSet;
@@ -25,7 +25,7 @@ use rift_server::ReadService;
 use tempfile::TempDir;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
-type RelationshipRow = (String, String, String, String, u64, u64);
+type EdgeRow = (String, String, String, String, u64, u64);
 const SYMBOL_PAGES_MAX: u64 = 32;
 
 const SOURCE_A: &str = "pub struct Beacon;\npub fn old() {}\n";
@@ -119,31 +119,24 @@ fn case_source_paths(root: &Path) -> TestResult<BTreeSet<String>> {
         .collect())
 }
 
-fn relationship_rows(
-    service: &ReadService,
-    ids: &BTreeSet<SymbolId>,
-) -> TestResult<BTreeSet<RelationshipRow>> {
-    let relationships = service.relationships();
-    if !relationships.is_complete() || relationships.dropped_edges() != 0 {
+fn edge_rows(service: &ReadService, ids: &BTreeSet<SymbolId>) -> TestResult<BTreeSet<EdgeRow>> {
+    let edges = service.edges();
+    if !edges.is_complete() || edges.dropped_edges() != 0 {
         return Err(format!(
-            "relationship store incomplete: dropped_edges={}",
-            relationships.dropped_edges()
+            "edge store incomplete: dropped_edges={}",
+            edges.dropped_edges()
         )
         .into());
     }
     let mut rows = BTreeSet::new();
     for id in ids {
-        for edge in relationships
-            .outgoing(id)
-            .iter()
-            .chain(relationships.incoming(id))
-        {
+        for edge in edges.outgoing(id).iter().chain(edges.incoming(id)) {
             let occurrence = edge.occurrence();
             let range = occurrence.range();
             rows.insert((
                 edge.from().as_str().to_owned(),
                 edge.to().as_str().to_owned(),
-                serde_json::to_string(&edge.facet())?,
+                serde_json::to_string(&edge.kind())?,
                 occurrence.unit().to_string(),
                 range.start(),
                 range.end(),
@@ -371,9 +364,9 @@ fn assert_matches_cold(
         "incremental documentation blocks, links, and references must equal a cold build"
     );
     assert_eq!(
-        relationship_rows(incremental, symbol_ids)?,
-        relationship_rows(&cold, symbol_ids)?,
-        "incremental semantic relationship edges must equal a cold build"
+        edge_rows(incremental, symbol_ids)?,
+        edge_rows(&cold, symbol_ids)?,
+        "incremental semantic edges must equal a cold build"
     );
     Ok(())
 }

@@ -10,7 +10,7 @@
 //! indent their further lines by two. Single-line facts are written with control characters made
 //! visible; multi-line text is written line by line, bytes unchanged.
 //!
-//! The hits a relationship walk reached are the syntax elements of a tree, one entry of the section. A
+//! The hits an edge walk reached are the syntax elements of a tree, one entry of the section. A
 //! syntax element under the root starts with a lead such as `↳ called`, one level deeper than the lines
 //! of its parent, and indents its further lines by one more.
 

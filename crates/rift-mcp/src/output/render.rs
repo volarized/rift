@@ -26,7 +26,7 @@
 //! start with `[n] `
 //! at one level and indent their further lines by two. Text an answer copies, such as source,
 //! keeps its own whitespace after the indent. No blank line separates two items or two sections.
-//! The hits a relationship walk reached are written as a tree; see the `walk` module.
+//! The hits an edge walk reached are written as a tree; see the `walk` module.
 //! `facets` answers, failures, and workspace pages follow the same principles; see the
 //! `facets`, `error`, and `workspace` modules.
 

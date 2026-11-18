@@ -1,7 +1,7 @@
 use super::{
     Arc, BTreeMap, DocumentationCollection, DocumentationContentIdentity,
-    DocumentationSourceIdentity, IdentifierMatcher, IndexDocument, IndexedFile, Language,
-    NormalizedGraph, NotebookFiles, Path, PathBuf, ProjectPath, ReadableSymbol, RelationshipStore,
+    DocumentationSourceIdentity, EdgeStore, IdentifierMatcher, IndexDocument, IndexedFile,
+    Language, NormalizedGraph, NotebookFiles, Path, PathBuf, ProjectPath, ReadableSymbol,
     RiftError, SymbolDeclarations, SymbolId, SymbolMatch, SymbolOwner, TextSourceFile,
     WorkspaceIndex, WorkspaceIndexLimits, WorkspaceSemantics, errors, symbol_rank,
 };
@@ -271,8 +271,8 @@ impl WorkspaceSymbolView {
 
     /// Captured reference adjacency, shared with the original publication.
     #[must_use]
-    pub fn relationships(&self) -> &RelationshipStore {
-        self.semantics.relationships()
+    pub fn edges(&self) -> &EdgeStore {
+        self.semantics.edges()
     }
 
     /// Ranking documents derived from the captured source and declaration facts.

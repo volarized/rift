@@ -7655,7 +7655,7 @@ done
                 "seed": seed,
                 "direction": "incoming", "depth": 1
             }});
-            request["traversal"]["facets"] = facets;
+            request["traversal"]["kinds"] = facets;
             let indexed = serde_json::from_value(request)?;
             assert!(
                 server
@@ -7689,7 +7689,7 @@ done
         fs::write(directory.path().join("lib.rs"), "pub fn later() {}\n")?;
         let params = serde_json::from_value(json!({"traversal": {
             "seed": seed,
-            "direction": "incoming", "facets": ["references"], "depth": 1
+            "direction": "incoming", "kinds": ["references"], "depth": 1
         }}))?;
         let resolved = super::ResolvedWorkspace::current(published, Duration::ZERO);
         assert!(
@@ -7847,7 +7847,7 @@ done
         let seed = captured_traversal_seed(&resolved.published.reads, "serve")?;
         let params = serde_json::from_value(json!({"target": "symbol", "traversal": {
             "seed": seed,
-            "direction": "incoming", "facets": ["references"], "depth": 1
+            "direction": "incoming", "kinds": ["references"], "depth": 1
         }}))?;
         let references = server
             .engine_references(&resolved, &params, deadline)
@@ -7888,7 +7888,7 @@ done
         let seed = captured_traversal_seed(&resolved.published.reads, "serve")?;
         let params = serde_json::from_value(json!({"target": "symbol", "traversal": {
             "seed": seed,
-            "direction": "incoming", "facets": ["references"], "depth": 1
+            "direction": "incoming", "kinds": ["references"], "depth": 1
         }}))?;
         fs::write(
             directory.path().join("main.py"),

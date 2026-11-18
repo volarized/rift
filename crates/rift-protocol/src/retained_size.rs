@@ -76,7 +76,7 @@ impl GetSize for crate::read::SourceUnitId {
 
 use crate::read::{
     Documentation, ExactKind, ExtensionKey, Extensions, Language, PackageIdentity, Parameter,
-    RuntimeIdentity, Signature, SignatureLink, Symbol, SymbolFacet, SymbolId, SymbolOrigin,
+    RuntimeIdentity, Signature, SignatureLink, Symbol, SymbolId, SymbolKind, SymbolOrigin,
     TypeBinding, TypeExpression,
 };
 
@@ -307,7 +307,7 @@ heap_fields!(
     language,
     name,
     kind,
-    facets => vector,
+    kinds => vector,
     origin,
     container,
     modifiers => vector,
@@ -318,7 +318,7 @@ heap_fields!(
     extensions,
 );
 
-impl GetSize for SymbolFacet {
+impl GetSize for SymbolKind {
     fn get_size(&self) -> usize {
         std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
     }
@@ -502,10 +502,10 @@ heap_fields!(crate::read::SourceUnitSpan, unit);
 heap_fields!(crate::producer::ProducerName, 0);
 heap_fields!(crate::producer::ProducerRevision, 0);
 heap_fields!(crate::producer::FactProducer, name, revision);
-heap_fields!(crate::read::Relationship, from, kind, facets => vector, to, occurrence, producer, extensions);
-heap_fields!(crate::search::GraphHop, relationship);
+heap_fields!(crate::read::Edge, from, kind, kinds => vector, to, occurrence, producer, extensions);
+heap_fields!(crate::search::GraphHop, edge);
 
-impl GetSize for crate::read::RelationshipFacet {
+impl GetSize for crate::read::EdgeKind {
     fn get_heap_size_with_tracker<T: GetSizeTracker>(&self, tracker: T) -> (usize, T) {
         (0, tracker)
     }
@@ -571,21 +571,21 @@ mod tests {
     }
 
     #[test]
-    fn retained_relationship_material_counts_capacity_and_refuses_unmeasured_facts() {
+    fn retained_edge_material_counts_capacity_and_refuses_unmeasured_facts() {
         let mut kind = String::with_capacity(256);
         kind.push_str("calls");
-        let mut facets = Vec::with_capacity(32);
-        facets.push(crate::read::RelationshipFacet::Calls);
-        let edge = crate::read::Relationship {
+        let mut kinds = Vec::with_capacity(32);
+        kinds.push(crate::read::EdgeKind::Calls);
+        let edge = crate::read::Edge {
             from: SymbolId("rift://symbol/local/rust/app/caller".to_owned()),
             kind: ExactKind(kind),
-            facets,
+            kinds,
             to: SymbolId("rift://symbol/local/rust/app/callee".to_owned()),
             occurrence: Some(crate::read::SourceUnitSpan {
                 unit: crate::read::SourceUnitId("rift://source/project/src/lib.rs".to_owned()),
                 range: crate::read::TextRange { start: 0, end: 12 },
             }),
-            derivation: crate::read::RelationshipDerivation::Resolution,
+            derivation: crate::read::EdgeDerivation::Resolution,
             confidence: None,
             producer: Some(crate::producer::FactProducer {
                 name: crate::producer::ProducerName::parse("demo-indexer").expect("name"),
@@ -597,11 +597,11 @@ mod tests {
         let minimum = edge.kind.0.capacity()
             + producer.name.as_str().len()
             + producer.revision.as_str().len()
-            + edge.facets.capacity() * std::mem::size_of::<crate::read::RelationshipFacet>()
+            + edge.kinds.capacity() * std::mem::size_of::<crate::read::EdgeKind>()
             + edge.from.0.capacity()
             + edge.to.0.capacity();
         let hop = crate::search::GraphHop {
-            relationship: edge,
+            edge,
             direction: crate::search::HopDirection::Outgoing,
         };
         let measured = hop
@@ -610,7 +610,7 @@ mod tests {
         assert!(measured >= std::mem::size_of_val(&hop) + minimum);
         assert_ne!(measured, usize::MAX);
         let mut unmeasured = hop;
-        unmeasured.relationship.extensions = Extensions(std::collections::BTreeMap::from([(
+        unmeasured.edge.extensions = Extensions(std::collections::BTreeMap::from([(
             ExtensionKey("example.org.fact".to_owned()),
             crate::read::ExtensionValue {
                 version: 1,

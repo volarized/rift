@@ -133,7 +133,7 @@ pub const fn file_bytes_max_default() -> usize {
 #[cfg(test)]
 mod tests {
     use rift_core::ProjectPath;
-    use rift_protocol::read::{Language, NodeFacet};
+    use rift_protocol::read::{Language, SyntaxKind};
 
     use super::*;
     use crate::document::SyntaxDocument;
@@ -253,7 +253,7 @@ mod tests {
             .with_source_witness(source.text))
         }
 
-        fn syntax_element_facets(&self, _kind: &str) -> Vec<NodeFacet> {
+        fn syntax_element_kinds(&self, _kind: &str) -> Vec<SyntaxKind> {
             Vec::new()
         }
     }

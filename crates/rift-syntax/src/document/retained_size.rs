@@ -72,7 +72,7 @@ impl GetSize for SyntaxSymbol {
         let (name, tracker) = self.name.get_heap_size_with_tracker(tracker);
         let (qualified, tracker) = self.qualified_name.get_heap_size_with_tracker(tracker);
         let (container, tracker) = self.container.get_heap_size_with_tracker(tracker);
-        let (facets, tracker) = self.facets.get_heap_size_with_tracker(tracker);
+        let (kinds, tracker) = self.kinds.get_heap_size_with_tracker(tracker);
         let (visibility, tracker) = self.visibility.get_heap_size_with_tracker(tracker);
         let (signatures, tracker) =
             rift_protocol::retained_arc_slice_material(&self.signatures, tracker);
@@ -88,7 +88,7 @@ impl GetSize for SyntaxSymbol {
             name,
             qualified,
             container,
-            facets,
+            kinds,
             visibility,
             signatures,
             documentation,

@@ -9,7 +9,7 @@
 
 use std::sync::OnceLock;
 
-use rift_protocol::read::{Language, NodeFacet};
+use rift_protocol::read::{Language, SyntaxKind};
 
 use crate::document::SyntaxDocument;
 use crate::ecmascript::{self, EcmaScriptKinds};
@@ -100,15 +100,15 @@ impl SyntaxProvider for TypeScriptSyntaxProvider {
         )
     }
 
-    fn syntax_element_facets(&self, kind: &str) -> Vec<NodeFacet> {
-        ecmascript::syntax_element_facets(kind)
+    fn syntax_element_kinds(&self, kind: &str) -> Vec<SyntaxKind> {
+        ecmascript::syntax_element_kinds(kind)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use rift_core::{PROVIDER_SYMBOL_ID_BYTES_MAX, ProjectPath};
-    use rift_protocol::read::SymbolFacet;
+    use rift_protocol::read::SymbolKind;
 
     use super::*;
 
@@ -248,7 +248,7 @@ mod tests {
                 (
                     symbol.qualified_name.as_str(),
                     symbol.container.as_deref(),
-                    symbol.facets.contains(&SymbolFacet::Public),
+                    symbol.kinds.contains(&SymbolKind::Public),
                 )
             })
             .collect::<Vec<_>>();
@@ -287,23 +287,23 @@ mod tests {
     }
 
     #[test]
-    fn test_document_facets_render_kind_categories_and_exported_public() {
+    fn test_document_kinds_render_kind_categories_and_exported_public() {
         let text = "export interface Route { path: string }\nexport enum Mode { Fast }\nexport type Alias = Route;\nexport namespace Registry {}\ninterface Hidden {}\n";
         let document = analyze(text);
-        let facets = document
+        let kinds = document
             .symbols()
             .iter()
-            .map(|symbol| symbol.facets.clone())
+            .map(|symbol| symbol.kinds.clone())
             .collect::<Vec<_>>();
         assert_eq!(
-            facets,
+            kinds,
             [
-                vec![SymbolFacet::Type, SymbolFacet::Public],
-                vec![SymbolFacet::Value],
-                vec![SymbolFacet::Type, SymbolFacet::Public],
-                vec![SymbolFacet::Type, SymbolFacet::Alias, SymbolFacet::Public],
-                vec![SymbolFacet::Namespace, SymbolFacet::Public],
-                vec![SymbolFacet::Type],
+                vec![SymbolKind::Type, SymbolKind::Public],
+                vec![SymbolKind::Value],
+                vec![SymbolKind::Type, SymbolKind::Public],
+                vec![SymbolKind::Type, SymbolKind::Alias, SymbolKind::Public],
+                vec![SymbolKind::Namespace, SymbolKind::Public],
+                vec![SymbolKind::Type],
             ]
         );
     }
@@ -320,7 +320,7 @@ mod tests {
             .map(|symbol| {
                 (
                     symbol.qualified_name.as_str(),
-                    symbol.facets.contains(&SymbolFacet::Public),
+                    symbol.kinds.contains(&SymbolKind::Public),
                 )
             })
             .collect::<Vec<_>>();
@@ -348,7 +348,7 @@ mod tests {
                 .map(|symbol| {
                     (
                         symbol.qualified_name.clone(),
-                        symbol.facets.contains(&SymbolFacet::Public),
+                        symbol.kinds.contains(&SymbolKind::Public),
                     )
                 })
                 .collect::<Vec<_>>()
@@ -431,7 +431,7 @@ mod tests {
                 (
                     symbol.qualified_name.as_str(),
                     symbol.kind,
-                    symbol.facets.contains(&SymbolFacet::Public),
+                    symbol.kinds.contains(&SymbolKind::Public),
                     symbol.visibility.as_deref(),
                 )
             })

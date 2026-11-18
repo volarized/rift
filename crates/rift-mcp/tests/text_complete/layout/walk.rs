@@ -8,15 +8,15 @@
 //!   order their first walk hit appears. Walk hits that share a prefix of hops share its symbols,
 //!   and the last hop of a path never lands on a symbol that already is a hit.
 //! - A hit outside the walk with the symbol identity of a root is that root and is no item.
-//! - A root sits at one level. A symbol at depth `d` writes its head line `↳ <relationship>` alone
+//! - A root sits at one level. A symbol at depth `d` writes its head line `↳ <edge>` alone
 //!   at `1 + d` levels and its further lines at `2 + d` levels. A root indents every line by one
 //!   level. A root that is a hit writes its declaration with no word before it, then `in <facts>`
 //!   and `at <symbol identity>` as a branch does; a root that is no hit writes `at <identity>`.
 //! - A blank line precedes every symbol except the first entry of the section.
 //! - A symbol without a hit writes `at <symbol identity>` and no other line. A symbol with a hit
 //!   writes the declaration, `in <facts>`, `at <symbol identity>`, and the further lines of a
-//!   symbol hit, without `relationship` among the matched fields. The declaration starts with
-//!   `by ` exactly when every facet phrase of the hop ends in ` by`; the head line then leaves
+//!   symbol hit, without `edge` among the matched fields. The declaration starts with
+//!   `by ` exactly when every kind phrase of the hop ends in ` by`; the head line then leaves
 //!   that ` by` out of each phrase. The facts start with `in ` exactly when they start with a
 //!   location.
 
@@ -29,7 +29,7 @@ use super::{
 
 /// Mark that starts a symbol under the root.
 const BRANCH: &str = "↳";
-/// Word before the declaration of a symbol when the relationship ends in `by`.
+/// Word before the declaration of a symbol when the edge ends in `by`.
 const BY: &str = "by ";
 /// Ending of a phrase that moves to the declaration line.
 const BY_ENDING: &str = " by";
@@ -37,13 +37,13 @@ const BY_ENDING: &str = " by";
 const IN: &str = "in ";
 /// Word before the symbol identity of a symbol.
 const AT: &str = "at ";
-/// Word before the first facet of a heuristic relationship.
+/// Word before the first kind of a heuristic edge.
 const HEURISTIC: &str = "probably ";
-/// Text between a relationship and the external producer that emitted it.
+/// Text between an edge and the external producer that emitted it.
 const PRODUCER: &str = " · ";
 /// Matched field that the tree states, so the facts line leaves it out.
-const STATED_FIELD: &str = "relationship";
-/// Each relationship facet, read from the target back to the source.
+const STATED_FIELD: &str = "edge";
+/// Each edge kind, read from the target back to the source.
 const INCOMING: [(&str, &str); 29] = [
     ("contains", "contained by"),
     ("declares", "declared by"),
@@ -84,7 +84,7 @@ struct Hop {
     reached: String,
     /// The head line of the symbol: `↳ probably called, referenced`.
     head: String,
-    /// Whether every facet phrase ends in ` by`, so the declaration line starts with `by `.
+    /// Whether every kind phrase ends in ` by`, so the declaration line starts with `by `.
     by: bool,
 }
 
@@ -93,7 +93,7 @@ struct WalkSymbol {
     id: String,
     /// Levels under the root.
     depth: usize,
-    /// `↳ <relationship>`, empty for a root.
+    /// `↳ <edge>`, empty for a root.
     lead: String,
     /// Whether the declaration line starts with `by `.
     by: bool,
@@ -144,31 +144,31 @@ fn hops_of(hit: &Value, at: &str) -> Result<Vec<Hop>, String> {
                 .map(str::to_owned)
                 .ok_or_else(|| format!("{at}{pointer}: must be a string"))
         };
-        let (from, to) = (text("/relationship/from")?, text("/relationship/to")?);
+        let (from, to) = (text("/edge/from")?, text("/edge/to")?);
         let outgoing = match text("/direction")?.as_str() {
             "outgoing" => true,
             "incoming" => false,
             other => return Err(format!("{at}.direction: unknown direction `{other}`")),
         };
         let mut phrases = Vec::new();
-        for facet in hop
-            .pointer("/relationship/facets")
+        for kind in hop
+            .pointer("/edge/kinds")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
         {
             phrases.push(if outgoing {
-                facet.replace('_', " ")
+                kind.replace('_', " ")
             } else {
                 INCOMING
                     .iter()
-                    .find(|(wire, _)| *wire == facet)
+                    .find(|(wire, _)| *wire == kind)
                     .map(|(_, phrase)| (*phrase).to_owned())
-                    .ok_or_else(|| format!("{at}.relationship.facets: unknown facet `{facet}`"))?
+                    .ok_or_else(|| format!("{at}.edge.kinds: unknown kind `{kind}`"))?
             });
         }
-        let guess = if text_at(hop, "/relationship/derivation") == Some("heuristic") {
+        let guess = if text_at(hop, "/edge/derivation") == Some("heuristic") {
             HEURISTIC
         } else {
             ""
@@ -180,8 +180,8 @@ fn hops_of(hit: &Value, at: &str) -> Result<Vec<Hop>, String> {
             }
         }
         let produced = match (
-            text_at(hop, "/relationship/producer/name"),
-            text_at(hop, "/relationship/producer/revision"),
+            text_at(hop, "/edge/producer/name"),
+            text_at(hop, "/edge/producer/revision"),
         ) {
             (Some(name), Some(revision)) => format!("{PRODUCER}{name} {revision}"),
             _ => String::new(),
@@ -475,7 +475,7 @@ impl<'a> Plan<'a> {
             let item = Item::symbol(&chunk.lines[1..], declaration, rest, &hit_at)?;
             require(declaration.starts_with(BY) == symbol.by, &at, || {
                 format!(
-                    "the declaration `{declaration}` must start with `{BY}` exactly when every facet ends in `{BY_ENDING}`"
+                    "the declaration `{declaration}` must start with `{BY}` exactly when every kind ends in `{BY_ENDING}`"
                 )
             })?;
             item

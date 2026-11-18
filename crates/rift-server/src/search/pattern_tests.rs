@@ -424,7 +424,7 @@ fn refusals_name_the_field_and_the_bound() -> TestResult {
         ),
         (
             json!({"pattern": "TODO", "traversal": {"seed": crate::read::tests::local_identity("rust", &["beacon", "alpha"])}}),
-            "a walk answers relationships",
+            "a walk answers edges",
             rift_error::errors::server::read_invalid::SLUG,
         ),
         (

@@ -39,7 +39,7 @@ pub(crate) fn projected_retrieval(
     pattern: &str,
 ) -> TestResult<QueryParams> {
     if parameters.traversal.is_some() {
-        return Err("relationship tests must express the requested path in SPARQL".into());
+        return Err("edge tests must express the requested path in SPARQL".into());
     }
     let fields = serde_json::to_value(parameters)?;
     let fields = fields

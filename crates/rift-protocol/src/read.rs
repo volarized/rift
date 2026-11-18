@@ -112,7 +112,7 @@ pub use crate::search::{
     ChangeTree, CommitHit, GraphHop, HopDirection, MatchedField, PathPattern, PathPatternViolation,
     PathSelector, ResultOrder, SEARCH_CHANGE_HEAD_DEFAULT, SEARCH_CHANGE_PATHS_MAX,
     SEARCH_PATTERN_CHARS_MAX, SEARCH_TRAVERSAL_DEPTH_DEFAULT, SEARCH_TRAVERSAL_DEPTH_MAX,
-    SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_FACETS_MAX, SearchChange, SearchHit,
+    SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_KINDS_MAX, SearchChange, SearchHit,
     SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget, SearchResult,
     SearchTraversal, SymbolChange, TraversalDirection,
 };
@@ -412,7 +412,7 @@ fn default_get_symbol_params_page_index() -> u64 {
                     "language": "rust",
                     "name": "load_config",
                     "kind": "function",
-                    "facets": [
+                    "kinds": [
                         "value",
                         "callable",
                         "public"
@@ -701,7 +701,7 @@ pub struct SyntaxElement {
     /// Portable structural classification, so a query can ask for bodies or imports without
     /// knowing the grammar that produced them. Absent when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub facets: Vec<NodeFacet>,
+    pub kinds: Vec<SyntaxKind>,
     /// The bytes it spans, as offsets into the file.
     pub range: TextRange,
     /// The syntax element's exact source text: the bytes `range` spans at the read's revision.
@@ -720,13 +720,13 @@ pub struct SyntaxElement {
     pub extensions: Extensions,
 }
 
-/// Portable structural facets, so a filter can ask for bodies or imports without knowing the
+/// Portable structural kinds, so a filter can ask for bodies or imports without knowing the
 /// grammar that produced them.
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
 #[serde(rename_all = "snake_case")]
-pub enum NodeFacet {
+pub enum SyntaxKind {
     /// Introduces a name.
     Declaration,
     /// Supplies the implementation behind a declared name.
@@ -859,7 +859,7 @@ pub const FACETS_DECLARATIONS_MAX: usize = 4;
                 "syntax": [
                     {
                         "declaration": 0,
-                        "facets": [
+                        "kinds": [
                             "declaration",
                             "definition"
                         ],
@@ -914,7 +914,7 @@ pub const FACETS_DECLARATIONS_MAX: usize = 4;
                     },
                     {
                         "declaration": 0,
-                        "facets": [
+                        "kinds": [
                             "declaration",
                             "definition"
                         ],
@@ -1562,7 +1562,7 @@ pub enum ReadWarning {
     },
     /// A traversal walk stopped at its symbol bound before exhausting the reachable graph,
     /// so hits reachable beyond the bound are missing from this answer. Narrow the walk -
-    /// a tighter `facets` list, a smaller `depth`, or a less-connected seed - to fit it
+    /// a tighter `kinds` list, a smaller `depth`, or a less-connected seed - to fit it
     /// under the bound.
     TraversalTruncated {
         /// Symbols the walk visited before it stopped, equal to the bound it hit.
@@ -1571,16 +1571,16 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         detail: String,
     },
-    /// No lane populates part of the relationship coverage the traversal asked for, so the
+    /// No lane populates part of the edge coverage the traversal asked for, so the
     /// walk had nothing to follow there whatever the graph holds. The warning states that a
     /// lane is absent; it never states that the seed has no such neighbor. An empty answer
     /// carrying it means the walk could not run; an empty answer without it means the walk
     /// ran and the seed has no neighbor under the request.
-    RelationshipCoverageMissing {
-        /// The requested facets no lane populates, in the request's own order,
-        /// deduplicated. Absent when every requested facet has a lane.
+    EdgeCoverageMissing {
+        /// The requested kinds no lane populates, in the request's own order,
+        /// deduplicated. Absent when every requested kind has a lane.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        facets: Vec<RelationshipFacet>,
+        kinds: Vec<EdgeKind>,
         /// Why the warning was raised - prose for a reader; nothing keys on it.
         #[schemars(length(max = 4096))]
         detail: String,
@@ -1588,7 +1588,7 @@ pub enum ReadWarning {
     /// A language engine serves the seed's language, and this read carries none of its
     /// edges: the engine answered about bytes the served revision does not carry, answered
     /// more than the walk's symbol bound holds, or was still analyzing when
-    /// `[server] readiness_timeout` was spent. The indexed relationships stand; whatever
+    /// `[server] readiness_timeout` was spent. The indexed edges stand; whatever
     /// the engine resolves on top of them is missing. The warning states that an engine's
     /// analysis is absent from this answer; it never states that the seed has no such
     /// neighbor. An engine still analyzing keeps loading, and a later read, served from a
@@ -1824,8 +1824,8 @@ pub enum RegionRole {
 /// derivation is how much the provider knew when it was read.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-#[schemars(transform = schema::declare_relationship_empty_defaults)]
-pub struct Relationship {
+#[schemars(transform = schema::declare_edge_empty_defaults)]
+pub struct Edge {
     /// The symbol the edge starts at.
     pub from: SymbolId,
     /// What the edge is in this provider's vocabulary, such as `import`, `use`, or
@@ -1834,7 +1834,7 @@ pub struct Relationship {
     /// Portable classification, so a query for `imports` finds local kinds such as `import`
     /// and `use` alike.
     #[schemars(length(min = 1))]
-    pub facets: Vec<RelationshipFacet>,
+    pub kinds: Vec<EdgeKind>,
     /// The symbol the edge points at. One Rift cannot read carries the `external` origin;
     /// the edge is the same either way.
     pub to: SymbolId,
@@ -1843,7 +1843,7 @@ pub struct Relationship {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub occurrence: Option<SourceUnitSpan>,
     /// How this edge was established.
-    pub derivation: RelationshipDerivation,
+    pub derivation: EdgeDerivation,
     /// How likely a `heuristic` edge is to hold, from 0 to 1. Absent for any other
     /// derivation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1866,7 +1866,7 @@ pub struct Relationship {
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
 #[serde(rename_all = "snake_case")]
-pub enum RelationshipDerivation {
+pub enum EdgeDerivation {
     /// The provider resolved the edge semantically, so a consumer may act on it directly.
     Resolution,
     /// The edge was read from syntax alone, without semantic resolution.
@@ -1876,7 +1876,7 @@ pub enum RelationshipDerivation {
 }
 
 /// One portable category an edge falls into. The local kinds `import` and `use` can share
-/// the `imports` facet, which lets one query cross languages.
+/// the `imports` kind, which lets one query cross languages.
 #[derive(
     Clone,
     Copy,
@@ -1893,7 +1893,7 @@ pub enum RelationshipDerivation {
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
-pub enum RelationshipFacet {
+pub enum EdgeKind {
     /// The source contains the target within its scope.
     Contains,
     /// The source declares the target.
@@ -2424,7 +2424,7 @@ pub struct SourceUnitSpan {
 }
 
 /// Readable Symbol assembled from normalized Contributions. Source structure lives in `SyntaxElement`
-/// and is connected through Relationship.
+/// and is connected through Edge.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[schemars(transform = schema::declare_symbol_empty_defaults)]
 pub struct Symbol {
@@ -2443,9 +2443,9 @@ pub struct Symbol {
     /// `table`.
     pub kind: ExactKind,
     /// Portable classification for cross-language queries, absent when empty. The local
-    /// kinds `trait` and `interface` can both carry the `type` facet.
+    /// kinds `trait` and `interface` can both carry the `type` kind.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub facets: Vec<SymbolFacet>,
+    pub kinds: Vec<SymbolKind>,
     /// Where the declaration belongs and how it was produced. Absent when it says a
     /// project declaration, authored, with no package - the common case.
     #[serde(
@@ -2529,13 +2529,13 @@ impl Symbol {
     }
 }
 
-/// One portable category a symbol falls into. Kinds are language-specific; facets are
-/// shared, so a filter written once applies to every served language.
+/// One portable category a symbol falls into, shared across served languages.
+/// The language-specific `kind` names the declaration in its provider's vocabulary.
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
 #[serde(rename_all = "snake_case")]
-pub enum SymbolFacet {
+pub enum SymbolKind {
     /// A named scope that groups declarations.
     Namespace,
     /// A compilation or import unit.
@@ -2947,9 +2947,9 @@ mod tests {
     use crate::dependencies::{PackageAvailability, PackageContextEntry, PackageSelector};
 
     use super::{
-        Digest, Duration, GLOBAL_WARNING_DETAIL_CHARS_MAX, GetSymbolParams, GlobalFailureClass,
-        GlobalPageWarningCode, LANGUAGE_IDENTITY_PATTERN, Language, PAGE_INDEX_DEFAULT,
-        PAGE_LIMIT_MAX, PackageIdentity, REVISION_ID_BYTES_MAX, ReadWarning, RelationshipFacet,
+        Digest, Duration, EdgeKind, GLOBAL_WARNING_DETAIL_CHARS_MAX, GetSymbolParams,
+        GlobalFailureClass, GlobalPageWarningCode, LANGUAGE_IDENTITY_PATTERN, Language,
+        PAGE_INDEX_DEFAULT, PAGE_LIMIT_MAX, PackageIdentity, REVISION_ID_BYTES_MAX, ReadWarning,
         RevisionId, RevisionIdViolation, SOURCE_WARNINGS_MAX, SearchScope, SourceUnitId, Symbol,
         SymbolId,
     };
@@ -3262,13 +3262,13 @@ mod tests {
         );
     }
 
-    /// Each relationship facet label matches the spelling serde emits.
+    /// Each edge kind label matches the spelling serde emits.
     #[test]
-    fn relationship_facet_labels_match_serde() {
-        for facet in RelationshipFacet::VARIANTS {
+    fn edge_kind_labels_match_serde() {
+        for kind in EdgeKind::VARIANTS {
             assert_eq!(
-                serde_json::to_value(facet).expect("serializes"),
-                json!(facet.as_ref())
+                serde_json::to_value(kind).expect("serializes"),
+                json!(kind.as_ref())
             );
         }
     }
@@ -3579,7 +3579,7 @@ mod tests {
             "language": "rust",
             "name": "Beacon",
             "kind": "struct",
-            "facets": ["type"],
+            "kinds": ["type"],
             "origin": {
                 "location": "dependency",
                 "package": { "manager": "cargo", "registry": "crates.io", "name": "beacon-core", "version": "0.1.0" },
@@ -3610,7 +3610,7 @@ mod tests {
             "language": "rust",
             "name": "Beacon",
             "kind": "struct",
-            "facets": ["type"]
+            "kinds": ["type"]
         });
         let symbol: Symbol =
             serde_json::from_value(common.clone()).expect("Symbol without origin decodes");
@@ -3997,28 +3997,28 @@ mod tests {
         assert_eq!(parsed, warning);
     }
 
-    /// An empty facet list is omitted, so absence is the signal a caller reads.
+    /// An empty kind list is omitted, so absence is the signal a caller reads.
     #[test]
-    fn the_relationship_coverage_warning_omits_an_empty_facet_list() {
+    fn the_edge_coverage_warning_omits_an_empty_kind_list() {
         let cases = [
             (
-                ReadWarning::RelationshipCoverageMissing {
-                    facets: vec![RelationshipFacet::Implements],
-                    detail: "no lane populates the requested facet implements".to_owned(),
+                ReadWarning::EdgeCoverageMissing {
+                    kinds: vec![EdgeKind::Implements],
+                    detail: "no lane populates the requested kind implements".to_owned(),
                 },
                 json!({
-                    "code": "relationship_coverage_missing",
-                    "facets": ["implements"],
-                    "detail": "no lane populates the requested facet implements",
+                    "code": "edge_coverage_missing",
+                    "kinds": ["implements"],
+                    "detail": "no lane populates the requested kind implements",
                 }),
             ),
             (
-                ReadWarning::RelationshipCoverageMissing {
-                    facets: Vec::new(),
+                ReadWarning::EdgeCoverageMissing {
+                    kinds: Vec::new(),
                     detail: "no lane populates the requested coverage".to_owned(),
                 },
                 json!({
-                    "code": "relationship_coverage_missing",
+                    "code": "edge_coverage_missing",
                     "detail": "no lane populates the requested coverage",
                 }),
             ),
@@ -4165,7 +4165,7 @@ mod tests {
             "package_requirement_absent",
             "package_unavailable",
             "package_context_degraded",
-            "relationship_coverage_missing",
+            "edge_coverage_missing",
             "history_store_filling",
         ] {
             assert!(

@@ -26,7 +26,7 @@ codebase. The answer carries:
 - `hubs` - the most-referenced symbols, ranked by reference count descending
 - `entry_points` - symbols where execution starts
 - `docs` - markdown files, in path order
-- `module_relationships` - the modules a resolved reference reaches between, ranked by that
+- `module_edges` - the modules a resolved reference reaches between, ranked by that
   count descending
 - `packages` - the packages the workspace's manifests and lockfiles state, in `manager`,
   `name`, then selector order
@@ -38,14 +38,14 @@ server **MUST** take the map's revision and counts from the same publication and
 [`local_index_preparing`](#reads) for incomplete preparation.
 
 `entry_points` lists symbols carrying the `entrypoint`
-[`SymbolFacet`](/docs/developer/protocol/reference) - a file-scope `fn main`, not one
+[`SymbolKind`](/docs/developer/protocol/reference) - a file-scope `fn main`, not one
 nested in a module, an `impl` block, or another function. It stays empty for a workspace with no
 such facts.
 
 `hubs` ranks [`SymbolId`](/docs/developer/protocol/reference)s by how often the index
-holds a resolved reference to them, and `module_relationships` folds both ends of every such
+holds a resolved reference to them, and `module_edges` folds both ends of every such
 reference to the module `modules` lists them under, drops a pair whose two ends fold to one
-module, and counts what is left. `module_relationships` carries at most 100 entries, ordered
+module, and counts what is left. `module_edges` carries at most 100 entries, ordered
 by `references` descending, then `from`, then `to`, so a workspace past that bound keeps the
 strongest pairs and two reads of one tree agree. Both read the index alone: the language
 engine resolves a reference for one read and publishes none, so both lists stay empty until a
@@ -121,7 +121,7 @@ properties as `[ :active true ; :count 7 ] .` Labels shown in text stay distinct
 the same spelling across pages of the retained answer. Structured content carries the exact
 RDF terms and retained identities.
 
-`DESCRIBE` uses the library's description behavior over all authoritative captured and published records in its selected dataset. It does not implicitly request every language-engine facet. Facts explicitly required by its `WHERE` pattern retain the same strict acquisition and missing-facts rules as other query forms; bounds still refuse incomplete admission.
+`DESCRIBE` uses the library's description behavior over all authoritative captured and published records in its selected dataset. It does not implicitly request every language-engine kind. Facts explicitly required by its `WHERE` pattern retain the same strict acquisition and missing-facts rules as other query forms; bounds still refuse incomplete admission.
 
 ### Full-text search [#search-fulltext]
 
@@ -143,8 +143,8 @@ LIMIT 5
 
 `:query`, `:pattern`, `:scope`, `:target`, `:order`, `:rev`, `:paths`, `:packages`, `:include`,
 `:change`, `:limit`, `:page_index`, and `:view` retain their producer meanings inside the service. Structured inputs
-use `rdf:JSON` literals. Conflicting constant inputs refuse. Requesting `:source` and `:score`
-projects the corresponding producer payload. Service input triples select records rather than
+use `rdf:JSON` literals. Conflicting constant inputs refuse. Portable categories use `:kinds`; the language-specific string uses `:kind`.
+Requesting `:source` and `:score` projects the corresponding producer payload. Service input triples select records rather than
 require those input values as stored facts on every result.
 
 `:limit` and `:page_index` select a producer page. Outer `LIMIT` and `OFFSET` apply to the
@@ -185,9 +185,9 @@ SELECT ?usage ?unit ?start ?end {
 ```
 
 `:usages` exposes raw physical occurrences. Each occurrence retains target, enclosing symbol
-when established, source unit, byte range, and supplied facets. Repeated locations in one
+when established, source unit, byte range, and supplied kinds. Repeated locations in one
 caller, recursive uses, and file-level uses remain distinct. The same physical occurrence
-supplied under two facets has one occurrence identity with both facets.
+supplied under two kinds has one occurrence identity with both kinds.
 
 Symbol adjacency remains separate:
 
@@ -211,14 +211,14 @@ symbols. Call hierarchy retains all established edges and actual ranges. Acquisi
 evaluation share cancellation and request bounds.
 
 Dependency continuation uses admitted source ownership and exact selected context. Supported
-complete-empty facts establish an empty answer. Unsupported facets, an incomplete publication,
+complete-empty facts establish an empty answer. Unsupported kinds, an incomplete publication,
 missing source authority, or a bound reached before completeness returns explicit
 unavailability. Global query serving reads existing collected facts; it does not collect,
 ingest, or backfill global language-engine facts. Local request facts do not enter collection.
 
 ### Flow search [#search-flows]
 
-The local `SERVICE :flows` discovers directed call paths through symbols matched by ranked text
+The local `SERVICE :flows` discovers paths of call edges through symbols matched by ranked text
 retrieval. Each path contains at least one matched symbol and one resolved call edge. The server
 can follow calls into and out of a matched symbol, so that symbol can be a step in the middle.
 
@@ -259,7 +259,7 @@ The service applies `:limit` to whole flows before SPARQL evaluates the outer qu
 `LIMIT` and `OFFSET` apply to solution rows and can split a flow's steps. When the caller
 follows `pagination.next_query`, the retained result keeps the original flow and step identities.
 
-The server returns usable paths in a positive `SELECT` with `relationship_coverage_missing`
+The server returns usable paths in a positive `SELECT` with `edge_coverage_missing`
 when a provider covers only part of the required calls. The server returns typed unavailability
 when the available calls cannot establish the requested result. A discovery bound that cuts the
 search reports `traversal_truncated`. A page continues the selected flow rows. If discovery reaches a

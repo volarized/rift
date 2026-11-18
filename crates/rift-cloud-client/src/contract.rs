@@ -399,14 +399,14 @@ fn validate_search_contract(document: &Value) -> Result<(), String> {
             &operation["requestBody"]["content"]["application/json"]["schema"],
             json!({"oneOf": [
                 {"$ref": "#/components/schemas/PackageSearchRequest"},
-                {"$ref": "#/components/schemas/RelationshipSearchRequest"}
+                {"$ref": "#/components/schemas/EdgeSearchRequest"}
             ]}),
         ),
         (
             &operation["responses"]["200"]["content"]["application/json"]["schema"],
             json!({"oneOf": [
                 {"$ref": "#/components/schemas/PackageSearchPage"},
-                {"$ref": "#/components/schemas/RelationshipSearchPage"}
+                {"$ref": "#/components/schemas/EdgeSearchPage"}
             ]}),
         ),
         (
@@ -415,9 +415,7 @@ fn validate_search_contract(document: &Value) -> Result<(), String> {
         ),
     ] {
         if schema != &expected {
-            return Err(
-                "POST /v1/search must declare ranked and raw relationship reads".to_owned(),
-            );
+            return Err("POST /v1/search must declare ranked and raw edge reads".to_owned());
         }
     }
     Ok(())
@@ -865,10 +863,9 @@ pub fn shared_schemas() -> serde_json::Map<String, Value> {
     let _ = generator.subschema_for::<rift_protocol::source_read::FindDeclarationsParams>();
     let _ = generator.subschema_for::<rift_protocol::source_read::FindDeclarationsResult>();
 
-    let _ =
-        generator.subschema_for::<rift_protocol::relationship_read::RelationshipSearchRequest>();
-    let _ = generator.subschema_for::<rift_protocol::relationship_read::RelationshipSearchPage>();
-    let _ = generator.subschema_for::<rift_protocol::relationship_read::RelationshipCapability>();
+    let _ = generator.subschema_for::<rift_protocol::edge_read::EdgeSearchRequest>();
+    let _ = generator.subschema_for::<rift_protocol::edge_read::EdgeSearchPage>();
+    let _ = generator.subschema_for::<rift_protocol::edge_read::EdgeCapability>();
     let _ = generator.subschema_for::<rift_protocol::search_read::SearchUnavailable>();
 
     // oas3 0.22 omits JSON Schema keywords used by shared models, including

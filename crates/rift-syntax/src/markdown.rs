@@ -29,8 +29,8 @@
 //! - Nothing attaches in front of a declaration, so `range` equals
 //!   `item_range`. A declaring section's `body_range` is the section minus
 //!   its heading line, absent for a section that is only a heading.
-//! - Headings carry no visibility and no portable symbol facet: `visibility`
-//!   stays `None` and `facets` stays empty.
+//! - Headings carry no visibility and no portable symbol kind: `visibility`
+//!   stays `None` and `kinds` stays empty.
 //! - A document with no headings emits no symbols; its syntax elements still serve.
 //! - `signatures` and `documentation` stay empty for every heading: a
 //!   heading has no callable form, and its `body_range` is the section's own
@@ -40,7 +40,7 @@
 use std::num::NonZeroU16;
 use std::sync::OnceLock;
 
-use rift_protocol::read::{Language, NodeFacet};
+use rift_protocol::read::{Language, SyntaxKind};
 use tree_sitter::Node;
 
 use crate::document::{ByteRange, SyntaxDocument};
@@ -209,7 +209,7 @@ impl MarkdownRules {
         Ok(Some(Declaration {
             name,
             kind: HEADING_KIND_WORD,
-            facets: Vec::new(),
+            kinds: Vec::new(),
             visibility: None,
             body_range: section_body_range(section, heading)?,
             documentation: Vec::new(),
@@ -231,7 +231,7 @@ impl MarkdownRules {
         Some(Declaration {
             name,
             kind: HEADING_KIND_WORD,
-            facets: Vec::new(),
+            kinds: Vec::new(),
             visibility: None,
             body_range: None,
             documentation: Vec::new(),
@@ -327,24 +327,24 @@ impl SyntaxProvider for MarkdownSyntaxProvider {
         Ok(syntax.with_markdown_facts(markdown_facts))
     }
 
-    /// Portable structural facets for one block grammar syntax element kind. Most
-    /// markdown kinds are prose structure no portable facet describes and
+    /// Portable structural kinds for one block grammar syntax element kind. Most
+    /// markdown kinds are prose structure no portable kind describes and
     /// carry none; the mapping covers the kinds with an honest portable
     /// reading.
-    fn syntax_element_facets(&self, kind: &str) -> Vec<NodeFacet> {
+    fn syntax_element_kinds(&self, kind: &str) -> Vec<SyntaxKind> {
         match kind {
             // The section declares its heading's name and the heading spells
             // it; a link reference definition introduces a label other
             // content refers to.
             SECTION_KIND | ATX_HEADING_KIND | SETEXT_HEADING_KIND | "link_reference_definition" => {
-                vec![NodeFacet::Declaration]
+                vec![SyntaxKind::Declaration]
             }
             // Content the document carries verbatim, uninterpreted by the
             // block grammar.
-            "fenced_code_block" | "indented_code_block" | "html_block" => vec![NodeFacet::Literal],
+            "fenced_code_block" | "indented_code_block" | "html_block" => vec![SyntaxKind::Literal],
             // The info string qualifies its fenced code block, as `rust`
             // does on a fence.
-            "info_string" => vec![NodeFacet::Annotation],
+            "info_string" => vec![SyntaxKind::Annotation],
             _ => Vec::new(),
         }
     }
@@ -578,9 +578,9 @@ mod tests {
                 .symbols()
                 .iter()
                 .all(|symbol| symbol.kind == "heading"
-                    && symbol.facets.is_empty()
+                    && symbol.kinds.is_empty()
                     && symbol.visibility.is_none()),
-            "every heading files under the one markdown kind with no facets and no visibility"
+            "every heading files under the one markdown kind with no kinds and no visibility"
         );
         assert!(!document.has_errors());
     }
@@ -891,33 +891,33 @@ mod tests {
         assert!(!document.has_errors());
     }
 
-    /// The declaring kinds carry the `Declaration` facet; verbatim content
+    /// The declaring kinds carry the `Declaration` kind; verbatim content
     /// reads as `Literal`, an info string as `Annotation`, and prose
     /// structure carries none.
     #[test]
-    fn test_syntax_element_facets_classify_the_interpreted_kinds() {
+    fn test_syntax_element_kinds_classify_the_interpreted_kinds() {
         let provider = MarkdownSyntaxProvider::default();
         for kind in [SECTION_KIND, ATX_HEADING_KIND, SETEXT_HEADING_KIND] {
             assert_eq!(
-                provider.syntax_element_facets(kind),
-                [NodeFacet::Declaration],
+                provider.syntax_element_kinds(kind),
+                [SyntaxKind::Declaration],
                 "kind {kind} must classify as a declaration"
             );
         }
         assert_eq!(
-            provider.syntax_element_facets("link_reference_definition"),
-            [NodeFacet::Declaration]
+            provider.syntax_element_kinds("link_reference_definition"),
+            [SyntaxKind::Declaration]
         );
         for kind in ["fenced_code_block", "indented_code_block", "html_block"] {
             assert_eq!(
-                provider.syntax_element_facets(kind),
-                [NodeFacet::Literal],
+                provider.syntax_element_kinds(kind),
+                [SyntaxKind::Literal],
                 "kind {kind} must classify as verbatim content"
             );
         }
         assert_eq!(
-            provider.syntax_element_facets("info_string"),
-            [NodeFacet::Annotation]
+            provider.syntax_element_kinds("info_string"),
+            [SyntaxKind::Annotation]
         );
         for kind in [
             "document",
@@ -928,9 +928,9 @@ mod tests {
             "block_quote",
         ] {
             assert_eq!(
-                provider.syntax_element_facets(kind),
+                provider.syntax_element_kinds(kind),
                 [],
-                "prose kind {kind} carries no portable facet"
+                "prose kind {kind} carries no portable kind"
             );
         }
     }
