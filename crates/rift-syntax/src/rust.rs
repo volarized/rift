@@ -6,7 +6,7 @@ mod blanking;
 use std::sync::OnceLock;
 
 use rift_error::errors;
-use rift_protocol::read::{Language, NodeFacet, SymbolFacet};
+use rift_protocol::read::{Language, SymbolKind, SyntaxKind};
 use strum::VariantArray;
 use tree_sitter::{Node, Parser, Query as TreeSitterQuery, QueryCursor, StreamingIterator};
 
@@ -57,16 +57,16 @@ impl RustSymbolKind {
         }
     }
 
-    /// Portable facets for this kind, before visibility adds `Public`.
-    fn facets(self) -> Vec<SymbolFacet> {
+    /// Portable kinds for this kind, before visibility adds `Public`.
+    fn kinds(self) -> Vec<SymbolKind> {
         match self {
-            Self::Function => vec![SymbolFacet::Value, SymbolFacet::Callable],
-            Self::Struct | Self::Enum | Self::Trait => vec![SymbolFacet::Type],
-            Self::TypeAlias => vec![SymbolFacet::Type, SymbolFacet::Alias],
-            Self::Module => vec![SymbolFacet::Namespace, SymbolFacet::Module],
-            Self::Macro => vec![SymbolFacet::Macro],
-            Self::Constant | Self::Static => vec![SymbolFacet::Value],
-            Self::Variant => vec![SymbolFacet::Variant],
+            Self::Function => vec![SymbolKind::Value, SymbolKind::Callable],
+            Self::Struct | Self::Enum | Self::Trait => vec![SymbolKind::Type],
+            Self::TypeAlias => vec![SymbolKind::Type, SymbolKind::Alias],
+            Self::Module => vec![SymbolKind::Namespace, SymbolKind::Module],
+            Self::Macro => vec![SymbolKind::Macro],
+            Self::Constant | Self::Static => vec![SymbolKind::Value],
+            Self::Variant => vec![SymbolKind::Variant],
         }
     }
 
@@ -379,21 +379,21 @@ impl SyntaxProvider for RustSyntaxProvider {
         .with_static_facts(Some(capture.finish())))
     }
 
-    fn syntax_element_facets(&self, kind: &str) -> Vec<NodeFacet> {
-        let mut facets = Vec::new();
+    fn syntax_element_kinds(&self, kind: &str) -> Vec<SyntaxKind> {
+        let mut kinds = Vec::new();
         if kind.ends_with("_item") || kind.ends_with("_declaration") {
-            facets.extend([NodeFacet::Declaration, NodeFacet::Definition]);
+            kinds.extend([SyntaxKind::Declaration, SyntaxKind::Definition]);
         }
         if kind.ends_with("_expression") {
-            facets.push(NodeFacet::Expression);
+            kinds.push(SyntaxKind::Expression);
         }
         if kind.ends_with("_statement") {
-            facets.push(NodeFacet::Statement);
+            kinds.push(SyntaxKind::Statement);
         }
         if kind.contains("comment") {
-            facets.push(NodeFacet::Comment);
+            kinds.push(SyntaxKind::Comment);
         }
-        facets
+        kinds
     }
 }
 
@@ -424,16 +424,16 @@ impl GrammarRules for RustGrammarRules {
             return Ok(None);
         };
         let visibility = declared_visibility(visited, kind, text);
-        let mut facets = declaration_facets(kind, &visibility);
+        let mut kinds = declaration_kinds(kind, &visibility);
         if is_entrypoint(visited, kind, &name) {
-            facets.push(SymbolFacet::Entrypoint);
+            kinds.push(SymbolKind::Entrypoint);
         }
         let (documentation, documentation_ranges) =
             attachment::attached_documentation(visited, text)?;
         Ok(Some(Declaration {
             name,
             kind: kind.word(),
-            facets,
+            kinds,
             visibility: Some(visibility.authored()),
             body_range: body_range(syntax_element, kind)?,
             documentation,
@@ -550,12 +550,12 @@ fn declaration_visibility(syntax_element: Node<'_>, text: &str) -> RustVisibilit
         .map_or(RustVisibility::Private, RustVisibility::from_authored)
 }
 
-fn declaration_facets(kind: RustSymbolKind, visibility: &RustVisibility) -> Vec<SymbolFacet> {
-    let mut facets = kind.facets();
+fn declaration_kinds(kind: RustSymbolKind, visibility: &RustVisibility) -> Vec<SymbolKind> {
+    let mut kinds = kind.kinds();
     if visibility == &RustVisibility::Public {
-        facets.push(SymbolFacet::Public);
+        kinds.push(SymbolKind::Public);
     }
-    facets
+    kinds
 }
 
 /// Numeric grammar ids for the ancestor kinds [`is_file_scope`] checks,
@@ -637,7 +637,7 @@ fn is_file_scope(visited: Visited<'_, '_>) -> bool {
 }
 
 /// Reports whether `syntax element` is a file-scope `fn main` - the binary
-/// entrypoint - so [`SymbolFacet::Entrypoint`] applies. A `main` nested in
+/// entrypoint - so [`SymbolKind::Entrypoint`] applies. A `main` nested in
 /// a `mod`, an `impl`, a `trait`, or another `fn` never qualifies.
 fn is_entrypoint(visited: Visited<'_, '_>, kind: RustSymbolKind, name: &str) -> bool {
     kind == RustSymbolKind::Function && name == "main" && is_file_scope(visited)
@@ -685,7 +685,7 @@ pub(crate) fn literal_function(
     let declaration = extract::Declaration {
         name: name.clone(),
         kind: RustSymbolKind::Function.word(),
-        facets: declaration_facets(RustSymbolKind::Function, &visibility),
+        kinds: declaration_kinds(RustSymbolKind::Function, &visibility),
         visibility: Some(visibility.authored()),
         body_range: Some(body_range),
         documentation: Vec::new(),
@@ -699,7 +699,7 @@ pub(crate) fn literal_function(
         container: None,
         kind: declaration.kind,
         syntax_element_kind: None,
-        facets: declaration.facets,
+        kinds: declaration.kinds,
         visibility: declaration.visibility,
         range: item_range,
         item_range,
@@ -956,7 +956,7 @@ mod tests {
         assert_eq!(function.signatures[0].language.name, "rust");
     }
 
-    /// A kind the grammar declares no `Callable` facet for never renders a signature, even
+    /// A kind the grammar declares no `Callable` kind for never renders a signature, even
     /// when it carries a `body_range` - a struct's braces are not a callable implementation.
     #[test]
     fn test_a_non_callable_declaration_with_a_body_range_renders_no_signature() {
@@ -1033,7 +1033,7 @@ mod tests {
         assert_eq!(names, ["Option::None", "Option::Some", "Option::Pair"]);
         assert_eq!(variants[0].documentation[0].text, "No value.");
         assert!(variants.iter().all(|symbol| symbol.signatures.is_empty()));
-        assert_eq!(variants[0].facets, [SymbolFacet::Variant]);
+        assert_eq!(variants[0].kinds, [SymbolKind::Variant]);
     }
 
     /// The const-trait forms the pinned grammar lacks parse without an error
@@ -1116,29 +1116,25 @@ mod tests {
                 ("hidden", Some("private")),
             ]
         );
-        assert!(document.symbols()[0].facets.contains(&SymbolFacet::Public));
+        assert!(document.symbols()[0].kinds.contains(&SymbolKind::Public));
     }
 
     #[test]
-    fn test_document_facets_render_kind_categories_and_public_visibility() {
+    fn test_document_kinds_render_kind_categories_and_public_visibility() {
         let document =
             analyze("pub fn f() {}\ntype A = u8;\nmod m {}\nmacro_rules! q { () => {}; }");
-        let facets = document
+        let kinds = document
             .symbols()
             .iter()
-            .map(|symbol| symbol.facets.clone())
+            .map(|symbol| symbol.kinds.clone())
             .collect::<Vec<_>>();
         assert_eq!(
-            facets,
+            kinds,
             [
-                vec![
-                    SymbolFacet::Value,
-                    SymbolFacet::Callable,
-                    SymbolFacet::Public
-                ],
-                vec![SymbolFacet::Type, SymbolFacet::Alias],
-                vec![SymbolFacet::Namespace, SymbolFacet::Module],
-                vec![SymbolFacet::Macro],
+                vec![SymbolKind::Value, SymbolKind::Callable, SymbolKind::Public],
+                vec![SymbolKind::Type, SymbolKind::Alias],
+                vec![SymbolKind::Namespace, SymbolKind::Module],
+                vec![SymbolKind::Macro],
             ]
         );
     }
@@ -1184,25 +1180,25 @@ mod tests {
     }
 
     #[test]
-    fn test_provider_syntax_element_facets_classify_declaration_expression_statement_and_comment() {
+    fn test_provider_syntax_element_kinds_classify_declaration_expression_statement_and_comment() {
         let provider = RustSyntaxProvider::default();
         assert_eq!(
-            provider.syntax_element_facets("function_item"),
-            [NodeFacet::Declaration, NodeFacet::Definition]
+            provider.syntax_element_kinds("function_item"),
+            [SyntaxKind::Declaration, SyntaxKind::Definition]
         );
         assert_eq!(
-            provider.syntax_element_facets("binary_expression"),
-            [NodeFacet::Expression]
+            provider.syntax_element_kinds("binary_expression"),
+            [SyntaxKind::Expression]
         );
         assert_eq!(
-            provider.syntax_element_facets("expression_statement"),
-            [NodeFacet::Statement]
+            provider.syntax_element_kinds("expression_statement"),
+            [SyntaxKind::Statement]
         );
         assert_eq!(
-            provider.syntax_element_facets("line_comment"),
-            [NodeFacet::Comment]
+            provider.syntax_element_kinds("line_comment"),
+            [SyntaxKind::Comment]
         );
-        assert_eq!(provider.syntax_element_facets("identifier"), []);
+        assert_eq!(provider.syntax_element_kinds("identifier"), []);
     }
 
     #[test]
@@ -1551,44 +1547,44 @@ mod tests {
     }
 
     #[test]
-    fn test_file_scope_main_carries_the_entrypoint_facet() {
+    fn test_file_scope_main_carries_the_entrypoint_kind() {
         let document = analyze("fn main() {}\n");
         let main = &document.symbols()[0];
         assert_eq!(main.name, "main");
-        assert!(main.facets.contains(&SymbolFacet::Entrypoint));
+        assert!(main.kinds.contains(&SymbolKind::Entrypoint));
     }
 
     #[test]
-    fn test_main_nested_in_a_module_does_not_carry_the_entrypoint_facet() {
+    fn test_main_nested_in_a_module_does_not_carry_the_entrypoint_kind() {
         let document = analyze("mod tests {\n    fn main() {}\n}\n");
         let main = document
             .symbols()
             .iter()
             .find(|symbol| symbol.name == "main");
         let main = main.expect("fixture declares a nested main");
-        assert!(!main.facets.contains(&SymbolFacet::Entrypoint));
+        assert!(!main.kinds.contains(&SymbolKind::Entrypoint));
     }
 
     #[test]
-    fn test_a_method_named_main_does_not_carry_the_entrypoint_facet() {
+    fn test_a_method_named_main_does_not_carry_the_entrypoint_kind() {
         let document = analyze("struct S;\nimpl S {\n    fn main(&self) {}\n}\n");
         let main = document
             .symbols()
             .iter()
             .find(|symbol| symbol.name == "main");
         let main = main.expect("fixture declares a method named main");
-        assert!(!main.facets.contains(&SymbolFacet::Entrypoint));
+        assert!(!main.kinds.contains(&SymbolKind::Entrypoint));
     }
 
     #[test]
-    fn test_a_trait_default_main_does_not_carry_the_entrypoint_facet() {
+    fn test_a_trait_default_main_does_not_carry_the_entrypoint_kind() {
         let document = analyze("trait Runs {\n    fn main() {}\n}\n");
         let main = document
             .symbols()
             .iter()
             .find(|symbol| symbol.name == "main");
         let main = main.expect("fixture declares a trait default method named main");
-        assert!(!main.facets.contains(&SymbolFacet::Entrypoint));
+        assert!(!main.kinds.contains(&SymbolKind::Entrypoint));
     }
 
     #[test]

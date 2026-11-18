@@ -33,8 +33,8 @@
 //!   `item_range`. An entry's `body_range` is the value syntax element's span,
 //!   absent for a key with no value; a document's is its content syntax element's
 //!   span, absent for a bare `---`.
-//! - Entries carry no visibility and no portable symbol facet:
-//!   `visibility` stays `None` and `facets` stays empty.
+//! - Entries carry no visibility and no portable symbol kind:
+//!   `visibility` stays `None` and `kinds` stays empty.
 //! - `signatures` and `documentation` stay empty for every entry and every
 //!   document: YAML has no callable form and, with nothing attached in
 //!   front of a declaration, no comment for one to carry either.
@@ -43,7 +43,7 @@ use std::num::NonZeroU16;
 use std::sync::OnceLock;
 
 use rift_error::errors;
-use rift_protocol::read::{Language, NodeFacet};
+use rift_protocol::read::{Language, SyntaxKind};
 use tree_sitter::{Node, Parser};
 
 use crate::document::{ByteRange, SyntaxDocument};
@@ -235,7 +235,7 @@ impl YamlRules {
         Ok(Some(Declaration {
             name,
             kind: MAPPING_ENTRY_KIND_WORD,
-            facets: Vec::new(),
+            kinds: Vec::new(),
             visibility: None,
             body_range,
             documentation: Vec::new(),
@@ -261,7 +261,7 @@ impl YamlRules {
         Ok(Some(Declaration {
             name: ordinal.to_string(),
             kind: DOCUMENT_KIND_WORD,
-            facets: Vec::new(),
+            kinds: Vec::new(),
             visibility: None,
             body_range: self.document_body_range(document)?,
             documentation: Vec::new(),
@@ -377,16 +377,16 @@ impl SyntaxProvider for YamlSyntaxProvider {
         .with_syntax_limits(limits))
     }
 
-    /// Portable structural facets for one YAML grammar syntax element kind. The
+    /// Portable structural kinds for one YAML grammar syntax element kind. The
     /// structural kinds - `stream`, syntax element wrappers, mappings, sequences -
     /// carry none.
-    fn syntax_element_facets(&self, kind: &str) -> Vec<NodeFacet> {
+    fn syntax_element_kinds(&self, kind: &str) -> Vec<SyntaxKind> {
         match kind {
             // The pair declares its key's name; a document declares its
             // ordinal in a multi-document stream; an anchor introduces a
             // label other content refers to.
             BLOCK_MAPPING_PAIR_KIND | FLOW_PAIR_KIND | DOCUMENT_KIND | "anchor" => {
-                vec![NodeFacet::Declaration]
+                vec![SyntaxKind::Declaration]
             }
             // A value written out directly.
             PLAIN_SCALAR_KIND
@@ -397,14 +397,14 @@ impl SyntaxProvider for YamlSyntaxProvider {
             | "integer_scalar"
             | "float_scalar"
             | "boolean_scalar"
-            | "null_scalar" => vec![NodeFacet::Literal],
+            | "null_scalar" => vec![SyntaxKind::Literal],
             // An alias is a written name referring to an anchor.
-            "alias" => vec![NodeFacet::Identifier],
+            "alias" => vec![SyntaxKind::Identifier],
             // A tag or directive qualifies the syntax element or document it rides.
             "tag" | "yaml_directive" | "tag_directive" | "reserved_directive" => {
-                vec![NodeFacet::Annotation]
+                vec![SyntaxKind::Annotation]
             }
-            "comment" => vec![NodeFacet::Comment],
+            "comment" => vec![SyntaxKind::Comment],
             _ => Vec::new(),
         }
     }
@@ -526,10 +526,10 @@ mod tests {
                 .iter()
                 .all(|symbol| symbol.kind == "mapping_entry"
                     && symbol.range == symbol.item_range
-                    && symbol.facets.is_empty()
+                    && symbol.kinds.is_empty()
                     && symbol.visibility.is_none()),
             "every entry files under the one YAML mapping kind, spans its \
-             own pair, and carries no facets and no visibility"
+             own pair, and carries no kinds and no visibility"
         );
         assert!(!document.has_errors());
     }
@@ -798,11 +798,11 @@ mod tests {
         assert!(!document.has_errors());
     }
 
-    /// The declaring kinds carry the `Declaration` facet, scalars read as
+    /// The declaring kinds carry the `Declaration` kind, scalars read as
     /// `Literal`, an alias as `Identifier`, tags and directives as
     /// `Annotation`, and structure carries none.
     #[test]
-    fn test_syntax_element_facets_classify_the_interpreted_kinds() {
+    fn test_syntax_element_kinds_classify_the_interpreted_kinds() {
         let provider = YamlSyntaxProvider::default();
         for kind in [
             BLOCK_MAPPING_PAIR_KIND,
@@ -811,8 +811,8 @@ mod tests {
             "anchor",
         ] {
             assert_eq!(
-                provider.syntax_element_facets(kind),
-                [NodeFacet::Declaration],
+                provider.syntax_element_kinds(kind),
+                [SyntaxKind::Declaration],
                 "kind {kind} must classify as a declaration"
             );
         }
@@ -825,14 +825,14 @@ mod tests {
             "integer_scalar",
         ] {
             assert_eq!(
-                provider.syntax_element_facets(kind),
-                [NodeFacet::Literal],
+                provider.syntax_element_kinds(kind),
+                [SyntaxKind::Literal],
                 "kind {kind} must classify as a literal value"
             );
         }
         assert_eq!(
-            provider.syntax_element_facets("alias"),
-            [NodeFacet::Identifier]
+            provider.syntax_element_kinds("alias"),
+            [SyntaxKind::Identifier]
         );
         for kind in [
             "tag",
@@ -841,14 +841,14 @@ mod tests {
             "reserved_directive",
         ] {
             assert_eq!(
-                provider.syntax_element_facets(kind),
-                [NodeFacet::Annotation],
+                provider.syntax_element_kinds(kind),
+                [SyntaxKind::Annotation],
                 "kind {kind} must classify as an annotation"
             );
         }
         assert_eq!(
-            provider.syntax_element_facets("comment"),
-            [NodeFacet::Comment]
+            provider.syntax_element_kinds("comment"),
+            [SyntaxKind::Comment]
         );
         for kind in [
             "stream",
@@ -861,9 +861,9 @@ mod tests {
             "flow_sequence",
         ] {
             assert_eq!(
-                provider.syntax_element_facets(kind),
+                provider.syntax_element_kinds(kind),
                 [],
-                "structural kind {kind} carries no portable facet"
+                "structural kind {kind} carries no portable kind"
             );
         }
     }

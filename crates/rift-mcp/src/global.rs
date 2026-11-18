@@ -429,7 +429,7 @@ impl GlobalState {
     }
 
     /// The facets of one package or runtime symbol, read from the global API.
-    pub(crate) async fn symbol_facets(
+    pub(crate) async fn symbol_kinds(
         &self,
         configuration: &GlobalConfiguration,
         params: &rift_protocol::read::FacetsParams,
@@ -601,7 +601,7 @@ async fn captured_callee_source(
         };
         let answer = client.facets(&request).await?;
         let matched =
-            answer.revision == release && declared_facets_match(&answer, id, &position.unit, held);
+            answer.revision == release && declared_kinds_match(&answer, id, &position.unit, held);
         verified.insert(verified_key, matched);
         return Ok(matched);
     }
@@ -610,7 +610,7 @@ async fn captured_callee_source(
 
 /// Whether the first page of `answer` lists the facets of `id` with an item syntax element in `unit`, and
 /// every such item syntax element's source equals `held` at the syntax element's byte range.
-fn declared_facets_match(
+fn declared_kinds_match(
     answer: &rift_protocol::read::FacetsResult,
     id: &SymbolId,
     unit: &rift_protocol::read::SourceUnitId,
@@ -3097,7 +3097,7 @@ mod tests {
 
 #[cfg(test)]
 mod captured_runtime_tests {
-    use super::declared_facets_match;
+    use super::declared_kinds_match;
     use rift_protocol::read::{FacetsResult, SymbolId};
 
     const ID: &str = "rift://symbol/stdlib/cpython/python/builtins/len";
@@ -3139,14 +3139,14 @@ mod captured_runtime_tests {
                 syntax_element(1, UNIT, 10, "obj"),
             ],
         );
-        assert!(declared_facets_match(&matching, &id, &unit, STUB));
-        assert!(!declared_facets_match(
+        assert!(declared_kinds_match(&matching, &id, &unit, STUB));
+        assert!(!declared_kinds_match(
             &matching,
             &id,
             &unit,
             "x = 1\ndef len(arg): ...\n"
         ));
-        assert!(!declared_facets_match(&matching, &id, &unit, "short"));
+        assert!(!declared_kinds_match(&matching, &id, &unit, "short"));
         let other_unit = answer(
             Some(ID),
             &[syntax_element(
@@ -3156,10 +3156,10 @@ mod captured_runtime_tests {
                 DECLARED,
             )],
         );
-        assert!(!declared_facets_match(&other_unit, &id, &unit, STUB));
+        assert!(!declared_kinds_match(&other_unit, &id, &unit, STUB));
         let shifted = answer(Some(ID), &[syntax_element(0, UNIT, 5, DECLARED)]);
-        assert!(!declared_facets_match(&shifted, &id, &unit, STUB));
+        assert!(!declared_kinds_match(&shifted, &id, &unit, STUB));
         let unnamed = answer(None, &[syntax_element(0, UNIT, 6, DECLARED)]);
-        assert!(!declared_facets_match(&unnamed, &id, &unit, STUB));
+        assert!(!declared_kinds_match(&unnamed, &id, &unit, STUB));
     }
 }

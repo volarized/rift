@@ -358,7 +358,7 @@ mod tests {
     #[test]
     fn a_non_text_block_is_refused() {
         let mut result = CallToolResult::success(vec![ContentBlock::image("AAAA", "image/png")]);
-        result.structured_content = Some(json!({ "facets": [], "source": [] }));
+        result.structured_content = Some(json!({ "kinds": [], "source": [] }));
         assert!(text_states(FACETS_TOOL, &result).is_err());
     }
 

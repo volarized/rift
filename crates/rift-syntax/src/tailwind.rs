@@ -588,7 +588,7 @@ fn symbol(name: &str, kind: &'static str, range: ByteRange) -> SyntaxSymbol {
         container: None,
         kind,
         syntax_element_kind: None,
-        facets: Vec::new(),
+        kinds: Vec::new(),
         visibility: None,
         range,
         item_range: range,

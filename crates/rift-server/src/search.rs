@@ -1,6 +1,6 @@
 //! `search` tool execution: lexical symbol and content-line search over syntax-indexed and
 //! `[search.text]` files alike, narrowed or extended by a request's `paths` selector. Extracted
-//! from `read` so that module stays below its size bound. The bounded relationship `traversal`
+//! from `read` so that module stays below its size bound. The bounded edge `traversal`
 //! lane lives in the sibling `traversal` module.
 
 mod body;
@@ -907,7 +907,7 @@ pub(crate) fn validate_search(params: &SearchParams) -> Result<(), RiftError> {
         if params.scope == SearchScope::Global {
             return errors::server::read_invalid()
                 .field("traversal")
-                .violation("the relationship graph serves the project alone")
+                .violation("the edge graph serves the project alone")
                 .fail();
         }
     }
@@ -920,7 +920,7 @@ pub(crate) fn validate_search(params: &SearchParams) -> Result<(), RiftError> {
 /// serves the current tree alone, so a committed revision has none. A comparison against
 /// the working tree is refused the same way: the walk from its changed declarations is not
 /// served. No resend of the same request clears that.
-pub(crate) const CHANGE_TRAVERSAL_CAPABILITY: &str = "relationship traversal beside a comparison";
+pub(crate) const CHANGE_TRAVERSAL_CAPABILITY: &str = "edge traversal beside a comparison";
 
 /// Refuses a `traversal` that names no `seed`, and one riding beside `change`.
 ///
@@ -3280,7 +3280,7 @@ impl Tower {
                     "unexpected visibility for {name}"
                 );
                 assert!(
-                    !hit["facets"]
+                    !hit["kinds"]
                         .as_array()
                         .is_some_and(|facets| facets.contains(&json!("public"))),
                     "{name} must not carry public facet"
@@ -4947,7 +4947,7 @@ impl Tower {
 
         let error = service
             .search(&params, &StoreAnswer::identifier_only())
-            .expect_err("the relationship graph serves the project alone");
+            .expect_err("the edge graph serves the project alone");
 
         assert!(
             (error.slug() == rift_error::errors::server::read_invalid::SLUG),
@@ -4959,7 +4959,7 @@ impl Tower {
                 .any(|(key, value)| { key == "field" && value == "traversal" })
         );
         assert!(error.context().any(|(key, value)| {
-            key == "violation" && value == "the relationship graph serves the project alone"
+            key == "violation" && value == "the edge graph serves the project alone"
         }));
         Ok(())
     }

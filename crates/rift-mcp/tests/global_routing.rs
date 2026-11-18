@@ -280,7 +280,7 @@ async fn request_deadline_bounds_the_remote_package_read() -> TestResult {
     let elapsed = started.elapsed();
     assert!(
         elapsed < READ_DELAY,
-        "facets: the request deadline must end the read wait: elapsed={elapsed:?}"
+        "kinds: the request deadline must end the read wait: elapsed={elapsed:?}"
     );
     assert_eq!(
         refused.code,

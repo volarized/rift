@@ -10,10 +10,9 @@ pub(crate) use rift_error::RiftError;
 use rift_error::errors;
 use rift_history::Repository;
 use rift_index::{
-    FileDigest, FileRecord, IndexedFile, PathChange, PathChanges, ReadableSymbol,
-    RelationshipStore, SymbolMatch, WorkspaceContentCache, WorkspaceDigests, WorkspaceFingerprint,
-    WorkspaceIndex, WorkspaceIndexLimits, WorkspaceIndexPreparation, WorkspaceIndexWarning,
-    WorkspaceSourcePolicy,
+    EdgeStore, FileDigest, FileRecord, IndexedFile, PathChange, PathChanges, ReadableSymbol,
+    SymbolMatch, WorkspaceContentCache, WorkspaceDigests, WorkspaceFingerprint, WorkspaceIndex,
+    WorkspaceIndexLimits, WorkspaceIndexPreparation, WorkspaceIndexWarning, WorkspaceSourcePolicy,
 };
 use rift_protocol::configuration::HistoryConfiguration;
 use rift_protocol::dependencies::{
@@ -384,8 +383,8 @@ impl ReadService {
     /// The symbol reference adjacency built from this snapshot's normalized graph: which
     /// symbols reference which, in both directions.
     #[must_use]
-    pub fn relationships(&self) -> &RelationshipStore {
-        self.index.relationships()
+    pub fn edges(&self) -> &EdgeStore {
+        self.index.edges()
     }
 
     /// The visibility policy this snapshot reads the filesystem through.
@@ -1840,9 +1839,9 @@ pub(crate) mod tests {
     use rift_index::{LastCapture, capture_digests_with_languages};
     use rift_protocol::configuration::{LanguageConfiguration, WorkspaceConfiguration};
     use rift_protocol::read::{
-        FacetsParams, GetSymbolParams, Language, NodeFacet, PAGE_LIMIT_MAX, Pagination,
-        ProjectPath, ReadWarning, RevisionId, SOURCE_WARNINGS_MAX, SearchScope, SymbolId,
-        SyntaxElement,
+        FacetsParams, GetSymbolParams, Language, PAGE_LIMIT_MAX, Pagination, ProjectPath,
+        ReadWarning, RevisionId, SOURCE_WARNINGS_MAX, SearchScope, SymbolId, SyntaxElement,
+        SyntaxKind,
     };
     use serde_json::json;
     use tempfile::TempDir;
@@ -2250,11 +2249,11 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// `ReadService::relationships` is a pass-through onto the underlying index's own
+    /// `ReadService::edges` is a pass-through onto the underlying index's own
     /// store: an independently built [`WorkspaceIndex`] over the identical source must
     /// report the same adjacency the service serves.
     #[test]
-    fn relationships_pass_through_serves_the_same_edges_the_index_holds() -> TestResult {
+    fn edges_pass_through_serves_the_same_edges_the_index_holds() -> TestResult {
         let directory = tempfile::tempdir()?;
         captured_rust_package(directory.path())?;
         fs::create_dir(directory.path().join("src"))?;
@@ -2279,17 +2278,17 @@ pub(crate) mod tests {
         let beta = rift_core::SymbolId::new(local_identity("rust", &["beacon", "beta"]))?;
         let alpha = rift_core::SymbolId::new(local_identity("rust", &["beacon", "alpha"]))?;
         assert_eq!(
-            service.relationships().is_empty(),
-            independent_index.relationships().is_empty(),
+            service.edges().is_empty(),
+            independent_index.edges().is_empty(),
             "no provider publishes a resolved reference, so both stores are empty"
         );
         assert_eq!(
-            service.relationships().outgoing(&beta),
-            independent_index.relationships().outgoing(&beta)
+            service.edges().outgoing(&beta),
+            independent_index.edges().outgoing(&beta)
         );
         assert_eq!(
-            service.relationships().incoming(&alpha),
-            independent_index.relationships().incoming(&alpha)
+            service.edges().incoming(&alpha),
+            independent_index.edges().incoming(&alpha)
         );
         Ok(())
     }
@@ -2451,7 +2450,7 @@ pub(crate) mod tests {
         assert_eq!(symbol["name"], "Beacon");
         assert_eq!(symbol["visibility"], "pub");
         assert!(
-            symbol["facets"]
+            symbol["kinds"]
                 .as_array()
                 .is_some_and(|facets| facets.contains(&json!("public")))
         );
@@ -2521,7 +2520,7 @@ pub(crate) mod tests {
         let symbol = &value["hits"][0]["symbol"];
         assert_eq!(symbol["language"], json!("rust"));
         assert_eq!(symbol["kind"], json!("function"));
-        assert_eq!(symbol["facets"], json!(["value", "callable", "public"]));
+        assert_eq!(symbol["kinds"], json!(["value", "callable", "public"]));
         assert_eq!(symbol["visibility"], json!("pub"));
         assert_eq!(
             symbol["container"],
@@ -2539,7 +2538,7 @@ pub(crate) mod tests {
         let top_value = serde_json::to_value(service.get_symbol(&top_level)?)?;
         let beacon = &top_value["hits"][0]["symbol"];
         assert_eq!(beacon["kind"], json!("struct"));
-        assert_eq!(beacon["facets"], json!(["type", "public"]));
+        assert_eq!(beacon["kinds"], json!(["type", "public"]));
         assert!(
             beacon.get("container").is_none(),
             "a top-level declaration serves no container"
@@ -2787,7 +2786,7 @@ pub(crate) mod tests {
     }
 
     /// One read service over `directory` under `visibility`, the shape every
-    /// `facets` classification test builds.
+    /// `kinds` classification test builds.
     fn facets_service(
         directory: &std::path::Path,
         visibility: &SourceVisibility,
@@ -3002,12 +3001,12 @@ pub(crate) mod tests {
             "from": symbol.id,
             "to": symbol.id,
             "kind": symbol.kind,
-            "facets": ["calls"],
+            "kinds": ["calls"],
             "derivation": "syntax"
         });
-        assert!(serde_json::from_value::<rift_protocol::read::Relationship>(edge.clone()).is_ok());
+        assert!(serde_json::from_value::<rift_protocol::read::Edge>(edge.clone()).is_ok());
         edge["to"] = json!(raw_address);
-        assert!(serde_json::from_value::<rift_protocol::read::Relationship>(edge).is_err());
+        assert!(serde_json::from_value::<rift_protocol::read::Edge>(edge).is_err());
         Ok(())
     }
 
@@ -3430,7 +3429,7 @@ pub(crate) mod tests {
         let symbol = &value["hits"][0]["symbol"];
         assert_eq!(symbol["language"], json!("typescript"));
         assert_eq!(symbol["kind"], json!("interface"));
-        assert_eq!(symbol["facets"], json!(["type", "public"]));
+        assert_eq!(symbol["kinds"], json!(["type", "public"]));
         assert_eq!(
             symbol["id"],
             json!(local_identity("typescript", &["beacon", "Route"]))
@@ -3547,7 +3546,7 @@ pub(crate) mod tests {
     }
 
     /// A markdown heading answers `get_symbol` like any declaration: the
-    /// provider's kind word, empty facets, physical path, and a range over
+    /// provider's kind word, empty kinds, physical path, and a range over
     /// the whole section.
     #[test]
     fn get_symbol_finds_a_markdown_heading_beside_other_languages() -> TestResult {
@@ -3558,8 +3557,8 @@ pub(crate) mod tests {
         assert_eq!(symbol["language"], json!("markdown"));
         assert_eq!(symbol["kind"], json!("heading"));
         assert!(
-            symbol.get("facets").is_none(),
-            "no facets must omit the member"
+            symbol.get("kinds").is_none(),
+            "no kinds must omit the member"
         );
         assert!(
             symbol.get("id").is_none(),
@@ -3615,7 +3614,7 @@ pub(crate) mod tests {
     }
 
     /// A JSON member answers `get_symbol` like any declaration: the
-    /// provider's kind word, empty facets, physical path, and a range over
+    /// provider's kind word, empty kinds, physical path, and a range over
     /// the whole pair.
     #[test]
     fn get_symbol_finds_a_json_member_beside_other_languages() -> TestResult {
@@ -3626,8 +3625,8 @@ pub(crate) mod tests {
         assert_eq!(symbol["language"], json!("json"));
         assert_eq!(symbol["kind"], json!("member"));
         assert!(
-            symbol.get("facets").is_none(),
-            "no facets must omit the member"
+            symbol.get("kinds").is_none(),
+            "no kinds must omit the member"
         );
         assert!(
             symbol.get("id").is_none(),
@@ -3667,7 +3666,7 @@ pub(crate) mod tests {
     }
 
     /// A YAML mapping entry answers `get_symbol` like any declaration: the
-    /// composed wire kind, empty facets, physical path, and a range over the
+    /// composed wire kind, empty kinds, physical path, and a range over the
     /// whole pair.
     #[test]
     fn get_symbol_finds_a_yaml_entry_beside_other_languages() -> TestResult {
@@ -3678,8 +3677,8 @@ pub(crate) mod tests {
         assert_eq!(symbol["language"], json!("yaml"));
         assert_eq!(symbol["kind"], json!("mapping_entry"));
         assert!(
-            symbol.get("facets").is_none(),
-            "no facets must omit the member"
+            symbol.get("kinds").is_none(),
+            "no kinds must omit the member"
         );
         assert!(
             symbol.get("id").is_none(),
@@ -4261,14 +4260,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn language_provider_routes_syntax_element_facets_through_the_registry() {
+    fn language_provider_routes_syntax_element_kinds_through_the_registry() {
         let rust = Language {
             name: "rust".to_owned(),
             dialect: None,
         };
         assert_eq!(
-            super::language_provider(&rust).syntax_element_facets("function_item"),
-            [NodeFacet::Declaration, NodeFacet::Definition]
+            super::language_provider(&rust).syntax_element_kinds("function_item"),
+            [SyntaxKind::Declaration, SyntaxKind::Definition]
         );
     }
 

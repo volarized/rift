@@ -16,7 +16,7 @@ use rift_syntax::{
     DocumentPlacement, SYNTAX_PROVIDER_ID, SyntaxDocument, SyntaxFacts, SyntaxPublicationBuilder,
 };
 
-use crate::relationship::RelationshipStore;
+use crate::edge::EdgeStore;
 use crate::static_resolution::{StaticOccurrence, StaticResolution, StaticSource};
 
 /// Publication bounds for a build that holds at most `declarations_max` declarations.
@@ -56,7 +56,7 @@ pub struct PlacedFacts<'a> {
 #[derive(Debug)]
 pub struct WorkspaceSemantics {
     graph: NormalizedGraph,
-    relationships: RelationshipStore,
+    edges: EdgeStore,
     syntax_provider: ProviderId,
     static_resolution: StaticResolution,
     static_occurrence_order: Vec<usize>,
@@ -93,15 +93,15 @@ impl PreparedSemantics {
     /// Returns a typed error when graph validation fails.
     pub fn build(
         self,
-        relationships_max: usize,
+        edges_max: usize,
         previous: Option<&NormalizedGraph>,
     ) -> Result<BuiltSemantics, RiftError> {
-        self.build_with_external(relationships_max, previous, None)
+        self.build_with_external(edges_max, previous, None)
     }
 
     fn build_with_external(
         self,
-        relationships_max: usize,
+        edges_max: usize,
         previous: Option<&NormalizedGraph>,
         external: Option<&ExternalTarget<'_>>,
     ) -> Result<BuiltSemantics, RiftError> {
@@ -124,11 +124,11 @@ impl PreparedSemantics {
                 previous,
             )?,
         };
-        let relationships = RelationshipStore::build_capped(&graph, relationships_max);
+        let edges = EdgeStore::build_capped(&graph, edges_max);
         Ok(BuiltSemantics {
             semantics: WorkspaceSemantics {
                 graph,
-                relationships,
+                edges,
                 syntax_provider: ProviderId::new(SYNTAX_PROVIDER_ID)?,
                 static_resolution: StaticResolution::default(),
                 static_occurrence_order: Vec::new(),
@@ -244,28 +244,28 @@ impl WorkspaceSemantics {
         revision: u64,
         previous: Option<&NormalizedGraph>,
     ) -> Result<BuiltSemantics, RiftError> {
-        Self::build_project_facts_with_relationships(
+        Self::build_project_facts_with_edges(
             documents,
             declarations_max,
-            crate::RELATIONSHIP_EDGES_MAX,
+            crate::EDGES_MAX,
             revision,
             previous,
         )
     }
 
-    /// Builds project semantics under caller-selected declaration and relationship bounds.
+    /// Builds project semantics under caller-selected declaration and edge bounds.
     ///
     /// # Errors
     /// Returns a typed error when source placement, publication, or graph validation fails.
-    pub fn build_project_facts_with_relationships<'a>(
+    pub fn build_project_facts_with_edges<'a>(
         documents: impl IntoIterator<Item = (&'a SyntaxFacts, &'a ProjectPath)>,
         declarations_max: usize,
-        relationships_max: usize,
+        edges_max: usize,
         revision: u64,
         previous: Option<&NormalizedGraph>,
     ) -> Result<BuiltSemantics, RiftError> {
         Self::prepare_project_facts(documents, declarations_max, revision)?
-            .build(relationships_max, previous)
+            .build(edges_max, previous)
     }
 
     /// Admits project declarations before graph construction.
@@ -301,30 +301,30 @@ impl WorkspaceSemantics {
         revision: u64,
         previous: Option<&NormalizedGraph>,
     ) -> Result<BuiltSemantics, RiftError> {
-        Self::build_facts_placed_with_relationships(
+        Self::build_facts_placed_with_edges(
             documents,
             declarations_max,
-            crate::RELATIONSHIP_EDGES_MAX,
+            crate::EDGES_MAX,
             revision,
             previous,
         )
     }
 
-    /// Builds placed facts under caller-selected declaration and relationship bounds.
+    /// Builds placed facts under caller-selected declaration and edge bounds.
     ///
     /// # Errors
     /// Returns a typed error when publication or graph validation fails.
-    pub fn build_facts_placed_with_relationships(
+    pub fn build_facts_placed_with_edges(
         documents: &[PlacedFacts<'_>],
         declarations_max: usize,
-        relationships_max: usize,
+        edges_max: usize,
         revision: u64,
         previous: Option<&NormalizedGraph>,
     ) -> Result<BuiltSemantics, RiftError> {
         Self::build_facts_placed_inner(
             documents,
             declarations_max,
-            relationships_max,
+            edges_max,
             revision,
             previous,
             false,
@@ -335,14 +335,14 @@ impl WorkspaceSemantics {
     pub(crate) fn build_facts_placed_with_external(
         documents: &[PlacedFacts<'_>],
         declarations_max: usize,
-        relationships_max: usize,
+        edges_max: usize,
         revision: u64,
         external: &dyn Fn(&rift_core::ContributionReference) -> Option<rift_core::SymbolId>,
     ) -> Result<BuiltSemantics, RiftError> {
         Self::build_facts_placed_inner(
             documents,
             declarations_max,
-            relationships_max,
+            edges_max,
             revision,
             None,
             false,
@@ -353,7 +353,7 @@ impl WorkspaceSemantics {
     fn build_facts_placed_inner(
         documents: &[PlacedFacts<'_>],
         declarations_max: usize,
-        relationships_max: usize,
+        edges_max: usize,
         revision: u64,
         previous: Option<&NormalizedGraph>,
         collect_refused_contributions: bool,
@@ -365,7 +365,7 @@ impl WorkspaceSemantics {
             revision,
             collect_refused_contributions,
         )?
-        .build_with_external(relationships_max, previous, external)
+        .build_with_external(edges_max, previous, external)
     }
 
     fn prepare_facts_placed(
@@ -450,20 +450,20 @@ impl WorkspaceSemantics {
 
     /// Returns the symbol reference adjacency built from this revision's graph.
     #[must_use]
-    pub const fn relationships(&self) -> &RelationshipStore {
-        &self.relationships
+    pub const fn edges(&self) -> &EdgeStore {
+        &self.edges
     }
 
     pub(crate) fn add_static_resolution(
         &mut self,
         sources: &[StaticSource<'_>],
         input: &crate::NamespaceInput<'_>,
-        relationships_max: usize,
+        edges_max: usize,
     ) {
-        let work_max = relationships_max.saturating_mul(16);
+        let work_max = edges_max.saturating_mul(16);
         let resolution = crate::static_resolution::resolve(&self.graph, sources, input, work_max);
-        self.relationships
-            .add_static(&self.graph, &resolution.occurrences, relationships_max);
+        self.edges
+            .add_static(&self.graph, &resolution.occurrences, edges_max);
         self.static_occurrence_order = (0..resolution.occurrences.len()).collect();
         self.static_occurrence_order.sort_unstable_by_key(|index| {
             (
@@ -522,12 +522,12 @@ impl WorkspaceSemantics {
     pub(crate) fn from_graph(
         graph: NormalizedGraph,
         syntax_provider: ProviderId,
-        relationships_max: usize,
+        edges_max: usize,
     ) -> Self {
-        let relationships = RelationshipStore::build_capped(&graph, relationships_max);
+        let edges = EdgeStore::build_capped(&graph, edges_max);
         Self {
             graph,
-            relationships,
+            edges,
             syntax_provider,
             static_resolution: StaticResolution::default(),
             static_occurrence_order: Vec::new(),
@@ -591,8 +591,7 @@ impl get_size2::GetSize for WorkspaceSemantics {
         let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.graph, tracker);
         bytes = bytes.saturating_add(field);
         tracker = next;
-        let (field, next) =
-            get_size2::GetSize::get_heap_size_with_tracker(&self.relationships, tracker);
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.edges, tracker);
         bytes = bytes.saturating_add(field);
         tracker = next;
         let (field, next) =

@@ -1775,14 +1775,14 @@ pub fn get_symbol_hit_addresses_one_location(schema: &mut Schema) {
     append(schema, one_of(vec![requires(&[path]), requires(&[unit])]));
 }
 
-/// A [`SyntaxElement`](crate::read::SyntaxElement) states `default: []` on `facets` and `regions`, and
+/// A [`SyntaxElement`](crate::read::SyntaxElement) states `default: []` on `kinds` and `regions`, and
 /// `default: {}` on `extensions`.
 pub fn declare_syntax_element_empty_defaults(schema: &mut Schema) {
     use crate::read::SyntaxElement;
     declare_empty_array_defaults(
         schema,
         &[
-            property!(SyntaxElement, facets),
+            property!(SyntaxElement, kinds),
             property!(SyntaxElement, regions),
         ],
     );
@@ -1796,7 +1796,7 @@ pub fn declare_symbol_empty_defaults(schema: &mut Schema) {
     declare_empty_array_defaults(
         schema,
         &[
-            property!(Symbol, facets),
+            property!(Symbol, kinds),
             property!(Symbol, modifiers),
             property!(Symbol, types),
             property!(Symbol, signatures),
@@ -1849,11 +1849,11 @@ pub fn declare_parameter_empty_defaults(schema: &mut Schema) {
     declare_empty_object_defaults(schema, &[property!(Parameter, extensions)]);
 }
 
-/// A [`Relationship`](crate::read::Relationship) states `default: {}` on `extensions`.
-/// `facets` carries its own `minItems: 1` and is never optional, so it states no default.
-pub fn declare_relationship_empty_defaults(schema: &mut Schema) {
-    use crate::read::Relationship;
-    declare_empty_object_defaults(schema, &[property!(Relationship, extensions)]);
+/// An [`Edge`](crate::read::Edge) states `default: {}` on `extensions`.
+/// `kinds` carries its own `minItems: 1` and is never optional, so it states no default.
+pub fn declare_edge_empty_defaults(schema: &mut Schema) {
+    use crate::read::Edge;
+    declare_empty_object_defaults(schema, &[property!(Edge, extensions)]);
 }
 
 /// A [`TypeExpression`](crate::read::TypeExpression) states `default: {}` on `extensions`.
@@ -1950,7 +1950,7 @@ pub fn declare_workspace_map_empty_defaults(schema: &mut Schema) {
             property!(WorkspaceMap, hubs),
             property!(WorkspaceMap, entry_points),
             property!(WorkspaceMap, docs),
-            property!(WorkspaceMap, module_relationships),
+            property!(WorkspaceMap, module_edges),
             property!(WorkspaceMap, packages),
             property!(WorkspaceMap, recommendations),
         ],
@@ -2836,7 +2836,7 @@ mod tests {
                 "SyntaxElement",
                 serde_json::to_value(schema_for!(crate::read::SyntaxElement)).expect("schema"),
                 vec![
-                    ("facets", array.clone()),
+                    ("kinds", array.clone()),
                     ("regions", array.clone()),
                     ("extensions", object.clone()),
                 ],
@@ -2845,7 +2845,7 @@ mod tests {
                 "Symbol",
                 serde_json::to_value(schema_for!(crate::read::Symbol)).expect("schema"),
                 vec![
-                    ("facets", array.clone()),
+                    ("kinds", array.clone()),
                     ("modifiers", array.clone()),
                     ("types", array.clone()),
                     ("signatures", array.clone()),
@@ -2877,8 +2877,8 @@ mod tests {
                 vec![("types", array.clone()), ("extensions", object.clone())],
             ),
             (
-                "Relationship",
-                serde_json::to_value(schema_for!(crate::read::Relationship)).expect("schema"),
+                "Edge",
+                serde_json::to_value(schema_for!(crate::read::Edge)).expect("schema"),
                 vec![("extensions", object.clone())],
             ),
             (
@@ -3038,9 +3038,9 @@ mod tests {
     #[test]
     fn min_length_one_collections_state_no_default_and_stay_required() {
         let cases = [(
-            "Relationship",
-            serde_json::to_value(schema_for!(crate::read::Relationship)).expect("schema"),
-            "facets",
+            "Edge",
+            serde_json::to_value(schema_for!(crate::read::Edge)).expect("schema"),
+            "kinds",
         )];
         for (model, schema, name) in cases {
             assert_eq!(

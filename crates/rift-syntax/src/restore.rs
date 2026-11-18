@@ -457,7 +457,7 @@ fn validate_symbol(
             return Err(errors::syntax::facts_range_invalid().error());
         }
     }
-    count(symbol.facets.len(), limits)?;
+    count(symbol.kinds.len(), limits)?;
     count(symbol.documentation_ranges.len(), limits)?;
     count(symbol.signatures.len(), limits)?;
     count(symbol.documentation.len(), limits)?;

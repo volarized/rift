@@ -30,13 +30,13 @@ pub use name::is_canonical_ascii_name;
 pub use path::{PathKind, PathViolation, ProjectPath, SourcePath};
 pub use semantic::{
     CONTRIBUTION_EVIDENCE_MAX, CONTRIBUTION_FACTS_MAX, CONTRIBUTION_NAMESPACE_BYTES_MAX,
-    CONTRIBUTION_NAMESPACES_MAX, Contribution, ContributionBuilder, ContributionKey,
-    ContributionOrigin, ContributionReference, ContributionRelationship, ContributionViolation,
-    DeclarationBinding, Documentation, DocumentationFormat, EquivalenceEvidence, ExactKind,
-    ExtensionKey, ExtensionValue, Extensions, Language, PROVIDER_SYMBOL_ID_BYTES_MAX,
-    PackageIdentity, PortableSymbolFacts, ReferenceRole, RelationshipKind, SemanticReference,
-    Signature, SourceApplicability, SourceKind, SourceLocation, SourceRange, SymbolFacet,
-    SymbolRecord, SymbolResolution, TypeBinding, fact_indices, is_portable_name,
+    CONTRIBUTION_NAMESPACES_MAX, Contribution, ContributionBuilder, ContributionEdge,
+    ContributionKey, ContributionOrigin, ContributionReference, ContributionViolation,
+    DeclarationBinding, Documentation, DocumentationFormat, EdgeKind, EquivalenceEvidence,
+    ExactKind, ExtensionKey, ExtensionValue, Extensions, Language, PROVIDER_SYMBOL_ID_BYTES_MAX,
+    PackageIdentity, PortableSymbolFacts, ReferenceRole, SemanticReference, Signature,
+    SourceApplicability, SourceKind, SourceLocation, SourceRange, SymbolKind, SymbolRecord,
+    SymbolResolution, TypeBinding, fact_indices, is_portable_name,
 };
 
 /// Iterates while charging one unit to a loop budget before each body execution.

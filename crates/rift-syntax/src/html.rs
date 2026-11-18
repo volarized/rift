@@ -3,7 +3,7 @@
 use crate::extract::{self, Declaration, GrammarRules, Visited};
 use crate::{ShippedLanguage, SyntaxDocument, SyntaxLimits, SyntaxProvider, SyntaxSource};
 use rift_error::RiftError;
-use rift_protocol::read::{Language, NodeFacet};
+use rift_protocol::read::{Language, SyntaxKind};
 use std::sync::OnceLock;
 use tree_sitter::{Language as Grammar, Node};
 
@@ -34,14 +34,14 @@ impl SyntaxProvider for HtmlSyntaxProvider {
         let document = analyze_base(source, limits, &self.language)?;
         crate::embedded::append(source, limits, &document)
     }
-    fn syntax_element_facets(&self, kind: &str) -> Vec<NodeFacet> {
+    fn syntax_element_kinds(&self, kind: &str) -> Vec<SyntaxKind> {
         match kind {
             "element" | "script_element" | "style_element" | "attribute" => {
-                vec![NodeFacet::Declaration]
+                vec![SyntaxKind::Declaration]
             }
-            "comment" => vec![NodeFacet::Comment],
-            "attribute_value" | "text" => vec![NodeFacet::Literal],
-            "tag_name" | "attribute_name" => vec![NodeFacet::Identifier],
+            "comment" => vec![SyntaxKind::Comment],
+            "attribute_value" | "text" => vec![SyntaxKind::Literal],
+            "tag_name" | "attribute_name" => vec![SyntaxKind::Identifier],
             _ => Vec::new(),
         }
     }
@@ -117,7 +117,7 @@ impl GrammarRules for HtmlRules {
         Ok(Some(Declaration {
             name: name.to_owned(),
             kind,
-            facets: Vec::new(),
+            kinds: Vec::new(),
             visibility: None,
             body_range: None,
             documentation: Vec::new(),

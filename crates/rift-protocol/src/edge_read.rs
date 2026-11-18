@@ -1,31 +1,31 @@
 //! Complete adjacency acquired through the existing global search operation.
 
 use crate::read::{
-    PackageIdentity, Relationship, RelationshipFacet, RuntimeIdentity, SourceUnitId,
-    SourceUnitSpan, Symbol, SymbolId, TraversalDirection,
+    Edge, EdgeKind, PackageIdentity, RuntimeIdentity, SourceUnitId, SourceUnitSpan, Symbol,
+    SymbolId, TraversalDirection,
 };
 use crate::symbol_read::{CapturedView, CapturedViewId, SymbolDeclaration};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Default canonical subjects in one raw adjacency batch, before accepted policy applies.
-pub const RELATIONSHIP_SEEDS_MAX: usize = 64;
-/// Capability advertised for the raw relationship branch of `/v1/search`.
-pub const RELATIONSHIPS_FEATURE: &str = "relationships";
+pub const EDGE_SEEDS_MAX: usize = 64;
+/// Capability advertised for the raw edge branch of `/v1/search`.
+pub const EDGES_FEATURE: &str = "edges";
 
-/// Positive count bounds for one raw relationship operation.
+/// Positive count bounds for one raw edge operation.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct RelationshipBounds {
+pub struct EdgeBounds {
     /// Most subjects in one request.
     #[schemars(range(min = 1))]
     pub max_seeds: u64,
-    /// Most selected facets in one request.
+    /// Most selected kinds in one request.
     #[schemars(range(min = 1))]
-    pub max_facets: u64,
-    /// Most relationship projections in one group.
+    pub max_kinds: u64,
+    /// Most edge projections in one group.
     #[schemars(range(min = 1))]
-    pub max_relationships: u64,
+    pub max_edges: u64,
     /// Most occurrence projections in one group.
     #[schemars(range(min = 1))]
     pub max_occurrences: u64,
@@ -37,40 +37,45 @@ pub struct RelationshipBounds {
     pub max_sources: u64,
 }
 
-/// One relationship operation the reader establishes from its existing collected facts.
+/// One edge operation the reader establishes from its existing collected facts.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct RelationshipCapability {
+pub struct EdgeCapability {
     /// Supported direction relative to each selected subject.
     pub direction: TraversalDirection,
-    /// Facets whose complete selected-domain reads the reader supports.
+    /// Kinds whose complete selected-domain reads the reader supports.
     #[schemars(length(min = 1))]
     #[schemars(extend("uniqueItems" = true))]
-    pub facets: Vec<RelationshipFacet>,
+    pub kinds: Vec<EdgeKind>,
     /// Accepted count bounds for this operation. Absence does not establish raw read support.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bounds: Option<RelationshipBounds>,
+    pub bounds: Option<EdgeBounds>,
 }
 
 /// Opaque identity of one original record within its selected publication.
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
-pub struct RelationshipRecordId(pub(crate) crate::identity::SourceDigest);
+pub struct EdgeRecordId(pub(crate) crate::identity::SourceDigest);
 
-impl JsonSchema for RelationshipRecordId {
+impl JsonSchema for EdgeRecordId {
     fn schema_name() -> std::borrow::Cow<'static, str> {
-        "RelationshipRecordId".into()
+        "EdgeRecordId".into()
     }
 
     fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         let mut schema = crate::identity::SourceDigest::json_schema(generator);
-        schema.insert("description".to_owned(),serde_json::Value::String(
-            "Opaque full identity of one original relationship record within its selected publication.".to_owned()));
+        schema.insert(
+            "description".to_owned(),
+            serde_json::Value::String(
+                "Opaque full identity of one original edge record within its selected publication."
+                    .to_owned(),
+            ),
+        );
         schema
     }
 }
 
-impl RelationshipRecordId {
+impl EdgeRecordId {
     /// Validates the complete digest form without exposing the provider's storage key.
     ///
     /// # Errors
@@ -86,25 +91,25 @@ impl RelationshipRecordId {
     }
 }
 
-/// One original relationship record, independent of equal endpoint or evidence payloads.
+/// One original edge record, independent of equal endpoint or evidence payloads.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct RelationshipRecord {
+pub struct EdgeRecord {
     /// Opaque full identity scoped to the selected publication.
-    pub id: RelationshipRecordId,
-    /// Existing domain relationship, including evidence and physical occurrence.
-    pub relationship: Relationship,
+    pub id: EdgeRecordId,
+    /// Existing domain edge, including evidence and physical occurrence.
+    pub edge: Edge,
 }
 
 /// One physical usage projected from an original selected-publication record.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct RelationshipOccurrence {
+pub struct EdgeOccurrence {
     /// Complete original record identity. Projections of the same record share this value.
-    pub id: RelationshipRecordId,
-    /// Related original relationship, only when the stored record establishes that link.
+    pub id: EdgeRecordId,
+    /// Related original edge, only when the stored record establishes that link.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub relationship: Option<RelationshipRecordId>,
+    pub edge: Option<EdgeRecordId>,
     /// Physical usage. Equal locations do not establish equal original record identities.
     pub occurrence: QueryOccurrence,
 }
@@ -112,28 +117,28 @@ pub struct RelationshipOccurrence {
 /// One incoming or outgoing adjacency selection, without ranking or path projection.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct RelationshipSelection {
+pub struct EdgeSelection {
     /// Established subjects whose complete adjacency is required.
     #[schemars(length(min = 1))]
     pub seeds: Vec<SymbolId>,
     /// Direction relative to each selected subject.
     pub direction: TraversalDirection,
-    /// Portable relationship facets. Empty selects every available facet.
+    /// Portable edge kinds. Empty selects every available kind.
     #[schemars(extend("uniqueItems" = true))]
-    pub facets: Vec<RelationshipFacet>,
+    pub kinds: Vec<EdgeKind>,
 }
 
-/// The optional projections of records in a relationship page. An omitted member is `false`.
+/// The optional projections of records in an edge page. An omitted member is `false`.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(example = serde_json::json!({"source": true}))]
-pub struct RelationshipInclude {
+pub struct EdgeInclude {
     /// Attaches the exact UTF-8 bytes of the selected source units.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub source: bool,
 }
 
-impl RelationshipInclude {
+impl EdgeInclude {
     /// Whether the caller requested no projection.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
@@ -152,8 +157,8 @@ pub struct QueryOccurrence {
     pub enclosing: Option<SymbolId>,
     /// The exact source unit and UTF-8 byte range of the occurrence.
     pub source: SourceUnitSpan,
-    /// The relationship established by this occurrence.
-    pub facet: RelationshipFacet,
+    /// The edge established by this occurrence.
+    pub kind: EdgeKind,
 }
 
 /// A symbol together with the physical declarations selected for this read.
@@ -179,13 +184,13 @@ pub struct QuerySource {
     pub text: Option<String>,
 }
 
-/// The exclusive raw relationship request on the existing search endpoint.
+/// The exclusive raw edge request on the existing search endpoint.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(extend("anyOf" = [{"required": ["packages"]}, {"required": ["runtimes"]}, {"required": ["view"]}]))]
-pub struct RelationshipSearchRequest {
-    /// Subjects, direction and facets selected for this adjacency batch.
-    pub relationships: RelationshipSelection,
+pub struct EdgeSearchRequest {
+    /// Subjects, direction and kinds selected for this adjacency batch.
+    pub edges: EdgeSelection,
     /// Exact eligible package domain. Required unless `view` retains that domain.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(min = 1, max = 20000))]
@@ -195,38 +200,38 @@ pub struct RelationshipSearchRequest {
     #[schemars(length(min = 1, max = 20000))]
     pub runtimes: Vec<RuntimeIdentity>,
     /// Requested exact projections; source bytes use the same selected publication.
-    #[serde(default, skip_serializing_if = "RelationshipInclude::is_empty")]
-    pub include: RelationshipInclude,
+    #[serde(default, skip_serializing_if = "EdgeInclude::is_empty")]
+    pub include: EdgeInclude,
     /// Original serving context. Continuation never selects latest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<CapturedViewId>,
 }
 
-/// Original relationship records for one requested subject on this page.
+/// Original edge records for one requested subject on this page.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct RelationshipGroup {
+pub struct EdgeGroup {
     /// Requested canonical subject, including when its adjacency is empty.
     pub seed: SymbolId,
     /// Original records, preserving parallel edges, evidence and occurrences.
-    pub relationships: Vec<RelationshipRecord>,
+    pub edges: Vec<EdgeRecord>,
     /// Physical usages, including recursive and file-level locations without a caller symbol.
-    /// Page limits count distinct original record identities across relationships and usages.
+    /// Page limits count distinct original record identities across edges and usages.
     /// Multiple projections of one original record consume one slot; independent records
     /// consume separate slots even when their payloads or locations are equal.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub occurrences: Vec<RelationshipOccurrence>,
+    pub occurrences: Vec<EdgeOccurrence>,
     /// Provider exhausted this subject's adjacency under the selected exact domain.
     pub complete: bool,
 }
 
-/// One raw relationship page from an immutable selected publication.
+/// One raw edge page from an immutable selected publication.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct RelationshipSearchPage {
+pub struct EdgeSearchPage {
     /// One authoritative group for every requested subject, in request order.
     #[schemars(length(min = 1))]
-    pub groups: Vec<RelationshipGroup>,
+    pub groups: Vec<EdgeGroup>,
     /// Exact symbols reached by this page. Identical captured records may repeat across pages;
     /// conflicting records are refused.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -255,9 +260,9 @@ pub struct RelationshipSearchPage {
 /// facts use the typed unavailable outcome, including `insufficient_coverage`.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(untagged)]
-pub enum RelationshipSearchResult {
+pub enum EdgeSearchResult {
     /// Complete required domain was selected; all requested subjects are answered within the accepted bounds.
-    Page(RelationshipSearchPage),
-    /// Required relationship facts cannot be established.
+    Page(EdgeSearchPage),
+    /// Required edge facts cannot be established.
     Unavailable(crate::search_read::SearchUnavailable),
 }

@@ -1,4 +1,4 @@
-//! Text of the hits a relationship walk reached, written as a tree.
+//! Text of the hits an edge walk reached, written as a tree.
 //!
 //! Each indent level is one tab, shown here as two spaces.
 //!
@@ -23,22 +23,22 @@
 //! ```
 //!
 //! The root is the symbol the walk starts from. Each hop of a `traversal_path` is one level: the
-//! symbol starts with `↳` and the relationship read from the symbol above it, then names the symbol
+//! symbol starts with `↳` and the edge read from the symbol above it, then names the symbol
 //! the hop reached. A symbol that is a hit of the answer writes the lines of that hit: the
 //! declaration, the line that starts with its location behind `in`, and the symbol identity
 //! behind `at`. Any other symbol writes its symbol identity behind `at`. The root starts with its
 //! declaration, or with its identity when it is no hit. A blank line precedes every symbol except
 //! the first entry of the section.
 //!
-//! An outgoing hop writes each facet of its relationship as it is spelled on the wire, with
-//! underscores as spaces (`calls`, `depends on`). An incoming hop writes the facet read from the
-//! other end (`called by`, `dependency of`). Several facets are joined by `, `, and a
-//! relationship whose derivation is `heuristic` starts with `probably`. A relationship an external
+//! An outgoing hop writes each kind of its edge as it is spelled on the wire, with
+//! underscores as spaces (`calls`, `depends on`). An incoming hop writes the kind read from the
+//! other end (`called by`, `dependency of`). Several kinds are joined by `, `, and a
+//! edge whose derivation is `heuristic` starts with `probably`. An edge an external
 //! producer emitted ends with ` · ` and the producer's name and revision (`↳ called ·
-//! demo-indexer 0.6.1`). When every facet ends in `by`, the head line leaves that word out and the
+//! demo-indexer 0.6.1`). When every kind ends in `by`, the head line leaves that word out and the
 //! declaration line starts with it.
 
-use rift_protocol::read::{Relationship, RelationshipDerivation, RelationshipFacet, SymbolId};
+use rift_protocol::read::{Edge, EdgeDerivation, EdgeKind, SymbolId};
 use rift_protocol::search::{GraphHop, HopDirection, SearchHit};
 
 use super::facts::spaced_name;
@@ -48,20 +48,20 @@ use crate::output::text::{TextError, TextWriter};
 
 /// Mark that starts a symbol under the root.
 const BRANCH: &str = "↳";
-/// Word written before the declaration of a symbol whose relationship ends in it.
+/// Word written before the declaration of a symbol whose edge ends in it.
 const BY: &str = "by";
-/// End of a relationship facet that moves to the declaration line.
+/// End of an edge kind that moves to the declaration line.
 const BY_ENDING: &str = " by";
 /// Word written before the location of a symbol.
 const PLACE: &str = "in";
 /// Word written before the symbol identity of a symbol.
 const IDENTITY: &str = "at";
-/// Word written before the relationship of a heuristic hop.
+/// Word written before the edge of a heuristic hop.
 const HEURISTIC: &str = "probably ";
-/// Separates a relationship from the external producer that emitted it.
+/// Separates an edge from the external producer that emitted it.
 const PRODUCER_SEPARATOR: &str = " · ";
-/// Text between two facets of one relationship.
-const FACET_SEPARATOR: &str = ", ";
+/// Text between two kinds of one edge.
+const KIND_SEPARATOR: &str = ", ";
 
 /// The words a symbol of a walk writes before the lines that name its symbol.
 #[derive(Clone, Copy)]
@@ -72,7 +72,7 @@ pub(super) enum Labels {
     /// follows `at`.
     Root,
     /// A symbol under the root: the location follows `in` and the identity follows `at`. The
-    /// declaration follows `by` when the relationship ends in that word.
+    /// declaration follows `by` when the edge ends in that word.
     Branch {
         /// Whether the declaration follows `by`.
         by: bool,
@@ -98,9 +98,9 @@ impl Labels {
 
 /// The head line of a symbol under the root.
 struct Lead {
-    /// The mark and the relationship: `↳ called`.
+    /// The mark and the edge: `↳ called`.
     text: String,
-    /// Whether the relationship ends in `by`, which the declaration line then starts with.
+    /// Whether the edge ends in `by`, which the declaration line then starts with.
     by: bool,
 }
 
@@ -120,7 +120,7 @@ struct WalkSymbol<'a> {
 
 /// The hits of a `search` answer, split into the trees of its walk and the hits outside it.
 pub(super) struct Walk<'a> {
-    /// Hits no relationship path reached, in answer order.
+    /// Hits no edge path reached, in answer order.
     outside: Vec<&'a SearchHit>,
     /// Every symbol of every tree.
     symbols: Vec<WalkSymbol<'a>>,
@@ -134,7 +134,7 @@ impl<'a> Walk<'a> {
     ///
     /// # Errors
     ///
-    /// Fails when a relationship facet has no unit wire name.
+    /// Fails when an edge kind has no unit wire name.
     pub(super) fn of(hits: &'a [SearchHit]) -> Result<Self, TextError> {
         let mut walk = Self {
             outside: Vec::new(),
@@ -282,45 +282,39 @@ impl<'a> Walk<'a> {
 
 /// The symbol a hop starts from and the symbol it reaches.
 ///
-/// An outgoing hop followed the relationship from its `from` to its `to`; an incoming hop went
+/// An outgoing hop followed the edge from its `from` to its `to`; an incoming hop went
 /// against it.
 fn ends_of(hop: &GraphHop) -> (&SymbolId, &SymbolId) {
-    let GraphHop {
-        relationship,
-        direction,
-    } = hop;
+    let GraphHop { edge, direction } = hop;
     match direction {
-        HopDirection::Outgoing => (&relationship.from, &relationship.to),
-        HopDirection::Incoming => (&relationship.to, &relationship.from),
+        HopDirection::Outgoing => (&edge.from, &edge.to),
+        HopDirection::Incoming => (&edge.to, &edge.from),
     }
 }
 
-/// The mark and the relationship of `hop`, read from the symbol above it: `↳ called`, with `by`
+/// The mark and the edge of `hop`, read from the symbol above it: `↳ called`, with `by`
 /// left to the declaration line.
 fn lead_of(hop: &GraphHop) -> Result<Lead, TextError> {
-    let GraphHop {
-        relationship,
-        direction,
-    } = hop;
-    let Relationship {
+    let GraphHop { edge, direction } = hop;
+    let Edge {
         from: _,
         kind: _,
-        facets,
+        kinds,
         to: _,
         occurrence: _,
         derivation,
         confidence: _,
         producer,
         extensions: _,
-    } = relationship;
-    let mut phrases = Vec::with_capacity(facets.len());
-    for facet in facets {
+    } = edge;
+    let mut phrases = Vec::with_capacity(kinds.len());
+    for kind in kinds {
         phrases.push(match direction {
-            HopDirection::Outgoing => spaced_name(facet)?,
-            HopDirection::Incoming => reversed(*facet).to_owned(),
+            HopDirection::Outgoing => spaced_name(kind)?,
+            HopDirection::Incoming => reversed(*kind).to_owned(),
         });
     }
-    let guess = if *derivation == RelationshipDerivation::Heuristic {
+    let guess = if *derivation == EdgeDerivation::Heuristic {
         HEURISTIC
     } else {
         ""
@@ -330,8 +324,8 @@ fn lead_of(hop: &GraphHop) -> Result<Lead, TextError> {
         .map(|phrase| phrase.strip_suffix(BY_ENDING))
         .collect();
     let (words, by) = match cut {
-        Some(cut) if !cut.is_empty() => (cut.join(FACET_SEPARATOR), true),
-        Some(_) | None => (phrases.join(FACET_SEPARATOR), false),
+        Some(cut) if !cut.is_empty() => (cut.join(KIND_SEPARATOR), true),
+        Some(_) | None => (phrases.join(KIND_SEPARATOR), false),
     };
     let produced = producer.as_ref().map_or_else(String::new, |producer| {
         format!(
@@ -347,37 +341,37 @@ fn lead_of(hop: &GraphHop) -> Result<Lead, TextError> {
     })
 }
 
-/// The relationship `facet` read from its target back to its source.
-fn reversed(facet: RelationshipFacet) -> &'static str {
-    match facet {
-        RelationshipFacet::Contains => "contained by",
-        RelationshipFacet::Declares => "declared by",
-        RelationshipFacet::Augments => "augmented by",
-        RelationshipFacet::References => "referenced by",
-        RelationshipFacet::Calls => "called by",
-        RelationshipFacet::Constructs => "constructed by",
-        RelationshipFacet::Reads => "read by",
-        RelationshipFacet::Writes => "written by",
-        RelationshipFacet::Imports => "imported by",
-        RelationshipFacet::Exports => "exported by",
-        RelationshipFacet::Extends => "extended by",
-        RelationshipFacet::Implements => "implemented by",
-        RelationshipFacet::HasType => "type of",
-        RelationshipFacet::Overrides => "overridden by",
-        RelationshipFacet::Aliases => "aliased by",
-        RelationshipFacet::Generates => "generated by",
-        RelationshipFacet::DependsOn => "dependency of",
-        RelationshipFacet::AnnotatedBy => "annotates",
-        RelationshipFacet::Throws => "thrown by",
-        RelationshipFacet::Catches => "caught by",
-        RelationshipFacet::BoundedBy => "bounds",
-        RelationshipFacet::Instantiates => "instantiated by",
-        RelationshipFacet::Specializes => "specialized by",
-        RelationshipFacet::Overloads => "overloaded by",
-        RelationshipFacet::MixesIn => "mixed in by",
-        RelationshipFacet::Embeds => "embedded by",
-        RelationshipFacet::Tests => "tested by",
-        RelationshipFacet::Configures => "configured by",
-        RelationshipFacet::Binds => "bound by",
+/// The edge `kind` read from its target back to its source.
+fn reversed(kind: EdgeKind) -> &'static str {
+    match kind {
+        EdgeKind::Contains => "contained by",
+        EdgeKind::Declares => "declared by",
+        EdgeKind::Augments => "augmented by",
+        EdgeKind::References => "referenced by",
+        EdgeKind::Calls => "called by",
+        EdgeKind::Constructs => "constructed by",
+        EdgeKind::Reads => "read by",
+        EdgeKind::Writes => "written by",
+        EdgeKind::Imports => "imported by",
+        EdgeKind::Exports => "exported by",
+        EdgeKind::Extends => "extended by",
+        EdgeKind::Implements => "implemented by",
+        EdgeKind::HasType => "type of",
+        EdgeKind::Overrides => "overridden by",
+        EdgeKind::Aliases => "aliased by",
+        EdgeKind::Generates => "generated by",
+        EdgeKind::DependsOn => "dependency of",
+        EdgeKind::AnnotatedBy => "annotates",
+        EdgeKind::Throws => "thrown by",
+        EdgeKind::Catches => "caught by",
+        EdgeKind::BoundedBy => "bounds",
+        EdgeKind::Instantiates => "instantiated by",
+        EdgeKind::Specializes => "specialized by",
+        EdgeKind::Overloads => "overloaded by",
+        EdgeKind::MixesIn => "mixed in by",
+        EdgeKind::Embeds => "embedded by",
+        EdgeKind::Tests => "tested by",
+        EdgeKind::Configures => "configured by",
+        EdgeKind::Binds => "bound by",
     }
 }

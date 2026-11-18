@@ -3,7 +3,7 @@
 use crate::extract::{self, Declaration, GrammarRules, Visited};
 use crate::{ShippedLanguage, SyntaxDocument, SyntaxLimits, SyntaxProvider, SyntaxSource};
 use rift_error::RiftError;
-use rift_protocol::read::{Language, NodeFacet, SymbolFacet};
+use rift_protocol::read::{Language, SymbolKind, SyntaxKind};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU16;
@@ -63,7 +63,7 @@ impl SyntaxProvider for NativeSyntaxProvider {
         };
         crate::parse::document(source, limits, &self.language, &grammar, &rules, &[])
     }
-    fn syntax_element_facets(&self, kind: &str) -> Vec<NodeFacet> {
+    fn syntax_element_kinds(&self, kind: &str) -> Vec<SyntaxKind> {
         match kind {
             "function_definition"
             | "class_definition"
@@ -72,9 +72,9 @@ impl SyntaxProvider for NativeSyntaxProvider {
             | "enum_specifier"
             | "declaration"
             | "cvar_def"
-            | "cvar_decl" => vec![NodeFacet::Declaration],
-            "preproc_include" | "include_statement" => vec![NodeFacet::Import],
-            "comment" => vec![NodeFacet::Comment],
+            | "cvar_decl" => vec![SyntaxKind::Declaration],
+            "preproc_include" | "include_statement" => vec![SyntaxKind::Import],
+            "comment" => vec![SyntaxKind::Comment],
             _ => Vec::new(),
         }
     }
@@ -449,10 +449,10 @@ impl GrammarRules for NativeRules {
         {
             kind = FUNCTION;
         }
-        let facets = match kind {
-            FUNCTION => vec![SymbolFacet::Value, SymbolFacet::Callable],
-            STRUCT | CLASS | ENUM | TYPE => vec![SymbolFacet::Type],
-            VARIABLE => vec![SymbolFacet::Value],
+        let kinds = match kind {
+            FUNCTION => vec![SymbolKind::Value, SymbolKind::Callable],
+            STRUCT | CLASS | ENUM | TYPE => vec![SymbolKind::Type],
+            VARIABLE => vec![SymbolKind::Value],
             _ => Vec::new(),
         };
         let body_range = self
@@ -464,7 +464,7 @@ impl GrammarRules for NativeRules {
         Ok(Some(Declaration {
             name: name.to_owned(),
             kind,
-            facets,
+            kinds,
             visibility: None,
             body_range,
             documentation: Vec::new(),

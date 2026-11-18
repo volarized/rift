@@ -39,10 +39,10 @@ impl PreparedProjectSemantics<'_> {
     /// Returns a typed error when graph validation fails.
     pub fn build(
         self,
-        relationships_max: usize,
+        edges_max: usize,
         previous: Option<&NormalizedGraph>,
     ) -> Result<BuiltSemantics, RiftError> {
-        let mut built = self.prepared.build(relationships_max, previous)?;
+        let mut built = self.prepared.build(edges_max, previous)?;
         built.semantics.outside_namespaces = self.outside_namespaces;
         if built.beyond_declaration_bound.is_empty() && built.refused_contributions.is_empty() {
             let sources = self
@@ -58,7 +58,7 @@ impl PreparedProjectSemantics<'_> {
                 .collect::<Vec<_>>();
             built
                 .semantics
-                .add_static_resolution(&sources, &self.input, relationships_max);
+                .add_static_resolution(&sources, &self.input, edges_max);
         }
         Ok(built)
     }
@@ -83,12 +83,12 @@ impl WorkspaceSemantics {
         input: NamespaceInput<'_>,
         documents: &[&IndexedFile],
         declarations_max: usize,
-        relationships_max: usize,
+        edges_max: usize,
         revision: u64,
         previous: Option<&NormalizedGraph>,
     ) -> Result<BuiltSemantics, RiftError> {
         Self::prepare_captured_project_facts(input, documents, declarations_max, revision)?
-            .build(relationships_max, previous)
+            .build(edges_max, previous)
     }
 
     /// Admits captured project declarations, including namespace aliases, before graph construction.

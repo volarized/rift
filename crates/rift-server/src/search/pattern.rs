@@ -81,7 +81,7 @@ pub(super) fn pattern_conflict(params: &SearchParams) -> Option<RiftError> {
         ),
         (
             params.traversal.is_some(),
-            "a walk answers relationships from one seed, and `pattern` answers text",
+            "a walk answers edges from one seed, and `pattern` answers text",
         ),
         (
             params.change.is_some(),

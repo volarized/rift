@@ -390,7 +390,7 @@ async fn global_handler(
     }
     if path.ends_with("/facets") {
         state.hold_read().await;
-        return symbol_facets(&body).map_or_else(
+        return symbol_kinds(&body).map_or_else(
             || problem_response(StatusCode::NOT_FOUND),
             |syntax_elements| {
                 state.response(numbered_result(
@@ -705,7 +705,7 @@ fn release_revision(id: &str) -> Value {
 /// The syntax elements of the collected declaration `request` names, as a symbol read of
 /// [`COLLECTED_SOURCE`] lists them: the item syntax element, then its visibility, name, parameters,
 /// and body, in the fixture's view when the request names one. `None` for any other symbol.
-fn symbol_facets(request: &Value) -> Option<Value> {
+fn symbol_kinds(request: &Value) -> Option<Value> {
     let id = request["symbol"].as_str()?;
     if id == named_identity(&NAMED_POSITIONS[0]) {
         return Some(runtime_facets(request));
@@ -734,7 +734,7 @@ fn symbol_facets(request: &Value) -> Option<Value> {
                 "source": source,
             });
             if index == 0 {
-                syntax_element["facets"] = json!(["declaration", "definition"]);
+                syntax_element["kinds"] = json!(["declaration", "definition"]);
             } else {
                 syntax_element["parent"] = json!(0);
             }
@@ -777,7 +777,7 @@ fn runtime_facets(request: &Value) -> Value {
         &[json!({
             "declaration": 0, "index": 0,
             "unit": named_unit(&NAMED_POSITIONS[0]), "language": "python",
-            "kind": "function_definition", "facets": ["declaration", "definition"],
+            "kind": "function_definition", "kinds": ["declaration", "definition"],
             "range": {"start": start, "end": end}, "source": source,
         })],
     );

@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rift_protocol::read::{Documentation, Language, Signature, SymbolFacet};
+use rift_protocol::read::{Documentation, Language, Signature, SymbolKind};
 use rift_syntax::{
     ByteRange, RustModulePath, SyntaxFacts, SyntaxFactsParts, SyntaxNames, SyntaxSymbol,
 };
@@ -53,7 +53,7 @@ struct CapturedSymbol {
     container: Option<String>,
     kind: String,
     syntax_element_kind: Option<String>,
-    facets: Vec<SymbolFacet>,
+    kinds: Vec<SymbolKind>,
     visibility: Option<String>,
     range: [u64; 2],
     item_range: [u64; 2],
@@ -84,7 +84,7 @@ impl CapturedSymbol {
             container: symbol.container.clone(),
             kind: symbol.kind.to_owned(),
             syntax_element_kind: symbol.syntax_element_kind.map(str::to_owned),
-            facets: symbol.facets.clone(),
+            kinds: symbol.kinds.clone(),
             visibility: symbol.visibility.clone(),
             range: captured_range(symbol.range),
             item_range: captured_range(symbol.item_range),
@@ -116,7 +116,7 @@ impl CapturedSymbol {
                     .syntax_element_kind(&kind)
                     .expect("recorded syntax element kind")
             }),
-            facets: self.facets,
+            kinds: self.kinds,
             visibility: self.visibility,
             range: restored_range(self.range),
             item_range: restored_range(self.item_range),

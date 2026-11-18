@@ -1241,12 +1241,11 @@ async fn outgoing_walks_over_scripted_engines_match_the_served_schemas() -> Test
     Ok(())
 }
 
-/// A global API with declaration lookups but missing relationship coverage returns
+/// A global API with declaration lookups but missing edge coverage returns
 /// typed unavailability in the advertised search result schema.
 #[cfg(unix)]
 #[tokio::test]
-async fn a_package_walk_with_missing_relationship_coverage_matches_the_served_schema() -> TestResult
-{
+async fn a_package_walk_with_missing_edge_coverage_matches_the_served_schema() -> TestResult {
     let global = GlobalFixture::start_with(global_api::FixtureOptions {
         python_collection: true,
         ..global_api::FixtureOptions::default()

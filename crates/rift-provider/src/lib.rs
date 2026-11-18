@@ -20,8 +20,8 @@ pub use composition::{
     PerKeyCache, ProviderComposition, StageDescriptor, StagePath, join_keyed,
 };
 pub use normalization::{
-    AssociationCandidate, AssociationState, NormalizedGraph, NormalizedReference,
-    NormalizedRelationship, NormalizedTarget, Normalizer, Scope,
+    AssociationCandidate, AssociationState, NormalizedEdge, NormalizedGraph, NormalizedReference,
+    NormalizedTarget, Normalizer, Scope,
 };
 pub use publication::{
     CONTRIBUTIONS_PER_PROVIDER_MAX_DEFAULT, CONTRIBUTIONS_TOTAL_MAX_DEFAULT, PROVIDERS_MAX_DEFAULT,

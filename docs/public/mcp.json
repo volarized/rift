@@ -245,6 +245,156 @@
             "pattern": "^(?:0|[1-9][0-9]*)(?:ms|s|m|h|d)$",
             "type": "string"
           },
+          "EdgeKind": {
+            "description": "One portable category an edge falls into. The local kinds `import` and `use` can share\nthe `imports` kind, which lets one query cross languages.",
+            "oneOf": [
+              {
+                "const": "contains",
+                "description": "The source contains the target within its scope.",
+                "type": "string"
+              },
+              {
+                "const": "declares",
+                "description": "The source declares the target.",
+                "type": "string"
+              },
+              {
+                "const": "augments",
+                "description": "The source adds to a declaration made elsewhere.",
+                "type": "string"
+              },
+              {
+                "const": "references",
+                "description": "The source mentions the target.",
+                "type": "string"
+              },
+              {
+                "const": "calls",
+                "description": "The source invokes the target.",
+                "type": "string"
+              },
+              {
+                "const": "constructs",
+                "description": "The source creates an instance of the target.",
+                "type": "string"
+              },
+              {
+                "const": "reads",
+                "description": "The source reads the target's value.",
+                "type": "string"
+              },
+              {
+                "const": "writes",
+                "description": "The source assigns to the target.",
+                "type": "string"
+              },
+              {
+                "const": "imports",
+                "description": "The source brings the target into scope.",
+                "type": "string"
+              },
+              {
+                "const": "exports",
+                "description": "The source exposes the target outside its unit.",
+                "type": "string"
+              },
+              {
+                "const": "extends",
+                "description": "The source inherits from the target.",
+                "type": "string"
+              },
+              {
+                "const": "implements",
+                "description": "The source fulfils the target's interface.",
+                "type": "string"
+              },
+              {
+                "const": "has_type",
+                "description": "The source is typed by the target.",
+                "type": "string"
+              },
+              {
+                "const": "overrides",
+                "description": "The source replaces the target inherited from a supertype.",
+                "type": "string"
+              },
+              {
+                "const": "aliases",
+                "description": "The source is another name for the target.",
+                "type": "string"
+              },
+              {
+                "const": "generates",
+                "description": "The source produces the target as generated code.",
+                "type": "string"
+              },
+              {
+                "const": "depends_on",
+                "description": "The source requires the target to build or run.",
+                "type": "string"
+              },
+              {
+                "const": "annotated_by",
+                "description": "The source carries the target as an annotation.",
+                "type": "string"
+              },
+              {
+                "const": "throws",
+                "description": "The source can raise the target.",
+                "type": "string"
+              },
+              {
+                "const": "catches",
+                "description": "The source handles the target when raised.",
+                "type": "string"
+              },
+              {
+                "const": "bounded_by",
+                "description": "The source's type parameter is constrained by the target.",
+                "type": "string"
+              },
+              {
+                "const": "instantiates",
+                "description": "The source applies concrete arguments to the generic target.",
+                "type": "string"
+              },
+              {
+                "const": "specializes",
+                "description": "The source is a specialization of the generic target.",
+                "type": "string"
+              },
+              {
+                "const": "overloads",
+                "description": "The source and target are separately dispatched forms of one name.",
+                "type": "string"
+              },
+              {
+                "const": "mixes_in",
+                "description": "The source incorporates the target as a mixin.",
+                "type": "string"
+              },
+              {
+                "const": "embeds",
+                "description": "The source embeds the target within its own definition.",
+                "type": "string"
+              },
+              {
+                "const": "tests",
+                "description": "The source exercises the target as a test.",
+                "type": "string"
+              },
+              {
+                "const": "configures",
+                "description": "The source supplies configuration for the target.",
+                "type": "string"
+              },
+              {
+                "const": "binds",
+                "description": "The source binds a name or value to the target.",
+                "type": "string"
+              }
+            ]
+          },
           "ExactKind": {
             "description": "A provider-local kind preserving the construct name used by that language implementation.",
             "pattern": "^[A-Za-z][A-Za-z0-9._-]*$",
@@ -282,7 +432,7 @@
           },
           "FacetDeclaration": {
             "additionalProperties": false,
-            "description": "One facet: a declaration with its location, source, and syntax structure.",
+            "description": "One kind: a declaration with its location, source, and syntax structure.",
             "properties": {
               "declaration": {
                 "description": "Declaration ordinal in the symbol, from zero.",
@@ -448,101 +598,6 @@
             "maxLength": 129,
             "pattern": "^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$",
             "type": "string"
-          },
-          "NodeFacet": {
-            "description": "Portable structural facets, so a filter can ask for bodies or imports without knowing the\ngrammar that produced them.",
-            "oneOf": [
-              {
-                "const": "declaration",
-                "description": "Introduces a name.",
-                "type": "string"
-              },
-              {
-                "const": "definition",
-                "description": "Supplies the implementation behind a declared name.",
-                "type": "string"
-              },
-              {
-                "const": "body",
-                "description": "The implementation part of a declaration.",
-                "type": "string"
-              },
-              {
-                "const": "block",
-                "description": "A delimited group of statements.",
-                "type": "string"
-              },
-              {
-                "const": "statement",
-                "description": "One executable step.",
-                "type": "string"
-              },
-              {
-                "const": "expression",
-                "description": "Computes a value.",
-                "type": "string"
-              },
-              {
-                "const": "type_expression",
-                "description": "Spells a type.",
-                "type": "string"
-              },
-              {
-                "const": "import",
-                "description": "Brings an external name into scope.",
-                "type": "string"
-              },
-              {
-                "const": "export",
-                "description": "Exposes a name outside its unit.",
-                "type": "string"
-              },
-              {
-                "const": "parameter",
-                "description": "A declared input of a callable.",
-                "type": "string"
-              },
-              {
-                "const": "argument",
-                "description": "A value passed at a call site.",
-                "type": "string"
-              },
-              {
-                "const": "annotation",
-                "description": "A decorator or attribute qualifying a construct.",
-                "type": "string"
-              },
-              {
-                "const": "comment",
-                "description": "Commentary the language ignores.",
-                "type": "string"
-              },
-              {
-                "const": "identifier",
-                "description": "A name as written in the source.",
-                "type": "string"
-              },
-              {
-                "const": "literal",
-                "description": "A value written out directly.",
-                "type": "string"
-              },
-              {
-                "const": "pattern",
-                "description": "A destructuring or match pattern.",
-                "type": "string"
-              },
-              {
-                "const": "generated",
-                "description": "Produced by a tool rather than authored.",
-                "type": "string"
-              },
-              {
-                "const": "test",
-                "description": "Belongs to test code.",
-                "type": "string"
-              }
-            ]
           },
           "NotebookCell": {
             "additionalProperties": false,
@@ -1448,7 +1503,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "A traversal walk stopped at its symbol bound before exhausting the reachable graph,\nso hits reachable beyond the bound are missing from this answer. Narrow the walk -\na tighter `facets` list, a smaller `depth`, or a less-connected seed - to fit it\nunder the bound.",
+                "description": "A traversal walk stopped at its symbol bound before exhausting the reachable graph,\nso hits reachable beyond the bound are missing from this answer. Narrow the walk -\na tighter `kinds` list, a smaller `depth`, or a less-connected seed - to fit it\nunder the bound.",
                 "properties": {
                   "code": {
                     "const": "traversal_truncated",
@@ -1475,10 +1530,10 @@
               },
               {
                 "additionalProperties": false,
-                "description": "No lane populates part of the relationship coverage the traversal asked for, so the\nwalk had nothing to follow there whatever the graph holds. The warning states that a\nlane is absent; it never states that the seed has no such neighbor. An empty answer\ncarrying it means the walk could not run; an empty answer without it means the walk\nran and the seed has no neighbor under the request.",
+                "description": "No lane populates part of the edge coverage the traversal asked for, so the\nwalk had nothing to follow there whatever the graph holds. The warning states that a\nlane is absent; it never states that the seed has no such neighbor. An empty answer\ncarrying it means the walk could not run; an empty answer without it means the walk\nran and the seed has no neighbor under the request.",
                 "properties": {
                   "code": {
-                    "const": "relationship_coverage_missing",
+                    "const": "edge_coverage_missing",
                     "type": "string"
                   },
                   "detail": {
@@ -1486,10 +1541,10 @@
                     "maxLength": 4096,
                     "type": "string"
                   },
-                  "facets": {
-                    "description": "The requested facets no lane populates, in the request's own order,\ndeduplicated. Absent when every requested facet has a lane.",
+                  "kinds": {
+                    "description": "The requested kinds no lane populates, in the request's own order,\ndeduplicated. Absent when every requested kind has a lane.",
                     "items": {
-                      "$ref": "#/$defs/RelationshipFacet"
+                      "$ref": "#/$defs/EdgeKind"
                     },
                     "type": "array"
                   }
@@ -1502,7 +1557,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "A language engine serves the seed's language, and this read carries none of its\nedges: the engine answered about bytes the served revision does not carry, answered\nmore than the walk's symbol bound holds, or was still analyzing when\n`[server] readiness_timeout` was spent. The indexed relationships stand; whatever\nthe engine resolves on top of them is missing. The warning states that an engine's\nanalysis is absent from this answer; it never states that the seed has no such\nneighbor. An engine still analyzing keeps loading, and a later read, served from a\nrevision the engine has caught up with or sent once it reads ready, carries the\nengine's edges again.",
+                "description": "A language engine serves the seed's language, and this read carries none of its\nedges: the engine answered about bytes the served revision does not carry, answered\nmore than the walk's symbol bound holds, or was still analyzing when\n`[server] readiness_timeout` was spent. The indexed edges stand; whatever\nthe engine resolves on top of them is missing. The warning states that an engine's\nanalysis is absent from this answer; it never states that the seed has no such\nneighbor. An engine still analyzing keeps loading, and a later read, served from a\nrevision the engine has caught up with or sent once it reads ready, carries the\nengine's edges again.",
                 "properties": {
                   "code": {
                     "const": "engine_analysis_unavailable",
@@ -1891,156 +1946,6 @@
               }
             ]
           },
-          "RelationshipFacet": {
-            "description": "One portable category an edge falls into. The local kinds `import` and `use` can share\nthe `imports` facet, which lets one query cross languages.",
-            "oneOf": [
-              {
-                "const": "contains",
-                "description": "The source contains the target within its scope.",
-                "type": "string"
-              },
-              {
-                "const": "declares",
-                "description": "The source declares the target.",
-                "type": "string"
-              },
-              {
-                "const": "augments",
-                "description": "The source adds to a declaration made elsewhere.",
-                "type": "string"
-              },
-              {
-                "const": "references",
-                "description": "The source mentions the target.",
-                "type": "string"
-              },
-              {
-                "const": "calls",
-                "description": "The source invokes the target.",
-                "type": "string"
-              },
-              {
-                "const": "constructs",
-                "description": "The source creates an instance of the target.",
-                "type": "string"
-              },
-              {
-                "const": "reads",
-                "description": "The source reads the target's value.",
-                "type": "string"
-              },
-              {
-                "const": "writes",
-                "description": "The source assigns to the target.",
-                "type": "string"
-              },
-              {
-                "const": "imports",
-                "description": "The source brings the target into scope.",
-                "type": "string"
-              },
-              {
-                "const": "exports",
-                "description": "The source exposes the target outside its unit.",
-                "type": "string"
-              },
-              {
-                "const": "extends",
-                "description": "The source inherits from the target.",
-                "type": "string"
-              },
-              {
-                "const": "implements",
-                "description": "The source fulfils the target's interface.",
-                "type": "string"
-              },
-              {
-                "const": "has_type",
-                "description": "The source is typed by the target.",
-                "type": "string"
-              },
-              {
-                "const": "overrides",
-                "description": "The source replaces the target inherited from a supertype.",
-                "type": "string"
-              },
-              {
-                "const": "aliases",
-                "description": "The source is another name for the target.",
-                "type": "string"
-              },
-              {
-                "const": "generates",
-                "description": "The source produces the target as generated code.",
-                "type": "string"
-              },
-              {
-                "const": "depends_on",
-                "description": "The source requires the target to build or run.",
-                "type": "string"
-              },
-              {
-                "const": "annotated_by",
-                "description": "The source carries the target as an annotation.",
-                "type": "string"
-              },
-              {
-                "const": "throws",
-                "description": "The source can raise the target.",
-                "type": "string"
-              },
-              {
-                "const": "catches",
-                "description": "The source handles the target when raised.",
-                "type": "string"
-              },
-              {
-                "const": "bounded_by",
-                "description": "The source's type parameter is constrained by the target.",
-                "type": "string"
-              },
-              {
-                "const": "instantiates",
-                "description": "The source applies concrete arguments to the generic target.",
-                "type": "string"
-              },
-              {
-                "const": "specializes",
-                "description": "The source is a specialization of the generic target.",
-                "type": "string"
-              },
-              {
-                "const": "overloads",
-                "description": "The source and target are separately dispatched forms of one name.",
-                "type": "string"
-              },
-              {
-                "const": "mixes_in",
-                "description": "The source incorporates the target as a mixin.",
-                "type": "string"
-              },
-              {
-                "const": "embeds",
-                "description": "The source embeds the target within its own definition.",
-                "type": "string"
-              },
-              {
-                "const": "tests",
-                "description": "The source exercises the target as a test.",
-                "type": "string"
-              },
-              {
-                "const": "configures",
-                "description": "The source supplies configuration for the target.",
-                "type": "string"
-              },
-              {
-                "const": "binds",
-                "description": "The source binds a name or value to the target.",
-                "type": "string"
-              }
-            ]
-          },
           "Revision": {
             "description": "One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.",
             "examples": [
@@ -2165,14 +2070,6 @@
                 "default": {},
                 "description": "Syntax facts the model has no field for, namespaced by the provider that emitted\nthem. Absent when empty."
               },
-              "facets": {
-                "default": [],
-                "description": "Portable structural classification, so a query can ask for bodies or imports without\nknowing the grammar that produced them. Absent when empty.",
-                "items": {
-                  "$ref": "#/$defs/NodeFacet"
-                },
-                "type": "array"
-              },
               "index": {
                 "description": "Pre-order position of this syntax element inside its declaration's item subtree, or inside its\nunit when `declaration` is absent. The item syntax element and the unit's file syntax element are 0.",
                 "format": "uint64",
@@ -2183,6 +2080,14 @@
               "kind": {
                 "$ref": "#/$defs/ExactKind",
                 "description": "What the syntax element is in the provider's vocabulary, such as `fn_item`, `mapping.key`, or\n`selector.class`."
+              },
+              "kinds": {
+                "default": [],
+                "description": "Portable structural classification, so a query can ask for bodies or imports without\nknowing the grammar that produced them. Absent when empty.",
+                "items": {
+                  "$ref": "#/$defs/SyntaxKind"
+                },
+                "type": "array"
               },
               "language": {
                 "$ref": "#/$defs/Language",
@@ -2237,6 +2142,101 @@
               {
                 "const": "tailwind",
                 "description": "Tailwind directives and classes under a known major version.",
+                "type": "string"
+              }
+            ]
+          },
+          "SyntaxKind": {
+            "description": "Portable structural kinds, so a filter can ask for bodies or imports without knowing the\ngrammar that produced them.",
+            "oneOf": [
+              {
+                "const": "declaration",
+                "description": "Introduces a name.",
+                "type": "string"
+              },
+              {
+                "const": "definition",
+                "description": "Supplies the implementation behind a declared name.",
+                "type": "string"
+              },
+              {
+                "const": "body",
+                "description": "The implementation part of a declaration.",
+                "type": "string"
+              },
+              {
+                "const": "block",
+                "description": "A delimited group of statements.",
+                "type": "string"
+              },
+              {
+                "const": "statement",
+                "description": "One executable step.",
+                "type": "string"
+              },
+              {
+                "const": "expression",
+                "description": "Computes a value.",
+                "type": "string"
+              },
+              {
+                "const": "type_expression",
+                "description": "Spells a type.",
+                "type": "string"
+              },
+              {
+                "const": "import",
+                "description": "Brings an external name into scope.",
+                "type": "string"
+              },
+              {
+                "const": "export",
+                "description": "Exposes a name outside its unit.",
+                "type": "string"
+              },
+              {
+                "const": "parameter",
+                "description": "A declared input of a callable.",
+                "type": "string"
+              },
+              {
+                "const": "argument",
+                "description": "A value passed at a call site.",
+                "type": "string"
+              },
+              {
+                "const": "annotation",
+                "description": "A decorator or attribute qualifying a construct.",
+                "type": "string"
+              },
+              {
+                "const": "comment",
+                "description": "Commentary the language ignores.",
+                "type": "string"
+              },
+              {
+                "const": "identifier",
+                "description": "A name as written in the source.",
+                "type": "string"
+              },
+              {
+                "const": "literal",
+                "description": "A value written out directly.",
+                "type": "string"
+              },
+              {
+                "const": "pattern",
+                "description": "A destructuring or match pattern.",
+                "type": "string"
+              },
+              {
+                "const": "generated",
+                "description": "Produced by a tool rather than authored.",
+                "type": "string"
+              },
+              {
+                "const": "test",
+                "description": "Belongs to test code.",
                 "type": "string"
               }
             ]
@@ -2297,12 +2297,12 @@
                 "syntax": [
                   {
                     "declaration": 0,
-                    "facets": [
+                    "index": 0,
+                    "kind": "struct_item",
+                    "kinds": [
                       "declaration",
                       "definition"
                     ],
-                    "index": 0,
-                    "kind": "struct_item",
                     "language": "rust",
                     "range": {
                       "end": 160,
@@ -2352,12 +2352,12 @@
                   },
                   {
                     "declaration": 0,
-                    "facets": [
+                    "index": 4,
+                    "kind": "field_declaration",
+                    "kinds": [
                       "declaration",
                       "definition"
                     ],
-                    "index": 4,
-                    "kind": "field_declaration",
                     "language": "rust",
                     "parent": 3,
                     "range": {
@@ -3356,6 +3356,156 @@
             "description": "A duration: an integer magnitude with a required unit suffix `ms`, `s`, `m`, `h`, or `d`.",
             "pattern": "^(?:0|[1-9][0-9]*)(?:ms|s|m|h|d)$",
             "type": "string"
+          },
+          "EdgeKind": {
+            "description": "One portable category an edge falls into. The local kinds `import` and `use` can share\nthe `imports` kind, which lets one query cross languages.",
+            "oneOf": [
+              {
+                "const": "contains",
+                "description": "The source contains the target within its scope.",
+                "type": "string"
+              },
+              {
+                "const": "declares",
+                "description": "The source declares the target.",
+                "type": "string"
+              },
+              {
+                "const": "augments",
+                "description": "The source adds to a declaration made elsewhere.",
+                "type": "string"
+              },
+              {
+                "const": "references",
+                "description": "The source mentions the target.",
+                "type": "string"
+              },
+              {
+                "const": "calls",
+                "description": "The source invokes the target.",
+                "type": "string"
+              },
+              {
+                "const": "constructs",
+                "description": "The source creates an instance of the target.",
+                "type": "string"
+              },
+              {
+                "const": "reads",
+                "description": "The source reads the target's value.",
+                "type": "string"
+              },
+              {
+                "const": "writes",
+                "description": "The source assigns to the target.",
+                "type": "string"
+              },
+              {
+                "const": "imports",
+                "description": "The source brings the target into scope.",
+                "type": "string"
+              },
+              {
+                "const": "exports",
+                "description": "The source exposes the target outside its unit.",
+                "type": "string"
+              },
+              {
+                "const": "extends",
+                "description": "The source inherits from the target.",
+                "type": "string"
+              },
+              {
+                "const": "implements",
+                "description": "The source fulfils the target's interface.",
+                "type": "string"
+              },
+              {
+                "const": "has_type",
+                "description": "The source is typed by the target.",
+                "type": "string"
+              },
+              {
+                "const": "overrides",
+                "description": "The source replaces the target inherited from a supertype.",
+                "type": "string"
+              },
+              {
+                "const": "aliases",
+                "description": "The source is another name for the target.",
+                "type": "string"
+              },
+              {
+                "const": "generates",
+                "description": "The source produces the target as generated code.",
+                "type": "string"
+              },
+              {
+                "const": "depends_on",
+                "description": "The source requires the target to build or run.",
+                "type": "string"
+              },
+              {
+                "const": "annotated_by",
+                "description": "The source carries the target as an annotation.",
+                "type": "string"
+              },
+              {
+                "const": "throws",
+                "description": "The source can raise the target.",
+                "type": "string"
+              },
+              {
+                "const": "catches",
+                "description": "The source handles the target when raised.",
+                "type": "string"
+              },
+              {
+                "const": "bounded_by",
+                "description": "The source's type parameter is constrained by the target.",
+                "type": "string"
+              },
+              {
+                "const": "instantiates",
+                "description": "The source applies concrete arguments to the generic target.",
+                "type": "string"
+              },
+              {
+                "const": "specializes",
+                "description": "The source is a specialization of the generic target.",
+                "type": "string"
+              },
+              {
+                "const": "overloads",
+                "description": "The source and target are separately dispatched forms of one name.",
+                "type": "string"
+              },
+              {
+                "const": "mixes_in",
+                "description": "The source incorporates the target as a mixin.",
+                "type": "string"
+              },
+              {
+                "const": "embeds",
+                "description": "The source embeds the target within its own definition.",
+                "type": "string"
+              },
+              {
+                "const": "tests",
+                "description": "The source exercises the target as a test.",
+                "type": "string"
+              },
+              {
+                "const": "configures",
+                "description": "The source supplies configuration for the target.",
+                "type": "string"
+              },
+              {
+                "const": "binds",
+                "description": "The source binds a name or value to the target.",
+                "type": "string"
+              }
+            ]
           },
           "ExactKind": {
             "description": "A provider-local kind preserving the construct name used by that language implementation.",
@@ -4611,7 +4761,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "A traversal walk stopped at its symbol bound before exhausting the reachable graph,\nso hits reachable beyond the bound are missing from this answer. Narrow the walk -\na tighter `facets` list, a smaller `depth`, or a less-connected seed - to fit it\nunder the bound.",
+                "description": "A traversal walk stopped at its symbol bound before exhausting the reachable graph,\nso hits reachable beyond the bound are missing from this answer. Narrow the walk -\na tighter `kinds` list, a smaller `depth`, or a less-connected seed - to fit it\nunder the bound.",
                 "properties": {
                   "code": {
                     "const": "traversal_truncated",
@@ -4638,10 +4788,10 @@
               },
               {
                 "additionalProperties": false,
-                "description": "No lane populates part of the relationship coverage the traversal asked for, so the\nwalk had nothing to follow there whatever the graph holds. The warning states that a\nlane is absent; it never states that the seed has no such neighbor. An empty answer\ncarrying it means the walk could not run; an empty answer without it means the walk\nran and the seed has no neighbor under the request.",
+                "description": "No lane populates part of the edge coverage the traversal asked for, so the\nwalk had nothing to follow there whatever the graph holds. The warning states that a\nlane is absent; it never states that the seed has no such neighbor. An empty answer\ncarrying it means the walk could not run; an empty answer without it means the walk\nran and the seed has no neighbor under the request.",
                 "properties": {
                   "code": {
-                    "const": "relationship_coverage_missing",
+                    "const": "edge_coverage_missing",
                     "type": "string"
                   },
                   "detail": {
@@ -4649,10 +4799,10 @@
                     "maxLength": 4096,
                     "type": "string"
                   },
-                  "facets": {
-                    "description": "The requested facets no lane populates, in the request's own order,\ndeduplicated. Absent when every requested facet has a lane.",
+                  "kinds": {
+                    "description": "The requested kinds no lane populates, in the request's own order,\ndeduplicated. Absent when every requested kind has a lane.",
                     "items": {
-                      "$ref": "#/$defs/RelationshipFacet"
+                      "$ref": "#/$defs/EdgeKind"
                     },
                     "type": "array"
                   }
@@ -4665,7 +4815,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "A language engine serves the seed's language, and this read carries none of its\nedges: the engine answered about bytes the served revision does not carry, answered\nmore than the walk's symbol bound holds, or was still analyzing when\n`[server] readiness_timeout` was spent. The indexed relationships stand; whatever\nthe engine resolves on top of them is missing. The warning states that an engine's\nanalysis is absent from this answer; it never states that the seed has no such\nneighbor. An engine still analyzing keeps loading, and a later read, served from a\nrevision the engine has caught up with or sent once it reads ready, carries the\nengine's edges again.",
+                "description": "A language engine serves the seed's language, and this read carries none of its\nedges: the engine answered about bytes the served revision does not carry, answered\nmore than the walk's symbol bound holds, or was still analyzing when\n`[server] readiness_timeout` was spent. The indexed edges stand; whatever\nthe engine resolves on top of them is missing. The warning states that an engine's\nanalysis is absent from this answer; it never states that the seed has no such\nneighbor. An engine still analyzing keeps loading, and a later read, served from a\nrevision the engine has caught up with or sent once it reads ready, carries the\nengine's edges again.",
                 "properties": {
                   "code": {
                     "const": "engine_analysis_unavailable",
@@ -5014,156 +5164,6 @@
               }
             ]
           },
-          "RelationshipFacet": {
-            "description": "One portable category an edge falls into. The local kinds `import` and `use` can share\nthe `imports` facet, which lets one query cross languages.",
-            "oneOf": [
-              {
-                "const": "contains",
-                "description": "The source contains the target within its scope.",
-                "type": "string"
-              },
-              {
-                "const": "declares",
-                "description": "The source declares the target.",
-                "type": "string"
-              },
-              {
-                "const": "augments",
-                "description": "The source adds to a declaration made elsewhere.",
-                "type": "string"
-              },
-              {
-                "const": "references",
-                "description": "The source mentions the target.",
-                "type": "string"
-              },
-              {
-                "const": "calls",
-                "description": "The source invokes the target.",
-                "type": "string"
-              },
-              {
-                "const": "constructs",
-                "description": "The source creates an instance of the target.",
-                "type": "string"
-              },
-              {
-                "const": "reads",
-                "description": "The source reads the target's value.",
-                "type": "string"
-              },
-              {
-                "const": "writes",
-                "description": "The source assigns to the target.",
-                "type": "string"
-              },
-              {
-                "const": "imports",
-                "description": "The source brings the target into scope.",
-                "type": "string"
-              },
-              {
-                "const": "exports",
-                "description": "The source exposes the target outside its unit.",
-                "type": "string"
-              },
-              {
-                "const": "extends",
-                "description": "The source inherits from the target.",
-                "type": "string"
-              },
-              {
-                "const": "implements",
-                "description": "The source fulfils the target's interface.",
-                "type": "string"
-              },
-              {
-                "const": "has_type",
-                "description": "The source is typed by the target.",
-                "type": "string"
-              },
-              {
-                "const": "overrides",
-                "description": "The source replaces the target inherited from a supertype.",
-                "type": "string"
-              },
-              {
-                "const": "aliases",
-                "description": "The source is another name for the target.",
-                "type": "string"
-              },
-              {
-                "const": "generates",
-                "description": "The source produces the target as generated code.",
-                "type": "string"
-              },
-              {
-                "const": "depends_on",
-                "description": "The source requires the target to build or run.",
-                "type": "string"
-              },
-              {
-                "const": "annotated_by",
-                "description": "The source carries the target as an annotation.",
-                "type": "string"
-              },
-              {
-                "const": "throws",
-                "description": "The source can raise the target.",
-                "type": "string"
-              },
-              {
-                "const": "catches",
-                "description": "The source handles the target when raised.",
-                "type": "string"
-              },
-              {
-                "const": "bounded_by",
-                "description": "The source's type parameter is constrained by the target.",
-                "type": "string"
-              },
-              {
-                "const": "instantiates",
-                "description": "The source applies concrete arguments to the generic target.",
-                "type": "string"
-              },
-              {
-                "const": "specializes",
-                "description": "The source is a specialization of the generic target.",
-                "type": "string"
-              },
-              {
-                "const": "overloads",
-                "description": "The source and target are separately dispatched forms of one name.",
-                "type": "string"
-              },
-              {
-                "const": "mixes_in",
-                "description": "The source incorporates the target as a mixin.",
-                "type": "string"
-              },
-              {
-                "const": "embeds",
-                "description": "The source embeds the target within its own definition.",
-                "type": "string"
-              },
-              {
-                "const": "tests",
-                "description": "The source exercises the target as a test.",
-                "type": "string"
-              },
-              {
-                "const": "configures",
-                "description": "The source supplies configuration for the target.",
-                "type": "string"
-              },
-              {
-                "const": "binds",
-                "description": "The source binds a name or value to the target.",
-                "type": "string"
-              }
-            ]
-          },
           "Revision": {
             "description": "One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.",
             "examples": [
@@ -5378,7 +5378,7 @@
             "type": "string"
           },
           "Symbol": {
-            "description": "Readable Symbol assembled from normalized Contributions. Source structure lives in `SyntaxElement`\nand is connected through Relationship.",
+            "description": "Readable Symbol assembled from normalized Contributions. Source structure lives in `SyntaxElement`\nand is connected through Edge.",
             "properties": {
               "container": {
                 "$ref": "#/$defs/SymbolId",
@@ -5402,14 +5402,6 @@
                 "default": {},
                 "description": "Language-specific facts with no portable equivalent, namespaced by the provider that\nemitted them. Absent when empty."
               },
-              "facets": {
-                "default": [],
-                "description": "Portable classification for cross-language queries, absent when empty. The local\nkinds `trait` and `interface` can both carry the `type` facet.",
-                "items": {
-                  "$ref": "#/$defs/SymbolFacet"
-                },
-                "type": "array"
-              },
               "id": {
                 "$ref": "#/$defs/SymbolId",
                 "description": "Unique identifier of this Symbol across the whole workspace. Absent for an\nunestablished symbol: no accepted evidence, or more than one, established its\nidentity."
@@ -5417,6 +5409,14 @@
               "kind": {
                 "$ref": "#/$defs/ExactKind",
                 "description": "What this symbol is in the provider's vocabulary, such as `trait`, `function`, or\n`table`."
+              },
+              "kinds": {
+                "default": [],
+                "description": "Portable classification for cross-language queries, absent when empty. The local\nkinds `trait` and `interface` can both carry the `type` kind.",
+                "items": {
+                  "$ref": "#/$defs/SymbolKind"
+                },
+                "type": "array"
               },
               "language": {
                 "$ref": "#/$defs/Language",
@@ -5563,8 +5563,75 @@
             ],
             "type": "object"
           },
-          "SymbolFacet": {
-            "description": "One portable category a symbol falls into. Kinds are language-specific; facets are\nshared, so a filter written once applies to every served language.",
+          "SymbolHistory": {
+            "additionalProperties": false,
+            "description": "One symbol's history as edges from the symbol to the commits that touched it and to the\nsymbols changed beside it. The history follows first parents from the served revision,\nor the selected releases in version order, through the commits the history store holds,\nand follows the declaration's file across a rename that kept its bytes. It is bounded by\n`[providers.history] max_revisions` and by a shallow clone's boundary.",
+            "properties": {
+              "co_changes_truncated": {
+                "$ref": "#/$defs/CoChangeTruncation",
+                "description": "The co-change edges the co-change bounds left out. Absent when they left out none."
+              },
+              "complete": {
+                "description": "Whether the history reached the repository's first commit. `false` when the\n`max_revisions` bound, a shallow clone's boundary, or the oldest selected release\nended it first, or while the history store has not yet analyzed the served\nrevision, so commits older than the listed ones may have touched the symbol.",
+                "type": "boolean"
+              },
+              "edges": {
+                "description": "The commit edges newest first, then the `co_changes` edges, most shared commits\nfirst.",
+                "items": {
+                  "$ref": "#/$defs/HistoryEdge"
+                },
+                "type": "array"
+              },
+              "symbol": {
+                "$ref": "#/$defs/SymbolId",
+                "description": "The symbol the history is for."
+              }
+            },
+            "required": [
+              "symbol",
+              "edges",
+              "complete"
+            ],
+            "type": "object"
+          },
+          "SymbolId": {
+            "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.",
+            "examples": [
+              "rift://symbol/local/rust/app/parser/parse",
+              "rift://symbol/local@cloud/rust/app/load",
+              "rift://symbol/local:docs/typescript/page/beacon",
+              "rift://symbol/local@cloud:docs/typescript/page/beacon",
+              "rift://symbol/npm/npmjs.org/@types/node/typescript/node/buffer/Buffer",
+              "rift://symbol/stdlib/cpython/python/builtins/len"
+            ],
+            "maxLength": 8192,
+            "minLength": 1,
+            "not": {
+              "pattern": "/\\.{1,2}(?:/|$)"
+            },
+            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$",
+            "type": "string"
+          },
+          "SymbolIdentity": {
+            "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.",
+            "examples": [
+              "rift://symbol/local/rust/app/parser/parse",
+              "rift://symbol/local@cloud/rust/app/load",
+              "rift://symbol/local:docs/typescript/page/beacon",
+              "rift://symbol/local@cloud:docs/typescript/page/beacon",
+              "rift://symbol/npm/npmjs.org/@types/node/typescript/node/buffer/Buffer",
+              "rift://symbol/stdlib/cpython/python/builtins/len"
+            ],
+            "maxLength": 8192,
+            "minLength": 1,
+            "not": {
+              "pattern": "/\\.{1,2}(?:/|$)"
+            },
+            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$",
+            "type": "string"
+          },
+          "SymbolKind": {
+            "description": "One portable category a symbol falls into, shared across served languages.\nThe language-specific `kind` names the declaration in its provider's vocabulary.",
             "oneOf": [
               {
                 "const": "namespace",
@@ -5717,73 +5784,6 @@
                 "type": "string"
               }
             ]
-          },
-          "SymbolHistory": {
-            "additionalProperties": false,
-            "description": "One symbol's history as edges from the symbol to the commits that touched it and to the\nsymbols changed beside it. The history follows first parents from the served revision,\nor the selected releases in version order, through the commits the history store holds,\nand follows the declaration's file across a rename that kept its bytes. It is bounded by\n`[providers.history] max_revisions` and by a shallow clone's boundary.",
-            "properties": {
-              "co_changes_truncated": {
-                "$ref": "#/$defs/CoChangeTruncation",
-                "description": "The co-change edges the co-change bounds left out. Absent when they left out none."
-              },
-              "complete": {
-                "description": "Whether the history reached the repository's first commit. `false` when the\n`max_revisions` bound, a shallow clone's boundary, or the oldest selected release\nended it first, or while the history store has not yet analyzed the served\nrevision, so commits older than the listed ones may have touched the symbol.",
-                "type": "boolean"
-              },
-              "edges": {
-                "description": "The commit edges newest first, then the `co_changes` edges, most shared commits\nfirst.",
-                "items": {
-                  "$ref": "#/$defs/HistoryEdge"
-                },
-                "type": "array"
-              },
-              "symbol": {
-                "$ref": "#/$defs/SymbolId",
-                "description": "The symbol the history is for."
-              }
-            },
-            "required": [
-              "symbol",
-              "edges",
-              "complete"
-            ],
-            "type": "object"
-          },
-          "SymbolId": {
-            "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.",
-            "examples": [
-              "rift://symbol/local/rust/app/parser/parse",
-              "rift://symbol/local@cloud/rust/app/load",
-              "rift://symbol/local:docs/typescript/page/beacon",
-              "rift://symbol/local@cloud:docs/typescript/page/beacon",
-              "rift://symbol/npm/npmjs.org/@types/node/typescript/node/buffer/Buffer",
-              "rift://symbol/stdlib/cpython/python/builtins/len"
-            ],
-            "maxLength": 8192,
-            "minLength": 1,
-            "not": {
-              "pattern": "/\\.{1,2}(?:/|$)"
-            },
-            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$",
-            "type": "string"
-          },
-          "SymbolIdentity": {
-            "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.",
-            "examples": [
-              "rift://symbol/local/rust/app/parser/parse",
-              "rift://symbol/local@cloud/rust/app/load",
-              "rift://symbol/local:docs/typescript/page/beacon",
-              "rift://symbol/local@cloud:docs/typescript/page/beacon",
-              "rift://symbol/npm/npmjs.org/@types/node/typescript/node/buffer/Buffer",
-              "rift://symbol/stdlib/cpython/python/builtins/len"
-            ],
-            "maxLength": 8192,
-            "minLength": 1,
-            "not": {
-              "pattern": "/\\.{1,2}(?:/|$)"
-            },
-            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$",
-            "type": "string"
           },
           "SymbolMatchContext": {
             "description": "The structural parts compared when an alternative was selected.",
@@ -6481,6 +6481,156 @@
             "description": "A duration: an integer magnitude with a required unit suffix `ms`, `s`, `m`, `h`, or `d`.",
             "pattern": "^(?:0|[1-9][0-9]*)(?:ms|s|m|h|d)$",
             "type": "string"
+          },
+          "EdgeKind": {
+            "description": "One portable category an edge falls into. The local kinds `import` and `use` can share\nthe `imports` kind, which lets one query cross languages.",
+            "oneOf": [
+              {
+                "const": "contains",
+                "description": "The source contains the target within its scope.",
+                "type": "string"
+              },
+              {
+                "const": "declares",
+                "description": "The source declares the target.",
+                "type": "string"
+              },
+              {
+                "const": "augments",
+                "description": "The source adds to a declaration made elsewhere.",
+                "type": "string"
+              },
+              {
+                "const": "references",
+                "description": "The source mentions the target.",
+                "type": "string"
+              },
+              {
+                "const": "calls",
+                "description": "The source invokes the target.",
+                "type": "string"
+              },
+              {
+                "const": "constructs",
+                "description": "The source creates an instance of the target.",
+                "type": "string"
+              },
+              {
+                "const": "reads",
+                "description": "The source reads the target's value.",
+                "type": "string"
+              },
+              {
+                "const": "writes",
+                "description": "The source assigns to the target.",
+                "type": "string"
+              },
+              {
+                "const": "imports",
+                "description": "The source brings the target into scope.",
+                "type": "string"
+              },
+              {
+                "const": "exports",
+                "description": "The source exposes the target outside its unit.",
+                "type": "string"
+              },
+              {
+                "const": "extends",
+                "description": "The source inherits from the target.",
+                "type": "string"
+              },
+              {
+                "const": "implements",
+                "description": "The source fulfils the target's interface.",
+                "type": "string"
+              },
+              {
+                "const": "has_type",
+                "description": "The source is typed by the target.",
+                "type": "string"
+              },
+              {
+                "const": "overrides",
+                "description": "The source replaces the target inherited from a supertype.",
+                "type": "string"
+              },
+              {
+                "const": "aliases",
+                "description": "The source is another name for the target.",
+                "type": "string"
+              },
+              {
+                "const": "generates",
+                "description": "The source produces the target as generated code.",
+                "type": "string"
+              },
+              {
+                "const": "depends_on",
+                "description": "The source requires the target to build or run.",
+                "type": "string"
+              },
+              {
+                "const": "annotated_by",
+                "description": "The source carries the target as an annotation.",
+                "type": "string"
+              },
+              {
+                "const": "throws",
+                "description": "The source can raise the target.",
+                "type": "string"
+              },
+              {
+                "const": "catches",
+                "description": "The source handles the target when raised.",
+                "type": "string"
+              },
+              {
+                "const": "bounded_by",
+                "description": "The source's type parameter is constrained by the target.",
+                "type": "string"
+              },
+              {
+                "const": "instantiates",
+                "description": "The source applies concrete arguments to the generic target.",
+                "type": "string"
+              },
+              {
+                "const": "specializes",
+                "description": "The source is a specialization of the generic target.",
+                "type": "string"
+              },
+              {
+                "const": "overloads",
+                "description": "The source and target are separately dispatched forms of one name.",
+                "type": "string"
+              },
+              {
+                "const": "mixes_in",
+                "description": "The source incorporates the target as a mixin.",
+                "type": "string"
+              },
+              {
+                "const": "embeds",
+                "description": "The source embeds the target within its own definition.",
+                "type": "string"
+              },
+              {
+                "const": "tests",
+                "description": "The source exercises the target as a test.",
+                "type": "string"
+              },
+              {
+                "const": "configures",
+                "description": "The source supplies configuration for the target.",
+                "type": "string"
+              },
+              {
+                "const": "binds",
+                "description": "The source binds a name or value to the target.",
+                "type": "string"
+              }
+            ]
           },
           "GlobalFailureClass": {
             "description": "Bounded classes a global API failure can carry in a read warning.",
@@ -7717,7 +7867,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "A traversal walk stopped at its symbol bound before exhausting the reachable graph,\nso hits reachable beyond the bound are missing from this answer. Narrow the walk -\na tighter `facets` list, a smaller `depth`, or a less-connected seed - to fit it\nunder the bound.",
+                "description": "A traversal walk stopped at its symbol bound before exhausting the reachable graph,\nso hits reachable beyond the bound are missing from this answer. Narrow the walk -\na tighter `kinds` list, a smaller `depth`, or a less-connected seed - to fit it\nunder the bound.",
                 "properties": {
                   "code": {
                     "const": "traversal_truncated",
@@ -7744,10 +7894,10 @@
               },
               {
                 "additionalProperties": false,
-                "description": "No lane populates part of the relationship coverage the traversal asked for, so the\nwalk had nothing to follow there whatever the graph holds. The warning states that a\nlane is absent; it never states that the seed has no such neighbor. An empty answer\ncarrying it means the walk could not run; an empty answer without it means the walk\nran and the seed has no neighbor under the request.",
+                "description": "No lane populates part of the edge coverage the traversal asked for, so the\nwalk had nothing to follow there whatever the graph holds. The warning states that a\nlane is absent; it never states that the seed has no such neighbor. An empty answer\ncarrying it means the walk could not run; an empty answer without it means the walk\nran and the seed has no neighbor under the request.",
                 "properties": {
                   "code": {
-                    "const": "relationship_coverage_missing",
+                    "const": "edge_coverage_missing",
                     "type": "string"
                   },
                   "detail": {
@@ -7755,10 +7905,10 @@
                     "maxLength": 4096,
                     "type": "string"
                   },
-                  "facets": {
-                    "description": "The requested facets no lane populates, in the request's own order,\ndeduplicated. Absent when every requested facet has a lane.",
+                  "kinds": {
+                    "description": "The requested kinds no lane populates, in the request's own order,\ndeduplicated. Absent when every requested kind has a lane.",
                     "items": {
-                      "$ref": "#/$defs/RelationshipFacet"
+                      "$ref": "#/$defs/EdgeKind"
                     },
                     "type": "array"
                   }
@@ -7771,7 +7921,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "A language engine serves the seed's language, and this read carries none of its\nedges: the engine answered about bytes the served revision does not carry, answered\nmore than the walk's symbol bound holds, or was still analyzing when\n`[server] readiness_timeout` was spent. The indexed relationships stand; whatever\nthe engine resolves on top of them is missing. The warning states that an engine's\nanalysis is absent from this answer; it never states that the seed has no such\nneighbor. An engine still analyzing keeps loading, and a later read, served from a\nrevision the engine has caught up with or sent once it reads ready, carries the\nengine's edges again.",
+                "description": "A language engine serves the seed's language, and this read carries none of its\nedges: the engine answered about bytes the served revision does not carry, answered\nmore than the walk's symbol bound holds, or was still analyzing when\n`[server] readiness_timeout` was spent. The indexed edges stand; whatever\nthe engine resolves on top of them is missing. The warning states that an engine's\nanalysis is absent from this answer; it never states that the seed has no such\nneighbor. An engine still analyzing keeps loading, and a later read, served from a\nrevision the engine has caught up with or sent once it reads ready, carries the\nengine's edges again.",
                 "properties": {
                   "code": {
                     "const": "engine_analysis_unavailable",
@@ -8117,156 +8267,6 @@
                   "reason"
                 ],
                 "type": "object"
-              }
-            ]
-          },
-          "RelationshipFacet": {
-            "description": "One portable category an edge falls into. The local kinds `import` and `use` can share\nthe `imports` facet, which lets one query cross languages.",
-            "oneOf": [
-              {
-                "const": "contains",
-                "description": "The source contains the target within its scope.",
-                "type": "string"
-              },
-              {
-                "const": "declares",
-                "description": "The source declares the target.",
-                "type": "string"
-              },
-              {
-                "const": "augments",
-                "description": "The source adds to a declaration made elsewhere.",
-                "type": "string"
-              },
-              {
-                "const": "references",
-                "description": "The source mentions the target.",
-                "type": "string"
-              },
-              {
-                "const": "calls",
-                "description": "The source invokes the target.",
-                "type": "string"
-              },
-              {
-                "const": "constructs",
-                "description": "The source creates an instance of the target.",
-                "type": "string"
-              },
-              {
-                "const": "reads",
-                "description": "The source reads the target's value.",
-                "type": "string"
-              },
-              {
-                "const": "writes",
-                "description": "The source assigns to the target.",
-                "type": "string"
-              },
-              {
-                "const": "imports",
-                "description": "The source brings the target into scope.",
-                "type": "string"
-              },
-              {
-                "const": "exports",
-                "description": "The source exposes the target outside its unit.",
-                "type": "string"
-              },
-              {
-                "const": "extends",
-                "description": "The source inherits from the target.",
-                "type": "string"
-              },
-              {
-                "const": "implements",
-                "description": "The source fulfils the target's interface.",
-                "type": "string"
-              },
-              {
-                "const": "has_type",
-                "description": "The source is typed by the target.",
-                "type": "string"
-              },
-              {
-                "const": "overrides",
-                "description": "The source replaces the target inherited from a supertype.",
-                "type": "string"
-              },
-              {
-                "const": "aliases",
-                "description": "The source is another name for the target.",
-                "type": "string"
-              },
-              {
-                "const": "generates",
-                "description": "The source produces the target as generated code.",
-                "type": "string"
-              },
-              {
-                "const": "depends_on",
-                "description": "The source requires the target to build or run.",
-                "type": "string"
-              },
-              {
-                "const": "annotated_by",
-                "description": "The source carries the target as an annotation.",
-                "type": "string"
-              },
-              {
-                "const": "throws",
-                "description": "The source can raise the target.",
-                "type": "string"
-              },
-              {
-                "const": "catches",
-                "description": "The source handles the target when raised.",
-                "type": "string"
-              },
-              {
-                "const": "bounded_by",
-                "description": "The source's type parameter is constrained by the target.",
-                "type": "string"
-              },
-              {
-                "const": "instantiates",
-                "description": "The source applies concrete arguments to the generic target.",
-                "type": "string"
-              },
-              {
-                "const": "specializes",
-                "description": "The source is a specialization of the generic target.",
-                "type": "string"
-              },
-              {
-                "const": "overloads",
-                "description": "The source and target are separately dispatched forms of one name.",
-                "type": "string"
-              },
-              {
-                "const": "mixes_in",
-                "description": "The source incorporates the target as a mixin.",
-                "type": "string"
-              },
-              {
-                "const": "embeds",
-                "description": "The source embeds the target within its own definition.",
-                "type": "string"
-              },
-              {
-                "const": "tests",
-                "description": "The source exercises the target as a test.",
-                "type": "string"
-              },
-              {
-                "const": "configures",
-                "description": "The source supplies configuration for the target.",
-                "type": "string"
-              },
-              {
-                "const": "binds",
-                "description": "The source binds a name or value to the target.",
-                "type": "string"
               }
             ]
           },

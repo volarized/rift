@@ -34,7 +34,7 @@ fn captured_symbol_material_keeps_source_graph_ranking_and_binding_facts() {
         view.normalized_graph(),
         index.normalized_graph()
     ));
-    assert!(std::ptr::eq(view.relationships(), index.relationships()));
+    assert!(std::ptr::eq(view.edges(), index.edges()));
     assert_eq!(view.index_documents().len(), index.index_documents().len());
     assert_eq!(
         view.object_by_identity(&identity)

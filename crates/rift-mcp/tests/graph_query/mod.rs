@@ -80,7 +80,7 @@ async fn rust_analyzer_supplies_a_call_on_an_inferred_receiver() -> TestResult {
             rift_protocol::configuration::HistoryConfiguration::default(),
         )?;
         let seed = rift_core::SymbolId::new(root.as_str())?;
-        let outgoing = captured.relationships().outgoing(&seed);
+        let outgoing = captured.edges().outgoing(&seed);
         assert!(
             outgoing
                 .iter()
@@ -205,11 +205,12 @@ async fn retrieval_projections_keep_ranked_and_regex_results_and_refuse_missing_
     )
     .await?;
     let leaf = identity(&client, "graph_leaf").await?;
-    let ranked = statement(&client, "SELECT ?s { SERVICE :search { ?hit :query 'graph_leaf'; :target 'symbol'; :symbol ?s; :index ?index } } ORDER BY ?index LIMIT 1").await?;
+    let ranked = statement(&client, "SELECT ?s ?kind { SERVICE :search { ?hit :query 'graph_leaf'; :target 'symbol'; :symbol ?s; :index ?index . ?s :kind ?kind; :kinds :callable } } ORDER BY ?index LIMIT 1").await?;
     let [row] = query::rows(&ranked)? else {
         return Err(format!("expected one ranked hit: {ranked}").into());
     };
     assert_eq!(query::iri(row, "s")?, leaf);
+    assert_eq!(query::literal(row, "kind")?, "function");
     let regex = statement(&client, "SELECT ?start ?end { SERVICE :search { ?hit :pattern 'graph_leaf'; :target 'file'; :start ?start; :end ?end } } ORDER BY ?start LIMIT 2").await?;
     let rows = query::rows(&regex)?;
     assert_eq!(rows.len(), 2);

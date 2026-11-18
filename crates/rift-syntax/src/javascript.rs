@@ -6,7 +6,7 @@
 
 use std::sync::OnceLock;
 
-use rift_protocol::read::{Language, NodeFacet};
+use rift_protocol::read::{Language, SyntaxKind};
 
 use crate::document::SyntaxDocument;
 use crate::ecmascript::{self, EcmaScriptKinds};
@@ -49,8 +49,8 @@ impl SyntaxProvider for JavaScriptSyntaxProvider {
         )
     }
 
-    fn syntax_element_facets(&self, kind: &str) -> Vec<NodeFacet> {
-        ecmascript::syntax_element_facets(kind)
+    fn syntax_element_kinds(&self, kind: &str) -> Vec<SyntaxKind> {
+        ecmascript::syntax_element_kinds(kind)
     }
 }
 
@@ -68,7 +68,7 @@ pub(crate) fn javascript_kinds() -> &'static EcmaScriptKinds {
 #[cfg(test)]
 mod tests {
     use rift_core::{PROVIDER_SYMBOL_ID_BYTES_MAX, ProjectPath};
-    use rift_protocol::read::SymbolFacet;
+    use rift_protocol::read::SymbolKind;
 
     use super::*;
 
@@ -167,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    fn test_exported_declarations_carry_the_public_facet_and_no_visibility() {
+    fn test_exported_declarations_carry_the_public_kind_and_no_visibility() {
         let text = "export function shipped() {}\nexport const limit = 1;\nexport default class Router {}\nfunction hidden() {}\n";
         let document = analyze(text);
         let facts = document
@@ -176,7 +176,7 @@ mod tests {
             .map(|symbol| {
                 (
                     symbol.name.as_str(),
-                    symbol.facets.contains(&SymbolFacet::Public),
+                    symbol.kinds.contains(&SymbolKind::Public),
                     symbol.visibility.clone(),
                 )
             })
@@ -193,7 +193,7 @@ mod tests {
     }
 
     /// Every qualified name `document` declares, beside whether it carries the
-    /// `Public` facet.
+    /// `Public` kind.
     fn public_facts(document: &SyntaxDocument) -> Vec<(&str, bool)> {
         document
             .symbols()
@@ -201,7 +201,7 @@ mod tests {
             .map(|symbol| {
                 (
                     symbol.qualified_name.as_str(),
-                    symbol.facets.contains(&SymbolFacet::Public),
+                    symbol.kinds.contains(&SymbolKind::Public),
                 )
             })
             .collect()
@@ -369,26 +369,22 @@ mod tests {
     }
 
     #[test]
-    fn test_document_facets_render_kind_categories() {
+    fn test_document_kinds_render_kind_categories() {
         let document = analyze(
             "export function shipped() {}\nclass Router { route() {} }\nconst limit = 1;\n",
         );
-        let facets = document
+        let kinds = document
             .symbols()
             .iter()
-            .map(|symbol| symbol.facets.clone())
+            .map(|symbol| symbol.kinds.clone())
             .collect::<Vec<_>>();
         assert_eq!(
-            facets,
+            kinds,
             [
-                vec![
-                    SymbolFacet::Value,
-                    SymbolFacet::Callable,
-                    SymbolFacet::Public
-                ],
-                vec![SymbolFacet::Type],
-                vec![SymbolFacet::Value, SymbolFacet::Callable],
-                vec![SymbolFacet::Value],
+                vec![SymbolKind::Value, SymbolKind::Callable, SymbolKind::Public],
+                vec![SymbolKind::Type],
+                vec![SymbolKind::Value, SymbolKind::Callable],
+                vec![SymbolKind::Value],
             ]
         );
     }
@@ -557,7 +553,7 @@ mod tests {
         let document = analyze(text);
         assert!(!document.has_errors());
         assert_eq!(document.symbols()[0].name, "Banner");
-        assert!(document.symbols()[0].facets.contains(&SymbolFacet::Public));
+        assert!(document.symbols()[0].kinds.contains(&SymbolKind::Public));
         assert!(
             document
                 .syntax_elements()
@@ -703,8 +699,8 @@ mod tests {
             .expect("original property binding");
         assert_eq!(symbol.kind, "function");
         assert_eq!(symbol.syntax_element_kind, Some("assignment_expression"));
-        assert!(symbol.facets.contains(&SymbolFacet::Callable));
-        assert!(!symbol.facets.contains(&SymbolFacet::Public));
+        assert!(symbol.kinds.contains(&SymbolKind::Callable));
+        assert!(!symbol.kinds.contains(&SymbolKind::Public));
         assert_eq!(
             &source[usize::try_from(symbol.item_range.start).expect("item start")
                 ..usize::try_from(symbol.item_range.end).expect("item end")],
@@ -749,7 +745,7 @@ mod tests {
         assert!(symbols[0].range.end < symbols[1].range.start);
         for symbol in symbols {
             assert_eq!(symbol.syntax_element_kind, Some("assignment_expression"));
-            assert!(!symbol.facets.contains(&SymbolFacet::Public));
+            assert!(!symbol.kinds.contains(&SymbolKind::Public));
         }
         let changed = analyze(&source.replace("return 2", "return 3"));
         assert_eq!(changed.symbols().len(), document.symbols().len());
@@ -773,7 +769,7 @@ mod tests {
                 .iter()
                 .find(|symbol| symbol.name == "open")
                 .expect("physical anonymous property binding");
-            assert!(!symbol.facets.contains(&SymbolFacet::Public), "{source}");
+            assert!(!symbol.kinds.contains(&SymbolKind::Public), "{source}");
             assert!(
                 document
                     .facts()
@@ -841,7 +837,7 @@ mod tests {
                     u64::try_from(expected_start).expect("supplied source offset")
                 );
                 assert_eq!(symbol.syntax_element_kind, Some("assignment_expression"));
-                assert!(!symbol.facets.contains(&SymbolFacet::Public));
+                assert!(!symbol.kinds.contains(&SymbolKind::Public));
                 let start = usize::try_from(symbol.item_range.start).expect("item start");
                 let end = usize::try_from(symbol.item_range.end).expect("item end");
                 assert!(source[start..end].starts_with(prefix));

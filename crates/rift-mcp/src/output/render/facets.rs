@@ -5,7 +5,7 @@ use super::layout;
 use crate::output::text::{TextError, TextWriter, quoted, visible};
 use rift_protocol::facets_read::FacetDeclaration;
 use rift_protocol::read::{
-    FacetRegion, FacetsResult, NodeFacet, SourceUnitId, SyntaxElement, TextRange,
+    FacetRegion, FacetsResult, SourceUnitId, SyntaxElement, SyntaxKind, TextRange,
 };
 const SEPARATOR: &str = " | ";
 
@@ -69,7 +69,7 @@ fn entry(out: &mut TextWriter, syntax_element: &SyntaxElement) -> Result<(), Tex
         unit: _,
         language: _,
         kind,
-        facets,
+        kinds,
         range,
         source,
         regions,
@@ -92,10 +92,10 @@ fn entry(out: &mut TextWriter, syntax_element: &SyntaxElement) -> Result<(), Tex
     if count > 1 {
         facts.push(format!("{count} lines"));
     }
-    if facets.contains(&NodeFacet::Generated) {
+    if kinds.contains(&SyntaxKind::Generated) {
         facts.push("generated".to_owned());
     }
-    if facets.contains(&NodeFacet::Test) {
+    if kinds.contains(&SyntaxKind::Test) {
         facts.push("test".to_owned());
     }
     facts.extend(region_facts(regions)?);

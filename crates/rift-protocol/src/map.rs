@@ -22,8 +22,8 @@ pub const MAP_DOCS_MAX: usize = 100;
 /// [`WorkspaceMap::packages`] entries one map carries, at most.
 pub const MAP_PACKAGES_MAX: usize = 1_000;
 
-/// [`WorkspaceMap::module_relationships`] entries one map carries, at most.
-pub const MAP_MODULE_RELATIONSHIPS_MAX: usize = 100;
+/// [`WorkspaceMap::module_edges`] entries one map carries, at most.
+pub const MAP_MODULE_EDGES_MAX: usize = 100;
 
 /// [`WorkspaceMap::recommendations`] entries one map carries, at most.
 pub const MAP_RECOMMENDATIONS_MAX: usize = 100;
@@ -68,11 +68,11 @@ pub struct WorkspaceMap {
     /// Modules the workspace resolved a reference between, ranked by that count descending
     /// with `from` then `to` breaking ties. A reference whose source or target is not
     /// project-located contributes none, and a reference between two files of one module is
-    /// not a relationship. At most [`MAP_MODULE_RELATIONSHIPS_MAX`] entries. Absent when
+    /// not an edge. At most [`MAP_MODULE_EDGES_MAX`] entries. Absent when
     /// empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 100))]
-    pub module_relationships: Vec<MapModuleRelationship>,
+    pub module_edges: Vec<MapModuleEdge>,
     /// Packages the workspace depends on, as its manifests and lockfiles state them, in
     /// `manager`, `name`, then selector order. Each entry carries the exact version a
     /// lockfile pins or the requirement a manifest declares, so a manifest-only project
@@ -123,7 +123,7 @@ pub struct MapRecommendation {
 /// Resolved references reaching from one listed module into another.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct MapModuleRelationship {
+pub struct MapModuleEdge {
     /// Project-relative directory the references were written in.
     pub from: ProjectPath,
     /// Project-relative directory the referenced declarations belong to.
@@ -207,7 +207,7 @@ mod tests {
             }],
             entry_points: vec![SymbolId("rift://symbol/local/rust/rift/main".to_owned())],
             docs: vec![ProjectPath("README.md".to_owned())],
-            module_relationships: vec![MapModuleRelationship {
+            module_edges: vec![MapModuleEdge {
                 from: ProjectPath("crates/rift-server".to_owned()),
                 to: ProjectPath("crates/rift-protocol".to_owned()),
                 references: 87,
@@ -278,7 +278,7 @@ mod tests {
         );
         assert_eq!(value["docs"][0], json!("README.md"));
         assert_eq!(
-            value["module_relationships"][0],
+            value["module_edges"][0],
             json!({
                 "from": "crates/rift-server",
                 "to": "crates/rift-protocol",
@@ -306,7 +306,7 @@ mod tests {
         empty.hubs.clear();
         empty.entry_points.clear();
         empty.docs.clear();
-        empty.module_relationships.clear();
+        empty.module_edges.clear();
         let value = serde_json::to_value(&empty).expect("workspace map serializes");
 
         assert!(value.get("languages").is_none());
@@ -314,7 +314,7 @@ mod tests {
         assert!(value.get("hubs").is_none());
         assert!(value.get("entry_points").is_none());
         assert!(value.get("docs").is_none());
-        assert!(value.get("module_relationships").is_none());
+        assert!(value.get("module_edges").is_none());
         assert!(value.get("recommendations").is_none());
 
         let deserialized: WorkspaceMap =
@@ -351,8 +351,8 @@ mod tests {
         );
         assert_eq!(properties["docs"]["maxItems"], json!(MAP_DOCS_MAX));
         assert_eq!(
-            properties["module_relationships"]["maxItems"],
-            json!(MAP_MODULE_RELATIONSHIPS_MAX)
+            properties["module_edges"]["maxItems"],
+            json!(MAP_MODULE_EDGES_MAX)
         );
         assert_eq!(properties["packages"]["maxItems"], json!(MAP_PACKAGES_MAX));
         assert_eq!(
@@ -383,7 +383,7 @@ mod tests {
             "hubs",
             "entry_points",
             "docs",
-            "module_relationships",
+            "module_edges",
             "packages",
             "recommendations",
         ] {

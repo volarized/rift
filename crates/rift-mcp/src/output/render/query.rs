@@ -491,7 +491,7 @@ fn write_query_warnings(out: &mut TextWriter, warnings: &[ReadWarning]) -> Resul
 
 fn query_warning_detail(warning: &ReadWarning) -> Option<&str> {
     match warning {
-        ReadWarning::RelationshipCoverageMissing { detail, .. }
+        ReadWarning::EdgeCoverageMissing { detail, .. }
         | ReadWarning::TraversalTruncated { detail, .. } => Some(detail),
         _ => None,
     }

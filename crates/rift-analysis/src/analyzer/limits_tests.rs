@@ -60,7 +60,7 @@ fn test_package_environment_overrides_reach_publication_and_retention() {
         ("RIFT_PACKAGE_IDENTIFIER_TERMS", "2"),
         ("RIFT_PACKAGE_RETAINED_SOURCE", "64b"),
         ("RIFT_PACKAGE_RETAINED_TOTAL", "256b"),
-        ("RIFT_SOURCE_RELATIONSHIPS", "1"),
+        ("RIFT_SOURCE_EDGES", "1"),
     ]);
     let accepted = accept_configuration::<WorkspaceConfiguration>(
         Some("[package]\nsymbols = 1\nretained_source = \"1b\"\n"),
@@ -87,7 +87,7 @@ fn test_package_environment_overrides_reach_publication_and_retention() {
             .all(|symbol| symbol.source_complete)
     );
     assert!(result.publication().warnings.is_empty());
-    assert_eq!(limits.relationships_max(), 1);
+    assert_eq!(limits.edges_max(), 1);
 }
 
 #[test]
@@ -123,16 +123,11 @@ fn test_package_publication_limits_validate_supported_capacity_and_ordering() {
                 .is_err()
         );
     }
+    assert!(ExactPackageLimits::new(2, 1024).with_edges(0).is_err());
     assert!(
         ExactPackageLimits::new(2, 1024)
-            .with_relationships(0)
-            .is_err()
-    );
-    assert!(
-        ExactPackageLimits::new(2, 1024)
-            .with_relationships(
-                usize::try_from(rift_protocol::source::SOURCE_RELATIONSHIPS_MAX)
-                    .expect("bound fits usize")
+            .with_edges(
+                usize::try_from(rift_protocol::source::SOURCE_EDGES_MAX).expect("bound fits usize")
                     + 1
             )
             .is_err()
@@ -151,7 +146,7 @@ fn test_package_publication_limits_validate_supported_capacity_and_ordering() {
 }
 
 #[test]
-fn test_relationship_configuration_preserves_declaration_only_package_analysis() {
+fn test_edge_configuration_preserves_declaration_only_package_analysis() {
     let package = identity();
     let owner = package.owner().expect("fixture owner");
     let language = language(ShippedLanguage::Rust);
@@ -161,21 +156,20 @@ fn test_relationship_configuration_preserves_declaration_only_package_analysis()
         &path,
         "pub fn alpha() {}\npub fn beta() {}\npub fn callers() { alpha(); beta(); }\n",
     )];
-    let analyze_bound = |relationships| {
+    let analyze_bound = |edges| {
         let mut configuration = WorkspaceConfiguration::default();
-        configuration.source.relationships = relationships;
-        let limits =
-            ExactPackageLimits::from_configuration(&configuration).expect("relationship bounds");
-        assert_eq!(limits.relationships_max() as u64, relationships);
+        configuration.source.edges = edges;
+        let limits = ExactPackageLimits::from_configuration(&configuration).expect("edge bounds");
+        assert_eq!(limits.edges_max() as u64, edges);
         let input = ExactPackageInput::new(&owner, &language, &origin, &files, limits)
             .expect("package input");
         PackageAnalyzer::analyze(input, 1).expect("package analysis")
     };
     let exact = analyze_bound(2);
-    assert!(exact.semantics.relationships().is_complete());
+    assert!(exact.semantics.edges().is_complete());
     let one_over = analyze_bound(1);
-    assert!(one_over.semantics.relationships().is_complete());
-    assert_eq!(one_over.semantics.relationships().dropped_edges(), 0);
+    assert!(one_over.semantics.edges().is_complete());
+    assert_eq!(one_over.semantics.edges().dropped_edges(), 0);
     assert_eq!(
         exact.publication().declarations,
         one_over.publication().declarations

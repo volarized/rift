@@ -1,7 +1,7 @@
 //! Syntax declarations, source fidelity, restoration, and bounds for shipped source grammars.
 
 use rift_core::ProjectPath;
-use rift_protocol::read::NodeFacet;
+use rift_protocol::read::SyntaxKind;
 use rift_syntax::{
     ShippedLanguage, SyntaxDocument, SyntaxFacts, SyntaxFactsParts, SyntaxLimits, SyntaxNames,
     SyntaxSource,
@@ -21,11 +21,11 @@ fn parsed(
         .expect("fixture parses within its bounds")
 }
 
-fn assert_syntax_element_facets(
+fn assert_syntax_element_kinds(
     shipped: ShippedLanguage,
     text: &str,
     expected: &[(&str, &str)],
-    facet: NodeFacet,
+    expected_kind: SyntaxKind,
 ) {
     let document = parsed(shipped, "source", text, SyntaxLimits::default());
     assert!(!document.has_errors());
@@ -39,13 +39,16 @@ fn assert_syntax_element_facets(
         let start = usize::try_from(syntax_element.range.start).expect("fixture start");
         let end = usize::try_from(syntax_element.range.end).expect("fixture end");
         assert_eq!(&text[start..end], *source);
-        assert_eq!(provider.syntax_element_facets(syntax_element.kind), [facet]);
+        assert_eq!(
+            provider.syntax_element_kinds(syntax_element.kind),
+            [expected_kind]
+        );
     }
 }
 
 #[test]
-fn css_literal_syntax_elements_preserve_original_values_and_facets() {
-    assert_syntax_element_facets(
+fn css_literal_syntax_elements_preserve_original_values_and_kinds() {
+    assert_syntax_element_kinds(
         ShippedLanguage::Css,
         ".lamp { color: #fff; width: 12px; content: \"灯\"; }",
         &[
@@ -53,18 +56,18 @@ fn css_literal_syntax_elements_preserve_original_values_and_facets() {
             ("integer_value", "12px"),
             ("string_value", "\"灯\""),
         ],
-        NodeFacet::Literal,
+        SyntaxKind::Literal,
     );
 }
 
 #[test]
 fn html_declaration_syntax_elements_preserve_original_elements_and_attributes() {
     let text = "<section title=\"灯\">beacon</section>";
-    assert_syntax_element_facets(
+    assert_syntax_element_kinds(
         ShippedLanguage::Html,
         text,
         &[("element", text), ("attribute", "title=\"灯\"")],
-        NodeFacet::Declaration,
+        SyntaxKind::Declaration,
     );
 }
 

@@ -61,7 +61,7 @@ pub struct ExactPackageLimits {
     bytes_max: u64,
     retained_source: Option<RetainedSourceLimits>,
     publication: Option<rift_protocol::configuration::PackageConfiguration>,
-    relationships_max: Option<usize>,
+    edges_max: Option<usize>,
     documentation: Option<crate::documentation::DocumentationLimits>,
     #[cfg(feature = "collector")]
     declarations_max: Option<u32>,
@@ -78,7 +78,7 @@ impl ExactPackageLimits {
             bytes_max,
             retained_source: None,
             publication: None,
-            relationships_max: None,
+            edges_max: None,
             documentation: None,
             #[cfg(feature = "collector")]
             declarations_max: None,
@@ -195,7 +195,7 @@ impl ExactPackageLimits {
             .with_syntax(syntax)
             .with_documentation(documentation)
             .with_declarations(source.declarations as u32)?
-            .with_relationships(source.relationships as usize)?
+            .with_edges(source.edges as usize)?
             .with_publication(configuration.package)
     }
 
@@ -231,13 +231,13 @@ impl ExactPackageLimits {
         self.publication.unwrap_or_default()
     }
 
-    /// Sets the relationship edge capacity used by semantic assembly.
+    /// Sets the edge edge capacity used by semantic assembly.
     ///
     /// # Errors
     /// Returns a configuration error for zero or capacity above the supported range.
-    pub fn with_relationships(self, maximum: usize) -> Result<Self, RiftError> {
+    pub fn with_edges(self, maximum: usize) -> Result<Self, RiftError> {
         let source = rift_protocol::source::SourceConfiguration {
-            relationships: maximum as u64,
+            edges: maximum as u64,
             ..rift_protocol::source::SourceConfiguration::default()
         };
         let configuration = rift_protocol::configuration::WorkspaceConfiguration {
@@ -248,16 +248,16 @@ impl ExactPackageLimits {
             .validate()
             .map_err(|violation| rift_core::configuration_violation_error(&violation))?;
         Ok(Self {
-            relationships_max: Some(maximum),
+            edges_max: Some(maximum),
             ..self
         })
     }
 
     #[cfg(feature = "collector")]
-    pub(crate) fn relationships_max(self) -> usize {
-        self.relationships_max.unwrap_or_else(|| {
-            usize::try_from(rift_protocol::source::SOURCE_RELATIONSHIPS_DEFAULT)
-                .expect("default relationship count fits usize")
+    pub(crate) fn edges_max(self) -> usize {
+        self.edges_max.unwrap_or_else(|| {
+            usize::try_from(rift_protocol::source::SOURCE_EDGES_DEFAULT)
+                .expect("default edge count fits usize")
         })
     }
 

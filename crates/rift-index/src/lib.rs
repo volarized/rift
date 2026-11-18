@@ -16,7 +16,7 @@ mod producer;
 mod semantic;
 mod trigram_store;
 
-mod relationship;
+mod edge;
 mod revision;
 mod vector;
 mod workspace;
@@ -30,6 +30,7 @@ pub use content_cache::WorkspaceContentCache;
 pub use database::{
     DatabaseName, DatabasePool, DatabaseReadings, HeldConnection, WorkspaceDatabase,
 };
+pub use edge::{EDGES_MAX, Edge, EdgeStore};
 pub use language::{EffectiveLanguage, WorkspaceLanguagePolicy};
 pub use lazy_database::LazyDatabase;
 pub use lexical::{
@@ -41,7 +42,6 @@ pub use producer::{
     ExtractionInput, FactExtractor, PRODUCER_FACTS_MAX, PublicationSyntax, accept_extracted_facts,
     accept_producer_facts,
 };
-pub use relationship::{RELATIONSHIP_EDGES_MAX, RelationshipEdge, RelationshipStore};
 pub use revision::RevisionPaths;
 pub use rift_analysis::documentation::{
     DocumentationCollection, documentation_context, documentation_context_with_budget,

@@ -14,7 +14,7 @@ use rift_protocol::revision::Revision;
 use rift_search::sparql::{GraphDatasetBuilder, GraphFact, RevisionIri, SymbolAddress};
 use rift_server::{CalleePackage, CalleeRoots, PackageCallee};
 
-use super::relationships::coverage_failure;
+use super::edges::coverage_failure;
 
 pub(super) struct InstalledTarget {
     pub(super) callee: PackageCallee,
@@ -184,7 +184,7 @@ impl InstalledTarget {
                         unit: self.unit.clone(),
                         language: self.symbol.language.clone(),
                         kind: rift_protocol::read::ExactKind(kind),
-                        facets: Vec::new(),
+                        kinds: Vec::new(),
                         range: range.clone(),
                         source,
                         regions: Vec::new(),

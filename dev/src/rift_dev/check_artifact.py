@@ -103,7 +103,7 @@ async def symbol_read(client: Client, hit: JsonObject) -> JsonObject:
 
 
 async def incoming_references(client: Client, seed: str) -> JsonObject:
-    """Read incoming reference relationships through the served query surface."""
+    """Read incoming reference edges through the served query surface."""
     return await client.call("search", incoming_references_request(seed))
 
 

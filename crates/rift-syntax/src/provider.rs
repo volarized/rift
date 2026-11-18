@@ -6,7 +6,7 @@ use rift_error::errors;
 use rift_protocol::configuration::{
     SYNTAX_DEPTH_DEFAULT, SYNTAX_ELEMENTS_DEFAULT, SYNTAX_FILE_BYTES_DEFAULT, SyntaxConfiguration,
 };
-use rift_protocol::read::{Language, NodeFacet};
+use rift_protocol::read::{Language, SyntaxKind};
 use serde::Serialize;
 
 use crate::document::SyntaxDocument;
@@ -212,8 +212,8 @@ pub trait SyntaxProvider: std::fmt::Debug + Send + Sync {
         limits: SyntaxLimits,
     ) -> Result<SyntaxDocument, RiftError>;
 
-    /// Portable structural facets for one grammar syntax element kind.
-    fn syntax_element_facets(&self, kind: &str) -> Vec<NodeFacet>;
+    /// Portable structural kinds for one grammar syntax element kind.
+    fn syntax_element_kinds(&self, kind: &str) -> Vec<SyntaxKind>;
 }
 
 #[cfg(test)]

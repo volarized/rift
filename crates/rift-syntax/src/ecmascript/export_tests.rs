@@ -110,8 +110,8 @@ fn named_aliases_keep_defining_names_and_reexport_sources() {
             .collect::<Vec<_>>(),
         ["format2", "SemVer", "SemVer.format"]
     );
-    assert!(document.symbols()[0].facets.contains(&SymbolFacet::Public));
-    assert!(!document.symbols()[2].facets.contains(&SymbolFacet::Public));
+    assert!(document.symbols()[0].kinds.contains(&SymbolKind::Public));
+    assert!(!document.symbols()[2].kinds.contains(&SymbolKind::Public));
 }
 
 #[test]
@@ -263,8 +263,8 @@ fn declared_exports_keep_bindings_public_facts_and_complete_statement_ranges() {
             .iter()
             .find(|symbol| symbol.name == "format")
             .expect("declared function");
-        assert!(format.facets.contains(&SymbolFacet::Public));
-        assert!(format.facets.contains(&SymbolFacet::Callable));
+        assert!(format.kinds.contains(&SymbolKind::Public));
+        assert!(format.kinds.contains(&SymbolKind::Callable));
         assert_eq!(format.range, bindings[0].range);
         assert_eq!(
             token(text, Some(format.item_range)),
@@ -276,14 +276,14 @@ fn declared_exports_keep_bindings_public_facts_and_complete_statement_ranges() {
             .iter()
             .find(|symbol| symbol.name == "hidden")
             .expect("unexported declaration");
-        assert!(!hidden.facets.contains(&SymbolFacet::Public));
+        assert!(!hidden.kinds.contains(&SymbolKind::Public));
         assert!(bindings.iter().all(|binding| binding.container.is_none()));
         assert!(
             document
                 .symbols()
                 .iter()
                 .filter(|symbol| { matches!(symbol.name.as_str(), "run" | "nested") })
-                .all(|symbol| !symbol.facets.contains(&SymbolFacet::Public))
+                .all(|symbol| !symbol.kinds.contains(&SymbolKind::Public))
         );
     }
 }
@@ -299,9 +299,9 @@ fn declared_function_types_keep_variable_kind_and_callable_fact() {
             }
             assert_eq!(symbol.kind, "variable");
             assert!(symbol.signatures.is_empty());
-            assert!(symbol.facets.contains(&SymbolFacet::Value));
+            assert!(symbol.kinds.contains(&SymbolKind::Value));
             assert_eq!(
-                symbol.facets.contains(&SymbolFacet::Callable),
+                symbol.kinds.contains(&SymbolKind::Callable),
                 symbol.name == "parse"
             );
         }

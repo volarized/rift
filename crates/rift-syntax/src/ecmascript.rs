@@ -9,7 +9,7 @@
 //! Decisions this module fixes for the family:
 //! - Qualified names join with `.`, the member access spelling
 //!   (`Router.route`), the way `rust` joins with `::`.
-//! - The `Public` facet marks a declaration the module exports. An `export`
+//! - The `Public` kind marks a declaration the module exports. An `export`
 //!   statement wrapping a declaration adds it, and so does an export naming a
 //!   module-scope declaration: `a` and `b` in `export { a, b as c }`, `a` in
 //!   `export default a` and the TypeScript `export = a`, and the declarations
@@ -24,7 +24,7 @@
 //!   module's declarations, so it marks none here. An anonymous function in a
 //!   literal property assignment (`exports.run = function () {}`) retains the
 //!   property binding and the original function source. The binding carries no
-//!   `Public` facet without supported module export context. Named function and
+//!   `Public` kind without supported module export context. Named function and
 //!   class expressions assigned to an export add no declaration.
 //! - `export` is not a visibility spelling: the `visibility` field carries
 //!   only an authored `accessibility_modifier` (`public`, `private`,
@@ -52,7 +52,7 @@
 //!   stripped and `@` tags kept as written. A `//` or `/* */` comment is not
 //!   documentation, and it stops the walk, as a blank line does. A
 //!   `Signature` renders for a callable declaration from `body_range` and the
-//!   `Callable` facet, and a bodyless one, an overload or a member signature,
+//!   `Callable` kind, and a bodyless one, an overload or a member signature,
 //!   renders its own text.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -60,7 +60,7 @@ use std::num::NonZeroU16;
 
 use rift_core::line::{LINE_FEED, LineEnding, lines_inclusive, without_ending};
 use rift_error::errors;
-use rift_protocol::read::{Documentation, DocumentationFormat, Language, NodeFacet, SymbolFacet};
+use rift_protocol::read::{Documentation, DocumentationFormat, Language, SymbolKind, SyntaxKind};
 mod commonjs;
 
 use tree_sitter::{Node, Parser};
@@ -200,14 +200,14 @@ impl EcmaScriptSymbolKind {
         }
     }
 
-    /// Portable facets for this kind, before an export adds `Public`.
-    fn facets(self) -> Vec<SymbolFacet> {
+    /// Portable kinds for this kind, before an export adds `Public`.
+    fn kinds(self) -> Vec<SymbolKind> {
         match self {
-            Self::Function | Self::Method => vec![SymbolFacet::Value, SymbolFacet::Callable],
-            Self::Class | Self::Interface | Self::Enum => vec![SymbolFacet::Type],
-            Self::TypeAlias => vec![SymbolFacet::Type, SymbolFacet::Alias],
-            Self::Variable | Self::Property => vec![SymbolFacet::Value],
-            Self::Namespace => vec![SymbolFacet::Namespace],
+            Self::Function | Self::Method => vec![SymbolKind::Value, SymbolKind::Callable],
+            Self::Class | Self::Interface | Self::Enum => vec![SymbolKind::Type],
+            Self::TypeAlias => vec![SymbolKind::Type, SymbolKind::Alias],
+            Self::Variable | Self::Property => vec![SymbolKind::Value],
+            Self::Namespace => vec![SymbolKind::Namespace],
         }
     }
 
@@ -1159,7 +1159,7 @@ impl GrammarRules for EcmaScriptRules<'_> {
             return Ok(Some(Declaration {
                 name: name.to_owned(),
                 kind: EcmaScriptSymbolKind::Function.word(),
-                facets: EcmaScriptSymbolKind::Function.facets(),
+                kinds: EcmaScriptSymbolKind::Function.kinds(),
                 visibility: None,
                 body_range: body.map(extract::byte_range).transpose()?,
                 documentation: Vec::new(),
@@ -1175,7 +1175,7 @@ impl GrammarRules for EcmaScriptRules<'_> {
         let Some(name) = self.declaration_name(syntax_element, kind, text) else {
             return Ok(None);
         };
-        let mut facets = kind.facets();
+        let mut kinds = kind.kinds();
         if kind == EcmaScriptSymbolKind::Variable
             && self.kinds.declaration_type.is_some_and(|field| {
                 syntax_element
@@ -1188,17 +1188,17 @@ impl GrammarRules for EcmaScriptRules<'_> {
                     })
             })
         {
-            facets.push(SymbolFacet::Callable);
+            kinds.push(SymbolKind::Callable);
         }
         if self.exported(visited, &name) {
-            facets.push(SymbolFacet::Public);
+            kinds.push(SymbolKind::Public);
         }
         let (documentation, documentation_ranges) =
             self.attached_jsdoc(self.statement(visited), text)?;
         Ok(Some(Declaration {
             name,
             kind: kind.word(),
-            facets,
+            kinds,
             visibility: self.accessibility(syntax_element, text),
             body_range: self.body_range(syntax_element, kind)?,
             documentation,
@@ -1354,10 +1354,10 @@ pub(crate) fn analyze_included(
     .with_syntax_limits(limits))
 }
 
-/// Portable structural facets for one ECMAScript grammar syntax element kind, shared
+/// Portable structural kinds for one ECMAScript grammar syntax element kind, shared
 /// by all three providers: every declaration kind the rules interpret maps
 /// to `Declaration`, and the grammar's suffix conventions classify the rest.
-pub(crate) fn syntax_element_facets(kind: &str) -> Vec<NodeFacet> {
+pub(crate) fn syntax_element_kinds(kind: &str) -> Vec<SyntaxKind> {
     match kind {
         FUNCTION_DECLARATION_KIND
         | GENERATOR_FUNCTION_DECLARATION_KIND
@@ -1368,41 +1368,41 @@ pub(crate) fn syntax_element_facets(kind: &str) -> Vec<NodeFacet> {
         | ENUM_DECLARATION_KIND
         | TYPE_ALIAS_DECLARATION_KIND
         | INTERNAL_MODULE_KIND
-        | MODULE_KIND => vec![NodeFacet::Declaration, NodeFacet::Definition],
+        | MODULE_KIND => vec![SyntaxKind::Declaration, SyntaxKind::Definition],
         FUNCTION_SIGNATURE_KIND | METHOD_SIGNATURE_KIND | PROPERTY_SIGNATURE_KIND => {
-            vec![NodeFacet::Declaration]
+            vec![SyntaxKind::Declaration]
         }
         LEXICAL_DECLARATION_KIND | VARIABLE_DECLARATION_KIND => {
-            vec![NodeFacet::Declaration, NodeFacet::Statement]
+            vec![SyntaxKind::Declaration, SyntaxKind::Statement]
         }
-        EXPORT_STATEMENT_KIND => vec![NodeFacet::Export, NodeFacet::Statement],
-        "import_statement" => vec![NodeFacet::Import, NodeFacet::Statement],
-        "statement_block" => vec![NodeFacet::Block],
-        CLASS_BODY_KIND | INTERFACE_BODY_KIND | "enum_body" => vec![NodeFacet::Body],
-        "required_parameter" | "optional_parameter" => vec![NodeFacet::Parameter],
-        "decorator" => vec![NodeFacet::Annotation],
-        "comment" | "html_comment" => vec![NodeFacet::Comment],
-        "type_annotation" => vec![NodeFacet::TypeExpression],
+        EXPORT_STATEMENT_KIND => vec![SyntaxKind::Export, SyntaxKind::Statement],
+        "import_statement" => vec![SyntaxKind::Import, SyntaxKind::Statement],
+        "statement_block" => vec![SyntaxKind::Block],
+        CLASS_BODY_KIND | INTERFACE_BODY_KIND | "enum_body" => vec![SyntaxKind::Body],
+        "required_parameter" | "optional_parameter" => vec![SyntaxKind::Parameter],
+        "decorator" => vec![SyntaxKind::Annotation],
+        "comment" | "html_comment" => vec![SyntaxKind::Comment],
+        "type_annotation" => vec![SyntaxKind::TypeExpression],
         "arrow_function" | "jsx_element" | "jsx_self_closing_element" => {
-            vec![NodeFacet::Expression]
+            vec![SyntaxKind::Expression]
         }
-        suffixed => suffix_facets(suffixed),
+        suffixed => suffix_kinds(suffixed),
     }
 }
 
 /// The grammar's spelling conventions for kinds outside the named table.
-fn suffix_facets(kind: &str) -> Vec<NodeFacet> {
-    let mut facets = Vec::new();
+fn suffix_kinds(kind: &str) -> Vec<SyntaxKind> {
+    let mut kinds = Vec::new();
     if kind.ends_with("_statement") {
-        facets.push(NodeFacet::Statement);
+        kinds.push(SyntaxKind::Statement);
     }
     if kind.ends_with("_expression") {
-        facets.push(NodeFacet::Expression);
+        kinds.push(SyntaxKind::Expression);
     }
     if kind.ends_with("_type") {
-        facets.push(NodeFacet::TypeExpression);
+        kinds.push(SyntaxKind::TypeExpression);
     }
-    facets
+    kinds
 }
 
 pub(crate) fn restored_symbol_kind(kinds: &EcmaScriptKinds, name: &str) -> Option<&'static str> {
@@ -1469,10 +1469,10 @@ mod tests {
     }
 
     /// Every declaration kind the rules interpret carries the `Declaration`
-    /// facet, so the syntax element table stays exhaustive over the interpreted
+    /// kind, so the syntax element table stays exhaustive over the interpreted
     /// vocabulary.
     #[test]
-    fn test_syntax_element_facets_classify_every_interpreted_declaration_kind() {
+    fn test_syntax_element_kinds_classify_every_interpreted_declaration_kind() {
         for kind in [
             FUNCTION_DECLARATION_KIND,
             GENERATOR_FUNCTION_DECLARATION_KIND,
@@ -1490,52 +1490,52 @@ mod tests {
             VARIABLE_DECLARATION_KIND,
         ] {
             assert!(
-                syntax_element_facets(kind).contains(&NodeFacet::Declaration),
+                syntax_element_kinds(kind).contains(&SyntaxKind::Declaration),
                 "kind {kind} must classify as a declaration"
             );
         }
     }
 
     #[test]
-    fn test_syntax_element_facets_classify_structure_boundaries_and_suffix_conventions() {
+    fn test_syntax_element_kinds_classify_structure_boundaries_and_suffix_conventions() {
         assert_eq!(
-            syntax_element_facets("export_statement"),
-            [NodeFacet::Export, NodeFacet::Statement]
+            syntax_element_kinds("export_statement"),
+            [SyntaxKind::Export, SyntaxKind::Statement]
         );
         assert_eq!(
-            syntax_element_facets("import_statement"),
-            [NodeFacet::Import, NodeFacet::Statement]
+            syntax_element_kinds("import_statement"),
+            [SyntaxKind::Import, SyntaxKind::Statement]
         );
-        assert_eq!(syntax_element_facets("statement_block"), [NodeFacet::Block]);
-        assert_eq!(syntax_element_facets("class_body"), [NodeFacet::Body]);
-        assert_eq!(syntax_element_facets("interface_body"), [NodeFacet::Body]);
-        assert_eq!(syntax_element_facets("enum_body"), [NodeFacet::Body]);
+        assert_eq!(syntax_element_kinds("statement_block"), [SyntaxKind::Block]);
+        assert_eq!(syntax_element_kinds("class_body"), [SyntaxKind::Body]);
+        assert_eq!(syntax_element_kinds("interface_body"), [SyntaxKind::Body]);
+        assert_eq!(syntax_element_kinds("enum_body"), [SyntaxKind::Body]);
         assert_eq!(
-            syntax_element_facets("required_parameter"),
-            [NodeFacet::Parameter]
+            syntax_element_kinds("required_parameter"),
+            [SyntaxKind::Parameter]
         );
-        assert_eq!(syntax_element_facets("decorator"), [NodeFacet::Annotation]);
-        assert_eq!(syntax_element_facets("comment"), [NodeFacet::Comment]);
+        assert_eq!(syntax_element_kinds("decorator"), [SyntaxKind::Annotation]);
+        assert_eq!(syntax_element_kinds("comment"), [SyntaxKind::Comment]);
         assert_eq!(
-            syntax_element_facets("type_annotation"),
-            [NodeFacet::TypeExpression]
-        );
-        assert_eq!(
-            syntax_element_facets("jsx_element"),
-            [NodeFacet::Expression]
+            syntax_element_kinds("type_annotation"),
+            [SyntaxKind::TypeExpression]
         );
         assert_eq!(
-            syntax_element_facets("return_statement"),
-            [NodeFacet::Statement]
+            syntax_element_kinds("jsx_element"),
+            [SyntaxKind::Expression]
         );
         assert_eq!(
-            syntax_element_facets("binary_expression"),
-            [NodeFacet::Expression]
+            syntax_element_kinds("return_statement"),
+            [SyntaxKind::Statement]
         );
         assert_eq!(
-            syntax_element_facets("predefined_type"),
-            [NodeFacet::TypeExpression]
+            syntax_element_kinds("binary_expression"),
+            [SyntaxKind::Expression]
         );
-        assert_eq!(syntax_element_facets("identifier"), []);
+        assert_eq!(
+            syntax_element_kinds("predefined_type"),
+            [SyntaxKind::TypeExpression]
+        );
+        assert_eq!(syntax_element_kinds("identifier"), []);
     }
 }

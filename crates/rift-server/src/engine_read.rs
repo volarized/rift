@@ -1,4 +1,4 @@
-//! Relationship traversal through configured language engines: incoming references,
+//! Edge traversal through configured language engines: incoming references,
 //! and outgoing calls through call hierarchy.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -6,17 +6,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use lsp_types::{CallHierarchyOutgoingCall, Location, Position, Range, Uri};
 use rift_core::{ProjectPath, SymbolId as CoreSymbolId};
 use rift_error::errors;
-use rift_index::{IndexedFile, RelationshipStore};
+use rift_index::{EdgeStore, IndexedFile};
 use rift_lsp::capabilities::PositionEncoding;
 use rift_lsp::position::LineIndex;
 use rift_lsp::session::EngineSession;
 use rift_lsp::uri::TreeRoot;
+use rift_protocol::edge_read::QueryOccurrence;
 use rift_protocol::read::{
-    ExactKind, Extensions, GraphHop, HopDirection, Language, ReadWarning, Relationship,
-    RelationshipDerivation, RelationshipFacet, SearchParams, SearchParamsTarget, SearchTraversal,
-    SourceUnitId, SourceUnitSpan, Symbol, SymbolId, TextRange, TraversalDirection,
+    Edge, EdgeDerivation, EdgeKind, ExactKind, Extensions, GraphHop, HopDirection, Language,
+    ReadWarning, SearchParams, SearchParamsTarget, SearchTraversal, SourceUnitId, SourceUnitSpan,
+    Symbol, SymbolId, TextRange, TraversalDirection,
 };
-use rift_protocol::relationship_read::QueryOccurrence;
 use rift_syntax::SyntaxSymbol;
 use tokio::time::Instant;
 
@@ -26,7 +26,7 @@ use crate::callee::{
 use crate::engine::{EnginePool, EngineSlot, OutgoingAnswer, SessionFuture};
 use crate::read::{ReadService, RiftError, symbol_id};
 use crate::traversal::{
-    TRAVERSAL_SYMBOLS_MAX, engine_facet, resolve_graph_symbol, validate_traversal,
+    TRAVERSAL_SYMBOLS_MAX, engine_kind, resolve_graph_symbol, validate_traversal,
     walk_traversal_with_references,
 };
 
@@ -88,7 +88,7 @@ impl EngineReferences {
     ///
     /// An engine answering about bytes the served revision does not carry holds an
     /// older view of the whole tree, not of one location, so the edges it already gave
-    /// for this read are dropped with the rest. The indexed relationships answer, and
+    /// for this read are dropped with the rest. The indexed edges answer, and
     /// the warning names the analysis that is missing from them. What the dropped
     /// answers said about callees and readiness leaves with them.
     fn degrade(&mut self, warning: ReadWarning) {
@@ -165,9 +165,9 @@ impl EngineReferences {
             };
             let caller = SymbolId(callee.caller().as_str().to_owned());
             let edges = self.outgoing.entry(callee.caller().clone()).or_default();
-            if !edges.iter().any(|edge| edge.relationship.to == id) {
+            if !edges.iter().any(|edge| edge.edge.to == id) {
                 edges.push(call_hop(&caller, id));
-                edges.sort_by(|left, right| left.relationship.to.cmp(&right.relationship.to));
+                edges.sort_by(|left, right| left.edge.to.cmp(&right.edge.to));
             }
             self.package_declarations.entry(end).or_insert(declaration);
         }
@@ -232,13 +232,13 @@ pub fn uses_engine_references(
             .violation("not a symbol identity")
             .error()
     })?;
-    reachable_reference_source(reads.relationships(), &seed, traversal, |identity| {
+    reachable_reference_source(reads.edges(), &seed, traversal, |identity| {
         Ok(reference_source(reads, engines, identity)?.is_some())
     })
 }
 
 fn reachable_reference_source(
-    store: &RelationshipStore,
+    store: &EdgeStore,
     seed: &CoreSymbolId,
     traversal: &SearchTraversal,
     has_source: impl Fn(&CoreSymbolId) -> Result<bool, RiftError>,
@@ -279,10 +279,8 @@ fn reference_traversal(params: &SearchParams) -> Option<(&SearchTraversal, &Symb
         params.target,
         SearchParamsTarget::All | SearchParamsTarget::Symbol
     );
-    let served = traversal.facets.is_empty()
-        || traversal
-            .facets
-            .contains(&engine_facet(traversal.direction));
+    let served =
+        traversal.kinds.is_empty() || traversal.kinds.contains(&engine_kind(traversal.direction));
     (current && symbols && served).then_some((traversal, seed))
 }
 
@@ -307,9 +305,9 @@ fn reference_source<'source>(
 }
 
 /// Resolves incoming references or outgoing calls while retaining every indexed
-/// relationship.
+/// edge.
 ///
-/// Only current-tree symbol traversals that name no facet, or name the engine facet of
+/// Only current-tree symbol traversals that name no kind, or name the engine kind of
 /// their direction, consult engines: `references` incoming, `calls` outgoing.
 /// The traversal's existing depth and syntax element bounds also bound engine requests. Each
 /// exchange uses the selected engine's retry and restart policy. The caller applies
@@ -318,7 +316,7 @@ fn reference_source<'source>(
 ///
 /// An engine answering about bytes the served revision does not carry, or answering more
 /// than the traversal bound carries, has its whole contribution dropped: the result holds
-/// the indexed relationships and an `engine_analysis_unavailable` warning naming what is
+/// the indexed edges and an `engine_analysis_unavailable` warning naming what is
 /// missing. No such condition refuses the read, because no resend of the same request
 /// clears it.
 ///
@@ -407,7 +405,7 @@ pub async fn resolve_engine_references(
         let mut step = traversal.clone();
         step.depth = depth + 1;
         pending = walk_traversal_with_references(
-            reads.relationships(),
+            reads.edges(),
             &seed,
             &step,
             TRAVERSAL_SYMBOLS_MAX,
@@ -491,7 +489,7 @@ enum SymbolReferences {
     },
     /// No engine serves this seed, or the one that does advertises no references
     /// capability. The indexed answer stands unchanged, and carries no warning: the
-    /// caller asked for relationships, not for an engine.
+    /// caller asked for edges, not for an engine.
     NotServed,
     /// The engine answered about bytes the served revision does not carry, so nothing it
     /// said maps into the tree this read serves.
@@ -586,14 +584,14 @@ fn callee_hops(seed: &SymbolId, callees: impl IntoIterator<Item = SymbolId>) -> 
 /// The outgoing edge from `from` to the declaration `to` it calls.
 fn call_hop(from: &SymbolId, to: SymbolId) -> GraphHop {
     GraphHop {
-        relationship: Relationship {
+        edge: Edge {
             producer: None,
             from: from.clone(),
             to,
-            kind: ExactKind(RelationshipFacet::Calls.as_ref().to_owned()),
-            facets: vec![RelationshipFacet::Calls],
+            kind: ExactKind(EdgeKind::Calls.as_ref().to_owned()),
+            kinds: vec![EdgeKind::Calls],
             occurrence: None,
-            derivation: RelationshipDerivation::Resolution,
+            derivation: EdgeDerivation::Resolution,
             confidence: None,
             extensions: Extensions::default(),
         },
@@ -1258,7 +1256,7 @@ async fn resolve_symbol_references(
 /// What one mapped engine answer contributes to the read.
 ///
 /// An answer the served bytes cannot carry drops the engine's contribution and
-/// leaves the indexed relationships standing. Every other failure is the engine
+/// leaves the indexed edges standing. Every other failure is the engine
 /// tier's own, and still refuses the read: a broken document URI or a workspace
 /// root the server cannot address says nothing about the engine's revision, and
 /// degrading it would hide a defect behind a warning.
@@ -1551,7 +1549,7 @@ fn captured_references(
                     end: range.end,
                 },
             },
-            facet: RelationshipFacet::References,
+            kind: EdgeKind::References,
         });
     }
     Ok(GraphReferences {
@@ -1682,7 +1680,7 @@ async fn engine_graph_references(
                         end: key.2,
                     },
                 },
-                facet: RelationshipFacet::References,
+                kind: EdgeKind::References,
             };
             found.insert(key, occurrence);
         }
@@ -1725,14 +1723,14 @@ fn map_references(
     Ok(callers
         .into_iter()
         .map(|caller| GraphHop {
-            relationship: Relationship {
+            edge: Edge {
                 producer: None,
                 from: caller,
                 to: SymbolId(target.as_str().to_owned()),
-                kind: ExactKind(RelationshipFacet::References.as_ref().to_owned()),
-                facets: vec![RelationshipFacet::References],
+                kind: ExactKind(EdgeKind::References.as_ref().to_owned()),
+                kinds: vec![EdgeKind::References],
                 occurrence: None,
-                derivation: RelationshipDerivation::Resolution,
+                derivation: EdgeDerivation::Resolution,
                 confidence: None,
                 extensions: Extensions::default(),
             },
@@ -1879,16 +1877,13 @@ mod tests {
         );
         let reached: Vec<_> = hops
             .iter()
-            .map(|hop| hop.relationship.to.0.rsplit('/').next().unwrap_or_default())
+            .map(|hop| hop.edge.to.0.rsplit('/').next().unwrap_or_default())
             .collect();
         assert_eq!(reached, ["join", "max", "maximum"]);
         for hop in &hops {
             assert_eq!(hop.direction, rift_protocol::read::HopDirection::Outgoing);
-            assert_eq!(hop.relationship.from, id("seed"));
-            assert_eq!(
-                hop.relationship.facets,
-                [rift_protocol::read::RelationshipFacet::Calls]
-            );
+            assert_eq!(hop.edge.from, id("seed"));
+            assert_eq!(hop.edge.kinds, [rift_protocol::read::EdgeKind::Calls]);
         }
     }
 
@@ -2158,7 +2153,7 @@ mod tests {
         let edges: Vec<&SymbolId> = references
             .outgoing(&caller)
             .iter()
-            .map(|edge| &edge.relationship.to)
+            .map(|edge| &edge.edge.to)
             .collect();
         assert_eq!(edges, [&len], "one edge per callee declaration");
         assert_eq!(references.dropped_callees, 1, "`loads` is named nothing");
@@ -2281,7 +2276,7 @@ mod tests {
                 json!({"scope": "global"}),
                 errors::server::read_invalid::SLUG,
                 "violation",
-                "the relationship graph serves the project alone",
+                "the edge graph serves the project alone",
             ),
         ] {
             for direction in ["incoming", "outgoing"] {
@@ -2345,7 +2340,7 @@ mod tests {
     }
 
     fn request(seed: &SymbolId) -> SearchParams {
-        serde_json::from_value(json!({"target":"symbol","traversal":{"seed":seed,"direction":"incoming","facets":["references"]}})).expect("traversal request")
+        serde_json::from_value(json!({"target":"symbol","traversal":{"seed":seed,"direction":"incoming","kinds":["references"]}})).expect("traversal request")
     }
 
     fn location(root: &std::path::Path, path: &str, line: u32, start: u32, end: u32) -> Location {
@@ -2427,11 +2422,11 @@ mod tests {
         };
         let edges = map_references(&reads, &target, report, directory.path())?;
         assert_eq!(edges.len(), 1);
-        assert_eq!(edges[0].relationship.from, symbol(&reads, "caller"));
-        assert_eq!(edges[0].relationship.to, seed);
+        assert_eq!(edges[0].edge.from, symbol(&reads, "caller"));
+        assert_eq!(edges[0].edge.to, seed);
         assert_eq!(
-            edges[0].relationship.facets,
-            vec![rift_protocol::read::RelationshipFacet::References]
+            edges[0].edge.kinds,
+            vec![rift_protocol::read::EdgeKind::References]
         );
         Ok(())
     }
@@ -2609,12 +2604,9 @@ mod tests {
         let references = result?;
         let seed = rift_core::SymbolId::new(symbol(&reads, "beacon").0)?;
         let caller = rift_core::SymbolId::new(symbol(&reads, "caller").0)?;
+        assert_eq!(references.incoming(&seed)[0].edge.from.0, caller.as_str());
         assert_eq!(
-            references.incoming(&seed)[0].relationship.from.0,
-            caller.as_str()
-        );
-        assert_eq!(
-            references.incoming(&caller)[0].relationship.from,
+            references.incoming(&caller)[0].edge.from,
             symbol(&reads, "outer")
         );
         let answer =
@@ -2714,9 +2706,8 @@ mod tests {
         let prior_edges = (0..super::TRAVERSAL_SYMBOLS_MAX)
             .map(|index| {
                 let mut edge = edge.clone();
-                edge.relationship.from =
-                    SymbolId(format!("rift://symbol/python/prior.py/caller_{index}"));
-                edge.relationship.to = SymbolId(prior.as_str().to_owned());
+                edge.edge.from = SymbolId(format!("rift://symbol/python/prior.py/caller_{index}"));
+                edge.edge.to = SymbolId(prior.as_str().to_owned());
                 edge
             })
             .collect();
@@ -3028,8 +3019,8 @@ mod tests {
         let base = request(&symbol(&reads, "beacon"));
         assert!(super::uses_engine_references(&reads, &engines, &base)?);
         let mut calls = base.clone();
-        calls.traversal.as_mut().expect("traversal").facets =
-            vec![rift_protocol::read::RelationshipFacet::Calls];
+        calls.traversal.as_mut().expect("traversal").kinds =
+            vec![rift_protocol::read::EdgeKind::Calls];
         let mut files = base;
         files.target = rift_protocol::read::SearchParamsTarget::File;
         for params in [calls, files] {
@@ -3050,7 +3041,7 @@ mod tests {
         let mut traversal = request(&SymbolId(seed.as_str().to_owned()))
             .traversal
             .expect("traversal");
-        traversal.facets.clear();
+        traversal.kinds.clear();
         let selected = |identity: &rift_core::SymbolId| identity == &caller;
         assert!(!selected(&seed));
         assert!(!super::reachable_reference_source(
@@ -3066,7 +3057,7 @@ mod tests {
             &traversal,
             |identity| Ok(selected(identity))
         )?);
-        traversal.facets = vec![rift_protocol::read::RelationshipFacet::References];
+        traversal.kinds = vec![rift_protocol::read::EdgeKind::References];
         assert!(!super::reachable_reference_source(
             &store,
             &seed,
@@ -3152,7 +3143,7 @@ done
 
     #[cfg(unix)]
     fn outgoing_request(seed: &SymbolId) -> SearchParams {
-        serde_json::from_value(json!({"target":"symbol","traversal":{"seed":seed,"direction":"outgoing","facets":["calls"]}})).expect("traversal request")
+        serde_json::from_value(json!({"target":"symbol","traversal":{"seed":seed,"direction":"outgoing","kinds":["calls"]}})).expect("traversal request")
     }
 
     /// An outgoing walk skips a declaration it already asked about and one no engine

@@ -3,11 +3,11 @@ use rift_protocol::error::{
     ErrorCause, ErrorCode, ErrorData, ErrorPhase, LimitEvidence, RetryDirective,
 };
 use rift_protocol::read::{
-    CommitAuthor, DiagnosticContext, Digest, Documentation, DocumentationFormat, ExactKind,
-    Extensions, FacetsResult, GetSymbolHit, GetSymbolResult, HistoryChange, HistoryCommit,
-    HistoryEdge, Language, PackageIdentity, Pagination, ProjectPath, ReadWarning,
-    RelationshipFacet, RevisionId, Signature, SourceKind, SourceLocationKind, SourceUnitId, Symbol,
-    SymbolFacet, SymbolHistory, SymbolId, SymbolOrigin, SymbolVersionKind, TextRange,
+    CommitAuthor, DiagnosticContext, Digest, Documentation, DocumentationFormat, EdgeKind,
+    ExactKind, Extensions, FacetsResult, GetSymbolHit, GetSymbolResult, HistoryChange,
+    HistoryCommit, HistoryEdge, Language, PackageIdentity, Pagination, ProjectPath, ReadWarning,
+    RevisionId, Signature, SourceKind, SourceLocationKind, SourceUnitId, Symbol, SymbolHistory,
+    SymbolId, SymbolKind, SymbolOrigin, SymbolVersionKind, TextRange,
 };
 use rift_protocol::revision::Revision;
 use rift_protocol::search::{
@@ -106,7 +106,7 @@ fn symbol(id: Option<&str>, name: &str) -> Symbol {
         language: rust(),
         name: name.to_owned(),
         kind: ExactKind("struct".to_owned()),
-        facets: vec![SymbolFacet::Type, SymbolFacet::Public],
+        kinds: vec![SymbolKind::Type, SymbolKind::Public],
         origin: SymbolOrigin {
             location: Some(SourceLocationKind::Project),
             package: None,
@@ -295,17 +295,17 @@ fn documentation_hit() -> DocumentationHit {
 
 /// A hop from `a.rs/A` to `b.rs/B` of the given direction, derivation, and confidence.
 fn hop(direction: &str, derivation: &str, confidence: Option<f64>) -> GraphHop {
-    let mut relationship = json!({
+    let mut edge = json!({
         "from": "rift://symbol/local/rust/app/a/A",
         "kind": "calls",
-        "facets": ["calls"],
+        "kinds": ["calls"],
         "to": "rift://symbol/local/rust/app/b/B",
         "derivation": derivation
     });
     if let Some(confidence) = confidence {
-        relationship["confidence"] = json!(confidence);
+        edge["confidence"] = json!(confidence);
     }
-    serde_json::from_value(json!({"relationship": relationship, "direction": direction}))
+    serde_json::from_value(json!({"edge": edge, "direction": direction}))
         .expect("graph hop deserializes")
 }
 
@@ -784,14 +784,14 @@ fn every_exceptional_fact_is_written_in_order() {
         Some(package("serde", "1.0.0")),
         SourceKind::Generated,
     );
-    everything.facets = vec![SymbolFacet::Test, SymbolFacet::Deprecated];
+    everything.kinds = vec![SymbolKind::Test, SymbolKind::Deprecated];
     everything.document_local = true;
     let hit = SearchHit {
         score: Some(1.5),
         distance: Some(1),
         unit: Some(source_unit("rift://source/cargo/crates.io/serde/lib.rs")),
         line: Some(3),
-        matched_by: vec![MatchedField::Relationship],
+        matched_by: vec![MatchedField::Edge],
         ..search_hit(SearchHitTarget::Symbol {
             symbol: Box::new(everything),
         })
@@ -801,7 +801,7 @@ fn every_exceptional_fact_is_written_in_order() {
         &[
             "1 result",
             "\tstruct A",
-            "\trift://source/cargo/crates.io/serde/lib.rs:3 · relationship · score 1.5 · dependency rift://revision/cargo/crates.io/serde@1.0.0 · generated · deprecated · test · document local",
+            "\trift://source/cargo/crates.io/serde/lib.rs:3 · edge · score 1.5 · dependency rift://revision/cargo/crates.io/serde@1.0.0 · generated · deprecated · test · document local",
             "\trift://symbol/local/rust/app/a/A",
         ],
     );
@@ -905,14 +905,14 @@ fn the_origin_is_written_only_when_it_is_not_the_project_default() {
 #[test]
 fn deprecated_test_and_document_local_are_written_only_when_they_hold() {
     let mut symbol = symbol(Some(A_ID), "A");
-    symbol.facets = vec![SymbolFacet::Type, SymbolFacet::Public];
+    symbol.kinds = vec![SymbolKind::Type, SymbolKind::Public];
     assert_eq!(
         facts_line(symbol.clone()),
         "rift://symbol/local/rust/app/a/A"
     );
-    symbol.facets.push(SymbolFacet::Test);
+    symbol.kinds.push(SymbolKind::Test);
     assert_eq!(facts_line(symbol.clone()), "test");
-    symbol.facets.push(SymbolFacet::Deprecated);
+    symbol.kinds.push(SymbolKind::Deprecated);
     assert_eq!(facts_line(symbol.clone()), "deprecated · test");
     symbol.document_local = true;
     assert_eq!(facts_line(symbol), "deprecated · test · document local");
@@ -943,13 +943,13 @@ fn fixture_symbol_id(at: &str) -> String {
         .wire_identity()
 }
 
-/// A hop over the edge `from` to `to` with the given facets, followed in `direction`.
-fn edge(direction: &str, (from, to): (&str, &str), facets: &[&str], derivation: &str) -> GraphHop {
+/// A hop over the edge `from` to `to` with the given kinds, followed in `direction`.
+fn edge(direction: &str, (from, to): (&str, &str), kinds: &[&str], derivation: &str) -> GraphHop {
     serde_json::from_value(json!({
-        "relationship": {
+        "edge": {
             "from": fixture_symbol_id(from),
             "kind": "edge",
-            "facets": facets,
+            "kinds": kinds,
             "to": fixture_symbol_id(to),
             "derivation": derivation
         },
@@ -958,17 +958,17 @@ fn edge(direction: &str, (from, to): (&str, &str), facets: &[&str], derivation: 
     .expect("graph hop deserializes")
 }
 
-/// A resolved hop against the edge `from` to `to`, which has the facet `facet`.
-fn against(from: &str, to: &str, facet: &str) -> GraphHop {
-    edge("incoming", (from, to), &[facet], "resolution")
+/// A resolved hop against the edge `from` to `to`, which has the kind `kind`.
+fn against(from: &str, to: &str, kind: &str) -> GraphHop {
+    edge("incoming", (from, to), &[kind], "resolution")
 }
 
 /// A symbol hit at `file/name` declared as `display`, placed at `line` of its file and matched
-/// by its relationship, that the hops `hops` reached.
+/// by its edge, that the hops `hops` reached.
 fn walked_hit(at: &str, display: &str, line: u64, hops: Vec<GraphHop>) -> SearchHit {
     let (file, name) = at.rsplit_once('/').expect("a symbol is `<file>/<name>`");
     SearchHit {
-        matched_by: vec![MatchedField::Relationship],
+        matched_by: vec![MatchedField::Edge],
         line: Some(line),
         path: Some(project_path(file)),
         traversal_path: Some(hops),
@@ -1063,7 +1063,7 @@ fn a_walk_hit_is_one_symbol_under_a_root_that_writes_its_identity() {
 }
 
 #[test]
-fn paths_that_share_a_prefix_share_its_facets_and_children_follow_answer_order() {
+fn paths_that_share_a_prefix_share_its_kinds_and_children_follow_answer_order() {
     golden(
         &only_page(vec![reload_hit(), main_hit(), run_hit()]),
         &[
@@ -1325,7 +1325,7 @@ fn two_walk_hits_that_reach_one_symbol_under_one_parent_each_get_a_symbol() {
 }
 
 #[test]
-fn an_outgoing_hop_writes_each_facet_as_its_wire_name_with_spaces() {
+fn an_outgoing_hop_writes_each_kind_as_its_wire_name_with_spaces() {
     let hop = edge(
         "outgoing",
         (MAIN, RUN),
@@ -1347,7 +1347,7 @@ fn an_outgoing_hop_writes_each_facet_as_its_wire_name_with_spaces() {
 }
 
 #[test]
-fn an_incoming_hop_writes_each_facet_read_from_its_target_back_and_the_distance_is_not_written() {
+fn an_incoming_hop_writes_each_kind_read_from_its_target_back_and_the_distance_is_not_written() {
     let hop = edge(
         "incoming",
         (RUN, LOAD_CONFIG),
@@ -1377,7 +1377,7 @@ fn a_heuristic_hop_starts_with_probably_whatever_its_confidence_and_direction() 
     let outgoing = edge("outgoing", (MAIN, RUN), &["implements"], "heuristic");
     let incoming = edge("incoming", (RUN, LOAD_CONFIG), &["implements"], "heuristic");
     let mut surer = incoming.clone();
-    surer.relationship.confidence = Some(0.9);
+    surer.edge.confidence = Some(0.9);
     golden(
         &only_page(vec![
             walked_hit(RUN, "fn run()", 20, vec![outgoing]),
@@ -1409,9 +1409,9 @@ fn a_heuristic_hop_starts_with_probably_whatever_its_confidence_and_direction() 
 }
 
 #[test]
-fn a_hop_an_external_producer_emitted_names_that_producer_after_its_relationship() {
+fn a_hop_an_external_producer_emitted_names_that_producer_after_its_edge() {
     let mut hop = edge("incoming", (RUN, LOAD_CONFIG), &["calls"], "resolution");
-    hop.relationship.producer = Some(
+    hop.edge.producer = Some(
         serde_json::from_value(serde_json::json!({"name": "demo-indexer", "revision": "0.6.1"}))
             .expect("producer"),
     );
@@ -1429,7 +1429,7 @@ fn a_hop_an_external_producer_emitted_names_that_producer_after_its_relationship
     );
 }
 
-/// Each facet with the words an incoming hop writes for it.
+/// Each kind with the words an incoming hop writes for it.
 const INCOMING_WORDS: [(&str, &str); 29] = [
     ("contains", "contained by"),
     ("declares", "declared by"),
@@ -1463,13 +1463,13 @@ const INCOMING_WORDS: [(&str, &str); 29] = [
 ];
 
 #[test]
-fn the_by_word_moves_to_the_declaration_line_only_when_every_facet_phrase_ends_in_it() {
-    let hit = |facets: &[&str], derivation: &str| {
+fn the_by_word_moves_to_the_declaration_line_only_when_every_kind_phrase_ends_in_it() {
+    let hit = |kinds: &[&str], derivation: &str| {
         walked_hit(
             RUN,
             "fn run()",
             20,
-            vec![edge("incoming", (RUN, LOAD_CONFIG), facets, derivation)],
+            vec![edge("incoming", (RUN, LOAD_CONFIG), kinds, derivation)],
         )
     };
     let root = "\tat rift://symbol/local/rust/app/config/load_config";
@@ -1506,12 +1506,12 @@ fn the_by_word_moves_to_the_declaration_line_only_when_every_facet_phrase_ends_i
 
 #[test]
 fn an_outgoing_hop_moves_by_for_annotated_by_and_writes_calls_whole() {
-    let walked = |facet: &str| {
+    let walked = |kind: &str| {
         walked_hit(
             RUN,
             "fn run()",
             20,
-            vec![edge("outgoing", (MAIN, RUN), &[facet], "resolution")],
+            vec![edge("outgoing", (MAIN, RUN), &[kind], "resolution")],
         )
     };
     let tail = [
@@ -1543,7 +1543,7 @@ fn a_symbol_without_a_location_writes_its_facts_without_in() {
     let hit = SearchHit {
         line: None,
         path: None,
-        matched_by: vec![MatchedField::Relationship, MatchedField::Name],
+        matched_by: vec![MatchedField::Edge, MatchedField::Name],
         ..run_hit()
     };
     golden(
@@ -1634,10 +1634,10 @@ fn no_line_of_a_sample_of_each_tool_starts_with_a_space() {
 }
 
 #[test]
-fn an_incoming_hop_reads_every_facet_as_the_table_says() {
-    assert_eq!(INCOMING_WORDS.len(), RelationshipFacet::VARIANTS.len());
-    for facet in RelationshipFacet::VARIANTS {
-        let wire = facet.as_ref();
+fn an_incoming_hop_reads_every_kind_as_the_table_says() {
+    assert_eq!(INCOMING_WORDS.len(), EdgeKind::VARIANTS.len());
+    for kind in EdgeKind::VARIANTS {
+        let wire = kind.as_ref();
         let Some((_, words)) = INCOMING_WORDS.iter().find(|(name, _)| *name == wire) else {
             panic!("the table has no row for {wire}");
         };
@@ -1674,12 +1674,12 @@ fn a_symbol_writes_every_line_of_a_symbol_hit_at_its_further_line_indent() {
         Some(package("serde", "1.0.0")),
         SourceKind::Generated,
     );
-    everything.facets = vec![SymbolFacet::Test, SymbolFacet::Deprecated];
+    everything.kinds = vec![SymbolKind::Test, SymbolKind::Deprecated];
     everything.document_local = true;
     everything.documentation = vec![documentation_text("Settings of a run.\n\nMore.")];
     let hit = SearchHit {
         score: Some(1.5),
-        matched_by: vec![MatchedField::Relationship, MatchedField::Name],
+        matched_by: vec![MatchedField::Edge, MatchedField::Name],
         unit: Some(source_unit("rift://source/cargo/crates.io/serde/lib.rs")),
         line: Some(3),
         source: Some("struct Config {\n\n    a: u8,\n}".to_owned()),
@@ -1720,13 +1720,13 @@ fn a_symbol_writes_every_line_of_a_symbol_hit_at_its_further_line_indent() {
 }
 
 #[test]
-fn the_relationship_field_is_left_out_of_a_symbol_and_every_other_field_stays() {
+fn the_edge_field_is_left_out_of_a_symbol_and_every_other_field_stays() {
     let only = SearchHit {
         score: Some(2.0),
         ..run_hit()
     };
     let named = SearchHit {
-        matched_by: vec![MatchedField::Relationship, MatchedField::Name],
+        matched_by: vec![MatchedField::Edge, MatchedField::Name],
         ..reload_hit()
     };
     let bare = SearchHit {
@@ -1758,7 +1758,7 @@ fn the_relationship_field_is_left_out_of_a_symbol_and_every_other_field_stays() 
 }
 
 #[test]
-fn an_item_keeps_the_relationship_field_among_its_matched_fields() {
+fn an_item_keeps_the_edge_field_among_its_matched_fields() {
     let item = SearchHit {
         traversal_path: None,
         ..run_hit()
@@ -1768,7 +1768,7 @@ fn an_item_keeps_the_relationship_field_among_its_matched_fields() {
         &[
             "1 result",
             "\tfn run()",
-            "\tsrc/app.rs:20 · relationship",
+            "\tsrc/app.rs:20 · edge",
             "\trift://symbol/local/rust/app/app/run",
         ],
     );
@@ -1815,7 +1815,7 @@ fn a_traversal_without_hops_is_an_item() {
 }
 
 #[test]
-fn warnings_leave_the_relationship_tree_text_unchanged() {
+fn warnings_leave_the_edge_tree_text_unchanged() {
     let answer = search_result(
         vec![readme_hit(), main_hit()],
         pagination(0, 1),
@@ -2377,12 +2377,12 @@ fn wire_names_are_the_serde_spellings_of_unit_variants() {
         MatchedField::Content,
         MatchedField::Ranked,
         MatchedField::Path,
-        MatchedField::Relationship,
+        MatchedField::Edge,
         MatchedField::Change,
     ];
     assert_eq!(
         wire_names(&every).as_deref(),
-        Ok("name, signature, documentation, content, ranked, path, relationship, change")
+        Ok("name, signature, documentation, content, ranked, path, edge, change")
     );
     assert_eq!(wire_names::<MatchedField>(&[]).as_deref(), Ok(""));
     assert_eq!(
@@ -2509,7 +2509,7 @@ fn exceptional_facts_of_a_get_symbol_hit_share_one_line_without_score_and_distan
         Some(package("serde", "1.0.0")),
         SourceKind::Generated,
     );
-    hit.symbol.facets = vec![SymbolFacet::Deprecated, SymbolFacet::Test];
+    hit.symbol.kinds = vec![SymbolKind::Deprecated, SymbolKind::Test];
     hit.symbol.document_local = true;
     hit.symbol.visibility = Some("pub".to_owned());
     golden(

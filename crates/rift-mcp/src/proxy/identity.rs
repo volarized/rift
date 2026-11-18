@@ -151,8 +151,8 @@ pub(super) fn qualify_hit(hit: &mut SearchHit, backend: &str) -> Result<(), Rift
     }
     if let Some(path) = &mut hit.traversal_path {
         for hop in path {
-            qualify_id(&mut hop.relationship.from, backend)?;
-            qualify_id(&mut hop.relationship.to, backend)?;
+            qualify_id(&mut hop.edge.from, backend)?;
+            qualify_id(&mut hop.edge.to, backend)?;
         }
     }
     Ok(())

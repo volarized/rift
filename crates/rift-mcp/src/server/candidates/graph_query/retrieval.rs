@@ -6,7 +6,7 @@ use rift_protocol::search_read::{SearchReadResult, SearchUnavailable};
 use rift_protocol::symbol_read::SymbolUnavailableReason;
 use rift_search::sparql::RetrievalSelection;
 
-use super::{RiftMcp, ToolFailure, read_failure, relationships::coverage_failure};
+use super::{RiftMcp, ToolFailure, edges::coverage_failure, read_failure};
 
 const PRODUCER_PAGES_MAX: usize = 64;
 

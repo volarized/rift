@@ -11,7 +11,7 @@ use rift_protocol::documentation::{
 };
 use rift_protocol::read::{
     CommitAuthor, Documentation, PackageIdentity, ProjectPath, Signature, SourceKind,
-    SourceLocationKind, SourceUnitId, Symbol, SymbolFacet, SymbolId, SymbolOrigin,
+    SourceLocationKind, SourceUnitId, Symbol, SymbolId, SymbolKind, SymbolOrigin,
 };
 use serde::Serialize;
 
@@ -292,7 +292,7 @@ pub(super) fn describe(symbol: &Symbol) -> Result<Described<'_>, TextError> {
         language: _,
         name,
         kind,
-        facets,
+        kinds,
         origin,
         container: _,
         modifiers: _,
@@ -306,10 +306,10 @@ pub(super) fn describe(symbol: &Symbol) -> Result<Described<'_>, TextError> {
     let mut facts = Facts::default();
     facts.push(&origin_fact(origin)?);
     facts.push(source_kind_fact(origin.source_kind));
-    if facets.contains(&SymbolFacet::Deprecated) {
+    if kinds.contains(&SymbolKind::Deprecated) {
         facts.push("deprecated");
     }
-    if facets.contains(&SymbolFacet::Test) {
+    if kinds.contains(&SymbolKind::Test) {
         facts.push("test");
     }
     if *document_local {

@@ -541,7 +541,7 @@ impl PackageCallee {
             kind: kind.clone(),
             language,
             name: self.name.clone(),
-            facets: Vec::new(),
+            kinds: Vec::new(),
             origin,
             container: None,
             modifiers: Vec::new(),

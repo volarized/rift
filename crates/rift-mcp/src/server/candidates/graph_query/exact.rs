@@ -14,14 +14,14 @@ use rift_search::sparql::{
 };
 
 use super::super::super::ResolvedWorkspace;
-use super::{RiftMcp, relationships::coverage_failure, unavailable};
+use super::{RiftMcp, edges::coverage_failure, unavailable};
 
 const SYNTAX_ELEMENT_PAGES_MAX: usize = 64;
 
 pub(super) struct ExactFacts {
     revision: RevisionIri,
     symbol: Option<Box<Symbol>>,
-    facets: Vec<SyntaxElement>,
+    kinds: Vec<SyntaxElement>,
     source: bool,
     warnings: Vec<ReadWarning>,
 }
@@ -43,7 +43,7 @@ impl ExactFacts {
             language: &symbol.language,
             revision: &self.revision,
         })?;
-        for syntax_element in &self.facets {
+        for syntax_element in &self.kinds {
             dataset.insert_declared_syntax_element(id, syntax_element, self.source)?;
         }
         Ok(())
@@ -88,7 +88,7 @@ impl RiftMcp {
         let mut result = ExactFacts {
             revision: RevisionIri::parse(&revision.to_string())?,
             symbol: None,
-            facets: Vec::new(),
+            kinds: Vec::new(),
             source: facets.is_some_and(|selected| selected.source),
             warnings: Vec::new(),
         };
@@ -134,7 +134,7 @@ impl RiftMcp {
         request.revision = Some(revision.clone());
         let mut remaining_bytes = limits.literal_bytes_max();
         for _ in 0..SYNTAX_ELEMENT_PAGES_MAX {
-            let page = self.global.symbol_facets(configuration, &request).await?;
+            let page = self.global.symbol_kinds(configuration, &request).await?;
             if &page.revision != revision || &page.symbol != id {
                 return Ok(Some(unavailable(SymbolUnavailableReason::ViewContext)));
             }
@@ -156,7 +156,7 @@ impl RiftMcp {
                 .map_err(|_| coverage_failure())?
                 .len();
             remaining_bytes -= charge;
-            result.facets.extend(
+            result.kinds.extend(
                 page.declarations
                     .into_iter()
                     .flat_map(|declaration| declaration.syntax),

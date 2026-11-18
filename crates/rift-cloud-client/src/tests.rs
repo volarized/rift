@@ -85,17 +85,17 @@ enum FixtureMode {
 
 #[derive(Clone)]
 enum OperationFixture {
-    RelationshipRefusal {
+    EdgeRefusal {
         value: serde_json::Value,
         problem: bool,
     },
-    Relationships {
+    Edges {
         pages: Vec<serde_json::Value>,
         advertised: bool,
     },
-    RelationshipBounds {
+    EdgeBounds {
         pages: Vec<serde_json::Value>,
-        bounds: rift_protocol::relationship_read::RelationshipBounds,
+        bounds: rift_protocol::edge_read::EdgeBounds,
         page_limit_min: i64,
         page_limit_max: i64,
     },
@@ -487,15 +487,15 @@ const PATTERN_PAGE_LIMIT_ADVERTISED: i64 = 200;
 
 fn operation_capabilities_response(mode: &OperationFixture) -> Response {
     capabilities_response_with(|value| match mode {
-        OperationFixture::Relationships {
+        OperationFixture::Edges {
             advertised: true, ..
         }
-        | OperationFixture::RelationshipBounds { .. }
-        | OperationFixture::RelationshipRefusal { .. } => {
+        | OperationFixture::EdgeBounds { .. }
+        | OperationFixture::EdgeRefusal { .. } => {
             value["supported_features"] =
-                serde_json::json!(["resolutions", "search", "symbols", "relationships"]);
-            value["relationship_capabilities"] = operation_relationship_capabilities(mode);
-            if let OperationFixture::RelationshipBounds {
+                serde_json::json!(["resolutions", "search", "symbols", "edges"]);
+            value["edge_capabilities"] = operation_edge_capabilities(mode);
+            if let OperationFixture::EdgeBounds {
                 page_limit_min,
                 page_limit_max,
                 ..
@@ -587,18 +587,18 @@ fn operation_capabilities_response(mode: &OperationFixture) -> Response {
     })
 }
 
-fn operation_relationship_capabilities(mode: &OperationFixture) -> serde_json::Value {
+fn operation_edge_capabilities(mode: &OperationFixture) -> serde_json::Value {
     let mut operations = serde_json::json!([
-        {"direction":"outgoing","facets":["calls"],"bounds":{
-            "max_seeds":64,"max_facets":16,"max_relationships":1000,
+        {"direction":"outgoing","kinds":["calls"],"bounds":{
+            "max_seeds":64,"max_kinds":16,"max_edges":1000,
             "max_occurrences":1000,"max_symbols":10000,"max_sources":10000
         }},
-        {"direction":"incoming","facets":["references"],"bounds":{
-            "max_seeds":64,"max_facets":16,"max_relationships":1000,
+        {"direction":"incoming","kinds":["references"],"bounds":{
+            "max_seeds":64,"max_kinds":16,"max_edges":1000,
             "max_occurrences":1000,"max_symbols":10000,"max_sources":10000
         }}
     ]);
-    if let OperationFixture::RelationshipBounds { bounds, .. } = mode {
+    if let OperationFixture::EdgeBounds { bounds, .. } = mode {
         for operation in operations.as_array_mut().expect("fixture operations") {
             operation["bounds"] = serde_json::to_value(bounds).expect("fixture count bounds");
         }
@@ -665,7 +665,7 @@ fn operation_search_response(
     query: Option<&str>,
     request_number: usize,
 ) -> Response {
-    if let OperationFixture::RelationshipRefusal { value, problem } = mode {
+    if let OperationFixture::EdgeRefusal { value, problem } = mode {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [(
@@ -680,10 +680,9 @@ fn operation_search_response(
         )
             .into_response();
     }
-    if let OperationFixture::Relationships { pages, .. }
-    | OperationFixture::RelationshipBounds { pages, .. } = mode
+    if let OperationFixture::Edges { pages, .. } | OperationFixture::EdgeBounds { pages, .. } = mode
     {
-        return relationship_response(pages);
+        return edge_response(pages);
     }
     if matches!(mode, OperationFixture::PartialFailure) && request_number > 1 {
         return problem_response(StatusCode::SERVICE_UNAVAILABLE);
@@ -1192,7 +1191,7 @@ fn test_client_response_errors_use_bounded_messages() {
 }
 
 #[test]
-fn test_request_relationships_are_validated_before_transport() {
+fn test_request_edges_are_validated_before_transport() {
     let mut resolution = resolution_request();
     resolution.entries[0].availability = PackageAvailability::Path;
     assert_registered_field(
@@ -2286,7 +2285,7 @@ fn traversal_request() -> PackageSearchRequest {
             to: None,
             depth: Some(1),
             direction: None,
-            facets: None,
+            kinds: None,
         }),
     }
 }
@@ -3259,8 +3258,8 @@ fn generated_exact_symbol_shapes_keep_shared_requests_and_typed_outcomes() {
     );
 }
 
-#[path = "relationships/tests.rs"]
-mod relationships;
+#[path = "edges/tests.rs"]
+mod edges;
 
 fn numbered_page(value: &mut serde_json::Value, query: Option<&str>, total: u64) {
     let number = |key: &str, default| {
@@ -3283,7 +3282,7 @@ fn numbered_page(value: &mut serde_json::Value, query: Option<&str>, total: u64)
     }
 }
 
-fn relationship_response(pages: &[serde_json::Value]) -> Response {
+fn edge_response(pages: &[serde_json::Value]) -> Response {
     let Some(mut answer) = pages.first().cloned() else {
         return json_response(&serde_json::Value::Null, None);
     };
@@ -3303,7 +3302,7 @@ fn relationship_response(pages: &[serde_json::Value]) -> Response {
             }
         }
         for (index, group) in page["groups"].as_array().into_iter().flatten().enumerate() {
-            for key in ["relationships", "occurrences"] {
+            for key in ["edges", "occurrences"] {
                 let values = group[key].as_array().cloned().unwrap_or_default();
                 answer["groups"][index]
                     .as_object_mut()

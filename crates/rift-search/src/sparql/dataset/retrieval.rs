@@ -124,7 +124,7 @@ fn project_fields(
                 Value::Array(values) => {
                     for (index, value) in values.into_iter().enumerate() {
                         let child = child(&subject, &key, index);
-                        if matches!(key.as_str(), "facets" | "evidence" | "modifiers") {
+                        if matches!(key.as_str(), "kinds" | "evidence" | "modifiers") {
                             emit(&subject, &key, value, child, &mut pending, triples)?;
                         } else {
                             triples.push(Triple::new(
@@ -197,7 +197,7 @@ fn emit(
         Value::Object(_) | Value::Array(_) => {
             Literal::new_typed_literal(value.to_string(), named(RDF_JSON)?).into()
         }
-        Value::String(value) if matches!(key, "facets" | "derivation") => vocabulary(&value).into(),
+        Value::String(value) if matches!(key, "kinds" | "derivation") => vocabulary(&value).into(),
         Value::String(value)
             if value.starts_with("rift://")
                 && matches!(

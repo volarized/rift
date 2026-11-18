@@ -12,7 +12,7 @@
         "language": "rust",
         "name": "load_config",
         "kind": "function",
-        "facets": ["value", "callable", "public"],
+        "kinds": ["value", "callable", "public"],
         "visibility": "pub",
         "signatures": [
           {
@@ -60,7 +60,7 @@
         "language": "rust",
         "name": "load_config",
         "kind": "function",
-        "facets": ["value", "callable", "public"],
+        "kinds": ["value", "callable", "public"],
         "visibility": "pub",
         "signatures": [
           {
@@ -581,7 +581,7 @@
               "unit": "rift://source/project/src/config.rs",
               "language": "rust",
               "kind": "function_item",
-              "facets": ["declaration", "definition"],
+              "kinds": ["declaration", "definition"],
               "range": {
                 "start": 218,
                 "end": 355
@@ -763,7 +763,7 @@
               "unit": "rift://source/project/src/config.rs",
               "language": "rust",
               "kind": "let_declaration",
-              "facets": ["declaration", "definition"],
+              "kinds": ["declaration", "definition"],
               "range": {
                 "start": 287,
                 "end": 329
@@ -790,7 +790,7 @@
               "unit": "rift://source/project/src/config.rs",
               "language": "rust",
               "kind": "try_expression",
-              "facets": ["expression"],
+              "kinds": ["expression"],
               "range": {
                 "start": 298,
                 "end": 328
@@ -804,7 +804,7 @@
               "unit": "rift://source/project/src/config.rs",
               "language": "rust",
               "kind": "call_expression",
-              "facets": ["expression"],
+              "kinds": ["expression"],
               "range": {
                 "start": 298,
                 "end": 327
@@ -909,7 +909,7 @@
               "unit": "rift://source/project/src/config.rs",
               "language": "rust",
               "kind": "call_expression",
-              "facets": ["expression"],
+              "kinds": ["expression"],
               "range": {
                 "start": 334,
                 "end": 353
@@ -949,7 +949,7 @@
               "unit": "rift://source/project/src/config.rs",
               "language": "rust",
               "kind": "reference_expression",
-              "facets": ["expression"],
+              "kinds": ["expression"],
               "range": {
                 "start": 347,
                 "end": 352

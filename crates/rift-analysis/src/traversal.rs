@@ -1,4 +1,4 @@
-//! Bounded relationship traversal over captured adjacency.
+//! Bounded edge traversal over captured adjacency.
 
 use std::collections::{BTreeSet, VecDeque};
 
@@ -18,8 +18,8 @@ pub struct TraversalWalk {
 /// Walks captured adjacency breadth-first from `seed`, honoring the depth and syntax element bounds.
 ///
 /// The caller supplies bounded adjacency in its established order, after applying the
-/// request's facet filter. Each pair carries the established next identity and its exact
-/// relationship evidence. The walk never reports `seed` itself and never requeues a
+/// request's kind filter. Each pair carries the established next identity and its exact
+/// edge evidence. The walk never reports `seed` itself and never requeues a
 /// discovered symbol. One `symbols_max` budget covers the whole walk.
 #[must_use]
 pub fn walk_traversal_capped<Edges>(
@@ -40,7 +40,7 @@ where
 
 /// Walks bounded adjacency read asynchronously, using the same transitions as
 /// [`walk_traversal_capped`]. The callback receives an owned identity and applies
-/// the request's facet filter before returning adjacency in its established order.
+/// the request's kind filter before returning adjacency in its established order.
 /// Dropping this future drops the current read and the unpublished walk.
 ///
 /// # Errors
@@ -126,8 +126,8 @@ mod tests {
 
     use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
     use rift_protocol::read::{
-        ExactKind, Extensions, HopDirection, Language, Relationship, RelationshipDerivation,
-        RelationshipFacet, SymbolId as WireSymbolId,
+        Edge, EdgeDerivation, EdgeKind, ExactKind, Extensions, HopDirection, Language,
+        SymbolId as WireSymbolId,
     };
 
     use super::*;
@@ -146,7 +146,7 @@ mod tests {
         SearchTraversal {
             seed: Some(WireSymbolId(seed.as_str().to_owned())),
             direction: TraversalDirection::Outgoing,
-            facets: vec![RelationshipFacet::Calls],
+            kinds: vec![EdgeKind::Calls],
             depth,
             to: None,
         }
@@ -154,14 +154,14 @@ mod tests {
 
     fn hop(from: &SymbolId, to: &SymbolId) -> GraphHop {
         GraphHop {
-            relationship: Relationship {
+            edge: Edge {
                 producer: None,
                 from: WireSymbolId(from.as_str().to_owned()),
                 to: WireSymbolId(to.as_str().to_owned()),
                 kind: ExactKind("calls".to_owned()),
-                facets: vec![RelationshipFacet::Calls],
+                kinds: vec![EdgeKind::Calls],
                 occurrence: None,
-                derivation: RelationshipDerivation::Syntax,
+                derivation: EdgeDerivation::Syntax,
                 confidence: None,
                 extensions: Extensions::default(),
             },
@@ -198,12 +198,12 @@ mod tests {
         );
         let path = &walk.discovered[2].1;
         assert_eq!(path.len(), 2);
-        assert_eq!(path[0].relationship.to.0, first.as_str());
-        assert_eq!(path[1].relationship.to.0, last.as_str());
-        assert!(path.iter().all(|hop| hop.relationship.occurrence.is_none()));
+        assert_eq!(path[0].edge.to.0, first.as_str());
+        assert_eq!(path[1].edge.to.0, last.as_str());
+        assert!(path.iter().all(|hop| hop.edge.occurrence.is_none()));
         assert!(
             path.iter()
-                .all(|hop| { hop.relationship.derivation == RelationshipDerivation::Syntax })
+                .all(|hop| { hop.edge.derivation == EdgeDerivation::Syntax })
         );
     }
 

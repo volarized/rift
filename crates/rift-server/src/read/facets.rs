@@ -260,7 +260,7 @@ fn wire(
         unit: super::file_id(file.path()),
         language: file.syntax().language().clone(),
         kind: super::wire_kind(kind),
-        facets: super::language_provider(file.syntax().language()).syntax_element_facets(kind),
+        kinds: super::language_provider(file.syntax().language()).syntax_element_kinds(kind),
         range: super::text_range(range),
         source: excerpt(file.source(), range),
         regions: Vec::new(),

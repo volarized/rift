@@ -202,7 +202,7 @@ impl DocumentationCollection {
     ///
     /// # Errors
     ///
-    /// Returns a typed refusal for invalid identities, ranges, ordering, or relationships.
+    /// Returns a typed refusal for invalid identities, ranges, ordering, or edges.
     pub fn new(index: DocumentationIndex) -> Result<Self, RiftError> {
         Self::new_with_limits(index, None)
     }
@@ -216,7 +216,7 @@ impl DocumentationCollection {
     /// # Errors
     ///
     /// Refuses incompatible revisions, invalid identities, ranges, ordering,
-    /// relationships, or collection bounds.
+    /// edges, or collection bounds.
     pub fn new_with_limits(
         index: DocumentationIndex,
         limits: Option<super::DocumentationLimits>,
@@ -240,7 +240,7 @@ impl DocumentationCollection {
     ///
     /// # Errors
     ///
-    /// Refuses invalid identities, ranges, ordering, relationships, or collection bounds.
+    /// Refuses invalid identities, ranges, ordering, edges, or collection bounds.
     pub fn from_stored(
         index: DocumentationIndex,
         limits: Option<super::DocumentationLimits>,
@@ -1778,7 +1778,7 @@ mod tests {
     }
 
     #[test]
-    fn block_link_and_reference_relationships_refuse_invalid_ranges() {
+    fn block_link_and_reference_edges_refuse_invalid_ranges() {
         let source_record = source("README.md", "hello world");
         let base = index(vec![source_record.clone()]);
 

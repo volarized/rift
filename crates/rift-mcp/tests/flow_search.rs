@@ -277,7 +277,7 @@ async fn static_rust_reports_partial_coverage_for_an_inferred_receiver() -> Test
             .as_array()
             .is_some_and(|warnings| warnings
                 .iter()
-                .any(|warning| { warning["code"] == "relationship_coverage_missing" })),
+                .any(|warning| { warning["code"] == "edge_coverage_missing" })),
         "partial flow must report unavailable call coverage: {partial}"
     );
 

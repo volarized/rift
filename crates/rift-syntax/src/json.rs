@@ -24,8 +24,8 @@
 //! - Nothing attaches in front of a pair, so `range` equals `item_range`.
 //!   `body_range` is the value syntax element's span, absent when the tree is
 //!   missing the value.
-//! - Members carry no visibility and no portable symbol facet:
-//!   `visibility` stays `None` and `facets` stays empty.
+//! - Members carry no visibility and no portable symbol kind:
+//!   `visibility` stays `None` and `kinds` stays empty.
 //! - `signatures` and `documentation` stay empty for every member: JSON has
 //!   no callable form and, with nothing attached in front of a pair, no
 //!   comment for a member to carry either.
@@ -34,7 +34,7 @@ use std::num::NonZeroU16;
 use std::sync::OnceLock;
 
 use rift_error::errors;
-use rift_protocol::read::{Language, NodeFacet};
+use rift_protocol::read::{Language, SyntaxKind};
 use tree_sitter::{Node, Parser};
 
 use crate::document::SyntaxDocument;
@@ -150,7 +150,7 @@ impl GrammarRules for JsonRules {
         Ok(Some(Declaration {
             name,
             kind: MEMBER_KIND_WORD,
-            facets: Vec::new(),
+            kinds: Vec::new(),
             visibility: None,
             body_range,
             documentation: Vec::new(),
@@ -237,17 +237,17 @@ impl SyntaxProvider for JsonSyntaxProvider {
         .with_syntax_limits(limits))
     }
 
-    /// Portable structural facets for one JSON grammar syntax element kind. The
+    /// Portable structural kinds for one JSON grammar syntax element kind. The
     /// structural kinds - `document`, `object`, `array` - carry none.
-    fn syntax_element_facets(&self, kind: &str) -> Vec<NodeFacet> {
+    fn syntax_element_kinds(&self, kind: &str) -> Vec<SyntaxKind> {
         match kind {
             // The pair declares its key's name.
-            PAIR_KIND => vec![NodeFacet::Declaration],
+            PAIR_KIND => vec![SyntaxKind::Declaration],
             // A value written out directly.
-            STRING_KIND | "number" | "true" | "false" | "null" => vec![NodeFacet::Literal],
+            STRING_KIND | "number" | "true" | "false" | "null" => vec![SyntaxKind::Literal],
             // The grammar accepts comments so an agent-read JSONC file still
             // parses; strict JSON never carries one.
-            "comment" => vec![NodeFacet::Comment],
+            "comment" => vec![SyntaxKind::Comment],
             _ => Vec::new(),
         }
     }
@@ -367,10 +367,10 @@ mod tests {
                 .iter()
                 .all(|symbol| symbol.kind == "member"
                     && symbol.range == symbol.item_range
-                    && symbol.facets.is_empty()
+                    && symbol.kinds.is_empty()
                     && symbol.visibility.is_none()),
             "every member files under the one JSON kind, spans its own pair, \
-             and carries no facets and no visibility"
+             and carries no kinds and no visibility"
         );
         assert!(!document.has_errors());
     }
@@ -532,31 +532,31 @@ mod tests {
         assert!(!document.has_errors());
     }
 
-    /// The pair carries the `Declaration` facet, scalar values read as
+    /// The pair carries the `Declaration` kind, scalar values read as
     /// `Literal`, a comment as `Comment`, and structure carries none.
     #[test]
-    fn test_syntax_element_facets_classify_the_interpreted_kinds() {
+    fn test_syntax_element_kinds_classify_the_interpreted_kinds() {
         let provider = JsonSyntaxProvider::default();
         assert_eq!(
-            provider.syntax_element_facets(PAIR_KIND),
-            [NodeFacet::Declaration]
+            provider.syntax_element_kinds(PAIR_KIND),
+            [SyntaxKind::Declaration]
         );
         for kind in [STRING_KIND, "number", "true", "false", "null"] {
             assert_eq!(
-                provider.syntax_element_facets(kind),
-                [NodeFacet::Literal],
+                provider.syntax_element_kinds(kind),
+                [SyntaxKind::Literal],
                 "kind {kind} must classify as a literal value"
             );
         }
         assert_eq!(
-            provider.syntax_element_facets("comment"),
-            [NodeFacet::Comment]
+            provider.syntax_element_kinds("comment"),
+            [SyntaxKind::Comment]
         );
         for kind in ["document", "object", "array", "string_content"] {
             assert_eq!(
-                provider.syntax_element_facets(kind),
+                provider.syntax_element_kinds(kind),
                 [],
-                "structural kind {kind} carries no portable facet"
+                "structural kind {kind} carries no portable kind"
             );
         }
     }

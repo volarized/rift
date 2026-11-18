@@ -17,13 +17,13 @@ use rift_search::sparql::{
 use super::{RiftMcp, read_failure};
 use crate::output::{Json, QueryDisplay, QueryOutput, ToolFailure};
 
+mod edges;
 mod exact;
 mod installed;
-mod relationships;
 pub(crate) mod retrieval;
 
 use super::super::RequestDeadline;
-use relationships::AcquiredAdjacency;
+use edges::AcquiredAdjacency;
 
 /// Settings and presentation retained with one query execution.
 pub(crate) struct QueryPageOptions<'a> {
@@ -133,7 +133,7 @@ impl RiftMcp {
             selected = None;
         }
         let mut acquired = match self
-            .prepare_relationships(
+            .prepare_edges(
                 &resolved,
                 query,
                 selected.as_ref(),
@@ -213,7 +213,7 @@ impl RiftMcp {
         limits: GraphLimits,
         deadline: RequestDeadline,
     ) -> Result<Result<Vec<AcquiredRetrieval>, SearchUnavailable>, ToolFailure> {
-        use relationships::FlowAcquisition;
+        use edges::FlowAcquisition;
 
         let mut retrieved = Vec::new();
         let mut acquisition = FlowAcquisition::new(self, resolved, limits, deadline);
@@ -250,7 +250,7 @@ impl RiftMcp {
         acquisition.validate().await.map_err(read_failure)?;
         Ok(Ok(retrieved))
     }
-    async fn prepare_relationships(
+    async fn prepare_edges(
         &self,
         resolved: &super::super::ResolvedWorkspace,
         query: &GraphQuery,
@@ -273,7 +273,7 @@ impl RiftMcp {
             {
                 Ok(Ok(AcquiredAdjacency::default()))
             } else {
-                Err(relationships::coverage_failure())
+                Err(edges::coverage_failure())
             }
         };
         let result = tokio::time::timeout_at(deadline.at(), Box::pin(acquire))
@@ -303,7 +303,7 @@ struct AcquiredGraph {
 
 struct AcquiredRetrieval {
     result: Box<SearchResult>,
-    flows: Option<(usize, relationships::AcquiredFlows)>,
+    flows: Option<(usize, edges::AcquiredFlows)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -340,7 +340,7 @@ fn project_retrievals(
 fn project_local_endpoints(
     input: &rift_server::LocalSymbolViewInput,
     reads: &rift_server::ReadService,
-    acquired: &relationships::AcquiredAdjacency,
+    acquired: &edges::AcquiredAdjacency,
     selected: &rift_search::sparql::AdjacencySelection,
     dataset: &mut rift_search::sparql::GraphDatasetBuilder,
     cancellation: &QueryCancellation,
@@ -948,10 +948,10 @@ mod tests {
         ([("content-type", "application/json")], value.to_string())
     }
 
-    fn graph_capabilities(managers: &[&str], relationships: &[Value]) -> Value {
+    fn graph_capabilities(managers: &[&str], edges: &[Value]) -> Value {
         json!({
             "supported_package_managers": managers,
-                    "supported_features": ["resolutions", "search", "symbols", "relationships", "facets"],
+                    "supported_features": ["resolutions", "search", "symbols", "edges", "facets"],
                     "publication_format": "rift-package-index-v2",
                     "analyzer_revision": "analyzer-v1",
                     "corpus_revision": "corpus-v1",
@@ -964,14 +964,14 @@ mod tests {
                         "page_limit_default": 10, "candidate_pool_max": 100,
                         "warnings_max": 32, "source_bytes_max": 1_048_576
                     },
-                    "relationship_capabilities": relationships
+                    "edge_capabilities": edges
         })
     }
 
-    fn graph_adjacency_capability(direction: &str, facets: &[&str]) -> Value {
+    fn graph_adjacency_capability(direction: &str, kinds: &[&str]) -> Value {
         json!({
-            "direction": direction, "facets": facets, "bounds": {
-                "max_seeds": 8, "max_facets": 4, "max_relationships": 100,
+            "direction": direction, "kinds": kinds, "bounds": {
+                "max_seeds": 8, "max_kinds": 4, "max_edges": 100,
                 "max_occurrences": 100, "max_symbols": 100, "max_sources": 100
             }
         })
@@ -1032,9 +1032,9 @@ mod tests {
                 let requests = Arc::clone(&requests);
                 let expires = endpoint_expiry.clone();
                 async move {
-                    let request: Value = serde_json::from_slice(&bytes).expect("valid raw relationship request");
-                    let facet = request["relationships"]["facets"][0].as_str().unwrap_or_default();
-                    let seed = request["relationships"]["seeds"][0].as_str().unwrap_or_default();
+                    let request: Value = serde_json::from_slice(&bytes).expect("valid raw edge request");
+                    let facet = request["edges"]["kinds"][0].as_str().unwrap_or_default();
+                    let seed = request["edges"]["seeds"][0].as_str().unwrap_or_default();
                     let (next, number) = match seed {
                         ROOT => (A, 1_u64),
                         A => (B, 2),
@@ -1046,9 +1046,9 @@ mod tests {
                     let (next_symbol, next_source) = graph_fixture_symbol(next, source);
                     let sources = seed_source.into_iter().chain(next_source).collect::<Vec<_>>();
                     let result = json!({
-                        "groups": [{"seed":seed,"complete":true,"relationships":[{
+                        "groups": [{"seed":seed,"complete":true,"edges":[{
                             "id": format!("{number:064x}"),
-                            "relationship":{"from":seed,"to":next,"kind":facet,"facets":[facet],"derivation":"resolution"}
+                            "edge":{"from":seed,"to":next,"kind":facet,"kinds":[facet],"derivation":"resolution"}
                         }]}],
                         "symbols":[seed_symbol,next_symbol],
                         "sources":sources,
@@ -1079,10 +1079,10 @@ mod tests {
             }))
             .route("/rift/v1/search", post(|bytes: axum::body::Bytes| async move {
                 let request: Value = serde_json::from_slice(&bytes).expect("valid reverse request");
-                assert_eq!(request["relationships"]["direction"], "incoming");
-                assert_eq!(request["relationships"]["facets"], json!(["calls"]));
+                assert_eq!(request["edges"]["direction"], "incoming");
+                assert_eq!(request["edges"]["kinds"], json!(["calls"]));
                 assert_eq!(request["packages"].as_array().expect("exact domain").len(), 2);
-                let (seed, caller, id) = match request["relationships"]["seeds"][0].as_str() {
+                let (seed, caller, id) = match request["edges"]["seeds"][0].as_str() {
                     Some(PACKAGE_GREETING) => (PACKAGE_GREETING, PACKAGE_BRIDGE, 1),
                     Some(PACKAGE_BRIDGE) => (PACKAGE_BRIDGE, PACKAGE_ENTRY, 2),
                     Some(PACKAGE_ENTRY) => {
@@ -1096,10 +1096,10 @@ mod tests {
                         "kind":"function","origin":{"source_kind":"synthetic"}}, "declarations":[]
                 });
                 json_response(&json!({
-                    "groups": [{"seed":seed,"complete":true,"relationships":[{
+                    "groups": [{"seed":seed,"complete":true,"edges":[{
                         "id": format!("{id:064x}"),
-                        "relationship":{"from":caller,"to":seed,"kind":"calls",
-                            "facets":["calls"],"derivation":"resolution"}
+                        "edge":{"from":caller,"to":seed,"kind":"calls",
+                            "kinds":["calls"],"derivation":"resolution"}
                     }]}],
                     "symbols":[symbol(seed),symbol(caller)],
                     "analyzer_revision":"analyzer-v1","corpus_revision":"corpus-v1",
@@ -1332,10 +1332,7 @@ mod tests {
             matches!(&bindings[0]["callee"], rift_protocol::query::RdfTerm::Iri { value } if value == C)
         );
         let requests_seen = requests_seen.lock().await;
-        assert_eq!(
-            requests_seen[1]["relationships"]["facets"],
-            json!(["references"])
-        );
+        assert_eq!(requests_seen[1]["edges"]["kinds"], json!(["references"]));
         assert_eq!(requests_seen.len(), 3);
         assert!(requests_seen[0].get("view").is_none());
         assert!(
@@ -1660,7 +1657,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn graph_ask_refuses_uncovered_relationships() -> TestResult {
+    async fn graph_ask_refuses_uncovered_edges() -> TestResult {
         let directory = tempfile::tempdir()?;
         crate::server::hermetic_workspace(directory.path(), "")?;
         std::fs::write(directory.path().join("lib.rs"), "fn alpha() {}\n")?;

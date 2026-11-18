@@ -50,7 +50,7 @@
                         "patterns",
                         "declarations",
                         "facets",
-                        "relationships"
+                        "edges"
                       ],
                       "publication_format": "rift-package-index-v2",
                       "analyzer_revision": "8f3371e3",
@@ -79,16 +79,16 @@
                         "source_bytes_max": 33554432
                       },
                       "documentation_revision": "8f3371e3",
-                      "relationship_capabilities": [
+                      "edge_capabilities": [
                         {
                           "direction": "incoming",
-                          "facets": [
+                          "kinds": [
                             "contains"
                           ],
                           "bounds": {
                             "max_seeds": 64,
-                            "max_facets": 16,
-                            "max_relationships": 1000,
+                            "max_kinds": 16,
+                            "max_edges": 1000,
                             "max_occurrences": 1000,
                             "max_symbols": 10000,
                             "max_sources": 10000
@@ -96,13 +96,13 @@
                         },
                         {
                           "direction": "outgoing",
-                          "facets": [
+                          "kinds": [
                             "contains"
                           ],
                           "bounds": {
                             "max_seeds": 64,
-                            "max_facets": 16,
-                            "max_relationships": 1000,
+                            "max_kinds": 16,
+                            "max_edges": 1000,
                             "max_occurrences": 1000,
                             "max_symbols": 10000,
                             "max_sources": 10000
@@ -135,7 +135,7 @@
             }
           },
           "400": {
-            "description": "Request JSON, query parameters, or field relationships are invalid.",
+            "description": "Request JSON, query parameters, or field edges are invalid.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -417,7 +417,7 @@
             }
           },
           "400": {
-            "description": "Request JSON, query parameters, or field relationships are invalid.",
+            "description": "Request JSON, query parameters, or field edges are invalid.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -597,7 +597,7 @@
                     "$ref": "#/components/schemas/PackageSearchRequest"
                   },
                   {
-                    "$ref": "#/components/schemas/RelationshipSearchRequest"
+                    "$ref": "#/components/schemas/EdgeSearchRequest"
                   }
                 ]
               },
@@ -653,15 +653,15 @@
                     "target": "documentation"
                   }
                 },
-                "relationships": {
-                  "summary": "Exact relationship request",
+                "edges": {
+                  "summary": "Exact edge request",
                   "value": {
-                    "relationships": {
+                    "edges": {
                       "seeds": [
                         "rift://symbol/pypi/pypi.org/idna/python/idna/codec/Codec"
                       ],
                       "direction": "outgoing",
-                      "facets": [
+                      "kinds": [
                         "contains"
                       ]
                     },
@@ -681,7 +681,7 @@
         },
         "responses": {
           "200": {
-            "description": "One ranked package declaration page or one complete relationship page.",
+            "description": "One ranked package declaration page or one complete edge page.",
             "content": {
               "application/json": {
                 "schema": {
@@ -690,7 +690,7 @@
                       "$ref": "#/components/schemas/PackageSearchPage"
                     },
                     {
-                      "$ref": "#/components/schemas/RelationshipSearchPage"
+                      "$ref": "#/components/schemas/EdgeSearchPage"
                     }
                   ]
                 },
@@ -711,7 +711,7 @@
                             "language": "rust",
                             "name": "Buffer",
                             "kind": "struct",
-                            "facets": [
+                            "kinds": [
                               "type",
                               "public"
                             ],
@@ -764,7 +764,7 @@
                             "language": "rust",
                             "name": "format",
                             "kind": "function",
-                            "facets": [
+                            "kinds": [
                               "value",
                               "callable",
                               "public"
@@ -829,7 +829,7 @@
                             "language": "rust",
                             "name": "new",
                             "kind": "function",
-                            "facets": [
+                            "kinds": [
                               "value",
                               "callable",
                               "public"
@@ -894,7 +894,7 @@
                             "language": "rust",
                             "name": "write",
                             "kind": "function",
-                            "facets": [
+                            "kinds": [
                               "value",
                               "callable"
                             ],
@@ -952,7 +952,7 @@
                             "language": "rust",
                             "name": "Integer",
                             "kind": "trait",
-                            "facets": [
+                            "kinds": [
                               "type",
                               "public"
                             ],
@@ -1002,7 +1002,7 @@
                             "language": "rust",
                             "name": "Sealed",
                             "kind": "trait",
-                            "facets": [
+                            "kinds": [
                               "type",
                               "public"
                             ],
@@ -1281,19 +1281,19 @@
                       "revision": "9ed97ad7"
                     }
                   },
-                  "relationships": {
-                    "summary": "Relationship page",
+                  "edges": {
+                    "summary": "Edge page",
                     "value": {
                       "groups": [
                         {
                           "seed": "rift://symbol/pypi/pypi.org/idna/python/idna/codec/Codec",
-                          "relationships": [
+                          "edges": [
                             {
                               "id": "63d8dd9d4533c338f4f1d9953fad4eab6b92b5723a55f88b888fe9abfca1d9dd",
-                              "relationship": {
+                              "edge": {
                                 "from": "rift://symbol/pypi/pypi.org/idna/python/idna/codec/Codec",
                                 "kind": "contains",
-                                "facets": [
+                                "kinds": [
                                   "contains"
                                 ],
                                 "to": "rift://symbol/pypi/pypi.org/idna/python/idna/codec/Codec/decode",
@@ -1306,10 +1306,10 @@
                             },
                             {
                               "id": "b883e8af769222c814e984fc66de5d04385b52127d77e0953d48fdae4837048f",
-                              "relationship": {
+                              "edge": {
                                 "from": "rift://symbol/pypi/pypi.org/idna/python/idna/codec/Codec",
                                 "kind": "contains",
-                                "facets": [
+                                "kinds": [
                                   "contains"
                                 ],
                                 "to": "rift://symbol/pypi/pypi.org/idna/python/idna/codec/Codec/encode",
@@ -1331,7 +1331,7 @@
                             "language": "python",
                             "name": "Codec",
                             "kind": "class",
-                            "facets": [
+                            "kinds": [
                               "type"
                             ],
                             "origin": {
@@ -1375,7 +1375,7 @@
                             "language": "python",
                             "name": "decode",
                             "kind": "function",
-                            "facets": [
+                            "kinds": [
                               "value",
                               "callable"
                             ],
@@ -1429,7 +1429,7 @@
                             "language": "python",
                             "name": "encode",
                             "kind": "function",
-                            "facets": [
+                            "kinds": [
                               "value",
                               "callable"
                             ],
@@ -1497,7 +1497,7 @@
             }
           },
           "400": {
-            "description": "Request JSON, query parameters, or field relationships are invalid.",
+            "description": "Request JSON, query parameters, or field edges are invalid.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1629,7 +1629,7 @@
                 },
                 "examples": {
                   "insufficient_coverage": {
-                    "summary": "Required relationship coverage is unavailable",
+                    "summary": "Required edge coverage is unavailable",
                     "value": {
                       "outcome": "unavailable",
                       "reason": "insufficient_coverage"
@@ -1709,7 +1709,7 @@
                         "language": "rust",
                         "name": "Buffer",
                         "kind": "struct",
-                        "facets": [
+                        "kinds": [
                           "type",
                           "public"
                         ],
@@ -1770,7 +1770,7 @@
             }
           },
           "400": {
-            "description": "Request JSON, query parameters, or field relationships are invalid.",
+            "description": "Request JSON, query parameters, or field edges are invalid.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2004,7 +2004,7 @@
                               "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
                               "language": "rust",
                               "kind": "struct_item",
-                              "facets": [
+                              "kinds": [
                                 "declaration",
                                 "definition"
                               ],
@@ -2021,7 +2021,7 @@
                               "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
                               "language": "rust",
                               "kind": "visibility_modifier",
-                              "facets": [],
+                              "kinds": [],
                               "range": {
                                 "start": 2357,
                                 "end": 2360
@@ -2036,7 +2036,7 @@
                               "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
                               "language": "rust",
                               "kind": "type_identifier",
-                              "facets": [],
+                              "kinds": [],
                               "range": {
                                 "start": 2368,
                                 "end": 2374
@@ -2051,7 +2051,7 @@
                               "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
                               "language": "rust",
                               "kind": "field_declaration_list",
-                              "facets": [],
+                              "kinds": [],
                               "range": {
                                 "start": 2375,
                                 "end": 2427
@@ -2066,7 +2066,7 @@
                               "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
                               "language": "rust",
                               "kind": "field_declaration",
-                              "facets": [
+                              "kinds": [
                                 "declaration",
                                 "definition"
                               ],
@@ -2084,7 +2084,7 @@
                               "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
                               "language": "rust",
                               "kind": "field_identifier",
-                              "facets": [],
+                              "kinds": [],
                               "range": {
                                 "start": 2381,
                                 "end": 2386
@@ -2099,7 +2099,7 @@
                               "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
                               "language": "rust",
                               "kind": "array_type",
-                              "facets": [],
+                              "kinds": [],
                               "range": {
                                 "start": 2388,
                                 "end": 2424
@@ -2114,7 +2114,7 @@
                               "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
                               "language": "rust",
                               "kind": "generic_type",
-                              "facets": [],
+                              "kinds": [],
                               "range": {
                                 "start": 2389,
                                 "end": 2404
@@ -2129,7 +2129,7 @@
                               "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
                               "language": "rust",
                               "kind": "type_identifier",
-                              "facets": [],
+                              "kinds": [],
                               "range": {
                                 "start": 2389,
                                 "end": 2400
@@ -2144,7 +2144,7 @@
                               "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
                               "language": "rust",
                               "kind": "type_arguments",
-                              "facets": [],
+                              "kinds": [],
                               "range": {
                                 "start": 2400,
                                 "end": 2404
@@ -2159,7 +2159,7 @@
                               "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
                               "language": "rust",
                               "kind": "primitive_type",
-                              "facets": [],
+                              "kinds": [],
                               "range": {
                                 "start": 2401,
                                 "end": 2403
@@ -2174,7 +2174,7 @@
                               "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
                               "language": "rust",
                               "kind": "scoped_identifier",
-                              "facets": [],
+                              "kinds": [],
                               "range": {
                                 "start": 2406,
                                 "end": 2423
@@ -2189,7 +2189,7 @@
                               "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
                               "language": "rust",
                               "kind": "identifier",
-                              "facets": [],
+                              "kinds": [],
                               "range": {
                                 "start": 2406,
                                 "end": 2410
@@ -2204,7 +2204,7 @@
                               "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
                               "language": "rust",
                               "kind": "identifier",
-                              "facets": [],
+                              "kinds": [],
                               "range": {
                                 "start": 2412,
                                 "end": 2423
@@ -2230,7 +2230,7 @@
             }
           },
           "400": {
-            "description": "Request JSON, query parameters, or field relationships are invalid.",
+            "description": "Request JSON, query parameters, or field edges are invalid.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2471,7 +2471,7 @@
                               "language": "rust",
                               "name": "format",
                               "kind": "function",
-                              "facets": [
+                              "kinds": [
                                 "value",
                                 "callable",
                                 "public"
@@ -2542,7 +2542,7 @@
             }
           },
           "400": {
-            "description": "Request JSON, query parameters, or field relationships are invalid.",
+            "description": "Request JSON, query parameters, or field edges are invalid.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2780,7 +2780,7 @@
             }
           },
           "400": {
-            "description": "Request JSON, query parameters, or field relationships are invalid.",
+            "description": "Request JSON, query parameters, or field edges are invalid.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -3075,12 +3075,12 @@
             "$ref": "#/components/schemas/ExactKind",
             "description": "What this symbol is in the provider's vocabulary, such as `trait`, `function`, or\n`table`."
           },
-          "facets": {
+          "kinds": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/SymbolFacet"
+              "$ref": "#/components/schemas/SymbolKind"
             },
-            "description": "Portable classification for cross-language queries, absent when empty. The local\nkinds `trait` and `interface` can both carry the `type` facet.",
+            "description": "Portable classification for cross-language queries, absent when empty. The local\nkinds `trait` and `interface` can both carry the `type` kind.",
             "default": []
           },
           "origin": {
@@ -3147,7 +3147,7 @@
           "name",
           "kind"
         ],
-        "description": "Readable Symbol assembled from normalized Contributions. Source structure lives in `SyntaxElement`\nand is connected through Relationship."
+        "description": "Readable Symbol assembled from normalized Contributions. Source structure lives in `SyntaxElement`\nand is connected through Edge."
       },
       "SymbolOrigin": {
         "type": "object",
@@ -3273,8 +3273,8 @@
         ],
         "description": "Versioned extension value. data is validated against the schema advertised for its key\nand version."
       },
-      "SymbolFacet": {
-        "description": "One portable category a symbol falls into. Kinds are language-specific; facets are\nshared, so a filter written once applies to every served language.",
+      "SymbolKind": {
+        "description": "One portable category a symbol falls into, shared across served languages.\nThe language-specific `kind` names the declaration in its provider's vocabulary.",
         "type": "string",
         "enum": [
           "namespace",
@@ -3911,12 +3911,12 @@
             "pattern": "^[0-9a-f]{8}$",
             "description": "Documentation revision used for documentation reads."
           },
-          "relationship_capabilities": {
-            "description": "Complete relationship operations supported by existing collected facts. Absence establishes no supported operation.",
+          "edge_capabilities": {
+            "description": "Complete edge operations supported by existing collected facts. Absence establishes no supported operation.",
             "type": "array",
             "maxItems": 2,
             "items": {
-              "$ref": "#/components/schemas/RelationshipCapability"
+              "$ref": "#/components/schemas/EdgeCapability"
             }
           }
         },
@@ -4041,7 +4041,7 @@
       },
       "PackageSearchRequest": {
         "additionalProperties": false,
-        "description": "A lexical package declaration search or a bounded relationship walk.",
+        "description": "A lexical package declaration search or a bounded edge walk.",
         "properties": {
           "query": {
             "description": "Original query text.",
@@ -4106,7 +4106,7 @@
             ]
           },
           "traversal": {
-            "description": "A bounded relationship walk from an explicit canonical seed.",
+            "description": "A bounded edge walk from an explicit canonical seed.",
             "$ref": "#/components/schemas/SearchTraversal"
           },
           "view": {
@@ -5276,7 +5276,7 @@
             "items": {
               "$ref": "#/components/schemas/GraphHop"
             },
-            "description": "Shortest relationship path to this hit, present when a traversal reached it,\nincluding a hit also matched lexically.",
+            "description": "Shortest edge path to this hit, present when a traversal reached it,\nincluding a hit also matched lexically.",
             "minItems": 1,
             "maxItems": 2
           },
@@ -5359,12 +5359,12 @@
             "description": "Which edges the walk follows from each visited symbol: `incoming` reaches the\ndeclarations referencing it, `outgoing` the declarations it calls. Omitted, `incoming`.",
             "default": "incoming"
           },
-          "facets": {
+          "kinds": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/RelationshipFacet"
+              "$ref": "#/components/schemas/EdgeKind"
             },
-            "description": "Portable relationship facets eligible for the walk. Omitted or empty, every facet is\neligible.",
+            "description": "Portable edge kinds eligible for the walk. Omitted or empty, every kind is\neligible.",
             "maxItems": 29
           },
           "depth": {
@@ -5380,7 +5380,7 @@
             "$ref": "#/components/schemas/SymbolId"
           }
         },
-        "description": "A bounded relationship walk starting at one symbol.\n\nFrom `seed`, the server visits its neighbors, then their neighbors, up to `depth` hops,\nfollowing `direction` and narrowed to `facets`; each reached symbol keeps the shortest\npath the walk found to it.",
+        "description": "A bounded edge walk starting at one symbol.\n\nFrom `seed`, the server visits its neighbors, then their neighbors, up to `depth` hops,\nfollowing `direction` and narrowed to `kinds`; each reached symbol keeps the shortest\npath the walk found to it.",
         "examples": [
           {
             "seed": "rift://symbol/local/rust/rift_server/read/ReadService",
@@ -5513,7 +5513,7 @@
           "content",
           "ranked",
           "path",
-          "relationship",
+          "edge",
           "change"
         ],
         "x-enum-descriptions": [
@@ -5523,7 +5523,7 @@
           "The file's contents matched.",
           "The vector ranking placed the hit, and no indexed field carries the query's\nliteral bytes. A hit any other ranking placed names the field that carried it\ninstead.",
           "The project-relative path matched.",
-          "A relationship traversal reached the hit.",
+          "An edge traversal reached the hit.",
           "A comparison `change` named found the declaration changed."
         ]
       },
@@ -5531,20 +5531,20 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "relationship": {
-            "$ref": "#/components/schemas/Relationship",
-            "description": "The relationship followed for this step."
+          "edge": {
+            "$ref": "#/components/schemas/Edge",
+            "description": "The edge followed for this step."
           },
           "direction": {
             "$ref": "#/components/schemas/HopDirection",
-            "description": "How the walk followed the directed relationship."
+            "description": "How the walk followed the directed edge."
           }
         },
         "required": [
-          "relationship",
+          "edge",
           "direction"
         ],
-        "description": "One auditable step in a search traversal. `relationship` retains its occurrence and\nderivation; `direction` records how the walk followed it."
+        "description": "One auditable step in a search traversal. `edge` retains its occurrence and\nderivation; `direction` records how the walk followed it."
       },
       "TraversalDirection": {
         "description": "Which edge direction a search traversal walks from each visited symbol. A language\nengine supplies the edges of both: its references for `incoming`, its call hierarchy for\n`outgoing`.",
@@ -5554,8 +5554,8 @@
           "outgoing"
         ],
         "x-enum-descriptions": [
-          "Walks edges arriving at each visited symbol: the references a language engine\nresolves to it, each hop carrying the `references` facet.",
-          "Walks edges leaving each visited symbol: the calls a language engine's call\nhierarchy names for it, each hop carrying the `calls` facet."
+          "Walks edges arriving at each visited symbol: the references a language engine\nresolves to it, each hop carrying the `references` kind.",
+          "Walks edges leaving each visited symbol: the calls a language engine's call\nhierarchy names for it, each hop carrying the `calls` kind."
         ]
       },
       "CommitHit": {
@@ -5609,7 +5609,7 @@
         "description": "One commit whose message matched a commit search, as the history store holds it."
       },
       "HopDirection": {
-        "description": "How one path step followed its directed relationship.",
+        "description": "How one path step followed its directed edge.",
         "type": "string",
         "enum": [
           "outgoing",
@@ -5620,7 +5620,7 @@
           "The walk followed the edge against its direction, from target to source."
         ]
       },
-      "Relationship": {
+      "Edge": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
@@ -5632,10 +5632,10 @@
             "$ref": "#/components/schemas/ExactKind",
             "description": "What the edge is in this provider's vocabulary, such as `import`, `use`, or\n`implements`."
           },
-          "facets": {
+          "kinds": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/RelationshipFacet"
+              "$ref": "#/components/schemas/EdgeKind"
             },
             "description": "Portable classification, so a query for `imports` finds local kinds such as `import`\nand `use` alike.",
             "minItems": 1
@@ -5649,7 +5649,7 @@
             "$ref": "#/components/schemas/SourceUnitSpan"
           },
           "derivation": {
-            "$ref": "#/components/schemas/RelationshipDerivation",
+            "$ref": "#/components/schemas/EdgeDerivation",
             "description": "How this edge was established."
           },
           "confidence": {
@@ -5672,13 +5672,13 @@
         "required": [
           "from",
           "kind",
-          "facets",
+          "kinds",
           "to",
           "derivation"
         ],
         "description": "One directed edge between two symbols. Its occurrence is where it was read from, and its\nderivation is how much the provider knew when it was read."
       },
-      "RelationshipDerivation": {
+      "EdgeDerivation": {
         "description": "How this edge was established. Every edge reaches Rift from a provider, and this field\nrecords whether the provider resolved the edge semantically, read it from syntax, or\ninferred it.",
         "type": "string",
         "enum": [
@@ -6808,7 +6808,7 @@
               "visited",
               "detail"
             ],
-            "description": "A traversal walk stopped at its symbol bound before exhausting the reachable graph,\nso hits reachable beyond the bound are missing from this answer. Narrow the walk -\na tighter `facets` list, a smaller `depth`, or a less-connected seed - to fit it\nunder the bound."
+            "description": "A traversal walk stopped at its symbol bound before exhausting the reachable graph,\nso hits reachable beyond the bound are missing from this answer. Narrow the walk -\na tighter `kinds` list, a smaller `depth`, or a less-connected seed - to fit it\nunder the bound."
           },
           {
             "type": "object",
@@ -6816,14 +6816,14 @@
             "properties": {
               "code": {
                 "type": "string",
-                "const": "relationship_coverage_missing"
+                "const": "edge_coverage_missing"
               },
-              "facets": {
+              "kinds": {
                 "type": "array",
                 "items": {
-                  "$ref": "#/components/schemas/RelationshipFacet"
+                  "$ref": "#/components/schemas/EdgeKind"
                 },
-                "description": "The requested facets no lane populates, in the request's own order,\ndeduplicated. Absent when every requested facet has a lane."
+                "description": "The requested kinds no lane populates, in the request's own order,\ndeduplicated. Absent when every requested kind has a lane."
               },
               "detail": {
                 "type": "string",
@@ -6835,7 +6835,7 @@
               "code",
               "detail"
             ],
-            "description": "No lane populates part of the relationship coverage the traversal asked for, so the\nwalk had nothing to follow there whatever the graph holds. The warning states that a\nlane is absent; it never states that the seed has no such neighbor. An empty answer\ncarrying it means the walk could not run; an empty answer without it means the walk\nran and the seed has no neighbor under the request."
+            "description": "No lane populates part of the edge coverage the traversal asked for, so the\nwalk had nothing to follow there whatever the graph holds. The warning states that a\nlane is absent; it never states that the seed has no such neighbor. An empty answer\ncarrying it means the walk could not run; an empty answer without it means the walk\nran and the seed has no neighbor under the request."
           },
           {
             "type": "object",
@@ -6859,7 +6859,7 @@
               "code",
               "detail"
             ],
-            "description": "A language engine serves the seed's language, and this read carries none of its\nedges: the engine answered about bytes the served revision does not carry, answered\nmore than the walk's symbol bound holds, or was still analyzing when\n`[server] readiness_timeout` was spent. The indexed relationships stand; whatever\nthe engine resolves on top of them is missing. The warning states that an engine's\nanalysis is absent from this answer; it never states that the seed has no such\nneighbor. An engine still analyzing keeps loading, and a later read, served from a\nrevision the engine has caught up with or sent once it reads ready, carries the\nengine's edges again."
+            "description": "A language engine serves the seed's language, and this read carries none of its\nedges: the engine answered about bytes the served revision does not carry, answered\nmore than the walk's symbol bound holds, or was still analyzing when\n`[server] readiness_timeout` was spent. The indexed edges stand; whatever\nthe engine resolves on top of them is missing. The warning states that an engine's\nanalysis is absent from this answer; it never states that the seed has no such\nneighbor. An engine still analyzing keeps loading, and a later read, served from a\nrevision the engine has caught up with or sent once it reads ready, carries the\nengine's edges again."
           },
           {
             "type": "object",
@@ -7273,8 +7273,8 @@
           }
         ]
       },
-      "RelationshipFacet": {
-        "description": "One portable category an edge falls into. The local kinds `import` and `use` can share\nthe `imports` facet, which lets one query cross languages.",
+      "EdgeKind": {
+        "description": "One portable category an edge falls into. The local kinds `import` and `use` can share\nthe `imports` kind, which lets one query cross languages.",
         "type": "string",
         "enum": [
           "contains",
@@ -8256,7 +8256,7 @@
                 "syntax": [
                   {
                     "declaration": 0,
-                    "facets": [
+                    "kinds": [
                       "declaration",
                       "definition"
                     ],
@@ -8311,7 +8311,7 @@
                   },
                   {
                     "declaration": 0,
-                    "facets": [
+                    "kinds": [
                       "declaration",
                       "definition"
                     ],
@@ -8460,10 +8460,10 @@
             "$ref": "#/components/schemas/ExactKind",
             "description": "What the syntax element is in the provider's vocabulary, such as `fn_item`, `mapping.key`, or\n`selector.class`."
           },
-          "facets": {
+          "kinds": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/NodeFacet"
+              "$ref": "#/components/schemas/SyntaxKind"
             },
             "description": "Portable structural classification, so a query can ask for bodies or imports without\nknowing the grammar that produced them. Absent when empty.",
             "default": []
@@ -8507,8 +8507,8 @@
         ],
         "description": "One syntax element of a source unit's syntax tree, with its source text, addressed by its place inside\na symbol. A syntax element inside a declaration's item subtree is syntax element `index` of declaration\n`declaration` of the symbol the read names; a syntax element outside every declaration is syntax element `index`\nof its `unit`. Indexes count in pre-order from 0 at the declaration's item syntax element, or from 0 at\nthe unit's file syntax element, and skip the subtrees of nested declarations, whose syntax elements belong to the\nnested symbol. The address names a place at the read's revision: an edit renumbers the syntax elements\nafter it."
       },
-      "NodeFacet": {
-        "description": "Portable structural facets, so a filter can ask for bodies or imports without knowing the\ngrammar that produced them.",
+      "SyntaxKind": {
+        "description": "Portable structural kinds, so a filter can ask for bodies or imports without knowing the\ngrammar that produced them.",
         "type": "string",
         "enum": [
           "declaration",
@@ -8647,15 +8647,15 @@
             "$ref": "#/components/schemas/SourceUnitSpan",
             "description": "The exact source unit and UTF-8 byte range of the occurrence."
           },
-          "facet": {
-            "$ref": "#/components/schemas/RelationshipFacet",
-            "description": "The relationship established by this occurrence."
+          "kind": {
+            "$ref": "#/components/schemas/EdgeKind",
+            "description": "The edge established by this occurrence."
           }
         },
         "required": [
           "target",
           "source",
-          "facet"
+          "kind"
         ],
         "description": "One physical reference or call supplied by a selected provider."
       },
@@ -8704,7 +8704,7 @@
         ],
         "description": "A symbol together with the physical declarations selected for this read."
       },
-      "RelationshipBounds": {
+      "EdgeBounds": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
@@ -8714,17 +8714,17 @@
             "minimum": 1,
             "description": "Most subjects in one request."
           },
-          "max_facets": {
+          "max_kinds": {
             "type": "integer",
             "format": "uint64",
             "minimum": 1,
-            "description": "Most selected facets in one request."
+            "description": "Most selected kinds in one request."
           },
-          "max_relationships": {
+          "max_edges": {
             "type": "integer",
             "format": "uint64",
             "minimum": 1,
-            "description": "Most relationship projections in one group."
+            "description": "Most edge projections in one group."
           },
           "max_occurrences": {
             "type": "integer",
@@ -8747,15 +8747,15 @@
         },
         "required": [
           "max_seeds",
-          "max_facets",
-          "max_relationships",
+          "max_kinds",
+          "max_edges",
           "max_occurrences",
           "max_symbols",
           "max_sources"
         ],
-        "description": "Positive count bounds for one raw relationship operation."
+        "description": "Positive count bounds for one raw edge operation."
       },
-      "RelationshipCapability": {
+      "EdgeCapability": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
@@ -8763,27 +8763,27 @@
             "$ref": "#/components/schemas/TraversalDirection",
             "description": "Supported direction relative to each selected subject."
           },
-          "facets": {
+          "kinds": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/RelationshipFacet"
+              "$ref": "#/components/schemas/EdgeKind"
             },
-            "description": "Facets whose complete selected-domain reads the reader supports.",
+            "description": "Kinds whose complete selected-domain reads the reader supports.",
             "minItems": 1,
             "uniqueItems": true
           },
           "bounds": {
             "description": "Accepted count bounds for this operation. Absence does not establish raw read support.",
-            "$ref": "#/components/schemas/RelationshipBounds"
+            "$ref": "#/components/schemas/EdgeBounds"
           }
         },
         "required": [
           "direction",
-          "facets"
+          "kinds"
         ],
-        "description": "One relationship operation the reader establishes from its existing collected facts."
+        "description": "One edge operation the reader establishes from its existing collected facts."
       },
-      "RelationshipGroup": {
+      "EdgeGroup": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
@@ -8791,19 +8791,19 @@
             "$ref": "#/components/schemas/SymbolId",
             "description": "Requested canonical subject, including when its adjacency is empty."
           },
-          "relationships": {
+          "edges": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/RelationshipRecord"
+              "$ref": "#/components/schemas/EdgeRecord"
             },
             "description": "Original records, preserving parallel edges, evidence and occurrences."
           },
           "occurrences": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/RelationshipOccurrence"
+              "$ref": "#/components/schemas/EdgeOccurrence"
             },
-            "description": "Physical usages, including recursive and file-level locations without a caller symbol.\nPage limits count distinct original record identities across relationships and usages.\nMultiple projections of one original record consume one slot; independent records\nconsume separate slots even when their payloads or locations are equal."
+            "description": "Physical usages, including recursive and file-level locations without a caller symbol.\nPage limits count distinct original record identities across edges and usages.\nMultiple projections of one original record consume one slot; independent records\nconsume separate slots even when their payloads or locations are equal."
           },
           "complete": {
             "type": "boolean",
@@ -8812,12 +8812,12 @@
         },
         "required": [
           "seed",
-          "relationships",
+          "edges",
           "complete"
         ],
-        "description": "Original relationship records for one requested subject on this page."
+        "description": "Original edge records for one requested subject on this page."
       },
-      "RelationshipInclude": {
+      "EdgeInclude": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
@@ -8826,24 +8826,24 @@
             "description": "Attaches the exact UTF-8 bytes of the selected source units."
           }
         },
-        "description": "The optional projections of records in a relationship page. An omitted member is `false`.",
+        "description": "The optional projections of records in an edge page. An omitted member is `false`.",
         "examples": [
           {
             "source": true
           }
         ]
       },
-      "RelationshipOccurrence": {
+      "EdgeOccurrence": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "id": {
-            "$ref": "#/components/schemas/RelationshipRecordId",
+            "$ref": "#/components/schemas/EdgeRecordId",
             "description": "Complete original record identity. Projections of the same record share this value."
           },
-          "relationship": {
-            "description": "Related original relationship, only when the stored record establishes that link.",
-            "$ref": "#/components/schemas/RelationshipRecordId"
+          "edge": {
+            "description": "Related original edge, only when the stored record establishes that link.",
+            "$ref": "#/components/schemas/EdgeRecordId"
           },
           "occurrence": {
             "$ref": "#/components/schemas/QueryOccurrence",
@@ -8856,40 +8856,40 @@
         ],
         "description": "One physical usage projected from an original selected-publication record."
       },
-      "RelationshipRecord": {
+      "EdgeRecord": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "id": {
-            "$ref": "#/components/schemas/RelationshipRecordId",
+            "$ref": "#/components/schemas/EdgeRecordId",
             "description": "Opaque full identity scoped to the selected publication."
           },
-          "relationship": {
-            "$ref": "#/components/schemas/Relationship",
-            "description": "Existing domain relationship, including evidence and physical occurrence."
+          "edge": {
+            "$ref": "#/components/schemas/Edge",
+            "description": "Existing domain edge, including evidence and physical occurrence."
           }
         },
         "required": [
           "id",
-          "relationship"
+          "edge"
         ],
-        "description": "One original relationship record, independent of equal endpoint or evidence payloads."
+        "description": "One original edge record, independent of equal endpoint or evidence payloads."
       },
-      "RelationshipRecordId": {
+      "EdgeRecordId": {
         "type": "string",
         "minLength": 64,
         "maxLength": 64,
         "pattern": "^[0-9a-f]{64}$",
-        "description": "Opaque full identity of one original relationship record within its selected publication."
+        "description": "Opaque full identity of one original edge record within its selected publication."
       },
-      "RelationshipSearchPage": {
+      "EdgeSearchPage": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "groups": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/RelationshipGroup"
+              "$ref": "#/components/schemas/EdgeGroup"
             },
             "description": "One authoritative group for every requested subject, in request order.",
             "minItems": 1
@@ -8939,15 +8939,15 @@
           "corpus_revision",
           "view"
         ],
-        "description": "One raw relationship page from an immutable selected publication."
+        "description": "One raw edge page from an immutable selected publication."
       },
-      "RelationshipSearchRequest": {
+      "EdgeSearchRequest": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "relationships": {
-            "$ref": "#/components/schemas/RelationshipSelection",
-            "description": "Subjects, direction and facets selected for this adjacency batch."
+          "edges": {
+            "$ref": "#/components/schemas/EdgeSelection",
+            "description": "Subjects, direction and kinds selected for this adjacency batch."
           },
           "packages": {
             "type": "array",
@@ -8968,7 +8968,7 @@
             "maxItems": 20000
           },
           "include": {
-            "$ref": "#/components/schemas/RelationshipInclude",
+            "$ref": "#/components/schemas/EdgeInclude",
             "description": "Requested exact projections; source bytes use the same selected publication."
           },
           "view": {
@@ -8977,9 +8977,9 @@
           }
         },
         "required": [
-          "relationships"
+          "edges"
         ],
-        "description": "The exclusive raw relationship request on the existing search endpoint.",
+        "description": "The exclusive raw edge request on the existing search endpoint.",
         "anyOf": [
           {
             "required": [
@@ -8998,7 +8998,7 @@
           }
         ]
       },
-      "RelationshipSelection": {
+      "EdgeSelection": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
@@ -9014,19 +9014,19 @@
             "$ref": "#/components/schemas/TraversalDirection",
             "description": "Direction relative to each selected subject."
           },
-          "facets": {
+          "kinds": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/RelationshipFacet"
+              "$ref": "#/components/schemas/EdgeKind"
             },
-            "description": "Portable relationship facets. Empty selects every available facet.",
+            "description": "Portable edge kinds. Empty selects every available kind.",
             "uniqueItems": true
           }
         },
         "required": [
           "seeds",
           "direction",
-          "facets"
+          "kinds"
         ],
         "description": "One incoming or outgoing adjacency selection, without ranking or path projection."
       },
@@ -9081,7 +9081,7 @@
           "source",
           "syntax"
         ],
-        "description": "One facet: a declaration with its location, source, and syntax structure."
+        "description": "One kind: a declaration with its location, source, and syntax structure."
       }
     },
     "headers": {

@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rift_protocol::read::SymbolFacet;
+use rift_protocol::read::SymbolKind;
 use rift_syntax::{ByteRange, StaticBindingKind, StaticCall, StaticCallee, SyntaxSymbol};
 
 use super::{Binding, File, Target, Work};
@@ -110,9 +110,9 @@ impl<'source> Namespaces<'source> {
             file: file.document,
             symbol,
         };
-        if symbol.facets.contains(&SymbolFacet::Type) && file.is_module_item(symbol) {
+        if symbol.kinds.contains(&SymbolKind::Type) && file.is_module_item(symbol) {
             insert(&mut self.types, path, target);
-        } else if symbol.facets.contains(&SymbolFacet::Callable) {
+        } else if symbol.kinds.contains(&SymbolKind::Callable) {
             if let Some(implementation) = inherent_member(file, symbol, work) {
                 insert(
                     &mut self.methods,
@@ -314,7 +314,7 @@ impl<'source> Namespaces<'source> {
         }
         target.symbol.visibility.as_deref() == Some("pub")
             || source == target_namespace
-            || (target.symbol.facets.contains(&SymbolFacet::Callable)
+            || (target.symbol.kinds.contains(&SymbolKind::Callable)
                 && self.methods.get(path).copied().flatten().is_some()
                 && target_namespace
                     .split_last()

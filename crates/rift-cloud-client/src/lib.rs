@@ -2,10 +2,10 @@
 
 mod cache;
 pub mod contract;
+pub mod edges;
 mod facets;
 mod failure;
 mod pattern;
-pub mod relationships;
 mod response;
 pub mod search;
 mod source;
@@ -62,22 +62,22 @@ pub use generated::{
     DocumentationContentIdentity, DocumentationContext, DocumentationFormat, DocumentationHit,
     DocumentationLicense, DocumentationReferenceEvidence, DocumentationSelectionReason,
     DocumentationSource, DocumentationSourceFormat, DocumentationSourceIdentity,
-    DocumentationStage, DocumentationWarningKind, ExactKind, Extensions, GetCapabilitiesRequest,
-    GetCapabilitiesResponse, IdentifierMatchClass, Language, NotebookCellIdentity,
-    NotebookCellKind, PackageAvailability, PackageContextEntry, PackageDocumentationHit,
-    PackageDocumentationHitContributingField, PackageIdentity, PackagePatternDeclaration,
-    PackagePatternHit, PackagePatternPage, PackagePatternRequest, PackagePatternRequestInclude,
-    PackageResolutionRequest, PackageResolutionResponse, PackageSearchHit,
-    PackageSearchHitContributingField, PackageSearchRequest, PackageSearchRequestInclude,
-    PackageSearchRequestPhase, PackageSearchRequestTarget, Parameter,
+    DocumentationStage, DocumentationWarningKind, EdgeKind, ExactKind, Extensions,
+    GetCapabilitiesRequest, GetCapabilitiesResponse, IdentifierMatchClass, Language,
+    NotebookCellIdentity, NotebookCellKind, PackageAvailability, PackageContextEntry,
+    PackageDocumentationHit, PackageDocumentationHitContributingField, PackageIdentity,
+    PackagePatternDeclaration, PackagePatternHit, PackagePatternPage, PackagePatternRequest,
+    PackagePatternRequestInclude, PackageResolutionRequest, PackageResolutionResponse,
+    PackageSearchHit, PackageSearchHitContributingField, PackageSearchRequest,
+    PackageSearchRequestInclude, PackageSearchRequestPhase, PackageSearchRequestTarget, Parameter,
     PositionEncoding as PackageDeclarationRequestPositionEncoding, ProblemDetails,
-    PublicationFormat, QueryTerm, RelationshipFacet, ResolvePackageContextRequest,
-    ResolvePackageContextResponse, ResolvedRequirement, Search200Response,
-    SearchPackagePatternsRequest, SearchPackagePatternsRequestQuery, SearchPackagePatternsResponse,
-    SearchPackagesRequest, SearchPackagesRequestQuery, SearchPackagesResponse, SearchTraversal,
-    SearchUnavailable, Signature, SignatureLink, SourceKind, SourceLocationKind, SourceUnitId,
-    Symbol, SymbolFacet, SymbolId, SymbolOrigin, TextRange, TraversalDirection, TypeBinding,
-    TypeBindingOrigin, TypeBindingRole, TypeExpression, Warning, WarningCode,
+    PublicationFormat, QueryTerm, ResolvePackageContextRequest, ResolvePackageContextResponse,
+    ResolvedRequirement, Search200Response, SearchPackagePatternsRequest,
+    SearchPackagePatternsRequestQuery, SearchPackagePatternsResponse, SearchPackagesRequest,
+    SearchPackagesRequestQuery, SearchPackagesResponse, SearchTraversal, SearchUnavailable,
+    Signature, SignatureLink, SourceKind, SourceLocationKind, SourceUnitId, Symbol, SymbolId,
+    SymbolKind, SymbolOrigin, TextRange, TraversalDirection, TypeBinding, TypeBindingOrigin,
+    TypeBindingRole, TypeExpression, Warning, WarningCode,
 };
 pub mod domain;
 pub use domain::{PackagePatternMatch, PackageSearchCandidate};
@@ -195,17 +195,17 @@ pub struct Config {
     pub max_response: usize,
     /// Most UTF-8 bytes one source payload carries, also bounded by capabilities.
     pub max_source: usize,
-    /// Most original symbol records in one relationship page.
+    /// Most original symbol records in one edge page.
     pub max_symbols: usize,
-    /// Most original source units in one relationship page.
+    /// Most original source units in one edge page.
     pub max_sources: usize,
-    /// Most subjects in one relationship request.
+    /// Most subjects in one edge request.
     pub max_seeds: usize,
-    /// Most selected facets in one relationship request.
-    pub max_facets: usize,
-    /// Most relationship projections in one relationship group.
-    pub max_relationships: usize,
-    /// Most occurrence projections in one relationship group.
+    /// Most selected kinds in one edge request.
+    pub max_kinds: usize,
+    /// Most edge projections in one edge group.
+    pub max_edges: usize,
+    /// Most occurrence projections in one edge group.
     pub max_occurrences: usize,
     /// Local ceiling for capability cache lifetime.
     pub capabilities_ttl: Duration,
@@ -232,10 +232,8 @@ impl Default for Config {
             max_symbols: usize::from(rift_protocol::configuration::GLOBAL_SYMBOLS_DEFAULT),
             max_sources: usize::from(rift_protocol::configuration::GLOBAL_SOURCES_DEFAULT),
             max_seeds: usize::from(rift_protocol::configuration::GLOBAL_SEEDS_DEFAULT),
-            max_facets: usize::from(rift_protocol::configuration::GLOBAL_FACETS_DEFAULT),
-            max_relationships: usize::from(
-                rift_protocol::configuration::GLOBAL_RELATIONSHIPS_DEFAULT,
-            ),
+            max_kinds: usize::from(rift_protocol::configuration::GLOBAL_KINDS_DEFAULT),
+            max_edges: usize::from(rift_protocol::configuration::GLOBAL_EDGES_DEFAULT),
             max_occurrences: usize::from(rift_protocol::configuration::GLOBAL_OCCURRENCES_DEFAULT),
             capabilities_ttl: Duration::from_mins(15),
             resolution_ttl: Duration::from_mins(15),
@@ -283,15 +281,11 @@ impl TryFrom<&rift_protocol::configuration::GlobalConfiguration> for Config {
             max_seeds: usize::try_from(value.max_seeds).map_err(|source| {
                 failure::configuration_source("max_seeds", "outside configured bounds", source)
             })?,
-            max_facets: usize::try_from(value.max_facets).map_err(|source| {
-                failure::configuration_source("max_facets", "outside configured bounds", source)
+            max_kinds: usize::try_from(value.max_kinds).map_err(|source| {
+                failure::configuration_source("max_kinds", "outside configured bounds", source)
             })?,
-            max_relationships: usize::try_from(value.max_relationships).map_err(|source| {
-                failure::configuration_source(
-                    "max_relationships",
-                    "outside configured bounds",
-                    source,
-                )
+            max_edges: usize::try_from(value.max_edges).map_err(|source| {
+                failure::configuration_source("max_edges", "outside configured bounds", source)
             })?,
             max_occurrences: usize::try_from(value.max_occurrences).map_err(|source| {
                 failure::configuration_source(
@@ -1832,9 +1826,9 @@ fn validate_search_traversal_request(request: &PackageSearchRequest) -> Result<(
                 .unwrap_or(rift_protocol::search::SEARCH_TRAVERSAL_DEPTH_DEFAULT),
         )
         || traversal
-            .facets
+            .kinds
             .as_ref()
-            .is_some_and(|facets| facets.len() > rift_protocol::search::SEARCH_TRAVERSAL_FACETS_MAX)
+            .is_some_and(|kinds| kinds.len() > rift_protocol::search::SEARCH_TRAVERSAL_KINDS_MAX)
     {
         return Err(failure::request_invalid(
             "validate_search_request",
@@ -2711,8 +2705,8 @@ fn validate_config(config: &Config) -> Result<(), RiftError> {
         ("max_symbols", config.max_symbols),
         ("max_sources", config.max_sources),
         ("max_seeds", config.max_seeds),
-        ("max_facets", config.max_facets),
-        ("max_relationships", config.max_relationships),
+        ("max_kinds", config.max_kinds),
+        ("max_edges", config.max_edges),
         ("max_occurrences", config.max_occurrences),
     ] {
         if value == 0 {

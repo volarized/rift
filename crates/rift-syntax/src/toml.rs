@@ -42,18 +42,18 @@
 //! - A table or table array element has no wrapping syntax element for the pairs it
 //!   holds, so its `body_range` is always absent; a pair's `body_range` is
 //!   its value syntax element's span.
-//! - Members carry no visibility and no portable symbol facet: `visibility`
-//!   stays `None` and `facets` stays empty.
+//! - Members carry no visibility and no portable symbol kind: `visibility`
+//!   stays `None` and `kinds` stays empty.
 //! - `signatures` and `documentation` stay empty for every member and every
 //!   table: TOML has no callable form - a pair's `body_range` names a
-//!   value, not an implementation, and carries no `Callable` facet - and,
+//!   value, not an implementation, and carries no `Callable` kind - and,
 //!   with nothing attached in front of a declaration, no comment for one to
 //!   carry either.
 
 use std::sync::OnceLock;
 
 use rift_error::errors;
-use rift_protocol::read::{Language, NodeFacet};
+use rift_protocol::read::{Language, SyntaxKind};
 use tree_sitter::{Node, Parser};
 
 use crate::document::SyntaxDocument;
@@ -107,11 +107,11 @@ const QUOTE_BYTE_WIDTH: usize = 1;
 
 /// Numeric grammar ids for every kind the extraction walk compares, resolved
 /// once so each decision compares integers. The pinned grammar declares no
-/// fields, so this table holds no field ids. `syntax_element_facets` classifies the
+/// fields, so this table holds no field ids. `syntax_element_kinds` classifies the
 /// value-literal kinds (`string`, `integer`, and the rest) by their kind
 /// name directly, so this table holds none of those - the same split the
 /// JSON provider draws between `pair`/`string`, which extraction consults,
-/// and `"number"`/`"true"`/`"false"`/`"null"`, which `syntax_element_facets` matches
+/// and `"number"`/`"true"`/`"false"`/`"null"`, which `syntax_element_kinds` matches
 /// by name alone.
 #[derive(Debug)]
 struct TomlKinds {
@@ -261,7 +261,7 @@ impl TomlRules {
         Ok(Some(Declaration {
             name,
             kind: MEMBER_KIND_WORD,
-            facets: Vec::new(),
+            kinds: Vec::new(),
             visibility: None,
             body_range,
             documentation: Vec::new(),
@@ -279,7 +279,7 @@ impl TomlRules {
         Some(Declaration {
             name,
             kind: TABLE_KIND_WORD,
-            facets: Vec::new(),
+            kinds: Vec::new(),
             visibility: None,
             body_range: None,
             documentation: Vec::new(),
@@ -385,14 +385,14 @@ impl SyntaxProvider for TomlSyntaxProvider {
         .with_syntax_limits(limits))
     }
 
-    /// Portable structural facets for one TOML grammar syntax element kind. The
+    /// Portable structural kinds for one TOML grammar syntax element kind. The
     /// structural kinds - `document`, `array`, `inline_table`, key segments
     /// - carry none.
-    fn syntax_element_facets(&self, kind: &str) -> Vec<NodeFacet> {
+    fn syntax_element_kinds(&self, kind: &str) -> Vec<SyntaxKind> {
         match kind {
             // A pair declares its key's name; a table or table array
             // element declares its header key's name.
-            PAIR_KIND | TABLE_KIND | TABLE_ARRAY_ELEMENT_KIND => vec![NodeFacet::Declaration],
+            PAIR_KIND | TABLE_KIND | TABLE_ARRAY_ELEMENT_KIND => vec![SyntaxKind::Declaration],
             // A value written out directly.
             STRING_KIND
             | INTEGER_KIND
@@ -402,9 +402,9 @@ impl SyntaxProvider for TomlSyntaxProvider {
             | LOCAL_TIME_KIND
             | LOCAL_DATE_TIME_KIND
             | OFFSET_DATE_TIME_KIND => {
-                vec![NodeFacet::Literal]
+                vec![SyntaxKind::Literal]
             }
-            COMMENT_KIND => vec![NodeFacet::Comment],
+            COMMENT_KIND => vec![SyntaxKind::Comment],
             _ => Vec::new(),
         }
     }
@@ -552,9 +552,9 @@ mod tests {
                 .symbols()
                 .iter()
                 .all(|symbol| symbol.range == symbol.item_range
-                    && symbol.facets.is_empty()
+                    && symbol.kinds.is_empty()
                     && symbol.visibility.is_none()),
-            "every declaration spans its own syntax_element and carries no facets and \
+            "every declaration spans its own syntax_element and carries no kinds and \
              no visibility"
         );
         assert_eq!(document.symbols()[0].kind, "member");
@@ -774,15 +774,15 @@ mod tests {
         assert!(!document.has_errors());
     }
 
-    /// The declaring kinds carry the `Declaration` facet, value kinds read
+    /// The declaring kinds carry the `Declaration` kind, value kinds read
     /// as `Literal`, a comment as `Comment`, and structure carries none.
     #[test]
-    fn test_syntax_element_facets_classify_the_interpreted_kinds() {
+    fn test_syntax_element_kinds_classify_the_interpreted_kinds() {
         let provider = TomlSyntaxProvider::default();
         for kind in [PAIR_KIND, TABLE_KIND, TABLE_ARRAY_ELEMENT_KIND] {
             assert_eq!(
-                provider.syntax_element_facets(kind),
-                [NodeFacet::Declaration],
+                provider.syntax_element_kinds(kind),
+                [SyntaxKind::Declaration],
                 "kind {kind} must classify as a declaration"
             );
         }
@@ -797,14 +797,14 @@ mod tests {
             OFFSET_DATE_TIME_KIND,
         ] {
             assert_eq!(
-                provider.syntax_element_facets(kind),
-                [NodeFacet::Literal],
+                provider.syntax_element_kinds(kind),
+                [SyntaxKind::Literal],
                 "kind {kind} must classify as a literal value"
             );
         }
         assert_eq!(
-            provider.syntax_element_facets(COMMENT_KIND),
-            [NodeFacet::Comment]
+            provider.syntax_element_kinds(COMMENT_KIND),
+            [SyntaxKind::Comment]
         );
         for kind in [
             "document",
@@ -814,9 +814,9 @@ mod tests {
             DOTTED_KEY_KIND,
         ] {
             assert_eq!(
-                provider.syntax_element_facets(kind),
+                provider.syntax_element_kinds(kind),
                 [],
-                "structural kind {kind} carries no portable facet"
+                "structural kind {kind} carries no portable kind"
             );
         }
     }

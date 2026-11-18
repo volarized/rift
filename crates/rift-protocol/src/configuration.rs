@@ -628,17 +628,17 @@ pub const GLOBAL_SOURCE_BYTES_MIN: u64 = 1;
 /// Global source payload bytes, at most.
 pub const GLOBAL_SOURCE_BYTES_MAX: u64 = 64 << 20;
 
-/// Default original symbols in one global relationship page.
+/// Default original symbols in one global edge page.
 pub const GLOBAL_SYMBOLS_DEFAULT: u16 = 10_000;
-/// Default original source units in one global relationship page.
+/// Default original source units in one global edge page.
 pub const GLOBAL_SOURCES_DEFAULT: u16 = 10_000;
-/// Default subjects in one global relationship request.
+/// Default subjects in one global edge request.
 pub const GLOBAL_SEEDS_DEFAULT: u16 = 64;
-/// Default selected facets in one global relationship request.
-pub const GLOBAL_FACETS_DEFAULT: u16 = 16;
-/// Default relationship projections in one global relationship group.
-pub const GLOBAL_RELATIONSHIPS_DEFAULT: u16 = 1_000;
-/// Default occurrence projections in one global relationship group.
+/// Default selected kinds in one global edge request.
+pub const GLOBAL_KINDS_DEFAULT: u16 = 16;
+/// Default edge projections in one global edge group.
+pub const GLOBAL_EDGES_DEFAULT: u16 = 1_000;
+/// Default occurrence projections in one global edge group.
 pub const GLOBAL_OCCURRENCES_DEFAULT: u16 = 1_000;
 
 /// The `[global]` table: global REST API access, request bounds, and cache lifetimes.
@@ -669,22 +669,22 @@ pub struct GlobalConfiguration {
     /// Most UTF-8 bytes in one source payload from the global API. The client also applies the
     /// advertised source bound, using the smaller value.
     pub max_source: ByteSize,
-    /// Most original symbol records in one global relationship page.
+    /// Most original symbol records in one global edge page.
     #[schemars(range(min = 1))]
     pub max_symbols: u64,
-    /// Most original source units in one global relationship page.
+    /// Most original source units in one global edge page.
     #[schemars(range(min = 1))]
     pub max_sources: u64,
-    /// Most subjects in one global relationship request.
+    /// Most subjects in one global edge request.
     #[schemars(range(min = 1))]
     pub max_seeds: u64,
-    /// Most selected facets in one global relationship request.
+    /// Most selected kinds in one global edge request.
     #[schemars(range(min = 1))]
-    pub max_facets: u64,
-    /// Most relationship projections in one global relationship group.
+    pub max_kinds: u64,
+    /// Most edge projections in one global edge group.
     #[schemars(range(min = 1))]
-    pub max_relationships: u64,
-    /// Most occurrence projections in one global relationship group.
+    pub max_edges: u64,
+    /// Most occurrence projections in one global edge group.
     #[schemars(range(min = 1))]
     pub max_occurrences: u64,
     /// Capabilities cache lifetime, 1m to 24h.
@@ -711,8 +711,8 @@ impl Default for GlobalConfiguration {
             max_symbols: u64::from(GLOBAL_SYMBOLS_DEFAULT),
             max_sources: u64::from(GLOBAL_SOURCES_DEFAULT),
             max_seeds: u64::from(GLOBAL_SEEDS_DEFAULT),
-            max_facets: u64::from(GLOBAL_FACETS_DEFAULT),
-            max_relationships: u64::from(GLOBAL_RELATIONSHIPS_DEFAULT),
+            max_kinds: u64::from(GLOBAL_KINDS_DEFAULT),
+            max_edges: u64::from(GLOBAL_EDGES_DEFAULT),
             max_occurrences: u64::from(GLOBAL_OCCURRENCES_DEFAULT),
             capabilities_ttl: Duration::from_millis(GLOBAL_CACHE_TTL_MS_DEFAULT),
             resolution_ttl: Duration::from_millis(GLOBAL_CACHE_TTL_MS_DEFAULT),
@@ -770,13 +770,8 @@ impl GlobalConfiguration {
             ("global.max_symbols", self.max_symbols, 1, u64::MAX),
             ("global.max_sources", self.max_sources, 1, u64::MAX),
             ("global.max_seeds", self.max_seeds, 1, u64::MAX),
-            ("global.max_facets", self.max_facets, 1, u64::MAX),
-            (
-                "global.max_relationships",
-                self.max_relationships,
-                1,
-                u64::MAX,
-            ),
+            ("global.max_kinds", self.max_kinds, 1, u64::MAX),
+            ("global.max_edges", self.max_edges, 1, u64::MAX),
             ("global.max_occurrences", self.max_occurrences, 1, u64::MAX),
             (
                 "global.capabilities_ttl",

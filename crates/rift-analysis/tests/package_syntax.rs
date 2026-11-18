@@ -400,7 +400,7 @@ fn every_package_provider_keeps_canonical_facts_and_reports_actual_calls() {
 #[test]
 fn captured_static_occurrences_survive_package_fact_restoration() {
     use rift_protocol::producer::FactKind;
-    use rift_protocol::read::RelationshipFacet;
+    use rift_protocol::read::EdgeKind;
 
     let source = "pub fn target() {}\npub fn caller() { target(); target(); }\n";
     let files = [("src/lib.rs", source)];
@@ -427,9 +427,9 @@ fn captured_static_occurrences_survive_package_fact_restoration() {
         .validate_facts()
         .expect("coverage matches facts");
     let calls = publication
-        .relationships
+        .edges
         .iter()
-        .filter(|relationship| relationship.facets.contains(&RelationshipFacet::Calls))
+        .filter(|edge| edge.kinds.contains(&EdgeKind::Calls))
         .collect::<Vec<_>>();
     assert_eq!(calls.len(), 2);
     assert_ne!(calls[0].occurrence, calls[1].occurrence);
