@@ -4,19 +4,19 @@
 //! hits form one tree per starting symbol; every other hit is an item. The tree is rebuilt here
 //! from the structured answer alone, then the text is checked against it:
 //!
-//! - Roots come in the order their first walk hit appears; the nodes under a node come in the
-//!   order their first walk hit appears. Walk hits that share a prefix of hops share its nodes,
-//!   and the last hop of a path never lands on a node that already is a hit.
+//! - Roots come in the order their first walk hit appears; the symbols under a symbol come in the
+//!   order their first walk hit appears. Walk hits that share a prefix of hops share its symbols,
+//!   and the last hop of a path never lands on a symbol that already is a hit.
 //! - A hit outside the walk with the symbol identity of a root is that root and is no item.
-//! - A root sits at one level. A node at depth `d` writes its head line `↳ <relationship>` alone
+//! - A root sits at one level. A symbol at depth `d` writes its head line `↳ <edge>` alone
 //!   at `1 + d` levels and its further lines at `2 + d` levels. A root indents every line by one
 //!   level. A root that is a hit writes its declaration with no word before it, then `in <facts>`
 //!   and `at <symbol identity>` as a branch does; a root that is no hit writes `at <identity>`.
-//! - A blank line precedes every node except the first entry of the section.
-//! - A node without a hit writes `at <symbol identity>` and no other line. A node with a hit
+//! - A blank line precedes every symbol except the first entry of the section.
+//! - A symbol without a hit writes `at <symbol identity>` and no other line. A symbol with a hit
 //!   writes the declaration, `in <facts>`, `at <symbol identity>`, and the further lines of a
-//!   symbol hit, without `relationship` among the matched fields. The declaration starts with
-//!   `by ` exactly when every facet phrase of the hop ends in ` by`; the head line then leaves
+//!   symbol hit, without `edge` among the matched fields. The declaration starts with
+//!   `by ` exactly when every kind phrase of the hop ends in ` by`; the head line then leaves
 //!   that ` by` out of each phrase. The facts start with `in ` exactly when they start with a
 //!   location.
 
@@ -27,23 +27,23 @@ use super::{
     source_may_end_blank, source_states, text_at, visible,
 };
 
-/// Mark that starts a node under the root.
+/// Mark that starts a symbol under the root.
 const BRANCH: &str = "↳";
-/// Word before the declaration of a node when the relationship ends in `by`.
+/// Word before the declaration of a symbol when the edge ends in `by`.
 const BY: &str = "by ";
 /// Ending of a phrase that moves to the declaration line.
 const BY_ENDING: &str = " by";
-/// Word before the facts of a node that start with a location.
+/// Word before the facts of a symbol that start with a location.
 const IN: &str = "in ";
-/// Word before the symbol identity of a node.
+/// Word before the symbol identity of a symbol.
 const AT: &str = "at ";
-/// Word before the first facet of a heuristic relationship.
+/// Word before the first kind of a heuristic edge.
 const HEURISTIC: &str = "probably ";
-/// Text between a relationship and the external producer that emitted it.
+/// Text between an edge and the external producer that emitted it.
 const PRODUCER: &str = " · ";
 /// Matched field that the tree states, so the facts line leaves it out.
-const STATED_FIELD: &str = "relationship";
-/// Each relationship facet, read from the target back to the source.
+const STATED_FIELD: &str = "edge";
+/// Each edge kind, read from the target back to the source.
 const INCOMING: [(&str, &str); 29] = [
     ("contains", "contained by"),
     ("declares", "declared by"),
@@ -82,32 +82,32 @@ struct Hop {
     start: String,
     /// Identity of the symbol the hop reaches.
     reached: String,
-    /// The head line of the node: `↳ probably called, referenced`.
+    /// The head line of the symbol: `↳ probably called, referenced`.
     head: String,
-    /// Whether every facet phrase ends in ` by`, so the declaration line starts with `by `.
+    /// Whether every kind phrase ends in ` by`, so the declaration line starts with `by `.
     by: bool,
 }
 
 /// One symbol of the tree.
-struct Node {
+struct WalkSymbol {
     id: String,
     /// Levels under the root.
     depth: usize,
-    /// `↳ <relationship>`, empty for a root.
+    /// `↳ <edge>`, empty for a root.
     lead: String,
     /// Whether the declaration line starts with `by `.
     by: bool,
     /// Index in `results` of the hit that is this symbol.
     hit: Option<usize>,
-    /// Index in `results` of the first walk hit whose path holds this node.
+    /// Index in `results` of the first walk hit whose path holds this symbol.
     origin: usize,
-    /// Places, among the nodes, of the nodes directly under this one, in answer order.
+    /// Places, among the symbols, of the symbols directly under this one, in answer order.
     children: Vec<usize>,
 }
 
-/// The lines of one node of the text, from its head line.
-pub(super) struct NodeLines<'e> {
-    node: usize,
+/// The lines of one symbol of the text, from its head line.
+pub(super) struct SymbolLines<'e> {
+    symbol: usize,
     lines: Vec<&'e str>,
 }
 
@@ -115,7 +115,7 @@ pub(super) struct NodeLines<'e> {
 pub(super) struct Plan<'a> {
     results: &'a [Value],
     outside: Vec<(usize, &'a Value)>,
-    nodes: Vec<Node>,
+    symbols: Vec<WalkSymbol>,
     roots: Vec<usize>,
 }
 
@@ -144,31 +144,31 @@ fn hops_of(hit: &Value, at: &str) -> Result<Vec<Hop>, String> {
                 .map(str::to_owned)
                 .ok_or_else(|| format!("{at}{pointer}: must be a string"))
         };
-        let (from, to) = (text("/relationship/from")?, text("/relationship/to")?);
+        let (from, to) = (text("/edge/from")?, text("/edge/to")?);
         let outgoing = match text("/direction")?.as_str() {
             "outgoing" => true,
             "incoming" => false,
             other => return Err(format!("{at}.direction: unknown direction `{other}`")),
         };
         let mut phrases = Vec::new();
-        for facet in hop
-            .pointer("/relationship/facets")
+        for kind in hop
+            .pointer("/edge/kinds")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
         {
             phrases.push(if outgoing {
-                facet.replace('_', " ")
+                kind.replace('_', " ")
             } else {
                 INCOMING
                     .iter()
-                    .find(|(wire, _)| *wire == facet)
+                    .find(|(wire, _)| *wire == kind)
                     .map(|(_, phrase)| (*phrase).to_owned())
-                    .ok_or_else(|| format!("{at}.relationship.facets: unknown facet `{facet}`"))?
+                    .ok_or_else(|| format!("{at}.edge.kinds: unknown kind `{kind}`"))?
             });
         }
-        let guess = if text_at(hop, "/relationship/derivation") == Some("heuristic") {
+        let guess = if text_at(hop, "/edge/derivation") == Some("heuristic") {
             HEURISTIC
         } else {
             ""
@@ -180,8 +180,8 @@ fn hops_of(hit: &Value, at: &str) -> Result<Vec<Hop>, String> {
             }
         }
         let produced = match (
-            text_at(hop, "/relationship/producer/name"),
-            text_at(hop, "/relationship/producer/revision"),
+            text_at(hop, "/edge/producer/name"),
+            text_at(hop, "/edge/producer/revision"),
         ) {
             (Some(name), Some(revision)) => format!("{PRODUCER}{name} {revision}"),
             _ => String::new(),
@@ -197,12 +197,12 @@ fn hops_of(hit: &Value, at: &str) -> Result<Vec<Hop>, String> {
     Ok(hops)
 }
 
-/// Levels that indent the head line of a node.
+/// Levels that indent the head line of a symbol.
 fn head_levels(depth: usize) -> usize {
     SECTION_LEVELS + depth
 }
 
-/// Levels that indent the further lines of a node. A root has no head line of its own.
+/// Levels that indent the further lines of a symbol. A root has no head line of its own.
 fn rest_levels(depth: usize) -> usize {
     if depth == 0 {
         SECTION_LEVELS
@@ -217,7 +217,7 @@ impl<'a> Plan<'a> {
         let mut plan = Self {
             results,
             outside: Vec::new(),
-            nodes: Vec::new(),
+            symbols: Vec::new(),
             roots: Vec::new(),
         };
         for (index, hit) in results.iter().enumerate() {
@@ -237,18 +237,18 @@ impl<'a> Plan<'a> {
         &self.outside
     }
 
-    /// Adds the path of the walk hit `index` and puts the hit at its last node.
+    /// Adds the path of the walk hit `index` and puts the hit at its last symbol.
     fn reach(&mut self, index: usize, hops: &[Hop]) {
         let Some(first) = hops.first() else {
             return;
         };
         let known = self.roots.iter().copied().find(|root| {
-            self.nodes
+            self.symbols
                 .get(*root)
-                .is_some_and(|node| node.id == first.start)
+                .is_some_and(|symbol| symbol.id == first.start)
         });
         let mut place = known.unwrap_or_else(|| {
-            self.nodes.push(Node {
+            self.symbols.push(WalkSymbol {
                 id: first.start.clone(),
                 depth: 0,
                 lead: String::new(),
@@ -257,19 +257,19 @@ impl<'a> Plan<'a> {
                 origin: index,
                 children: Vec::new(),
             });
-            self.roots.push(self.nodes.len() - 1);
-            self.nodes.len() - 1
+            self.roots.push(self.symbols.len() - 1);
+            self.symbols.len() - 1
         });
         for (position, hop) in hops.iter().enumerate() {
             let last = position + 1 == hops.len();
             let parent = place;
-            let existing = self.nodes[parent].children.iter().copied().find(|child| {
-                let node = &self.nodes[*child];
-                node.id == hop.reached && !(last && node.hit.is_some())
+            let existing = self.symbols[parent].children.iter().copied().find(|child| {
+                let symbol = &self.symbols[*child];
+                symbol.id == hop.reached && !(last && symbol.hit.is_some())
             });
             place = existing.unwrap_or_else(|| {
-                let depth = self.nodes[parent].depth + 1;
-                self.nodes.push(Node {
+                let depth = self.symbols[parent].depth + 1;
+                self.symbols.push(WalkSymbol {
                     id: hop.reached.clone(),
                     depth,
                     lead: hop.head.clone(),
@@ -278,65 +278,65 @@ impl<'a> Plan<'a> {
                     origin: index,
                     children: Vec::new(),
                 });
-                let place = self.nodes.len() - 1;
-                self.nodes[parent].children.push(place);
+                let place = self.symbols.len() - 1;
+                self.symbols[parent].children.push(place);
                 place
             });
         }
-        self.nodes[place].hit = Some(index);
+        self.symbols[place].hit = Some(index);
     }
 
     /// Moves the hit outside the walk that is the symbol of a root into that root.
     fn claim_roots(&mut self) {
         for root in self.roots.clone() {
-            let id = self.nodes[root].id.clone();
+            let id = self.symbols[root].id.clone();
             let found = self.outside.iter().position(|(_, hit)| {
                 text_at(hit, "/hit/target") == Some("symbol")
                     && text_at(hit, "/hit/symbol/id") == Some(id.as_str())
             });
             if let Some(found) = found {
-                self.nodes[root].hit = Some(self.outside.remove(found).0);
+                self.symbols[root].hit = Some(self.outside.remove(found).0);
             }
         }
     }
 
-    /// The nodes in the order the text writes them: each node before the nodes under it.
+    /// The symbols in the order the text writes them: each symbol before the symbols under it.
     fn order(&self) -> Vec<usize> {
         let mut order = Vec::new();
         let mut pending: Vec<usize> = self.roots.iter().rev().copied().collect();
         while let Some(place) = pending.pop() {
             order.push(place);
-            pending.extend(self.nodes[place].children.iter().rev());
+            pending.extend(self.symbols[place].children.iter().rev());
         }
         order
     }
 
-    /// The JSON path that names a node.
+    /// The JSON path that names a symbol.
     fn at(&self, place: usize) -> String {
-        let node = &self.nodes[place];
-        let hop = node.depth.saturating_sub(1);
-        format!("$.results[{}].traversal_path[{hop}]", node.origin)
+        let symbol = &self.symbols[place];
+        let hop = symbol.depth.saturating_sub(1);
+        format!("$.results[{}].traversal_path[{hop}]", symbol.origin)
     }
 
-    /// The identity the node writes: the one of its hit when it has one, else its own.
-    fn identity_of<'n>(&'n self, node: &'n Node) -> Option<&'n str> {
-        match node.hit {
+    /// The identity the symbol writes: the one of its hit when it has one, else its own.
+    fn identity_of<'n>(&'n self, symbol: &'n WalkSymbol) -> Option<&'n str> {
+        match symbol.hit {
             Some(index) => text_at(&self.results[index], "/hit/symbol/id"),
-            None => Some(node.id.as_str()),
+            None => Some(symbol.id.as_str()),
         }
     }
 
-    /// The index in `entries` of the head line of the node `place`, at or after `cursor`.
+    /// The index in `entries` of the head line of the symbol `place`, at or after `cursor`.
     fn head_of(&self, place: usize, entries: &[&str], cursor: usize) -> Result<usize, String> {
-        let node = &self.nodes[place];
+        let symbol = &self.symbols[place];
         let at = self.at(place);
-        let id = visible(&node.id);
-        if node.depth > 0 {
-            let opening = format!("{}{}", indent(head_levels(node.depth)), node.lead);
-            // The identity line tells two nodes with the same head line apart.
+        let id = visible(&symbol.id);
+        if symbol.depth > 0 {
+            let opening = format!("{}{}", indent(head_levels(symbol.depth)), symbol.lead);
+            // The identity line tells two symbols with the same head line apart.
             let identity = self
-                .identity_of(node)
-                .map(|id| format!("{}{AT}{}", indent(rest_levels(node.depth)), visible(id)));
+                .identity_of(symbol)
+                .map(|id| format!("{}{AT}{}", indent(rest_levels(symbol.depth)), visible(id)));
             let found = (cursor..entries.len()).find(|line| {
                 entries[*line] == opening
                     && identity.as_ref().is_none_or(|identity| {
@@ -347,7 +347,7 @@ impl<'a> Plan<'a> {
                     })
             });
             return found.ok_or_else(|| {
-                format!("{at}: no line opens the node with `{opening}` and the identity `{id}`")
+                format!("{at}: no line opens the symbol with `{opening}` and the identity `{id}`")
             });
         }
         // The identity line is the only line of a root without a hit, and the line after the
@@ -356,7 +356,7 @@ impl<'a> Plan<'a> {
         let line = (cursor..entries.len())
             .find(|line| entries[*line] == anchor)
             .ok_or_else(|| format!("{at}: no line equals the root `{anchor}`"))?;
-        if node.hit.is_none() {
+        if symbol.hit.is_none() {
             return Ok(line);
         }
         [2, 1]
@@ -372,13 +372,13 @@ impl<'a> Plan<'a> {
             })
     }
 
-    /// Splits `entries` into the lines of the items and the lines of each node.
+    /// Splits `entries` into the lines of the items and the lines of each symbol.
     ///
-    /// The blank line before the first node belongs to neither.
+    /// The blank line before the first symbol belongs to neither.
     pub(super) fn split<'e>(
         &self,
         entries: &[&'e str],
-    ) -> Result<(Vec<&'e str>, Vec<NodeLines<'e>>), String> {
+    ) -> Result<(Vec<&'e str>, Vec<SymbolLines<'e>>), String> {
         let order = self.order();
         if order.is_empty() {
             return Ok((entries.to_vec(), Vec::new()));
@@ -392,55 +392,55 @@ impl<'a> Plan<'a> {
         }
         if self.outside.is_empty() {
             require(heads[0] == 0, "$.results", || {
-                "no line may come before the first node".to_owned()
+                "no line may come before the first symbol".to_owned()
             })?;
         }
-        let mut nodes = Vec::with_capacity(order.len());
+        let mut symbols = Vec::with_capacity(order.len());
         for (position, place) in order.iter().enumerate() {
             let head = heads[position];
             require(
                 head == 0 || entries[head - 1].is_empty(),
                 &self.at(*place),
-                || format!("a blank line must precede the node `{}`", entries[head]),
+                || format!("a blank line must precede the symbol `{}`", entries[head]),
             )?;
             let end = heads
                 .get(position + 1)
                 .map_or(entries.len(), |next| next - 1);
-            nodes.push(NodeLines {
-                node: *place,
+            symbols.push(SymbolLines {
+                symbol: *place,
                 lines: entries[head..end].to_vec(),
             });
         }
-        Ok((entries[..heads[0].saturating_sub(1)].to_vec(), nodes))
+        Ok((entries[..heads[0].saturating_sub(1)].to_vec(), symbols))
     }
 
-    /// Checks the lines of every node.
-    pub(super) fn states(&self, nodes: &[NodeLines<'_>]) -> Result<(), String> {
-        for chunk in nodes {
-            self.node_states(chunk)?;
+    /// Checks the lines of every symbol.
+    pub(super) fn states(&self, symbols: &[SymbolLines<'_>]) -> Result<(), String> {
+        for chunk in symbols {
+            self.symbol_states(chunk)?;
         }
         Ok(())
     }
 
-    /// Checks one node: its head, its indents, and the lines of its hit.
-    fn node_states(&self, chunk: &NodeLines<'_>) -> Result<(), String> {
-        let node = &self.nodes[chunk.node];
-        let at = self.at(chunk.node);
-        let rest = rest_levels(node.depth);
-        if node.depth > 0 && node.hit.is_none() {
-            let identity = format!("{}{AT}{}", indent(rest), visible(&node.id));
+    /// Checks one symbol: its head, its indents, and the lines of its hit.
+    fn symbol_states(&self, chunk: &SymbolLines<'_>) -> Result<(), String> {
+        let symbol = &self.symbols[chunk.symbol];
+        let at = self.at(chunk.symbol);
+        let rest = rest_levels(symbol.depth);
+        if symbol.depth > 0 && symbol.hit.is_none() {
+            let identity = format!("{}{AT}{}", indent(rest), visible(&symbol.id));
             return require(
                 chunk.lines == [chunk.lines[0], identity.as_str()],
                 &at,
                 || {
                     format!(
-                        "a node without a hit writes `{AT}{}` and no other line",
-                        node.id
+                        "a symbol without a hit writes `{AT}{}` and no other line",
+                        symbol.id
                     )
                 },
             );
         }
-        let Some(index) = node.hit else {
+        let Some(index) = symbol.hit else {
             return require(chunk.lines.len() == 1, &at, || {
                 "a root without a hit writes `at <identity>` and no further line".to_owned()
             });
@@ -452,18 +452,18 @@ impl<'a> Plan<'a> {
                 || chunk.lines.last() != Some(&"")
                 || source_may_end_blank(hit.get("source")),
             &hit_at,
-            || "a blank line may not end a node, before the next node or section".to_owned(),
+            || "a blank line may not end a symbol, before the next symbol or section".to_owned(),
         )?;
-        let mut item = if node.depth == 0 {
+        let mut item = if symbol.depth == 0 {
             let head = chunk
                 .lines
                 .first()
                 .and_then(|line| line.strip_prefix(indent(SECTION_LEVELS).as_str()))
                 .ok_or_else(|| format!("{at}: the root head must be indented by one level"))?;
             require(!marked(head), &hit_at, || {
-                format!("a node takes no marker, got `{head}`")
+                format!("a symbol takes no marker, got `{head}`")
             })?;
-            Item::node(&chunk.lines, head, rest, &hit_at)?
+            Item::symbol(&chunk.lines, head, rest, &hit_at)?
         } else {
             let declaration = chunk
                 .lines
@@ -472,10 +472,10 @@ impl<'a> Plan<'a> {
                 .ok_or_else(|| {
                     format!("{at}: the declaration must be indented by {rest} levels")
                 })?;
-            let item = Item::node(&chunk.lines[1..], declaration, rest, &hit_at)?;
-            require(declaration.starts_with(BY) == node.by, &at, || {
+            let item = Item::symbol(&chunk.lines[1..], declaration, rest, &hit_at)?;
+            require(declaration.starts_with(BY) == symbol.by, &at, || {
                 format!(
-                    "the declaration `{declaration}` must start with `{BY}` exactly when every facet ends in `{BY_ENDING}`"
+                    "the declaration `{declaration}` must start with `{BY}` exactly when every kind ends in `{BY_ENDING}`"
                 )
             })?;
             item
@@ -488,8 +488,8 @@ impl<'a> Plan<'a> {
         source_states(&item, hit.get("source"), &hit_at)
     }
 
-    /// Removes `in ` from the facts line and `at ` from the identity line of a node under the
-    /// root, after checking that they are there exactly when the node states them.
+    /// Removes `in ` from the facts line and `at ` from the identity line of a symbol under the
+    /// root, after checking that they are there exactly when the symbol states them.
     fn strip_words(item: &mut Item<'_>, hit: &Value, at: &str) -> Result<(), String> {
         let located = place_of(
             text_at(hit, "/path"),
@@ -533,7 +533,7 @@ fn marked(head: &str) -> bool {
         .is_some_and(|(number, _)| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// Checks that the source of a node follows a blank line.
+/// Checks that the source of a symbol follows a blank line.
 fn source_after_blank(item: &Item<'_>, source: Option<&Value>, at: &str) -> Result<(), String> {
     let Some(source) = source
         .and_then(Value::as_str)

@@ -7,15 +7,14 @@ use rift_protocol::read::SEARCH_PATTERN_CHARS_MAX;
 
 use crate::{
     Capabilities, GlobalClient, HitLocation, PackagePatternHit, PackagePatternPage,
-    PackagePatternRequest, PageMetadata, SearchPackagePatternsRequestQuery,
-    active_response_body_bytes_max, advertised_page_limit, bounded_nonempty_characters, contract,
-    failure, includes_source, package_key, package_source_path, response, serialize_body,
-    smaller_bound, supports_feature, validate_body_for_capabilities, validate_canonical_hit,
-    validate_packages, validate_page, validate_read_bounds,
+    PackagePatternRequest, PageMetadata, active_response_body_bytes_max,
+    bounded_nonempty_characters, contract, failure, package_key, package_source_path, response,
+    serialize_body, smaller_bound, supports_feature, validate_body_for_capabilities,
+    validate_canonical_hit, validate_packages, validate_read_bounds,
 };
 
 /// Most distinct files one pattern page holds matches from. The server verifies candidate files
-/// in path order and stops a page at this many, so `next_cursor` continues from the next file.
+/// in path order and refuses a page above this bound.
 pub const PATTERN_PAGE_FILES_MAX: usize = 500;
 
 /// The capability feature a server advertises when it serves pattern search.
@@ -68,13 +67,9 @@ impl PackagePatternPage {
 }
 
 impl GlobalClient {
-    /// Reads one page of pattern matches over the selected exact package versions, asking for
-    /// the smaller of `limit` and the advertised `page_limit_max`.
-    ///
-    /// The page stops at that many matches, at [`PATTERN_PAGE_FILES_MAX`] files, or at the text
-    /// bound the server verifies per page, and a page that stopped before the last match
-    /// carries a `result_truncated` warning; the caller decides whether to follow
-    /// `next_cursor`.
+    /// Reads one page of pattern matches over the selected exact package versions.
+    /// The requested page and `max_results` are sent unchanged. A page above the advertised
+    /// count, file, or source byte bound is refused.
     ///
     /// # Errors
     ///
@@ -89,7 +84,7 @@ impl GlobalClient {
         &self,
         request: &PackagePatternRequest,
         limit: i64,
-        cursor: Option<&str>,
+        page_number: u64,
     ) -> Result<PackagePatternPage, RiftError> {
         rift_tracing::traced!(
             component = "global",
@@ -102,19 +97,23 @@ impl GlobalClient {
                     ));
                 }
                 validate_pattern_request(request)?;
-                validate_page(limit, cursor)?;
+                super::validate_numbered_page(limit, page_number)?;
                 let capabilities = self.get_capabilities().await?;
-                let limit = advertised_page_limit(limit, &capabilities);
-                validate_pattern_request_for_capabilities(request, limit, cursor, &capabilities)?;
+                validate_pattern_request_for_capabilities(
+                    request,
+                    limit,
+                    page_number,
+                    &capabilities,
+                )?;
                 let body = serialize_body(request, self.inner.config.max_request)?;
                 validate_body_for_capabilities(
                     &body,
                     &capabilities,
                     self.inner.config.max_request,
                 )?;
-                let query = SearchPackagePatternsRequestQuery {
-                    limit: Some(limit),
-                    cursor: cursor.map(str::to_owned),
+                let query = rift_protocol::read::GlobalPageParams {
+                    page: page_number,
+                    max_results: limit.cast_unsigned(),
                 };
                 let response_body_bytes_max =
                     active_response_body_bytes_max(&capabilities, self.inner.config.max_response);
@@ -133,7 +132,7 @@ impl GlobalClient {
                     request,
                     capabilities: &capabilities,
                     limit,
-                    cursor,
+                    page: page_number,
                     source_bytes_max: self.inner.config.max_source,
                 }
                 .validate(&page);
@@ -147,24 +146,13 @@ impl GlobalClient {
 
 pub(crate) fn validate_pattern_request(request: &PackagePatternRequest) -> Result<(), RiftError> {
     bounded_nonempty_characters(&request.pattern, SEARCH_PATTERN_CHARS_MAX, "pattern")?;
-    if request
-        .include
-        .as_ref()
-        .is_some_and(|values| values.len() > 1 || values.iter().any(|value| value != "source"))
-    {
-        return Err(failure::request_invalid(
-            "validate_pattern_request",
-            "include",
-            "field failed validation",
-        ));
-    }
     validate_packages(request.packages.as_deref().unwrap_or_default())
 }
 
 pub(crate) fn validate_pattern_request_for_capabilities(
     request: &PackagePatternRequest,
     limit: i64,
-    cursor: Option<&str>,
+    _page: u64,
     capabilities: &Capabilities,
 ) -> Result<(), RiftError> {
     if !supports_feature(capabilities, PATTERN_FEATURE) {
@@ -176,7 +164,6 @@ pub(crate) fn validate_pattern_request_for_capabilities(
     validate_read_bounds(
         request.packages.as_ref().map_or(0, Vec::len),
         limit,
-        cursor,
         capabilities,
     )
 }
@@ -187,7 +174,7 @@ pub(crate) struct PatternPageCheck<'a> {
     pub(crate) request: &'a PackagePatternRequest,
     pub(crate) capabilities: &'a Capabilities,
     pub(crate) limit: i64,
-    pub(crate) cursor: Option<&'a str>,
+    pub(crate) page: u64,
     pub(crate) source_bytes_max: usize,
 }
 
@@ -198,7 +185,6 @@ impl PatternPageCheck<'_> {
             analyzer_revision: &page.analyzer_revision,
             corpus_revision: &page.corpus_revision,
             documentation_revision: None,
-            next_cursor: page.next_cursor.as_deref(),
             warnings: &page.warnings,
         }
         .validate(self.capabilities, false)?;
@@ -242,14 +228,35 @@ impl PatternPageCheck<'_> {
                 None,
             ));
         }
-        if self.cursor.is_some()
-            && page.items.is_empty()
-            && page.next_cursor.as_deref() == self.cursor
+        let pagination = rift_protocol::read::Pagination::new(
+            page.pagination.page,
+            page.pagination.max_results,
+            page.pagination.total,
+        );
+        if pagination.pages != page.pagination.pages {
+            return Err(failure::response_invalid(
+                "validate",
+                "pagination",
+                "field failed validation",
+                None,
+            ));
+        }
+        super::validate_pagination(
+            &pagination,
+            self.limit.cast_unsigned(),
+            self.page,
+            page.items.len(),
+        )?;
+        if self
+            .request
+            .revision
+            .as_ref()
+            .is_some_and(|revision| revision != &page.revision)
         {
             return Err(failure::response_invalid(
                 "validate",
-                "cursor_progress",
-                "field failed validation",
+                "revision",
+                "indexed revision changed",
                 None,
             ));
         }
@@ -293,7 +300,12 @@ impl PatternPageCheck<'_> {
             self.capabilities.bounds.source_bytes_max,
             self.source_bytes_max,
         );
-        let source_allowed = includes_source(self.request.include.as_deref());
+        let source_allowed = self
+            .request
+            .include
+            .as_ref()
+            .and_then(|include| include.source)
+            .unwrap_or_default();
         if hit
             .source
             .as_ref()

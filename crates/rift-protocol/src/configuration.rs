@@ -158,10 +158,10 @@ pub const HISTORY_RELEASE_PATTERN_BYTES_MAX: usize = 256;
 pub const SYNTAX_FILE_BYTES_DEFAULT: u64 = 4 << 20;
 /// Bytes `providers.syntax.max_file` may hold, at most.
 pub const SYNTAX_FILE_BYTES_MAX: u64 = 64 << 20;
-/// Syntax nodes one source may produce when `providers.syntax.max_nodes` is absent.
-pub const SYNTAX_NODES_DEFAULT: u64 = 250_000;
-/// Syntax nodes `providers.syntax.max_nodes` may allow, at most.
-pub const SYNTAX_NODES_MAX: u64 = 100_000_000;
+/// Syntax syntax elements one source may produce when `providers.syntax.max_syntax_elements` is absent.
+pub const SYNTAX_ELEMENTS_DEFAULT: u64 = 250_000;
+/// Syntax syntax elements `providers.syntax.max_syntax_elements` may allow, at most.
+pub const SYNTAX_ELEMENTS_MAX: u64 = 100_000_000;
 /// Nesting one source may reach when `providers.syntax.max_depth` is absent.
 pub const SYNTAX_DEPTH_DEFAULT: u64 = 512;
 /// Nesting `providers.syntax.max_depth` may allow, at most.
@@ -628,17 +628,17 @@ pub const GLOBAL_SOURCE_BYTES_MIN: u64 = 1;
 /// Global source payload bytes, at most.
 pub const GLOBAL_SOURCE_BYTES_MAX: u64 = 64 << 20;
 
-/// Default original symbols in one global relationship page.
+/// Default original symbols in one global edge page.
 pub const GLOBAL_SYMBOLS_DEFAULT: u16 = 10_000;
-/// Default original source units in one global relationship page.
+/// Default original source units in one global edge page.
 pub const GLOBAL_SOURCES_DEFAULT: u16 = 10_000;
-/// Default subjects in one global relationship request.
+/// Default subjects in one global edge request.
 pub const GLOBAL_SEEDS_DEFAULT: u16 = 64;
-/// Default selected facets in one global relationship request.
-pub const GLOBAL_FACETS_DEFAULT: u16 = 16;
-/// Default relationship projections in one global relationship group.
-pub const GLOBAL_RELATIONSHIPS_DEFAULT: u16 = 1_000;
-/// Default occurrence projections in one global relationship group.
+/// Default selected kinds in one global edge request.
+pub const GLOBAL_KINDS_DEFAULT: u16 = 16;
+/// Default edge projections in one global edge group.
+pub const GLOBAL_EDGES_DEFAULT: u16 = 1_000;
+/// Default occurrence projections in one global edge group.
 pub const GLOBAL_OCCURRENCES_DEFAULT: u16 = 1_000;
 
 /// The `[global]` table: global REST API access, request bounds, and cache lifetimes.
@@ -669,22 +669,22 @@ pub struct GlobalConfiguration {
     /// Most UTF-8 bytes in one source payload from the global API. The client also applies the
     /// advertised source bound, using the smaller value.
     pub max_source: ByteSize,
-    /// Most original symbol records in one global relationship page.
+    /// Most original symbol records in one global edge page.
     #[schemars(range(min = 1))]
     pub max_symbols: u64,
-    /// Most original source units in one global relationship page.
+    /// Most original source units in one global edge page.
     #[schemars(range(min = 1))]
     pub max_sources: u64,
-    /// Most subjects in one global relationship request.
+    /// Most subjects in one global edge request.
     #[schemars(range(min = 1))]
     pub max_seeds: u64,
-    /// Most selected facets in one global relationship request.
+    /// Most selected kinds in one global edge request.
     #[schemars(range(min = 1))]
-    pub max_facets: u64,
-    /// Most relationship projections in one global relationship group.
+    pub max_kinds: u64,
+    /// Most edge projections in one global edge group.
     #[schemars(range(min = 1))]
-    pub max_relationships: u64,
-    /// Most occurrence projections in one global relationship group.
+    pub max_edges: u64,
+    /// Most occurrence projections in one global edge group.
     #[schemars(range(min = 1))]
     pub max_occurrences: u64,
     /// Capabilities cache lifetime, 1m to 24h.
@@ -711,8 +711,8 @@ impl Default for GlobalConfiguration {
             max_symbols: u64::from(GLOBAL_SYMBOLS_DEFAULT),
             max_sources: u64::from(GLOBAL_SOURCES_DEFAULT),
             max_seeds: u64::from(GLOBAL_SEEDS_DEFAULT),
-            max_facets: u64::from(GLOBAL_FACETS_DEFAULT),
-            max_relationships: u64::from(GLOBAL_RELATIONSHIPS_DEFAULT),
+            max_kinds: u64::from(GLOBAL_KINDS_DEFAULT),
+            max_edges: u64::from(GLOBAL_EDGES_DEFAULT),
             max_occurrences: u64::from(GLOBAL_OCCURRENCES_DEFAULT),
             capabilities_ttl: Duration::from_millis(GLOBAL_CACHE_TTL_MS_DEFAULT),
             resolution_ttl: Duration::from_millis(GLOBAL_CACHE_TTL_MS_DEFAULT),
@@ -770,13 +770,8 @@ impl GlobalConfiguration {
             ("global.max_symbols", self.max_symbols, 1, u64::MAX),
             ("global.max_sources", self.max_sources, 1, u64::MAX),
             ("global.max_seeds", self.max_seeds, 1, u64::MAX),
-            ("global.max_facets", self.max_facets, 1, u64::MAX),
-            (
-                "global.max_relationships",
-                self.max_relationships,
-                1,
-                u64::MAX,
-            ),
+            ("global.max_kinds", self.max_kinds, 1, u64::MAX),
+            ("global.max_edges", self.max_edges, 1, u64::MAX),
             ("global.max_occurrences", self.max_occurrences, 1, u64::MAX),
             (
                 "global.capabilities_ttl",
@@ -1194,7 +1189,7 @@ pub struct ProvidersConfiguration {
 }
 
 /// The `[providers.syntax]` table. A syntax provider's cost scales with the
-/// source it parses, so each source is bounded by size, node count, and
+/// source it parses, so each source is bounded by size, syntax element count, and
 /// nesting depth; a source past any bound is left out of the index.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1202,9 +1197,9 @@ pub struct ProvidersConfiguration {
 pub struct SyntaxConfiguration {
     /// Bytes of one source a provider parses, 1b to 64mb.
     pub max_file: ByteSize,
-    /// Syntax nodes one source may produce.
+    /// Syntax syntax elements one source may produce.
     #[schemars(range(min = 1, max = 100_000_000))]
-    pub max_nodes: u64,
+    pub max_syntax_elements: u64,
     /// Nesting one source's syntax tree may reach.
     #[schemars(range(min = 1, max = 65_536))]
     pub max_depth: u64,
@@ -1242,7 +1237,7 @@ impl Default for SyntaxConfiguration {
     fn default() -> Self {
         Self {
             max_file: ByteSize::from_bytes(SYNTAX_FILE_BYTES_DEFAULT),
-            max_nodes: SYNTAX_NODES_DEFAULT,
+            max_syntax_elements: SYNTAX_ELEMENTS_DEFAULT,
             max_depth: SYNTAX_DEPTH_DEFAULT,
             frameworks: Vec::new(),
         }
@@ -1261,10 +1256,10 @@ impl SyntaxConfiguration {
                 SYNTAX_FILE_BYTES_MAX,
             ),
             (
-                "providers.syntax.max_nodes",
-                self.max_nodes,
+                "providers.syntax.max_syntax_elements",
+                self.max_syntax_elements,
                 1,
-                SYNTAX_NODES_MAX,
+                SYNTAX_ELEMENTS_MAX,
             ),
             (
                 "providers.syntax.max_depth",
@@ -4261,8 +4256,8 @@ mod tests {
                 "providers.syntax.max_file",
             ),
             (
-                |syntax| syntax.max_nodes = SYNTAX_NODES_MAX + 1,
-                "providers.syntax.max_nodes",
+                |syntax| syntax.max_syntax_elements = SYNTAX_ELEMENTS_MAX + 1,
+                "providers.syntax.max_syntax_elements",
             ),
             (|syntax| syntax.max_depth = 0, "providers.syntax.max_depth"),
         ];
@@ -4284,7 +4279,7 @@ mod tests {
         let mut configuration = WorkspaceConfiguration::default();
         configuration.providers.syntax = SyntaxConfiguration {
             max_file: ByteSize::from_bytes(SYNTAX_FILE_BYTES_MAX),
-            max_nodes: SYNTAX_NODES_MAX,
+            max_syntax_elements: SYNTAX_ELEMENTS_MAX,
             max_depth: SYNTAX_DEPTH_MAX,
             frameworks: Vec::new(),
         };

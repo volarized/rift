@@ -596,14 +596,14 @@ path = "src/lib.rs"
             !index
                 .syntax(&path)
                 .map(|document| document.map(|document| document
-                    .nodes_at(4)
+                    .syntax_elements_at(4)
                     .into_iter()
                     .cloned()
                     .collect::<Vec<_>>()))
-                .expect("node parse")
+                .expect("syntax element parse")
                 .expect("indexed path")
                 .is_empty(),
-            "syntax nodes parse from committed bytes"
+            "syntax elements parse from committed bytes"
         );
         let lines = index.source_matches("committed", 5).expect("lexical read");
         assert_eq!(lines[0].1, 1);

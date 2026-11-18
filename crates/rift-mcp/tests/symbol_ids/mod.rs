@@ -61,22 +61,20 @@ async fn local_symbol_ids_answer_reads_for_each_language() -> TestResult {
         assert_eq!(symbol["symbol"]["name"], name, "{symbol}");
         assert_eq!(symbol["symbol"]["id"], id, "{symbol}");
         let facets =
-            call_retrying_acceptance(&client, tool_request("nodes", &json!({"symbol": id})))
+            call_retrying_acceptance(&client, tool_request("facets", &json!({"symbol": id})))
                 .await?;
         assert_eq!(facets["symbol"], id, "{facets}");
+        assert_eq!(facets["pagination"]["total"], 1, "{facets}");
         let declarations = facets["declarations"].as_array().ok_or("declarations")?;
         assert_eq!(declarations.len(), 1, "{facets}");
-        let full = call_retrying_acceptance(
-            &client,
-            tool_request("nodes", &json!({"symbol": id, "syntax": true})),
-        )
-        .await?;
-        let elements = full["nodes"].as_array().ok_or("syntax elements")?;
+        let elements = declarations[0]["syntax"]
+            .as_array()
+            .ok_or("syntax elements")?;
         assert!(
             elements.iter().any(|element| element["source"]
                 .as_str()
                 .is_some_and(|text| source.contains(text) && text.contains(name))),
-            "{full}"
+            "{facets}"
         );
     }
     client.cancel().await?;

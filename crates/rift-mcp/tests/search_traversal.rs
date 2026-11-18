@@ -105,7 +105,7 @@ async fn search_traversal_neighbors_depth_one_reaches_the_direct_callers() -> Te
         assert!(
             hit["matched_by"]
                 .as_array()
-                .is_some_and(|matched| matched.contains(&json!("relationship"))),
+                .is_some_and(|matched| matched.contains(&json!("edge"))),
             "{hit}"
         );
     }
@@ -217,7 +217,7 @@ async fn search_query_and_traversal_merge_carry_both_matched_by_entries_and_the_
         .as_array()
         .ok_or("matched_by must be an array")?;
     assert!(matched_by.contains(&json!("name")), "{hit}");
-    assert!(matched_by.contains(&json!("relationship")), "{hit}");
+    assert!(matched_by.contains(&json!("edge")), "{hit}");
     assert_eq!(
         hit["traversal_path"].as_array().map(Vec::len),
         Some(1),
@@ -232,7 +232,7 @@ async fn search_query_and_traversal_merge_carry_both_matched_by_entries_and_the_
 /// no lane and the served answer says so instead of leaving the caller to read the walk's
 /// hits as the whole coverage.
 #[tokio::test]
-async fn search_traversal_over_an_unproduced_facet_serves_the_coverage_warning() -> TestResult {
+async fn search_traversal_over_an_unproduced_kind_serves_the_coverage_warning() -> TestResult {
     let (_directory, client, _server_task) =
         served_workspace(CALL_GRAPH_FILES, Some(ENGINE.to_owned())).await?;
 
@@ -243,7 +243,7 @@ async fn search_traversal_over_an_unproduced_facet_serves_the_coverage_warning()
             &json!({
                 "traversal": {
                     "seed": captured_seed(&client, "leaf", "graph.py").await?,
-                    "facets": ["implements", "references"]
+                    "kinds": ["implements", "references"]
                 }
             }),
         ),
@@ -257,25 +257,25 @@ async fn search_traversal_over_an_unproduced_facet_serves_the_coverage_warning()
     assert_eq!(warnings.len(), 1, "{structured}");
     assert_eq!(
         warnings[0]["code"],
-        json!("relationship_coverage_missing"),
+        json!("edge_coverage_missing"),
         "{structured}"
     );
-    assert_eq!(warnings[0]["facets"], json!(["implements"]), "{structured}");
+    assert_eq!(warnings[0]["kinds"], json!(["implements"]), "{structured}");
 
     client.cancel().await?;
     Ok(())
 }
 
-/// A facets list naming no facet the engine lane populates leaves the walk no edge source
+/// A kinds list naming no kind the engine lane populates leaves the walk no edge source
 /// at all, so the read refuses instead of answering an empty page.
 #[tokio::test]
-async fn search_traversal_over_only_unproduced_facets_refuses() -> TestResult {
+async fn search_traversal_over_only_unproduced_kinds_refuses() -> TestResult {
     let (_directory, client, _server_task) =
         served_workspace(CALL_GRAPH_FILES, Some(ENGINE.to_owned())).await?;
 
     let code = refusal_code(
         &client,
-        &json!({"traversal": {"seed": captured_seed(&client, "leaf", "graph.py").await?, "facets": ["implements"]}}),
+        &json!({"traversal": {"seed": captured_seed(&client, "leaf", "graph.py").await?, "kinds": ["implements"]}}),
     )
     .await?;
 
@@ -285,10 +285,10 @@ async fn search_traversal_over_only_unproduced_facets_refuses() -> TestResult {
     Ok(())
 }
 
-/// The same walk narrowed to the produced facet carries no warning, so the code keeps
+/// The same walk narrowed to the produced kind carries no warning, so the code keeps
 /// naming an absent lane rather than an empty answer.
 #[tokio::test]
-async fn search_traversal_over_a_produced_facet_serves_no_coverage_warning() -> TestResult {
+async fn search_traversal_over_a_produced_kind_serves_no_coverage_warning() -> TestResult {
     let (_directory, client, _server_task) =
         served_workspace(CALL_GRAPH_FILES, Some(ENGINE.to_owned())).await?;
 
@@ -299,7 +299,7 @@ async fn search_traversal_over_a_produced_facet_serves_no_coverage_warning() -> 
             &json!({
                 "traversal": {
                     "seed": captured_seed(&client, "leaf", "graph.py").await?,
-                    "facets": ["references"]
+                    "kinds": ["references"]
                 }
             }),
         ),
@@ -742,7 +742,7 @@ async fn live_seed(
         client,
         tool_request(
             "search_retrieval",
-            &json!({"query": name, "target": "symbol", "include": ["source"], "limit": 1000}),
+            &json!({"query": name, "target": "symbol", "include": {"source": true}, "max_results": 1000}),
         ),
     )
     .await?;
@@ -959,7 +959,7 @@ async fn live_typescript_language_server_walks_both_directions() -> TestResult {
     eprintln!("live typescript: outgoing after {:?}", started.elapsed());
     let hop = &results(&answer)[0]["traversal_path"][0];
     assert_eq!(hop["direction"], json!("outgoing"), "{answer}");
-    assert_eq!(hop["relationship"]["facets"], json!(["calls"]), "{answer}");
+    assert_eq!(hop["edge"]["kinds"], json!(["calls"]), "{answer}");
     let warnings = answer["warnings"]
         .as_array()
         .ok_or("the walk counts the callee it dropped")?;
@@ -987,11 +987,7 @@ async fn live_typescript_language_server_walks_both_directions() -> TestResult {
     for hit in results(&answer) {
         let hop = &hit["traversal_path"][0];
         assert_eq!(hop["direction"], json!("incoming"), "{hit}");
-        assert_eq!(
-            hop["relationship"]["facets"],
-            json!(["references"]),
-            "{hit}"
-        );
+        assert_eq!(hop["edge"]["kinds"], json!(["references"]), "{hit}");
     }
     assert!(answer["warnings"].is_null(), "{answer}");
     assert_eq!(
@@ -1090,11 +1086,11 @@ async fn search_traversal_outgoing_depth_one_reaches_the_direct_callees() -> Tes
         let hop = &hit["traversal_path"][0];
         assert_eq!(hop["direction"], json!("outgoing"), "{hit}");
         assert_eq!(
-            hop["relationship"]["from"],
+            hop["edge"]["from"],
             json!(captured_seed(&client, "root", "graph.py").await?),
             "{hit}"
         );
-        assert_eq!(hop["relationship"]["facets"], json!(["calls"]), "{hit}");
+        assert_eq!(hop["edge"]["kinds"], json!(["calls"]), "{hit}");
     }
     assert!(structured["warnings"].is_null(), "{structured}");
 
@@ -1129,7 +1125,7 @@ async fn search_traversal_outgoing_depth_two_reaches_the_callees_of_the_callees(
         .ok_or("leaf must be a hit")?;
     assert_eq!(leaf["distance"], json!(2), "{leaf}");
     assert_eq!(
-        leaf["traversal_path"][1]["relationship"]["to"],
+        leaf["traversal_path"][1]["edge"]["to"],
         json!(captured_seed(&client, "leaf", "graph.py").await?),
         "{leaf}"
     );
@@ -1150,7 +1146,7 @@ async fn search_traversal_outgoing_depth_two_reaches_the_callees_of_the_callees(
     Ok(())
 }
 
-/// `query` and an outgoing walk merge as an incoming walk does, and facets filter on
+/// `query` and an outgoing walk merge as an incoming walk does, and kinds filter on
 /// `calls`: `references` has no outgoing lane, so asking for it alone refuses and beside
 /// `calls` it warns.
 #[tokio::test]
@@ -1163,7 +1159,7 @@ async fn search_traversal_outgoing_merges_with_query_and_filters_on_calls() -> T
         &json!({
             "query": "branch_a",
             "target": "symbol",
-            "traversal": { "seed": captured_seed(&client, "root", "graph.py").await?, "direction": "outgoing", "facets": ["calls"] }
+            "traversal": { "seed": captured_seed(&client, "root", "graph.py").await?, "direction": "outgoing", "kinds": ["calls"] }
         }),
     )
     .await?;
@@ -1173,14 +1169,14 @@ async fn search_traversal_outgoing_merges_with_query_and_filters_on_calls() -> T
         .ok_or("branch_a must be a hit")?;
     let matched_by = hit["matched_by"].as_array().ok_or("matched_by")?;
     assert!(matched_by.contains(&json!("name")), "{hit}");
-    assert!(matched_by.contains(&json!("relationship")), "{hit}");
+    assert!(matched_by.contains(&json!("edge")), "{hit}");
     assert!(merged["warnings"].is_null(), "{merged}");
 
     let warned = search_after_population(
         &client,
         &json!({
             "traversal": {
-                "seed": captured_seed(&client, "root", "graph.py").await?, "direction": "outgoing", "facets": ["references", "calls"]
+                "seed": captured_seed(&client, "root", "graph.py").await?, "direction": "outgoing", "kinds": ["references", "calls"]
             }
         }),
     )
@@ -1188,13 +1184,13 @@ async fn search_traversal_outgoing_merges_with_query_and_filters_on_calls() -> T
     assert_eq!(symbol_names(&warned), ["branch_a", "branch_b"], "{warned}");
     assert_eq!(
         warned["warnings"][0]["code"],
-        json!("relationship_coverage_missing")
+        json!("edge_coverage_missing")
     );
-    assert_eq!(warned["warnings"][0]["facets"], json!(["references"]));
+    assert_eq!(warned["warnings"][0]["kinds"], json!(["references"]));
 
     let code = refusal_code(
         &client,
-        &json!({"traversal": {"seed": captured_seed(&client, "root", "graph.py").await?, "direction": "outgoing", "facets": ["references"]}}),
+        &json!({"traversal": {"seed": captured_seed(&client, "root", "graph.py").await?, "direction": "outgoing", "kinds": ["references"]}}),
     )
     .await?;
     assert_eq!(code, ErrorCode::CapabilityUnavailable);
@@ -1719,7 +1715,7 @@ async fn search_traversal_outgoing_past_the_readiness_timeout_warns_and_keeps_th
     Ok(())
 }
 
-/// The relationship graph serves the project alone, and package facts come from the
+/// The edge graph serves the project alone, and package facts come from the
 /// global index, so a `global` search leaves a walk nothing to run over and refuses naming
 /// `traversal`.
 #[tokio::test]
@@ -1858,13 +1854,13 @@ async fn search_traversal_outgoing_names_a_standard_library_callee_by_its_global
     );
     assert!(len["path"].is_null() && len["range"].is_null(), "{len}");
     assert_eq!(len["distance"], json!(1), "{len}");
-    let hop = &len["traversal_path"][0]["relationship"];
+    let hop = &len["traversal_path"][0]["edge"];
     assert_eq!(
         hop["from"],
         json!(captured_seed(&client, "counted", "extra.py").await?)
     );
     assert_eq!(hop["to"], json!(id), "{len}");
-    assert_eq!(hop["facets"], json!(["calls"]), "{len}");
+    assert_eq!(hop["kinds"], json!(["calls"]), "{len}");
     assert!(counted["warnings"].is_null(), "{counted}");
 
     let requests = declaration_requests(&fixture).await;
@@ -1883,14 +1879,14 @@ async fn search_traversal_outgoing_names_a_standard_library_callee_by_its_global
         .requests()
         .await
         .into_iter()
-        .filter(|request| request.uri.ends_with("/nodes"))
+        .filter(|request| request.uri.ends_with("/facets"))
         .filter_map(|request| request.body)
         .filter(|body| body["symbol"] == json!(runtime_id))
         .collect();
     assert_eq!(
         stub_requests.len(),
         1,
-        "one stub nodes read: {stub_requests:?}"
+        "one stub facets read: {stub_requests:?}"
     );
     assert!(stub_requests[0]["revision"].is_string());
 
@@ -1951,7 +1947,7 @@ async fn search_traversal_outgoing_names_a_dependency_callee_and_counts_one_answ
     let (_directory, client, _server_task) =
         served_workspace(INSTALLED_FILES, Some(configuration)).await?;
 
-    let request = json!({"include":["source"], "limit":1,
+    let request = json!({"include":{"source": true}, "max_results":1,
         "traversal": { "seed": captured_seed(&client, "hello", "app.py").await?, "direction": "outgoing" }
     });
     let hello =

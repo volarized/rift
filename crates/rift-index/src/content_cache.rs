@@ -21,7 +21,7 @@ struct ContentKey {
     digest: FileDigest,
     language_identity: usize,
     source_bytes_max: usize,
-    syntax_nodes_max: usize,
+    syntax_elements_max: usize,
     syntax_depth_max: usize,
     analyzer: usize,
 }
@@ -184,7 +184,7 @@ fn content_key(
         digest,
         language_identity: std::ptr::from_ref(provider.language()).cast::<()>() as usize,
         source_bytes_max: limits.source_bytes_max(),
-        syntax_nodes_max: limits.syntax_nodes_max(),
+        syntax_elements_max: limits.syntax_elements_max(),
         syntax_depth_max: limits.syntax_depth_max(),
         analyzer: std::ptr::from_ref(provider).cast::<()>() as usize,
     }

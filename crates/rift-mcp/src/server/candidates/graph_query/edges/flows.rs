@@ -1,4 +1,4 @@
-//! Bounded acquisition of call paths from ranked local symbols.
+//! Bounded acquisition of paths of call edges from ranked local symbols.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -12,8 +12,8 @@ use rift_search::flow::{
 use rift_search::sparql::{FlowCallSite, QueryFlows};
 
 use super::{
-    AdjacencyStep, AdjacencyWalk, GraphLimits, RelationshipFacet, RequestDeadline,
-    ResolvedWorkspace, RiftMcp, TraversalDirection, coverage_failure,
+    AdjacencyStep, AdjacencyWalk, EdgeKind, GraphLimits, RequestDeadline, ResolvedWorkspace,
+    RiftMcp, TraversalDirection, coverage_failure,
 };
 
 type Subject = Arc<rift_protocol::read::SymbolId>;
@@ -50,7 +50,7 @@ impl<'request> FlowAcquisition<'request> {
     ) -> Self {
         let step = AdjacencyStep {
             direction: TraversalDirection::Incoming,
-            facet: RelationshipFacet::Calls,
+            kind: EdgeKind::Calls,
         };
         Self {
             walk: AdjacencyWalk::new(server, resolved, None, step, limits, deadline),
@@ -182,8 +182,8 @@ impl AcquiredFlows {
             self.discovery.finish(limit)
         });
         if self.partial {
-            warnings.push(ReadWarning::RelationshipCoverageMissing {
-                facets: vec![RelationshipFacet::Calls],
+            warnings.push(ReadWarning::EdgeCoverageMissing {
+                kinds: vec![EdgeKind::Calls],
                 detail: "some selected call directions have incomplete provider coverage"
                     .to_owned(),
             });

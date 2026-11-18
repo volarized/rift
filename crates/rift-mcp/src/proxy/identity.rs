@@ -151,24 +151,19 @@ pub(super) fn qualify_hit(hit: &mut SearchHit, backend: &str) -> Result<(), Rift
     }
     if let Some(path) = &mut hit.traversal_path {
         for hop in path {
-            qualify_id(&mut hop.relationship.from, backend)?;
-            qualify_id(&mut hop.relationship.to, backend)?;
+            qualify_id(&mut hop.edge.from, backend)?;
+            qualify_id(&mut hop.edge.to, backend)?;
         }
     }
     Ok(())
 }
 
-pub(super) fn qualify_nodes(
-    result: &mut rift_protocol::nodes_read::NodesToolResult,
+pub(super) fn qualify_facets(
+    result: &mut rift_protocol::read::FacetsResult,
     backend: &str,
 ) -> Result<(), RiftError> {
-    use rift_protocol::nodes_read::NodesToolResult;
-    let (symbol, warnings) = match result {
-        NodesToolResult::Summary(summary) => (&mut summary.symbol, &mut summary.warnings),
-        NodesToolResult::Syntax(syntax) => (&mut syntax.symbol, &mut syntax.warnings),
-    };
-    qualify_optional(symbol, backend)?;
-    qualify_warnings(warnings, backend)
+    qualify_id(&mut result.symbol, backend)?;
+    qualify_warnings(&mut result.warnings, backend)
 }
 
 pub(super) fn qualify_search(
@@ -367,7 +362,7 @@ mod tests {
     fn named_symbol_links_change_only_typed_identities() -> Result<(), Box<dyn std::error::Error>> {
         let mut result: GetSymbolResult = serde_json::from_value(serde_json::json!({
             "outcome":"found", "symbol":{"id":"rift://symbol/local/rust/app/load", "language":"rust", "name":"load", "kind":"function", "container":"rift://symbol/local/rust/app", "documentation":[{"format":"markdown","text":"rift://symbol/local/rust/app/load"}], "signatures":[{"display":"load()", "language":"rust", "links":[{"range":{"start":0,"end":4},"symbol":"rift://symbol/local/rust/app/load"}]}]},
-            "revision":"rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11", "declarations":[{"origin":{"location":"project","source_kind":"authored"},"path":"lib.rs","range":{"start":0,"end":12},"line":1,"signature_indices":[],"type_indices":[],"documentation_indices":[]}]
+            "revision":"rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11", "pagination":{"page":1,"pages":1,"max_results":10,"total":1}, "declarations":[{"origin":{"location":"project","source_kind":"authored"},"path":"lib.rs","range":{"start":0,"end":12},"line":1,"signature_indices":[],"type_indices":[],"documentation_indices":[]}]
         }))?;
         let original = result.clone();
         qualify_symbol_result(&mut result, "cloud")?;

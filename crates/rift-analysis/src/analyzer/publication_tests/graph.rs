@@ -2,11 +2,11 @@
 
 use super::*;
 use rift_core::{
-    Contribution, ContributionKey, ContributionReference, ContributionRelationship,
-    DeclarationBinding, IndexRevision, PortableSymbolFacts, ProviderId, ProviderRevision,
-    ProviderSymbolId, SourceApplicability, SourceRange, SourceRevision, TreeRevision,
+    Contribution, ContributionEdge, ContributionKey, ContributionReference, DeclarationBinding,
+    IndexRevision, PortableSymbolFacts, ProviderId, ProviderRevision, ProviderSymbolId,
+    SourceApplicability, SourceRange, SourceRevision, TreeRevision,
 };
-use rift_protocol::read::{ExactKind, RelationshipDerivation, RelationshipFacet};
+use rift_protocol::read::{EdgeDerivation, EdgeKind, ExactKind};
 use rift_provider::{Normalizer, ProviderPublication, PublicationLimits, PublicationSet};
 
 const SOURCE: &str = "// é\npub fn start() { finish(); finish(); }\npub fn finish() {}\n";
@@ -60,11 +60,7 @@ impl GraphFixture {
         ProviderId::new("publication.fixture").expect("provider")
     }
 
-    fn contribution(
-        &self,
-        name: &str,
-        relationships: Vec<ContributionRelationship>,
-    ) -> Contribution {
+    fn contribution(&self, name: &str, edges: Vec<ContributionEdge>) -> Contribution {
         Contribution::builder(
             ContributionKey::new(
                 Self::provider(),
@@ -81,14 +77,14 @@ impl GraphFixture {
             self.origin.clone(),
         )
         .identity_anchor(self.identity(name))
-        .relationships(relationships)
+        .edges(edges)
         .build()
         .expect("source-less logical contribution")
     }
 
-    fn graph(&self, relationships: Vec<ContributionRelationship>) -> WorkspaceSemantics {
+    fn graph(&self, edges: Vec<ContributionEdge>) -> WorkspaceSemantics {
         Self::graph_with_contributions(vec![
-            self.contribution("start", relationships),
+            self.contribution("start", edges),
             self.contribution("finish", Vec::new()),
         ])
     }
@@ -121,7 +117,7 @@ impl GraphFixture {
     fn named_contribution(
         &self,
         name: &str,
-        relationships: Vec<ContributionRelationship>,
+        edges: Vec<ContributionEdge>,
         established: bool,
     ) -> Result<Contribution, RiftError> {
         use rift_protocol::read::{Documentation, DocumentationFormat, Extensions, Signature};
@@ -162,7 +158,7 @@ impl GraphFixture {
             facts,
             self.origin.clone(),
         )
-        .relationships(relationships);
+        .edges(edges);
         if established {
             builder = builder.identity_anchor(self.identity("wide"));
         }
@@ -180,13 +176,10 @@ impl GraphFixture {
         )
     }
 
-    fn edge(&self, occurrence: DeclarationBinding) -> ContributionRelationship {
-        ContributionRelationship::new(
-            rift_core::RelationshipKind::Reference,
-            self.reference("finish"),
-        )
-        .with_derivation(RelationshipDerivation::Syntax)
-        .with_occurrence(occurrence)
+    fn edge(&self, occurrence: DeclarationBinding) -> ContributionEdge {
+        ContributionEdge::new(rift_core::EdgeKind::Reference, self.reference("finish"))
+            .with_derivation(EdgeDerivation::Syntax)
+            .with_occurrence(occurrence)
     }
 
     fn publication(
@@ -261,7 +254,7 @@ fn artifact_name_bytes_and_public_name_characters_keep_distinct_bounds() {
 }
 
 #[test]
-fn source_less_wide_objects_roundtrip_all_facts_and_relationship_occurrences() {
+fn source_less_wide_objects_roundtrip_all_facts_and_edge_occurrences() {
     let fixture = GraphFixture::new();
     let name = "n".repeat(4097);
     for established in [true, false] {
@@ -329,13 +322,13 @@ fn source_less_wide_objects_roundtrip_all_facts_and_relationship_occurrences() {
             serde_json::from_value(wire).expect("full artifact restore");
         assert_eq!(restored, publication);
         assert_eq!(
-            semantics.graph().relationships().len(),
+            semantics.graph().edges().len(),
             if established { 2 } else { 0 }
         );
         if established {
-            assert_eq!(restored.relationships.len(), 2);
+            assert_eq!(restored.edges.len(), 2);
             let starts = restored
-                .relationships
+                .edges
                 .iter()
                 .map(|edge| {
                     let occurrence = edge.occurrence.as_ref().expect("actual source occurrence");
@@ -563,7 +556,7 @@ fn assert_foreign_facts_retained(publication: &PackagePublication) {
 }
 
 #[test]
-fn portable_relationships_keep_two_original_call_sites_without_nodes() {
+fn portable_edges_keep_two_original_call_sites_without_syntax_elements() {
     let fixture = GraphFixture::new();
     let first = SOURCE.find("finish();").expect("first call");
     let second = SOURCE.rfind("finish();").expect("second call");
@@ -579,16 +572,16 @@ fn portable_relationships_keep_two_original_call_sites_without_nodes() {
                 .expect("bounded retained excerpts"),
         )
         .expect("portable occurrence projection");
-    assert_eq!(publication.relationships.len(), 2);
+    assert_eq!(publication.edges.len(), 2);
     assert!(!publication.units[0].source_complete);
     let starts = publication
-        .relationships
+        .edges
         .iter()
         .map(|edge| {
             assert_eq!(edge.from.0, fixture.identity("start").as_str());
             assert_eq!(edge.to.0, fixture.identity("finish").as_str());
-            assert_eq!(edge.derivation, RelationshipDerivation::Syntax);
-            assert_eq!(edge.facets, [RelationshipFacet::References]);
+            assert_eq!(edge.derivation, EdgeDerivation::Syntax);
+            assert_eq!(edge.kinds, [EdgeKind::References]);
             assert!(edge.confidence.is_none());
             let occurrence = edge.occurrence.as_ref().expect("original call site");
             assert_eq!(occurrence.unit, publication.units[0].unit);
@@ -599,32 +592,32 @@ fn portable_relationships_keep_two_original_call_sites_without_nodes() {
         })
         .collect::<BTreeSet<_>>();
     assert_eq!(starts, BTreeSet::from([first, second]));
-    assert_eq!(semantics.graph().relationships().len(), 2);
+    assert_eq!(semantics.graph().edges().len(), 2);
     assert!(
         publication
             .coverage
             .iter()
-            .all(|coverage| coverage.relationships.is_empty())
+            .all(|coverage| coverage.edges.is_empty())
     );
 }
 
 #[test]
-fn absent_derivation_keeps_graph_fact_without_portable_relationship() {
+fn absent_derivation_keeps_graph_fact_without_portable_edge() {
     let fixture = GraphFixture::new();
-    let semantics = fixture.graph(vec![ContributionRelationship::new(
-        rift_core::RelationshipKind::Reference,
+    let semantics = fixture.graph(vec![ContributionEdge::new(
+        rift_core::EdgeKind::Reference,
         fixture.reference("finish"),
     )]);
     let publication = fixture
         .publication(&semantics, ExactPackageLimits::new(1, 1024))
-        .expect("unresolved relationship projection");
-    assert_eq!(semantics.graph().relationships().len(), 1);
-    assert!(publication.relationships.is_empty());
+        .expect("unresolved edge projection");
+    assert_eq!(semantics.graph().edges().len(), 1);
+    assert!(publication.edges.is_empty());
     assert!(
         publication
             .coverage
             .iter()
-            .all(|coverage| coverage.relationships.is_empty())
+            .all(|coverage| coverage.edges.is_empty())
     );
 }
 
@@ -638,7 +631,7 @@ fn invalid_occurrence_refuses_original_byte_range_and_unknown_unit() {
                 .publication(&semantics, ExactPackageLimits::new(1, 1024))
                 .is_err()
         );
-        assert_eq!(semantics.graph().relationships().len(), 1);
+        assert_eq!(semantics.graph().edges().len(), 1);
     }
     let unit = rift_core::SourceUnitId::for_owner(fixture.owner.clone(), "missing.rs")
         .expect("canonical unit outside selected inventory");
@@ -648,7 +641,7 @@ fn invalid_occurrence_refuses_original_byte_range_and_unknown_unit() {
     let publication = fixture
         .publication(&semantics, ExactPackageLimits::new(1, 1024))
         .expect("unavailable occurrence projection");
-    assert!(publication.relationships.is_empty());
+    assert!(publication.edges.is_empty());
     assert!(
         publication
             .coverage
@@ -656,11 +649,11 @@ fn invalid_occurrence_refuses_original_byte_range_and_unknown_unit() {
             .all(|coverage| !coverage.identity_complete)
     );
     assert_eq!(publication.units[0].source, SOURCE);
-    assert_eq!(semantics.graph().relationships().len(), 1);
+    assert_eq!(semantics.graph().edges().len(), 1);
 }
 
 #[test]
-fn relationship_bound_keeps_captured_graph_immutable() {
+fn edge_bound_keeps_captured_graph_immutable() {
     let fixture = GraphFixture::new();
     let semantics = fixture.graph(vec![
         fixture.edge(fixture.occurrence(0, 1)),
@@ -670,15 +663,15 @@ fn relationship_bound_keeps_captured_graph_immutable() {
         .publication(
             &semantics,
             ExactPackageLimits::new(1, 1024)
-                .with_relationships(1)
+                .with_edges(1)
                 .expect("portable edge bound"),
         )
-        .expect("bounded portable relationships");
-    assert_eq!(publication.relationships.len(), 1);
-    assert_eq!(semantics.graph().relationships().len(), 2);
+        .expect("bounded portable edges");
+    assert_eq!(publication.edges.len(), 1);
+    assert_eq!(semantics.graph().edges().len(), 2);
     assert!(publication.warnings.iter().any(|warning| matches!(warning,
         PackageAnalysisWarning::PublicationTruncated { collection, bound }
-            if collection == "relationships" && *bound == 1)));
+            if collection == "edges" && *bound == 1)));
 }
 
 #[test]

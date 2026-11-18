@@ -112,7 +112,7 @@ fn supplied_angular_template_facts_are_refused_when_current_context_is_unresolve
         .expect("raw TypeScript");
     let (enriched, _, _) = context
         .apply(source, limits, raw)
-        .expect("Angular template nodes");
+        .expect("Angular template syntax elements");
     assert!(
         enriched
             .symbols()

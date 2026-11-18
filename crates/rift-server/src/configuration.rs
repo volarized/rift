@@ -597,29 +597,36 @@ download_timeout = "5m"
 
     #[test]
     fn test_a_bound_broken_by_a_variable_names_the_variable() {
-        let environment =
-            ConfigurationEnvironment::from_variables([("RIFT_PROVIDERS_SYNTAX_MAX_NODES", "0")]);
+        let environment = ConfigurationEnvironment::from_variables([(
+            "RIFT_PROVIDERS_SYNTAX_MAX_SYNTAX_ELEMENTS",
+            "0",
+        )]);
         let error = accept_workspace(Some("[providers.history]\nenabled = true\n"), &environment)
-            .expect_err("zero nodes breaks the documented bound");
+            .expect_err("zero syntax elements breaks the documented bound");
         assert_eq!(
             error.slug(),
             errors::core::configuration_limit_out_of_range::SLUG
         );
         assert!(error.context().any(|(key, value)| {
-            key == "variables" && value == "RIFT_PROVIDERS_SYNTAX_MAX_NODES"
+            key == "variables" && value == "RIFT_PROVIDERS_SYNTAX_MAX_SYNTAX_ELEMENTS"
         }));
     }
 
     #[test]
     fn test_a_variable_prevails_over_the_file() {
         let environment = ConfigurationEnvironment::from_variables([(
-            "RIFT_PROVIDERS_SYNTAX_MAX_NODES",
+            "RIFT_PROVIDERS_SYNTAX_MAX_SYNTAX_ELEMENTS",
             "5000000",
         )]);
-        let configuration =
-            accept_workspace(Some("[providers.syntax]\nmax_nodes = 1000\n"), &environment)
-                .expect("the variable's value is in bounds");
-        assert_eq!(configuration.providers.syntax.max_nodes, 5_000_000);
+        let configuration = accept_workspace(
+            Some("[providers.syntax]\nmax_syntax_elements = 1000\n"),
+            &environment,
+        )
+        .expect("the variable's value is in bounds");
+        assert_eq!(
+            configuration.providers.syntax.max_syntax_elements,
+            5_000_000
+        );
     }
 }
 

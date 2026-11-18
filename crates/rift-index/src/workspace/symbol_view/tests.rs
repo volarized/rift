@@ -34,7 +34,7 @@ fn captured_symbol_material_keeps_source_graph_ranking_and_binding_facts() {
         view.normalized_graph(),
         index.normalized_graph()
     ));
-    assert!(std::ptr::eq(view.relationships(), index.relationships()));
+    assert!(std::ptr::eq(view.edges(), index.edges()));
     assert_eq!(view.index_documents().len(), index.index_documents().len());
     assert_eq!(
         view.object_by_identity(&identity)
@@ -121,7 +121,7 @@ fn captured_symbol_material_measures_existing_workspace() {
 }
 
 #[test]
-fn captured_nodes_keep_inline_framework_source_after_current_context_changes() {
+fn captured_syntax_elements_keep_inline_framework_source_after_current_context_changes() {
     let root = tempfile::tempdir().expect("workspace");
     let text = "import {Component} from '@angular/core'; @Component({template:`<p>{{ title }}</p>`}) export class Beacon {}";
     fs::write(root.path().join("package.json"), "{}").expect("package context");
@@ -140,15 +140,19 @@ fn captured_nodes_keep_inline_framework_source_after_current_context_changes() {
         .map(|document| {
             document.map(|document| {
                 document
-                    .nodes_at(position)
+                    .syntax_elements_at(position)
                     .into_iter()
                     .cloned()
                     .collect::<Vec<_>>()
             })
         })
-        .expect("original nodes")
+        .expect("original syntax elements")
         .expect("selected source");
-    assert!(original.iter().any(|node| node.kind == "interpolation"));
+    assert!(
+        original
+            .iter()
+            .any(|syntax_element| syntax_element.kind == "interpolation")
+    );
     let view = index.symbol_view().expect("captured material");
     assert_eq!(view.frameworks[&path].templates.len(), 1);
     let charge = view.retained_material_bytes();
@@ -159,11 +163,11 @@ fn captured_nodes_keep_inline_framework_source_after_current_context_changes() {
     assert_eq!(
         view.syntax(&path)
             .map(|document| document.map(|document| document
-                .nodes_at(position)
+                .syntax_elements_at(position)
                 .into_iter()
                 .cloned()
                 .collect::<Vec<_>>()))
-            .expect("captured nodes"),
+            .expect("captured syntax elements"),
         Some(original)
     );
     assert_eq!(view.file(&path).expect("captured source").source(), text);
@@ -171,7 +175,7 @@ fn captured_nodes_keep_inline_framework_source_after_current_context_changes() {
     assert_eq!(
         view.syntax(&path)
             .map(|document| document.map(|document| document
-                .nodes_at(u64::MAX)
+                .syntax_elements_at(u64::MAX)
                 .into_iter()
                 .cloned()
                 .collect::<Vec<_>>()))
@@ -181,7 +185,7 @@ fn captured_nodes_keep_inline_framework_source_after_current_context_changes() {
     assert!(
         view.syntax(&rift_core::ProjectPath::new("missing.ts").expect("missing path"))
             .map(|document| document.map(|document| document
-                .nodes_at(0)
+                .syntax_elements_at(0)
                 .into_iter()
                 .cloned()
                 .collect::<Vec<_>>()))

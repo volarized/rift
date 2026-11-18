@@ -7,7 +7,7 @@ use rift_error::{RiftError, errors};
 use super::{PackageCoverage, PackageOccurrence, PackagePublication, PackageSourceUnit};
 use crate::identity::SymbolIdentity;
 use crate::producer::{FactKind, FactProducer};
-use crate::read::{Language, Relationship};
+use crate::read::{Edge, Language};
 
 /// Reason a publication's facts disagree with its coverage.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,7 +22,7 @@ enum FactViolation {
     Range,
     /// Occurrences are not in strict unit, range, and symbol order.
     Order,
-    /// A relationship starts at a symbol whose identity does not parse.
+    /// An edge starts at a symbol whose identity does not parse.
     Symbol,
 }
 
@@ -47,7 +47,7 @@ impl FactViolation {
 }
 
 impl PackagePublication {
-    /// Checks every relationship and occurrence against the coverage that states it.
+    /// Checks every edge and occurrence against the coverage that states it.
     ///
     /// Each fact's language, kind, and producer must be named by one coverage entry, and
     /// each occurrence must lie inside a unit the publication carries, in unit, range, and
@@ -62,14 +62,10 @@ impl PackagePublication {
                 .iter()
                 .any(|coverage| &coverage.language == language && coverage.covers(kind, producer))
         };
-        for relationship in &self.relationships {
-            let language = relationship_language(relationship)?;
-            if !covered(
-                &language,
-                FactKind::Relationships,
-                relationship.producer.as_ref(),
-            ) {
-                return Err(FactViolation::Uncovered.error("relationships"));
+        for edge in &self.edges {
+            let language = edge_language(edge)?;
+            if !covered(&language, FactKind::Edges, edge.producer.as_ref()) {
+                return Err(FactViolation::Uncovered.error("edges"));
             }
         }
         let units = self
@@ -113,10 +109,10 @@ fn validate_coverage(coverage: &[PackageCoverage]) -> Result<(), RiftError> {
     Ok(())
 }
 
-fn relationship_language(relationship: &Relationship) -> Result<Language, RiftError> {
-    SymbolIdentity::parse(relationship.from.as_str())
+fn edge_language(edge: &Edge) -> Result<Language, RiftError> {
+    SymbolIdentity::parse(edge.from.as_str())
         .map(|identity| identity.language().clone())
-        .map_err(|_| FactViolation::Symbol.error("relationships.from"))
+        .map_err(|_| FactViolation::Symbol.error("edges.from"))
 }
 
 fn occurrence_key(occurrence: &PackageOccurrence) -> (&str, u64, u64, &str) {

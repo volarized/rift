@@ -123,7 +123,7 @@ pub enum FlowCardinality {
 }
 
 #[derive(Debug, Clone)]
-struct StageNode {
+struct Stage {
     path: StagePath,
     component: ProviderId,
     inputs: Vec<usize>,
@@ -244,7 +244,7 @@ impl StageDescriptor {
 pub struct CompositionBuilder {
     id: CompositionId,
     origin: u64,
-    stages: Vec<StageNode>,
+    stages: Vec<Stage>,
     paths: BTreeSet<StagePath>,
     output: Option<usize>,
     errors: Vec<RiftError>,
@@ -471,7 +471,7 @@ impl CompositionBuilder {
         let output = self
             .output
             .ok_or_else(|| errors::provider::composition_missing_output().error())?;
-        Ok(ProviderComposition::from_nodes(
+        Ok(ProviderComposition::from_steps(
             self.id,
             self.stages,
             output,
@@ -489,7 +489,7 @@ impl CompositionBuilder {
             );
         }
         let stage = self.stages.len();
-        self.stages.push(StageNode {
+        self.stages.push(Stage {
             path: registration.path,
             component: registration.component.clone(),
             inputs: registration.inputs.to_vec(),
@@ -584,33 +584,33 @@ impl CompositionScope<'_> {
 pub struct ProviderComposition {
     id: CompositionId,
     stages: Box<[StageDescriptor]>,
-    nodes: Box<[StageNode]>,
+    steps: Box<[Stage]>,
     output: usize,
 }
 
 impl ProviderComposition {
-    fn from_nodes(id: CompositionId, nodes: Vec<StageNode>, output: usize) -> Self {
-        let stages = nodes
+    fn from_steps(id: CompositionId, steps: Vec<Stage>, output: usize) -> Self {
+        let stages = steps
             .iter()
-            .map(|node| StageDescriptor {
-                path: node.path.clone(),
-                component: node.component.clone(),
-                inputs: node
+            .map(|step| StageDescriptor {
+                path: step.path.clone(),
+                component: step.component.clone(),
+                inputs: step
                     .inputs
                     .iter()
-                    .map(|index| nodes[*index].path.clone())
+                    .map(|index| steps[*index].path.clone())
                     .collect(),
-                component_input_type: node.component_input.name,
-                output_type: node.output.name,
-                cardinality: node.cardinality,
-                key_join_policy: node.key_join_policy,
+                component_input_type: step.component_input.name,
+                output_type: step.output.name,
+                cardinality: step.cardinality,
+                key_join_policy: step.key_join_policy,
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Self {
             id,
             stages,
-            nodes: nodes.into_boxed_slice(),
+            steps: steps.into_boxed_slice(),
             output,
         }
     }
@@ -638,7 +638,7 @@ impl ProviderComposition {
     pub fn edit(&self) -> CompositionEditor {
         CompositionEditor {
             id: self.id.clone(),
-            nodes: self.nodes.to_vec(),
+            steps: self.steps.to_vec(),
             output: self.output,
             errors: Vec::new(),
         }
@@ -652,7 +652,7 @@ impl ProviderComposition {
 #[derive(Debug)]
 pub struct CompositionEditor {
     id: CompositionId,
-    nodes: Vec<StageNode>,
+    steps: Vec<Stage>,
     output: usize,
     errors: Vec<RiftError>,
 }
@@ -708,9 +708,9 @@ impl CompositionEditor {
         if let Some(error) = self.errors.into_iter().next() {
             return error.fail();
         }
-        Ok(ProviderComposition::from_nodes(
+        Ok(ProviderComposition::from_steps(
             self.id,
-            self.nodes,
+            self.steps,
             self.output,
         ))
     }
@@ -722,22 +722,22 @@ impl CompositionEditor {
         component: &Component<T, T>,
     ) -> Result<(), RiftError> {
         let index = self.index(path)?;
-        if self.nodes[index].output.id != TypeId::of::<T>() {
+        if self.steps[index].output.id != TypeId::of::<T>() {
             return errors::provider::composition_type_mismatch()
-                .stage(&self.nodes[index].path)
+                .stage(&self.steps[index].path)
                 .fail();
         }
         validate_name(name)?;
         let new_path = StagePath::root(&self.id, name);
-        if self.nodes.iter().any(|node| node.path == new_path) {
+        if self.steps.iter().any(|step| step.path == new_path) {
             return errors::provider::composition_duplicate_stage()
                 .stage(&new_path)
                 .fail();
         }
         self.remap_stage_references(|stage| if stage >= index { stage + 1 } else { stage });
-        self.nodes.insert(
+        self.steps.insert(
             index + 1,
-            StageNode {
+            Stage {
                 path: new_path,
                 component: component.id().clone(),
                 inputs: vec![index],
@@ -756,33 +756,33 @@ impl CompositionEditor {
         component: &Component<I, O>,
     ) -> Result<(), RiftError> {
         let index = self.index(path)?;
-        if self.nodes[index].component_input.id != TypeId::of::<I>()
-            || self.nodes[index].output.id != TypeId::of::<O>()
+        if self.steps[index].component_input.id != TypeId::of::<I>()
+            || self.steps[index].output.id != TypeId::of::<O>()
         {
             return errors::provider::composition_type_mismatch()
-                .stage(&self.nodes[index].path)
+                .stage(&self.steps[index].path)
                 .fail();
         }
-        self.nodes[index].component = component.id().clone();
+        self.steps[index].component = component.id().clone();
         Ok(())
     }
 
     fn try_remove(&mut self, path: &str) -> Result<(), RiftError> {
         let index = self.index(path)?;
-        if index == self.output || self.nodes.iter().any(|node| node.inputs.contains(&index)) {
+        if index == self.output || self.steps.iter().any(|step| step.inputs.contains(&index)) {
             return errors::provider::composition_dangling_input()
-                .stage(&self.nodes[index].path)
+                .stage(&self.steps[index].path)
                 .fail();
         }
-        self.nodes.remove(index);
+        self.steps.remove(index);
         self.remap_stage_references(|stage| if stage > index { stage - 1 } else { stage });
         Ok(())
     }
 
     fn index(&self, path: &str) -> Result<usize, RiftError> {
-        self.nodes
+        self.steps
             .iter()
-            .position(|node| node.path.as_str() == path)
+            .position(|step| step.path.as_str() == path)
             .ok_or_else(|| {
                 errors::provider::composition_stage_not_found()
                     .stage(path)
@@ -790,11 +790,11 @@ impl CompositionEditor {
             })
     }
 
-    // Every stage index lives in node inputs and the output selector; one remap
+    // Every stage index lives in step inputs and the output selector; one remap
     // keeps both consistent when insertion or removal shifts positions.
     fn remap_stage_references(&mut self, remap: impl Fn(usize) -> usize) {
-        for node in &mut self.nodes {
-            for input in &mut node.inputs {
+        for step in &mut self.steps {
+            for input in &mut step.inputs {
                 *input = remap(*input);
             }
         }
@@ -1065,7 +1065,7 @@ impl get_size2::GetSize for StageDescriptor {
     }
 }
 
-impl get_size2::GetSize for StageNode {
+impl get_size2::GetSize for Stage {
     fn get_size(&self) -> usize {
         std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
     }
@@ -1115,7 +1115,7 @@ impl get_size2::GetSize for ProviderComposition {
         let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.stages, tracker);
         bytes = bytes.saturating_add(field);
         tracker = next;
-        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.nodes, tracker);
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.steps, tracker);
         bytes = bytes.saturating_add(field);
         tracker = next;
         (bytes, tracker)

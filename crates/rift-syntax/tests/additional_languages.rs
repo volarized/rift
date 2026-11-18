@@ -1,7 +1,7 @@
 //! Syntax declarations, source fidelity, restoration, and bounds for shipped source grammars.
 
 use rift_core::ProjectPath;
-use rift_protocol::read::NodeFacet;
+use rift_protocol::read::SyntaxKind;
 use rift_syntax::{
     ShippedLanguage, SyntaxDocument, SyntaxFacts, SyntaxFactsParts, SyntaxLimits, SyntaxNames,
     SyntaxSource,
@@ -21,31 +21,34 @@ fn parsed(
         .expect("fixture parses within its bounds")
 }
 
-fn assert_node_facets(
+fn assert_syntax_element_kinds(
     shipped: ShippedLanguage,
     text: &str,
     expected: &[(&str, &str)],
-    facet: NodeFacet,
+    expected_kind: SyntaxKind,
 ) {
     let document = parsed(shipped, "source", text, SyntaxLimits::default());
     assert!(!document.has_errors());
     let provider = shipped.definition().syntax_provider();
     for (kind, source) in expected {
-        let node = document
-            .nodes()
+        let syntax_element = document
+            .syntax_elements()
             .iter()
-            .find(|node| node.kind == *kind)
-            .unwrap_or_else(|| panic!("missing {kind}: {:?}", document.nodes()));
-        let start = usize::try_from(node.range.start).expect("fixture start");
-        let end = usize::try_from(node.range.end).expect("fixture end");
+            .find(|syntax_element| syntax_element.kind == *kind)
+            .unwrap_or_else(|| panic!("missing {kind}: {:?}", document.syntax_elements()));
+        let start = usize::try_from(syntax_element.range.start).expect("fixture start");
+        let end = usize::try_from(syntax_element.range.end).expect("fixture end");
         assert_eq!(&text[start..end], *source);
-        assert_eq!(provider.node_facets(node.kind), [facet]);
+        assert_eq!(
+            provider.syntax_element_kinds(syntax_element.kind),
+            [expected_kind]
+        );
     }
 }
 
 #[test]
-fn css_literal_nodes_preserve_original_values_and_facets() {
-    assert_node_facets(
+fn css_literal_syntax_elements_preserve_original_values_and_kinds() {
+    assert_syntax_element_kinds(
         ShippedLanguage::Css,
         ".lamp { color: #fff; width: 12px; content: \"灯\"; }",
         &[
@@ -53,18 +56,18 @@ fn css_literal_nodes_preserve_original_values_and_facets() {
             ("integer_value", "12px"),
             ("string_value", "\"灯\""),
         ],
-        NodeFacet::Literal,
+        SyntaxKind::Literal,
     );
 }
 
 #[test]
-fn html_declaration_nodes_preserve_original_elements_and_attributes() {
+fn html_declaration_syntax_elements_preserve_original_elements_and_attributes() {
     let text = "<section title=\"灯\">beacon</section>";
-    assert_node_facets(
+    assert_syntax_element_kinds(
         ShippedLanguage::Html,
         text,
         &[("element", text), ("attribute", "title=\"灯\"")],
-        NodeFacet::Declaration,
+        SyntaxKind::Declaration,
     );
 }
 
@@ -128,9 +131,9 @@ fn native_declarations_keep_names_ranges_and_language_identity() {
         let start = usize::try_from(symbol.range.start).expect("fixture start");
         let end = usize::try_from(symbol.range.end).expect("fixture end");
         assert!(source[start..end].contains(expected));
-        for node in document.nodes() {
-            let start = usize::try_from(node.range.start).expect("fixture start");
-            let end = usize::try_from(node.range.end).expect("fixture end");
+        for syntax_element in document.syntax_elements() {
+            let start = usize::try_from(syntax_element.range.start).expect("fixture start");
+            let end = usize::try_from(syntax_element.range.end).expect("fixture end");
             assert!(source.get(start..end).is_some());
         }
         let facts = document.facts();
@@ -162,7 +165,7 @@ fn native_declarations_keep_names_ranges_and_language_identity() {
 }
 
 #[test]
-fn new_source_providers_refuse_byte_node_and_depth_bounds() {
+fn new_source_providers_refuse_byte_syntax_element_and_depth_bounds() {
     let cases = [
         (ShippedLanguage::C, "int open(void) { return 1; }"),
         (
@@ -182,7 +185,7 @@ fn new_source_providers_refuse_byte_node_and_depth_bounds() {
         let provider = shipped.definition().syntax_provider();
         for limits in [
             SyntaxLimits::new(1, 1000, 100).expect("byte bound"),
-            SyntaxLimits::new(10000, 1, 100).expect("node bound"),
+            SyntaxLimits::new(10000, 1, 100).expect("syntax element bound"),
             SyntaxLimits::new(10000, 1000, 1).expect("depth bound"),
         ] {
             assert!(
@@ -262,7 +265,7 @@ fn embedded_signatures_restore_only_registered_host_languages() {
 }
 
 #[test]
-fn new_source_grammars_report_malformed_input_with_original_nodes() {
+fn new_source_grammars_report_malformed_input_with_original_syntax_elements() {
     for (shipped, source) in [
         (ShippedLanguage::C, "int open( {"),
         (ShippedLanguage::Cpp, "class Client {"),
@@ -276,7 +279,7 @@ fn new_source_grammars_report_malformed_input_with_original_nodes() {
             document.has_errors(),
             "malformed fixture must report {shipped:?} errors"
         );
-        assert!(!document.nodes().is_empty());
+        assert!(!document.syntax_elements().is_empty());
         assert_eq!(
             document.source_digest(),
             Some(&rift_core::FileDigest::of(source.as_bytes()))

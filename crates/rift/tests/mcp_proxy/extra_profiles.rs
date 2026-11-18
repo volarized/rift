@@ -26,7 +26,7 @@ async fn beacons(
 ) -> TestResult<BTreeMap<String, (String, Option<String>)>> {
     let parameters = serde_json::from_value(json!({
         "query":"beacon", "target":"symbol", "scope":scope,
-        "paths":{"include":["lib.rs"]}, "include":["source"], "limit":10,
+        "paths":{"include":["lib.rs"]}, "include":{"source": true}, "max_results":10,
     }))?;
     let arguments = query::retrieval(&parameters)?;
     let answer = crate::workspace_client::query_after_population(client, &arguments).await?;
@@ -123,6 +123,7 @@ async fn extra_project_profiles_serve_distinct_scopes_through_one_connection() -
     let all = crate::workspace_client::query_after_population(&client, &rift_protocol::query::QueryParams {
         query: "SELECT (COUNT(?hit) AS ?count) { SERVICE :search { ?hit :query 'beacon'; :target 'file'; :scope 'all' } }".to_owned(),
         language: rift_protocol::query::QueryLanguage::Sparql,
+    ..Default::default()
     }).await?;
     let [count] = query::rows(&all)? else {
         return Err(format!("one all-scope count: {all}").into());
@@ -167,29 +168,19 @@ async fn assert_exact_profile_reads(
     );
     assert_eq!(declarations.len(), 1);
 
-    let nodes = proxied_call(
-        client,
-        "nodes",
-        &json!({"symbol":profile_id, "syntax":true}),
-    )
-    .await?;
-    let item = &nodes["nodes"][0];
-    assert_eq!(nodes["symbol"].as_str(), Some(profile_id), "{nodes}");
-    assert_eq!(item["index"].as_u64(), Some(0), "{nodes}");
-    assert_eq!(item["source"].as_str(), Some(PROFILE_SOURCE), "{nodes}");
-
-    let by_path = proxied_call(
-        client,
-        "nodes",
-        &json!({"path": "lib.rs", "position": 8, "scope": "local@other:docs"}),
-    )
-    .await?;
-    assert_eq!(by_path["symbol"], profile_id, "{by_path}");
+    let syntax_elements = proxied_call(client, "facets", &json!({"symbol":profile_id})).await?;
+    let item = &syntax_elements["declarations"][0]["syntax"][0];
     assert_eq!(
-        by_path["declarations"][0]["source"]["text"], PROFILE_SOURCE,
-        "{by_path}"
+        syntax_elements["symbol"].as_str(),
+        Some(profile_id),
+        "{syntax_elements}"
     );
-    assert!(by_path.get("nodes").is_none());
+    assert_eq!(item["index"].as_u64(), Some(0), "{syntax_elements}");
+    assert_eq!(
+        item["source"].as_str(),
+        Some(PROFILE_SOURCE),
+        "{syntax_elements}"
+    );
 
     Ok(())
 }

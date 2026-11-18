@@ -34,25 +34,25 @@ pub(crate) fn append(
 ) -> Result<SyntaxDocument, RiftError> {
     let lines = line_starts(source.text);
     let selections = selected_languages(document, source.text);
-    let mut nodes = document.nodes().to_vec();
+    let mut syntax_elements = document.syntax_elements().to_vec();
     let mut symbols = document.symbols().to_vec();
     symbols.extend_from_slice(document.facts().left_out_symbols());
     let mut has_errors = document.has_errors();
     let mut omitted =
         document.left_out_declaration_count() - document.facts().left_out_symbols().len();
-    for (index, node) in document.nodes().iter().enumerate() {
-        if node.kind != RAW_TEXT {
+    for (index, syntax_element) in document.syntax_elements().iter().enumerate() {
+        if syntax_element.kind != RAW_TEXT {
             continue;
         }
-        let Some(parent) = node.parent else {
+        let Some(parent) = syntax_element.parent else {
             continue;
         };
         let Some(&language) = selections.get(&parent) else {
             continue;
         };
-        let depth = node_depth(document, index) + 1;
-        let remaining = remaining_limits(source, limits, nodes.len(), depth)?;
-        let range = included_range(source.text, node.range, &lines);
+        let depth = syntax_element_depth(document, index) + 1;
+        let remaining = remaining_limits(source, limits, syntax_elements.len(), depth)?;
+        let range = included_range(source.text, syntax_element.range, &lines);
         let embedded = analyze(language, source, remaining, range)
             .map_err(|error| aggregate_error(error, source, limits))?;
         admit_depth(source, limits, depth, &embedded)?;
@@ -62,21 +62,21 @@ pub(crate) fn append(
                 embedded.left_out_declaration_count() - embedded.facts().left_out_symbols().len(),
             )
             .ok_or_else(|| {
-                errors::syntax::too_many_nodes()
+                errors::syntax::too_many_syntax_elements()
                     .path(source.path)
-                    .syntax_nodes_max(limits.syntax_nodes_max())
+                    .syntax_elements_max(limits.syntax_elements_max())
                     .error()
             })?;
-        append_nodes(&mut nodes, &embedded, index);
+        append_syntax_elements(&mut syntax_elements, &embedded, index);
         symbols.extend_from_slice(embedded.symbols());
         symbols.extend_from_slice(embedded.facts().left_out_symbols());
     }
-    order_nodes(&mut nodes);
+    order_syntax_elements(&mut syntax_elements);
     symbols.sort_by_key(|symbol| symbol.range.start);
     Ok(SyntaxDocument::new(
         document.language().clone(),
         source.path.clone(),
-        nodes,
+        syntax_elements,
         symbols,
         has_errors,
     )
@@ -115,14 +115,14 @@ fn analyze(
 fn selected_languages(document: &SyntaxDocument, text: &str) -> BTreeMap<usize, EmbeddedLanguage> {
     let mut tags = BTreeMap::new();
     let mut attributes: BTreeMap<usize, BTreeMap<&str, &str>> = BTreeMap::new();
-    for (index, node) in document.nodes().iter().enumerate() {
-        let Some(parent) = node.parent else {
+    for (index, syntax_element) in document.syntax_elements().iter().enumerate() {
+        let Some(parent) = syntax_element.parent else {
             continue;
         };
-        if node.kind == START_TAG {
+        if syntax_element.kind == START_TAG {
             tags.insert(parent, index);
         }
-        if node.kind == ATTRIBUTE
+        if syntax_element.kind == ATTRIBUTE
             && let Some((name, value)) = attribute(document, index, text)
         {
             attributes.entry(parent).or_default().insert(name, value);
@@ -133,8 +133,12 @@ fn selected_languages(document: &SyntaxDocument, text: &str) -> BTreeMap<usize, 
             let attribute = attributes.get(&tag);
             let language = attribute.and_then(|values| values.get("lang").copied());
             let script_type = attribute.and_then(|values| values.get("type").copied());
-            selection(document.nodes()[parent].kind, language, script_type)
-                .map(|language| (parent, language))
+            selection(
+                document.syntax_elements()[parent].kind,
+                language,
+                script_type,
+            )
+            .map(|language| (parent, language))
         })
         .collect()
 }
@@ -161,16 +165,16 @@ fn attribute<'a>(
     index: usize,
     text: &'a str,
 ) -> Option<(&'a str, &'a str)> {
-    let range = document.nodes()[index].range;
-    let children = document.nodes()[index + 1..]
+    let range = document.syntax_elements()[index].range;
+    let children = document.syntax_elements()[index + 1..]
         .iter()
-        .take_while(|node| node.range.start < range.end);
+        .take_while(|syntax_element| syntax_element.range.start < range.end);
     let mut name = None;
     let mut value = None;
-    for node in children {
-        match node.kind {
-            ATTRIBUTE_NAME => name = range_text(text, node.range),
-            ATTRIBUTE_VALUE => value = range_text(text, node.range),
+    for syntax_element in children {
+        match syntax_element.kind {
+            ATTRIBUTE_NAME => name = range_text(text, syntax_element.range),
+            ATTRIBUTE_VALUE => value = range_text(text, syntax_element.range),
             _ => {}
         }
     }
@@ -189,10 +193,10 @@ pub(crate) fn remaining_limits(
     count: usize,
     depth: usize,
 ) -> Result<SyntaxLimits, RiftError> {
-    if count >= limits.syntax_nodes_max() {
-        return errors::syntax::too_many_nodes()
+    if count >= limits.syntax_elements_max() {
+        return errors::syntax::too_many_syntax_elements()
             .path(source.path)
-            .syntax_nodes_max(limits.syntax_nodes_max())
+            .syntax_elements_max(limits.syntax_elements_max())
             .fail();
     }
     if depth > limits.syntax_depth_max() {
@@ -203,17 +207,17 @@ pub(crate) fn remaining_limits(
     }
     SyntaxLimits::new(
         limits.source_bytes_max(),
-        limits.syntax_nodes_max() - count,
+        limits.syntax_elements_max() - count,
         (limits.syntax_depth_max() - depth).max(1),
     )
 }
 
-pub(crate) fn node_depth(document: &SyntaxDocument, index: usize) -> usize {
+pub(crate) fn syntax_element_depth(document: &SyntaxDocument, index: usize) -> usize {
     let mut depth = 0;
-    let mut parent = document.nodes()[index].parent;
+    let mut parent = document.syntax_elements()[index].parent;
     while let Some(index) = parent {
         depth += 1;
-        parent = document.nodes()[index].parent;
+        parent = document.syntax_elements()[index].parent;
     }
     depth
 }
@@ -259,19 +263,24 @@ fn point(position: usize, lines: &[usize]) -> Point {
     }
 }
 
-pub(crate) fn order_nodes(nodes: &mut Vec<crate::SyntaxNode>) {
-    let mut order: Vec<usize> = (0..nodes.len()).collect();
-    order.sort_by_key(|index| (nodes[*index].range.start, Reverse(nodes[*index].range.end)));
-    let mut positions = vec![0; nodes.len()];
+pub(crate) fn order_syntax_elements(syntax_elements: &mut Vec<crate::SyntaxElement>) {
+    let mut order: Vec<usize> = (0..syntax_elements.len()).collect();
+    order.sort_by_key(|index| {
+        (
+            syntax_elements[*index].range.start,
+            Reverse(syntax_elements[*index].range.end),
+        )
+    });
+    let mut positions = vec![0; syntax_elements.len()];
     for (position, index) in order.iter().enumerate() {
         positions[*index] = position;
     }
-    *nodes = order
+    *syntax_elements = order
         .into_iter()
         .map(|index| {
-            let mut node = nodes[index].clone();
-            node.parent = node.parent.map(|parent| positions[parent]);
-            node
+            let mut syntax_element = syntax_elements[index].clone();
+            syntax_element.parent = syntax_element.parent.map(|parent| positions[parent]);
+            syntax_element
         })
         .collect();
 }
@@ -281,17 +290,27 @@ pub(crate) fn restored_symbol_kind(name: &str) -> Option<&'static str> {
         .or_else(|| crate::css::restored_symbol_kind(name))
 }
 
-/// Appends one included tree and keeps every parent attached to its host node.
-pub(crate) fn append_nodes(
-    nodes: &mut Vec<crate::SyntaxNode>,
+/// Appends one included tree and keeps every parent attached to its host syntax element.
+pub(crate) fn append_syntax_elements(
+    syntax_elements: &mut Vec<crate::SyntaxElement>,
     embedded: &SyntaxDocument,
     parent: usize,
 ) {
-    let offset = nodes.len();
-    nodes.extend(embedded.nodes().iter().cloned().map(|mut node| {
-        node.parent = Some(node.parent.map_or(parent, |parent| offset + parent));
-        node
-    }));
+    let offset = syntax_elements.len();
+    syntax_elements.extend(
+        embedded
+            .syntax_elements()
+            .iter()
+            .cloned()
+            .map(|mut syntax_element| {
+                syntax_element.parent = Some(
+                    syntax_element
+                        .parent
+                        .map_or(parent, |parent| offset + parent),
+                );
+                syntax_element
+            }),
+    );
 }
 
 /// Resolves a captured byte range against the original source's line starts.
@@ -306,10 +325,12 @@ pub(crate) fn aggregate_error(
     limits: SyntaxLimits,
 ) -> RiftError {
     match error.slug() {
-        errors::syntax::too_many_nodes::SLUG => errors::syntax::too_many_nodes()
-            .path(source.path)
-            .syntax_nodes_max(limits.syntax_nodes_max())
-            .error(),
+        errors::syntax::too_many_syntax_elements::SLUG => {
+            errors::syntax::too_many_syntax_elements()
+                .path(source.path)
+                .syntax_elements_max(limits.syntax_elements_max())
+                .error()
+        }
         errors::syntax::too_deep::SLUG => errors::syntax::too_deep()
             .path(source.path)
             .syntax_depth_max(limits.syntax_depth_max())
@@ -325,9 +346,11 @@ pub(crate) fn admit_depth(
     host_depth: usize,
     document: &SyntaxDocument,
 ) -> Result<(), RiftError> {
-    let mut depths = Vec::with_capacity(document.nodes().len());
-    for node in document.nodes() {
-        let depth = node.parent.map_or(host_depth, |parent| depths[parent] + 1);
+    let mut depths = Vec::with_capacity(document.syntax_elements().len());
+    for syntax_element in document.syntax_elements() {
+        let depth = syntax_element
+            .parent
+            .map_or(host_depth, |parent| depths[parent] + 1);
         if depth > limits.syntax_depth_max() {
             return errors::syntax::too_deep()
                 .path(source.path)

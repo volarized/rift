@@ -12,7 +12,7 @@ use rift_error::{RiftError, errors};
 #[cfg(test)]
 const SOURCE_BYTES_MAX: usize = 4 * 1_024 * 1_024;
 #[cfg(test)]
-const SYNTAX_NODES_MAX: usize = 250_000;
+const SYNTAX_ELEMENTS_MAX: usize = 250_000;
 #[cfg(test)]
 const SYNTAX_DEPTH_MAX: usize = 512;
 #[cfg(test)]
@@ -121,7 +121,7 @@ pub(super) fn extract_rst_facts_with_limits(
     })?;
     let bounds = RstParseBounds {
         source_bytes,
-        node_count: limits.nodes_max as usize,
+        syntax_element_count: limits.syntax_elements_max as usize,
         depth: limits.depth_max as usize,
         progress_callbacks: limits.progress_callbacks_max as usize,
     };
@@ -131,7 +131,7 @@ pub(super) fn extract_rst_facts_with_limits(
 #[derive(Clone, Copy, Debug)]
 struct RstParseBounds {
     source_bytes: usize,
-    node_count: usize,
+    syntax_element_count: usize,
     depth: usize,
     progress_callbacks: usize,
 }
@@ -141,7 +141,7 @@ impl RstParseBounds {
     const fn default() -> Self {
         Self {
             source_bytes: SOURCE_BYTES_MAX,
-            node_count: SYNTAX_NODES_MAX,
+            syntax_element_count: SYNTAX_ELEMENTS_MAX,
             depth: SYNTAX_DEPTH_MAX,
             progress_callbacks: PROGRESS_CALLBACKS_MAX,
         }
@@ -161,7 +161,7 @@ fn extract_rst_facts_with_bounds(
     let tree = parse(text, bounds)?;
     let language: Language = tree_sitter_rst::LANGUAGE.into();
     let kinds = rst_kinds(&language);
-    let entries = bounded_nodes(tree.root_node(), bounds)?;
+    let entries = bounded_syntax_elements(tree.root_node(), bounds)?;
     build_facts(text, &tree, &entries, kinds)
 }
 
@@ -208,44 +208,53 @@ fn parse(text: &str, bounds: RstParseBounds) -> Result<Tree, RiftError> {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct RstNode<'tree> {
-    node: Node<'tree>,
+struct RstElement<'tree> {
+    syntax_element: Node<'tree>,
     parent: Option<usize>,
 }
 
-fn bounded_nodes(root: Node<'_>, bounds: RstParseBounds) -> Result<Vec<RstNode<'_>>, RiftError> {
-    let mut nodes = Vec::new();
+fn bounded_syntax_elements(
+    root: Node<'_>,
+    bounds: RstParseBounds,
+) -> Result<Vec<RstElement<'_>>, RiftError> {
+    let mut syntax_elements = Vec::new();
     let mut pending = vec![(root, 0_usize, None)];
     let mut cursor = root.walk();
-    while let Some((node, depth, parent)) = pending.pop() {
+    while let Some((syntax_element, depth, parent)) = pending.pop() {
         if depth > bounds.depth {
             return errors::analysis::documentation_limit_exceeded()
                 .field("rst_depth")
                 .fail();
         }
-        if nodes.len() >= bounds.node_count {
+        if syntax_elements.len() >= bounds.syntax_element_count {
             return errors::analysis::documentation_limit_exceeded()
-                .field("rst_nodes")
+                .field("rst_syntax_elements")
                 .fail();
         }
-        let node_id = node.id();
-        nodes.push(RstNode { node, parent });
-        if nodes.len() + pending.len() + node.named_child_count() > bounds.node_count {
+        let syntax_element_id = syntax_element.id();
+        syntax_elements.push(RstElement {
+            syntax_element,
+            parent,
+        });
+        if syntax_elements.len() + pending.len() + syntax_element.named_child_count()
+            > bounds.syntax_element_count
+        {
             return errors::analysis::documentation_limit_exceeded()
-                .field("rst_nodes")
+                .field("rst_syntax_elements")
                 .fail();
         }
         // The cursor steps sibling to sibling; `Node::child` restarts from the
-        // first child on every call, which makes a wide node quadratic. The
+        // first child on every call, which makes a wide syntax element quadratic. The
         // children go on reversed so the worklist pops them in source order.
         let first_child = pending.len();
         pending.extend(
-            node.named_children(&mut cursor)
-                .map(|child| (child, depth + 1, Some(node_id))),
+            syntax_element
+                .named_children(&mut cursor)
+                .map(|child| (child, depth + 1, Some(syntax_element_id))),
         );
         pending[first_child..].reverse();
     }
-    Ok(nodes)
+    Ok(syntax_elements)
 }
 
 #[derive(Debug)]
@@ -325,7 +334,7 @@ fn kind_id(language: &Language, kind: &str, named: bool) -> u16 {
 
 #[derive(Clone, Debug)]
 struct SectionDraft {
-    node_id: usize,
+    syntax_element_id: usize,
     section_start: usize,
     title_range: TextRange,
     level: u32,
@@ -341,7 +350,7 @@ struct SectionFacts {
 
 fn collect_section_facts(
     text: &str,
-    entries: &[RstNode<'_>],
+    entries: &[RstElement<'_>],
     kinds: &RstKinds,
 ) -> Result<SectionFacts, RiftError> {
     let mut adornment_levels = HashMap::<char, u32>::new();
@@ -350,13 +359,13 @@ fn collect_section_facts(
     let mut section_title_ranges = HashMap::<usize, TextRange>::new();
     for entry in entries
         .iter()
-        .filter(|entry| entry.node.kind_id() == kinds.section)
+        .filter(|entry| entry.syntax_element.kind_id() == kinds.section)
     {
-        let node = entry.node;
-        let Some(title) = child_of_kind(node, kinds.title) else {
+        let syntax_element = entry.syntax_element;
+        let Some(title) = child_of_kind(syntax_element, kinds.title) else {
             continue;
         };
-        let Some(style) = section_adornment(node, kinds.adornment, text) else {
+        let Some(style) = section_adornment(syntax_element, kinds.adornment, text) else {
             continue;
         };
         let level = if let Some(level) = adornment_levels.get(&style) {
@@ -379,13 +388,13 @@ fn collect_section_facts(
             .to_owned();
         section_stack.push((level, name.clone()));
         sections.push(SectionDraft {
-            node_id: node.id(),
-            section_start: node.start_byte(),
+            syntax_element_id: syntax_element.id(),
+            section_start: syntax_element.start_byte(),
             title_range: byte_range(title)?,
             level,
             name,
         });
-        section_title_ranges.insert(node.id(), byte_range(title)?);
+        section_title_ranges.insert(syntax_element.id(), byte_range(title)?);
     }
 
     let mut section_stack = Vec::<(u32, RstHeading)>::new();
@@ -409,7 +418,7 @@ fn collect_section_facts(
             .iter()
             .map(|(_, heading)| heading.clone())
             .collect::<Vec<_>>();
-        section_paths.insert(section.node_id, path.clone());
+        section_paths.insert(section.syntax_element_id, path.clone());
         section_events.push((section.section_start, section.title_range, path));
     }
 
@@ -422,15 +431,15 @@ fn collect_section_facts(
 
 fn collect_entry_facts(
     text: &str,
-    entries: &[RstNode<'_>],
+    entries: &[RstElement<'_>],
     kinds: &RstKinds,
     starts: &[usize],
     sections: &SectionFacts,
 ) -> Result<RstFacts, RiftError> {
     let mut state = RstEntryState {
         facts: RstFacts::default(),
-        omitted_node_ids: HashSet::new(),
-        block_for_node: HashMap::with_capacity(entries.len()),
+        omitted_syntax_element_ids: HashSet::new(),
+        block_for_syntax_element: HashMap::with_capacity(entries.len()),
     };
     for entry in entries {
         collect_entry(entry, text, kinds, starts, sections, &mut state)?;
@@ -441,8 +450,8 @@ fn collect_entry_facts(
 #[derive(Default)]
 struct RstEntryState {
     facts: RstFacts,
-    omitted_node_ids: HashSet<usize>,
-    block_for_node: HashMap<usize, TextRange>,
+    omitted_syntax_element_ids: HashSet<usize>,
+    block_for_syntax_element: HashMap<usize, TextRange>,
 }
 
 #[expect(
@@ -450,7 +459,7 @@ struct RstEntryState {
     reason = "One tree walk keeps omitted ancestry and authored facts in source order"
 )]
 fn collect_entry(
-    entry: &RstNode<'_>,
+    entry: &RstElement<'_>,
     text: &str,
     kinds: &RstKinds,
     starts: &[usize],
@@ -459,30 +468,30 @@ fn collect_entry(
 ) -> Result<(), RiftError> {
     let RstEntryState {
         facts,
-        omitted_node_ids,
-        block_for_node,
+        omitted_syntax_element_ids,
+        block_for_syntax_element,
     } = state;
-    let node = entry.node;
+    let syntax_element = entry.syntax_element;
     if entry
         .parent
-        .is_some_and(|parent| omitted_node_ids.contains(&parent))
+        .is_some_and(|parent| omitted_syntax_element_ids.contains(&parent))
     {
-        omitted_node_ids.insert(node.id());
+        omitted_syntax_element_ids.insert(syntax_element.id());
         return Ok(());
     }
     let mut current_block = entry
         .parent
-        .and_then(|parent| block_for_node.get(&parent).cloned());
+        .and_then(|parent| block_for_syntax_element.get(&parent).cloned());
 
-    if node.kind_id() == kinds.directive {
-        let name = node
+    if syntax_element.kind_id() == kinds.directive {
+        let name = syntax_element
             .child_by_field_id(kinds.name_field)
             .and_then(|name| text.get(name.byte_range()))
             .unwrap_or_default()
             .trim()
             .to_ascii_lowercase();
         if name == "code" || name == "code-block" {
-            let body = node.child_by_field_id(kinds.body_field);
+            let body = syntax_element.child_by_field_id(kinds.body_field);
             let code = body.and_then(|body| child_of_kind(body, kinds.content));
             if let Some(code) = code {
                 let range = byte_range(code)?;
@@ -497,32 +506,32 @@ fn collect_entry(
                     line,
                     kind: RstBlockKind::Code,
                     structure: "code",
-                    heading_path: heading_path_at(&sections.events, node.start_byte()),
+                    heading_path: heading_path_at(&sections.events, syntax_element.start_byte()),
                     language,
                 });
                 current_block = Some(range);
             } else {
-                facts.omitted_ranges.push(byte_range(node)?);
+                facts.omitted_ranges.push(byte_range(syntax_element)?);
             }
         } else {
-            facts.omitted_ranges.push(byte_range(node)?);
+            facts.omitted_ranges.push(byte_range(syntax_element)?);
         }
-        omitted_node_ids.insert(node.id());
+        omitted_syntax_element_ids.insert(syntax_element.id());
     } else if matches!(
-        node.kind_id(),
+        syntax_element.kind_id(),
         id if id == kinds.comment
             || id == kinds.footnote
             || id == kinds.citation
             || id == kinds.substitution_definition
             || id == kinds.doctest_block
     ) {
-        facts.omitted_ranges.push(byte_range(node)?);
-        omitted_node_ids.insert(node.id());
-    } else if node.kind_id() == kinds.section {
-        let Some(path) = sections.paths.get(&node.id()).cloned() else {
+        facts.omitted_ranges.push(byte_range(syntax_element)?);
+        omitted_syntax_element_ids.insert(syntax_element.id());
+    } else if syntax_element.kind_id() == kinds.section {
+        let Some(path) = sections.paths.get(&syntax_element.id()).cloned() else {
             return Ok(());
         };
-        let Some(title_range) = sections.title_ranges.get(&node.id()).cloned() else {
+        let Some(title_range) = sections.title_ranges.get(&syntax_element.id()).cloned() else {
             return Ok(());
         };
         facts.blocks.push(RstBlockFact {
@@ -534,9 +543,9 @@ fn collect_entry(
             language: None,
         });
         current_block = Some(title_range);
-    } else if node.kind_id() == kinds.paragraph {
-        let full = byte_range(node)?;
-        let literal = child_of_kind(node, kinds.literal_block);
+    } else if syntax_element.kind_id() == kinds.paragraph {
+        let full = byte_range(syntax_element)?;
+        let literal = child_of_kind(syntax_element, kinds.literal_block);
         let range = literal.map_or(full.clone(), |literal| TextRange {
             start: full.start,
             end: byte_range(literal).map_or(full.end, |range| range.start),
@@ -548,69 +557,71 @@ fn collect_entry(
                 line,
                 kind: RstBlockKind::Prose,
                 structure: "paragraph",
-                heading_path: heading_path_at(&sections.events, node.start_byte()),
+                heading_path: heading_path_at(&sections.events, syntax_element.start_byte()),
                 language: None,
             });
             current_block = Some(range);
         }
-    } else if node.kind_id() == kinds.literal_block {
-        let range = byte_range(node)?;
+    } else if syntax_element.kind_id() == kinds.literal_block {
+        let range = byte_range(syntax_element)?;
         let line = line_of(starts, range.start);
         facts.blocks.push(RstBlockFact {
             range: range.clone(),
             line,
             kind: RstBlockKind::Code,
             structure: "literal_block",
-            heading_path: heading_path_at(&sections.events, node.start_byte()),
+            heading_path: heading_path_at(&sections.events, syntax_element.start_byte()),
             language: None,
         });
         current_block = Some(range);
-    } else if node.kind_id() == kinds.bullet_list
-        || node.kind_id() == kinds.enumerated_list
-        || node.kind_id() == kinds.definition_list
-        || node.kind_id() == kinds.field_list
+    } else if syntax_element.kind_id() == kinds.bullet_list
+        || syntax_element.kind_id() == kinds.enumerated_list
+        || syntax_element.kind_id() == kinds.definition_list
+        || syntax_element.kind_id() == kinds.field_list
     {
-        let range = byte_range(node)?;
+        let range = byte_range(syntax_element)?;
         let line = line_of(starts, range.start);
         facts.blocks.push(RstBlockFact {
             range: range.clone(),
             line,
             kind: RstBlockKind::Prose,
             structure: "list",
-            heading_path: heading_path_at(&sections.events, node.start_byte()),
+            heading_path: heading_path_at(&sections.events, syntax_element.start_byte()),
             language: None,
         });
         current_block = Some(range);
-    } else if node.kind_id() == kinds.block_quote || node.kind_id() == kinds.line_block {
-        let range = byte_range(node)?;
+    } else if syntax_element.kind_id() == kinds.block_quote
+        || syntax_element.kind_id() == kinds.line_block
+    {
+        let range = byte_range(syntax_element)?;
         let line = line_of(starts, range.start);
         facts.blocks.push(RstBlockFact {
             range: range.clone(),
             line,
             kind: RstBlockKind::Prose,
-            structure: if node.kind_id() == kinds.block_quote {
+            structure: if syntax_element.kind_id() == kinds.block_quote {
                 "block_quote"
             } else {
                 "line_block"
             },
-            heading_path: heading_path_at(&sections.events, node.start_byte()),
+            heading_path: heading_path_at(&sections.events, syntax_element.start_byte()),
             language: None,
         });
         current_block = Some(range);
     }
 
     if let Some(block) = &current_block {
-        block_for_node.insert(node.id(), block.clone());
+        block_for_syntax_element.insert(syntax_element.id(), block.clone());
     }
-    collect_target(node, text, kinds, &mut facts.targets)?;
-    collect_link(node, text, kinds, current_block, &mut facts.links)?;
+    collect_target(syntax_element, text, kinds, &mut facts.targets)?;
+    collect_link(syntax_element, text, kinds, current_block, &mut facts.links)?;
     Ok(())
 }
 
 fn build_facts(
     text: &str,
     tree: &Tree,
-    entries: &[RstNode<'_>],
+    entries: &[RstElement<'_>],
     kinds: &RstKinds,
 ) -> Result<RstFacts, RiftError> {
     let starts = line_starts(text);
@@ -650,15 +661,16 @@ fn build_facts(
     Ok(facts)
 }
 
-fn child_of_kind(node: Node<'_>, kind: u16) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    node.children(&mut cursor)
+fn child_of_kind(syntax_element: Node<'_>, kind: u16) -> Option<Node<'_>> {
+    let mut cursor = syntax_element.walk();
+    syntax_element
+        .children(&mut cursor)
         .find(|child| child.kind_id() == kind)
 }
 
-fn section_adornment(node: Node<'_>, kind: u16, text: &str) -> Option<char> {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
+fn section_adornment(syntax_element: Node<'_>, kind: u16, text: &str) -> Option<char> {
+    let mut cursor = syntax_element.walk();
+    for child in syntax_element.children(&mut cursor) {
         if child.kind_id() == kind {
             return text.get(child.byte_range())?.chars().next();
         }
@@ -678,13 +690,13 @@ fn heading_path_at(
 }
 
 fn collect_target(
-    node: Node<'_>,
+    syntax_element: Node<'_>,
     text: &str,
     kinds: &RstKinds,
     targets: &mut Vec<RstTargetFact>,
 ) -> Result<(), RiftError> {
-    if node.kind_id() == kinds.target {
-        if let Some(name) = node.child_by_field_id(kinds.name_field) {
+    if syntax_element.kind_id() == kinds.target {
+        if let Some(name) = syntax_element.child_by_field_id(kinds.name_field) {
             let raw_range = byte_range(name)?;
             let mut start = usize::try_from(raw_range.start).map_err(|_| {
                 errors::analysis::documentation_range_invalid()
@@ -717,7 +729,7 @@ fn collect_target(
                 .trim()
                 .to_owned();
             let range = text_range(start, end)?;
-            let destination = node.child_by_field_id(kinds.link_field);
+            let destination = syntax_element.child_by_field_id(kinds.link_field);
             let destination_range = destination.map(byte_range).transpose()?;
             let destination_text = destination
                 .and_then(|destination| text.get(destination.byte_range()))
@@ -730,8 +742,8 @@ fn collect_target(
                 destination_range,
             });
         }
-    } else if node.kind_id() == kinds.inline_target {
-        let full = byte_range(node)?;
+    } else if syntax_element.kind_id() == kinds.inline_target {
+        let full = byte_range(syntax_element)?;
         let mut start = usize::try_from(full.start).unwrap_or(text.len());
         let mut end = usize::try_from(full.end).unwrap_or(text.len());
         if text
@@ -754,7 +766,7 @@ fn collect_target(
 }
 
 fn collect_link(
-    node: Node<'_>,
+    syntax_element: Node<'_>,
     text: &str,
     kinds: &RstKinds,
     block_range: Option<TextRange>,
@@ -763,10 +775,13 @@ fn collect_link(
     let Some(block_range) = block_range else {
         return Ok(());
     };
-    let (authored_range, kind) = if node.kind_id() == kinds.standalone_hyperlink {
-        (Some(byte_range(node)?), RstLinkKind::Destination)
-    } else if node.kind_id() == kinds.reference {
-        (reference_name_range(node, text)?, RstLinkKind::Reference)
+    let (authored_range, kind) = if syntax_element.kind_id() == kinds.standalone_hyperlink {
+        (Some(byte_range(syntax_element)?), RstLinkKind::Destination)
+    } else if syntax_element.kind_id() == kinds.reference {
+        (
+            reference_name_range(syntax_element, text)?,
+            RstLinkKind::Reference,
+        )
     } else {
         (None, RstLinkKind::Reference)
     };
@@ -783,8 +798,11 @@ fn collect_link(
     Ok(())
 }
 
-fn reference_name_range(node: Node<'_>, text: &str) -> Result<Option<TextRange>, RiftError> {
-    let mut range = byte_range(node)?;
+fn reference_name_range(
+    syntax_element: Node<'_>,
+    text: &str,
+) -> Result<Option<TextRange>, RiftError> {
+    let mut range = byte_range(syntax_element)?;
     let mut start = usize::try_from(range.start).map_err(|_| {
         errors::analysis::documentation_range_invalid()
             .field("rst_range")
@@ -815,9 +833,9 @@ fn reference_name_range(node: Node<'_>, text: &str) -> Result<Option<TextRange>,
     Ok((range.start < range.end).then_some(range))
 }
 
-fn collect_errors(node: Node<'_>, output: &mut Vec<TextRange>) -> Result<(), RiftError> {
-    let mut pending = vec![node];
-    let mut cursor = node.walk();
+fn collect_errors(syntax_element: Node<'_>, output: &mut Vec<TextRange>) -> Result<(), RiftError> {
+    let mut pending = vec![syntax_element];
+    let mut cursor = syntax_element.walk();
     while let Some(current) = pending.pop() {
         if current.is_error() || current.is_missing() {
             output.push(byte_range(current)?);
@@ -829,14 +847,14 @@ fn collect_errors(node: Node<'_>, output: &mut Vec<TextRange>) -> Result<(), Rif
     Ok(())
 }
 
-fn byte_range(node: Node<'_>) -> Result<TextRange, RiftError> {
+fn byte_range(syntax_element: Node<'_>) -> Result<TextRange, RiftError> {
     Ok(TextRange {
-        start: u64::try_from(node.start_byte()).map_err(|_| {
+        start: u64::try_from(syntax_element.start_byte()).map_err(|_| {
             errors::analysis::documentation_range_invalid()
                 .field("rst_range")
                 .error()
         })?,
-        end: u64::try_from(node.end_byte()).map_err(|_| {
+        end: u64::try_from(syntax_element.end_byte()).map_err(|_| {
             errors::analysis::documentation_range_invalid()
                 .field("rst_range")
                 .error()
@@ -1028,21 +1046,21 @@ mod tests {
     }
 
     #[test]
-    fn node_and_depth_bounds_refuse_supported_source() {
+    fn syntax_element_and_depth_bounds_refuse_supported_source() {
         let path = path();
         let text = "Title\n=====\n\nParagraph.\n";
-        let node_error = extract_rst_facts_with_bounds(
+        let syntax_element_error = extract_rst_facts_with_bounds(
             text,
             &path,
             RstParseBounds {
-                node_count: 1,
+                syntax_element_count: 1,
                 ..RstParseBounds::default()
             },
         )
-        .expect_err("node bound");
+        .expect_err("syntax element bound");
         assert_eq!(
-            crate::documentation::failure::context_value(&node_error, "field").as_deref(),
-            Some("rst_nodes")
+            crate::documentation::failure::context_value(&syntax_element_error, "field").as_deref(),
+            Some("rst_syntax_elements")
         );
 
         let depth_error = extract_rst_facts_with_bounds(

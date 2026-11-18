@@ -3,12 +3,11 @@ use rift_protocol::error::{
     ErrorCause, ErrorCode, ErrorData, ErrorPhase, LimitEvidence, RetryDirective,
 };
 use rift_protocol::read::{
-    CommitAuthor, DiagnosticContext, Digest, Documentation, DocumentationFormat, ExactKind,
-    Extensions, GetSymbolHit, GetSymbolResult, HistoryChange, HistoryCommit, HistoryEdge, Language,
-    Node, NodeFacet, NodeRegion, NodesResult, PackageIdentity, Pagination, ProjectPath,
-    ReadWarning, RegionRole, RelationshipFacet, RevisionId, Signature, SourceKind,
-    SourceLocationKind, SourceUnitId, Symbol, SymbolFacet, SymbolHistory, SymbolId, SymbolOrigin,
-    SymbolVersionKind, TextRange,
+    CommitAuthor, DiagnosticContext, Digest, Documentation, DocumentationFormat, EdgeKind,
+    ExactKind, Extensions, FacetsResult, GetSymbolHit, GetSymbolResult, HistoryChange,
+    HistoryCommit, HistoryEdge, Language, PackageIdentity, Pagination, ProjectPath, ReadWarning,
+    RevisionId, Signature, SourceKind, SourceLocationKind, SourceUnitId, Symbol, SymbolHistory,
+    SymbolId, SymbolKind, SymbolOrigin, SymbolVersionKind, TextRange,
 };
 use rift_protocol::revision::Revision;
 use rift_protocol::search::{
@@ -92,10 +91,12 @@ fn rust() -> Language {
     }
 }
 
-fn pagination(page_index: u64, total_pages: u64) -> Pagination {
+fn pagination(page: u64, pages: u64) -> Pagination {
     Pagination {
-        page_index,
-        total_pages,
+        page: page.saturating_add(1),
+        pages,
+        max_results: 10,
+        total: pages.saturating_mul(10),
     }
 }
 
@@ -105,7 +106,7 @@ fn symbol(id: Option<&str>, name: &str) -> Symbol {
         language: rust(),
         name: name.to_owned(),
         kind: ExactKind("struct".to_owned()),
-        facets: vec![SymbolFacet::Type, SymbolFacet::Public],
+        kinds: vec![SymbolKind::Type, SymbolKind::Public],
         origin: SymbolOrigin {
             location: Some(SourceLocationKind::Project),
             package: None,
@@ -241,22 +242,6 @@ fn stale_index() -> ReadWarning {
     }
 }
 
-fn node(index: u64, kind: &str, start: u64, end: u64) -> Node {
-    Node {
-        declaration: None,
-        index,
-        unit: SourceUnitId("rift://source/project/src/lib.rs".to_owned()),
-        language: rust(),
-        kind: ExactKind(kind.to_owned()),
-        facets: Vec::new(),
-        range: range(start, end),
-        source: String::new(),
-        regions: Vec::new(),
-        parent: None,
-        extensions: Extensions::default(),
-    }
-}
-
 /// Joins `lines` with a line feed after each, the way the writer ends every line.
 fn text(lines: &[&str]) -> String {
     let mut joined = lines.join("\n");
@@ -310,17 +295,17 @@ fn documentation_hit() -> DocumentationHit {
 
 /// A hop from `a.rs/A` to `b.rs/B` of the given direction, derivation, and confidence.
 fn hop(direction: &str, derivation: &str, confidence: Option<f64>) -> GraphHop {
-    let mut relationship = json!({
+    let mut edge = json!({
         "from": "rift://symbol/local/rust/app/a/A",
         "kind": "calls",
-        "facets": ["calls"],
+        "kinds": ["calls"],
         "to": "rift://symbol/local/rust/app/b/B",
         "derivation": derivation
     });
     if let Some(confidence) = confidence {
-        relationship["confidence"] = json!(confidence);
+        edge["confidence"] = json!(confidence);
     }
-    serde_json::from_value(json!({"relationship": relationship, "direction": direction}))
+    serde_json::from_value(json!({"edge": edge, "direction": direction}))
         .expect("graph hop deserializes")
 }
 
@@ -348,21 +333,7 @@ fn symbol_result(hits: Vec<GetSymbolHit>, page: Pagination) -> GetSymbolResult {
     }
 }
 
-/// A `nodes` answer whose nodes carry `source`, one text per node in order.
-fn nodes_result(mut nodes: Vec<Node>, source: Vec<&str>) -> NodesResult {
-    assert_eq!(nodes.len(), source.len(), "one source per fixture node");
-    for (node, text) in nodes.iter_mut().zip(source) {
-        text.clone_into(&mut node.source);
-    }
-    NodesResult {
-        symbol: None,
-        nodes,
-        node_cursor: None,
-        revision: tree_revision(),
-        warnings: Vec::new(),
-    }
-}
-
+/// A `facets` answer whose facets carry `source`, one text per syntax element in order.
 fn error_data(code: ErrorCode, message: &str) -> ErrorData {
     ErrorData {
         code,
@@ -406,7 +377,7 @@ fn the_owner_search_example_with_two_hits_on_the_first_of_three_pages() {
     golden(
         &owner_search_page(),
         &[
-            "2 results · page 1/3",
+            "2 results",
             "\t[1] pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
             "\t\tsrc/config.rs:10 · name",
             "\t\trift://symbol/local/rust/app/config/load_config",
@@ -445,7 +416,7 @@ fn the_authored_search_examples_render_as_the_layout_shows() {
     golden(
         &example::<SearchResult>(0),
         &[
-            "2 results · page 1/3",
+            "2 results",
             "\t[1] pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
             "\t\tsrc/config.rs:10 · name",
             "\t\trift://symbol/local/rust/app/config/load_config",
@@ -530,7 +501,7 @@ fn several_results_on_one_page_have_markers_and_indent_and_no_page() {
 }
 
 #[test]
-fn the_page_follows_the_page_index() {
+fn the_page_follows_the_page() {
     let item = || placed_symbol_hit(symbol(Some(A_ID), "A"));
     let body = [
         "\tstruct A",
@@ -544,9 +515,18 @@ fn the_page_follows_the_page_index() {
         lines.extend(body);
         lines
     };
-    golden(&page(0, 3), &expect("1 result · page 1/3"));
-    golden(&page(1, 3), &expect("1 result · page 2/3"));
-    golden(&page(2, 3), &expect("1 result · page 3/3"));
+    golden(
+        &page(0, 3),
+        &expect("1 result · page 1/3, total 30 results"),
+    );
+    golden(
+        &page(1, 3),
+        &expect("1 result · page 2/3, total 30 results"),
+    );
+    golden(
+        &page(2, 3),
+        &expect("1 result · page 3/3, total 30 results"),
+    );
     golden(&page(0, 1), &expect("1 result"));
 }
 
@@ -554,24 +534,29 @@ fn the_page_follows_the_page_index() {
 fn a_page_past_the_end_names_the_page() {
     golden(
         &search_result(Vec::new(), pagination(5, 3), Vec::new()),
-        &["0 results · page 6/3"],
+        &["0 results · page 6/3, total 30 results"],
     );
     golden(
         &search_result(Vec::new(), pagination(3, 3), Vec::new()),
-        &["0 results · page 4/3"],
+        &["0 results · page 4/3, total 30 results"],
     );
     golden(
         &search_result(Vec::new(), pagination(4, 0), Vec::new()),
-        &["0 results"],
+        &["0 results · page 5/0, total 0 results"],
     );
 }
 
 #[test]
-fn the_largest_page_index_renders_without_overflow() {
+fn the_largest_page_renders_without_overflow() {
     let answer = search_result(Vec::new(), pagination(u64::MAX, u64::MAX), Vec::new());
     assert_eq!(
         rendered(&answer),
-        format!("0 results · page {}/{}\n", u64::MAX, u64::MAX)
+        format!(
+            "0 results · page {}/{}, total {} results\n",
+            u64::MAX,
+            u64::MAX,
+            u64::MAX
+        )
     );
 }
 
@@ -799,14 +784,14 @@ fn every_exceptional_fact_is_written_in_order() {
         Some(package("serde", "1.0.0")),
         SourceKind::Generated,
     );
-    everything.facets = vec![SymbolFacet::Test, SymbolFacet::Deprecated];
+    everything.kinds = vec![SymbolKind::Test, SymbolKind::Deprecated];
     everything.document_local = true;
     let hit = SearchHit {
         score: Some(1.5),
         distance: Some(1),
         unit: Some(source_unit("rift://source/cargo/crates.io/serde/lib.rs")),
         line: Some(3),
-        matched_by: vec![MatchedField::Relationship],
+        matched_by: vec![MatchedField::Edge],
         ..search_hit(SearchHitTarget::Symbol {
             symbol: Box::new(everything),
         })
@@ -816,7 +801,7 @@ fn every_exceptional_fact_is_written_in_order() {
         &[
             "1 result",
             "\tstruct A",
-            "\trift://source/cargo/crates.io/serde/lib.rs:3 · relationship · score 1.5 · dependency rift://revision/cargo/crates.io/serde@1.0.0 · generated · deprecated · test · document local",
+            "\trift://source/cargo/crates.io/serde/lib.rs:3 · edge · score 1.5 · dependency rift://revision/cargo/crates.io/serde@1.0.0 · generated · deprecated · test · document local",
             "\trift://symbol/local/rust/app/a/A",
         ],
     );
@@ -920,14 +905,14 @@ fn the_origin_is_written_only_when_it_is_not_the_project_default() {
 #[test]
 fn deprecated_test_and_document_local_are_written_only_when_they_hold() {
     let mut symbol = symbol(Some(A_ID), "A");
-    symbol.facets = vec![SymbolFacet::Type, SymbolFacet::Public];
+    symbol.kinds = vec![SymbolKind::Type, SymbolKind::Public];
     assert_eq!(
         facts_line(symbol.clone()),
         "rift://symbol/local/rust/app/a/A"
     );
-    symbol.facets.push(SymbolFacet::Test);
+    symbol.kinds.push(SymbolKind::Test);
     assert_eq!(facts_line(symbol.clone()), "test");
-    symbol.facets.push(SymbolFacet::Deprecated);
+    symbol.kinds.push(SymbolKind::Deprecated);
     assert_eq!(facts_line(symbol.clone()), "deprecated · test");
     symbol.document_local = true;
     assert_eq!(facts_line(symbol), "deprecated · test · document local");
@@ -958,13 +943,13 @@ fn fixture_symbol_id(at: &str) -> String {
         .wire_identity()
 }
 
-/// A hop over the edge `from` to `to` with the given facets, followed in `direction`.
-fn edge(direction: &str, (from, to): (&str, &str), facets: &[&str], derivation: &str) -> GraphHop {
+/// A hop over the edge `from` to `to` with the given kinds, followed in `direction`.
+fn edge(direction: &str, (from, to): (&str, &str), kinds: &[&str], derivation: &str) -> GraphHop {
     serde_json::from_value(json!({
-        "relationship": {
+        "edge": {
             "from": fixture_symbol_id(from),
             "kind": "edge",
-            "facets": facets,
+            "kinds": kinds,
             "to": fixture_symbol_id(to),
             "derivation": derivation
         },
@@ -973,17 +958,17 @@ fn edge(direction: &str, (from, to): (&str, &str), facets: &[&str], derivation: 
     .expect("graph hop deserializes")
 }
 
-/// A resolved hop against the edge `from` to `to`, which has the facet `facet`.
-fn against(from: &str, to: &str, facet: &str) -> GraphHop {
-    edge("incoming", (from, to), &[facet], "resolution")
+/// A resolved hop against the edge `from` to `to`, which has the kind `kind`.
+fn against(from: &str, to: &str, kind: &str) -> GraphHop {
+    edge("incoming", (from, to), &[kind], "resolution")
 }
 
 /// A symbol hit at `file/name` declared as `display`, placed at `line` of its file and matched
-/// by its relationship, that the hops `hops` reached.
+/// by its edge, that the hops `hops` reached.
 fn walked_hit(at: &str, display: &str, line: u64, hops: Vec<GraphHop>) -> SearchHit {
     let (file, name) = at.rsplit_once('/').expect("a symbol is `<file>/<name>`");
     SearchHit {
-        matched_by: vec![MatchedField::Relationship],
+        matched_by: vec![MatchedField::Edge],
         line: Some(line),
         path: Some(project_path(file)),
         traversal_path: Some(hops),
@@ -1062,7 +1047,7 @@ fn readme_hit() -> SearchHit {
 }
 
 #[test]
-fn a_walk_hit_is_one_node_under_a_root_that_writes_its_identity() {
+fn a_walk_hit_is_one_symbol_under_a_root_that_writes_its_identity() {
     golden(
         &only_page(vec![run_hit()]),
         &[
@@ -1078,7 +1063,7 @@ fn a_walk_hit_is_one_node_under_a_root_that_writes_its_identity() {
 }
 
 #[test]
-fn paths_that_share_a_prefix_share_its_nodes_and_children_follow_answer_order() {
+fn paths_that_share_a_prefix_share_its_kinds_and_children_follow_answer_order() {
     golden(
         &only_page(vec![reload_hit(), main_hit(), run_hit()]),
         &[
@@ -1306,16 +1291,16 @@ fn a_root_that_is_no_hit_is_one_line_at_its_identity() {
 }
 
 #[test]
-fn a_walk_node_whose_hit_is_not_a_symbol_writes_nothing() {
+fn a_walk_symbol_whose_hit_is_not_a_symbol_writes_nothing() {
     let mut out = TextWriter::new(1 << 10);
-    let mut lines = super::layout::Lines::node(&mut out, 0, None);
-    super::search::walk_node(&mut lines, &readme_hit(), super::walk::Labels::Root)
+    let mut lines = super::layout::Lines::walk_symbol(&mut out, 0, None);
+    super::search::walk_symbol(&mut lines, &readme_hit(), super::walk::Labels::Root)
         .expect("a hit that is not a symbol writes nothing");
     assert_eq!(out.finish(), Ok(String::new()));
 }
 
 #[test]
-fn two_walk_hits_that_reach_one_symbol_under_one_parent_each_get_a_node() {
+fn two_walk_hits_that_reach_one_symbol_under_one_parent_each_get_a_symbol() {
     let again = SearchHit {
         line: Some(21),
         ..run_hit()
@@ -1340,7 +1325,7 @@ fn two_walk_hits_that_reach_one_symbol_under_one_parent_each_get_a_node() {
 }
 
 #[test]
-fn an_outgoing_hop_writes_each_facet_as_its_wire_name_with_spaces() {
+fn an_outgoing_hop_writes_each_kind_as_its_wire_name_with_spaces() {
     let hop = edge(
         "outgoing",
         (MAIN, RUN),
@@ -1362,7 +1347,7 @@ fn an_outgoing_hop_writes_each_facet_as_its_wire_name_with_spaces() {
 }
 
 #[test]
-fn an_incoming_hop_writes_each_facet_read_from_its_target_back_and_the_distance_is_not_written() {
+fn an_incoming_hop_writes_each_kind_read_from_its_target_back_and_the_distance_is_not_written() {
     let hop = edge(
         "incoming",
         (RUN, LOAD_CONFIG),
@@ -1392,7 +1377,7 @@ fn a_heuristic_hop_starts_with_probably_whatever_its_confidence_and_direction() 
     let outgoing = edge("outgoing", (MAIN, RUN), &["implements"], "heuristic");
     let incoming = edge("incoming", (RUN, LOAD_CONFIG), &["implements"], "heuristic");
     let mut surer = incoming.clone();
-    surer.relationship.confidence = Some(0.9);
+    surer.edge.confidence = Some(0.9);
     golden(
         &only_page(vec![
             walked_hit(RUN, "fn run()", 20, vec![outgoing]),
@@ -1424,9 +1409,9 @@ fn a_heuristic_hop_starts_with_probably_whatever_its_confidence_and_direction() 
 }
 
 #[test]
-fn a_hop_an_external_producer_emitted_names_that_producer_after_its_relationship() {
+fn a_hop_an_external_producer_emitted_names_that_producer_after_its_edge() {
     let mut hop = edge("incoming", (RUN, LOAD_CONFIG), &["calls"], "resolution");
-    hop.relationship.producer = Some(
+    hop.edge.producer = Some(
         serde_json::from_value(serde_json::json!({"name": "demo-indexer", "revision": "0.6.1"}))
             .expect("producer"),
     );
@@ -1444,7 +1429,7 @@ fn a_hop_an_external_producer_emitted_names_that_producer_after_its_relationship
     );
 }
 
-/// Each facet with the words an incoming hop writes for it.
+/// Each kind with the words an incoming hop writes for it.
 const INCOMING_WORDS: [(&str, &str); 29] = [
     ("contains", "contained by"),
     ("declares", "declared by"),
@@ -1478,13 +1463,13 @@ const INCOMING_WORDS: [(&str, &str); 29] = [
 ];
 
 #[test]
-fn the_by_word_moves_to_the_declaration_line_only_when_every_facet_phrase_ends_in_it() {
-    let hit = |facets: &[&str], derivation: &str| {
+fn the_by_word_moves_to_the_declaration_line_only_when_every_kind_phrase_ends_in_it() {
+    let hit = |kinds: &[&str], derivation: &str| {
         walked_hit(
             RUN,
             "fn run()",
             20,
-            vec![edge("incoming", (RUN, LOAD_CONFIG), facets, derivation)],
+            vec![edge("incoming", (RUN, LOAD_CONFIG), kinds, derivation)],
         )
     };
     let root = "\tat rift://symbol/local/rust/app/config/load_config";
@@ -1521,12 +1506,12 @@ fn the_by_word_moves_to_the_declaration_line_only_when_every_facet_phrase_ends_i
 
 #[test]
 fn an_outgoing_hop_moves_by_for_annotated_by_and_writes_calls_whole() {
-    let walked = |facet: &str| {
+    let walked = |kind: &str| {
         walked_hit(
             RUN,
             "fn run()",
             20,
-            vec![edge("outgoing", (MAIN, RUN), &[facet], "resolution")],
+            vec![edge("outgoing", (MAIN, RUN), &[kind], "resolution")],
         )
     };
     let tail = [
@@ -1554,11 +1539,11 @@ fn an_outgoing_hop_moves_by_for_annotated_by_and_writes_calls_whole() {
 }
 
 #[test]
-fn a_node_without_a_location_writes_its_facts_without_in() {
+fn a_symbol_without_a_location_writes_its_facts_without_in() {
     let hit = SearchHit {
         line: None,
         path: None,
-        matched_by: vec![MatchedField::Relationship, MatchedField::Name],
+        matched_by: vec![MatchedField::Edge, MatchedField::Name],
         ..run_hit()
     };
     golden(
@@ -1578,12 +1563,12 @@ fn a_node_without_a_location_writes_its_facts_without_in() {
 #[test]
 fn copied_source_keeps_its_own_leading_spaces_and_empty_lines_after_the_indent() {
     let source = "  two spaces\n\n\tone tab\n    four spaces";
-    let node = SearchHit {
+    let walk_hit = SearchHit {
         source: Some(source.to_owned()),
         ..run_hit()
     };
     golden(
-        &only_page(vec![node]),
+        &only_page(vec![walk_hit]),
         &[
             "1 result",
             "\tat rift://symbol/local/rust/app/config/load_config",
@@ -1629,7 +1614,7 @@ fn no_line_of_a_sample_of_each_tool_starts_with_a_space() {
     let mut texts = vec![
         rendered(&example::<SearchResult>(0)),
         rendered(&example::<GetSymbolResult>(0)),
-        rendered(&example::<NodesResult>(0)),
+        rendered(&example::<FacetsResult>(0)),
         rendered(&error_data(ErrorCode::InternalError, "first")),
         rendered(&search_result(
             vec![readme_hit(), main_hit(), reload_hit()],
@@ -1649,10 +1634,10 @@ fn no_line_of_a_sample_of_each_tool_starts_with_a_space() {
 }
 
 #[test]
-fn an_incoming_hop_reads_every_facet_as_the_table_says() {
-    assert_eq!(INCOMING_WORDS.len(), RelationshipFacet::VARIANTS.len());
-    for facet in RelationshipFacet::VARIANTS {
-        let wire = facet.as_ref();
+fn an_incoming_hop_reads_every_kind_as_the_table_says() {
+    assert_eq!(INCOMING_WORDS.len(), EdgeKind::VARIANTS.len());
+    for kind in EdgeKind::VARIANTS {
+        let wire = kind.as_ref();
         let Some((_, words)) = INCOMING_WORDS.iter().find(|(name, _)| *name == wire) else {
             panic!("the table has no row for {wire}");
         };
@@ -1678,7 +1663,7 @@ fn an_incoming_hop_reads_every_facet_as_the_table_says() {
 }
 
 #[test]
-fn a_node_writes_every_line_of_a_symbol_hit_at_its_further_line_indent() {
+fn a_symbol_writes_every_line_of_a_symbol_hit_at_its_further_line_indent() {
     let mut everything = signed_symbol(
         Some("rift://symbol/pkg/cargo/crates.io/serde@1.0.0/rust/serde/Config"),
         "Config",
@@ -1689,12 +1674,12 @@ fn a_node_writes_every_line_of_a_symbol_hit_at_its_further_line_indent() {
         Some(package("serde", "1.0.0")),
         SourceKind::Generated,
     );
-    everything.facets = vec![SymbolFacet::Test, SymbolFacet::Deprecated];
+    everything.kinds = vec![SymbolKind::Test, SymbolKind::Deprecated];
     everything.document_local = true;
     everything.documentation = vec![documentation_text("Settings of a run.\n\nMore.")];
     let hit = SearchHit {
         score: Some(1.5),
-        matched_by: vec![MatchedField::Relationship, MatchedField::Name],
+        matched_by: vec![MatchedField::Edge, MatchedField::Name],
         unit: Some(source_unit("rift://source/cargo/crates.io/serde/lib.rs")),
         line: Some(3),
         source: Some("struct Config {\n\n    a: u8,\n}".to_owned()),
@@ -1735,13 +1720,13 @@ fn a_node_writes_every_line_of_a_symbol_hit_at_its_further_line_indent() {
 }
 
 #[test]
-fn the_relationship_field_is_left_out_of_a_node_and_every_other_field_stays() {
+fn the_edge_field_is_left_out_of_a_symbol_and_every_other_field_stays() {
     let only = SearchHit {
         score: Some(2.0),
         ..run_hit()
     };
     let named = SearchHit {
-        matched_by: vec![MatchedField::Relationship, MatchedField::Name],
+        matched_by: vec![MatchedField::Edge, MatchedField::Name],
         ..reload_hit()
     };
     let bare = SearchHit {
@@ -1773,7 +1758,7 @@ fn the_relationship_field_is_left_out_of_a_node_and_every_other_field_stays() {
 }
 
 #[test]
-fn an_item_keeps_the_relationship_field_among_its_matched_fields() {
+fn an_item_keeps_the_edge_field_among_its_matched_fields() {
     let item = SearchHit {
         traversal_path: None,
         ..run_hit()
@@ -1783,7 +1768,7 @@ fn an_item_keeps_the_relationship_field_among_its_matched_fields() {
         &[
             "1 result",
             "\tfn run()",
-            "\tsrc/app.rs:20 · relationship",
+            "\tsrc/app.rs:20 · edge",
             "\trift://symbol/local/rust/app/app/run",
         ],
     );
@@ -1830,7 +1815,7 @@ fn a_traversal_without_hops_is_an_item() {
 }
 
 #[test]
-fn warnings_leave_the_relationship_tree_text_unchanged() {
+fn warnings_leave_the_edge_tree_text_unchanged() {
     let answer = search_result(
         vec![readme_hit(), main_hit()],
         pagination(0, 1),
@@ -1933,7 +1918,7 @@ fn an_empty_source_of_a_symbol_hit_is_one_empty_line_after_the_blank_line() {
     assert!(with_empty.ends_with("rift://symbol/local/rust/app/a/A\n\n\n"));
 }
 
-// File, node, and documentation hits.
+// File, syntax element, and documentation hits.
 
 #[test]
 fn a_file_hit_writes_its_place_and_the_source_directly_under_it() {
@@ -2392,12 +2377,12 @@ fn wire_names_are_the_serde_spellings_of_unit_variants() {
         MatchedField::Content,
         MatchedField::Ranked,
         MatchedField::Path,
-        MatchedField::Relationship,
+        MatchedField::Edge,
         MatchedField::Change,
     ];
     assert_eq!(
         wire_names(&every).as_deref(),
-        Ok("name, signature, documentation, content, ranked, path, relationship, change")
+        Ok("name, signature, documentation, content, ranked, path, edge, change")
     );
     assert_eq!(wire_names::<MatchedField>(&[]).as_deref(), Ok(""));
     assert_eq!(
@@ -2486,7 +2471,7 @@ fn warnings_leave_symbol_page_text_unchanged() {
     golden(
         &answer,
         &[
-            "1 result · page 2/4",
+            "1 result · page 2/4, total 40 results",
             "\tstruct A",
             "\ta.rs:1",
             "\trift://symbol/local/rust/app/a/A",
@@ -2524,7 +2509,7 @@ fn exceptional_facts_of_a_get_symbol_hit_share_one_line_without_score_and_distan
         Some(package("serde", "1.0.0")),
         SourceKind::Generated,
     );
-    hit.symbol.facets = vec![SymbolFacet::Deprecated, SymbolFacet::Test];
+    hit.symbol.kinds = vec![SymbolKind::Deprecated, SymbolKind::Test];
     hit.symbol.document_local = true;
     hit.symbol.visibility = Some("pub".to_owned());
     golden(
@@ -2771,27 +2756,11 @@ fn a_search_value_holding_a_delimiter_is_quoted_and_others_stay_bare() {
 }
 
 #[test]
-fn a_node_kind_holding_a_delimiter_is_quoted_and_others_stay_bare() {
-    let answer = nodes_result(
-        vec![
-            node(0, "a | b", 0, 9),
-            node(1, "c: d", 1, 8),
-            node(2, "e:f·g", 2, 7),
-        ],
-        vec!["a", "b", "c"],
-    );
-    golden(
-        &answer,
-        &[
-            "3 nodes",
-            "\t\"a | b\" | bytes 0..9 | index 0",
-            "\tc: d | bytes 1..8 | index 1",
-            "\te:f·g | bytes 2..7 | index 2",
-            "",
-            "\t\ta",
-            REVISION_LINE,
-        ],
-    );
+fn a_syntax_element_kind_holding_a_delimiter_is_quoted() {
+    let mut answer = example::<FacetsResult>(0);
+    answer.declarations[0].syntax[0].kind = ExactKind("a | b".to_owned());
+    let text = rendered(&answer);
+    assert!(text.contains("\t\"a | b\" | bytes"), "{text}");
 }
 
 #[test]
@@ -2805,7 +2774,7 @@ fn a_workspace_value_holding_a_delimiter_is_quoted_and_others_stay_bare() {
             {"path": "x: y.py", "digest": "8a4d20bc"},
             {"path": "a:b·c.py", "digest": "8a4d20bc"}
         ],
-        "pagination": {"page_index": 0, "total_pages": 1}
+        "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 10}
     }))
     .expect("the workspace fixture deserializes");
     golden(
@@ -3053,277 +3022,31 @@ fn control_characters_in_get_symbol_facts_are_escaped() {
     assert!(output.contains("\n\t\t\ta\\tb\n"), "{output}");
 }
 
-// Nodes answers.
+// Facets answers.
 
 #[test]
-fn a_declaration_summary_names_the_parts_and_keeps_their_addresses_in_structured_content() {
-    use rift_protocol::nodes_read::NodesToolResult;
-
-    let (summary, _) = super::nodes::select(example::<NodesResult>(0), None, 0);
-    assert_eq!(summary.declarations[0].parts[0].index, 3);
-    let output = rendered(&NodesToolResult::Summary(summary));
-    assert!(
-        output
-            .lines()
-            .any(|line| line == "\tStructure | field declaration list"),
-        "{output}"
-    );
-}
-
-fn outer_and_inner() -> NodesResult {
-    let outer = node(0, "function_item", 0, 20);
-    let mut inner = node(1, "identifier", 3, 9);
-    inner.parent = Some(outer.index);
-    nodes_result(vec![outer, inner], vec!["fn name() {}\n// tail", "name"])
-}
-
-/// A package symbol's nodes, which sit in a package source unit, write as a project symbol's
-/// do: the unit locates a node for a reader of the structured answer, and the text writes
-/// the same items and the item's source.
-#[test]
-fn a_package_symbol_answer_writes_like_a_project_symbol_answer() {
-    const PACKAGE_ID: &str = "rift://symbol/cargo/crates.io/demo/rust/demo/beacon";
-    let package_unit = rift_protocol::read::SourceUnitId(
-        "rift://source/cargo/crates.io/demo/src/lib.rs".to_owned(),
-    );
-    let mut item = node(0, "function_item", 26, 44);
-    item.declaration = Some(0);
-    let mut name = node(2, "identifier", 33, 39);
-    name.declaration = Some(0);
-    name.parent = Some(0);
-    let mut answer = nodes_result(vec![item, name], vec!["pub fn beacon() {}", "beacon"]);
-    answer.symbol = Some(SymbolId(PACKAGE_ID.to_owned()));
-    let project_text = rendered(&answer);
-    for node in &mut answer.nodes {
-        node.unit = package_unit.clone();
+fn facets_render_declaration_location_source_and_syntax() {
+    let answer = example::<FacetsResult>(0);
+    let text = rendered(&answer);
+    let declaration = &answer.declarations[0];
+    assert!(text.contains("Declaration 0 | struct_item"), "{text}");
+    assert!(text.contains("src/config.rs"), "{text}");
+    for line in declaration.source.text.lines() {
+        assert!(text.contains(line), "{text}");
     }
-    assert_eq!(rendered(&answer), project_text);
-    golden(
-        &answer,
-        &[
-            "2 nodes | rift://symbol/cargo/crates.io/demo/rust/demo/beacon",
-            "\tfunction_item | bytes 26..44 | declaration 0 | index 0",
-            "\tidentifier | bytes 33..39 | declaration 0 | index 2 | parent 0",
-            "",
-            "\t\tpub fn beacon() {}",
-            REVISION_LINE,
-        ],
-    );
+    for element in &declaration.syntax {
+        assert!(text.contains(&format!("index {}", element.index)), "{text}");
+    }
 }
 
 #[test]
-fn a_symbol_answer_writes_each_declaration_source_then_its_cursor() {
-    let mut first = node(0, "function_item", 0, 9);
-    first.declaration = Some(0);
-    let name = node(1, "identifier", 3, 4);
-    let mut second = node(0, "function_item", 20, 29);
-    second.declaration = Some(1);
-    let mut answer = nodes_result(
-        vec![first, name, second],
-        vec!["fn a() {}", "a", "fn a() {}"],
-    );
-    answer.node_cursor = Some("3.0123456789abcdef".to_owned());
-    answer.symbol = Some(SymbolId(A_ID.to_owned()));
-    golden(
-        &answer,
-        &[
-            "3 nodes | rift://symbol/local/rust/app/a/A",
-            "\tfunction_item | bytes 0..9 | declaration 0 | index 0",
-            "\tidentifier | bytes 3..4 | index 1",
-            "\tfunction_item | bytes 20..29 | declaration 1 | index 0",
-            "",
-            "\t\tfn a() {}",
-            "",
-            "\t\tfn a() {}",
-            "node_cursor 3.0123456789abcdef",
-            REVISION_LINE,
-        ],
-    );
-}
-
-#[test]
-fn an_empty_nodes_answer_writes_only_the_header() {
-    let answer = nodes_result(Vec::new(), Vec::new());
-    golden(&answer, &["0 nodes", REVISION_LINE]);
-}
-
-#[test]
-fn one_node_has_no_marker_and_its_excerpt_follows_a_blank_line() {
-    let answer = nodes_result(vec![node(1, "identifier", 3, 9)], vec!["name"]);
-    golden(
-        &answer,
-        &[
-            "1 node",
-            "\tidentifier | bytes 3..9 | index 1",
-            "",
-            "\tname",
-            REVISION_LINE,
-        ],
-    );
-}
-
-#[test]
-fn several_nodes_follow_each_other_without_a_blank_line_and_only_the_outermost_excerpt_is_written()
-{
-    let answer = outer_and_inner();
-    golden(
-        &answer,
-        &[
-            "2 nodes",
-            "\tfunction_item | bytes 0..20 | index 0 | 2 lines",
-            "\tidentifier | bytes 3..9 | index 1 | parent 0",
-            "",
-            "\t\tfn name() {}",
-            "\t\t// tail",
-            REVISION_LINE,
-        ],
-    );
-    assert!(
-        !rendered(&answer).contains("\t\tname\n"),
-        "the enclosed excerpt is not written"
-    );
-}
-
-#[test]
-fn a_node_names_its_symbol_its_regions_and_its_generated_and_test_facets() {
-    let mut item = node(0, "function_item", 0, 20);
-    item.declaration = Some(0);
-    item.facets = vec![
-        NodeFacet::Declaration,
-        NodeFacet::Test,
-        NodeFacet::Definition,
-        NodeFacet::Generated,
-    ];
-    item.regions = vec![
-        NodeRegion {
-            role: RegionRole::Name,
-            range: range(3, 4),
-        },
-        NodeRegion {
-            role: RegionRole::Body,
-            range: range(8, 20),
-        },
-    ];
-    let mut plain = node(1, "block", 9, 10);
-    plain.facets = vec![NodeFacet::Body, NodeFacet::Block];
-    golden(
-        &nodes_result(vec![item, plain], vec!["fn a() {\n    b\n}", "{"]),
-        &[
-            "2 nodes",
-            "\tfunction_item | bytes 0..20 | declaration 0 | index 0 | 3 lines | generated | test | name 3..4 | body 8..20",
-            "\tblock | bytes 9..10 | index 1",
-            "",
-            "\t\tfn a() {",
-            "\t\t    b",
-            "\t\t}",
-            REVISION_LINE,
-        ],
-    );
-}
-
-#[test]
-fn the_line_count_follows_the_excerpt_lines_and_not_its_trailing_line_feed() {
-    let nodes = vec![
-        node(0, "a", 0, 1),
-        node(1, "b", 1, 2),
-        node(2, "c", 2, 3),
-        node(3, "d", 3, 4),
-    ];
-    golden(
-        &nodes_result(nodes, vec!["", "x\n", "x\ny\n", "z"]),
-        &[
-            "4 nodes",
-            "\ta | bytes 0..1 | index 0",
-            "\tb | bytes 1..2 | index 1",
-            "\tc | bytes 2..3 | index 2 | 2 lines",
-            "\td | bytes 3..4 | index 3",
-            "",
-            "",
-            "",
-            "\t\tx",
-            "",
-            "",
-            "\t\tx",
-            "\t\ty",
-            "",
-            "",
-            "\t\tz",
-            REVISION_LINE,
-        ],
-    );
-}
-
-#[test]
-fn an_empty_innermost_excerpt_is_one_empty_line_after_the_blank_line() {
-    let answer = nodes_result(vec![node(0, "a", 0, 1)], vec![""]);
-    assert_eq!(
-        rendered(&answer),
-        text(&[
-            "1 node",
-            "\ta | bytes 0..1 | index 0",
-            "",
-            "",
-            REVISION_LINE
-        ])
-    );
-}
-
-#[test]
-fn warnings_leave_node_excerpts_unchanged() {
-    let mut answer = outer_and_inner();
-    answer.warnings = vec![stale_index()];
-    golden(
-        &answer,
-        &[
-            "2 nodes",
-            "\tfunction_item | bytes 0..20 | index 0 | 2 lines",
-            "\tidentifier | bytes 3..9 | index 1 | parent 0",
-            "",
-            "\t\tfn name() {}",
-            "\t\t// tail",
-            REVISION_LINE,
-        ],
-    );
-}
-
-#[test]
-fn an_excerpt_with_backticks_and_header_lines_stays_verbatim_under_the_node() {
-    let excerpt = "````rust\n```\n! stale_index\n2 nodes\n[1] fake\n\tnested\n````";
-    let nodes = vec![node(0, "a", 0, 9)];
-    let single = nodes_result(nodes, vec![excerpt]);
-    golden(
-        &single,
-        &[
-            "1 node",
-            "\ta | bytes 0..9 | index 0 | 7 lines",
-            "",
-            "\t````rust",
-            "\t```",
-            "\t! stale_index",
-            "\t2 nodes",
-            "\t[1] fake",
-            "\t\tnested",
-            "\t````",
-            REVISION_LINE,
-        ],
-    );
-    let two = nodes_result(
-        vec![node(0, "a", 0, 9), node(1, "b", 1, 9)],
-        vec![excerpt, "x"],
-    );
-    let output = rendered(&two);
-    assert_no_trailing_space(&output);
-    let block: Vec<&str> = output
-        .lines()
-        .skip(4)
-        .take_while(|line| !line.starts_with("revision "))
-        .collect();
-    assert_eq!(block.len(), 7);
-    let recovered: Vec<&str> = block
-        .iter()
-        .map(|line| line.strip_prefix("\t\t").unwrap_or(line))
-        .collect();
-    assert_eq!(recovered.join("\n"), excerpt);
+fn facets_render_empty_declarations_and_continuation() {
+    let mut answer = example::<FacetsResult>(0);
+    answer.declarations.clear();
+    answer.pagination = Pagination::new(2, 10, 20);
+    let text = rendered(&answer);
+    assert!(text.contains("No declaration source available."));
+    assert!(text.contains("page 2/2, total 20 results"));
 }
 
 #[test]
@@ -3587,9 +3310,8 @@ fn diagnostics_follow_the_message_and_the_limit_one_compiler_style_line_each() {
 
 #[test]
 fn identities_are_written_whole_and_hashes_are_cut() {
-    let symbol_id = "rift://symbol/local/rust/rift_server/read/ReadService/nodes";
+    let symbol_id = "rift://symbol/local/rust/rift_server/read/ReadService/facets";
     let unit = "rift://source/project/packages/@scope/name/package.json";
-    let file = "rift://source/project/src/dir%20name/lib.rs";
     let mut hit = search_hit(symbol_target(Some(symbol_id), "ReadService"));
     hit.unit = Some(source_unit(unit));
     let search = rendered(&only_page(vec![hit]));
@@ -3606,50 +3328,20 @@ fn identities_are_written_whole_and_hashes_are_cut() {
         get_symbol.lines().any(|line| line == entry(symbol_id)),
         "{get_symbol}"
     );
-    let mut node_item = node(0, "function_item", 0, 1);
-    node_item.unit = SourceUnitId(file.to_owned());
-    let mut node_answer = nodes_result(vec![node_item], vec!["x"]);
-    node_answer.symbol = Some(SymbolId(symbol_id.to_owned()));
-    let nodes = rendered(&node_answer);
+    let mut answer = example::<FacetsResult>(0);
+    answer.symbol = SymbolId(symbol_id.to_owned());
+    let facets = rendered(&answer);
     assert!(
-        nodes
+        facets
             .lines()
             .next()
             .is_some_and(|title| title.ends_with(symbol_id)),
-        "{nodes}"
+        "{facets}"
     );
     let mut commit = commit_hit();
     commit.revision = RevisionId("main^2".to_owned());
     let by_branch = rendered(&commit_answer(commit));
     assert!(by_branch.contains("\n\tmain^2 · "), "{by_branch}");
-}
-
-/// The authored `nodes` example, rendered unmodified.
-#[test]
-fn the_authored_nodes_example_renders_one_entry_per_node_and_the_outermost_source() {
-    golden(
-        &example::<NodesResult>(0),
-        &[
-            "12 nodes | rift://symbol/local/rust/app/config/Config",
-            "\tstruct_item | bytes 105..160 | declaration 0 | index 0 | 3 lines",
-            "\tvisibility_modifier | bytes 105..108 | declaration 0 | index 1 | parent 0",
-            "\ttype_identifier | bytes 116..122 | declaration 0 | index 2 | parent 0",
-            "\tfield_declaration_list | bytes 123..160 | declaration 0 | index 3 | parent 0 | 3 lines",
-            "\tfield_declaration | bytes 129..157 | declaration 0 | index 4 | parent 3",
-            "\tvisibility_modifier | bytes 129..132 | declaration 0 | index 5 | parent 4",
-            "\tfield_identifier | bytes 133..137 | declaration 0 | index 6 | parent 4",
-            "\tscoped_type_identifier | bytes 139..157 | declaration 0 | index 7 | parent 4",
-            "\tscoped_identifier | bytes 139..148 | declaration 0 | index 8 | parent 7",
-            "\tidentifier | bytes 139..142 | declaration 0 | index 9 | parent 8",
-            "\tidentifier | bytes 144..148 | declaration 0 | index 10 | parent 8",
-            "\ttype_identifier | bytes 150..157 | declaration 0 | index 11 | parent 7",
-            "",
-            "\t\tpub struct Config {",
-            "\t\t    pub root: std::path::PathBuf,",
-            "\t\t}",
-            AUTHORED_REVISION_LINE,
-        ],
-    );
 }
 
 // Limits.
@@ -3678,7 +3370,7 @@ fn an_answer_over_the_byte_limit_yields_no_text() {
 fn the_compact_text_of_every_authored_example_is_shorter_in_bytes_than_its_json_text() {
     assert_text_shorter_than_json::<SearchResult>();
     assert_text_shorter_than_json::<GetSymbolResult>();
-    assert_text_shorter_than_json::<NodesResult>();
+    assert_text_shorter_than_json::<FacetsResult>();
 }
 
 // StatsAlloc is used only by this ignored measurement; run it alone in a release build.
@@ -3845,7 +3537,7 @@ fn output_allocation_cost() {
 
     measure_allocations::<SearchResult>("search");
     measure_allocations::<GetSymbolResult>("get_symbol");
-    measure_allocations::<NodesResult>("nodes");
+    measure_allocations::<FacetsResult>("facets");
 }
 
 #[test]
@@ -3856,7 +3548,7 @@ fn canonical_symbol_render_keeps_source_less_object_without_physical_bindings() 
         symbol: Box::new(symbol(Some(id.as_str()), "A")),
         revision: tree_revision(),
         declarations: Vec::new(),
-        declaration_cursor: None,
+        pagination: Pagination::new(1, 10, 0),
         history: None,
         documentation: None,
         warnings: Vec::new(),
@@ -3887,7 +3579,7 @@ fn canonical_symbol_render_keeps_binding_location_and_declaration_continuation()
         }],
         symbol: Box::new(logical),
         revision: tree_revision(),
-        declaration_cursor: Some("opaque-continuation".to_owned()),
+        pagination: Pagination::new(1, 1, 2),
         history: None,
         documentation: None,
         warnings: Vec::new(),
@@ -3895,7 +3587,7 @@ fn canonical_symbol_render_keeps_binding_location_and_declaration_continuation()
     let text = rendered(&answer);
     assert!(text.contains("a.rs:1"));
     assert!(text.contains(&format!("0..{}", source.len())));
-    assert!(text.contains("declaration_cursor opaque-continuation"));
+    assert!(text.contains("page 1/2, total 2 results"));
 }
 
 #[test]
@@ -4037,12 +3729,6 @@ fn another_unavailable_reason_keeps_its_name_and_no_progress() {
         "no progress warning survives: {warnings:?}"
     );
 }
-
-/// The `revision` line of an answer read at [`tree_revision`].
-const REVISION_LINE: &str = "revision rift://revision/tree/0000000000000000000000000000000000000000000000000000000000000000";
-
-/// The `revision` line of the authored `nodes` example.
-const AUTHORED_REVISION_LINE: &str = "revision rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11";
 
 fn tree_revision() -> rift_protocol::revision::Revision {
     rift_protocol::revision::Revision::tree(&"0".repeat(64)).expect("tree revision")

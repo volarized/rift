@@ -25,7 +25,7 @@ start a workspace server. Each workspace retains its own index, configuration, w
 
 The `rift server` coordinates source discovery and providers. Source
 resolvers identify project files, dependencies, and generated code. Providers analyze that source
-and produce facts such as symbols, syntax nodes, relationships, and diagnostics.
+and produce facts such as symbols, syntax elements, edges, and diagnostics.
 
 The server stores searchable provider output in an embedded index under `.rift`. The
 [`search`](/docs/mcp#tool-search) tool always retrieves lexical matches; when
@@ -328,7 +328,7 @@ capability - arrives as a typed entry in the result's `warnings`.
 Rift ships syntax providers based on
 [tree-sitter](https://tree-sitter.github.io/tree-sitter/) by default. They parse readable project,
 dependency, and generated units into declarations, syntax structure, and parse diagnostics. Project
-declarations also carry their syntax nodes and byte ranges.
+declarations also carry their syntax elements and byte ranges.
 
 The server invalidates a changed path's syntax facts and search-index entries.
 
@@ -359,7 +359,7 @@ transport through the same LSP session contract. Its version ships with the Rift
 ### History
 
 The history source resolver reads the workspace's git objects in place, with no checkout or `git`
-subprocess. That access serves revision-addressed reads. `get_symbol`, `nodes`, and `SERVICE :search`
+subprocess. That access serves revision-addressed reads. `get_symbol`, `facets`, and `SERVICE :search`
 can select a git revision. The server indexes that commit's tree with the same syntax providers
 and leaves the working tree untouched.
 
@@ -451,8 +451,8 @@ provider with no usable revision contributes nothing, and the result's `warnings
 
 A read captures one tree revision, one index revision where it searches, and the provider
 revisions it uses. Later writes create new revisions; they do not alter the captured result. A
-request addresses one page with `page_index`, and a page past the end returns an empty page
-with the true `total_pages`.
+request addresses one page with `page`, and a page past the end returns an empty page
+with the true `pages`.
 
 Normalization validates equivalence evidence without using provider order, candidate names, or
 provider composition as identity evidence. It retains unresolved and conflicting records instead
@@ -467,14 +467,14 @@ presentation fields and combines list facts without discarding conflicting Contr
 />
 
 The server keeps an immutable index over the project's source. Tree-sitter extracts
-declarations and syntax nodes from the files the workspace's source policy includes.
+declarations and syntax elements from the files the workspace's source policy includes.
 
 <VersionBadge version="v0.0.47" />
 
 The server starts with an empty publication, then publishes discovered paths and prepared files
 as indexing advances. Reads answer from prepared source and carry
 [`local_index_preparing`](/docs/developer/protocol/mcp#reads) while their selected local scope is
-incomplete. A `nodes` request can read its supplied file ahead of background preparation.
+incomplete. A `facets` request refuses while source preparation is incomplete.
 
 Every publication owns its preparation counts and map together, so progress describes the
 answer the caller received. A tree change can reduce those counts; completion applies to the
@@ -533,7 +533,7 @@ answer at all because it refused to load or holds no indexed tree.
 
 <VersionBadge version="v0.0.32" />
 
-A file past the per-file byte bound, one its syntax provider refuses under a node or depth
+A file past the per-file byte bound, one its syntax provider refuses under a syntax element or depth
 bound, one holding a declaration the Contribution contract refuses, or one standing past the
 [`[source]`](/docs/developer/configuration#source) `declarations` capacity, is left out of the
 index: it answers no search or lookup, counts nowhere in
@@ -628,7 +628,7 @@ hit. Under `target: "all"`, an attached comment keeps its symbol result when tha
 a file match outside the comment remains a file result.
 
 For example, a guide containing the inline code `Compass` can contribute context to
-`get_symbol` with its established `id` and `include: ["documentation"]`. The reference resolves only
+`get_symbol` with its established `id` and `include: {"documentation": true}`. The reference resolves only
 when the selected declaration set establishes one exact target. Ambiguous names remain unresolved.
 The read returns at most 32 references per symbol and 16 KiB of documentation excerpts across the
 page, with typed warnings for missing bytes or reached bounds.
@@ -759,9 +759,9 @@ the other two inputs and says so, rather than waiting for a model to load.
 ### Retrieve symbol
 
 [`get_symbol`](/docs/mcp#tool-get_symbol) reads one logical symbol by its canonical `id`.
-The answer separates the symbol from its declaration bindings; [`nodes`](/docs/mcp#tool-nodes)
+The answer separates the symbol from its declaration bindings; [`facets`](/docs/mcp#tool-facets)
 reads a declaration's source. The answer names the `revision` it was read at, and its
-`declaration_cursor` continues the declarations at that revision.
+`page` selects declarations at that revision.
 
 A Symbol carries `id` when the index established one identity for the declaration; a symbol
 the providers could not settle answers without an `id`, and a retained provider disagreement

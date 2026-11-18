@@ -22,7 +22,7 @@ const KEY_FIELD: &str = "key";
 const VALUE_FIELD: &str = "value";
 
 #[cfg(test)]
-const SOURCE_NODES_MAX: usize = 250_000;
+const SOURCE_ELEMENTS_MAX: usize = 250_000;
 #[cfg(test)]
 const SOURCE_DEPTH_MAX: usize = 512;
 
@@ -53,7 +53,10 @@ impl JsonKinds {
 
 fn kind_id(language: &Grammar, kind: &str) -> u16 {
     let id = language.id_for_node_kind(kind, true);
-    assert!(id != 0, "pinned JSON grammar must define node kind: {kind}");
+    assert!(
+        id != 0,
+        "pinned JSON grammar must define syntax element kind: {kind}"
+    );
     id
 }
 
@@ -148,7 +151,7 @@ struct SelectedCell<'tree> {
 ///
 /// Tree-sitter owns notebook structure and original token spans. Each selected
 /// JSON string is decoded independently; source arrays concatenate without
-/// inserted separators. Input bytes, syntax nodes, depth, and retained source
+/// inserted separators. Input bytes, syntax elements, depth, and retained source
 /// ranges stay within declared bounds.
 ///
 /// # Errors
@@ -227,21 +230,21 @@ fn decode_tree(root: Node<'_>, source: &str) -> Result<NotebookContent, RiftErro
     let kinds = json_kinds();
     let document = root
         .named_child(0)
-        .filter(|node| node.kind_id() == kinds.object)
+        .filter(|syntax_element| syntax_element.kind_id() == kinds.object)
         .ok_or_else(|| {
             errors::analysis::documentation_notebook_invalid()
                 .field("notebook.object")
                 .error()
         })?;
-    let cells_node = object_value(document, "cells", source, kinds)?
-        .filter(|node| node.kind_id() == kinds.array)
+    let cells_syntax_element = object_value(document, "cells", source, kinds)?
+        .filter(|syntax_element| syntax_element.kind_id() == kinds.array)
         .ok_or_else(|| {
             errors::analysis::documentation_notebook_invalid()
                 .field("notebook.cells")
                 .error()
         })?;
     let language = notebook_language(document, source, kinds)?;
-    let cells = decode_cells(cells_node, language.as_ref(), source, kinds)?;
+    let cells = decode_cells(cells_syntax_element, language.as_ref(), source, kinds)?;
     let selected_count = u32::try_from(cells.len()).map_err(|_| {
         errors::analysis::documentation_limit_exceeded()
             .field("notebook.cells")
@@ -259,12 +262,12 @@ fn decode_tree(root: Node<'_>, source: &str) -> Result<NotebookContent, RiftErro
 }
 
 fn decode_cells(
-    cells_node: Node<'_>,
+    cells_syntax_element: Node<'_>,
     language: Option<&Language>,
     source: &str,
     kinds: &JsonKinds,
 ) -> Result<Vec<NotebookCellContent>, RiftError> {
-    let selected = selected_cells(cells_node, source, kinds)?;
+    let selected = selected_cells(cells_syntax_element, source, kinds)?;
     let id_counts = authored_id_counts(&selected, source, kinds)?;
     let mut cells = Vec::with_capacity(selected.len());
     for selected_cell in selected {
@@ -288,7 +291,7 @@ fn decode_cell(
 ) -> Result<NotebookCellContent, RiftError> {
     let authored_id = selected
         .id
-        .map(|node| decode_string(source, node, kinds))
+        .map(|syntax_element| decode_string(source, syntax_element, kinds))
         .transpose()?;
     let identity = cell_identity(authored_id, selected.index, id_counts);
     let (text, physical_ranges) = decode_source(selected.source, source, kinds)?;
@@ -307,17 +310,17 @@ fn decode_cell(
 
 fn validate_tree(root: Node<'_>, limits: &super::DocumentationLimits) -> Result<(), RiftError> {
     let mut pending = vec![(root, 0_usize)];
-    let mut nodes_seen = 0_usize;
+    let mut syntax_elements_seen = 0_usize;
     let mut cursor = root.walk();
-    while let Some((node, depth)) = pending.pop() {
-        nodes_seen = nodes_seen.checked_add(1).ok_or_else(|| {
+    while let Some((syntax_element, depth)) = pending.pop() {
+        syntax_elements_seen = syntax_elements_seen.checked_add(1).ok_or_else(|| {
             errors::analysis::documentation_limit_exceeded()
-                .field("notebook.nodes")
+                .field("notebook.syntax_elements")
                 .error()
         })?;
-        if nodes_seen > limits.nodes_max as usize {
+        if syntax_elements_seen > limits.syntax_elements_max as usize {
             return errors::analysis::documentation_limit_exceeded()
-                .field("notebook.nodes")
+                .field("notebook.syntax_elements")
                 .fail();
         }
         if depth > limits.depth_max as usize {
@@ -325,7 +328,11 @@ fn validate_tree(root: Node<'_>, limits: &super::DocumentationLimits) -> Result<
                 .field("notebook.depth")
                 .fail();
         }
-        pending.extend(node.children(&mut cursor).map(|child| (child, depth + 1)));
+        pending.extend(
+            syntax_element
+                .children(&mut cursor)
+                .map(|child| (child, depth + 1)),
+        );
     }
     Ok(())
 }
@@ -350,8 +357,8 @@ fn selected_cells<'tree>(
         }
         let cell_type = object_value(cell, "cell_type", source, kinds)?;
         let kind = match cell_type {
-            Some(node) if node.kind_id() == kinds.string => {
-                match decode_string(source, node, kinds)?.as_str() {
+            Some(syntax_element) if syntax_element.kind_id() == kinds.string => {
+                match decode_string(source, syntax_element, kinds)?.as_str() {
                     "markdown" => NotebookCellKind::Markdown,
                     "code" => NotebookCellKind::Code,
                     _ => continue,
@@ -359,20 +366,23 @@ fn selected_cells<'tree>(
             }
             _ => continue,
         };
-        let source_node = object_value(cell, "source", source, kinds)?.ok_or_else(|| {
-            errors::analysis::documentation_notebook_invalid()
-                .field("notebook.cell.source")
-                .error()
-        })?;
-        if source_node.kind_id() != kinds.string && source_node.kind_id() != kinds.array {
+        let source_syntax_element =
+            object_value(cell, "source", source, kinds)?.ok_or_else(|| {
+                errors::analysis::documentation_notebook_invalid()
+                    .field("notebook.cell.source")
+                    .error()
+            })?;
+        if source_syntax_element.kind_id() != kinds.string
+            && source_syntax_element.kind_id() != kinds.array
+        {
             return errors::analysis::documentation_notebook_invalid()
                 .field("notebook.cell.source")
                 .fail();
         }
         selected.push(SelectedCell {
-            source: source_node,
+            source: source_syntax_element,
             id: object_value(cell, "id", source, kinds)?
-                .filter(|node| node.kind_id() == kinds.string),
+                .filter(|syntax_element| syntax_element.kind_id() == kinds.string),
             index: cell_index,
             kind,
         });
@@ -425,15 +435,15 @@ fn valid_authored_id(id: &str) -> bool {
 }
 
 fn decode_source(
-    source_node: Node<'_>,
+    source_syntax_element: Node<'_>,
     source: &str,
     kinds: &JsonKinds,
 ) -> Result<(String, Vec<TextRange>), RiftError> {
     let mut decoded = String::new();
     let mut physical_ranges = Vec::new();
-    if source_node.kind_id() == kinds.string {
+    if source_syntax_element.kind_id() == kinds.string {
         append_string(
-            source_node,
+            source_syntax_element,
             source,
             kinds,
             &mut decoded,
@@ -441,8 +451,8 @@ fn decode_source(
         )?;
         return Ok((decoded, physical_ranges));
     }
-    let mut cursor = source_node.walk();
-    for child in source_node.named_children(&mut cursor) {
+    let mut cursor = source_syntax_element.walk();
+    for child in source_syntax_element.named_children(&mut cursor) {
         if child.kind_id() != kinds.string {
             return errors::analysis::documentation_notebook_invalid()
                 .field("notebook.source")
@@ -454,19 +464,19 @@ fn decode_source(
 }
 
 fn append_string(
-    node: Node<'_>,
+    syntax_element: Node<'_>,
     source: &str,
     kinds: &JsonKinds,
     decoded: &mut String,
     physical_ranges: &mut Vec<TextRange>,
 ) -> Result<(), RiftError> {
-    decoded.push_str(&decode_string(source, node, kinds)?);
-    let start = u64::try_from(node.start_byte()).map_err(|_| {
+    decoded.push_str(&decode_string(source, syntax_element, kinds)?);
+    let start = u64::try_from(syntax_element.start_byte()).map_err(|_| {
         errors::analysis::documentation_limit_exceeded()
             .field("notebook.source_range")
             .error()
     })?;
-    let end = u64::try_from(node.end_byte()).map_err(|_| {
+    let end = u64::try_from(syntax_element.end_byte()).map_err(|_| {
         errors::analysis::documentation_limit_exceeded()
             .field("notebook.source_range")
             .error()
@@ -522,7 +532,7 @@ fn object_value<'tree>(
         }
         let key = pair
             .child_by_field_id(kinds.key.get())
-            .filter(|node| node.kind_id() == kinds.string)
+            .filter(|syntax_element| syntax_element.kind_id() == kinds.string)
             .ok_or_else(|| {
                 errors::analysis::documentation_notebook_invalid()
                     .field("notebook.object.key")
@@ -540,13 +550,17 @@ fn object_value<'tree>(
     Ok(value)
 }
 
-fn decode_string(source: &str, node: Node<'_>, kinds: &JsonKinds) -> Result<String, RiftError> {
-    if node.kind_id() != kinds.string {
+fn decode_string(
+    source: &str,
+    syntax_element: Node<'_>,
+    kinds: &JsonKinds,
+) -> Result<String, RiftError> {
+    if syntax_element.kind_id() != kinds.string {
         return errors::analysis::documentation_notebook_invalid()
             .field("notebook.string")
             .fail();
     }
-    let token = source.get(node.byte_range()).ok_or_else(|| {
+    let token = source.get(syntax_element.byte_range()).ok_or_else(|| {
         errors::analysis::documentation_notebook_invalid()
             .field("notebook.string.range")
             .error()
@@ -566,7 +580,7 @@ mod tests {
     };
     use rift_protocol::read::ProjectPath;
 
-    use super::{NotebookCellContent, SOURCE_DEPTH_MAX, SOURCE_NODES_MAX, decode_notebook};
+    use super::{NotebookCellContent, SOURCE_DEPTH_MAX, SOURCE_ELEMENTS_MAX, decode_notebook};
     use rift_protocol::documentation::DOCUMENTATION_SOURCE_BYTES_MAX;
 
     fn notebook_identity() -> DocumentationContentIdentity {
@@ -748,7 +762,7 @@ mod tests {
 
     #[test]
     fn a_cell_source_line_or_member_of_another_kind_refuses_the_notebook() {
-        // tree-sitter-json reads a comment as a named node beside the values, and nbformat
+        // tree-sitter-json reads a comment as a named syntax element beside the values, and nbformat
         // JSON carries none, so a comment refuses the notebook as a stray value does.
         let cases = [
             (r#"{"cells":[7],"metadata":{}}"#, "notebook.cell"),
@@ -795,8 +809,8 @@ mod tests {
     }
 
     #[test]
-    fn excessive_json_node_count_is_refused_before_cell_selection() {
-        let cell_count = SOURCE_NODES_MAX / 4 + 1;
+    fn excessive_json_syntax_element_count_is_refused_before_cell_selection() {
+        let cell_count = SOURCE_ELEMENTS_MAX / 4 + 1;
         let raw_cell = r#"{"cell_type":"raw"}"#;
         let cells = std::iter::repeat_n(raw_cell, cell_count)
             .collect::<Vec<_>>()
@@ -804,10 +818,11 @@ mod tests {
         let source = format!("{{\"cells\":[{cells}],\"metadata\":{{}}}}");
         assert!(source.len() < DOCUMENTATION_SOURCE_BYTES_MAX as usize);
 
-        let error = decode_notebook(&source, &notebook_identity()).expect_err("node bound");
+        let error =
+            decode_notebook(&source, &notebook_identity()).expect_err("syntax element bound");
         assert_eq!(
             crate::documentation::failure::context_value(&error, "field").as_deref(),
-            Some("notebook.nodes")
+            Some("notebook.syntax_elements")
         );
     }
 

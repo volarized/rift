@@ -43,7 +43,7 @@ enabled = true
     path: "src/config.rs",
     language: "rust",
     excerpt: true,
-    // Preserve the nodes example's UTF-8 byte offsets in this source excerpt.
+    // Preserve the facets example's UTF-8 byte offsets in this source excerpt.
     code: `use std::path::Path;
 
 use crate::error::ConfigError;

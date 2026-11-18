@@ -5,8 +5,8 @@ use rift_protocol::read::{Language, SourceUnitId, SymbolId, TextRange};
 
 use super::{
     GraphAnswer, GraphDataset, GraphDatasetBuilder, GraphFact, GraphLimits, GraphQuery, GraphTerm,
-    HistoryEvent, NodeAddress, NodeFact, NodeLocation, QueryCancellation, RevisionIri,
-    SymbolRelation,
+    HistoryEvent, QueryCancellation, RevisionIri, SymbolRelation, SyntaxAddress, SyntaxFact,
+    SyntaxLocation,
 };
 
 const MAIN: &str = "rift://symbol/local/rust/app/main";
@@ -86,27 +86,27 @@ fn model(limits: GraphLimits) -> Result<GraphDataset, RiftError> {
         },
     ];
     let mut graph = GraphDataset::builder(limits);
-    insert_nodes(&mut graph, &main, &unit, &language)?;
+    insert_syntax_elements(&mut graph, &main, &unit, &language)?;
     for fact in facts {
         graph.insert(fact)?;
     }
     Ok(graph.build())
 }
 
-/// A file node holding `main`'s declaration node, which holds a call that uses `parse`.
-fn insert_nodes(
+/// A file syntax element holding `main`'s declaration syntax element, which holds a call that uses `parse`.
+fn insert_syntax_elements(
     graph: &mut GraphDatasetBuilder,
     main: &SymbolId,
     unit: &SourceUnitId,
     language: &Language,
 ) -> Result<(), RiftError> {
-    let file = NodeAddress::Unit { unit, index: 0 };
-    let declaration = NodeAddress::Declaration {
+    let file = SyntaxAddress::Unit { unit, index: 0 };
+    let declaration = SyntaxAddress::Declaration {
         symbol: main,
         declaration: 0,
         index: 0,
     };
-    let call = NodeAddress::Declaration {
+    let call = SyntaxAddress::Declaration {
         symbol: main,
         declaration: 0,
         index: 3,
@@ -116,30 +116,30 @@ fn insert_nodes(
         TextRange { start: 4, end: 30 },
         TextRange { start: 16, end: 23 },
     );
-    let node = |address, kind, parent, range, source| NodeFact {
+    let syntax_element = |address, kind, parent, range, source| SyntaxFact {
         address,
         kind,
         language,
         parent,
-        location: Some(NodeLocation { unit, range }),
+        location: Some(SyntaxLocation { unit, range }),
         source: Some(source),
     };
-    let nodes = [
-        node(
+    let syntax_elements = [
+        syntax_element(
             file,
             "source_file",
             None,
             &file_range,
             "\n\n\n\nfn main() { parse(); }",
         ),
-        node(
+        syntax_element(
             declaration,
             "function_item",
             Some(file),
             &declaration_range,
             "fn main() { parse(); }",
         ),
-        node(
+        syntax_element(
             call,
             "call_expression",
             Some(declaration),
@@ -147,13 +147,13 @@ fn insert_nodes(
             "parse()",
         ),
     ];
-    for fact in nodes.into_iter().map(GraphFact::Node) {
+    for fact in syntax_elements.into_iter().map(GraphFact::SyntaxElement) {
         graph.insert(fact)?;
     }
     let parse = symbol(PARSE);
     graph.insert(GraphFact::Usage {
         symbol: &parse,
-        node: call,
+        syntax_element: call,
     })
 }
 
@@ -186,7 +186,7 @@ fn refusal(result: Result<impl std::fmt::Debug, RiftError>) -> ErrorSlug {
 }
 
 #[test]
-fn test_graph_dataset_answers_symbol_node_and_edge_vocabulary() {
+fn test_graph_dataset_answers_symbol_syntax_element_and_edge_vocabulary() {
     let dataset = model(GraphLimits::default()).expect("model builds");
     assert_eq!(
         rows(
@@ -202,7 +202,7 @@ fn test_graph_dataset_answers_symbol_node_and_edge_vocabulary() {
         ),
         vec![vec![LOAD.to_owned()]]
     );
-    let declared = "SELECT ?symbol ?declaration ?index ?kind ?parent ?source { ?n a :Node ; :of ?symbol ; :declaration ?declaration ; :index ?index ; :kind ?kind ; :source ?source ; :parent/:kind ?parent }";
+    let declared = "SELECT ?symbol ?declaration ?index ?kind ?parent ?source { ?n a :SyntaxElement ; :of ?symbol ; :declaration ?declaration ; :index ?index ; :kind ?kind ; :source ?source ; :parent/:kind ?parent }";
     assert_eq!(
         rows(&dataset, declared),
         vec![
@@ -224,8 +224,7 @@ fn test_graph_dataset_answers_symbol_node_and_edge_vocabulary() {
             ],
         ]
     );
-    let outside =
-        "SELECT ?unit ?index ?kind { ?n a :Node ; :unit ?unit ; :index ?index ; :kind ?kind }";
+    let outside = "SELECT ?unit ?index ?kind { ?n a :SyntaxElement ; :unit ?unit ; :index ?index ; :kind ?kind }";
     assert_eq!(
         rows(&dataset, outside),
         vec![vec![UNIT, "0", "source_file"]]
@@ -295,7 +294,7 @@ fn test_graph_dataset_answers_history_and_revision_vocabulary() {
 fn test_graph_dataset_construct_and_describe_preserve_rdf_terms() {
     let dataset = model(GraphLimits::default()).expect("model builds");
     let construct = format!(
-        "CONSTRUCT {{ _:node :of ?callee ; rdfs:label 'callee'@en }} WHERE {{ <{MAIN}> :calls ?callee }} LIMIT 1"
+        "CONSTRUCT {{ _:syntax_element :of ?callee ; rdfs:label 'callee'@en }} WHERE {{ <{MAIN}> :calls ?callee }} LIMIT 1"
     );
     let GraphAnswer::Graph(triples) = answer(&dataset, &construct).expect("construct answers")
     else {
@@ -363,7 +362,7 @@ fn test_graph_dataset_repeated_fact_costs_no_triples() {
     assert_eq!(
         exact.triple_count(),
         count,
-        "repeated nodes and types add no triple"
+        "repeated syntax elements and types add no triple"
     );
 }
 
@@ -426,7 +425,7 @@ fn test_graph_dataset_refuses_identity_outside_its_form() {
     let language = rust();
     let mut graph = GraphDataset::builder(GraphLimits::default());
     let cases = [
-        SymbolId("rift://node/rust/x".to_owned()),
+        SymbolId("rift://syntax_element/rust/x".to_owned()),
         SymbolId("rift://symbol/".to_owned()),
         SymbolId("not an iri".to_owned()),
     ];

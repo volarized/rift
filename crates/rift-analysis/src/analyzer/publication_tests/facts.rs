@@ -2,7 +2,7 @@
 
 use rift_protocol::index::PackageOccurrence;
 use rift_protocol::producer::{FactCoverage, FactKind, FactProducer};
-use rift_protocol::read::Relationship;
+use rift_protocol::read::Edge;
 use serde_json::json;
 
 use super::publication;
@@ -34,17 +34,17 @@ fn occurrence(publication: &PackagePublication, start: u64, end: u64) -> Package
     }
 }
 
-fn relationship(from: &str, producer: Option<FactProducer>) -> Relationship {
-    let mut relationship: Relationship = serde_json::from_value(json!({
+fn edge(from: &str, producer: Option<FactProducer>) -> Edge {
+    let mut edge: Edge = serde_json::from_value(json!({
         "from": from,
         "kind": "calls",
-        "facets": ["calls"],
+        "kinds": ["calls"],
         "to": ECHO,
         "derivation": "resolution",
     }))
-    .expect("relationship");
-    relationship.producer = producer;
-    relationship
+    .expect("edge");
+    edge.producer = producer;
+    edge
 }
 
 fn cover(publication: &mut PackagePublication, kind: FactKind) {
@@ -65,21 +65,18 @@ fn refusal(publication: &PackagePublication) -> String {
 }
 
 #[test]
-fn built_in_publication_covers_its_relationships_and_no_occurrences() {
+fn built_in_publication_covers_its_edges_and_no_occurrences() {
     let publication = click();
     publication.validate_facts().expect("built-in facts agree");
     for coverage in &publication.coverage {
-        assert!(coverage.covers(FactKind::Relationships, None));
+        assert!(coverage.covers(FactKind::Edges, None));
         assert!(!coverage.covers(FactKind::Occurrences, None));
-        assert!(!coverage.covers(FactKind::Relationships, Some(&producer())));
+        assert!(!coverage.covers(FactKind::Edges, Some(&producer())));
     }
     assert!(publication.occurrences.is_empty());
     let wire = serde_json::to_value(&publication).expect("serialize");
     assert!(wire.get("occurrences").is_none(), "no occurrences, no key");
-    assert_eq!(
-        wire["coverage"][0]["facts"],
-        json!([{"kind": "relationships"}])
-    );
+    assert_eq!(wire["coverage"][0]["facts"], json!([{"kind": "edges"}]));
 }
 
 #[test]
@@ -88,19 +85,15 @@ fn producer_facts_survive_a_round_trip_once_their_coverage_names_them() {
     publication
         .occurrences
         .push(occurrence(&publication, 64, 68));
-    publication
-        .relationships
-        .push(relationship(ECHO, Some(producer())));
+    publication.edges.push(edge(ECHO, Some(producer())));
     cover(&mut publication, FactKind::Occurrences);
-    cover(&mut publication, FactKind::Relationships);
+    cover(&mut publication, FactKind::Edges);
     publication.validate_facts().expect("covered facts agree");
     let wire = serde_json::to_string(&publication).expect("serialize");
     let read: PackagePublication = serde_json::from_str(&wire).expect("deserialize");
     assert_eq!(read, publication);
     assert_eq!(
-        read.relationships
-            .last()
-            .and_then(|edge| edge.producer.clone()),
+        read.edges.last().and_then(|edge| edge.producer.clone()),
         Some(producer())
     );
 }
@@ -116,16 +109,14 @@ fn uncovered_producer_facts_are_refused() {
         "{}",
         refusal(&occurrences)
     );
-    let mut relationships = click();
-    relationships
-        .relationships
-        .push(relationship(ECHO, Some(producer())));
-    assert!(refusal(&relationships).contains("field relationships, violation uncovered"));
+    let mut edges = click();
+    edges.edges.push(edge(ECHO, Some(producer())));
+    assert!(refusal(&edges).contains("field edges, violation uncovered"));
     let mut malformed = click();
-    let mut unparsed = relationship(ECHO, None);
+    let mut unparsed = edge(ECHO, None);
     unparsed.from = rift_protocol::read::SymbolId("rift://symbol/".to_owned());
-    malformed.relationships.push(unparsed);
-    assert!(refusal(&malformed).contains("field relationships.from, violation symbol"));
+    malformed.edges.push(unparsed);
+    assert!(refusal(&malformed).contains("field edges.from, violation symbol"));
 }
 
 #[test]

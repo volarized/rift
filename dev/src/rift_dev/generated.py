@@ -42,12 +42,13 @@ def generate(check: bool) -> None:
     if check:
         schema_export("--check", "docs", "plugins/claude").run()
         schema_export("--check", "--analyzer-manifest", ".").run()
-        schema_export("--global-contract", "docs").run()
+        schema_export("--check", "--global-contract", "docs").run()
         check_client()
         check_cli_help()
     else:
         schema_export("docs", "plugins/claude").run()
         schema_export("--analyzer-manifest", ".").run()
+        schema_export("--global-contract", "docs").run()
         write_client(CLIENT)
         CLI_HELP.write_text(cli_help(), encoding="utf-8")
 
@@ -55,9 +56,9 @@ def generate(check: bool) -> None:
 def write_client(destination: Path) -> None:
     """Generates the global API client's Rust types into `destination`."""
     document = json.loads((REPOSITORY / OPENAPI).read_text(encoding="utf-8"))
-    request = document["components"]["schemas"]["RelationshipSearchRequest"]
+    request = document["components"]["schemas"]["EdgeSearchRequest"]
     if request.get("type") != "object" or "properties" not in request:
-        fail("relationship request must retain its shared object schema")
+        fail("edge request must retain its shared object schema")
     # oas3-gen 0.28 treats this object-presence condition as enum<Value>, then
     # emits a struct constructor for it. Rust owns the fields and admission;
     # the committed contract retains its complete condition unchanged.

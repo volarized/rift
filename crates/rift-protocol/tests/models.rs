@@ -5,8 +5,8 @@
 
 use rift_protocol::error::ErrorData;
 use rift_protocol::read::{
-    Diagnostic, DiagnosticReliability, GetSymbolInclude, GetSymbolParams, GetSymbolResult,
-    NodesResult, ResultOrder, SearchParams, SearchParamsTarget, Severity,
+    Diagnostic, DiagnosticReliability, FacetsResult, GetSymbolInclude, GetSymbolParams,
+    GetSymbolResult, ResultOrder, SearchParams, SearchParamsTarget, Severity,
 };
 use rift_protocol::search::SearchResult;
 use schemars::schema_for;
@@ -64,34 +64,36 @@ fn response_model_examples_carry_no_null_or_empty_collection() {
         serde_json::to_value(schema_for!(GetSymbolResult)).expect("get_symbol_result schema");
     assert_examples_carry_no_null_or_empty(&get_symbol_result, "GetSymbolResult");
 
-    let nodes_result = serde_json::to_value(schema_for!(NodesResult)).expect("nodes_result schema");
-    assert_examples_carry_no_null_or_empty(&nodes_result, "NodesResult");
+    let facets_result =
+        serde_json::to_value(schema_for!(FacetsResult)).expect("facets_result schema");
+    assert_examples_carry_no_null_or_empty(&facets_result, "FacetsResult");
 
     let search_result =
         serde_json::to_value(schema_for!(SearchResult)).expect("search_result schema");
     assert_examples_carry_no_null_or_empty(&search_result, "SearchResult");
 }
 
-/// A `GetSymbolResult`, `NodesResult`, and `SearchResult` each deserialize from a minimal
+/// A `GetSymbolResult`, `FacetsResult`, and `SearchResult` each deserialize from a minimal
 /// JSON that omits `warnings` entirely, filling the field with its empty default -
 /// proving the serde side of the schema's `default: []` for a reader who never sends it.
 #[test]
 fn paginated_read_results_deserialize_with_warnings_absent() -> TestResult {
     let get_symbol: GetSymbolResult = serde_json::from_value(json!({
         "hits": [],
-        "pagination": { "page_index": 0, "total_pages": 0 }
+        "pagination": {"page": 1, "pages": 0, "max_results": 10, "total": 0}
     }))?;
     assert!(get_symbol.warnings.is_empty());
 
-    let nodes: NodesResult = serde_json::from_value(json!({
-        "nodes": [],
+    let facets: FacetsResult = serde_json::from_value(json!({
+        "symbol": "rift://symbol/local/rust/app/config/load_config",
+        "declarations": [], "pagination":{"page":1,"pages":0,"max_results":10,"total":0},
         "revision": "rift://revision/git/1f2080e49da12fee4431e6872630509355cd62d1",
     }))?;
-    assert!(nodes.warnings.is_empty());
+    assert!(facets.warnings.is_empty());
 
     let search: SearchResult = serde_json::from_value(json!({
         "results": [],
-        "pagination": { "page_index": 0, "total_pages": 0 }
+        "pagination": {"page": 1, "pages": 0, "max_results": 10, "total": 0}
     }))?;
     assert!(search.warnings.is_empty());
     Ok(())
@@ -115,20 +117,23 @@ fn error_data_deserializes_with_diagnostics_and_causes_absent() -> TestResult {
 #[test]
 fn get_symbol_params_fill_documented_defaults() -> TestResult {
     let params: GetSymbolParams = serde_json::from_value(json!({ "name": "ReadService" }))?;
-    assert_eq!(params.include, Vec::<GetSymbolInclude>::new());
-    assert_eq!(params.limit, 5);
+    assert_eq!(params.include, GetSymbolInclude::default());
+    assert_eq!(params.max_results, 10);
     Ok(())
 }
 
-/// `include: ["history", "documentation"]` decodes to both entries.
+/// `include: {"history": true, "documentation": true}` decodes to both members.
 #[test]
-fn get_symbol_params_include_explicit_both_carries_both_entries() -> TestResult {
+fn get_symbol_params_include_explicit_both_carries_both_members() -> TestResult {
     let params: GetSymbolParams = serde_json::from_value(
-        json!({ "name": "ReadService", "include": ["history", "documentation"] }),
+        json!({ "name": "ReadService", "include": {"history": true, "documentation": true} }),
     )?;
     assert_eq!(
         params.include,
-        vec![GetSymbolInclude::History, GetSymbolInclude::Documentation]
+        GetSymbolInclude {
+            documentation: true,
+            history: true,
+        }
     );
     Ok(())
 }
@@ -185,4 +190,37 @@ fn schema_constraints_land_on_their_models() {
         hit["allOf"][1]["then"]["required"],
         json!(["range", "line"])
     );
+}
+
+#[test]
+fn paging_schemas_pin_defaults_and_maximums_to_the_model_constants() {
+    fn check<T: schemars::JsonSchema>(maximum: u64) {
+        let schema = serde_json::to_value(schemars::schema_for!(T)).expect("paging schema");
+        assert_eq!(
+            schema["properties"]["page"]["minimum"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            schema["properties"]["page"]["default"],
+            serde_json::json!(rift_protocol::read::PAGE_DEFAULT)
+        );
+        assert_eq!(
+            schema["properties"]["max_results"]["minimum"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            schema["properties"]["max_results"]["default"],
+            serde_json::json!(rift_protocol::read::MAX_RESULTS_DEFAULT)
+        );
+        assert_eq!(
+            schema["properties"]["max_results"]["maximum"],
+            serde_json::json!(maximum)
+        );
+    }
+    check::<rift_protocol::query::QueryParams>(rift_protocol::query::QUERY_MAX_RESULTS);
+    check::<rift_protocol::symbol_read::GetSymbolParams>(
+        rift_protocol::symbol_read::GET_SYMBOL_MAX_RESULTS,
+    );
+    check::<rift_protocol::read::FacetsParams>(rift_protocol::read::FACETS_MAX_RESULTS);
+    check::<rift_protocol::read::GlobalPageParams>(rift_protocol::read::GLOBAL_MAX_RESULTS);
 }

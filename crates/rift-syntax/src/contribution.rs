@@ -334,17 +334,14 @@ impl SyntaxPublicationBuilder {
                 alias.qualified_name.clone(),
                 ExactKind("export".to_owned()),
             )
-            .facets(vec![
-                rift_protocol::read::SymbolFacet::Alias,
-                rift_protocol::read::SymbolFacet::Public,
+            .kinds(vec![
+                rift_protocol::read::SymbolKind::Alias,
+                rift_protocol::read::SymbolKind::Public,
             ])
             .visibility("public");
-            let relationship = rift_core::ContributionRelationship::new(
-                rift_core::RelationshipKind::Alias,
-                target,
-            )
-            .with_derivation(rift_protocol::read::RelationshipDerivation::Syntax)
-            .with_occurrence(source.clone());
+            let edge = rift_core::ContributionEdge::new(rift_core::EdgeKind::Alias, target)
+                .with_derivation(rift_protocol::read::EdgeDerivation::Syntax)
+                .with_occurrence(source.clone());
             additions.push(
                 Contribution::builder(
                     ContributionKey::new(self.provider.clone(), self.publication, provider_symbol),
@@ -357,7 +354,7 @@ impl SyntaxPublicationBuilder {
                 )
                 .source(source)
                 .identity_anchor(alias.identity.clone())
-                .relationships(vec![relationship])
+                .edges(vec![edge])
                 .build()?,
             );
         }
@@ -440,7 +437,7 @@ impl crate::SyntaxSymbol {
             self.qualified_name.clone(),
             ExactKind(self.kind.to_owned()),
         )
-        .facets(self.facets.clone())
+        .kinds(self.kinds.clone())
         .with_shared_signatures(Arc::clone(&self.signatures))
         .with_shared_documentation(Arc::clone(&self.documentation));
         if let Some(visibility) = &self.visibility {

@@ -1,28 +1,23 @@
-//! Exact projections supplied by the same bounded raw relationship pages.
+//! Exact projections supplied by the same bounded raw edge pages.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use rift_error::RiftError;
+use rift_protocol::edge_read::{EdgeSearchPage, EdgeSearchRequest, QuerySource};
 use rift_protocol::identity::{SymbolIdentity, SymbolOwner, parse_source_unit_identity};
 use rift_protocol::read::{PAGE_LIMIT_MAX, SourceKind, SourceUnitId, SymbolId};
-use rift_protocol::relationship_read::{
-    QuerySource, QuerySymbol, RelationshipInclude, RelationshipSearchPage,
-    RelationshipSearchRequest,
-};
 
 use super::invalid;
 
 pub(super) fn validate_page(
-    request: &RelationshipSearchRequest,
-    page: &RelationshipSearchPage,
+    request: &EdgeSearchRequest,
+    page: &EdgeSearchPage,
     source_bytes_max: usize,
     symbols_max: usize,
     sources_max: usize,
 ) -> Result<(), RiftError> {
     if page.symbols.len() > symbols_max || page.sources.len() > sources_max {
-        return Err(invalid(
-            "relationship fact projections exceed their page bound",
-        ));
+        return Err(invalid("edge fact projections exceed their page bound"));
     }
     let mut versions = BTreeMap::new();
     for package in &request.packages {
@@ -36,7 +31,7 @@ pub(super) fn validate_page(
             .symbol
             .id
             .clone()
-            .ok_or_else(|| invalid("relationship symbol identity is absent"))?;
+            .ok_or_else(|| invalid("edge symbol identity is absent"))?;
         let identity = SymbolIdentity::parse(id.as_str())?;
         let owner = identity.owner();
         let origin = &symbol.symbol.origin;
@@ -70,7 +65,7 @@ pub(super) fn validate_page(
             })
         {
             return Err(invalid(
-                "relationship symbol projections differ from their selected identity or source owner",
+                "edge symbol projections differ from their selected identity or source owner",
             ));
         }
     }
@@ -81,7 +76,7 @@ pub(super) fn validate_page(
                     .encode(rift_core::FileDigest::of(text.as_bytes()).as_bytes())
         }) {
             return Err(invalid(
-                "relationship source bytes differ from their selected full digest",
+                "edge source bytes differ from their selected full digest",
             ));
         }
         let (owner, _) = parse_source_unit_identity(source.unit.as_str())?;
@@ -90,11 +85,13 @@ pub(super) fn validate_page(
                 owner,
                 SymbolOwner::Package { .. } | SymbolOwner::Runtime { .. }
             )
-        }) || source.text.as_ref().is_some_and(|text| {
-            !request.include.contains(&RelationshipInclude::Source) || text.len() > source_bytes_max
-        }) {
+        }) || source
+            .text
+            .as_ref()
+            .is_some_and(|text| !request.include.source || text.len() > source_bytes_max)
+        {
             return Err(invalid(
-                "relationship source projections differ from their released owner or accepted byte bound",
+                "edge source projections differ from their released owner or accepted byte bound",
             ));
         }
     }
@@ -102,8 +99,8 @@ pub(super) fn validate_page(
 }
 
 pub(super) fn validate_complete(
-    request: &RelationshipSearchRequest,
-    page: &RelationshipSearchPage,
+    request: &EdgeSearchRequest,
+    page: &EdgeSearchPage,
 ) -> Result<(), RiftError> {
     let symbols = page
         .symbols
@@ -115,14 +112,14 @@ pub(super) fn validate_complete(
         .iter()
         .map(|source| (&source.unit, source))
         .collect::<BTreeMap<_, _>>();
-    for seed in &request.relationships.seeds {
+    for seed in &request.edges.seeds {
         require_symbol(seed, &symbols)?;
     }
     for group in &page.groups {
-        for record in &group.relationships {
-            require_symbol(&record.relationship.from, &symbols)?;
-            require_symbol(&record.relationship.to, &symbols)?;
-            if let Some(source) = &record.relationship.occurrence {
+        for record in &group.edges {
+            require_symbol(&record.edge.from, &symbols)?;
+            require_symbol(&record.edge.to, &symbols)?;
+            if let Some(source) = &record.edge.occurrence {
                 require_source(&source.unit, &source.range, &sources, request)?;
             }
         }
@@ -157,7 +154,7 @@ fn require_symbol(id: &SymbolId, symbols: &BTreeSet<&SymbolId>) -> Result<(), Ri
     ) && !symbols.contains(id)
     {
         return Err(invalid(
-            "complete relationship pages omitted a required reached symbol",
+            "complete edge pages omitted a required reached symbol",
         ));
     }
     Ok(())
@@ -167,16 +164,14 @@ fn require_source(
     unit: &SourceUnitId,
     range: &rift_protocol::read::TextRange,
     sources: &BTreeMap<&SourceUnitId, &QuerySource>,
-    request: &RelationshipSearchRequest,
+    request: &EdgeSearchRequest,
 ) -> Result<(), RiftError> {
     if range.start > range.end || range.end > 9_007_199_254_740_991 {
-        return Err(invalid(
-            "relationship range exceeds the accepted byte range",
-        ));
+        return Err(invalid("edge range exceeds the accepted byte range"));
     }
     let source = sources
         .get(unit)
-        .ok_or_else(|| invalid("complete relationship pages omitted a required physical source"))?;
+        .ok_or_else(|| invalid("complete edge pages omitted a required physical source"))?;
     match source.text.as_deref() {
         Some(text) => {
             let start = usize::try_from(range.start)
@@ -185,78 +180,16 @@ fn require_source(
                 .map_err(|_| invalid("source range exceeds the platform bound"))?;
             if text.get(start..end).is_none() {
                 return Err(invalid(
-                    "relationship range does not select complete captured UTF-8 bytes",
+                    "edge range does not select complete captured UTF-8 bytes",
                 ));
             }
         }
-        None if request.include.contains(&RelationshipInclude::Source) => {
+        None if request.include.source => {
             return Err(invalid(
-                "complete relationship pages omitted requested source bytes",
+                "complete edge pages omitted requested source bytes",
             ));
         }
         None => {}
     }
     Ok(())
-}
-
-#[derive(Default)]
-pub(super) struct Catalog {
-    symbols: BTreeMap<SymbolId, QuerySymbol>,
-    sources: BTreeMap<SourceUnitId, QuerySource>,
-}
-
-impl Catalog {
-    pub(super) fn merge(&mut self, page: &mut RelationshipSearchPage) -> Result<(), RiftError> {
-        use std::collections::btree_map::Entry;
-
-        for symbol in std::mem::take(&mut page.symbols) {
-            let id = symbol
-                .symbol
-                .id
-                .clone()
-                .ok_or_else(|| invalid("relationship symbol identity is absent"))?;
-            match self.symbols.entry(id) {
-                Entry::Occupied(mut entry) => {
-                    let held = entry.get_mut();
-                    if held.symbol != symbol.symbol {
-                        return Err(invalid("relationship symbol changed between pages"));
-                    }
-                    for declaration in symbol.declarations {
-                        if !held.declarations.contains(&declaration) {
-                            held.declarations.push(declaration);
-                        }
-                    }
-                }
-                Entry::Vacant(entry) => {
-                    entry.insert(symbol);
-                }
-            }
-        }
-        for source in std::mem::take(&mut page.sources) {
-            match self.sources.entry(source.unit.clone()) {
-                Entry::Occupied(mut entry) => {
-                    let held = entry.get_mut();
-                    if held.digest != source.digest {
-                        return Err(invalid("relationship source digest changed between pages"));
-                    }
-                    match (&held.text, source.text) {
-                        (Some(previous), Some(next)) if previous != &next => {
-                            return Err(invalid("relationship source changed between pages"));
-                        }
-                        (None, Some(text)) => held.text = Some(text),
-                        _ => {}
-                    }
-                }
-                Entry::Vacant(entry) => {
-                    entry.insert(source);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub(super) fn finish(self, page: &mut RelationshipSearchPage) {
-        page.symbols = self.symbols.into_values().collect();
-        page.sources = self.sources.into_values().collect();
-    }
 }

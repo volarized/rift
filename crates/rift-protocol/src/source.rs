@@ -29,10 +29,10 @@ pub const SOURCE_WORKSPACE_BYTES_MAX: u64 = 64 << 30;
 /// 439,749 from 26,162, so the default leaves room for a workspace twice either one.
 pub const SOURCE_DECLARATIONS_DEFAULT: u64 = 1_000_000;
 
-/// Default adjacency capacity for source relationships.
-pub const SOURCE_RELATIONSHIPS_DEFAULT: u64 = 10_000_000;
-/// Supported adjacency capacity for source relationships.
-pub const SOURCE_RELATIONSHIPS_MAX: u64 = 500_000_000;
+/// Default adjacency capacity for source edges.
+pub const SOURCE_EDGES_DEFAULT: u64 = 10_000_000;
+/// Supported adjacency capacity for source edges.
+pub const SOURCE_EDGES_MAX: u64 = 500_000_000;
 /// Declarations the index may hold, at least.
 pub const SOURCE_DECLARATIONS_MIN: u64 = 10_000;
 /// Declarations the index may hold, at most.
@@ -93,9 +93,9 @@ pub struct SourceConfiguration {
     #[schemars(range(min = 10_000, max = 50_000_000))]
     #[serde(default = "default_source_declarations")]
     pub declarations: u64,
-    /// Most relationship edges held together, 1 to 500000000.
+    /// Most edges held together, 1 to 500000000.
     #[schemars(range(min = 1, max = 500_000_000))]
-    pub relationships: u64,
+    pub edges: u64,
     /// Most directory levels scanned below the workspace root, 1 to 4096.
     /// A deeper directory refuses the rebuild naming this key.
     #[schemars(range(min = 1, max = 4_096))]
@@ -113,7 +113,7 @@ impl Default for SourceConfiguration {
             files: default_source_files(),
             workspace_size: default_source_workspace_size(),
             declarations: default_source_declarations(),
-            relationships: SOURCE_RELATIONSHIPS_DEFAULT,
+            edges: SOURCE_EDGES_DEFAULT,
             directory_depth: default_source_directory_depth(),
         }
     }
@@ -154,12 +154,7 @@ impl SourceConfiguration {
                 SOURCE_DECLARATIONS_MIN,
                 SOURCE_DECLARATIONS_MAX,
             ),
-            (
-                "source.relationships",
-                self.relationships,
-                1,
-                SOURCE_RELATIONSHIPS_MAX,
-            ),
+            ("source.edges", self.edges, 1, SOURCE_EDGES_MAX),
             (
                 SOURCE_DIRECTORY_DEPTH_FIELD,
                 self.directory_depth,

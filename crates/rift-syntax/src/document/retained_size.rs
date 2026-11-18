@@ -72,7 +72,7 @@ impl GetSize for SyntaxSymbol {
         let (name, tracker) = self.name.get_heap_size_with_tracker(tracker);
         let (qualified, tracker) = self.qualified_name.get_heap_size_with_tracker(tracker);
         let (container, tracker) = self.container.get_heap_size_with_tracker(tracker);
-        let (facets, tracker) = self.facets.get_heap_size_with_tracker(tracker);
+        let (kinds, tracker) = self.kinds.get_heap_size_with_tracker(tracker);
         let (visibility, tracker) = self.visibility.get_heap_size_with_tracker(tracker);
         let (signatures, tracker) =
             rift_protocol::retained_arc_slice_material(&self.signatures, tracker);
@@ -88,7 +88,7 @@ impl GetSize for SyntaxSymbol {
             name,
             qualified,
             container,
-            facets,
+            kinds,
             visibility,
             signatures,
             documentation,
@@ -114,10 +114,10 @@ impl GetSize for SyntaxFacts {
 
     fn get_heap_size_with_tracker<T: GetSizeTracker>(&self, tracker: T) -> (usize, T) {
         let (language, tracker) = self.language.get_heap_size_with_tracker(tracker);
-        let nodes = self.nodes.as_ref().map_or(0, |nodes| {
-            nodes
+        let syntax_elements = self.syntax_elements.as_ref().map_or(0, |syntax_elements| {
+            syntax_elements
                 .len()
-                .saturating_mul(std::mem::size_of::<super::SyntaxNode>())
+                .saturating_mul(std::mem::size_of::<super::SyntaxElement>())
         });
         let (symbols, tracker) = rift_protocol::retained_vector_material(&self.symbols, tracker);
         let (retained, tracker) =
@@ -162,7 +162,7 @@ impl GetSize for SyntaxFacts {
             .map_or(0, crate::StaticFacts::retained_bytes);
         (
             language
-                .saturating_add(nodes)
+                .saturating_add(syntax_elements)
                 .saturating_add(symbols)
                 .saturating_add(retained)
                 .saturating_add(exports)

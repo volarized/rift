@@ -140,11 +140,7 @@ impl GraphQuery {
         let parser = predeclared_parser();
         match parser.parse_query(text) {
             Ok(mut query) => {
-                let admission = if super::page::selection(&query).is_some() {
-                    Admission::default()
-                } else {
-                    admit(&mut query, limits)?
-                };
+                let admission = admit(&mut query, limits)?;
                 Ok(Self { query, admission })
             }
             Err(_)
@@ -269,7 +265,7 @@ mod tests {
             "DESCRIBE <urn:x>",
             "SELECT ?hit { SERVICE :search { ?hit :query 'parse config' } }",
             "SELECT ?symbol WHERE { ?symbol a :Symbol ; :calls+ ?callee }",
-            "ASK { ?node rdf:type :Node ; :start ?start FILTER(?start > \"0\"^^xsd:integer) }",
+            "ASK { ?syntax_element rdf:type :SyntaxElement ; :start ?start FILTER(?start > \"0\"^^xsd:integer) }",
             "PREFIX : <urn:rift:vocabulary:> SELECT (COUNT(*) AS ?count) { ?s :uses ?r }",
             "SELECT * { ?s ?p ?o FILTER NOT EXISTS { ?s :removedIn ?r } } ORDER BY ?s LIMIT 5",
             "SELECT * { BIND(1 AS ?x) ?s ?p ?o }",

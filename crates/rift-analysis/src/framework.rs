@@ -286,7 +286,7 @@ impl FrameworkContext {
                 if matches!(
                     error.slug(),
                     errors::syntax::source_too_large::SLUG
-                        | errors::syntax::too_many_nodes::SLUG
+                        | errors::syntax::too_many_syntax_elements::SLUG
                         | errors::syntax::too_deep::SLUG
                 ) =>
             {
@@ -448,7 +448,7 @@ impl<'source> FrameworkInputs<'source> {
                         if matches!(
                             error.slug(),
                             errors::syntax::source_too_large::SLUG
-                                | errors::syntax::too_many_nodes::SLUG
+                                | errors::syntax::too_many_syntax_elements::SLUG
                                 | errors::syntax::too_deep::SLUG
                         ) => {}
                     Err(error) => return Err(error),
@@ -602,10 +602,11 @@ fn stylesheet_evidence(
     );
     let mut v4 = false;
     if let Some(document) = document {
-        for node in document.nodes() {
-            v3 |= node.kind == "at_keyword" && source_range(text, node.range) == Some("@tailwind");
-            v4 |= node.kind == "import_statement"
-                && source_range(text, node.range).is_some_and(|import| {
+        for syntax_element in document.syntax_elements() {
+            v3 |= syntax_element.kind == "at_keyword"
+                && source_range(text, syntax_element.range) == Some("@tailwind");
+            v4 |= syntax_element.kind == "import_statement"
+                && source_range(text, syntax_element.range).is_some_and(|import| {
                     import.split(['"', '\'']).nth(1).is_some_and(|target| {
                         target == "tailwindcss" || target.starts_with("tailwindcss/")
                     })

@@ -13,10 +13,10 @@ pub(crate) fn invalid_declarations(
     declarations: &[ByteRange],
 ) -> Result<BTreeSet<ByteRange>, RiftError> {
     limits.admit_source(source)?;
-    if declarations.len() > limits.syntax_nodes_max() {
-        return errors::syntax::too_many_nodes()
+    if declarations.len() > limits.syntax_elements_max() {
+        return errors::syntax::too_many_syntax_elements()
             .path(source.path)
-            .syntax_nodes_max(limits.syntax_nodes_max())
+            .syntax_elements_max(limits.syntax_elements_max())
             .fail();
     }
     let names =
@@ -47,7 +47,7 @@ fn invalid_ranges(
     let mut pending = vec![(root, 0_usize, false)];
     let mut visited = 0_usize;
     let mut cursor = root.walk();
-    while let Some((node, depth, in_error)) = pending.pop() {
+    while let Some((syntax_element, depth, in_error)) = pending.pop() {
         visited += 1;
         if depth > limits.syntax_depth_max() {
             return errors::syntax::too_deep()
@@ -55,18 +55,20 @@ fn invalid_ranges(
                 .syntax_depth_max(limits.syntax_depth_max())
                 .fail();
         }
-        if visited + pending.len() + node.named_child_count() > limits.syntax_nodes_max() {
-            return errors::syntax::too_many_nodes()
+        if visited + pending.len() + syntax_element.named_child_count()
+            > limits.syntax_elements_max()
+        {
+            return errors::syntax::too_many_syntax_elements()
                 .path(source.path)
-                .syntax_nodes_max(limits.syntax_nodes_max())
+                .syntax_elements_max(limits.syntax_elements_max())
                 .fail();
         }
-        let range = extract::byte_range(node)?;
-        if declarations.contains(&range) && (in_error || node.has_error()) {
+        let range = extract::byte_range(syntax_element)?;
+        if declarations.contains(&range) && (in_error || syntax_element.has_error()) {
             invalid.insert(range);
         }
-        let in_error = in_error || node.is_error() || node.is_missing();
-        extract::push_named_children(&mut pending, &mut cursor, node, |child| {
+        let in_error = in_error || syntax_element.is_error() || syntax_element.is_missing();
+        extract::push_named_children(&mut pending, &mut cursor, syntax_element, |child| {
             (child, depth + 1, in_error)
         });
     }
@@ -115,7 +117,7 @@ mod tests {
     }
 
     #[test]
-    fn declaration_validation_preserves_source_node_and_depth_bounds() {
+    fn declaration_validation_preserves_syntax_bounds() {
         let path = ProjectPath::new("main.py").expect("source path");
         let source = SyntaxSource {
             path: &path,
@@ -129,7 +131,7 @@ mod tests {
             ),
             (
                 SyntaxLimits::new(100, 1, 100),
-                errors::syntax::too_many_nodes::SLUG,
+                errors::syntax::too_many_syntax_elements::SLUG,
             ),
             (
                 SyntaxLimits::new(100, 100, 1),
@@ -166,6 +168,6 @@ mod tests {
         let error = PythonSyntaxProvider::default()
             .invalid_declarations(source, limits, &declarations)
             .expect_err("declaration bound");
-        assert_eq!(error.slug(), errors::syntax::too_many_nodes::SLUG);
+        assert_eq!(error.slug(), errors::syntax::too_many_syntax_elements::SLUG);
     }
 }
