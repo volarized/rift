@@ -1169,6 +1169,23 @@ pub fn declare_search_ranges(schema: &mut Schema) {
     );
 }
 
+/// A [`QueryConfiguration`](crate::query::QueryConfiguration) states its `ByteSize` bounds
+/// as `rift:range` on each key: schema validation alone cannot compare `"1mb"` against a
+/// ceiling, so the server enforces the bounds at load and the schema carries them for readers.
+pub fn declare_query_ranges(schema: &mut Schema) {
+    use crate::configuration::ByteSize;
+    use crate::query::{QUERY_RETAINED_BYTES_MAX, QUERY_RETAINED_BYTES_MIN, QueryConfiguration};
+    annotate_property(
+        schema,
+        property!(QueryConfiguration, retained_size),
+        RIFT_RANGE,
+        range(
+            &ByteSize::from_bytes(QUERY_RETAINED_BYTES_MIN),
+            &ByteSize::from_bytes(QUERY_RETAINED_BYTES_MAX),
+        ),
+    );
+}
+
 /// An [`EmbeddingConfiguration`](crate::configuration::EmbeddingConfiguration) states the
 /// `Duration` bounds of each arm that carries one as `rift:range` on the key: schema
 /// validation alone cannot compare `"5m"` against a ceiling, so the server enforces the

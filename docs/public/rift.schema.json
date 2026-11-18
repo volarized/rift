@@ -1620,12 +1620,29 @@
     },
     "QueryConfiguration": {
       "additionalProperties": false,
-      "description": "Bounds on one query result page.",
+      "description": "Bounds on one query result page and on the views retained for later pages.",
       "properties": {
         "page_limit": {
           "$ref": "#/$defs/ByteSize",
           "default": "4mb",
           "description": "Most encoded bytes on one page, from 1 KiB to 4 MiB."
+        },
+        "retained_size": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "8gb",
+          "description": "Most material the retained views hold together, 1mb to 64gb. A new view past\nthe bound releases the least recently used ones; a view larger than the bound\nalone is refused.",
+          "rift:range": {
+            "max": "64gb",
+            "min": "1mb"
+          }
+        },
+        "retained_views": {
+          "default": 256,
+          "description": "Most views the server retains for later pages, 1 to 4096. A new view past\nthe bound releases the least recently used one.",
+          "format": "uint64",
+          "maximum": 4096,
+          "minimum": 1,
+          "type": "integer"
         }
       },
       "type": "object"
@@ -1816,7 +1833,9 @@
         "query": {
           "$ref": "#/$defs/QueryConfiguration",
           "default": {
-            "page_limit": "4mb"
+            "page_limit": "4mb",
+            "retained_size": "8gb",
+            "retained_views": 256
           },
           "description": "Transport bounds for retained graph query answers."
         },
@@ -2496,7 +2515,9 @@
         "pattern_verified_size": "128mb",
         "pool_slots": 4,
         "query": {
-          "page_limit": "4mb"
+          "page_limit": "4mb",
+          "retained_size": "8gb",
+          "retained_views": 256
         },
         "ranking": {
           "fusion_k": 60,
