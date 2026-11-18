@@ -24,7 +24,7 @@ use lsp_types::notification::{
 };
 use lsp_types::request::{
     CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare,
-    DocumentDiagnosticRequest, Initialize, References, RegisterCapability, Request, Shutdown,
+    DocumentDiagnosticRequest, References, RegisterCapability, Request, Shutdown,
     WorkDoneProgressCreate, WorkspaceConfiguration, WorkspaceDiagnosticRefresh,
 };
 use lsp_types::{
@@ -48,6 +48,8 @@ use tokio::process::{Child, Command};
 use tokio::time::Instant;
 
 use crate::capabilities::{Capabilities, glob_matches, offered};
+
+mod edges;
 use crate::correlation::{self, Correlation, METHOD_NOT_FOUND_CODE, RequestId};
 use crate::framing::Framing;
 use crate::uri::TreeRoot;
@@ -874,11 +876,9 @@ impl EngineSession {
     /// The locations the engine names for the declaration at one position, its own
     /// occurrence included.
     ///
-    /// `context.include_declaration` is `true`, so an engine that resolved the declaration
-    /// names at least that declaration's own occurrence. The caller separates it from the
-    /// references, and reads an answer naming nothing at all as the answer of an engine
-    /// that does not hold the file, never as proof the declaration is unreferenced. An
-    /// engine answering `null` names nothing.
+    /// `context.include_declaration` requests the declaration's own occurrence. Engines
+    /// can omit it. The caller establishes readiness from engine progress and repeated
+    /// quiet responses. An engine answering `null` names nothing.
     ///
     /// # Errors
     ///
@@ -1310,8 +1310,9 @@ impl EngineSession {
         };
         // Boxed: the initialize exchange's future measures 11,056 bytes, and this handshake
         // runs once per session start, so the allocation is paid once.
-        let answer = Box::pin(self.request_within::<Initialize>(params, startup_timeout)).await?;
-        self.capabilities = Capabilities::negotiated(&answer)?;
+        let answer =
+            Box::pin(self.request_within::<edges::EdgeInitialize>(params, startup_timeout)).await?;
+        self.capabilities = Capabilities::negotiated_edge_answer(answer)?;
         self.notify::<Initialized>(&InitializedParams {}).await
     }
 

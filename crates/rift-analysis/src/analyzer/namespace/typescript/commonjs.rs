@@ -45,13 +45,7 @@ pub(super) fn prepare(
             continue;
         };
         let public = checked_names(file);
-        let anchors = declaration_anchors_with_public(
-            input,
-            file.syntax,
-            file.source,
-            Some(&module),
-            &public,
-        );
+        let anchors = declaration_anchors_with_public(input, file, Some(&module), &public);
         if prepared.anchors.get(path.as_str()).is_some_and(|previous| {
             previous
                 .iter()

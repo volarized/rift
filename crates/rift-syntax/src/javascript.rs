@@ -153,17 +153,17 @@ mod tests {
         assert_eq!(&text[start..end], "(value) => value");
     }
 
-    /// A destructuring declarator declares its names through a pattern, not
-    /// a single name, and emits no symbol.
+    /// A destructuring declarator declares each name its pattern binds, and
+    /// no symbol for the pattern itself.
     #[test]
-    fn test_destructuring_declarator_emits_no_symbol() {
+    fn test_destructuring_declarator_declares_each_bound_name() {
         let document = analyze("const { first, second } = pair;\nconst kept = 1;\n");
         let names = document
             .symbols()
             .iter()
             .map(|symbol| symbol.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(names, ["kept"]);
+        assert_eq!(names, ["first", "second", "kept"]);
     }
 
     #[test]
@@ -285,8 +285,8 @@ mod tests {
             [
                 ("open", true),
                 ("outer", false),
-                ("open", false),
-                ("limit", false),
+                ("outer.open", false),
+                ("outer.limit", false),
                 ("Router", false),
                 ("Router.open", false),
                 ("limit", true),
@@ -362,7 +362,7 @@ mod tests {
             [
                 ("helper", false),
                 ("config", false),
-                ("load", false),
+                ("config.load", false),
                 ("load", false),
             ]
         );

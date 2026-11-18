@@ -1,7 +1,10 @@
 //! Compact syntax evidence for source-based name resolution.
 
+mod heritage_edges;
 mod javascript;
+mod python_edges;
 mod rust;
+pub use heritage_edges::HeritageEdge;
 
 use rift_error::{RiftError, errors};
 use tree_sitter::{Language, Node};
@@ -65,6 +68,11 @@ pub enum StaticBindingKind {
         /// Imported name, or absent for the default export.
         export: Option<ByteRange>,
     },
+    /// Statically named ECMAScript namespace import.
+    JavaScriptEdgeNamespace {
+        /// Unquoted module specifier.
+        module: ByteRange,
+    },
     /// Literal `CommonJS` import whose mode and `require` binding need verification.
     JavaScriptRequire {
         /// Authored identifier whose binding must be checked.
@@ -78,6 +86,13 @@ pub enum StaticBindingKind {
     JavaScriptInstance {
         /// Constructor name.
         constructor: ByteRange,
+    },
+    /// Statically named Python import.
+    PythonImport {
+        /// Authored module path.
+        module: ByteRange,
+        /// Imported name, absent for a module binding.
+        export: Option<ByteRange>,
     },
     /// Explicit Rust use path.
     RustUse {
@@ -114,6 +129,8 @@ pub struct StaticInherentImpl {
 /// Collections retained by static syntax capture.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StaticFactsParts {
+    /// Class and implementation headers.
+    pub heritage_edges: Vec<HeritageEdge>,
     /// Authored calls.
     pub calls: Vec<StaticCall>,
     /// Lexical bindings.
@@ -135,6 +152,12 @@ pub struct StaticFactsParts {
 pub struct StaticFacts(StaticFactsParts);
 
 impl StaticFacts {
+    /// Captured class and implementation edges.
+    #[must_use]
+    pub fn heritage_edges(&self) -> &[HeritageEdge] {
+        &self.0.heritage_edges
+    }
+
     /// Restores checked facts from an original source selection.
     ///
     /// # Errors
@@ -194,6 +217,7 @@ impl StaticFacts {
 
     pub(crate) fn retained_bytes(&self) -> usize {
         [
+            vector_capacity(&self.0.heritage_edges),
             vector_capacity(&self.0.calls),
             vector_capacity(&self.0.bindings),
             vector_capacity(&self.0.reexports),
@@ -208,6 +232,7 @@ impl StaticFacts {
 
     pub(crate) fn validate(&self, source: &str, limits: SyntaxLimits) -> Result<(), RiftError> {
         let lengths = [
+            self.heritage_edges().len(),
             self.calls().len(),
             self.bindings().len(),
             self.reexports().len(),
@@ -229,6 +254,15 @@ impl StaticFacts {
                 .zip(end)
                 .is_some_and(|(start, end)| start < end && source.get(start..end).is_some())
         };
+        let edges = self.heritage_edges().iter().all(|edge| {
+            valid(edge.from)
+                && valid(edge.target)
+                && matches!(
+                    edge.kind,
+                    rift_protocol::read::EdgeKind::Extends
+                        | rift_protocol::read::EdgeKind::Implements
+                )
+        });
         let calls = self.calls().iter().all(|call| call.valid(valid));
         let bindings = self.bindings().iter().all(|binding| binding.valid(valid));
         let reexports = self
@@ -241,7 +275,8 @@ impl StaticFacts {
             valid(row.range) && valid(row.type_path) && contains(row.range, row.type_path)
         });
         let conditional = self.conditional_items().iter().copied().all(valid);
-        if !(calls
+        if !(edges
+            && calls
             && bindings
             && reexports
             && assignments
@@ -272,7 +307,8 @@ impl StaticCall {
 impl StaticBinding {
     fn valid(&self, valid: impl Fn(ByteRange) -> bool) -> bool {
         let evidence = match self.kind {
-            StaticBindingKind::JavaScriptImport { module, export } => {
+            StaticBindingKind::JavaScriptImport { module, export }
+            | StaticBindingKind::PythonImport { module, export } => {
                 valid(module) && export.is_none_or(&valid)
             }
             StaticBindingKind::JavaScriptRequire {
@@ -280,6 +316,7 @@ impl StaticBinding {
                 export,
                 require,
             } => valid(module) && export.is_none_or(&valid) && valid(require),
+            StaticBindingKind::JavaScriptEdgeNamespace { module } => valid(module),
             StaticBindingKind::JavaScriptInstance { constructor } => valid(constructor),
             StaticBindingKind::RustUse { path } => valid(path),
             StaticBindingKind::RustReceiver { type_path } => valid(type_path),
@@ -303,6 +340,7 @@ fn vector_capacity<T>(items: &Vec<T>) -> usize {
 }
 
 enum Grammar {
+    Python(&'static python_edges::EdgePythonKinds),
     JavaScript(&'static javascript::Kinds),
     Rust(&'static rust::Kinds),
 }
@@ -311,30 +349,60 @@ pub(crate) struct Capture<'source> {
     grammar: Grammar,
     source: &'source str,
     facts: StaticFacts,
+    edge_heritage: &'static heritage_edges::EdgeHeritageKinds,
 }
 
 impl<'source> Capture<'source> {
     pub(crate) fn for_javascript(source: &'source str) -> Self {
         Self {
             grammar: Grammar::JavaScript(javascript::kinds()),
+            edge_heritage: heritage_edges::edge_javascript_kinds(),
             source,
             facts: StaticFacts::default(),
+        }
+    }
+
+    pub(crate) fn for_edge_typescript(
+        source: &'source str,
+        dialect: crate::typescript::TypeScriptDialect,
+    ) -> Self {
+        Self {
+            grammar: Grammar::JavaScript(javascript::edge_typescript_kinds(dialect)),
+            edge_heritage: heritage_edges::edge_typescript_kinds(dialect),
+            source,
+            facts: StaticFacts::default(),
+        }
+    }
+
+    pub(crate) fn for_edge_python(source: &'source str) -> Self {
+        Self {
+            grammar: Grammar::Python(python_edges::edge_python_kinds()),
+            source,
+            facts: StaticFacts::default(),
+            edge_heritage: heritage_edges::edge_python_kinds(),
         }
     }
 
     pub(crate) fn for_rust(source: &'source str) -> Self {
         Self {
             grammar: Grammar::Rust(rust::kinds()),
+            edge_heritage: heritage_edges::edge_rust_kinds(),
             source,
             facts: StaticFacts::default(),
         }
     }
 
-    pub(crate) fn record(&mut self, syntax_element: Node<'_>) -> Result<(), RiftError> {
-        if syntax_element.is_missing() {
+    pub(crate) fn record(
+        &mut self,
+        visited: crate::extract::Visited<'_, '_>,
+    ) -> Result<(), RiftError> {
+        let syntax_element = visited.syntax_element();
+        if syntax_element.is_missing() || syntax_element.is_extra() {
             return Ok(());
         }
+        self.edge_heritage.record_edge(visited, &mut self.facts.0)?;
         match self.grammar {
+            Grammar::Python(kinds) => kinds.record_edge(visited, &mut self.facts.0),
             Grammar::JavaScript(kinds) => {
                 kinds.record(syntax_element, self.source, &mut self.facts.0)
             }

@@ -166,13 +166,67 @@ impl StaticResolution {
                 .saturating_add(binding)
                 .saturating_add(target_binding)
                 .saturating_add(target);
+            let (from, next) =
+                get_size2::GetSize::get_heap_size_with_tracker(&occurrence.edge_from, next);
+            bytes = bytes.saturating_add(from);
             tracker = next;
         }
-        (bytes, tracker)
+        let (coverage, tracker) =
+            rift_protocol::retained_map_material(&self.edge_calls, tracker, |coverage, tracker| {
+                let (language, tracker) =
+                    get_size2::GetSize::get_heap_size_with_tracker(&coverage.language, tracker);
+                (
+                    language.saturating_add(
+                        coverage
+                            .unresolved
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<rift_syntax::ByteRange>()),
+                    ),
+                    tracker,
+                )
+            });
+        (bytes.saturating_add(coverage), tracker)
     }
 }
 
 impl WorkspaceSemantics {
+    /// Whether static capture establishes every call edge in the selected source range.
+    ///
+    /// Incoming reads require every captured source of the same language, across its dialects.
+    /// JavaScript and TypeScript share incoming coverage because their imports can cross languages.
+    /// Parse errors, unresolved calls, missing identities, and exhausted bounds prevent completeness.
+    #[must_use]
+    pub fn static_edge_calls_complete(
+        &self,
+        unit: &rift_core::SourceUnitId,
+        range: Option<rift_syntax::ByteRange>,
+    ) -> bool {
+        if self.static_resolution.exhausted || !self.edges.is_complete() {
+            return false;
+        }
+        let coverage = &self.static_resolution.edge_calls;
+        let Some(selected) = coverage.get(unit) else {
+            return false;
+        };
+        match range {
+            Some(range) => {
+                !selected.unavailable
+                    && !selected
+                        .unresolved
+                        .iter()
+                        .any(|site| range.encloses(*site) || site.encloses(range))
+            }
+            None => coverage
+                .values()
+                .filter(|source| match selected.language.name.as_str() {
+                    "javascript" | "typescript" => {
+                        matches!(source.language.name.as_str(), "javascript" | "typescript")
+                    }
+                    _ => source.language.name == selected.language.name,
+                })
+                .all(|source| !source.unavailable && source.unresolved.is_empty()),
+        }
+    }
     /// Builds one syntax publication and one normalized graph over one file set.
     ///
     /// Every document takes the project placement, [`DocumentPlacement::project`];
@@ -560,6 +614,33 @@ impl WorkspaceSemantics {
             record,
             std::slice::from_ref(&self.syntax_provider),
         )
+    }
+
+    /// Position of the normalized record that holds a syntax provider-local identity.
+    ///
+    /// Declarations merged into one record share its position, so a pass over every
+    /// declaration answers [`Self::readable_identity_at`] once per record.
+    #[must_use]
+    pub fn record_position(&self, provider_symbol: &str) -> Option<usize> {
+        let reference = ContributionReference::new(
+            self.syntax_provider.clone(),
+            ProviderSymbolId::for_symbol(provider_symbol).ok()?,
+        );
+        self.graph.record_position_for(&reference)
+    }
+
+    /// Established identity of the record at `position` when that record assembles into a
+    /// readable symbol.
+    ///
+    /// Answers what [`Self::assembled`] followed by its portable facts and identity answers,
+    /// without assembling the record's references, edges, and presentation.
+    #[must_use]
+    pub fn readable_identity_at(&self, position: usize) -> Option<&rift_core::SymbolId> {
+        let record = self.graph.records().get(position)?;
+        if !SymbolAssembler::assembles_facts(&self.graph, record) {
+            return None;
+        }
+        record.identity()
     }
 
     /// Assembles one captured record, including records with no source declaration.

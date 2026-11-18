@@ -20,6 +20,8 @@
 
 #![cfg(unix)]
 
+#[path = "edges/mod.rs"]
+mod edge_tests;
 mod exchange;
 mod process_lifecycle;
 

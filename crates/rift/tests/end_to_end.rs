@@ -162,3 +162,168 @@ async fn search_reaches_the_mdx_file_and_the_extensionless_justfile() -> TestRes
     failure_window.passed();
     Ok(())
 }
+
+const DECLARATION_READS: &[(&str, &str, Option<&str>)] = &[
+    (
+        "rust/rift_live_fixture/Point/x",
+        "field_declaration",
+        Some("rust/rift_live_fixture/Point"),
+    ),
+    ("rust/rift_live_fixture/Bits", "union_item", None),
+    (
+        "rust/rift_live_fixture/Shape/Unit",
+        "associated_type",
+        Some("rust/rift_live_fixture/Shape"),
+    ),
+    (
+        "rust/rift_live_fixture/a/inner",
+        "function",
+        Some("rust/rift_live_fixture/a"),
+    ),
+    (
+        "rust/rift_live_fixture/b/inner",
+        "function",
+        Some("rust/rift_live_fixture/b"),
+    ),
+    ("rust/rift_live_fixture/Round", "export", None),
+    (
+        "javascript/.%2Fmain.js/outer/local",
+        "variable",
+        Some("javascript/.%2Fmain.js/outer"),
+    ),
+    (
+        "javascript/.%2Fmain.js/obj/method",
+        "method",
+        Some("javascript/.%2Fmain.js/obj"),
+    ),
+    (
+        "javascript/.%2Fmain.js/default/anon",
+        "method",
+        Some("javascript/.%2Fmain.js/default"),
+    ),
+    (
+        "javascript/.%2Fmain.js/Widget/count",
+        "property",
+        Some("javascript/.%2Fmain.js/Widget"),
+    ),
+    ("javascript/.%2Fmain.js/major", "variable", None),
+    ("javascript/.%2Fmain.js/mi", "variable", None),
+    ("python/pkg", "module", None),
+    ("python/pkg/Model", "export", None),
+    ("python/pkg/models/A", "variable", None),
+    ("python/pkg/models/B", "variable", None),
+    ("python/pkg/models/Pair", "type_alias", None),
+    ("python/pkg/models/FLAG", "variable", None),
+    (
+        "python/pkg/models/Model/save",
+        "method",
+        Some("python/pkg/models/Model"),
+    ),
+    (
+        "python/pkg/models/Model/name",
+        "variable",
+        Some("python/pkg/models/Model"),
+    ),
+];
+
+/// Declaration facts retain their containers and public import paths through the CLI.
+#[tokio::test]
+async fn declaration_members_bound_names_and_module_exports_are_addressable() -> TestResult {
+    let directory = laid_out_workspace(
+        &[
+            ("Cargo.toml", harness::RUST_PROJECT_MANIFEST),
+            (
+                "lib.rs",
+                "pub struct Point {\n    /// Horizontal.\n    pub x: i32,\n}\npub union Bits { pub i: u32 }\npub trait Shape { type Unit; fn area(&self); }\nimpl Shape for Point { type Unit = i32; fn area(&self) {} }\npub fn a() { fn inner() {} }\npub fn b() { fn inner() {} }\nmod shapes { pub struct Circle; }\npub use shapes::Circle as Round;\n",
+            ),
+            (
+                "main.js",
+                "export function outer() { const local = () => 1; }\nconst obj = { method() {} };\nexport default class { anon() {} }\nexport class Widget { count = 0; }\nexport const { major, minor: mi } = version;\n",
+            ),
+            (
+                "pyproject.toml",
+                "[build-system]\nrequires = ['pdm-backend']\nbuild-backend = 'pdm.backend'\n",
+            ),
+            (
+                "pkg/__init__.py",
+                "\"\"\"Package documentation.\"\"\"\nfrom .models import Model as Model\n",
+            ),
+            (
+                "pkg/models.py",
+                "A, B = 1, 2\ntype Pair = tuple[int, int]\nif True:\n    FLAG = 1\nclass Model:\n    def __init__(self):\n        self.name = 'x'\n    def save(self):\n        pass\n",
+            ),
+        ],
+        &assigned_port_key()?,
+    )?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+    let failure_window = FailureWindow::begin(root);
+    let client = proxy_client(root).await?;
+    within("workspace preparation", await_workspace_ready(&client)).await??;
+    for &(path, kind, container) in DECLARATION_READS {
+        let id = format!("rift://symbol/local/{path}");
+        let answer = proxied_call(
+            &client,
+            "get_symbol",
+            &json!({"id":id, "page":1, "max_results":10}),
+        )
+        .await?;
+        assert_eq!(answer["symbol"]["id"], id, "{answer}");
+        assert_eq!(answer["symbol"]["kind"], kind, "{answer}");
+        let expected = container.map(|path| format!("rift://symbol/local/{path}"));
+        assert_eq!(
+            answer["symbol"]["container"].as_str(),
+            expected.as_deref(),
+            "{answer}"
+        );
+        if kind != "export" {
+            assert_eq!(
+                answer["declarations"].as_array().map(Vec::len),
+                Some(1),
+                "{answer}"
+            );
+        }
+    }
+    declaration_pages(&client).await?;
+    client.cancel().await?;
+    let stopped = run_rift(root, &["server", "stop"]).await?;
+    require_success(&stopped, "stop after declaration reads")?;
+    failure_window.passed();
+    Ok(())
+}
+
+/// Newly collected declarations use the same paging contract for symbols and facets.
+async fn declaration_pages(
+    client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
+) -> TestResult {
+    let id = "rift://symbol/local/rust/rift_live_fixture/Point/x";
+    let request = json!({"id":id, "page":1, "max_results":1});
+    let symbol = proxied_call(client, "get_symbol", &request).await?;
+    let revision = symbol["revision"].as_str().ok_or("symbol revision")?;
+    assert_eq!(
+        symbol["pagination"],
+        json!({"page":1,"pages":1,"max_results":1,"total":1})
+    );
+    assert!(
+        symbol["symbol"]["kinds"]
+            .as_array()
+            .ok_or("symbol kinds")?
+            .contains(&json!("member"))
+    );
+    let request = json!({"symbol":id,"revision":revision,"page":1,"max_results":1});
+    let facets = proxied_call(client, "facets", &request).await?;
+    assert_eq!(facets["pagination"], symbol["pagination"]);
+    assert_eq!(facets["revision"], revision);
+    assert_eq!(facets["declarations"][0]["kind"], "field_declaration");
+    for (tool, selector) in [("get_symbol", "id"), ("facets", "symbol")] {
+        let request = json!({selector:id,"revision":revision,"page":2,"max_results":1});
+        let answer = proxied_call(client, tool, &request).await?;
+        assert_eq!(answer["declarations"], json!([]), "{answer}");
+        assert_eq!(
+            answer["pagination"],
+            json!({"page":2,"pages":1,"max_results":1,"total":1})
+        );
+        assert_eq!(answer["revision"], revision);
+    }
+    Ok(())
+}

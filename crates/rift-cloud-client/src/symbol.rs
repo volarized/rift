@@ -178,7 +178,7 @@ fn valid_result(
                         })
                     })
                 })
-                && (history.is_none() || request.include.history)
+                && history.is_some() == request.include.history
                 && documentation.as_ref().is_none_or(|context| {
                     request.include.documentation
                         && valid_documentation(

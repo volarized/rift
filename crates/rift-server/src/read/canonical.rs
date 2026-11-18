@@ -102,7 +102,7 @@ impl LocalSymbolViewInput {
         self.material.index.file(&path)?.source().get(start..end)
     }
 
-    /// Collects the complete canonical seed inventory for a bounded local semantic read.
+    /// Collects canonical declarations with source names for a bounded engine read.
     ///
     /// # Errors
     /// Refuses incomplete source or identity coverage and a seed inventory above the bound.
@@ -125,6 +125,12 @@ impl LocalSymbolViewInput {
         let mut seeds = Vec::new();
         for (id, object) in index.objects() {
             let object = object?;
+            // A Python file module has no source name token for an engine request.
+            // Its declaration remains in the captured symbol inventory.
+            let facts = object.facts();
+            if facts.language().name == "python" && facts.kind().0 == "module" {
+                continue;
+            }
             let declarations = object.assembled().contributions().len().max(1);
             remaining = remaining
                 .checked_sub(declarations)

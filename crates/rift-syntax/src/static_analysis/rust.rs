@@ -30,6 +30,7 @@ pub(super) struct Kinds {
     attribute: u16,
     inner_attribute: u16,
     impl_item: u16,
+    edge_macro: u16,
     assignment: [u16; 2],
     scopes: [u16; 3],
     functions: [u16; 3],
@@ -78,6 +79,7 @@ pub(super) fn kinds() -> &'static Kinds {
             attribute: id("attribute_item"),
             inner_attribute: id("inner_attribute_item"),
             impl_item: id("impl_item"),
+            edge_macro: id("macro_invocation"),
             assignment: [id("assignment_expression"), id("compound_assignment_expr")],
             scopes: [id("source_file"), id("block"), id("declaration_list")],
             functions: [
@@ -124,6 +126,8 @@ impl Kinds {
             self.record_function(syntax_element, facts)?;
         } else if self.assignment.contains(&id) {
             self.record_mutation(syntax_element, facts)?;
+        } else if id == self.edge_macro {
+            facts.unsupported_bindings.push(byte_range(syntax_element)?);
         } else if id == self.impl_item {
             self.record_impl(syntax_element, facts)?;
         } else if id == self.attribute || id == self.inner_attribute {

@@ -293,7 +293,8 @@ pub struct GetSymbolInclude {
     /// Attaches bounded documentation referring to the exact declaration.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub documentation: bool,
-    /// Attaches the symbol's version-control timeline.
+    /// Attaches the symbol's timeline: the commits that touched a project symbol, or the
+    /// collected releases that introduced, changed, or removed a package or runtime symbol.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub history: bool,
 }
@@ -2688,20 +2689,24 @@ pub const CO_CHANGE_COMMIT_DECLARATIONS_MAX: usize = 256;
 /// commits come first; [`CoChangeTruncation::symbols_past_bound`] counts the rest.
 pub const CO_CHANGE_SYMBOLS_MAX: usize = 32;
 
-/// One symbol's history as edges from the symbol to the commits that touched it and to the
-/// symbols changed beside it. The history follows first parents from the served revision,
-/// or the selected releases in version order, through the commits the history store holds,
-/// and follows the declaration's file across a rename that kept its bytes. It is bounded by
-/// `[providers.history] max_revisions` and by a shallow clone's boundary.
+/// One symbol's history as edges from the symbol to the points that touched it. A project
+/// symbol's history names commits and the symbols changed beside it: it follows first
+/// parents from the served revision, or the selected releases in version order, through the
+/// commits the history store holds, and follows the declaration's file across a rename that
+/// kept its bytes. It is bounded by `[providers.history] max_revisions` and by a shallow
+/// clone's boundary. A package or runtime symbol's history names the collected releases of
+/// its owner that introduced, changed, or removed its declaration, and carries only release
+/// edges.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SymbolHistory {
     /// The symbol the history is for.
     pub symbol: SymbolId,
     /// The commit edges newest first, then the `co_changes` edges, most shared commits
-    /// first.
+    /// first. A package or runtime symbol's release edges come newest release first.
     pub edges: Vec<HistoryEdge>,
-    /// Whether the history reached the repository's first commit. `false` when the
+    /// Whether the history reached the repository's first commit, or for a package or
+    /// runtime symbol the oldest collected release of its owner. `false` when the
     /// `max_revisions` bound, a shallow clone's boundary, or the oldest selected release
     /// ended it first, or while the history store has not yet analyzed the served
     /// revision, so commits older than the listed ones may have touched the symbol.
@@ -2712,7 +2717,9 @@ pub struct SymbolHistory {
 }
 
 /// One edge from a symbol in its history. Every commit edge names the commit as a
-/// `rift://revision/git/<commit>` revision.
+/// `rift://revision/git/<commit>` revision. Every release edge names the release as a
+/// `rift://revision/<manager>/<registry>/<name>@<version>` or
+/// `rift://revision/stdlib/<runtime>@<version>` revision of the symbol's owner.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "edge", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HistoryEdge {
@@ -2751,6 +2758,68 @@ pub enum HistoryEdge {
         /// How many listed commits changed both symbols.
         commits: u64,
     },
+    /// The release brought the symbol into existence: it is the oldest collected release of
+    /// the symbol's owner that declares the symbol.
+    IntroducedInRelease {
+        /// The release, as a release revision of the symbol's owner.
+        revision: crate::revision::Revision,
+    },
+    /// The release changed the symbol's declaration from the collected release before it.
+    ChangedInRelease {
+        /// The release, as a release revision of the symbol's owner.
+        revision: crate::revision::Revision,
+        /// Which part of the declaration the release changed.
+        change: HistoryChange,
+    },
+    /// The release deleted the symbol's declaration: the collected release before it
+    /// declares the symbol, and this release does not.
+    RemovedInRelease {
+        /// The release, as a release revision of the symbol's owner.
+        revision: crate::revision::Revision,
+    },
+}
+
+impl HistoryEdge {
+    /// The release a release edge names; absent for a commit or `co_changes` edge.
+    #[must_use]
+    pub const fn release(&self) -> Option<&crate::revision::Revision> {
+        match self {
+            Self::IntroducedInRelease { revision }
+            | Self::ChangedInRelease { revision, .. }
+            | Self::RemovedInRelease { revision } => Some(revision),
+            Self::IntroducedIn { .. }
+            | Self::ChangedIn { .. }
+            | Self::RemovedIn { .. }
+            | Self::RenamedFrom { .. }
+            | Self::CoChanges { .. } => None,
+        }
+    }
+}
+
+impl SymbolHistory {
+    /// Whether this history may answer for `requested`: it names that symbol, a project
+    /// symbol's history carries no release edge, and a package or runtime symbol's history
+    /// carries only release edges naming releases of the symbol's owner and no
+    /// `co_changes_truncated`.
+    #[must_use]
+    pub fn is_valid_for(&self, requested: &SymbolId) -> bool {
+        let Ok(identity) = crate::identity::SymbolIdentity::parse(requested.as_str()) else {
+            return false;
+        };
+        let owner = identity.owner();
+        if self.symbol != *requested {
+            return false;
+        }
+        if owner.is_local() {
+            return self.edges.iter().all(|edge| edge.release().is_none());
+        }
+        self.co_changes_truncated.is_none()
+            && self.edges.iter().all(|edge| {
+                edge.release().is_some_and(|revision| {
+                    revision.answers_for(owner) && revision.release_version().is_some()
+                })
+            })
+    }
 }
 
 /// One commit a history edge names, with where the symbol's declaration lived in it.
@@ -2773,7 +2842,8 @@ pub struct HistoryCommit {
     pub author: CommitAuthor,
 }
 
-/// Which part of a declaration a `changed_in` commit changed.
+/// Which part of a declaration a `changed_in` commit or a `changed_in_release` release
+/// changed.
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]

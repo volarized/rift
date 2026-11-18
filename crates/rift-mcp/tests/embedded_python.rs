@@ -60,8 +60,9 @@ async fn incoming_references(configuration: &str, provider: &str) -> TestResult 
     let results = answer["results"]
         .as_array()
         .ok_or("search must return results")?;
-    assert_eq!(results.len(), 1, "{answer:#}");
-    let hit = &results[0];
+    assert_eq!(results.len(), 2, "{answer:#}");
+    assert_eq!(results[0]["hit"]["symbol"]["name"], "main", "{answer:#}");
+    let hit = &results[1];
     assert_eq!(hit["path"], json!("main.py"), "{answer:#}");
     assert_eq!(hit["hit"]["symbol"]["name"], json!("caller"), "{answer:#}");
     let path = hit["traversal_path"]

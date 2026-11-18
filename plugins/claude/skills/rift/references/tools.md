@@ -6,7 +6,7 @@ Generated from the served tool surface.
 
 Reads every declaration of `symbol` with its location, source, and syntax structure.
 The result includes each declaration's syntax tree.
-Use `page` with the same symbol and revision to continue declarations.
+`page` selects declarations at the revision the answer names.
 Use `revision` to read a commit or release, or to pin the served working tree.
 
 Parameters:

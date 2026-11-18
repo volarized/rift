@@ -2776,7 +2776,8 @@ pub struct FindDeclarationsResult {
 pub struct GetSymbolInclude {
     /// Attaches bounded documentation referring to the exact declaration.
     pub documentation: Option<bool>,
-    /// Attaches the symbol's version-control timeline.
+    /// Attaches the symbol's timeline: the commits that touched a project symbol, or the
+    /// collected releases that introduced, changed, or removed a package or runtime symbol.
     pub history: Option<bool>,
 }
 /// Reads one exact logical symbol obtained from discovery or another read.
@@ -3409,20 +3410,24 @@ pub struct SymbolDeclaration {
     /// Entries in the result symbol's documentation array supplied by this declaration.
     pub documentation_indices: Vec<u64>,
 }
-/// One symbol's history as edges from the symbol to the commits that touched it and to the
-/// symbols changed beside it. The history follows first parents from the served revision,
-/// or the selected releases in version order, through the commits the history store holds,
-/// and follows the declaration's file across a rename that kept its bytes. It is bounded by
-/// `[providers.history] max_revisions` and by a shallow clone's boundary.
+/// One symbol's history as edges from the symbol to the points that touched it. A project
+/// symbol's history names commits and the symbols changed beside it: it follows first
+/// parents from the served revision, or the selected releases in version order, through the
+/// commits the history store holds, and follows the declaration's file across a rename that
+/// kept its bytes. It is bounded by `[providers.history] max_revisions` and by a shallow
+/// clone's boundary. A package or runtime symbol's history names the collected releases of
+/// its owner that introduced, changed, or removed its declaration, and carries only release
+/// edges.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
 pub struct SymbolHistory {
     /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     pub symbol: String,
     /// The commit edges newest first, then the `co_changes` edges, most shared commits
-    /// first.
+    /// first. A package or runtime symbol's release edges come newest release first.
     pub edges: Vec<HistoryEdge>,
-    /// Whether the history reached the repository's first commit. `false` when the
+    /// Whether the history reached the repository's first commit, or for a package or
+    /// runtime symbol the oldest collected release of its owner. `false` when the
     /// `max_revisions` bound, a shallow clone's boundary, or the oldest selected release
     /// ended it first, or while the history store has not yet analyzed the served
     /// revision, so commits older than the listed ones may have touched the symbol.
@@ -3431,7 +3436,9 @@ pub struct SymbolHistory {
     pub co_changes_truncated: Option<CoChangeTruncation>,
 }
 /// One edge from a symbol in its history. Every commit edge names the commit as a
-/// `rift://revision/git/<commit>` revision.
+/// `rift://revision/git/<commit>` revision. Every release edge names the release as a
+/// `rift://revision/<manager>/<registry>/<name>@<version>` or
+/// `rift://revision/stdlib/<runtime>@<version>` revision of the symbol's owner.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(untagged)]
 pub enum HistoryEdge {
@@ -3450,6 +3457,14 @@ pub enum HistoryEdge {
     /// The symbol and `symbol` changed in the same commits, counted over the commits the
     /// history lists.
     SymbolId(HistoryEdgeSymbolId),
+    /// The release brought the symbol into existence: it is the oldest collected release of
+    /// the symbol's owner that declares the symbol.
+    Revision(HistoryEdgeRevision),
+    /// The release changed the symbol's declaration from the collected release before it.
+    Object3(HistoryEdgeObject3),
+    /// The release deleted the symbol's declaration: the collected release before it
+    /// declares the symbol, and this release does not.
+    Revision2(HistoryEdgeRevision2),
 }
 impl HistoryEdge {
     /// The commit brought the symbol into existence.
@@ -3463,6 +3478,22 @@ impl HistoryEdge {
     pub fn commit2(commit: HistoryCommit) -> Self {
         Self::HistoryCommit2(HistoryEdgeHistoryCommit2 {
             commit,
+            ..Default::default()
+        })
+    }
+    /// The release brought the symbol into existence: it is the oldest collected release of
+    /// the symbol's owner that declares the symbol.
+    pub fn revision(revision: String) -> Self {
+        Self::Revision(HistoryEdgeRevision {
+            revision,
+            ..Default::default()
+        })
+    }
+    /// The release deleted the symbol's declaration: the collected release before it
+    /// declares the symbol, and this release does not.
+    pub fn revision2(revision: String) -> Self {
+        Self::Revision2(HistoryEdgeRevision2 {
+            revision,
             ..Default::default()
         })
     }
@@ -3489,7 +3520,8 @@ pub struct HistoryCommit {
     /// address.
     pub author: CommitAuthor,
 }
-/// Which part of a declaration a `changed_in` commit changed.
+/// Which part of a declaration a `changed_in` commit or a `changed_in_release` release
+/// changed.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
 pub enum HistoryChange {
     /// The commit changed the declared interface.
@@ -4318,7 +4350,7 @@ pub struct EdgeSelection {
 }
 /// Complete lowercase SHA-256 digest of immutable source bytes.
 pub type SourceDigest = String;
-/// One kind: a declaration with its location, source, and syntax structure.
+/// One facet: a declaration with its location, source, and syntax structure.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
 pub struct FacetDeclaration {
@@ -4817,7 +4849,7 @@ pub enum SearchPackagesResponse {
     ///default: Unknown response
     Unknown,
 }
-/// Reads one exact logical symbol obtained from discovery or another read. The caller selects declarations with `page` and `max_results`, and pins later pages with `revision`.
+/// Reads one exact logical symbol obtained from discovery or another read. The caller selects declarations with `page` and `max_results`, and pins later pages with `revision`. A `found` answer to a request whose `include.history` is `true` **MUST** carry `history`: the collected releases of the symbol's owner that introduced, changed, or removed its declaration, as `introduced_in_release`, `changed_in_release`, and `removed_in_release` edges, newest release first. The server answers `unavailable` with reason `insufficient_coverage` when it cannot establish that history.
 #[derive(Debug, Clone, validator::Validate, oas3_gen_support::Default)]
 pub struct GetSymbolRequest {
     /// Reads one exact logical symbol obtained from discovery or another read.
@@ -5911,11 +5943,14 @@ pub struct GetSymbolResultObject {
     pub declarations: Vec<SymbolDeclaration>,
     /// The requested page and the size of its complete result set.
     pub pagination: Pagination,
-    /// One symbol's history as edges from the symbol to the commits that touched it and to the
-    /// symbols changed beside it. The history follows first parents from the served revision,
-    /// or the selected releases in version order, through the commits the history store holds,
-    /// and follows the declaration's file across a rename that kept its bytes. It is bounded by
-    /// `[providers.history] max_revisions` and by a shallow clone's boundary.
+    /// One symbol's history as edges from the symbol to the points that touched it. A project
+    /// symbol's history names commits and the symbols changed beside it: it follows first
+    /// parents from the served revision, or the selected releases in version order, through the
+    /// commits the history store holds, and follows the declaration's file across a rename that
+    /// kept its bytes. It is bounded by `[providers.history] max_revisions` and by a shallow
+    /// clone's boundary. A package or runtime symbol's history names the collected releases of
+    /// its owner that introduced, changed, or removed its declaration, and carries only release
+    /// edges.
     pub history: Option<SymbolHistory>,
     /// Bounded documentation context requested for one exact declaration.
     pub documentation: Option<DocumentationContext>,
@@ -5967,7 +6002,8 @@ pub struct HistoryEdgeObject {
     pub edge: String,
     /// One commit a history edge names, with where the symbol's declaration lived in it.
     pub commit: HistoryCommit,
-    /// Which part of a declaration a `changed_in` commit changed.
+    /// Which part of a declaration a `changed_in` commit or a `changed_in_release` release
+    /// changed.
     pub change: HistoryChange,
 }
 /// The commit deleted the symbol's declaration.
@@ -6009,6 +6045,38 @@ pub struct HistoryEdgeSymbolId {
     pub symbol: String,
     /// How many listed commits changed both symbols.
     pub commits: u64,
+}
+/// The release brought the symbol into existence: it is the oldest collected release of
+/// the symbol's owner that declares the symbol.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct HistoryEdgeRevision {
+    #[default("introduced_in_release".to_string())]
+    pub edge: String,
+    /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
+    pub revision: String,
+}
+/// The release changed the symbol's declaration from the collected release before it.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct HistoryEdgeObject3 {
+    #[default("changed_in_release".to_string())]
+    pub edge: String,
+    /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
+    pub revision: String,
+    /// Which part of a declaration a `changed_in` commit or a `changed_in_release` release
+    /// changed.
+    pub change: HistoryChange,
+}
+/// The release deleted the symbol's declaration: the collected release before it
+/// declares the symbol, and this release does not.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct HistoryEdgeRevision2 {
+    #[default("removed_in_release".to_string())]
+    pub edge: String,
+    /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
+    pub revision: String,
 }
 /// Presence or absence cannot be established in the requested selection.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]

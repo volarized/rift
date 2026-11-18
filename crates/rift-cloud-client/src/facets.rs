@@ -123,7 +123,7 @@ fn is_release_owner(owner: &SymbolOwner) -> bool {
     )
 }
 
-/// Validates the selected symbol, exact release, syntax element sources, page bounds and continuation.
+/// Validates the selected symbol, exact release, syntax element sources, page bounds and pagination.
 fn valid_result(
     request: &FacetsParams,
     symbol: &RequestedSymbol<'_>,

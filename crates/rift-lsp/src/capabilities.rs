@@ -23,6 +23,15 @@ pub enum PositionEncoding {
     Utf16,
 }
 
+/// Advertised engine operations that supply inheritance edges.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EdgeCapabilities {
+    /// Whether the engine advertises implementation edges.
+    pub implementation: bool,
+    /// Whether the engine advertises type hierarchy edges.
+    pub type_hierarchy: bool,
+}
+
 /// What one engine advertised at initialize.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Capabilities {
@@ -33,6 +42,8 @@ pub struct Capabilities {
     /// Whether the engine serves `textDocument/prepareCallHierarchy` and
     /// `callHierarchy/outgoingCalls`.
     pub call_hierarchy: bool,
+    /// Advertised implementation and type hierarchy operations.
+    pub edges: EdgeCapabilities,
     /// Whether the engine serves `textDocument/diagnostic`.
     pub pull_diagnostics: bool,
     /// The identifier the engine registered its diagnostics under.
@@ -46,6 +57,7 @@ impl Default for Capabilities {
             position_encoding: PositionEncoding::Utf16,
             references: false,
             call_hierarchy: false,
+            edges: EdgeCapabilities::default(),
             pull_diagnostics: false,
             diagnostic_identifier: None,
         }
@@ -53,6 +65,22 @@ impl Default for Capabilities {
 }
 
 impl Capabilities {
+    /// Retains the type hierarchy capability missing from the dependency's initialize model.
+    pub(crate) fn negotiated_edge_answer(answer: serde_json::Value) -> Result<Self, RiftError> {
+        let edge_type_hierarchy = answer
+            .get("capabilities")
+            .and_then(|capabilities| capabilities.get("typeHierarchyProvider"))
+            .is_some_and(|value| value.as_bool() == Some(true) || value.is_object());
+        let answer = serde_json::from_value(answer).map_err(|source| {
+            errors::lsp::engine_result_invalid()
+                .method("initialize")
+                .source(source)
+                .error()
+        })?;
+        let mut capabilities = Self::negotiated(&answer)?;
+        capabilities.edges.type_hierarchy = edge_type_hierarchy;
+        Ok(capabilities)
+    }
     /// Builds the record from an engine's initialize answer.
     ///
     /// An absent position encoding is UTF-16, the protocol default.
@@ -97,6 +125,14 @@ impl Capabilities {
             position_encoding,
             references,
             call_hierarchy,
+            edges: EdgeCapabilities {
+                implementation: match advertised.implementation_provider {
+                    Some(lsp_types::ImplementationProviderCapability::Simple(served)) => served,
+                    Some(lsp_types::ImplementationProviderCapability::Options(_)) => true,
+                    None => false,
+                },
+                type_hierarchy: false,
+            },
             pull_diagnostics,
             diagnostic_identifier,
         })
@@ -166,6 +202,8 @@ pub fn offered() -> ClientCapabilities {
         }),
         text_document: Some(TextDocumentClientCapabilities {
             references: Some(ReferenceClientCapabilities::default()),
+            implementation: Some(lsp_types::GotoCapability::default()),
+            type_hierarchy: Some(lsp_types::TypeHierarchyClientCapabilities::default()),
             call_hierarchy: Some(CallHierarchyClientCapabilities::default()),
             diagnostic: Some(DiagnosticClientCapabilities {
                 dynamic_registration: Some(true),
@@ -191,6 +229,25 @@ mod tests {
             capabilities,
             ..InitializeResult::default()
         }
+    }
+
+    #[test]
+    fn test_edge_capability_forms_are_gated_by_the_advertised_flags() {
+        for (value, expected) in [
+            (serde_json::Value::Null, false),
+            (serde_json::json!(false), false),
+            (serde_json::json!(true), true),
+            (serde_json::json!({}), true),
+        ] {
+            let answer = serde_json::json!({"capabilities":{"implementationProvider":value,"typeHierarchyProvider":value}});
+            let negotiated =
+                Capabilities::negotiated_edge_answer(answer).expect("edge capabilities");
+            assert_eq!(negotiated.edges.implementation, expected);
+            assert_eq!(negotiated.edges.type_hierarchy, expected);
+        }
+        let offered = offered().text_document.expect("text document capabilities");
+        assert!(offered.implementation.is_some());
+        assert!(offered.type_hierarchy.is_some());
     }
 
     #[test]

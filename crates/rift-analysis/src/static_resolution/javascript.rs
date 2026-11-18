@@ -39,7 +39,7 @@ impl PackageModes {
 
     fn mode(&self, path: &str, work: &mut Work) -> ModuleMode {
         match path.rsplit_once('.').map(|(_, extension)| extension) {
-            Some("mjs") => return ModuleMode::Esm,
+            Some("mjs" | "ts" | "tsx" | "mts" | "cts") => return ModuleMode::Esm,
             Some("cjs") => return ModuleMode::CommonJs,
             Some("js") => {}
             _ => return ModuleMode::Unknown,
@@ -80,6 +80,21 @@ fn package_mode(text: &str) -> ModuleMode {
 }
 
 impl<'source> Index<'source> {
+    pub(super) fn edge_javascript_target(
+        &self,
+        file: &File<'source>,
+        range: rift_syntax::ByteRange,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let name = file.text(range)?;
+        if let Some((receiver, member)) = name.split_once('.') {
+            let binding = js_binding(file, receiver, range.start, Some(member), work)?;
+            return self.javascript_member(file, binding, member, work);
+        }
+        let binding = js_binding(file, name, range.start, None, work)?;
+        self.javascript_binding_target(file, binding, work)
+    }
+
     pub(super) fn javascript_call(
         &self,
         file: &File<'source>,
@@ -158,6 +173,9 @@ impl<'source> Index<'source> {
         work: &mut Work,
     ) -> Option<Target<'source>> {
         match binding.kind {
+            StaticBindingKind::JavaScriptEdgeNamespace { module } => {
+                self.javascript_export(file, file.text(module)?, member, ModuleMode::Esm, work)
+            }
             StaticBindingKind::JavaScriptInstance { constructor } => {
                 let constructor_name = file.text(constructor)?;
                 let constructor_binding =
@@ -189,6 +207,33 @@ impl<'source> Index<'source> {
             && !file.reassigned("require", None)
     }
 
+    fn edge_javascript_module(&self, path: &str) -> Option<&File<'source>> {
+        if let Some(file) = self.files.get(path) {
+            return Some(file);
+        }
+        let stem = path.strip_suffix(".js").unwrap_or(path);
+        if let Some(stem) = path.strip_suffix(".mjs") {
+            return self.files.get(format!("{stem}.mts").as_str());
+        }
+        if let Some(stem) = path.strip_suffix(".cjs") {
+            return self.files.get(format!("{stem}.cts").as_str());
+        }
+        let mut found = None;
+        for candidate in [
+            format!("{stem}.ts"),
+            format!("{stem}.tsx"),
+            format!("{stem}/index.ts"),
+            format!("{stem}/index.tsx"),
+        ] {
+            if let Some(file) = self.files.get(candidate.as_str())
+                && found.replace(file).is_some()
+            {
+                return None;
+            }
+        }
+        found
+    }
+
     fn javascript_export<'index>(
         &'index self,
         mut file: &'index File<'source>,
@@ -205,13 +250,16 @@ impl<'source> Index<'source> {
                 return None;
             }
             let path = relative_path(file.document.path.as_str(), module, work)?;
-            file = self.files.get(path.as_str())?;
+            file = self.edge_javascript_module(&path)?;
             if !visited.insert((file.document.path.as_str(), name))
-                || file.document.facts.language().name != "javascript"
+                || !matches!(
+                    file.document.facts.language().name.as_str(),
+                    "javascript" | "typescript"
+                )
             {
                 return None;
             }
-            let actual = self.javascript.mode(&path, work);
+            let actual = self.javascript.mode(file.document.path.as_str(), work);
             match mode {
                 ModuleMode::Esm if actual != ModuleMode::CommonJs => {}
                 ModuleMode::CommonJs if actual == ModuleMode::CommonJs => {}
@@ -342,10 +390,7 @@ fn literal_contents(source: &str) -> Option<&str> {
 
 fn relative_path(from: &str, module: &str, work: &mut Work) -> Option<String> {
     let relative = module.starts_with("./") || module.starts_with("../");
-    let explicit_extension = [".js", ".mjs", ".cjs"]
-        .iter()
-        .any(|suffix| module.ends_with(suffix));
-    if !relative || !explicit_extension || module.contains(['\\', '?', '#', '%']) {
+    if !relative || module.contains(['\\', '?', '#', '%']) {
         return None;
     }
     let mut segments = from

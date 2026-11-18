@@ -385,6 +385,15 @@ fn kind(name: &str) -> Option<EdgeKind> {
     match name {
         "calls" => Some(EdgeKind::Calls),
         "references" => Some(EdgeKind::References),
+        "imports" => Some(EdgeKind::Imports),
+        "aliases" => Some(EdgeKind::Aliases),
+        "extends" => Some(EdgeKind::Extends),
+        "implements" => Some(EdgeKind::Implements),
+        "declares" => Some(EdgeKind::Declares),
+        "reads" => Some(EdgeKind::Reads),
+        "writes" => Some(EdgeKind::Writes),
+        "hasType" => Some(EdgeKind::HasType),
+
         _ => None,
     }
 }

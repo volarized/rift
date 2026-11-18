@@ -70,6 +70,22 @@ pub enum VocabularyProperty {
     Calls,
     /// A symbol mentions a symbol.
     References,
+    /// The source brings the target into scope.
+    Imports,
+    /// The source is another name for the target.
+    Aliases,
+    /// The source inherits from the target.
+    Extends,
+    /// The source fulfils the target's interface.
+    Implements,
+    /// The source declares the target.
+    Declares,
+    /// The source reads the target's value.
+    Reads,
+    /// The source assigns to the target.
+    Writes,
+    /// The source is typed by the target.
+    HasType,
     /// A syntax element that uses a symbol.
     Usages,
     /// The revision that added a symbol.
@@ -257,6 +273,46 @@ impl VocabularyProperty {
                 &[SYMBOL],
                 Resource(SYMBOL),
                 "The symbol mentions the target.",
+            ),
+            Self::Imports => (
+                &[SYMBOL],
+                Resource(SYMBOL),
+                "The source brings the target into scope.",
+            ),
+            Self::Aliases => (
+                &[SYMBOL],
+                Resource(SYMBOL),
+                "The source is another name for the target.",
+            ),
+            Self::Extends => (
+                &[SYMBOL],
+                Resource(SYMBOL),
+                "The source inherits from the target.",
+            ),
+            Self::Implements => (
+                &[SYMBOL],
+                Resource(SYMBOL),
+                "The source fulfils the target's interface.",
+            ),
+            Self::Declares => (
+                &[SYMBOL],
+                Resource(SYMBOL),
+                "The source declares the target.",
+            ),
+            Self::Reads => (
+                &[SYMBOL],
+                Resource(SYMBOL),
+                "The source reads the target's value.",
+            ),
+            Self::Writes => (
+                &[SYMBOL],
+                Resource(SYMBOL),
+                "The source assigns to the target.",
+            ),
+            Self::HasType => (
+                &[SYMBOL],
+                Resource(SYMBOL),
+                "The source is typed by the target.",
             ),
             Self::Usages => (
                 &[SYMBOL],

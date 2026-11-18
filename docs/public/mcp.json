@@ -2,7 +2,7 @@
   "description": "Tools served by the Rift MCP server, with the JSON Schemas derived from the Rust wire models.",
   "tools": [
     {
-      "description": "Reads every declaration of `symbol` with its location, source, and syntax structure.\nThe result includes each declaration's syntax tree.\nUse `page` with the same symbol and revision to continue declarations.\nUse `revision` to read a commit or release, or to pin the served working tree.",
+      "description": "Reads every declaration of `symbol` with its location, source, and syntax structure.\nThe result includes each declaration's syntax tree.\n`page` selects declarations at the revision the answer names.\nUse `revision` to read a commit or release, or to pin the served working tree.",
       "input_schema": {
         "$defs": {
           "Revision": {
@@ -432,7 +432,7 @@
           },
           "FacetDeclaration": {
             "additionalProperties": false,
-            "description": "One kind: a declaration with its location, source, and syntax structure.",
+            "description": "One facet: a declaration with its location, source, and syntax structure.",
             "properties": {
               "declaration": {
                 "description": "Declaration ordinal in the symbol, from zero.",
@@ -2598,7 +2598,7 @@
                 "type": "boolean"
               },
               "history": {
-                "description": "Attaches the symbol's version-control timeline.",
+                "description": "Attaches the symbol's timeline: the commits that touched a project symbol, or the\ncollected releases that introduced, changed, or removed a package or runtime symbol.",
                 "type": "boolean"
               }
             },
@@ -3638,7 +3638,7 @@
             ]
           },
           "HistoryChange": {
-            "description": "Which part of a declaration a `changed_in` commit changed.",
+            "description": "Which part of a declaration a `changed_in` commit or a `changed_in_release` release\nchanged.",
             "oneOf": [
               {
                 "const": "signature_changed",
@@ -3693,7 +3693,7 @@
             "type": "object"
           },
           "HistoryEdge": {
-            "description": "One edge from a symbol in its history. Every commit edge names the commit as a\n`rift://revision/git/<commit>` revision.",
+            "description": "One edge from a symbol in its history. Every commit edge names the commit as a\n`rift://revision/git/<commit>` revision. Every release edge names the release as a\n`rift://revision/<manager>/<registry>/<name>@<version>` or\n`rift://revision/stdlib/<runtime>@<version>` revision of the symbol's owner.",
             "oneOf": [
               {
                 "additionalProperties": false,
@@ -3804,6 +3804,68 @@
                   "edge",
                   "symbol",
                   "commits"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The release brought the symbol into existence: it is the oldest collected release of\nthe symbol's owner that declares the symbol.",
+                "properties": {
+                  "edge": {
+                    "const": "introduced_in_release",
+                    "type": "string"
+                  },
+                  "revision": {
+                    "$ref": "#/$defs/Revision",
+                    "description": "The release, as a release revision of the symbol's owner."
+                  }
+                },
+                "required": [
+                  "edge",
+                  "revision"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The release changed the symbol's declaration from the collected release before it.",
+                "properties": {
+                  "change": {
+                    "$ref": "#/$defs/HistoryChange",
+                    "description": "Which part of the declaration the release changed."
+                  },
+                  "edge": {
+                    "const": "changed_in_release",
+                    "type": "string"
+                  },
+                  "revision": {
+                    "$ref": "#/$defs/Revision",
+                    "description": "The release, as a release revision of the symbol's owner."
+                  }
+                },
+                "required": [
+                  "edge",
+                  "revision",
+                  "change"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The release deleted the symbol's declaration: the collected release before it\ndeclares the symbol, and this release does not.",
+                "properties": {
+                  "edge": {
+                    "const": "removed_in_release",
+                    "type": "string"
+                  },
+                  "revision": {
+                    "$ref": "#/$defs/Revision",
+                    "description": "The release, as a release revision of the symbol's owner."
+                  }
+                },
+                "required": [
+                  "edge",
+                  "revision"
                 ],
                 "type": "object"
               }
@@ -5565,18 +5627,18 @@
           },
           "SymbolHistory": {
             "additionalProperties": false,
-            "description": "One symbol's history as edges from the symbol to the commits that touched it and to the\nsymbols changed beside it. The history follows first parents from the served revision,\nor the selected releases in version order, through the commits the history store holds,\nand follows the declaration's file across a rename that kept its bytes. It is bounded by\n`[providers.history] max_revisions` and by a shallow clone's boundary.",
+            "description": "One symbol's history as edges from the symbol to the points that touched it. A project\nsymbol's history names commits and the symbols changed beside it: it follows first\nparents from the served revision, or the selected releases in version order, through the\ncommits the history store holds, and follows the declaration's file across a rename that\nkept its bytes. It is bounded by `[providers.history] max_revisions` and by a shallow\nclone's boundary. A package or runtime symbol's history names the collected releases of\nits owner that introduced, changed, or removed its declaration, and carries only release\nedges.",
             "properties": {
               "co_changes_truncated": {
                 "$ref": "#/$defs/CoChangeTruncation",
                 "description": "The co-change edges the co-change bounds left out. Absent when they left out none."
               },
               "complete": {
-                "description": "Whether the history reached the repository's first commit. `false` when the\n`max_revisions` bound, a shallow clone's boundary, or the oldest selected release\nended it first, or while the history store has not yet analyzed the served\nrevision, so commits older than the listed ones may have touched the symbol.",
+                "description": "Whether the history reached the repository's first commit, or for a package or\nruntime symbol the oldest collected release of its owner. `false` when the\n`max_revisions` bound, a shallow clone's boundary, or the oldest selected release\nended it first, or while the history store has not yet analyzed the served\nrevision, so commits older than the listed ones may have touched the symbol.",
                 "type": "boolean"
               },
               "edges": {
-                "description": "The commit edges newest first, then the `co_changes` edges, most shared commits\nfirst.",
+                "description": "The commit edges newest first, then the `co_changes` edges, most shared commits\nfirst. A package or runtime symbol's release edges come newest release first.",
                 "items": {
                   "$ref": "#/$defs/HistoryEdge"
                 },

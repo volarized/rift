@@ -18,6 +18,8 @@ pub struct OccurrenceSelection {
 /// The semantic and physical facts needed from a complete selected domain.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SemanticInventory {
+    /// The query can inspect captured edge kinds.
+    pub edges: bool,
     /// The query can inspect call edges.
     pub calls: bool,
     /// The query can inspect caller-to-target reference edges.
@@ -32,7 +34,10 @@ impl GraphQuery {
     #[must_use]
     pub fn semantic_inventory(&self) -> Option<SemanticInventory> {
         self.admission().semantics.filter(|requirements| {
-            requirements.calls || requirements.references || requirements.occurrences.is_some()
+            requirements.edges
+                || requirements.calls
+                || requirements.references
+                || requirements.occurrences.is_some()
         })
     }
 }
@@ -52,6 +57,10 @@ impl SemanticInventory {
                 None if class(pattern) == Some("Edge") => {}
                 Some("calls") => self.calls = true,
                 Some("references") => self.references = true,
+                Some(
+                    "imports" | "aliases" | "extends" | "implements" | "declares" | "reads"
+                    | "writes" | "hasType",
+                ) => self.edges = true,
                 Some("usages") => {
                     self.occurrences.get_or_insert_default();
                 }
@@ -91,6 +100,10 @@ impl SemanticInventory {
                     match predicate.as_str().strip_prefix(VOCABULARY_NAMESPACE) {
                         Some("calls") => self.calls = true,
                         Some("references") => self.references = true,
+                        Some(
+                            "imports" | "aliases" | "extends" | "implements" | "declares" | "reads"
+                            | "writes" | "hasType",
+                        ) => self.edges = true,
                         Some("usages") => {
                             self.occurrences.get_or_insert_default();
                         }

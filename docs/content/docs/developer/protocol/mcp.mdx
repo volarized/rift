@@ -120,7 +120,7 @@ entire graph and its only subject is an unreferenced blank node, text groups tha
 properties as `[ :active true ; :count 7 ] .` Labels shown in text stay distinct. Structured
 content carries the exact RDF terms and identities.
 
-`DESCRIBE` uses the library's description behavior over all authoritative captured and published records in its selected dataset. It does not implicitly request every language-engine kind. Facts explicitly required by its `WHERE` pattern retain the same strict acquisition and missing-facts rules as other query forms; bounds still refuse incomplete admission.
+`DESCRIBE` uses the library's description behavior over all authoritative captured and published records in its selected dataset. It does not implicitly request every language-engine fact. Facts explicitly required by its `WHERE` pattern retain the same strict acquisition and missing-facts rules as other query forms; bounds still refuse incomplete admission.
 
 ### Full-text search [#search-fulltext]
 
@@ -341,8 +341,8 @@ does not reparse source to manufacture a complete syntax family.
 
 ### Migration
 
-Former top-level `target`, `scope`, `paths`, `include`, `limit`, `page`, `traversal`,
-`change`, and `revision` are rejected. Express field projection, joins, paths, order, and slicing in
+Former top-level `target`, `scope`, `paths`, `include`, `limit`, `traversal`, and `change`
+are rejected. Express field projection, joins, paths, order, and slicing in
 SPARQL. Use `SERVICE :search` for existing ranking, regex, revision comparison, and commit
 producers. Send `page` and `max_results` for answer pages.
 
@@ -352,7 +352,7 @@ producers. Send `page` and `max_results` for answer pages.
 
 `id` selects one canonical logical symbol. Ownership and language are encoded in that
 identity; declaration source addresses remain separate. `get_symbol` accepts neither
-name discovery nor `scope`, `packages`, `limit`, or `page`.
+name discovery nor `scope`, `packages`, or `limit`.
 
 Every declaration of one qualified path binds to that one identity, so `declarations` lists
 repeated definitions, overloads, and `cfg` variants of one symbol together.
@@ -424,6 +424,20 @@ left out nothing.
 still filling ended the history before the repository's first commit. When the store did not
 open, the server walks Git per request instead, and that history carries no `co_changes` edge.
 
+A package or runtime symbol's `history` comes from the global API and names releases in place
+of commits. Its edges come newest release first: `introduced_in_release` for the oldest
+collected release that declares the symbol, `changed_in_release` with a `change` for a release
+that changed the declaration from the collected release before it, and `removed_in_release` for
+a release that no longer declares it. Each names its release as a
+`rift://revision/<manager>/<registry>/<name>@<version>` or
+`rift://revision/stdlib/<runtime>@<version>` revision of the symbol's owner.
+
+A release history carries no commit edge, no `co_changes` edge, and no `co_changes_truncated`.
+The server **MUST** treat a global API answer that breaks this, or a `found` answer that omits
+the requested history, as invalid and fail the read. `complete: false` means the history ended
+before the oldest collected release of the owner, and a project symbol's history carries no
+release edge.
+
 ### Symbol ownership [#get_symbol-scope]
 
 A `local:name` owner in a symbol identity selects a profile defined in the root configuration.
@@ -446,6 +460,8 @@ its `revision`. The declaration's `unit` keeps the physical defining owner even 
 owner differs.
 
 <ReadExample name="global-symbol-documentation" />
+
+<ReadExample name="global-symbol-history" />
 
 `revision` selects the [revision](#revision-reads) to read, and the answer carries the revision
 it was read at. For a package or runtime identity it names a release of that identity's owner.
@@ -684,7 +700,7 @@ The caller selects the representations when it starts the proxy with `rift mcp -
 The proxy **MUST** keep the selected output for its lifetime. Direct HTTP access to
 `rift server` carries both tool representations.
 
-Search text shows the query answer and any continuation. An exact read states its outcome and
+Search text shows the query answer and its pagination. An exact read states its outcome and
 selected object. Use `rift server logs` for diagnostic codes and details.
 The [tool execution failure](#tool-execution-failures) form applies when `isError` is set.
 
@@ -970,12 +986,12 @@ The tabs below show execution failures as compact text, and the completed tool r
 
 <Tab value="invalid_request">
 
-**Execution failure, compact text** of a request whose `limit` is below 1:
+**Execution failure, compact text** of a request whose `max_results` is below 1:
 
 ```text
 1 error
 	invalid_request · retry never
-		the request does not match the documented form: field limit, violation zero; correct the reported field and resend the request
+		the request does not match the documented form: field max_results, violation expected 1..=10000, received 0; correct the reported field and resend the request
 		rift.server.read_invalid
 ```
 
@@ -989,7 +1005,7 @@ The tabs below show execution failures as compact text, and the completed tool r
 {
   "content": [
     {
-      "text": "1 error\n\tinvalid_request · retry never\n\t\tthe request does not match the documented form: field limit, violation zero; correct the reported field and resend the request\n\t\trift.server.read_invalid\n",
+      "text": "1 error\n\tinvalid_request · retry never\n\t\tthe request does not match the documented form: field max_results, violation expected 1..=10000, received 0; correct the reported field and resend the request\n\t\trift.server.read_invalid\n",
       "type": "text"
     }
   ],

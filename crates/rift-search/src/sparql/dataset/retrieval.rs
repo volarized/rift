@@ -41,9 +41,11 @@ impl GraphDatasetBuilder {
         selection: &RetrievalSelection,
         result: &SearchResult,
     ) -> Result<(), RiftError> {
+        // `page` is 1-based: the first hit of page `p` is hit `(p - 1) * max_results`.
         let offset = selection
             .request
             .page
+            .saturating_sub(1)
             .checked_mul(selection.request.max_results.unwrap_or(0))
             .ok_or_else(projection_failure)?;
         for (index, hit) in result.results.iter().enumerate() {
@@ -268,4 +270,58 @@ fn projection_failure() -> RiftError {
     errors::search::query_evaluation_failed()
         .detail("could not project the retained retrieval result")
         .error()
+}
+
+#[cfg(test)]
+mod tests {
+    use rift_protocol::query::QueryAnswer;
+    use rift_protocol::read::SearchResult;
+    use serde_json::json;
+
+    use crate::sparql::{GraphDataset, GraphLimits, GraphQuery, QueryCancellation};
+
+    #[test]
+    fn retrieval_index_counts_hits_from_the_first_page() -> Result<(), Box<dyn std::error::Error>> {
+        for (page, expected) in [(1, ["0", "1"]), (3, ["4", "5"])] {
+            let limits = GraphLimits::default();
+            let query = GraphQuery::parse(
+                &format!(
+                    "SELECT ?index {{ SERVICE :search {{ ?hit :pattern 'beacon'; \
+                     :max_results 2; :page {page}; :index ?index }} }} ORDER BY ?index"
+                ),
+                &limits,
+            )?;
+            let [selection] = query.retrieval_requests() else {
+                return Err("one retrieval service".into());
+            };
+            let hit = |path: &str| json!({"hit": {"target": "file", "size": 1}, "path": path});
+            let result: SearchResult = serde_json::from_value(json!({
+                "results": [hit("a.rs"), hit("b.rs")],
+                "pagination": {"page": page, "pages": 3, "max_results": 2, "total": 6},
+            }))?;
+            let mut builder = GraphDataset::builder(limits);
+            builder.insert_retrieval(selection, &result)?;
+            let answer: QueryAnswer = builder
+                .build()
+                .evaluate(&query, &QueryCancellation::new())?
+                .into();
+            let QueryAnswer::Bindings { bindings, .. } = answer else {
+                return Err("SELECT answers bindings".into());
+            };
+            let rows = serde_json::to_value(&bindings)?;
+            let indexes = rows
+                .as_array()
+                .ok_or("bindings encode as an array")?
+                .iter()
+                .map(|row| {
+                    row["index"]["value"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(indexes, expected, "page {page}");
+        }
+        Ok(())
+    }
 }
