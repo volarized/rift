@@ -191,17 +191,21 @@ stop begins, and each stage takes only what the one before it left:
    1.5 s: `SERVER_EXPORT_STOP_RESERVE`, `SERVER_LOG_FLUSH_RESERVE`, and
    `SERVER_DATABASE_STOP_RESERVE`, 500 ms each. A close failure becomes a `warn` record with
    operation `database.close`, so a later stage writes it.
-3. The `otlp export` stage sends the final spans, log records, and metric points and shuts the
-   export down by the deadline minus 1 s, and at most `SERVER_EXPORT_STOP_RESERVE` after it
-   starts. A collector that is down or stalled costs the stop that reserve and never fails it.
-4. The log drain's final flush ends by the deadline minus `SERVER_DATABASE_STOP_RESERVE`. A
-   drain that outlasts it is aborted, and its warning carries `unwritten`: the records the
-   drain accepted and never wrote.
-5. The metrics database closes by the deadline, so it outlives every record.
+3. The log drain's final flush ends by the deadline minus `SERVER_DATABASE_STOP_RESERVE`
+   and `SERVER_EXPORT_STOP_RESERVE`. A drain that outlasts it is aborted, and its warning
+   carries `unwritten`: the records the drain accepted and never wrote.
+4. The metrics database closes by the deadline minus `SERVER_EXPORT_STOP_RESERVE`.
+5. The `otlp export` stage flushes ended spans, closes its stage span, shuts down traces and
+   metrics, records the flush and provider results through logs, then shuts down logs. Each phase uses
+   what remains of the same stop deadline. Earlier stages leave `SERVER_EXPORT_STOP_RESERVE`;
+   export can use any additional time they left.
+
+   Export failures never fail the stop. Without a configured collector, export ends at once.
+   The log shutdown result reaches stderr after the provider closes.
 6. The election guard drops, right before the process exits.
-7. The `tracing shutdown` stage flushes what the export still holds, within
-   `OTLP_SHUTDOWN_TIMEOUT` (500 ms), and a `process exits` record with `stage = "process exit"`
-   and the exit `status` is the last line on stderr before the process exits.
+7. The `tracing shutdown` stage finds the providers already taken by the export stage. A
+   `process exits` record with `stage = "process exit"` and the exit `status` is the last line
+   on stderr before the process exits.
 
 On Windows, a process does not end while one of its threads has pending I/O: "The terminated
 process cannot exit until all pending I/O has been completed or canceled" (`TerminateProcess`).
@@ -216,8 +220,8 @@ the index supervisor, then the index and vectors databases stop by the workspace
 `WORKSPACE_LOG_FLUSH_RESERVE` and `WORKSPACE_DATABASE_STOP_RESERVE`; its consumer's final flush
 ends by the deadline minus `WORKSPACE_DATABASE_STOP_RESERVE`; its metrics database closes last.
 The server's serving stages end by the deadline minus `SERVER_EXPORT_STOP_RESERVE` and
-`SERVER_LOG_FLUSH_RESERVE`, its `otlp export` stage by the deadline minus
-`SERVER_LOG_FLUSH_RESERVE`, and its `log drain` stage by the deadline.
+`SERVER_LOG_FLUSH_RESERVE`. Its `log drain` stage ends by the deadline minus
+`SERVER_EXPORT_STOP_RESERVE`, and its `otlp export` phases share the stop deadline.
 
 Each stage runs inside a `server.stop` span and ends with a `stop stage ended` record carrying
 `stage`, `remaining`, and `outcome`, plus `error` and `causes` for a failure. The outcome is `ok`
