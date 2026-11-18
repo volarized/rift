@@ -30,6 +30,12 @@ pub struct GraphQuery {
 }
 
 impl GraphQuery {
+    /// Renders the admitted algebra with normalized SPARQL syntax.
+    #[must_use]
+    pub fn normalized_text(&self) -> String {
+        self.query.to_string()
+    }
+
     /// Parses `text` and refuses what the graph does not serve.
     ///
     /// Parsing runs on the query thread, after a count of every opening bracket and operator
