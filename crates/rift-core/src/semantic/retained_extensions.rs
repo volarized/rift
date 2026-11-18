@@ -3,7 +3,17 @@ use serde_json::Value;
 
 // serde_json 1.0.151 uses indexmap 2.14.0. Rebuilding each owned object through
 // FromIterator fixes its initial capacity. No public Map capacity is assumed.
+//
+// A collection with no entries is replaced by a new one and charged nothing. std 1.98
+// `BTreeMap::new` allocates no root node and `Clone` of an empty map returns a new map,
+// so neither the Contribution nor a copy of it owns storage for the collection. Syntax
+// Contributions carry no provider-specific facts; one charged node each was about 0.8 KB
+// per declaration, in the graph and again in every assembled record.
 pub(super) fn compact(extensions: &mut Extensions) -> usize {
+    if extensions.0.is_empty() {
+        *extensions = Extensions::default();
+        return 0;
+    }
     let mut bytes =
         rift_protocol::btree_material_bytes::<ExtensionKey, ExtensionValue>(extensions.0.len());
     for (key, extension) in &mut extensions.0 {
@@ -99,6 +109,21 @@ mod tests {
         assert_eq!(value, before);
         assert!(bytes > 0 && bytes < usize::MAX);
         assert!(compact_value(&mut value.clone()) <= bytes);
+    }
+
+    #[test]
+    fn empty_collection_is_replaced_and_charged_nothing() {
+        let mut extensions = Extensions(std::collections::BTreeMap::from([(
+            ExtensionKey("org.rift.history".to_owned()),
+            ExtensionValue {
+                version: 1,
+                data: serde_json::json!({"commit": "abc123"}),
+            },
+        )]));
+        assert!(compact(&mut extensions.clone()) > 0);
+        extensions.0.clear();
+        assert_eq!(compact(&mut extensions), 0);
+        assert_eq!(extensions, Extensions::default());
     }
 
     #[test]

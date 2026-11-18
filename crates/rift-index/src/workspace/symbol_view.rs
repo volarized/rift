@@ -20,7 +20,6 @@ pub struct WorkspaceSymbolView {
     owner: SymbolOwner,
     files: BTreeMap<ProjectPath, Arc<IndexedFile>>,
     frameworks: BTreeMap<ProjectPath, rift_analysis::ResolvedFramework>,
-    identities: BTreeMap<(ProjectPath, usize), SymbolId>,
     text_files: BTreeMap<ProjectPath, Arc<TextSourceFile>>,
     notebooks: NotebookFiles,
     semantics: Arc<WorkspaceSemantics>,
@@ -62,15 +61,6 @@ impl WorkspaceIndex {
                     self.frameworks
                         .for_source(path, &file.digest())
                         .map(|context| (path.clone(), context.clone()))
-                })
-                .collect(),
-            identities: declarations
-                .canonical
-                .iter()
-                .flat_map(|(identity, bindings)| {
-                    bindings
-                        .iter()
-                        .map(move |binding| (binding.clone(), identity.clone()))
                 })
                 .collect(),
             text_files: self.text_files.clone(),
@@ -166,7 +156,9 @@ impl WorkspaceSymbolView {
     /// Returns the established identity at one captured declaration position.
     #[must_use]
     pub fn symbol_identity_at(&self, path: &ProjectPath, position: usize) -> Option<&SymbolId> {
-        self.identities.get(&(path.clone(), position))
+        self.declarations
+            .address(path, position)
+            .map(|(identity, _)| identity)
     }
 
     /// The symbol the captured declaration at `position` of `path`'s symbols binds, and that
@@ -201,7 +193,9 @@ impl WorkspaceSymbolView {
             .symbols()
             .iter()
             .position(|symbol| symbol.range == range || symbol.item_range == range)?;
-        self.identities.get(&(path.clone(), position))
+        self.declarations
+            .address(path, position)
+            .map(|(identity, _)| identity)
     }
 
     /// Returns accepted source bytes from the captured syntax or text catalog.
@@ -343,7 +337,7 @@ impl WorkspaceSymbolView {
             .filter(|(_, bindings)| {
                 bindings
                     .iter()
-                    .any(|binding| !self.identities.contains_key(binding))
+                    .any(|(path, position)| self.declarations.address(path, *position).is_none())
             })
             .map(|(provider, _)| {
                 ReadableSymbol::assembled_by(&self.semantics, provider)

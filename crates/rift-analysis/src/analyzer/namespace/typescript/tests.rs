@@ -907,14 +907,12 @@ fn package_ambient_requires_metadata_and_local_declarations_keep_their_owner() {
 }
 
 #[test]
-fn package_ambient_global_unquoted_outside_and_malformed_remain_unknown() {
+fn package_ambient_global_unquoted_and_outside_remain_unknown() {
     let metadata = include_str!("../../../../tests/fixtures/types-node-package.json");
     for source in [
         "declare namespace NodeJS { function isUtf8(): boolean; }",
         "declare global { function isUtf8(): boolean; }",
         "export function isUtf8(): boolean;",
-        "declare module \"node:buffer\" { export function isUtf8(input: ): boolean; }",
-        "declare module \"node:buffer\" { global { interface Broken { value: } } }",
     ] {
         let (found, _) = ambient_prepared(&types_node_owner(), Some(metadata), source);
         assert!(found.anchors.is_empty(), "{source}");
@@ -926,6 +924,27 @@ fn package_ambient_global_unquoted_outside_and_malformed_remain_unknown() {
     assert!(anchors.contains_key("\"node:buffer\".isUtf8"));
     assert!(!anchors.contains_key("outside"));
     assert!(!anchors.keys().any(|name| name.starts_with("global.")));
+}
+
+#[test]
+fn package_ambient_module_keeps_id_with_malformed_members() {
+    let metadata = include_str!("../../../../tests/fixtures/types-node-package.json");
+    for source in [
+        "declare module \"node:buffer\" { export function isUtf8(input: ): boolean; }",
+        "declare module \"node:buffer\" { global { interface Broken { value: } } }",
+    ] {
+        let (found, facts) = ambient_prepared(&types_node_owner(), Some(metadata), source);
+        assert!(facts.has_errors());
+        let anchors = &found.anchors["buffer.d.ts"];
+        assert_eq!(
+            anchors.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["\"node:buffer\""],
+            "{source}"
+        );
+        let identity =
+            SymbolIdentity::parse(anchors["\"node:buffer\""].as_str()).expect("module identity");
+        assert_eq!(identity.qualified_path(), ["node:buffer"]);
+    }
 }
 
 #[test]

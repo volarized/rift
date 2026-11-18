@@ -2667,6 +2667,16 @@ struct SymbolDeclarations {
     addresses: BTreeMap<(ProjectPath, usize), (SymbolId, usize)>,
 }
 
+/// The assembled record one declaration belongs to, as the directory build already holds it.
+enum HeldRecordObject<'a> {
+    /// The record's identity has this readable object.
+    Assembled(&'a ReadableSymbol),
+    /// The record assembles with portable facts and has no identity.
+    Unidentified,
+    /// The held objects do not answer; the declaration is assembled on its own.
+    Unknown,
+}
+
 impl SymbolDeclarations {
     /// The symbol one declaration binds, and the declaration's ordinal among that symbol's
     /// bindings in the order a symbol read lists them.
@@ -3829,6 +3839,63 @@ impl WorkspaceIndex {
         })
     }
 
+    /// What [`Self::assembled_symbol`] answers for the declaration `provider` names, read from
+    /// the record objects the directory already assembled.
+    ///
+    /// Declarations merged into one record share its assembly. Assembling it again per
+    /// declaration cost the record's Contribution count once per declaration, quadratic in
+    /// a record's size: on Bun (511,604 declarations in 270,153 identified records) that pass
+    /// took 28 s, against 0.8 s for one assembly per record. A record with no identity is
+    /// decided from its Contributions alone. Any other case answers
+    /// [`HeldRecordObject::Unknown`], and the caller assembles it as before.
+    fn held_record_object<'a>(
+        &self,
+        objects: &BTreeMap<SymbolId, usize>,
+        assembled: &'a BTreeMap<SymbolId, Result<ReadableSymbol, RiftError>>,
+        provider: &str,
+    ) -> HeldRecordObject<'a> {
+        let graph = self.semantics.graph();
+        let Some(position) = self.semantics.record_position(provider) else {
+            return HeldRecordObject::Unknown;
+        };
+        let Some(record) = graph.records().get(position) else {
+            return HeldRecordObject::Unknown;
+        };
+        let Some(identity) = record.identity() else {
+            return if rift_provider::SymbolAssembler::assembles_facts(graph, record) {
+                HeldRecordObject::Unidentified
+            } else {
+                HeldRecordObject::Unknown
+            };
+        };
+        if objects.get(identity) != Some(&position) {
+            return HeldRecordObject::Unknown;
+        }
+        match assembled.get(identity) {
+            Some(Ok(object)) => HeldRecordObject::Assembled(object),
+            _ => HeldRecordObject::Unknown,
+        }
+    }
+
+    /// The readable symbol one declaration binds while the directory is built: the held
+    /// record object when [`Self::held_record_object`] answers, `None` for a record with no
+    /// identity, and [`Self::assembled_symbol`] otherwise.
+    fn declaration_object<'a>(
+        &self,
+        matched: SymbolMatch<'_>,
+        provider: &str,
+        objects: &BTreeMap<SymbolId, usize>,
+        assembled: &'a BTreeMap<SymbolId, Result<ReadableSymbol, RiftError>>,
+    ) -> Result<Option<Cow<'a, ReadableSymbol>>, RiftError> {
+        Ok(
+            match self.held_record_object(objects, assembled, provider) {
+                HeldRecordObject::Assembled(object) => Some(Cow::Borrowed(object)),
+                HeldRecordObject::Unidentified => None,
+                HeldRecordObject::Unknown => Some(Cow::Owned(self.assembled_symbol(matched)?)),
+            },
+        )
+    }
+
     /// Files the build left out of the index, whole or in part, in project-path order.
     ///
     /// Build and rebuild continue after invalid UTF-8, NUL bytes, a file beyond
@@ -4163,7 +4230,15 @@ impl WorkspaceIndex {
                     .entry(provider.clone())
                     .or_default()
                     .push((file.path().clone(), index));
-                let assembled = self.assembled_symbol(matched)?;
+                let Some(assembled) = self.declaration_object(
+                    matched,
+                    &provider,
+                    &declarations.objects,
+                    &declarations.assembled,
+                )?
+                else {
+                    continue;
+                };
                 if let Some(identity) = assembled.identity() {
                     let declaration =
                         self.declaration_facts(matched, &provider, &assembled, &starts)?;
@@ -13565,6 +13640,69 @@ mod tests {
                 .expect("established bindings")
                 .len(),
             3
+        );
+    }
+
+    #[test]
+    fn directory_reads_each_declaration_from_its_record_assembly() {
+        let root = tempfile::tempdir().expect("workspace");
+        fs::write(
+            root.path().join("package.json"),
+            r#"{"name":"beacon","version":"1.0.0","main":"index.js","types":"index.d.ts"}"#,
+        )
+        .expect("captured package metadata");
+        fs::write(
+            root.path().join("index.js"),
+            "export function open(path) {}\nfunction local() {}\n",
+        )
+        .expect("implementation");
+        fs::write(
+            root.path().join("index.d.ts"),
+            "export declare function open(path: string): void;\nexport declare function open(path: number): void;\n",
+        )
+        .expect("overloads");
+        let index = WorkspaceIndex::build(
+            root.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("captured index");
+        let declarations = index.build_symbol_declarations().expect("directory");
+        let mut held = 0;
+        for file in index.files() {
+            for position in 0..file.syntax().symbols().len() {
+                let matched = index
+                    .declaration_match(file.path(), position)
+                    .expect("captured declaration");
+                let provider = matched.symbol.provider_address(
+                    &file.syntax().language().identity_segment(),
+                    file.path().as_str(),
+                );
+                let assembled = index.assembled_symbol(matched).expect("readable symbol");
+                match index.held_record_object(
+                    &declarations.objects,
+                    &declarations.assembled,
+                    &provider,
+                ) {
+                    HeldRecordObject::Assembled(object) => {
+                        assert_eq!(object, &assembled, "{provider}");
+                        held += 1;
+                    }
+                    HeldRecordObject::Unidentified => {
+                        assert!(assembled.identity().is_none(), "{provider}");
+                    }
+                    HeldRecordObject::Unknown => panic!("{provider} has no held record"),
+                }
+            }
+        }
+        assert_eq!(held, declarations.facts.len());
+        assert!(
+            declarations
+                .canonical
+                .values()
+                .any(|bindings| bindings.len() == 3),
+            "three declarations of open share one record assembly"
         );
     }
 
