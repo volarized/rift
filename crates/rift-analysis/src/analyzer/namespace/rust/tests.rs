@@ -2863,6 +2863,91 @@ fn external_public_reexports_keep_original_alias_chain_and_defining_owner() {
     );
 }
 
+/// A `pub use` path that starts at a child module, without `crate::` or
+/// `self::`, names that module's item, and an `as` rename gives the alias
+/// its own name.
+#[test]
+fn relative_public_reexports_alias_the_child_module_item() {
+    let target = local_alias_analysis(
+        &[
+            (
+                "src/lib.rs",
+                "mod shapes;\npub use shapes::Circle as Round;\npub use shapes::Square;\n",
+            ),
+            ("src/shapes.rs", "pub struct Circle;\npub struct Square;\n"),
+        ],
+        "[package]\nname='serde_core'\nversion='1.0.228'\n[lib]\npath='src/lib.rs'\n",
+    );
+    for (alias, item) in [
+        ("/serde_core/Round", "/serde_core/shapes/Circle"),
+        ("/serde_core/Square", "/serde_core/shapes/Square"),
+    ] {
+        assert!(
+            target.publication().edges.iter().any(|edge| edge
+                .from
+                .as_str()
+                .ends_with(alias)
+                && edge.to.as_str().ends_with(item)),
+            "alias {alias} must target {item}"
+        );
+    }
+}
+
+#[test]
+fn rust_public_reexports_keep_rust_identity_in_a_mixed_workspace() {
+    let path = ProjectPath::new("src/lib.rs").expect("source path");
+    let text = "mod shapes { pub struct Circle; }\npub use shapes::Circle as Round;\n";
+    let files = [PackageSource::new(&path, text)];
+    let manifest_path = ProjectPath::new("Cargo.toml").expect("manifest path");
+    let metadata = [PackageSource::new(&manifest_path, MANIFEST)];
+    let owner = SymbolOwner::Local;
+    let language = rift_syntax::ShippedLanguage::Toml.language();
+    let limits = rift_syntax::SyntaxLimits::default();
+    let input =
+        NamespaceInput::workspace(&owner, &language, &files, &metadata, &[], (2, 4096, limits))
+            .expect("mixed workspace");
+    let syntax = RustSyntaxProvider::default()
+        .analyze(SyntaxSource { path: &path, text }, limits)
+        .expect("Rust syntax")
+        .into_facts();
+    let selected = [super::super::SelectedFile {
+        path: &path,
+        source: text,
+        syntax: &syntax,
+    }];
+    let prepared = super::prepare(&input, &selected);
+    assert_eq!(prepared.exports.len(), 1);
+    assert_eq!(
+        prepared.exports[0].identity.as_str(),
+        "rift://symbol/local/rust/crate_root/Round"
+    );
+    assert_eq!(
+        prepared.exports[0].target.as_str(),
+        "rift://symbol/local/rust/crate_root/shapes/Circle"
+    );
+}
+
+#[test]
+fn public_reexports_remain_when_an_external_crate_is_declared() {
+    let target = local_alias_analysis(
+        &[
+            (
+                "src/lib.rs",
+                "mod shapes;\npub use shapes::Circle as Round;\nextern crate core;\n",
+            ),
+            ("src/shapes.rs", "pub struct Circle;\n"),
+        ],
+        "[package]\nname='serde_core'\nversion='1.0.228'\n[lib]\npath='src/lib.rs'\n",
+    );
+    assert!(
+        target.publication().edges.iter().any(|edge| edge
+            .from
+            .as_str()
+            .ends_with("/serde_core/Round")
+            && edge.to.as_str().ends_with("/serde_core/shapes/Circle"))
+    );
+}
+
 #[test]
 fn external_public_reexports_without_admitted_target_remain_unresolved() {
     let target = local_alias_analysis(
@@ -3034,7 +3119,7 @@ fn cargo_targets_other_than_the_library_and_their_modules_sit_outside_namespaces
 }
 
 #[test]
-fn a_target_that_failed_analysis_does_not_reach_its_modules() {
+fn a_target_with_parse_errors_reaches_its_valid_modules() {
     let origin = ContributionOrigin::new(
         Some(SourceLocation::Project { package: None }),
         SourceKind::Authored,
@@ -3043,8 +3128,9 @@ fn a_target_that_failed_analysis_does_not_reach_its_modules() {
     let prepared = prepared_for_context(
         &[("Cargo.toml", MANIFEST)],
         &[
-            ("src/main.rs", "mod cli;\nfn main( {}\n"),
-            ("src/cli.rs", "pub fn run() {}\n"),
+            ("src/main.rs", "mod a;\nfn main( {}\n"),
+            ("src/a.rs", "mod b;\npub fn run( {}\n"),
+            ("src/a/b.rs", "pub fn run() {}\n"),
         ],
         None,
         false,
@@ -3058,6 +3144,144 @@ fn a_target_that_failed_analysis_does_not_reach_its_modules() {
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>(),
+        ["src/a.rs", "src/a/b.rs", "src/main.rs"]
+    );
+}
+
+#[test]
+fn library_modules_keep_identities_beside_parse_errors() {
+    let found = selected_anchors(
+        &[("Cargo.toml", MANIFEST)],
+        &[
+            ("src/lib.rs", "pub mod a;\npub fn broken( {}\n"),
+            ("src/a.rs", "pub mod b;\npub fn broken( {}\n"),
+            ("src/a/b.rs", "pub struct Sender;\n"),
+        ],
+        None,
+        false,
+    );
+    assert_eq!(
+        found["src/lib.rs"]["a"].as_str(),
+        "rift://symbol/cargo/crates.io/crate-root/rust/crate_root/a"
+    );
+    assert_eq!(
+        found["src/a.rs"]["b"].as_str(),
+        "rift://symbol/cargo/crates.io/crate-root/rust/crate_root/a/b"
+    );
+    assert_eq!(
+        found["src/a/b.rs"]["Sender"].as_str(),
+        "rift://symbol/cargo/crates.io/crate-root/rust/crate_root/a/b/Sender"
+    );
+}
+
+#[test]
+fn modules_inside_error_subtrees_are_not_followed() {
+    let text = "pub mod a;\nfn broken() { mod hidden;\n";
+    let path = ProjectPath::new("src/lib.rs").expect("source path");
+    let source = SyntaxSource { path: &path, text };
+    let provider = RustSyntaxProvider::default();
+    let limits = rift_syntax::SyntaxLimits::default();
+    let document = provider.analyze(source, limits).expect("captured syntax");
+    let hidden = document
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.name == "hidden")
+        .expect("captured module inside error subtree");
+    assert!(hidden.container.is_none());
+    let invalid = provider
+        .invalid_declarations(source, limits, &[hidden.item_range])
+        .expect("declaration validation");
+    assert!(invalid.contains(&hidden.item_range));
+    let origin = ContributionOrigin::new(
+        Some(SourceLocation::Project { package: None }),
+        SourceKind::Authored,
+    )
+    .expect("selected project origin");
+    for root in ["src/lib.rs", "src/main.rs"] {
+        let prepared = prepared_for_context(
+            &[("Cargo.toml", MANIFEST)],
+            &[
+                (root, text),
+                ("src/a.rs", "pub struct Sender;\n"),
+                ("src/hidden.rs", "pub struct Hidden;\n"),
+            ],
+            None,
+            false,
+            &SymbolOwner::Local,
+            &origin,
+            false,
+        );
+        assert!(!prepared.anchors.contains_key("src/hidden.rs"));
+        assert!(!prepared.outside_namespaces.contains("src/hidden.rs"));
+        if root == "src/lib.rs" {
+            assert!(prepared.anchors.contains_key("src/a.rs"));
+        } else {
+            assert!(prepared.outside_namespaces.contains("src/a.rs"));
+        }
+    }
+}
+
+#[test]
+fn library_and_binary_with_parse_errors_keep_the_shared_module_library_identity() {
+    let origin = ContributionOrigin::new(
+        Some(SourceLocation::Project { package: None }),
+        SourceKind::Authored,
+    )
+    .expect("selected project origin");
+    let prepared = prepared_for_context(
+        &[("Cargo.toml", MANIFEST)],
+        &[
+            ("src/lib.rs", "pub mod shared;\npub fn broken( {}\n"),
+            ("src/main.rs", "mod shared;\nfn main( {}\n"),
+            ("src/shared.rs", "pub struct Sender;\n"),
+        ],
+        None,
+        false,
+        &SymbolOwner::Local,
+        &origin,
+        false,
+    );
+    assert_eq!(
+        prepared.anchors["src/shared.rs"]["Sender"].as_str(),
+        "rift://symbol/local/rust/crate_root/shared/Sender"
+    );
+    assert_eq!(
+        prepared.outside_namespaces.into_iter().collect::<Vec<_>>(),
         ["src/main.rs"]
     );
+}
+
+#[test]
+fn partial_library_extraction_keeps_original_source_and_incomplete_coverage() {
+    let text = "pub mod a;\n}\n";
+    let analysis = local_alias_analysis(
+        &[("src/lib.rs", text), ("src/a.rs", "pub struct Sender;\n")],
+        LOCAL_ALIAS_MANIFEST,
+    );
+    let publication = analysis.publication();
+    let sender = publication
+        .objects
+        .iter()
+        .find(|object| object.name == "Sender")
+        .expect("valid module declaration");
+    assert_eq!(
+        sender.id.as_ref().expect("library identity").as_str(),
+        "rift://symbol/cargo/crates.io/serde_core/rust/serde_core/a/Sender"
+    );
+    assert!(publication.objects.iter().all(|object| object.id.is_some()));
+    let root = publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "src/lib.rs")
+        .expect("original root");
+    assert_eq!(root.source, text);
+    assert!(root.source_complete);
+    let parsed_root = analysis
+        .files()
+        .iter()
+        .find(|held| held.file().path().as_str() == "src/lib.rs")
+        .expect("captured root");
+    assert!(parsed_root.file().syntax().has_errors());
+    assert!(publication.coverage[0].inventory_complete);
+    assert!(!publication.coverage[0].identity_complete);
 }

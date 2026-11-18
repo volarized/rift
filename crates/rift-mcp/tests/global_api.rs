@@ -167,7 +167,7 @@ pub(crate) struct FixtureOptions {
     /// The `dependency_entries_max` the capabilities advertise.
     pub(crate) dependency_entries_max: u64,
     /// Whether the precise search page stops at the response body bound: it answers its
-    /// declarations with a `result_truncated` warning and [`BODY_BOUND_CURSOR`].
+    /// declarations with a `result_truncated` warning.
     pub(crate) stopped_at_body_bound: bool,
     /// Whether precise search answers carry the incomplete-query warning.
     pub(crate) query_narrowed: bool,
@@ -636,8 +636,7 @@ fn declarations(request: &Value) -> Value {
     json!({"results": results})
 }
 
-/// One page of `items` and `warnings`, with the revision fields every page carries and no
-/// cursor.
+/// One page of `items` and `warnings`, with the revision fields every page carries.
 fn page(items: &[Value], warnings: &Value) -> Value {
     json!({
         "items": items,
@@ -842,7 +841,7 @@ fn greeting_symbol() -> Value {
 /// page warning; the broad phase answers no further declaration unless the query is
 /// [`BROAD_BODY_MATCH_QUERY`]. That query answers every declaration as a body match in
 /// source order. [`BODY_MATCH_QUERY`] answers `beacon` as a body match. A page stopped
-/// at the response body bound adds `result_truncated` and [`BODY_BOUND_CURSOR`].
+/// at the response body bound adds `result_truncated`.
 fn search_page(
     fixture: SymbolFixture,
     request: &Value,

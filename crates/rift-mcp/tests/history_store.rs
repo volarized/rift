@@ -155,9 +155,19 @@ async fn a_symbol_history_answers_from_the_store_with_authors_across_a_move() ->
 
     let history = complete_history(&client).await?;
 
-    let edges: Vec<(String, String)> = history["edges"]
+    let (commits, co_changes): (Vec<&Value>, Vec<&Value>) = history["edges"]
         .as_array()
         .ok_or("edges is an array")?
+        .iter()
+        .partition(|edge| edge.get("commit").is_some());
+    assert!(
+        co_changes.iter().all(|edge| edge["edge"] == "co_changes"
+            && edge["symbol"]
+                .as_str()
+                .is_some_and(|symbol| symbol.starts_with("rift://symbol/local/toml/"))),
+        "only the fixture's TOML documents change with it: {history}"
+    );
+    let edges: Vec<(String, String)> = commits
         .iter()
         .map(|edge| {
             (
@@ -176,7 +186,7 @@ async fn a_symbol_history_answers_from_the_store_with_authors_across_a_move() ->
     ]
     .map(|(edge, path)| (edge.to_owned(), path.to_owned()));
     assert_eq!(edges, expected, "{history}");
-    for edge in history["edges"].as_array().into_iter().flatten() {
+    for edge in commits {
         assert_eq!(
             edge["commit"]["author"],
             json!({"name": "Rift Fixture", "email": "fixture@rift.invalid"}),
@@ -218,7 +228,13 @@ async fn a_second_worktree_reads_the_store_the_first_filled() -> TestResult {
         json!(true),
         "the store already holds every shared commit: {history}"
     );
-    assert_eq!(history["edges"].as_array().map(Vec::len), Some(3));
+    let commits = history["edges"].as_array().map(|edges| {
+        edges
+            .iter()
+            .filter(|edge| edge.get("commit").is_some())
+            .count()
+    });
+    assert_eq!(commits, Some(3), "{history}");
     assert_eq!(
         store_files(&root.join(".git/.rift")).len(),
         1,

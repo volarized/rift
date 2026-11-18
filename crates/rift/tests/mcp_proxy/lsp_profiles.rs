@@ -246,8 +246,9 @@ async fn caller_read(
     logs: &Path,
 ) -> TestResult {
     let seed = oxrdf::NamedNodeRef::new(hit.id.as_str())?;
+    // Module imports also reference the symbol; select the calling function.
     let arguments = json!({"query":format!(
-        "SELECT DISTINCT ?symbol {{ ?symbol :references {seed} }}"
+        "SELECT DISTINCT ?symbol {{ ?symbol :references {seed}; :kind 'function' }}"
     )});
     let answer = match proxied_call(client, "search", &arguments).await {
         Ok(answer) => answer,

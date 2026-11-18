@@ -630,9 +630,12 @@ fn captured_project_metadata_keeps_local_and_named_owners_distinct() {
 }
 
 #[test]
-fn local_owner_without_captured_entry_metadata_keeps_identity_unresolved() {
+fn local_owner_without_captured_entry_metadata_uses_relative_module() {
     let result = prepared_project(&rift_protocol::identity::SymbolOwner::Local, None);
-    assert!(result.anchors.is_empty());
+    assert_eq!(
+        result.anchors["index.d.ts"]["format"].as_str(),
+        "rift://symbol/local/typescript/.%2Findex.d.ts/format"
+    );
     assert!(result.exports.is_empty());
     assert!(result.mappings.is_empty());
 }
@@ -862,7 +865,7 @@ fn package_ambient_original_buffer_keeps_owner_ranges_and_unknown_entry() {
 }
 
 #[test]
-fn package_ambient_missing_wrong_metadata_and_other_owners_remain_unknown() {
+fn package_ambient_requires_metadata_and_local_declarations_keep_their_owner() {
     use rift_protocol::identity::SymbolOwner;
     let source =
         "declare module \"node:buffer\" { export function isUtf8(input: unknown): boolean; }";
@@ -888,20 +891,28 @@ fn package_ambient_missing_wrong_metadata_and_other_owners_remain_unknown() {
     ] {
         let (found, facts) = ambient_prepared(&owner, Some(original), source);
         assert!(facts.symbols().iter().any(|symbol| symbol.name == "isUtf8"));
-        assert!(found.anchors.is_empty(), "{owner:?}");
+        if owner.is_local() {
+            let identity = &found.anchors["buffer.d.ts"]["\"node:buffer\".isUtf8"];
+            assert_eq!(
+                SymbolIdentity::parse(identity.as_str())
+                    .expect("local declaration")
+                    .owner(),
+                &owner
+            );
+        } else {
+            assert!(found.anchors.is_empty(), "{owner:?}");
+        }
         assert!(found.mappings.is_empty());
     }
 }
 
 #[test]
-fn package_ambient_global_unquoted_outside_and_malformed_remain_unknown() {
+fn package_ambient_global_unquoted_and_outside_remain_unknown() {
     let metadata = include_str!("../../../../tests/fixtures/types-node-package.json");
     for source in [
         "declare namespace NodeJS { function isUtf8(): boolean; }",
         "declare global { function isUtf8(): boolean; }",
         "export function isUtf8(): boolean;",
-        "declare module \"node:buffer\" { export function isUtf8(input: ): boolean; }",
-        "declare module \"node:buffer\" { global { interface Broken { value: } } }",
     ] {
         let (found, _) = ambient_prepared(&types_node_owner(), Some(metadata), source);
         assert!(found.anchors.is_empty(), "{source}");
@@ -913,6 +924,27 @@ fn package_ambient_global_unquoted_outside_and_malformed_remain_unknown() {
     assert!(anchors.contains_key("\"node:buffer\".isUtf8"));
     assert!(!anchors.contains_key("outside"));
     assert!(!anchors.keys().any(|name| name.starts_with("global.")));
+}
+
+#[test]
+fn package_ambient_module_keeps_id_with_malformed_members() {
+    let metadata = include_str!("../../../../tests/fixtures/types-node-package.json");
+    for source in [
+        "declare module \"node:buffer\" { export function isUtf8(input: ): boolean; }",
+        "declare module \"node:buffer\" { global { interface Broken { value: } } }",
+    ] {
+        let (found, facts) = ambient_prepared(&types_node_owner(), Some(metadata), source);
+        assert!(facts.has_errors());
+        let anchors = &found.anchors["buffer.d.ts"];
+        assert_eq!(
+            anchors.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["\"node:buffer\""],
+            "{source}"
+        );
+        let identity =
+            SymbolIdentity::parse(anchors["\"node:buffer\""].as_str()).expect("module identity");
+        assert_eq!(identity.qualified_path(), ["node:buffer"]);
+    }
 }
 
 #[test]

@@ -67,7 +67,7 @@ fn anchors(text: &str, parsed: &str, captured: bool) -> BTreeMap<String, SymbolI
 fn python_captured_and_uncaptured_digest_keep_identical_unique_identity() {
     let text = "def beacon():\n    return 1\n";
     let ordinary = anchors(text, text, false);
-    assert_eq!(ordinary.len(), 1);
+    assert_eq!(ordinary.len(), 2);
     assert_eq!(anchors(text, text, true), ordinary);
     let identity = SymbolIdentity::parse(ordinary["beacon"].as_str()).expect("canonical identity");
     assert_eq!(identity.owner(), &SymbolOwner::Local);
@@ -79,7 +79,7 @@ fn python_cached_digest_rejects_facts_from_different_bytes() {
     let changed = "def beacon():\n    return 2\n";
     assert!(anchors(text, changed, true).is_empty());
     assert!(anchors(text, changed, false).is_empty());
-    assert_eq!(anchors(changed, changed, true).len(), 1);
+    assert_eq!(anchors(changed, changed, true).len(), 2);
 }
 
 #[test]
@@ -90,7 +90,7 @@ fn python_repeated_declarations_share_one_identity() {
     assert_eq!(ordinary, captured);
     assert_eq!(
         ordinary.len(),
-        1,
+        2,
         "both declarations spell one qualified name"
     );
     let identities = captured.values().collect::<std::collections::BTreeSet<_>>();
@@ -99,15 +99,23 @@ fn python_repeated_declarations_share_one_identity() {
             .into_iter()
             .map(SymbolId::as_str)
             .collect::<Vec<_>>(),
-        ["rift://symbol/local/python/main/beacon"]
+        [
+            "rift://symbol/local/python/main",
+            "rift://symbol/local/python/main/beacon"
+        ]
     );
 }
 
 #[test]
-fn python_captured_digest_refuses_malformed_source_facts() {
+fn python_captured_digest_keeps_module_for_malformed_source_facts() {
     let malformed = "def beacon(\n";
-    assert!(anchors(malformed, malformed, true).is_empty());
-    assert!(anchors(malformed, malformed, false).is_empty());
+    let ordinary = anchors(malformed, malformed, false);
+    assert_eq!(anchors(malformed, malformed, true), ordinary);
+    assert_eq!(
+        ordinary.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["."]
+    );
+    assert_eq!(ordinary["."].as_str(), "rift://symbol/local/python/main");
 }
 use rift_protocol::identity::SymbolOwner;
 use rift_syntax::SyntaxLimits;

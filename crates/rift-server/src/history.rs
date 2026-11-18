@@ -1529,6 +1529,12 @@ mod tests {
                 "changed_in body_changed lib.rs".to_owned(),
                 "introduced_in lib.rs".to_owned(),
                 format!("co_changes {} 2", beacon_two.as_str()),
+                "co_changes rift://symbol/local/toml/Cargo.toml/lib 1".to_owned(),
+                "co_changes rift://symbol/local/toml/Cargo.toml/lib%20%3E%20path 1".to_owned(),
+                "co_changes rift://symbol/local/toml/Cargo.toml/package 1".to_owned(),
+                "co_changes rift://symbol/local/toml/Cargo.toml/package%20%3E%20name 1".to_owned(),
+                "co_changes rift://symbol/local/toml/Cargo.toml/package%20%3E%20version 1"
+                    .to_owned(),
             ],
             "both commits changed both declarations, and a walk holds no store"
         );
@@ -1681,7 +1687,11 @@ mod tests {
         else {
             return Err("the read carries the stored history".into());
         };
-        assert_eq!(history.edges.len(), 3, "two commit edges and one co-change");
+        assert_eq!(
+            history.edges.len(),
+            8,
+            "two commit edges and six co-changes"
+        );
         assert!(history.complete);
         Ok(())
     }
@@ -1767,6 +1777,11 @@ mod tests {
                 "renamed_from after.rs from before.rs",
                 "changed_in body_changed before.rs",
                 "introduced_in before.rs",
+                "co_changes rift://symbol/local/toml/Cargo.toml/lib 1",
+                "co_changes rift://symbol/local/toml/Cargo.toml/lib%20%3E%20path 1",
+                "co_changes rift://symbol/local/toml/Cargo.toml/package 1",
+                "co_changes rift://symbol/local/toml/Cargo.toml/package%20%3E%20name 1",
+                "co_changes rift://symbol/local/toml/Cargo.toml/package%20%3E%20version 1",
             ]
         );
         assert!(timeline.complete);
@@ -1834,7 +1849,12 @@ mod tests {
             [
                 "renamed_from to.rs from from.rs",
                 "introduced_in from.rs",
+                "co_changes rift://symbol/local/toml/Cargo.toml/lib 2",
+                "co_changes rift://symbol/local/toml/Cargo.toml/lib%20%3E%20path 2",
                 "co_changes rift://symbol/local/rust/beacon/arrived 1",
+                "co_changes rift://symbol/local/toml/Cargo.toml/package 1",
+                "co_changes rift://symbol/local/toml/Cargo.toml/package%20%3E%20name 1",
+                "co_changes rift://symbol/local/toml/Cargo.toml/package%20%3E%20version 1",
             ],
             "the move introduced `arrived` beside it; the removed `stays` binds no served symbol"
         );

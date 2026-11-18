@@ -4316,7 +4316,7 @@ pub struct EdgeSelection {
 }
 /// Complete lowercase SHA-256 digest of immutable source bytes.
 pub type SourceDigest = String;
-/// One kind: a declaration with its location, source, and syntax structure.
+/// One facet: a declaration with its location, source, and syntax structure.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
 pub struct FacetDeclaration {

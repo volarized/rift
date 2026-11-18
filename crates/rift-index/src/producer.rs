@@ -190,7 +190,7 @@ impl<'publication> PublicationSyntax<'publication> {
 /// The added edges follow the built-in ones, sorted by `from`, `to`, `kind`,
 /// occurrence unit and range, `derivation`, `kinds`, then `confidence`, so the order the
 /// producer emitted them in does not reach the publication's bytes. Occurrences are kept in
-/// unit, range, and symbol order. The publication is checked whole with
+/// unit, range, symbol, and producer order. The publication is checked whole with
 /// [`PackagePublication::validate_facts`] before it is returned.
 ///
 /// # Errors
@@ -235,12 +235,20 @@ pub fn accept_producer_facts(
     publication.edges[built_in..].sort_by(canonical_order);
     publication.occurrences.extend(occurrences);
     publication.occurrences.sort_by(|left, right| {
-        (&left.unit, left.range.start, left.range.end, &left.symbol).cmp(&(
-            &right.unit,
-            right.range.start,
-            right.range.end,
-            &right.symbol,
-        ))
+        (
+            &left.unit,
+            left.range.start,
+            left.range.end,
+            &left.symbol,
+            &left.producer,
+        )
+            .cmp(&(
+                &right.unit,
+                right.range.start,
+                right.range.end,
+                &right.symbol,
+                &right.producer,
+            ))
     });
     publication.coverage[coverage]
         .facts

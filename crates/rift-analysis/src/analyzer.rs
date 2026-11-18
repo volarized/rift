@@ -453,7 +453,7 @@ fn resolve_package_static(
     );
 }
 
-fn edge_kind(kind: rift_core::EdgeKind) -> rift_protocol::read::EdgeKind {
+pub(crate) fn edge_kind(kind: rift_core::EdgeKind) -> rift_protocol::read::EdgeKind {
     match kind {
         rift_core::EdgeKind::Reference => rift_protocol::read::EdgeKind::References,
         rift_core::EdgeKind::Definition => rift_protocol::read::EdgeKind::Declares,
@@ -1612,7 +1612,12 @@ impl Records {
             let Some(id) = record.identity().filter(|id| objects.contains(id.as_str())) else {
                 continue;
             };
-            for edge in semantics.edges().outgoing(id) {
+            for edge in semantics
+                .edges()
+                .outgoing(id)
+                .iter()
+                .filter(|edge| !edge.is_graph_edge())
+            {
                 if self.edges.len() >= limit {
                     self.warn(truncation(
                         "edges",
@@ -2763,7 +2768,7 @@ mod tests {
                     return Some(syntax.clone());
                 }
                 let syntax = source.parse().expect("fixture syntax");
-                assert_eq!(syntax.facts().symbols().len(), per_file);
+                assert_eq!(syntax.facts().symbols().len(), per_file + 1);
                 provider_calls += 1;
                 parsed = Some(syntax.clone());
                 Some(syntax)

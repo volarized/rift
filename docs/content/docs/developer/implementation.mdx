@@ -1573,11 +1573,11 @@ Rift imports into the same `PackagePublication`. Rift neither runs nor ships pro
   of a kind and makes no claim that they are complete; a kind no entry names was not produced.
 
 Package analysis covers `edges` for every language it analyzes and no `occurrences`.
-Whether a facet's edges are complete is stated by `coverage[].edges` alone,
+Whether the edges of an edge kind are complete is stated by `coverage[].edges` alone,
 which package analysis writes and an import leaves unchanged.
 
 `PackagePublication::validate_facts` refuses a fact whose language, kind, and producer no
-coverage entry names, and an occurrence outside the units the publication carries. A
+coverage entry names, and an occurrence outside the units the publication carries. An
 edge keeps its `producer` in the collected edge record.
 
 #### Producer input and output
@@ -1651,7 +1651,7 @@ A range that resolves to no syntax element - outside its unit, in a unit the pub
 or past a source the analyzer cut - is refused with `producer_range_unresolved`.
 
 Imported edges follow the built-in ones, sorted by `from`, `to`, `kind`, occurrence,
-`derivation`, `kinds`, and `confidence`, and occurrences stay in unit, range, and symbol order.
+`derivation`, `kinds`, and `confidence`, and occurrences stay in unit, range, symbol, and producer order.
 Two runs of one producer that find the same facts in another order give byte-identical
 publications, unless two of its edges differ in their `extensions` alone.
 

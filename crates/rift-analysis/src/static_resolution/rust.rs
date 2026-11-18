@@ -37,6 +37,20 @@ enum Namespace {
 }
 
 impl<'source> Namespaces<'source> {
+    pub(super) fn edge_type_target(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        if file.conditional(range, work) {
+            return None;
+        }
+        let parts = path_segments(file.text(range)?, work)?;
+        let path = self.resolved_path(file, range.start, &parts, work)?;
+        self.lookup(file, range.start, &path, Namespace::Type, work)
+    }
+
     pub(super) fn new(
         files: &BTreeMap<&'source str, File<'source>>,
         work: &mut Work,

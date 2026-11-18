@@ -54,12 +54,12 @@ fn test_package_publication_configuration_reaches_record_bounds() {
 fn test_package_environment_overrides_reach_publication_and_retention() {
     let environment = ConfigurationEnvironment::from_variables([
         ("RIFT_PACKAGE_UNITS", "2"),
-        ("RIFT_PACKAGE_SYMBOLS", "4"),
+        ("RIFT_PACKAGE_SYMBOLS", "6"),
         ("RIFT_PACKAGE_DOCUMENTS", "6"),
         ("RIFT_PACKAGE_WARNINGS", "8"),
         ("RIFT_PACKAGE_IDENTIFIER_TERMS", "2"),
         ("RIFT_PACKAGE_RETAINED_SOURCE", "64b"),
-        ("RIFT_PACKAGE_RETAINED_TOTAL", "256b"),
+        ("RIFT_PACKAGE_RETAINED_TOTAL", "512b"),
         ("RIFT_SOURCE_EDGES", "1"),
     ]);
     let accepted = accept_configuration::<WorkspaceConfiguration>(
@@ -70,7 +70,7 @@ fn test_package_environment_overrides_reach_publication_and_retention() {
     let limits =
         ExactPackageLimits::from_configuration(accepted.configuration()).expect("accepted limits");
     let result = analyze(limits, &source(2), &source(2)).expect("configured package");
-    assert_eq!(result.publication().declarations.len(), 4);
+    assert_eq!(result.publication().declarations.len(), 6);
     assert_eq!(result.publication().documents.len(), 6);
     assert!(
         result
@@ -211,12 +211,12 @@ fn analyze(
 #[test]
 fn test_declaration_limit_accepts_exact_count_and_refuses_one_more() {
     let limits = ExactPackageLimits::new(2, 1 << 20)
-        .with_declarations(4)
+        .with_declarations(6)
         .expect("limit");
     let first = source(2);
     let second = source(2);
     let analysis = analyze(limits, &first, &second).expect("exact declaration count");
-    assert_eq!(analysis.publication().declarations.len(), 4);
+    assert_eq!(analysis.publication().declarations.len(), 6);
     assert!(analysis.publication().warnings.is_empty());
 
     let error = analyze(limits, &first, &source(3)).expect_err("one more declaration");
@@ -242,9 +242,9 @@ fn test_declaration_limit_preserves_default_and_uses_configured_bound() {
     let source_max = rift_protocol::index::PACKAGE_SOURCE_BYTES_MAX as usize;
     assert!(first.len() <= source_max && second.len() <= source_max);
     let baseline = analyze(limits, &first, &second).expect("default declaration bound");
-    assert_eq!(baseline.publication().declarations.len(), 3);
+    assert_eq!(baseline.publication().declarations.len(), 5);
     let selected = limits
-        .with_declarations(2)
+        .with_declarations(4)
         .expect("selected declaration bound");
     let error = analyze(selected, &first, &second).expect_err("selected declaration bound");
     assert_eq!(
@@ -253,10 +253,10 @@ fn test_declaration_limit_preserves_default_and_uses_configured_bound() {
     );
 
     let raised = selected
-        .with_declarations(3)
+        .with_declarations(5)
         .expect("raised declaration bound");
     let analysis = analyze(raised, &first, &second).expect("larger package");
-    assert_eq!(analysis.publication().declarations.len(), 3);
+    assert_eq!(analysis.publication().declarations.len(), 5);
     assert!(analysis.publication().warnings.is_empty());
 }
 
@@ -282,7 +282,7 @@ fn test_configuration_and_environment_declaration_limits_reach_analysis() {
     );
 
     let environment = ConfigurationEnvironment::from_variables([
-        ("RIFT_SOURCE_DECLARATIONS", "10001"),
+        ("RIFT_SOURCE_DECLARATIONS", "10003"),
         ("RIFT_SOURCE_FILES", "3000"),
         ("RIFT_SOURCE_WORKSPACE_SIZE", "64mb"),
         ("RIFT_PROVIDERS_SYNTAX_MAX_FILE", "16mb"),
@@ -294,13 +294,13 @@ fn test_configuration_and_environment_declaration_limits_reach_analysis() {
     let limits = ExactPackageLimits::from_configuration(accepted.configuration()).expect("bounds");
     assert_eq!(limits.files_max(), 3000);
     assert_eq!(limits.bytes_max(), 64 << 20);
-    assert_eq!(limits.declarations_max(), 10_001);
+    assert_eq!(limits.declarations_max(), 10_003);
     assert_eq!(
         limits.syntax(),
         SyntaxLimits::new(16 << 20, 5_000_000, 1024).expect("syntax")
     );
     let analysis = analyze(limits, &first, &second).expect("environment raises declaration bound");
-    assert_eq!(analysis.publication().declarations.len(), 10_001);
+    assert_eq!(analysis.publication().declarations.len(), 10_003);
     assert!(analysis.publication().warnings.is_empty());
 }
 
@@ -359,13 +359,13 @@ fn test_retained_total_counts_only_published_document_copies() {
     configuration.package.documents = 1;
     configuration.package.retained_source = rift_protocol::configuration::ByteSize::from_bytes(1);
     configuration.package.retained_total =
-        Some(rift_protocol::configuration::ByteSize::from_bytes(3));
+        Some(rift_protocol::configuration::ByteSize::from_bytes(5));
     let limits = ExactPackageLimits::from_configuration(&configuration).expect("limits");
-    let analysis = analyze(limits, "# first", "# second").expect("three retained copies");
+    let analysis = analyze(limits, "# first", "# second").expect("five retained copies");
     assert_eq!(analysis.publication().units.len(), 2);
     assert_eq!(analysis.publication().documents.len(), 1);
     configuration.package.retained_total =
-        Some(rift_protocol::configuration::ByteSize::from_bytes(2));
+        Some(rift_protocol::configuration::ByteSize::from_bytes(4));
     let limits = ExactPackageLimits::from_configuration(&configuration).expect("limits");
     assert_eq!(
         analyze(limits, "# first", "# second")
