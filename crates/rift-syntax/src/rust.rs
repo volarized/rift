@@ -428,6 +428,9 @@ impl SyntaxProvider for RustSyntaxProvider {
 
     fn node_facets(&self, kind: &str) -> Vec<NodeFacet> {
         let mut facets = Vec::new();
+        if kind == attachment::ATTRIBUTE_ITEM_KIND || kind == INNER_ATTRIBUTE_ITEM_KIND {
+            return vec![NodeFacet::Annotation];
+        }
         if kind.ends_with("_item") || kind.ends_with("_declaration") {
             facets.extend([NodeFacet::Declaration, NodeFacet::Definition]);
         }
@@ -439,9 +442,6 @@ impl SyntaxProvider for RustSyntaxProvider {
         }
         if kind.contains("comment") {
             facets.push(NodeFacet::Comment);
-        }
-        if kind == attachment::ATTRIBUTE_ITEM_KIND {
-            facets.push(NodeFacet::Annotation);
         }
         facets
     }
@@ -680,6 +680,9 @@ fn declaration_name(node: Node<'_>, text: &str) -> Option<String> {
 /// Grammar spelling of a type applying generic arguments, from
 /// tree-sitter-rust 0.24.2 `node-types.json`.
 const GENERIC_TYPE_KIND: &str = "generic_type";
+/// Grammar spelling of an inner attribute (`#![..]`), from tree-sitter-rust's
+/// `node-types.json`.
+const INNER_ATTRIBUTE_ITEM_KIND: &str = "inner_attribute_item";
 
 /// The type an `impl` block implements, without the generic arguments the
 /// block applies to it: methods of `impl<T> Holder<T>` qualify through
@@ -1389,6 +1392,10 @@ mod tests {
         assert_eq!(provider.node_facets("line_comment"), [NodeFacet::Comment]);
         assert_eq!(
             provider.node_facets("attribute_item"),
+            [NodeFacet::Annotation]
+        );
+        assert_eq!(
+            provider.node_facets("inner_attribute_item"),
             [NodeFacet::Annotation]
         );
         assert_eq!(provider.node_facets("identifier"), []);

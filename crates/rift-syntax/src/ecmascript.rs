@@ -49,8 +49,9 @@
 //! - A declaration's complete span starts at the statement carrying it - the
 //!   `export_statement`, or the `lexical_declaration` or `variable_declaration`
 //!   holding it as its first declarator - and extends over the `JSDoc`
-//!   comments directly attached before that statement. Decorators remain
-//!   children of the declared node.
+//!   comments directly attached before that statement. A decorator belongs
+//!   to the declaration it qualifies: a child of the declared node, or, for a
+//!   TypeScript method, a sibling written before it that starts its span.
 //! - A `method_signature` or `property_signature` declares a `method` or a
 //!   `property` only inside an interface or class body, qualified by it
 //!   (`Array.map`); the same kinds inside a type literal (`{ size: number }`)
@@ -205,6 +206,8 @@ const MODULE_VARIABLE: &str = "module";
 const EXPORTS_NAME: &str = "exports";
 /// Grammar spelling of a `comment`, line or block.
 const COMMENT_KIND: &str = "comment";
+/// Grammar spelling of one `@decorator`.
+const DECORATOR_KIND: &str = "decorator";
 /// Opens a `JSDoc` block: a block comment whose first delimiter carries a second `*`.
 const JSDOC_OPEN: &str = "/**";
 /// Closes every block comment, a `JSDoc` block included.
@@ -358,6 +361,7 @@ pub(crate) struct EcmaScriptKinds {
     export_statement: u16,
     identifier: u16,
     comment: u16,
+    decorator: u16,
     /// `Some` on the TypeScript grammars; the JavaScript grammar spells no
     /// accessibility.
     accessibility_modifier: Option<u16>,
@@ -470,6 +474,7 @@ impl EcmaScriptKinds {
             export_statement: kind_id(language, EXPORT_STATEMENT_KIND),
             identifier: kind_id(language, IDENTIFIER_KIND),
             comment: kind_id(language, COMMENT_KIND),
+            decorator: kind_id(language, DECORATOR_KIND),
             accessibility_modifier: None,
             ambient_declaration: None,
             global_namespace: None,
@@ -1280,8 +1285,9 @@ impl EcmaScriptRules<'_> {
 
     /// The statement carrying `node`: the declaration itself, the
     /// `lexical_declaration` or `variable_declaration` holding it as its
-    /// first declarator, its TypeScript `ambient_declaration`, and the
-    /// `export_statement` wrapping them. A
+    /// first declarator, its TypeScript `ambient_declaration`, the
+    /// `export_statement` wrapping them, and the decorators the TypeScript
+    /// grammar writes as siblings before a method. A
     /// `JSDoc` block written above `export` or `const` stands before this
     /// node, since the grammar makes `export` the declaration's previous
     /// sibling.
@@ -1304,6 +1310,12 @@ impl EcmaScriptRules<'_> {
             .filter(|parent| parent.node().kind_id() == self.kinds.export_statement)
         {
             front = parent;
+        }
+        while let Some(previous) = front
+            .previous_sibling()
+            .filter(|previous| previous.node().kind_id() == self.kinds.decorator)
+        {
+            front = previous;
         }
         front
     }

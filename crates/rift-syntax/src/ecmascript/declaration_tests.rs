@@ -290,3 +290,51 @@ fn test_function_valued_variables_carry_the_callable_category() {
         ]
     );
 }
+
+/// Decorators belong to the declaration they qualify: a TypeScript method's
+/// decorators, which the grammar writes as siblings before it, start its
+/// span, and the `JSDoc` above them documents it, as it does for a class and
+/// for a JavaScript method, whose decorators are children of the declaration.
+#[test]
+fn test_decorated_declarations_span_their_decorators() {
+    let text = "/** Sealed. */\n@sealed\nclass Shape {\n  \
+                /** Draws. */\n  @log @trace()\n  draw(): void {}\n  \
+                @observable sides = 0;\n}\n";
+    let document = typescript(text);
+    let shape = symbol(&document, "Shape");
+    assert_eq!(
+        spelled(text, shape.range)
+            .lines()
+            .take(2)
+            .collect::<Vec<_>>(),
+        ["/** Sealed. */", "@sealed"]
+    );
+    let draw = symbol(&document, "Shape.draw");
+    assert_eq!(
+        spelled(text, draw.range),
+        "/** Draws. */\n  @log @trace()\n  draw(): void {}"
+    );
+    assert_eq!(
+        draw.documentation.first().map(|doc| doc.text.as_str()),
+        Some("Draws.")
+    );
+    assert_eq!(
+        draw.signatures
+            .first()
+            .map(|signature| signature.display.as_str()),
+        Some("draw(): void")
+    );
+    assert_eq!(
+        spelled(text, symbol(&document, "Shape.sides").range),
+        "@observable sides = 0"
+    );
+
+    let text = "class Widget {\n  /** Runs. */\n  @bound run() {}\n}\n";
+    let document = javascript(text);
+    let run = symbol(&document, "Widget.run");
+    assert_eq!(spelled(text, run.range), "/** Runs. */\n  @bound run() {}");
+    assert_eq!(
+        run.documentation.first().map(|doc| doc.text.as_str()),
+        Some("Runs.")
+    );
+}
