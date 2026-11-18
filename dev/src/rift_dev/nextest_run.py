@@ -166,15 +166,27 @@ class AttemptIdentity(BaseModel):
 
 
 class Outcome(BaseModel):
-    """Started and terminal result for one selected case."""
+    """Started and terminal results for one selected case, across stress iterations.
+
+    `result` is the first failed iteration's result once one failed, so a later
+    passing iteration cannot hide it, and otherwise the latest terminal result.
+    """
 
     case: CaseIdentity
     started: bool = False
+    running: bool = False
     result: TestEvent | None = None
+    attempts: int = 0
 
     @property
     def failed(self) -> bool:
-        return self.started and (self.result is None or self.result.event != "ok")
+        return self.started and (
+            self.running or self.result is None or self.result.event != "ok"
+        )
+
+    @property
+    def incomplete(self) -> bool:
+        return self.started and (self.running or self.result is None)
 
 
 class LogEvidence(BaseModel):
@@ -681,18 +693,46 @@ RUN_VALUE_OPTIONS = frozenset(
         "--message-format-version",
         "--max-fail",
         "--max-progress-running",
+        "--stress-count",
+        "--stress-duration",
     }
 )
 RUN_FLAG_OPTIONS = frozenset(
     {"--no-report", "--no-fail-fast", "--fail-fast", "--hide-progress-bar"}
 )
-UNSUPPORTED_OPTIONS = frozenset(
-    {"--no-capture", "--nocapture", "--stress-count", "--stress-duration"}
+UNSUPPORTED_OPTIONS = frozenset({"--no-capture", "--nocapture"})
+# Nextest names one stress iteration's case `<crate>::<binary>@stress-<index>$<test>`.
+STRESS_NAME = re.compile(
+    r"(?P<binary>[^$]*)@stress-(?P<index>[0-9]+)(?P<test>\$.*)", re.DOTALL
 )
 
 
+def case_name(name: str) -> str:
+    """The discovered full name of one JSON+ case, with any stress iteration removed.
+
+    >>> case_name("rift::server_cli@stress-12$stops_cleanly")
+    'rift::server_cli$stops_cleanly'
+    >>> case_name("rift::server_cli$stops_cleanly")
+    'rift::server_cli$stops_cleanly'
+    >>> case_name("rift::server_cli$named@stress-1$like")
+    'rift::server_cli$named@stress-1$like'
+    """
+    stress = STRESS_NAME.fullmatch(name)
+    return f"{stress['binary']}{stress['test']}" if stress else name
+
+
 def list_arguments(arguments: Sequence[str]) -> list[str]:
-    """Keep discovery selection unchanged while removing execution-only options."""
+    """Keep discovery selection unchanged while removing execution-only options.
+
+    Stress options repeat execution, so discovery lists the selection once:
+
+    >>> list_arguments(["-p", "rift", "--stress-count", "10", "--stress-duration=2m", "-E", "test(=stops)"])
+    ['-p', 'rift', '-E', 'test(=stops)']
+    >>> list_arguments(["--no-capture"])
+    Traceback (most recent call last):
+    ...
+    ValueError: appliance requires captured execution: --no-capture
+    """
     retained: list[str] = []
     index = 0
     while index < len(arguments):
@@ -702,9 +742,7 @@ def list_arguments(arguments: Sequence[str]) -> list[str]:
             break
         name = argument.partition("=")[0]
         if name in UNSUPPORTED_OPTIONS:
-            raise ValueError(
-                f"appliance requires captured, single-attempt execution: {name}"
-            )
+            raise ValueError(f"appliance requires captured execution: {name}")
         if name in RUN_VALUE_OPTIONS:
             index += 1 if "=" in argument else 2
             continue
@@ -935,7 +973,33 @@ def prepare(command: Command, directory: Path) -> tuple[dict[str, Outcome], Path
 
 
 class EventReader:
-    """Bound JSONL buffering without stopping either command pipe drain."""
+    """Bound JSONL buffering without stopping either command pipe drain.
+
+    Stress iterations of one case fold into its outcome, and the first failed
+    iteration stays its result even when a later iteration passes:
+
+    >>> import json, tempfile
+    >>> case = CaseIdentity(
+    ...     binary="rift::server_cli", test="stops",
+    ...     full_name="rift::server_cli$stops", selected=True,
+    ... )
+    >>> outcomes = {case.full_name: Outcome(case=case)}
+    >>> with tempfile.TemporaryDirectory() as directory:
+    ...     artifact = ArtifactStore(Path(directory) / "telemetry.jsonl", outcomes)
+    ...     reader = EventReader(outcomes, CaseStore(observe=artifact.observe), artifact)
+    ...     for index, result in enumerate(["ok", "failed", "ok"]):
+    ...         name = f"rift::server_cli@stress-{index}$stops"
+    ...         start = {"type": "test", "event": "started", "name": name}
+    ...         end = {"type": "test", "event": result, "name": name, "stdout": f"run {index}"}
+    ...         reader.line(json.dumps(start).encode())
+    ...         reader.line(json.dumps(end).encode())
+    ...     artifact.close()
+    >>> outcome = outcomes[case.full_name]
+    >>> (outcome.attempts, outcome.failed, outcome.incomplete, outcome.result.stdout)
+    (3, True, False, 'run 1')
+    >>> reader.errors
+    []
+    """
 
     def __init__(
         self, outcomes: dict[str, Outcome], cases: CaseStore, artifact: ArtifactStore
@@ -977,10 +1041,11 @@ class EventReader:
             self.error(f"invalid Nextest JSON+ event: {str(error)[:LINE_CHARS_MAX]}")
             return
         if isinstance(event, SuiteEvent):
-            if event.nextest.stress_index is not None:
-                self.error("Nextest stress results cannot identify individual attempts")
+            # A stress iteration's suite events carry its index; each case event
+            # names the iteration it belongs to.
             return
-        outcome = self.outcomes.get(event.name)
+        stressed = STRESS_NAME.fullmatch(event.name) is not None
+        outcome = self.outcomes.get(case_name(event.name))
         if outcome is None:
             self.error(f"unassigned Nextest full name: {event.name}")
             return
@@ -989,17 +1054,25 @@ class EventReader:
             # these even when Nextest omits their ignored terminal event.
             if not outcome.case.selected:
                 return
-            if outcome.started:
+            # Stress iterations of one case run one after another, never at once.
+            if outcome.running or (outcome.started and not stressed):
                 self.error(f"duplicate Nextest start: {event.name}")
             outcome.started = True
+            outcome.running = True
         elif event.event == "ignored":
             outcome.started = False
+            outcome.running = False
             outcome.result = event
         else:
-            if outcome.result is not None or not outcome.started:
+            if not outcome.running:
                 self.error(
                     f"Nextest terminal result without unique start: {event.name}"
                 )
+            outcome.running = False
+            outcome.attempts += 1
+            if outcome.result is not None and outcome.result.event != "ok":
+                # The first failed iteration stays the reported result.
+                return
             # Bound aggregate retained result text, not just each JSONL event.
             # The portable recording remains Nextest's captured-output source.
             texts: dict[str, str] = {}
@@ -1101,10 +1174,19 @@ def failure_report(
     return "\n".join(lines) + "\n"
 
 
-def success_line(count: int, elapsed: float) -> str:
-    """Round elapsed duration up so the stated bound contains the run."""
+def success_line(count: int, elapsed: float, attempts: int | None = None) -> str:
+    """Round elapsed duration up so the stated bound contains the run.
+
+    A stress run names its attempts beside its tests:
+
+    >>> success_line(2, 61.2)
+    '2 tests launched, all succeeded in under 1 minutes and 2 seconds.'
+    >>> success_line(2, 3.0, attempts=6)
+    '2 tests launched over 6 attempts, all succeeded in under 0 minutes and 3 seconds.'
+    """
     minutes, seconds = divmod(math.ceil(elapsed), 60)
-    return f"{count} tests launched, all succeeded in under {minutes} minutes and {seconds} seconds."
+    repeated = f" over {attempts} attempts" if attempts and attempts != count else ""
+    return f"{count} tests launched{repeated}, all succeeded in under {minutes} minutes and {seconds} seconds."
 
 
 def collection_report(
@@ -1304,9 +1386,10 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
 
     failed = [outcome for outcome in outcomes.values() if outcome.failed]
     launched = sum(outcome.started for outcome in outcomes.values())
-    incomplete = sum(
-        outcome.started and outcome.result is None for outcome in outcomes.values()
+    attempts_launched = sum(
+        outcome.attempts + outcome.running for outcome in outcomes.values()
     )
+    incomplete = sum(outcome.incomplete for outcome in outcomes.values())
     unlaunched = sum(
         outcome.case.selected and not outcome.started for outcome in outcomes.values()
     )
@@ -1337,7 +1420,7 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
         status=status,
         elapsed_seconds=elapsed,
         launched=launched,
-        attempts_launched=launched,
+        attempts_launched=attempts_launched,
         succeeded=launched - len(failed),
         failed=len(failed) - incomplete,
         incomplete=incomplete,
@@ -1430,4 +1513,4 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
         if original_error is not None:
             raise original_error
         raise CommandFailed(command, status or 1, f"evidence: {directory}")
-    print(success_line(launched, elapsed), flush=True)
+    print(success_line(launched, elapsed, attempts_launched), flush=True)
