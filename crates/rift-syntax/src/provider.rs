@@ -212,6 +212,19 @@ pub trait SyntaxProvider: std::fmt::Debug + Send + Sync {
         limits: SyntaxLimits,
     ) -> Result<SyntaxDocument, RiftError>;
 
+    /// Returns declaration ranges containing parser errors or occurring within parser error subtrees.
+    ///
+    /// # Errors
+    /// Returns the existing syntax refusal for an unknown grammar or an exceeded bound.
+    fn invalid_declarations(
+        &self,
+        source: SyntaxSource<'_>,
+        limits: SyntaxLimits,
+        declarations: &[crate::ByteRange],
+    ) -> Result<std::collections::BTreeSet<crate::ByteRange>, RiftError> {
+        crate::parse_errors::invalid_declarations(self.language(), source, limits, declarations)
+    }
+
     /// Portable structural kinds for one grammar syntax element kind.
     fn syntax_element_kinds(&self, kind: &str) -> Vec<SyntaxKind>;
 }

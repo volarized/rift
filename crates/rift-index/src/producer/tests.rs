@@ -21,6 +21,7 @@ use crate::located_syntax_element::SyntaxAddress;
 const SOURCE: &str =
     "def echo(value):\n    return value\n\ndef shout(value):\n    return echo(value)\n";
 const ECHO: &str = "rift://symbol/pypi/pypi.org/click/python/click/core/echo";
+const MODULE: &str = "rift://symbol/pypi/pypi.org/click/python/click/core";
 const SHOUT: &str = "rift://symbol/pypi/pypi.org/click/python/click/core/shout";
 /// A plain-text unit, which no syntax provider parses.
 const NOTES: &str = "echo returns its value\n";
@@ -93,6 +94,7 @@ fn facts(publication: &PackagePublication, body: Value) -> ProducerFacts {
     }
     let text = facts
         .to_string()
+        .replace("TEXT_UNIT", publication.units[1].unit.0.as_str())
         .replace("UNIT", publication.units[0].unit.0.as_str());
     serde_json::from_str(&text).expect("producer facts")
 }
@@ -172,7 +174,7 @@ fn a_range_resolves_to_its_place_inside_the_enclosing_declaration() {
         )
         .expect("resolved module");
     assert!(
-        matches!(between.address, SyntaxAddress::Unit { .. }),
+        matches!(&between.address, SyntaxAddress::Declaration { symbol, index: 0, .. } if symbol.as_str() == MODULE),
         "{between:?}"
     );
     let text_unit = publication
@@ -264,6 +266,7 @@ fn producer_facts_enter_the_publication_under_their_producer() {
     let ranges = accepted
         .occurrences
         .iter()
+        .filter(|occurrence| occurrence.producer.is_some())
         .map(|occurrence| (occurrence.range.start, occurrence.range.end))
         .collect::<Vec<_>>();
     assert_eq!(
@@ -275,6 +278,7 @@ fn producer_facts_enter_the_publication_under_their_producer() {
         accepted
             .occurrences
             .iter()
+            .filter(|occurrence| occurrence.producer.is_some())
             .all(|occurrence| occurrence.producer.as_ref() == Some(&producer))
     );
     let coverage = &accepted.coverage[0];
@@ -285,6 +289,28 @@ fn producer_facts_enter_the_publication_under_their_producer() {
     let wire = serde_json::to_string(&accepted).expect("serialize");
     let read: PackagePublication = serde_json::from_str(&wire).expect("deserialize");
     assert_eq!(read, accepted);
+}
+
+#[test]
+fn test_edge_occurrences_keep_independent_producers_for_the_same_source_range() {
+    let publication = click();
+    let facts = call_facts(&publication);
+    let producer = facts.producer.clone();
+    let accepted = accept_producer_facts(publication, facts, SyntaxLimits::default())
+        .expect("accepted edge facts");
+    let observations = accepted
+        .occurrences
+        .iter()
+        .filter(|occurrence| {
+            (occurrence.range.start, occurrence.range.end) == CALL
+                && occurrence.symbol.as_str() == ECHO
+        })
+        .map(|occurrence| occurrence.producer.as_ref())
+        .collect::<Vec<_>>();
+    assert_eq!(observations, [None, Some(&producer)]);
+    accepted
+        .validate_facts()
+        .expect("independent producer facts");
 }
 
 #[test]
@@ -306,10 +332,11 @@ fn producer_facts_naming_a_symbol_keep_it_and_still_resolve_their_range() {
     );
     assert!(refusal(publication, facts).contains("resolves to no syntax element"));
     let publication = click();
+    let edge_occurrences = publication.occurrences.clone();
     let covered_only = facts_with_kinds(&publication, &["occurrences"]);
     let accepted = accept_producer_facts(publication, covered_only, SyntaxLimits::default())
         .expect("a covered kind without facts");
-    assert!(accepted.occurrences.is_empty());
+    assert_eq!(accepted.occurrences, edge_occurrences);
     assert!(accepted.coverage[0].covers(FactKind::Occurrences, Some(&accepted_producer())));
 }
 
@@ -348,7 +375,7 @@ fn producer_facts_outside_their_coverage_or_address_are_refused() {
         (
             json!({"edges": [{
                 "kind": "call", "kinds": ["calls"], "to": ECHO, "derivation": "resolution",
-                "occurrence": {"unit": "UNIT", "range": {"start": 34, "end": 35}},
+                "occurrence": {"unit": "TEXT_UNIT", "range": {"start": 0, "end": 4}},
             }]}),
             "field edges.occurrence, violation outside_declaration",
         ),
@@ -538,6 +565,7 @@ fn an_extractor_reads_its_language_units_and_its_facts_enter_the_publication() {
     let ranges = accepted
         .occurrences
         .iter()
+        .filter(|occurrence| occurrence.producer.is_some())
         .map(|occurrence| (occurrence.range.start, occurrence.range.end))
         .collect::<Vec<_>>();
     assert_eq!(

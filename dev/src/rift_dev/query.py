@@ -33,6 +33,10 @@ _INPUT_FIELDS = frozenset(
         "change",
     }
 )
+# Rows one `search` answer page may hold (`QUERY_MAX_RESULTS`). Every page of a query
+# answer evaluates the query again, so a read that needs the whole answer asks for the
+# largest page instead of the default ten rows.
+QUERY_MAX_RESULTS = 1000
 _OUTPUT_FIELDS = frozenset(
     {
         "hit",
@@ -91,12 +95,20 @@ def retrieval_request(
     parameters: Mapping[str, Json],
     columns: Sequence[str] = ("symbol", "name", "path", "unit", "start", "end"),
 ) -> JsonObject:
-    """Invoke existing retrieval through standard SERVICE syntax and explicit projection."""
+    """Invoke existing retrieval through standard SERVICE syntax and explicit projection.
+
+    `max_results` and `page` among `parameters` bound the hits the SERVICE call
+    retrieves. The answer is read in pages of `QUERY_MAX_RESULTS` rows, so an answer
+    of up to that many rows arrives in one request.
+
+    >>> request = retrieval_request({"query": "test", "max_results": 5}, ("hit",))
+    >>> request["max_results"] == QUERY_MAX_RESULTS, ":max_results 5 ." in request["query"]
+    (True, True)
+    """
     projection = " ".join(f"?{column}" for column in columns)
     return {
         "query": f"SELECT {projection} {{ {_retrieval_service(parameters, columns)} }} ORDER BY ?index",
-        "page": parameters.get("page", 1),
-        "max_results": parameters.get("max_results", 10),
+        "max_results": QUERY_MAX_RESULTS,
     }
 
 
@@ -112,7 +124,8 @@ def retrieval_batch_request(
         for slot, parameters in enumerate(requests)
     )
     return {
-        "query": f"SELECT ?slot {projection} {{ {branches} }} ORDER BY ?slot ?index"
+        "query": f"SELECT ?slot {projection} {{ {branches} }} ORDER BY ?slot ?index",
+        "max_results": QUERY_MAX_RESULTS,
     }
 
 
@@ -126,7 +139,7 @@ def _retrieval_service(parameters: Mapping[str, Json], columns: Sequence[str]) -
     clauses = [
         f"?hit :{'rev' if key == 'revision' else key} {_input(value)} ."
         for key, value in parameters.items()
-        if value is not None and key not in {"page", "max_results"}
+        if value is not None
     ]
     clauses.append("?hit :index ?index .")
     symbol_columns = {"name", "kind", "language"}.intersection(columns)

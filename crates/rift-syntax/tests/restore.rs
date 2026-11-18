@@ -91,21 +91,26 @@ fn python_overload_import_and_decorator_ranges_restore_without_inventing_old_fac
     let source = "from typing import overload as ov\n@ov\ndef call(value: int): ...\n";
     let document = parsed(ShippedLanguage::Python, source);
     let captured = parts(document.facts());
+    let position = captured
+        .symbols
+        .iter()
+        .position(|symbol| symbol.name == "call")
+        .expect("captured function");
     assert!(matches!(
-        captured.symbols[0].python_overload,
+        captured.symbols[position].python_overload,
         Some(rift_syntax::PythonOverload::Overload { .. })
     ));
     let restored = SyntaxFacts::from_parts(source, SyntaxLimits::default(), captured.clone())
         .expect("exact original import and decorator");
     assert_eq!(&restored, document.facts());
     let mut old = captured.clone();
-    old.symbols[0].python_overload = None;
+    old.symbols[position].python_overload = None;
     let restored = SyntaxFacts::from_parts(source, SyntaxLimits::default(), old)
         .expect("unrecorded older overload state");
-    assert!(restored.symbols()[0].python_overload.is_none());
+    assert!(restored.symbols()[position].python_overload.is_none());
     for mutation in 0..5 {
         let mut invalid = captured.clone();
-        let symbol = &mut invalid.symbols[0];
+        let symbol = &mut invalid.symbols[position];
         let Some(rift_syntax::PythonOverload::Overload {
             import_statement,
             module,
@@ -273,6 +278,59 @@ fn complete_facts_restore_for_every_shipped_language() {
                 assert_eq!(resolved_syntax_element, Some(kind));
             }
         }
+    }
+}
+
+/// Facts for members, bound names, attributes, and decorated declarations
+/// restore exactly, attached documentation included.
+#[test]
+fn member_and_bound_name_facts_restore_for_every_extended_language() {
+    let cases = [
+        (
+            ShippedLanguage::Rust,
+            "pub trait Shape { type Unit; const SIDES: u32; fn area(&self) -> f64; }\n\
+             pub struct Point {\n    /// Horizontal.\n    pub x: i32,\n}\n\
+             pub union Bits { pub i: u32 }\n\
+             impl Shape for Remote { type Unit = i32; const SIDES: u32 = 0; fn area(&self) -> f64 { 1.0 } }\n\
+             pub fn a() { fn inner() {} }\n",
+        ),
+        (
+            ShippedLanguage::JavaScript,
+            "class Widget {\n  count = 0;\n  #secret = 1;\n  /** Runs. */\n  @bound run() {}\n}\n\
+             export const { major, minor: mi } = version;\n\
+             export default class { anon() {} }\n",
+        ),
+        (
+            ShippedLanguage::TypeScript,
+            "/** Sealed. */\n@sealed\nexport abstract class Shape {\n  /** Side count. */\n  sides: number = 0;\n  \
+             abstract area(): number;\n  /** Draws. */\n  @log\n  draw(): void {}\n  \
+             constructor(public readonly name: string) {}\n}\n\
+             export enum Kind { A = 1, B }\n",
+        ),
+        (
+            ShippedLanguage::Python,
+            "LIMIT = 10\n\"\"\"Most rows per page.\"\"\"\nA, B = 1, 2\ntype Pair = tuple[int, int]\n\
+             if True:\n    FLAG = 1\n\
+             class Model:\n    kind = 'model'\n    \"The model kind.\"\n    \
+             @property\n    def label(self):\n        return 1\n    \
+             def __init__(self):\n        self.name = 'x'\n        \"The display name.\"\n\
+             def keys(d):\n    pass\n\nkeys.__doc__ = \"Return keys.\"\n",
+        ),
+    ];
+    for (shipped, text) in cases {
+        let document = parsed(shipped, text);
+        assert!(!document.has_errors(), "{shipped:?}");
+        assert!(
+            document
+                .symbols()
+                .iter()
+                .any(|symbol| !symbol.documentation.is_empty()),
+            "{shipped:?} fixture attaches documentation"
+        );
+        let restored =
+            SyntaxFacts::from_parts(text, SyntaxLimits::default(), parts(document.facts()))
+                .unwrap_or_else(|error| panic!("{shipped:?} facts restore: {error:?}"));
+        assert_eq!(&restored, document.facts(), "{shipped:?}");
     }
 }
 

@@ -174,10 +174,10 @@ async fn a_symbol_the_release_does_not_declare_refuses_symbol_not_found() {
     assert_eq!(error_text_field(&error, "id"), SYMBOL);
 }
 
-/// A cursor past the advertised bound refuses after the capability read alone, and a
+/// A result count past the advertised bound refuses after the capability read alone, and a
 /// disabled client refuses before any request.
 #[tokio::test]
-async fn a_cursor_past_the_advertised_bound_and_a_disabled_client_refuse() {
+async fn a_result_count_past_the_advertised_bound_and_a_disabled_client_refuse() {
     let (server, client) = operation_client(OperationFixture::Facets(
         facets_response_json(),
         StatusCode::OK,
@@ -190,7 +190,7 @@ async fn a_cursor_past_the_advertised_bound_and_a_disabled_client_refuse() {
     let error = client
         .facets(&request)
         .await
-        .expect_err("cursor past the bound");
+        .expect_err("result count past the bound");
     assert_registered_field(&error, "rift.client.request_invalid", "max_results");
     assert_eq!(server.state.last_path.lock().await.as_deref(), None);
     let disabled = GlobalClient::new(Config {
@@ -238,10 +238,10 @@ async fn facets_breaking_the_contract_refuse_as_invalid_responses() {
         ("source differs from the declaration", |answer| {
             answer["declarations"][0]["syntax"][1]["source"] = json!("BEACON");
         }),
-        ("cursor beside no facets", |answer| {
+        ("result count beside no facets", |answer| {
             *answer = json!({"symbol": SYMBOL, "revision": RELEASE, "declarations": [], "max_results": "1.ab"});
         }),
-        ("empty cursor", |answer| {
+        ("empty result count", |answer| {
             answer["max_results"] = json!("");
         }),
         ("page over the source bound", |answer| {

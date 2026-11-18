@@ -362,15 +362,15 @@ mod tests {
             .iter()
             .map(|symbol| implementation.stub_forms(&symbol.qualified_name).len())
             .collect::<Vec<_>>();
-        assert_eq!(forms, [2, 2], "the stub forms belong to the one symbol");
-        assert_eq!(analysis.publication().declarations.len(), 4);
+        assert_eq!(forms, [1, 2, 2], "the stub forms belong to the one symbol");
+        assert_eq!(analysis.publication().declarations.len(), 6);
         let identities = analysis
             .publication()
             .declarations
             .iter()
             .map(|declaration| &declaration.symbol)
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(identities.len(), 1);
+        assert_eq!(identities.len(), 2);
         let documented = analysis
             .publication()
             .documents

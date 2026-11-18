@@ -690,7 +690,7 @@ fn operation_search_response(
     if matches!(mode, OperationFixture::RetrySearch) && request_number == 1 {
         return problem_response_with_retry(StatusCode::SERVICE_UNAVAILABLE);
     }
-    let cursor = query_page(query);
+    let page = query_page(query);
     let mut body = match mode {
         OperationFixture::Documentation { search, .. }
         | OperationFixture::DocumentationBounds { search, .. } => search.clone(),
@@ -725,23 +725,23 @@ fn operation_search_response(
         OperationFixture::PageRevisionChange => search_page_json(
             "demo",
             Some("next"),
-            if cursor.is_some() {
+            if page.is_some() {
                 "analyzer-v2"
             } else {
                 "analyzer-v1"
             },
-            if cursor.is_some() { "second" } else { "first" },
+            if page.is_some() { "second" } else { "first" },
         ),
         OperationFixture::RepeatedPage => repeated_page(query),
         OperationFixture::BodyBoundStop => pages::body_bound_page(
             search_page_json("demo", Some("next"), "analyzer-v2", "first"),
             search_page_json("demo", None, "analyzer-v2", "second"),
-            cursor,
+            page,
         ),
         OperationFixture::SearchPages
         | OperationFixture::CandidateBound
         | OperationFixture::PartialFailure
-        | OperationFixture::RepeatedItem => paged_search_response(mode, cursor),
+        | OperationFixture::RepeatedItem => paged_search_response(mode, page),
         _ => search_page_json("demo", None, "analyzer-v2", "first"),
     };
     let multiple = matches!(
@@ -763,8 +763,8 @@ fn operation_search_response(
     json_response(&body, None)
 }
 
-fn paged_search_response(mode: &OperationFixture, cursor: Option<&str>) -> serde_json::Value {
-    if cursor.is_none() {
+fn paged_search_response(mode: &OperationFixture, page: Option<&str>) -> serde_json::Value {
+    if page.is_none() {
         search_page_json("demo", Some("next"), "analyzer-v2", "first")
     } else if matches!(mode, OperationFixture::RepeatedItem) {
         search_page_json("demo", None, "analyzer-v2", "first")
@@ -1831,9 +1831,9 @@ fn test_bad_request_problem_names_the_refused_field() {
             "exceeds 200",
         ),
         (
-            Some(problem("cursor expired", serde_json::json!({}))),
+            Some(problem("page expired", serde_json::json!({}))),
             "request",
-            "cursor expired",
+            "page expired",
         ),
         (None, "request", "the global API refused the request"),
     ] {
@@ -2733,7 +2733,7 @@ async fn test_discovery_search_accepts_omitted_or_empty_package_selection() {
 }
 
 #[tokio::test]
-async fn test_fixture_page_assembly_handles_cursor_and_revisions() {
+async fn test_fixture_page_assembly_handles_page_and_revisions() {
     let (server, client) = operation_client(OperationFixture::SearchPages).await;
     let pages = client.search_packages_pages(&search_request(), 1).await;
     assert!(pages.is_ok());
@@ -2769,7 +2769,7 @@ async fn test_fixture_page_assembly_handles_cursor_and_revisions() {
 }
 
 #[tokio::test]
-async fn test_fixture_page_rejects_repeated_cursor_and_partial_failure() {
+async fn test_fixture_page_rejects_repeated_items_and_partial_failure() {
     let (_server, client) = operation_client(OperationFixture::RepeatedItem).await;
     assert_registered_field(
         &(client.search_packages_pages(&search_request(), 1).await)

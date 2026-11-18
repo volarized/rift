@@ -24,13 +24,13 @@ use tree_sitter::Node;
 const OUTER_DOC_MARKER_FIELD: &str = "outer";
 
 /// Grammar spelling of an outer attribute, from tree-sitter-rust's
-/// `syntax element-types.json`.
-const ATTRIBUTE_ITEM_KIND: &str = "attribute_item";
+/// `node-types.json`.
+pub(super) const ATTRIBUTE_ITEM_KIND: &str = "attribute_item";
 /// Grammar spelling of a `//` comment, from tree-sitter-rust's
-/// `syntax element-types.json`.
+/// `node-types.json`.
 const LINE_COMMENT_KIND: &str = "line_comment";
 /// Grammar spelling of a `/* */` comment, from tree-sitter-rust's
-/// `syntax element-types.json`.
+/// `node-types.json`.
 const BLOCK_COMMENT_KIND: &str = "block_comment";
 
 /// Numeric grammar ids for the syntax element kinds [`is_attached`] classifies,

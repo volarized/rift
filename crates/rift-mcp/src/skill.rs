@@ -27,7 +27,7 @@ pub const SKILL_DESCRIPTION: &str = "Use when finding or reading code in a works
     identity, and syntax inspection.";
 /// The plugin manifest's `description`: the canonical product sentence.
 const PLUGIN_DESCRIPTION: &str =
-    "Rift is an agentic development toolkit for reading and discovering codebases.";
+    "Rift is an agentic development toolkit for reading, discovering, and exploring codebases.";
 /// POSIX installer command, verbatim from the docs landing page.
 const INSTALL_COMMAND_POSIX: &str =
     "curl --proto '=https' --tlsv1.2 -fsSL https://volar.sh/rift/install.sh | bash";

@@ -119,12 +119,13 @@ fn analyze(provider: &dyn rift_syntax::SyntaxProvider, text: &str) -> SyntaxDocu
         .expect("fixture must parse")
 }
 
-/// The one symbol a fixture's declaration produced.
+/// The fixture declaration, beside any file module.
 fn declared_symbol(document: &SyntaxDocument) -> &rift_syntax::SyntaxSymbol {
     document
         .symbols()
-        .first()
-        .expect("fixture must declare exactly one symbol")
+        .iter()
+        .find(|symbol| symbol.kind != "module")
+        .expect("fixture must declare a symbol beside its file module")
 }
 
 #[test]

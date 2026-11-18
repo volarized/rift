@@ -1223,11 +1223,10 @@ async fn outgoing_walks_over_scripted_engines_match_the_served_schemas() -> Test
     assert_validates(
         output_validator,
         &unavailable,
-        "required call hierarchy item is unavailable",
+        "static capture establishes an empty call answer",
     );
-    assert_eq!(unavailable["outcome"], "unavailable", "{unavailable}");
-    assert_eq!(
-        unavailable["reason"], "insufficient_coverage",
+    assert!(
+        workspace_client::query::rows(&unavailable)?.is_empty(),
         "{unavailable}"
     );
     client.cancel().await?;
@@ -1250,9 +1249,16 @@ async fn outgoing_walks_over_scripted_engines_match_the_served_schemas() -> Test
         &structured,
         "an unconfirmed engine's walk",
     );
-    assert_eq!(structured["outcome"], "unavailable", "{structured}");
-    assert_eq!(
-        structured["reason"], "insufficient_coverage",
+    assert!(
+        !workspace_client::query::rows(&structured)?.is_empty(),
+        "{structured}"
+    );
+    assert!(
+        structured["warnings"]
+            .as_array()
+            .is_some_and(|warnings| warnings
+                .iter()
+                .any(|warning| warning["code"] == "engine_readiness_unconfirmed")),
         "{structured}"
     );
     client.cancel().await?;

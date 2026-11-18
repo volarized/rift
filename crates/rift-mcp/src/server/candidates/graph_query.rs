@@ -444,7 +444,7 @@ fn project_semantic_inventory(
     acquired.project_local(
         dataset,
         input,
-        required.references || required.calls,
+        required.edges || required.references || required.calls,
         required.occurrences,
     )
 }
@@ -490,7 +490,7 @@ impl AcquiredGraph {
             mut warnings,
         } = self;
         if acquired.is_incomplete() && !query.admits_partial_witness() {
-            return Ok(query_unavailable(SymbolUnavailableReason::InsufficientCoverage).into());
+            return Ok(incomplete_flows(warnings).into());
         }
         let input = reads.local_search_view_input(true)?;
         let mut dataset = GraphDataset::builder(limits);

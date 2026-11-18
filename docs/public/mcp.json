@@ -2,7 +2,7 @@
   "description": "Tools served by the Rift MCP server, with the JSON Schemas derived from the Rust wire models.",
   "tools": [
     {
-      "description": "Reads every declaration of `symbol` with its location, source, and syntax structure.\nThe result includes each declaration's syntax tree.\nUse `page` with the same symbol and revision to continue declarations.\nUse `revision` to read a commit or release, or to pin the served working tree.",
+      "description": "Reads every declaration of `symbol` with its location, source, and syntax structure.\nThe result includes each declaration's syntax tree.\n`page` selects declarations at the revision the answer names.\nUse `revision` to read a commit or release, or to pin the served working tree.",
       "input_schema": {
         "$defs": {
           "Revision": {
@@ -432,7 +432,7 @@
           },
           "FacetDeclaration": {
             "additionalProperties": false,
-            "description": "One kind: a declaration with its location, source, and syntax structure.",
+            "description": "One facet: a declaration with its location, source, and syntax structure.",
             "properties": {
               "declaration": {
                 "description": "Declaration ordinal in the symbol, from zero.",

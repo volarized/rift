@@ -3,6 +3,7 @@
 mod attachment;
 mod blanking;
 
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use rift_error::errors;
@@ -38,6 +39,12 @@ enum RustSymbolKind {
     Macro,
     /// Enum variant.
     Variant,
+    /// Named field of a struct, a union, or a struct-like variant.
+    Field,
+    /// Union.
+    Union,
+    /// Associated type a trait declares.
+    AssociatedType,
 }
 
 impl RustSymbolKind {
@@ -54,6 +61,9 @@ impl RustSymbolKind {
             Self::Module => "module",
             Self::Macro => "macro",
             Self::Variant => "variant",
+            Self::Field => "field_declaration",
+            Self::Union => "union_item",
+            Self::AssociatedType => "associated_type",
         }
     }
 
@@ -61,7 +71,14 @@ impl RustSymbolKind {
     fn kinds(self) -> Vec<SymbolKind> {
         match self {
             Self::Function => vec![SymbolKind::Value, SymbolKind::Callable],
-            Self::Struct | Self::Enum | Self::Trait => vec![SymbolKind::Type],
+            Self::Struct | Self::Enum | Self::Union => vec![SymbolKind::Type],
+            Self::Trait => vec![
+                SymbolKind::Type,
+                SymbolKind::Implementable,
+                SymbolKind::MemberContainer,
+            ],
+            Self::Field => vec![SymbolKind::Value, SymbolKind::Member],
+            Self::AssociatedType => vec![SymbolKind::Type, SymbolKind::Member],
             Self::TypeAlias => vec![SymbolKind::Type, SymbolKind::Alias],
             Self::Module => vec![SymbolKind::Namespace, SymbolKind::Module],
             Self::Macro => vec![SymbolKind::Macro],
@@ -79,16 +96,17 @@ impl RustSymbolKind {
             | Self::Enum
             | Self::Trait
             | Self::Module
-            | Self::Variant => Some(RustGrammarField::Body),
+            | Self::Variant
+            | Self::Union => Some(RustGrammarField::Body),
             Self::Constant | Self::Static => Some(RustGrammarField::Value),
-            Self::TypeAlias | Self::Macro => None,
+            Self::TypeAlias | Self::Macro | Self::Field | Self::AssociatedType => None,
         }
     }
 }
 
 /// Tree-sitter grammar syntax element kind interpreted by this module.
 ///
-/// Vocabulary comes from the `syntax element-types.json` of the pinned
+/// Vocabulary comes from the `node-types.json` of the pinned
 /// tree-sitter-rust 0.24.2 grammar. The grammar defines many more kinds;
 /// only the ones this module reads are listed, so conversion from an
 /// arbitrary kind string is fallible.
@@ -121,10 +139,23 @@ enum RustGrammarSyntaxKind {
     TypeItem,
     /// `visibility_modifier` marker on one declaration.
     VisibilityModifier,
+    /// `field_declaration`: one named field.
+    FieldDeclaration,
+    /// `union_item` declaration.
+    UnionItem,
+    /// `associated_type`: `type Unit;` inside a trait.
+    AssociatedType,
+    /// `declaration_list`: the item list of a trait, an impl, or a module.
+    DeclarationList,
+    /// `field_declaration_list`: the named fields of a struct, union, or
+    /// variant.
+    FieldDeclarationList,
+    /// `enum_variant_list`: the variants of an enum.
+    EnumVariantList,
 }
 
 impl RustGrammarSyntaxKind {
-    /// Returns grammar spelling from tree-sitter-rust `syntax element-types.json`.
+    /// Returns grammar spelling from tree-sitter-rust `node-types.json`.
     const fn as_str(self) -> &'static str {
         match self {
             Self::ConstItem => "const_item",
@@ -140,6 +171,12 @@ impl RustGrammarSyntaxKind {
             Self::TraitItem => "trait_item",
             Self::TypeItem => "type_item",
             Self::VisibilityModifier => "visibility_modifier",
+            Self::FieldDeclaration => "field_declaration",
+            Self::UnionItem => "union_item",
+            Self::AssociatedType => "associated_type",
+            Self::DeclarationList => "declaration_list",
+            Self::FieldDeclarationList => "field_declaration_list",
+            Self::EnumVariantList => "enum_variant_list",
         }
     }
 
@@ -163,7 +200,14 @@ impl RustGrammarSyntaxKind {
             Self::StaticItem => Some(RustSymbolKind::Static),
             Self::ModItem => Some(RustSymbolKind::Module),
             Self::MacroDefinition => Some(RustSymbolKind::Macro),
-            Self::ImplItem | Self::VisibilityModifier => None,
+            Self::FieldDeclaration => Some(RustSymbolKind::Field),
+            Self::UnionItem => Some(RustSymbolKind::Union),
+            Self::AssociatedType => Some(RustSymbolKind::AssociatedType),
+            Self::ImplItem
+            | Self::VisibilityModifier
+            | Self::DeclarationList
+            | Self::FieldDeclarationList
+            | Self::EnumVariantList => None,
         }
     }
 }
@@ -181,7 +225,7 @@ impl std::str::FromStr for RustGrammarSyntaxKind {
 }
 
 /// Grammar field name this module reads, from tree-sitter-rust 0.24.2
-/// `syntax element-types.json`.
+/// `node-types.json`.
 #[derive(Debug, Clone, Copy)]
 enum RustGrammarField {
     /// `name` field on declaration items.
@@ -193,6 +237,8 @@ enum RustGrammarField {
     Body,
     /// `value` field on `const_item` and `static_item`.
     Value,
+    /// `trait` field on an `impl_item` that implements a trait.
+    Trait,
 }
 
 impl RustGrammarField {
@@ -202,6 +248,7 @@ impl RustGrammarField {
             Self::Type => "type",
             Self::Body => "body",
             Self::Value => "value",
+            Self::Trait => "trait",
         }
     }
 }
@@ -360,12 +407,15 @@ impl SyntaxProvider for RustSyntaxProvider {
             .parse(parsed.as_ref(), None)
             .ok_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())?;
         let mut capture = crate::static_analysis::Capture::for_rust(source.text);
+        let rules = RustGrammarRules {
+            traits: file_traits(tree.root_node(), source.text),
+        };
         let (syntax_elements, symbols, _) = extract::extract_with_capture(
             tree.root_node(),
             source,
             limits,
             &self.language,
-            &RustGrammarRules,
+            &rules,
             Some(&mut capture),
         )?;
         Ok(SyntaxDocument::new_rust(
@@ -381,6 +431,9 @@ impl SyntaxProvider for RustSyntaxProvider {
 
     fn syntax_element_kinds(&self, kind: &str) -> Vec<SyntaxKind> {
         let mut kinds = Vec::new();
+        if kind == attachment::ATTRIBUTE_ITEM_KIND || kind == INNER_ATTRIBUTE_ITEM_KIND {
+            return vec![SyntaxKind::Annotation];
+        }
         if kind.ends_with("_item") || kind.ends_with("_declaration") {
             kinds.extend([SyntaxKind::Declaration, SyntaxKind::Definition]);
         }
@@ -399,7 +452,131 @@ impl SyntaxProvider for RustSyntaxProvider {
 
 /// tree-sitter-rust's decisions for the shared bounded walk.
 #[derive(Debug)]
-struct RustGrammarRules;
+struct RustGrammarRules {
+    /// The visibility of every trait the file declares, by name; `None`
+    /// for a name two traits share with different visibilities.
+    traits: BTreeMap<String, Option<RustVisibility>>,
+}
+
+/// Where a declaration's visibility comes from.
+#[derive(Debug, PartialEq, Eq)]
+enum VisibilityOwner {
+    /// The declaration's own `visibility_modifier`, `private` without one.
+    Own,
+    /// The trait, trait impl, or enum holding it, since the language
+    /// spells no visibility on its items.
+    Inherited(RustVisibility),
+    /// An item of an impl whose trait the file does not declare: the
+    /// language spells no visibility, and the trait's is not in the file.
+    Unknown,
+}
+
+/// The visibility of each trait declared at module scope in the file -
+/// the source root and the bodies of inline `mod` items, never function
+/// bodies - by trait name. Each syntax element is read once, so the work is linear in
+/// the parsed tree.
+fn file_traits(root: Node<'_>, text: &str) -> BTreeMap<String, Option<RustVisibility>> {
+    let mut traits: BTreeMap<String, Option<RustVisibility>> = BTreeMap::new();
+    let mut pending = vec![root];
+    let mut cursor = root.walk();
+    while let Some(scope) = pending.pop() {
+        for item in scope.named_children(&mut cursor) {
+            match RustGrammarSyntaxKind::from_kind(item.kind()) {
+                Some(RustGrammarSyntaxKind::TraitItem) => {
+                    let Some(name) = declaration_name(item, text) else {
+                        continue;
+                    };
+                    let visibility = declaration_visibility(item, text);
+                    traits
+                        .entry(name)
+                        .and_modify(|known| {
+                            if known.as_ref() != Some(&visibility) {
+                                *known = None;
+                            }
+                        })
+                        .or_insert_with(|| Some(visibility.clone()));
+                }
+                Some(RustGrammarSyntaxKind::ModItem) => {
+                    pending.extend(item.child_by_field_name(RustGrammarField::Body.as_str()));
+                }
+                _ => {}
+            }
+        }
+    }
+    traits
+}
+
+/// The trait path an impl's `trait` field spells, without generic arguments.
+/// Qualified paths stay qualified, so an external trait cannot take the
+/// visibility of a local trait sharing its last name.
+fn implemented_trait_name<'text>(implementation: Node<'_>, text: &'text str) -> Option<&'text str> {
+    let mut name = implementation.child_by_field_name(RustGrammarField::Trait.as_str())?;
+    if name.kind() == GENERIC_TYPE_KIND {
+        name = name.child_by_field_name(RustGrammarField::Type.as_str())?;
+    }
+    text.get(name.byte_range())
+}
+
+impl RustGrammarRules {
+    /// Where the visited declaration's visibility comes from: a trait item
+    /// takes its trait's, an item of a trait impl takes the visibility of the
+    /// trait the file declares under that name, and a variant and its fields
+    /// take their enum's.
+    fn visibility_owner(&self, visited: Visited<'_, '_>, text: &str) -> VisibilityOwner {
+        let kind = |visited: Option<Visited<'_, '_>>| {
+            visited.and_then(|visited| {
+                RustGrammarSyntaxKind::from_kind(visited.syntax_element().kind())
+            })
+        };
+        let parent = visited.parent();
+        let holder = parent.and_then(Visited::parent);
+        match (kind(parent), kind(holder)) {
+            (
+                Some(RustGrammarSyntaxKind::DeclarationList),
+                Some(RustGrammarSyntaxKind::TraitItem),
+            ) => {
+                let trait_item = holder.map(Visited::syntax_element);
+                VisibilityOwner::Inherited(
+                    trait_item.map_or(RustVisibility::Private, |syntax_element| {
+                        declaration_visibility(syntax_element, text)
+                    }),
+                )
+            }
+            (
+                Some(RustGrammarSyntaxKind::DeclarationList),
+                Some(RustGrammarSyntaxKind::ImplItem),
+            ) => {
+                let Some(implementation) = holder.map(Visited::syntax_element) else {
+                    return VisibilityOwner::Own;
+                };
+                if implementation
+                    .child_by_field_name(RustGrammarField::Trait.as_str())
+                    .is_none()
+                {
+                    return VisibilityOwner::Own;
+                }
+                implemented_trait_name(implementation, text)
+                    .and_then(|name| self.traits.get(name).cloned().flatten())
+                    .map_or(VisibilityOwner::Unknown, VisibilityOwner::Inherited)
+            }
+            (
+                Some(RustGrammarSyntaxKind::EnumVariantList),
+                Some(RustGrammarSyntaxKind::EnumItem),
+            ) => {
+                VisibilityOwner::Inherited(holder.map_or(RustVisibility::Private, |enumeration| {
+                    declaration_visibility(enumeration.syntax_element(), text)
+                }))
+            }
+            (
+                Some(RustGrammarSyntaxKind::FieldDeclarationList),
+                Some(RustGrammarSyntaxKind::EnumVariant),
+            ) => holder.map_or(VisibilityOwner::Own, |variant| {
+                self.visibility_owner(variant, text)
+            }),
+            _ => VisibilityOwner::Own,
+        }
+    }
+}
 
 impl GrammarRules for RustGrammarRules {
     fn name_range(&self, syntax_element: Node<'_>) -> Result<Option<crate::ByteRange>, RiftError> {
@@ -423,8 +600,15 @@ impl GrammarRules for RustGrammarRules {
         let Some(name) = declaration_name(syntax_element, text) else {
             return Ok(None);
         };
-        let visibility = declared_visibility(visited, kind, text);
-        let mut kinds = declaration_kinds(kind, &visibility);
+        let visibility = match self.visibility_owner(visited, text) {
+            VisibilityOwner::Own => Some(declared_visibility(visited, kind, text)),
+            VisibilityOwner::Inherited(visibility) => Some(visibility),
+            VisibilityOwner::Unknown => None,
+        };
+        let mut kinds = kind.kinds();
+        if visibility == Some(RustVisibility::Public) {
+            kinds.push(SymbolKind::Public);
+        }
         if is_entrypoint(visited, kind, &name) {
             kinds.push(SymbolKind::Entrypoint);
         }
@@ -434,7 +618,7 @@ impl GrammarRules for RustGrammarRules {
             name,
             kind: kind.word(),
             kinds,
-            visibility: Some(visibility.authored()),
+            visibility: visibility.as_ref().map(RustVisibility::authored),
             body_range: body_range(syntax_element, kind)?,
             documentation,
             documentation_ranges,
@@ -446,7 +630,10 @@ impl GrammarRules for RustGrammarRules {
             RustGrammarSyntaxKind::ModItem
             | RustGrammarSyntaxKind::StructItem
             | RustGrammarSyntaxKind::EnumItem
-            | RustGrammarSyntaxKind::TraitItem => {
+            | RustGrammarSyntaxKind::TraitItem
+            | RustGrammarSyntaxKind::UnionItem
+            | RustGrammarSyntaxKind::EnumVariant
+            | RustGrammarSyntaxKind::FunctionItem => {
                 let name = syntax_element.child_by_field_name(RustGrammarField::Name.as_str())?;
                 text.get(name.byte_range()).map(Into::into)
             }
@@ -505,8 +692,11 @@ fn declaration_name(syntax_element: Node<'_>, text: &str) -> Option<String> {
 }
 
 /// Grammar spelling of a type applying generic arguments, from
-/// tree-sitter-rust 0.24.2 `syntax element-types.json`.
+/// tree-sitter-rust 0.24.2 `node-types.json`.
 const GENERIC_TYPE_KIND: &str = "generic_type";
+/// Grammar spelling of an inner attribute (`#![..]`), from tree-sitter-rust's
+/// `node-types.json`.
+const INNER_ATTRIBUTE_ITEM_KIND: &str = "inner_attribute_item";
 
 /// The type an `impl` block implements, without the generic arguments the
 /// block applies to it: methods of `impl<T> Holder<T>` qualify through
@@ -714,6 +904,9 @@ pub(crate) fn literal_function(
 }
 
 #[cfg(test)]
+mod declaration_tests;
+
+#[cfg(test)]
 mod tests {
     use rift_core::ProjectPath;
     use rift_error::errors;
@@ -905,13 +1098,25 @@ mod tests {
             .iter()
             .map(|symbol| symbol.qualified_name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(names, ["Holder", "Plain", "Holder::run", "Plain::run"]);
+        assert_eq!(
+            names,
+            [
+                "Holder",
+                "Holder::store",
+                "Plain",
+                "Holder::run",
+                "Plain::run"
+            ]
+        );
         let containers = document
             .symbols()
             .iter()
             .map(|symbol| symbol.container.as_deref())
             .collect::<Vec<_>>();
-        assert_eq!(containers, [None, None, Some("Holder"), Some("Plain")]);
+        assert_eq!(
+            containers,
+            [None, Some("Holder"), None, Some("Holder"), Some("Plain")]
+        );
     }
 
     #[test]
@@ -1033,7 +1238,8 @@ mod tests {
         assert_eq!(names, ["Option::None", "Option::Some", "Option::Pair"]);
         assert_eq!(variants[0].documentation[0].text, "No value.");
         assert!(variants.iter().all(|symbol| symbol.signatures.is_empty()));
-        assert_eq!(variants[0].kinds, [SymbolKind::Variant]);
+        assert_eq!(variants[0].kinds, [SymbolKind::Variant, SymbolKind::Public]);
+        assert_eq!(variants[0].visibility.as_deref(), Some("pub"));
     }
 
     /// The const-trait forms the pinned grammar lacks parse without an error
@@ -1158,6 +1364,7 @@ mod tests {
             [
                 ("f", true),
                 ("S", true),
+                ("x", false),
                 ("Unit", false),
                 ("E", true),
                 ("A", false),
@@ -1197,6 +1404,14 @@ mod tests {
         assert_eq!(
             provider.syntax_element_kinds("line_comment"),
             [SyntaxKind::Comment]
+        );
+        assert_eq!(
+            provider.syntax_element_kinds("attribute_item"),
+            [SyntaxKind::Annotation]
+        );
+        assert_eq!(
+            provider.syntax_element_kinds("inner_attribute_item"),
+            [SyntaxKind::Annotation]
         );
         assert_eq!(provider.syntax_element_kinds("identifier"), []);
     }
