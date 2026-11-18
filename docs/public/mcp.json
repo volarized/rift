@@ -432,7 +432,7 @@
           },
           "FacetDeclaration": {
             "additionalProperties": false,
-            "description": "One kind: a declaration with its location, source, and syntax structure.",
+            "description": "One facet: a declaration with its location, source, and syntax structure.",
             "properties": {
               "declaration": {
                 "description": "Declaration ordinal in the symbol, from zero.",
