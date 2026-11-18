@@ -670,14 +670,21 @@ fn local_exports(
         return;
     };
     let mut work = 0usize;
+    // Both are built on first use and read by every later binding: visiting every
+    // declaration and every identity again per binding made this pass quadratic in
+    // the crate's public imports.
+    let mut declarations = None;
+    let mut anchored = None;
     for (namespace, (path, range, name, target)) in requested {
         // Captured conditional declarations do not establish export completeness.
         prepared.unresolved_exports = true;
         let local = requested_path(namespace, target).and_then(|target_path| {
+            let declarations = declarations.get_or_insert_with(|| {
+                local_declarations(selected, &prepared.anchors, &mut work, work_max)
+            });
             local_target(
                 input,
-                selected,
-                &prepared.anchors,
+                declarations.as_ref()?,
                 &target_path,
                 &mut work,
                 work_max,
@@ -712,10 +719,16 @@ fn local_exports(
         if identity == target {
             continue;
         }
-        if prepared
-            .anchors
-            .values()
-            .any(|anchors| anchors.values().any(|anchor| *anchor == identity))
+        if anchored
+            .get_or_insert_with(|| {
+                prepared
+                    .anchors
+                    .values()
+                    .flat_map(BTreeMap::values)
+                    .map(SymbolId::as_str)
+                    .collect::<std::collections::BTreeSet<_>>()
+            })
+            .contains(identity.as_str())
         {
             continue;
         }
@@ -807,26 +820,23 @@ fn is_path_keyword(target: &[String]) -> bool {
         .is_some_and(|head| matches!(head.as_str(), "crate" | "self" | "super"))
 }
 
-fn local_target<'input>(
-    input: &NamespaceInput<'_>,
-    selected: &'input [super::SelectedFile<'input>],
-    anchors: &'input super::Anchors,
-    path: &[String],
-    work: &mut usize,
-    work_max: usize,
-) -> Option<(
+/// One admitted declaration: its file, its syntax facts, and its identity.
+type LocalDeclaration<'input> = (
     &'input super::SelectedFile<'input>,
     &'input rift_syntax::SyntaxSymbol,
     &'input SymbolId,
-)> {
-    let requested = SymbolIdentity::new(
-        input.owner().clone(),
-        ShippedLanguage::Rust.language(),
-        path.to_vec(),
-    )
-    .ok()?
-    .wire_identity();
-    let mut found = None;
+);
+
+/// Every admitted declaration of the inventory by identity, in selection order. Each
+/// declaration is visited once and counts one unit of `work`; `None` once `work`
+/// passes `work_max`.
+fn local_declarations<'input>(
+    selected: &'input [super::SelectedFile<'input>],
+    anchors: &'input super::Anchors,
+    work: &mut usize,
+    work_max: usize,
+) -> Option<BTreeMap<&'input str, Vec<LocalDeclaration<'input>>>> {
+    let mut declarations = BTreeMap::<&str, Vec<_>>::new();
     for file in selected {
         let Some(anchors) = anchors.get(file.path.as_str()) else {
             continue;
@@ -836,27 +846,46 @@ fn local_target<'input>(
             if *work > work_max {
                 return None;
             }
-            let Some(identity) = anchors
-                .get(&symbol.qualified_name)
-                .filter(|identity| identity.as_str() == requested)
-            else {
-                continue;
-            };
-            if symbol.visibility.as_deref() != Some("pub")
-                || file
-                    .source
-                    .get(
-                        usize::try_from(symbol.range.start).ok()?
-                            ..usize::try_from(symbol.range.end).ok()?,
-                    )
-                    .is_none()
-                || found.replace((file, symbol, identity)).is_some()
-            {
-                return None;
+            if let Some(identity) = anchors.get(&symbol.qualified_name) {
+                declarations
+                    .entry(identity.as_str())
+                    .or_default()
+                    .push((file, symbol, identity));
             }
         }
     }
-    found
+    Some(declarations)
+}
+
+/// The one public declaration `path` names among the admitted declarations; `None`
+/// when no declaration or more than one carries that identity, or when it is not
+/// `pub` or its range lies outside its source.
+fn local_target<'input>(
+    input: &NamespaceInput<'_>,
+    declarations: &BTreeMap<&'input str, Vec<LocalDeclaration<'input>>>,
+    path: &[String],
+    work: &mut usize,
+    work_max: usize,
+) -> Option<LocalDeclaration<'input>> {
+    let requested = SymbolIdentity::new(
+        input.owner().clone(),
+        ShippedLanguage::Rust.language(),
+        path.to_vec(),
+    )
+    .ok()?
+    .wire_identity();
+    *work = work.checked_add(1)?;
+    if *work > work_max {
+        return None;
+    }
+    let [(file, symbol, identity)] = declarations.get(requested.as_str())?.as_slice() else {
+        return None;
+    };
+    let spelled = file
+        .source
+        .get(usize::try_from(symbol.range.start).ok()?..usize::try_from(symbol.range.end).ok()?)
+        .is_some();
+    (symbol.visibility.as_deref() == Some("pub") && spelled).then_some((*file, *symbol, *identity))
 }
 
 #[cfg(test)]
