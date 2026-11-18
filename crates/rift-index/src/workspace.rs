@@ -571,7 +571,7 @@ pub struct WorkspaceSourcePolicy {
     root: PathBuf,
     watched_root: PathBuf,
     limits: WorkspaceIndexLimits,
-    matcher: PathMatcher,
+    matcher: Arc<PathMatcher>,
     gitignore: Option<GitignoreChain>,
     language: WorkspaceLanguagePolicy,
 }
@@ -716,16 +716,18 @@ impl WorkspaceSourcePolicy {
     ) -> Result<Self, RiftError> {
         let watched_root = root.to_path_buf();
         let root = canonical_root(root)?;
-        let matcher = PathMatcher::build_with_force_include(
+        let matcher = Arc::new(PathMatcher::build_with_force_include(
             &root,
             visibility.include(),
             visibility.exclude(),
             visibility.force_include(),
-        )?;
+        )?);
         let language = WorkspaceLanguagePolicy::build(&root, languages, text_inclusion)?;
         let gitignore = visibility
             .respect_gitignore()
-            .then(|| GitignoreChain::build_cancellable(&root, limits, cancelled))
+            .then(|| {
+                GitignoreChain::build_cancellable(&root, limits, Arc::clone(&matcher), cancelled)
+            })
             .transpose()?;
         Ok(Self {
             root,
@@ -799,6 +801,7 @@ impl WorkspaceSourcePolicy {
             &self.root,
             self.limits.directory_depth_max,
             GitignorePolicy::Ignore,
+            Some(Arc::clone(&self.matcher)),
         ) {
             check_cancelled(cancelled)?;
             let entry = entry.map_err(|error| walk_error(&self.root, error))?;
@@ -4465,6 +4468,7 @@ impl WorkspaceIndex {
             &self.root,
             self.limits.directory_depth_max,
             GitignorePolicy::Ignore,
+            None,
         );
         for entry in walker {
             let entry = entry.map_err(|error| walk_error(&self.root, error))?;
@@ -4541,6 +4545,7 @@ impl WorkspaceIndex {
             &self.root,
             self.limits.directory_depth_max,
             GitignorePolicy::Ignore,
+            None,
         );
         for entry in walker {
             let entry = entry.map_err(|error| walk_error(&self.root, error))?;
@@ -5231,19 +5236,24 @@ fn discover_cancellable(
     language: &WorkspaceLanguagePolicy,
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<DiscoveredPaths, RiftError> {
-    let matcher = PathMatcher::build_with_force_include(
+    let matcher = Arc::new(PathMatcher::build_with_force_include(
         root,
         visibility.include(),
         visibility.exclude(),
         visibility.force_include(),
-    )?;
+    )?);
     let gitignore = GitignorePolicy::from_respecting(visibility.respect_gitignore());
     let ignore_chain = visibility
         .respect_gitignore()
-        .then(|| GitignoreChain::build_cancellable(root, limits, cancelled))
+        .then(|| GitignoreChain::build_cancellable(root, limits, Arc::clone(&matcher), cancelled))
         .transpose()?;
     let mut discovered = DiscoveredPaths::default();
-    for entry in source_walk(root, limits.directory_depth_max, gitignore) {
+    for entry in source_walk(
+        root,
+        limits.directory_depth_max,
+        gitignore,
+        Some(Arc::clone(&matcher)),
+    ) {
         check_cancelled(cancelled)?;
         let entry = entry.map_err(|error| walk_error(root, error))?;
         let Some(path) = walked_file(&entry, limits.directory_depth_max)? else {
@@ -5279,7 +5289,7 @@ fn discover_cancellable(
 fn discover_forced(
     root: &Path,
     limits: WorkspaceIndexLimits,
-    matcher: &PathMatcher,
+    matcher: &Arc<PathMatcher>,
     language: &WorkspaceLanguagePolicy,
     discovered: &mut DiscoveredPaths,
     cancelled: &(dyn Fn() -> bool + Sync),
@@ -5295,7 +5305,7 @@ fn discover_forced(
         .chain(discovered.text.iter().cloned())
         .chain(discovered.lockfiles.iter().cloned())
         .collect();
-    for entry in forced_walk(root, limits.directory_depth_max, reach) {
+    for entry in forced_walk(root, limits.directory_depth_max, reach, Arc::clone(matcher)) {
         check_cancelled(cancelled)?;
         let entry = entry.map_err(|error| walk_error(root, error))?;
         let Some(path) = walked_file(&entry, limits.directory_depth_max)? else {
@@ -5366,6 +5376,7 @@ impl GitignoreChain {
     fn build_cancellable(
         root: &Path,
         limits: WorkspaceIndexLimits,
+        matcher: Arc<PathMatcher>,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<Self, RiftError> {
         let mut layers: BTreeMap<PathBuf, Vec<Gitignore>> = BTreeMap::new();
@@ -5383,7 +5394,12 @@ impl GitignoreChain {
             }
         }
         let mut ignore_files = inputs.len();
-        for entry in source_walk(root, limits.directory_depth_max, GitignorePolicy::Ignore) {
+        for entry in source_walk(
+            root,
+            limits.directory_depth_max,
+            GitignorePolicy::Ignore,
+            Some(matcher),
+        ) {
             check_cancelled(cancelled)?;
             let entry = entry.map_err(|error| walk_error(root, error))?;
             let path = entry.path();
@@ -6235,8 +6251,13 @@ impl GitignorePolicy {
 /// One depth-bounded, hard-floor-filtered walk rooted at `root`, shared by the `[source]`-scoped
 /// scan and `force_include`'s on-demand walk. `gitignore` selects whether the workspace's own
 /// `.gitignore` chain also applies; the hard floor, depth bound, and file-name order are the
-/// same either way.
-fn source_walk(root: &Path, directory_depth_max: usize, gitignore: GitignorePolicy) -> Walk {
+/// same either way. `matcher` prunes directories whose descendants the source policy excludes.
+fn source_walk(
+    root: &Path,
+    directory_depth_max: usize,
+    gitignore: GitignorePolicy,
+    matcher: Option<Arc<PathMatcher>>,
+) -> Walk {
     let mut builder = WalkBuilder::new(root);
     builder
         .standard_filters(false)
@@ -6244,17 +6265,30 @@ fn source_walk(root: &Path, directory_depth_max: usize, gitignore: GitignorePoli
         .follow_links(false)
         .max_depth(Some(directory_depth_max.saturating_add(1)))
         .sort_by_file_name(OsStr::cmp)
-        .filter_entry(hard_floor_includes)
+        .filter_entry(move |entry| source_walk_includes(entry, matcher.as_deref()))
         .git_ignore(gitignore == GitignorePolicy::Respect)
         .git_exclude(gitignore == GitignorePolicy::Respect);
     builder.build()
+}
+
+/// Applies the hard floor and prunes only directories the source policy proves excluded.
+fn source_walk_includes(entry: &DirEntry, matcher: Option<&PathMatcher>) -> bool {
+    hard_floor_includes(entry)
+        && (entry.depth() == 0
+            || !entry.file_type().is_some_and(|kind| kind.is_dir())
+            || matcher.is_none_or(|matcher| !matcher.excludes_descendants(entry.path())))
 }
 
 /// One walk over the subtrees `force_include` reaches, with `.gitignore` not consulted. The
 /// hard floor, depth bound, and file-name order are [`source_walk`]'s; `reach` prunes every
 /// directory the patterns cannot lead to, so a workspace's ignored build output is never
 /// descended for a pattern that names one other directory.
-fn forced_walk(root: &Path, directory_depth_max: usize, reach: ForceIncludeReach) -> Walk {
+fn forced_walk(
+    root: &Path,
+    directory_depth_max: usize,
+    reach: ForceIncludeReach,
+    matcher: Arc<PathMatcher>,
+) -> Walk {
     let mut builder = WalkBuilder::new(root);
     builder
         .standard_filters(false)
@@ -6262,7 +6296,9 @@ fn forced_walk(root: &Path, directory_depth_max: usize, reach: ForceIncludeReach
         .follow_links(false)
         .max_depth(Some(directory_depth_max.saturating_add(1)))
         .sort_by_file_name(OsStr::cmp)
-        .filter_entry(move |entry| hard_floor_includes(entry) && reach.reaches(entry.path()))
+        .filter_entry(move |entry| {
+            source_walk_includes(entry, Some(matcher.as_ref())) && reach.reaches(entry.path())
+        })
         .git_ignore(false);
     builder.build()
 }
@@ -15375,6 +15411,115 @@ mod framework_cache_tests {
 #[cfg(test)]
 mod source_policy_depth_tests {
     use super::*;
+
+    fn excluded_tree() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().expect("workspace");
+        fs::create_dir_all(directory.path().join("build/deep")).expect("excluded directories");
+        fs::write(directory.path().join("kept.rs"), "pub fn kept() {}\n").expect("visible source");
+        fs::write(
+            directory.path().join("build/deep/hidden.rs"),
+            "pub fn hidden() {}\n",
+        )
+        .expect("excluded source");
+        directory
+    }
+
+    fn shallow_limits() -> WorkspaceIndexLimits {
+        WorkspaceIndexLimits::new(10, 1_024, 4_096, 1, 100).expect("bounds")
+    }
+
+    fn excluding_build(respect_gitignore: bool) -> SourceVisibility {
+        SourceVisibility::new(
+            vec!["*.rs".to_owned()],
+            vec!["build/**".to_owned()],
+            respect_gitignore,
+        )
+    }
+
+    #[test]
+    fn excluded_directories_do_not_reach_validation_depth() {
+        let directory = excluded_tree();
+        let policy = WorkspaceSourcePolicy::build(
+            directory.path(),
+            shallow_limits(),
+            &excluding_build(false),
+            &TextFileInclusion::default(),
+        )
+        .expect("source policy");
+        let paths = policy
+            .visible_paths()
+            .expect("excluded directories stay outside the walk");
+        assert_eq!(
+            paths,
+            vec![ProjectPath::new("kept.rs").expect("visible path")]
+        );
+    }
+
+    #[test]
+    fn excluded_directories_do_not_reach_capture_depth() {
+        let directory = excluded_tree();
+        let digests = capture_digests(directory.path(), shallow_limits(), &excluding_build(false))
+            .expect("excluded directories stay outside capture");
+        assert_eq!(digests.len(), 1);
+    }
+
+    #[test]
+    fn excluded_directories_do_not_reach_the_forced_walk() {
+        let directory = excluded_tree();
+        fs::write(directory.path().join(".gitignore"), "build/\n").expect("ignored directory");
+        let visibility = excluding_build(true).with_force_include(vec!["build/**".to_owned()]);
+        let index = WorkspaceIndex::build(
+            directory.path(),
+            shallow_limits(),
+            &visibility,
+            &TextFileInclusion::default(),
+        )
+        .expect("exclude decides before force_include descends");
+        assert_eq!(index.file_count(), 1);
+    }
+
+    #[test]
+    fn excluded_directory_ignore_files_are_not_read() {
+        let directory = excluded_tree();
+        fs::write(directory.path().join("build/.gitignore"), [b'x'; 2_048])
+            .expect("ignore file past the byte bound");
+        let policy = WorkspaceSourcePolicy::build(
+            directory.path(),
+            shallow_limits(),
+            &excluding_build(true),
+            &TextFileInclusion::default(),
+        )
+        .expect("excluded ignore files stay outside the policy walk");
+        assert_eq!(policy.visible_paths().expect("visible files").len(), 1);
+    }
+
+    #[test]
+    fn forced_walk_keeps_partial_glob_components() {
+        for (pattern, directory) in [
+            ("src/g*/**", "src/generated"),
+            ("src/{generated,other}/**", "src/generated"),
+            ("src/ke*.rs", "src"),
+        ] {
+            let root = tempfile::tempdir().expect("workspace");
+            fs::create_dir_all(root.path().join(directory)).expect("source directory");
+            fs::write(
+                root.path().join(directory).join("kept.rs"),
+                "pub fn kept() {}\n",
+            )
+            .expect("source");
+            fs::write(root.path().join(".gitignore"), "src/\n").expect("ignored source");
+            let visibility = SourceVisibility::new(vec![pattern.to_owned()], Vec::new(), true)
+                .with_force_include(vec![pattern.to_owned()]);
+            let index = WorkspaceIndex::build(
+                root.path(),
+                WorkspaceIndexLimits::default(),
+                &visibility,
+                &TextFileInclusion::default(),
+            )
+            .expect("force_include reaches matching files");
+            assert_eq!(index.file_count(), 1, "{pattern}");
+        }
+    }
 
     #[test]
     fn visible_paths_respect_directory_depth_bound() {
