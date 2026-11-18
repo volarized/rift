@@ -4450,8 +4450,8 @@ fn file_digest_revision(digest: rift_index::FileDigest) -> String {
 }
 
 impl RiftMcp {
-    /// The `initialize` instructions this server answers: the global index's for a workspace
-    /// whose `[search] default_scope` is `global`, else the workspace's.
+    /// The instructions `initialize` and `server/discover` answer: the global index's for a
+    /// workspace whose `[search] default_scope` is `global`, else the workspace's.
     async fn served_instructions(&self) -> &'static str {
         let (published, _) = read_published(&self.published).await.snapshot();
         if published.configuration.search_configuration().default_scope == SearchScope::Global {
@@ -4710,6 +4710,22 @@ impl ServerHandler for RiftMcp {
         std::future::ready(Ok(()))
     }
 
+    /// Answers as rmcp's default does, with the instructions `initialize` answers: a
+    /// workspace whose `[search] default_scope` is `global` describes the global index.
+    async fn discover(
+        &self,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::DiscoverResult, ErrorData> {
+        let mut info = self.get_info();
+        info.instructions = Some(self.served_instructions().await.to_owned());
+        Ok(rmcp::model::DiscoverResult::from_server_info(
+            self.supported_protocol_versions().into_owned(),
+            info,
+        ))
+    }
+
+    /// Carries no instructions: `initialize` and `discover` add the ones the published
+    /// configuration selects.
     fn get_info(&self) -> ServerConfig {
         let mut info = ServerConfig::new(
             ServerCapabilities::builder()
@@ -4717,8 +4733,7 @@ impl ServerHandler for RiftMcp {
                 .enable_resources()
                 .build(),
         )
-        .with_server_info(Implementation::new("rift", env!("CARGO_PKG_VERSION")))
-        .with_instructions(WORKSPACE_INSTRUCTIONS);
+        .with_server_info(Implementation::new("rift", env!("CARGO_PKG_VERSION")));
         info.meta = Some(crate::identity::identity_meta(&self.identity));
         info
     }
@@ -4935,11 +4950,32 @@ mod tests {
     /// is `global`, and the workspace on one reading it by default.
     #[tokio::test]
     async fn initialize_instructions_follow_the_default_scope() -> TestResult {
-        for (configuration, expected) in [
-            ("", super::WORKSPACE_INSTRUCTIONS),
+        assert_instructions_follow_the_default_scope(rmcp::ClientLifecycleMode::Initialize).await
+    }
+
+    /// `server/discover` answers the instructions `initialize` does, for both scopes.
+    #[tokio::test]
+    async fn discover_instructions_follow_the_default_scope() -> TestResult {
+        assert_instructions_follow_the_default_scope(rmcp::ClientLifecycleMode::Discover {
+            preferred_versions: vec![rmcp::model::ProtocolVersion::V_2026_07_28],
+        })
+        .await
+    }
+
+    /// Opens a client with `lifecycle` against a workspace reading its index by default and
+    /// one whose `[search] default_scope` is `global`, and asserts the instructions it reads
+    /// and the `search` examples `tools/list` answers. The listing also opens the session a
+    /// `server/discover` probe leaves unselected.
+    async fn assert_instructions_follow_the_default_scope(
+        lifecycle: rmcp::ClientLifecycleMode,
+    ) -> TestResult {
+        use rmcp::ClientServiceExt as _;
+        for (configuration, expected, reads_global) in [
+            ("", super::WORKSPACE_INSTRUCTIONS, false),
             (
                 "[global]\nenabled = false\n\n[search]\ndefault_scope = \"global\"\n",
                 super::GLOBAL_INSTRUCTIONS,
+                true,
             ),
         ] {
             let directory = tempfile::tempdir()?;
@@ -4955,11 +4991,30 @@ mod tests {
                     .expect("server must initialize");
                 service.waiting().await.expect("server must stop cleanly");
             });
-            let client = ().serve(client_transport).await?;
+            let client = ().serve_with_lifecycle(client_transport, lifecycle.clone()).await?;
             let instructions = client
                 .peer_info()
                 .and_then(|info| info.instructions.clone());
-            assert_eq!(instructions.as_deref(), Some(expected), "{configuration:?}");
+            assert_eq!(
+                instructions.as_deref(),
+                Some(expected),
+                "{lifecycle:?} {configuration:?}"
+            );
+            let mut expected_tools = RiftMcp::tool_router().list_all();
+            if reads_global {
+                crate::schema::serve_global_examples(&mut expected_tools);
+            }
+            let search_examples = |tools: &[rmcp::model::Tool]| {
+                tools
+                    .iter()
+                    .find(|tool| tool.name == "search")
+                    .and_then(|tool| tool.input_schema.get("examples").cloned())
+            };
+            assert_eq!(
+                search_examples(&client.list_all_tools().await?),
+                search_examples(&expected_tools),
+                "{lifecycle:?} {configuration:?}"
+            );
             client.cancel().await?;
             server_task.await?;
         }
