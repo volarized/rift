@@ -386,7 +386,7 @@ CHURN_REQUESTS: dict[str, JsonObject] = {
         f"{{ ?element :of <{CHURN_PROBE_ID}>; :index 0; :source ?source; "
         ":range [ :unit ?unit; :start ?start; :end ?end ] }"
     },
-    "kinds": {"symbol": CHURN_PROBE_ID},
+    "facets": {"symbol": CHURN_PROBE_ID},
 }
 CHURN_TOOLS: dict[str, str] = {}
 # The convergence loop resends every churn tool until the newest source lands, so it
