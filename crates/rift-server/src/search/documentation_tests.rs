@@ -111,7 +111,7 @@ async fn scoped_documentation_search(
         "query": query,
         "scope": scope,
         "target": "documentation",
-        "limit": 100
+        "max_results": 100
     }))?;
     let answer = answer(store, service, query).await?;
     Ok(service.search(&params, &answer)?)
@@ -126,8 +126,8 @@ async fn search_for(
     let params: SearchParams = serde_json::from_value(json!({
         "query": query,
         "target": target,
-        "include": ["source", "score"],
-        "limit": 100
+        "include": {"source": true, "score": true},
+        "max_results": 100
     }))?;
     Ok(service.search(&params, &answer(store, service, query).await?)?)
 }
@@ -176,7 +176,7 @@ async fn required_documentation_formats_search_captured_content() -> TestResult 
     let service = service(directory.path())?;
     let store = stored(directory.path(), &service).await?;
     let params: SearchParams = serde_json::from_value(
-        json!({"query":"compass","target":"documentation","include":["source"],"limit":100}),
+        json!({"query":"compass","target":"documentation","include":{"source": true},"max_results":100}),
     )?;
     let results = service.search(&params, &answer(&store, &service, "compass").await?)?;
     assert_eq!(results.results.len(), 6, "{results:#?}");
@@ -217,11 +217,11 @@ async fn heading_and_baseline_match_project_once_before_pagination() -> TestResu
     let store = stored(directory.path(), &service).await?;
     for target in ["documentation", "all"] {
         let params: SearchParams = serde_json::from_value(
-            json!({"query":"Compass","target":target,"limit":1,"include":["source"]}),
+            json!({"query":"Compass","target":target,"max_results":1,"include":{"source": true}}),
         )?;
         let result = service.search(&params, &answer(&store, &service, "Compass").await?)?;
         assert_eq!(result.results.len(), 1);
-        assert_eq!(result.pagination.total_pages, 1);
+        assert_eq!(result.pagination.pages, 1);
         assert!(matches!(
             result.results[0].hit,
             SearchHitTarget::Documentation { .. }
@@ -258,8 +258,8 @@ async fn page_excerpt_budget_respects_utf8_and_coalesces_same_source_warnings() 
     let params: SearchParams = serde_json::from_value(json!({
         "query":"compass",
         "target":"documentation",
-        "include":["source"],
-        "limit":100
+        "include":{"source": true},
+        "max_results":100
     }))?;
 
     let result = service.search(&params, &answer(&store, &service, "compass").await?)?;
@@ -328,7 +328,7 @@ fn documentation_include_reads_exact_reverse_references_and_is_optional() -> Tes
             .is_none()
     );
     let params: GetSymbolParams =
-        serde_json::from_value(json!({"name":"Compass","include":["documentation"]}))?;
+        serde_json::from_value(json!({"name":"Compass","include":{"documentation": true}}))?;
     let result = service.get_symbol(&params)?;
     let context = result.hits[0]
         .documentation
@@ -356,7 +356,7 @@ async fn attached_documentation_keeps_symbol_owner_and_outside_file_matches() ->
     let service = service(directory.path())?;
     let store = stored(directory.path(), &service).await?;
     let documentation: SearchParams = serde_json::from_value(
-        json!({"query":"compass","target":"documentation","include":["source"]}),
+        json!({"query":"compass","target":"documentation","include":{"source": true}}),
     )?;
     let result = service.search(&documentation, &answer(&store, &service, "compass").await?)?;
     assert_eq!(result.results.len(), 1, "{result:#?}");
@@ -726,7 +726,7 @@ async fn get_symbol_documentation_keeps_project_hits_and_exact_source_context() 
     let local_with: GetSymbolParams = serde_json::from_value(json!({
         "name": "Beacon",
         "scope": "local",
-        "include": ["documentation"]
+        "include": {"documentation": true}
     }))?;
     let without = service.get_symbol(&local_without)?;
     let local = service.get_symbol(&local_with)?;
@@ -749,14 +749,14 @@ async fn get_symbol_documentation_keeps_project_hits_and_exact_source_context() 
     let global_params: GetSymbolParams = serde_json::from_value(json!({
         "name": "Beacon",
         "scope": "global",
-        "include": ["documentation"]
+        "include": {"documentation": true}
     }))?;
     assert!(service.get_symbol(&global_params)?.hits.is_empty());
 
     let all_params: GetSymbolParams = serde_json::from_value(json!({
         "name": "Beacon",
         "scope": "all",
-        "include": ["documentation"]
+        "include": {"documentation": true}
     }))?;
     let all = service.get_symbol(&all_params)?;
     assert_eq!(all.hits, local.hits);
@@ -772,8 +772,8 @@ fn search_with_answer(
     let params: SearchParams = serde_json::from_value(json!({
         "query": query,
         "target": target,
-        "include": ["source", "score"],
-        "limit": 100
+        "include": {"source": true, "score": true},
+        "max_results": 100
     }))?;
     Ok(service.search(&params, answer)?)
 }

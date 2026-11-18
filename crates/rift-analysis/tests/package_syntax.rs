@@ -221,9 +221,11 @@ fn checked_restored(syntax: &PackageSyntax, text: &str) -> PackageSyntax {
     for symbol in &mut symbols {
         let kind = symbol.kind.to_owned();
         symbol.kind = names.symbol_kind(&kind).expect("restored provider kind");
-        symbol.node_kind = symbol.node_kind.map(|kind| {
+        symbol.syntax_element_kind = symbol.syntax_element_kind.map(|kind| {
             let captured = kind.to_owned();
-            names.node_kind(&captured).expect("restored grammar kind")
+            names
+                .syntax_element_kind(&captured)
+                .expect("restored grammar kind")
         });
     }
     let digest = rift_core::FileDigest::of(text.as_bytes());
@@ -398,7 +400,7 @@ fn every_package_provider_keeps_canonical_facts_and_reports_actual_calls() {
 #[test]
 fn captured_static_occurrences_survive_package_fact_restoration() {
     use rift_protocol::producer::FactKind;
-    use rift_protocol::read::RelationshipFacet;
+    use rift_protocol::read::EdgeKind;
 
     let source = "pub fn target() {}\npub fn caller() { target(); target(); }\n";
     let files = [("src/lib.rs", source)];
@@ -425,9 +427,9 @@ fn captured_static_occurrences_survive_package_fact_restoration() {
         .validate_facts()
         .expect("coverage matches facts");
     let calls = publication
-        .relationships
+        .edges
         .iter()
-        .filter(|relationship| relationship.facets.contains(&RelationshipFacet::Calls))
+        .filter(|edge| edge.kinds.contains(&EdgeKind::Calls))
         .collect::<Vec<_>>();
     assert_eq!(calls.len(), 2);
     assert_ne!(calls[0].occurrence, calls[1].occurrence);
@@ -623,19 +625,19 @@ fn incompatible_recorded_inputs_fall_back_to_current_provider() {
     for limits in [
         SyntaxLimits::new(
             limits.source_bytes_max() + 1,
-            limits.syntax_nodes_max(),
+            limits.syntax_elements_max(),
             limits.syntax_depth_max(),
         )
         .expect("bounds"),
         SyntaxLimits::new(
             limits.source_bytes_max(),
-            limits.syntax_nodes_max() + 1,
+            limits.syntax_elements_max() + 1,
             limits.syntax_depth_max(),
         )
         .expect("bounds"),
         SyntaxLimits::new(
             limits.source_bytes_max(),
-            limits.syntax_nodes_max(),
+            limits.syntax_elements_max(),
             limits.syntax_depth_max() + 1,
         )
         .expect("bounds"),
@@ -820,7 +822,7 @@ fn supplied_identity_cannot_replace_facts_syntax_bounds() {
     let limits = SyntaxLimits::default();
     let raised = SyntaxLimits::new(
         limits.source_bytes_max(),
-        limits.syntax_nodes_max() + 1,
+        limits.syntax_elements_max() + 1,
         limits.syntax_depth_max(),
     )
     .expect("bounds");

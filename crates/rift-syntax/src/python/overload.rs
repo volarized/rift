@@ -32,45 +32,47 @@ impl OverloadContext {
         let mut cursor = root.walk();
         for statement in root
             .named_children(&mut cursor)
-            .take(limits.syntax_nodes_max())
+            .take(limits.syntax_elements_max())
         {
             context.import(statement, source)?;
         }
         let mut work = vec![(root, 0_usize)];
         let mut visited = 0_usize;
-        while let Some((node, depth)) = work.pop() {
-            if visited >= limits.syntax_nodes_max() || depth > limits.syntax_depth_max() {
+        while let Some((syntax_element, depth)) = work.pop() {
+            if visited >= limits.syntax_elements_max() || depth > limits.syntax_depth_max() {
                 context.unknown = true;
                 break;
             }
             visited += 1;
-            match node.kind() {
+            match syntax_element.kind() {
                 "assignment" | "augmented_assignment" => {
-                    if let Some(left) = node.child_by_field_name("left") {
+                    if let Some(left) = syntax_element.child_by_field_name("left") {
                         context.shadow(left, source);
                     }
                 }
                 "function_definition" | "class_definition" => {
-                    if let Some(name) = node.child_by_field_name("name") {
+                    if let Some(name) = syntax_element.child_by_field_name("name") {
                         context.shadow(name, source);
                     }
                 }
                 "parameters" | "lambda_parameters" => {
-                    let mut cursor = node.walk();
-                    for child in node.named_children(&mut cursor) {
+                    let mut cursor = syntax_element.walk();
+                    for child in syntax_element.named_children(&mut cursor) {
                         context.shadow(child, source);
                     }
                 }
                 "import_statement" | "import_from_statement"
-                    if node.parent().is_none_or(|parent| parent.id() != root.id()) =>
+                    if syntax_element
+                        .parent()
+                        .is_none_or(|parent| parent.id() != root.id()) =>
                 {
                     context.unknown = true;
                 }
                 _ => {}
             }
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                if work.len().saturating_add(visited) >= limits.syntax_nodes_max() {
+            let mut cursor = syntax_element.walk();
+            for child in syntax_element.named_children(&mut cursor) {
+                if work.len().saturating_add(visited) >= limits.syntax_elements_max() {
                     context.unknown = true;
                     break;
                 }
@@ -80,8 +82,8 @@ impl OverloadContext {
         Ok(context)
     }
 
-    fn shadow(&mut self, node: Node<'_>, source: &str) {
-        if let Some(name) = source.get(node.byte_range())
+    fn shadow(&mut self, syntax_element: Node<'_>, source: &str) {
+        if let Some(name) = source.get(syntax_element.byte_range())
             && self.imports.contains_key(name)
         {
             self.shadowed.insert(name.to_owned());
@@ -143,8 +145,12 @@ impl OverloadContext {
         Ok(())
     }
 
-    pub(super) fn state(&self, node: Node<'_>, source: &str) -> Result<PythonOverload, RiftError> {
-        let Some(parent) = node
+    pub(super) fn state(
+        &self,
+        syntax_element: Node<'_>,
+        source: &str,
+    ) -> Result<PythonOverload, RiftError> {
+        let Some(parent) = syntax_element
             .parent()
             .filter(|parent| parent.kind() == "decorated_definition")
         else {

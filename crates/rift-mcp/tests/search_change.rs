@@ -117,7 +117,7 @@ async fn search_change_answers_every_declaration_the_two_revisions_differ_in() -
             "search_retrieval",
             &json!({
                 "change": {"base": "baseline", "head": "HEAD"},
-                "include": ["source"]
+                "include": {"source": true}
             }),
         ),
     )

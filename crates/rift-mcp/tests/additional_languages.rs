@@ -125,49 +125,13 @@ async fn workspace_discovers_native_web_and_explicit_template_languages() -> Tes
     let (_directory, client, server_task) =
         served_relative_workspace(&files, Some(CONFIGURATION.to_owned())).await?;
     for case in SOURCE_CASES {
-        assert_workspace_nodes(&client, case).await?;
         assert_workspace_search(&client, case).await?;
         if let Some(name) = case.symbol {
             assert_workspace_symbol(&client, case, name).await?;
         }
     }
-    let unknown = call_retrying_acceptance(
-        &client,
-        tool_request(
-            "nodes",
-            &json!({"path":"unknown.beacon", "position":0, "syntax":true}),
-        ),
-    )
-    .await?;
-    assert_eq!(unknown["nodes"][0]["kind"], "file", "{unknown}");
-    assert_eq!(unknown["nodes"][0]["language"], "text", "{unknown}");
-    assert_eq!(unknown["nodes"][0]["source"], "unsupported_beacon 灯");
     client.cancel().await?;
     server_task.await?;
-    Ok(())
-}
-
-async fn assert_workspace_nodes(client: &Client, case: &SourceCase) -> TestResult {
-    let output = call_retrying_acceptance(
-        client,
-        tool_request(
-            "nodes",
-            &json!({"path":case.path, "position":0, "syntax":true}),
-        ),
-    )
-    .await?;
-    let nodes = output["nodes"].as_array().ok_or("nodes array")?;
-    assert!(!nodes.is_empty(), "{}: {output}", case.path);
-    assert_eq!(
-        nodes[0]["language"], case.language,
-        "{}: {output}",
-        case.path
-    );
-    assert_eq!(
-        nodes[0]["source"], case.text,
-        "{}: the file node carries the original source",
-        case.path
-    );
     Ok(())
 }
 
@@ -176,7 +140,7 @@ async fn assert_workspace_search(client: &Client, case: &SourceCase) -> TestResu
         client,
         &json!({
             "pattern":"灯", "target":"file", "paths":{"include":[case.path]},
-            "include":["source"],
+            "include":{"source": true},
         }),
     )
     .await?;
@@ -198,7 +162,7 @@ async fn assert_workspace_symbol(client: &Client, case: &SourceCase, name: &str)
         client,
         &json!({
             "query":name, "target":"symbol", "paths":{"include":[case.path]},
-            "include":["source"],
+            "include":{"source": true},
         }),
     )
     .await?;
@@ -223,7 +187,6 @@ async fn assert_workspace_symbol(client: &Client, case: &SourceCase, name: &str)
     let start = usize::try_from(hit["range"]["start"].as_u64().ok_or("range start")?)?;
     let end = usize::try_from(hit["range"]["end"].as_u64().ok_or("range end")?)?;
     assert_eq!(hit["source"], Value::from(&case.text[start..end]));
-    assert_workspace_symbol_node(client, case, name, start, end).await?;
     let search = search_after_population(
         client,
         &json!({
@@ -246,54 +209,9 @@ async fn assert_workspace_symbol(client: &Client, case: &SourceCase, name: &str)
     Ok(())
 }
 
-async fn assert_workspace_symbol_node(
-    client: &Client,
-    case: &SourceCase,
-    name: &str,
-    start: usize,
-    end: usize,
-) -> TestResult {
-    let source = &case.text[start..end];
-    let positions = source.match_indices(name).collect::<Vec<_>>();
-    assert_eq!(positions.len(), 1, "{name} has one original name span");
-    let position = u64::try_from(start.checked_add(positions[0].0).ok_or("name offset")?)?;
-    let output = call_retrying_acceptance(
-        client,
-        tool_request(
-            "nodes",
-            &json!({"path":case.path, "position":position, "syntax":true}),
-        ),
-    )
-    .await?;
-    let nodes = output["nodes"].as_array().ok_or("nodes array")?;
-    let start = u64::try_from(start)?;
-    let end = u64::try_from(end)?;
-    let node = nodes
-        .iter()
-        .filter(|node| {
-            node["range"]["start"]
-                .as_u64()
-                .is_some_and(|node_start| node_start >= start && node_start <= position)
-                && node["range"]["end"] == end
-        })
-        .max_by_key(|node| node["range"]["start"].as_u64())
-        .ok_or_else(|| format!("{name} declaration node: {output}"))?;
-    assert!(
-        node["index"].is_u64(),
-        "source carries node address: {node}"
-    );
-    assert_eq!(node["language"], case.language, "{node}");
-    let node_start = usize::try_from(node["range"]["start"].as_u64().ok_or("node start")?)?;
-    let node_end = usize::try_from(end)?;
-    assert_eq!(
-        node["source"],
-        Value::from(&case.text[node_start..node_end])
-    );
-    Ok(())
-}
-
 #[tokio::test]
-async fn nodes_summaries_continue_over_declarations_and_refuse_another_selector() -> TestResult {
+async fn syntax_elements_summaries_continue_over_declarations_and_refuse_another_selector()
+-> TestResult {
     use workspace_client::served_workspace;
 
     let (_directory, client, task) = served_workspace(
@@ -318,14 +236,18 @@ async fn nodes_summaries_continue_over_declarations_and_refuse_another_selector(
     )
     .await?;
     let symbol = "rift://symbol/local/javascript/beacon/open";
-    let default =
-        call_retrying_acceptance(&client, tool_request("nodes", &json!({"symbol":symbol}))).await?;
-    let cursor = default["node_cursor"]
-        .as_str()
-        .ok_or("declaration continuation")?;
+    let default = call_retrying_acceptance(
+        &client,
+        tool_request("facets", &json!({"symbol":symbol,"max_results":4})),
+    )
+    .await?;
+    let revision = &default["revision"];
     let next = call_retrying_acceptance(
         &client,
-        tool_request("nodes", &json!({"symbol":symbol, "node_cursor":cursor})),
+        tool_request(
+            "facets",
+            &json!({"symbol":symbol, "page":2,"max_results":4,"revision":revision}),
+        ),
     )
     .await?;
     let declarations = |value: Value| -> TestResult<Vec<u64>> {
@@ -340,20 +262,23 @@ async fn nodes_summaries_continue_over_declarations_and_refuse_another_selector(
             })
             .collect()
     };
-    assert!(next.get("node_cursor").is_none(), "{next}");
+    assert_eq!(
+        next["pagination"],
+        json!({"page":2,"pages":2,"max_results":4,"total":6})
+    );
     assert_eq!(declarations(default.clone())?, [0, 1, 2, 3]);
     assert_eq!(declarations(next)?, [4, 5]);
     let refused = client
         .call_tool(tool_request(
-            "nodes",
-            &json!({"symbol":symbol, "node_cursor":cursor, "syntax":true}),
+            "facets",
+            &json!({"symbol":symbol, "page":2,"max_results":4,"revision":revision, "syntax":true}),
         ))
         .await?;
     assert_eq!(refused.is_error, Some(true), "{refused:?}");
     let refused = client
         .call_tool(tool_request(
-            "nodes",
-            &json!({"path":"index.js", "position":17, "node_cursor":cursor}),
+            "facets",
+            &json!({"path":"index.js", "position":17, "page":2,"max_results":4,"revision":revision}),
         ))
         .await?;
     assert_eq!(refused.is_error, Some(true), "{refused:?}");

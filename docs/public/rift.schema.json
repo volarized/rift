@@ -275,7 +275,7 @@
         "resolution": {
           "$ref": "#/$defs/DependencyResolution",
           "default": "auto",
-          "description": "Whether a standard library version probe runs: `auto` runs `rustc --version` or\n`node --version` when no pin names the version, `static` reads the pins and project\nfiles alone and runs no program."
+          "description": "Whether a standard library version probe runs: `auto` runs `rustc --version` or\n`syntax element --version` when no pin names the version, `static` reads the pins and project\nfiles alone and runs no program."
         }
       },
       "type": "object"
@@ -285,7 +285,7 @@
       "oneOf": [
         {
           "const": "auto",
-          "description": "A standard library version no pin names is read from `rustc --version` or\n`node --version`, and the static reading stands when the probe fails.",
+          "description": "A standard library version no pin names is read from `rustc --version` or\n`syntax element --version`, and the static reading stands when the probe fails.",
           "type": "string"
         },
         {
@@ -371,14 +371,6 @@
           "minimum": 1,
           "type": "integer"
         },
-        "max_nodes": {
-          "default": 250000,
-          "description": "Syntax nodes one documentation parser accepts.",
-          "format": "uint32",
-          "maximum": 100000000,
-          "minimum": 1,
-          "type": "integer"
-        },
         "max_progress": {
           "default": 131072,
           "description": "Progress callbacks one reStructuredText parser accepts.",
@@ -400,6 +392,14 @@
           "description": "Selected documentation sources one collection accepts.",
           "format": "uint32",
           "maximum": 5000000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_syntax_elements": {
+          "default": 250000,
+          "description": "Syntax syntax elements one documentation parser accepts.",
+          "format": "uint32",
+          "maximum": 100000000,
           "minimum": 1,
           "type": "integer"
         },
@@ -717,9 +717,9 @@
             "min": "1s"
           }
         },
-        "max_facets": {
-          "default": 16,
-          "description": "Most selected facets in one global relationship request.",
+        "max_edges": {
+          "default": 1000,
+          "description": "Most edge projections in one global edge group.",
           "format": "uint64",
           "minimum": 1,
           "type": "integer"
@@ -732,16 +732,16 @@
           "minimum": 1,
           "type": "integer"
         },
-        "max_occurrences": {
-          "default": 1000,
-          "description": "Most occurrence projections in one global relationship group.",
+        "max_kinds": {
+          "default": 16,
+          "description": "Most selected kinds in one global edge request.",
           "format": "uint64",
           "minimum": 1,
           "type": "integer"
         },
-        "max_relationships": {
+        "max_occurrences": {
           "default": 1000,
-          "description": "Most relationship projections in one global relationship group.",
+          "description": "Most occurrence projections in one global edge group.",
           "format": "uint64",
           "minimum": 1,
           "type": "integer"
@@ -766,7 +766,7 @@
         },
         "max_seeds": {
           "default": 64,
-          "description": "Most subjects in one global relationship request.",
+          "description": "Most subjects in one global edge request.",
           "format": "uint64",
           "minimum": 1,
           "type": "integer"
@@ -782,14 +782,14 @@
         },
         "max_sources": {
           "default": 10000,
-          "description": "Most original source units in one global relationship page.",
+          "description": "Most original source units in one global edge page.",
           "format": "uint64",
           "minimum": 1,
           "type": "integer"
         },
         "max_symbols": {
           "default": 10000,
-          "description": "Most original symbol records in one global relationship page.",
+          "description": "Most original symbol records in one global edge page.",
           "format": "uint64",
           "minimum": 1,
           "type": "integer"
@@ -1569,11 +1569,11 @@
           "default": {
             "declarations": 1000000,
             "directory_depth": 64,
+            "edges": 10000000,
             "exclude": [],
             "files": 100000,
             "force_include": [],
             "include": [],
-            "relationships": 10000000,
             "respect_gitignore": true,
             "workspace_size": "512mb"
           },
@@ -1611,7 +1611,7 @@
             "frameworks": [],
             "max_depth": 512,
             "max_file": "4mb",
-            "max_nodes": 250000
+            "max_syntax_elements": 250000
           },
           "description": "The bounds every syntax provider parses one source under."
         }
@@ -1620,20 +1620,12 @@
     },
     "QueryConfiguration": {
       "additionalProperties": false,
-      "description": "Bounds on one transport page of a retained query result.",
+      "description": "Bounds on one query result page.",
       "properties": {
         "page_limit": {
           "$ref": "#/$defs/ByteSize",
           "default": "4mb",
           "description": "Most encoded bytes on one page, from 1 KiB to 4 MiB."
-        },
-        "page_size": {
-          "default": 50,
-          "description": "Most bindings or triples on one page, from 1 to 1000.",
-          "format": "uint64",
-          "maximum": 1000,
-          "minimum": 1,
-          "type": "integer"
         }
       },
       "type": "object"
@@ -1824,8 +1816,7 @@
         "query": {
           "$ref": "#/$defs/QueryConfiguration",
           "default": {
-            "page_limit": "4mb",
-            "page_size": 50
+            "page_limit": "4mb"
           },
           "description": "Transport bounds for retained graph query answers."
         },
@@ -2031,6 +2022,14 @@
           "minimum": 1,
           "type": "integer"
         },
+        "edges": {
+          "default": 10000000,
+          "description": "Most edges held together, 1 to 500000000.",
+          "format": "uint64",
+          "maximum": 500000000,
+          "minimum": 1,
+          "type": "integer"
+        },
         "exclude": {
           "default": [],
           "description": "Exact file paths or globs dropped from visibility, in [`PathPattern`] syntax. A match\nhere is dropped even when `include` also matches it.",
@@ -2066,14 +2065,6 @@
           "maxItems": 512,
           "type": "array"
         },
-        "relationships": {
-          "default": 10000000,
-          "description": "Most relationship edges held together, 1 to 500000000.",
-          "format": "uint64",
-          "maximum": 500000000,
-          "minimum": 1,
-          "type": "integer"
-        },
         "respect_gitignore": {
           "default": true,
           "description": "Whether root and nested `.gitignore` files and repository-local `.git/info/exclude` hide matching paths.\nGlobal and parent-directory ignore sources are never read.",
@@ -2093,7 +2084,7 @@
     },
     "SyntaxConfiguration": {
       "additionalProperties": false,
-      "description": "The `[providers.syntax]` table. A syntax provider's cost scales with the\nsource it parses, so each source is bounded by size, node count, and\nnesting depth; a source past any bound is left out of the index.",
+      "description": "The `[providers.syntax]` table. A syntax provider's cost scales with the\nsource it parses, so each source is bounded by size, syntax element count, and\nnesting depth; a source past any bound is left out of the index.",
       "properties": {
         "frameworks": {
           "default": [],
@@ -2121,9 +2112,9 @@
             "min": "1b"
           }
         },
-        "max_nodes": {
+        "max_syntax_elements": {
           "default": 250000,
-          "description": "Syntax nodes one source may produce.",
+          "description": "Syntax syntax elements one source may produce.",
           "format": "uint64",
           "maximum": 100000000,
           "minimum": 1,
@@ -2330,10 +2321,10 @@
         "max_heading_depth": 512,
         "max_layer_blocks": 2000000,
         "max_mappings": 6000000,
-        "max_nodes": 250000,
         "max_progress": 131072,
         "max_references": 250000,
         "max_sources": 100000,
+        "max_syntax_elements": 250000,
         "max_text": "4kb",
         "max_total": "512mb",
         "max_warnings": 256
@@ -2359,10 +2350,10 @@
         "enabled": true,
         "endpoint": "https://api.volar.sh/rift/rest",
         "failure_ttl": "30s",
-        "max_facets": 16,
+        "max_edges": 1000,
         "max_in_flight": 4,
+        "max_kinds": 16,
         "max_occurrences": 1000,
-        "max_relationships": 1000,
         "max_request": "4mb",
         "max_response": "32mb",
         "max_seeds": 64,
@@ -2479,7 +2470,7 @@
           "frameworks": [],
           "max_depth": 512,
           "max_file": "4mb",
-          "max_nodes": 250000
+          "max_syntax_elements": 250000
         }
       },
       "description": "Bounds and switches for the built-in providers."
@@ -2505,8 +2496,7 @@
         "pattern_verified_size": "128mb",
         "pool_slots": 4,
         "query": {
-          "page_limit": "4mb",
-          "page_size": 50
+          "page_limit": "4mb"
         },
         "ranking": {
           "fusion_k": 60,
@@ -2575,11 +2565,11 @@
       "default": {
         "declarations": 1000000,
         "directory_depth": 64,
+        "edges": 10000000,
         "exclude": [],
         "files": 100000,
         "force_include": [],
         "include": [],
-        "relationships": 10000000,
         "respect_gitignore": true,
         "workspace_size": "512mb"
       },

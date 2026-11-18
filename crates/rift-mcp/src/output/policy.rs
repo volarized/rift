@@ -136,7 +136,7 @@ mod tests {
 
     #[test]
     fn all_leaves_a_listing_unchanged() {
-        let page = listing(vec![described_tool("search"), described_tool("nodes")]);
+        let page = listing(vec![described_tool("search"), described_tool("facets")]);
         assert_eq!(OutputPolicy::All.select_listing(page.clone()), page);
     }
 
@@ -144,12 +144,12 @@ mod tests {
     fn text_removes_output_schema_from_every_tool_and_keeps_the_rest() {
         let page = listing(vec![
             described_tool("search"),
-            described_tool("nodes"),
+            described_tool("facets"),
             bare_tool("get_symbol"),
         ]);
         let expected = listing(vec![
             bare_tool("search"),
-            bare_tool("nodes"),
+            bare_tool("facets"),
             bare_tool("get_symbol"),
         ]);
         let selected = OutputPolicy::Text.select_listing(page);

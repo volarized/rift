@@ -3,8 +3,8 @@ use rift_error::__rift_error_definition;
 __rift_error_definition!(
     facts_count_exceeded,
     slug = "rift.syntax.facts_count_exceeded",
-    message = "syntax facts exceed their node bound",
-    action = "reduce facts below the accepted node bound and parse again",
+    message = "syntax facts exceed their syntax element bound",
+    action = "reduce facts below the accepted syntax element bound and parse again",
     fields = {},
 );
 
@@ -146,13 +146,13 @@ __rift_error_definition!(
 __rift_error_definition!(
     position_overflow,
     slug = "rift.syntax.position_overflow",
-    message = "syntax node position does not fit the accepted byte width",
+    message = "syntax element position does not fit the accepted byte width",
     action = "report this internal failure with its full context",
     fields = {
         end_byte: required(unsigned),
-        node_kind: required(string),
         source: required(source),
         start_byte: required(unsigned),
+        syntax_element_kind: required(string),
     },
 );
 
@@ -202,23 +202,23 @@ __rift_error_definition!(
 );
 
 __rift_error_definition!(
-    too_many_nodes,
-    slug = "rift.syntax.too_many_nodes",
-    message = "syntax tree node count exceeds accepted limit {syntax_nodes_max}",
-    action = "reduce syntax tree node count below {syntax_nodes_max} and retry",
+    too_many_syntax_elements,
+    slug = "rift.syntax.too_many_syntax_elements",
+    message = "syntax element count exceeds accepted limit {syntax_elements_max}",
+    action = "reduce syntax element count below {syntax_elements_max} and retry",
     fields = {
         path: required(path),
-        syntax_nodes_max: required(unsigned),
+        syntax_elements_max: required(unsigned),
     },
 );
 
 __rift_error_definition!(
-    unknown_node_kind,
-    slug = "rift.syntax.unknown_node_kind",
-    message = "node kind {node_kind} is outside interpreted grammar vocabulary",
+    unknown_syntax_element_kind,
+    slug = "rift.syntax.unknown_syntax_element_kind",
+    message = "syntax element kind {syntax_element_kind} is outside interpreted grammar vocabulary",
     action = "report this internal failure with its full context",
     fields = {
-        node_kind: required(string),
+        syntax_element_kind: required(string),
     },
 );
 

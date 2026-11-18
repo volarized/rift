@@ -2,7 +2,7 @@
 
 use rift_error::{RiftError, errors};
 use rift_protocol::identity::SymbolIdentity;
-use rift_protocol::read::{GetSymbolInclude, ReadWarning, SymbolHistory};
+use rift_protocol::read::{ReadWarning, SymbolHistory};
 use rift_protocol::symbol_read::{
     GetSymbolParams, GetSymbolResult, SymbolAlternative, SymbolMatchContext, SymbolNotFound,
     SymbolUnavailableReason,
@@ -16,31 +16,28 @@ impl ReadService {
     /// Reads one project symbol by its canonical identity at the revision this service
     /// serves.
     ///
-    /// An unready publication answers `index_preparing`. A `declaration_cursor` resumes a
-    /// preceding read of the same symbol at the same revision; the service holds nothing
-    /// between pages.
+    /// An unready publication answers `index_preparing`. The caller selects declarations with `page`
+    /// and pins the revision for later pages.
     ///
     /// # Errors
     ///
     /// Returns `read_revision_unserved` for a `revision` this service does not serve,
-    /// `read_invalid` for a malformed identity, limit, or a cursor minted for another symbol
-    /// or revision, and the index or history read failure.
+    /// `read_invalid` for a malformed identity, page or `max_results`, and the index or history read failure.
     pub fn exact_symbol(
         &self,
         request: &GetSymbolParams,
         ready: bool,
     ) -> Result<GetSymbolResult, RiftError> {
         let identity = SymbolIdentity::parse(request.id.as_str())?;
-        let limit = super::accepted_limit(request.declaration_limit)?.min(self.index.results_max());
+        let limit = super::accepted_max_results(
+            request.max_results,
+            rift_protocol::symbol_read::GET_SYMBOL_MAX_RESULTS,
+        )?;
         self.accept_revision(request.revision.as_ref())?;
         let revision = self.served_revision()?;
-        let served = revision.to_string();
-        let offset = request
-            .declaration_cursor
-            .as_deref()
-            .map_or(Ok(0), |cursor| {
-                super::cursor::offset(cursor, "declaration_cursor", request.id.as_str(), &served)
-            })?;
+        let pagination = rift_protocol::read::Pagination::new(request.page, request.max_results, 0);
+        super::accept_page(request.page)?;
+        let offset = pagination.offset();
         let warnings = self.warnings();
         if !ready {
             return Ok(unavailable(
@@ -72,7 +69,7 @@ impl ReadService {
         };
         let page = DeclarationPage {
             revision,
-            served,
+            page: request.page,
             offset,
             limit,
         };
@@ -103,7 +100,7 @@ impl ReadService {
                 warnings,
             ));
         }
-        let history = if request.include.contains(&GetSymbolInclude::History) {
+        let history = if request.include.history {
             let Some(history) = self.exact_history(index, request, key)? else {
                 return Ok(unavailable(
                     request,
@@ -115,19 +112,20 @@ impl ReadService {
         } else {
             None
         };
-        let (declarations, total) =
-            index.declarations_by_identity_page(key, page.offset, page.limit)?;
-        let next = page.offset.saturating_add(declarations.len());
+        let (declarations, total) = declarations_page(index, key, page.offset, page.limit)?;
         let documentation = request
             .include
-            .contains(&GetSymbolInclude::Documentation)
+            .documentation
             .then(|| exact_documentation(index, request));
         warnings.extend(super::symbol_disagreement_warning(readable.assembled()));
         Ok(GetSymbolResult::Found {
             symbol: Box::new(symbol),
             declarations,
-            declaration_cursor: (next < total)
-                .then(|| super::cursor::mint(next, request.id.as_str(), &page.served)),
+            pagination: rift_protocol::read::Pagination::new(
+                page.page,
+                page.limit as u64,
+                total as u64,
+            ),
             revision: page.revision,
             history,
             documentation,
@@ -238,7 +236,7 @@ fn symbol_alternatives(
 /// read serves.
 struct DeclarationPage {
     revision: rift_protocol::revision::Revision,
-    served: String,
+    page: u64,
     offset: usize,
     limit: usize,
 }
@@ -258,3 +256,25 @@ fn unavailable(
 
 #[cfg(test)]
 mod tests;
+
+fn declarations_page(
+    index: &WorkspaceSymbolView,
+    key: &rift_core::SymbolId,
+    offset: usize,
+    max_results: usize,
+) -> Result<(Vec<rift_protocol::symbol_read::SymbolDeclaration>, usize), RiftError> {
+    let mut declarations = Vec::new();
+    let mut total = 0;
+    for start in (0..max_results).step_by(index.results_max()) {
+        let count = (max_results - start).min(index.results_max());
+        let (page, count_total) =
+            index.declarations_by_identity_page(key, offset.saturating_add(start), count)?;
+        total = count_total;
+        let end = page.len() < count;
+        declarations.extend(page);
+        if end {
+            break;
+        }
+    }
+    Ok((declarations, total))
+}

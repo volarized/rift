@@ -27,10 +27,12 @@ pub enum SearchUnavailable {
 /// One page of search hits, or the typed cause of selection unavailability.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(untagged)]
-#[schemars(extend("examples" = [{
-    "outcome": "unavailable",
-    "reason": "insufficient_coverage"
-}]))]
+#[schemars(extend("examples" = [
+    {
+        "outcome": "unavailable",
+        "reason": "insufficient_coverage"
+    }
+]))]
 pub enum SearchReadResult {
     /// Search hits and the captured serving context, including an empty page.
     Results(Box<crate::search::SearchResult>),
@@ -55,7 +57,7 @@ mod schema_tests {
         let page = json!({
             "view": view,
             "results": [],
-            "pagination": {"page_index": 2, "total_pages": 0}
+            "pagination": {"page": 2, "pages": 0, "max_results": 10, "total": 0}
         });
         let unavailable = json!({
             "outcome": "unavailable",
@@ -86,12 +88,12 @@ mod schema_tests {
         for value in [
             json!({
                 "outcome": "unavailable", "reason": "view_context",
-                "results": [], "pagination": {"page_index": 0, "total_pages": 0}
+                "results": [], "pagination": {"page": 1, "pages": 0, "max_results": 10, "total": 0}
             }),
             json!({"results": [], "outcome": "unavailable"}),
             json!({"outcome": "unavailable", "reason": "view_context", "unknown": true}),
             json!({
-                "results": [], "pagination": {"page_index": 0, "total_pages": 0},
+                "results": [], "pagination": {"page": 1, "pages": 0, "max_results": 10, "total": 0},
                 "view": {"id": "claims.selection"}
             }),
         ] {

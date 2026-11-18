@@ -11,7 +11,7 @@ use rift_core::{
     ContributionReference, DeclarationBinding, FileDigest, LoopBudget, ProjectPath, ProviderId,
     ProviderSymbolId, ReferenceRole, SourceRange,
 };
-use rift_protocol::read::SymbolFacet;
+use rift_protocol::read::SymbolKind;
 use rift_provider::{NormalizedGraph, NormalizedTarget};
 use rift_syntax::{
     ByteRange, DocumentPlacement, SYNTAX_PROVIDER_ID, StaticBinding, StaticBindingKind, StaticCall,
@@ -107,8 +107,8 @@ struct Target<'source> {
 impl Target<'_> {
     fn callable(self) -> Option<Self> {
         self.symbol
-            .facets
-            .contains(&SymbolFacet::Callable)
+            .kinds
+            .contains(&SymbolKind::Callable)
             .then_some(self)
     }
 

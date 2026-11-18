@@ -1,13 +1,12 @@
 //! Exercises the public SPARQL route against authored bytes and a real embedded engine.
 
 use std::collections::BTreeSet;
-use std::fs;
 
 use crate::workspace_client::{TestResult, query, query_after_population, served_workspace};
 use rift_protocol::query::{QueryLanguage, QueryParams};
 use serde_json::{Value, json};
 
-const CONFIGURATION: &str = "[search.query]\npage_size=2\n[languages.python.lsp]\nembedded='ty'\n";
+const CONFIGURATION: &str = "[search.query]\n[languages.python.lsp]\nembedded='ty'\n";
 const METADATA: &str = "[project]\nname='graph-fixture'\nversion='0.1.0'\n[build-system]\nrequires=['setuptools==80.9.0']\nbuild-backend='setuptools.build_meta'\n[tool.setuptools]\npy-modules=['graph']\n";
 const SOURCE: &str = "def graph_root() -> int:\n    return graph_leaf() + graph_branch() + graph_leaf()\n\n\
     def graph_branch() -> int:\n    return graph_mid()\n\n\
@@ -22,8 +21,10 @@ async fn statement(
     query_after_population(
         client,
         &QueryParams {
+            max_results: 2,
             query: text.into(),
             language: QueryLanguage::Sparql,
+            ..Default::default()
         },
     )
     .await
@@ -79,7 +80,7 @@ async fn rust_analyzer_supplies_a_call_on_an_inferred_receiver() -> TestResult {
             rift_protocol::configuration::HistoryConfiguration::default(),
         )?;
         let seed = rift_core::SymbolId::new(root.as_str())?;
-        let outgoing = captured.relationships().outgoing(&seed);
+        let outgoing = captured.edges().outgoing(&seed);
         assert!(
             outgoing
                 .iter()
@@ -123,8 +124,8 @@ async fn rust_analyzer_supplies_a_call_on_an_inferred_receiver() -> TestResult {
 }
 
 #[tokio::test]
-async fn graph_paths_and_physical_usages_retain_exact_pages_after_edit() -> TestResult {
-    let (directory, client, _server_task) = served_workspace(
+async fn graph_paths_and_physical_usages_select_exact_pages() -> TestResult {
+    let (_directory, client, _server_task) = served_workspace(
         &[("pyproject.toml", METADATA), ("graph.py", SOURCE)],
         Some(CONFIGURATION.to_owned()),
     )
@@ -166,16 +167,17 @@ async fn graph_paths_and_physical_usages_retain_exact_pages_after_edit() -> Test
     assert_eq!(empty["answer"], json!({"result":"boolean", "value":false}));
 
     let first = statement(&client, format!("SELECT ?u ?start ?source {{ <{leaf}> :usages ?u . ?u :range/:start ?start; :source ?source }} ORDER BY ?start")).await?;
-    assert_eq!(first["pagination"]["total_pages"], 2);
-    let continuation = first["pagination"]["next_query"]
-        .as_str()
-        .ok_or("retained next query")?;
-    fs::write(
-        directory.path().join("graph.py"),
-        format!("# shifted after capture\n{SOURCE}"),
-    )?;
-    let second = statement(&client, continuation).await?;
-    assert_eq!(second["view"], first["view"]);
+    assert_eq!(first["pagination"]["pages"], 2);
+    let parameters = QueryParams {
+        query: format!(
+            "SELECT ?u ?start ?source {{ <{leaf}> :usages ?u . ?u :range/:start ?start; :source ?source }} ORDER BY ?start"
+        ),
+        max_results: 2,
+        ..Default::default()
+    };
+    let parameters = query::result_page(&parameters, &first, 2)?;
+    let second = query_after_population(&client, &parameters).await?;
+    assert_eq!(second["revision"], first["revision"]);
     let mut ranges = Vec::new();
     let mut usages = BTreeSet::new();
     for row in query::rows(&first)?.iter().chain(query::rows(&second)?) {
@@ -203,11 +205,12 @@ async fn retrieval_projections_keep_ranked_and_regex_results_and_refuse_missing_
     )
     .await?;
     let leaf = identity(&client, "graph_leaf").await?;
-    let ranked = statement(&client, "SELECT ?s { SERVICE :search { ?hit :query 'graph_leaf'; :target 'symbol'; :symbol ?s; :index ?index } } ORDER BY ?index LIMIT 1").await?;
+    let ranked = statement(&client, "SELECT ?s ?kind { SERVICE :search { ?hit :query 'graph_leaf'; :target 'symbol'; :symbol ?s; :index ?index . ?s :kind ?kind; :kinds :callable } } ORDER BY ?index LIMIT 1").await?;
     let [row] = query::rows(&ranked)? else {
         return Err(format!("expected one ranked hit: {ranked}").into());
     };
     assert_eq!(query::iri(row, "s")?, leaf);
+    assert_eq!(query::literal(row, "kind")?, "function");
     let regex = statement(&client, "SELECT ?start ?end { SERVICE :search { ?hit :pattern 'graph_leaf'; :target 'file'; :start ?start; :end ?end } } ORDER BY ?start LIMIT 2").await?;
     let rows = query::rows(&regex)?;
     assert_eq!(rows.len(), 2);

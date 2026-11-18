@@ -2,7 +2,7 @@ use serde_json::json;
 
 use super::{
     FactCoverage, FactKind, FactProducer, PRODUCER_NAME_BYTES_MAX, PRODUCER_NAME_PATTERN,
-    PRODUCER_REVISION_BYTES_MAX, PRODUCER_REVISION_PATTERN, ProducerName, ProducerRelationship,
+    PRODUCER_REVISION_BYTES_MAX, PRODUCER_REVISION_PATTERN, ProducerEdge, ProducerName,
     ProducerRevision,
 };
 
@@ -92,12 +92,12 @@ fn test_fact_producer_round_trips_and_deserialization_enforces_the_spelling() {
 #[test]
 fn test_fact_coverage_omits_the_built_in_producer() {
     let built_in = FactCoverage {
-        kind: FactKind::Relationships,
+        kind: FactKind::Edges,
         producer: None,
     };
     assert_eq!(
         serde_json::to_value(&built_in).expect("serialize"),
-        json!({"kind": "relationships"})
+        json!({"kind": "edges"})
     );
     let external: FactCoverage = serde_json::from_value(json!({
         "kind": "occurrences",
@@ -169,21 +169,17 @@ fn test_producer_schema_agrees_with_the_classifier() {
 }
 
 #[test]
-fn producer_relationship_without_extensions_serializes_without_the_field() {
+fn producer_edge_without_extensions_serializes_without_the_field() {
     let wire = json!({
         "from": "rift://symbol/pypi/pypi.org/click/python/click/core/shout",
         "kind": "call",
-        "facets": ["calls"],
+        "kinds": ["calls"],
         "to": "rift://symbol/pypi/pypi.org/click/python/click/core/echo",
         "derivation": "resolution",
     });
-    let relationship: ProducerRelationship =
-        serde_json::from_value(wire.clone()).expect("deserialize");
-    assert!(relationship.extensions.is_empty());
-    assert_eq!(
-        serde_json::to_value(&relationship).expect("serialize"),
-        wire
-    );
+    let edge: ProducerEdge = serde_json::from_value(wire.clone()).expect("deserialize");
+    assert!(edge.extensions.is_empty());
+    assert_eq!(serde_json::to_value(&edge).expect("serialize"), wire);
 }
 
 /// The published schema describes fact coverage as the producer of a kind's facts and makes

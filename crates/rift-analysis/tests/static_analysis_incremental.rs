@@ -14,7 +14,7 @@ use rift_core::{
 };
 use rift_protocol::canonical::canonical_json;
 use rift_protocol::identity::SymbolOwner;
-use rift_protocol::read::{Language, PackageIdentity, RelationshipFacet};
+use rift_protocol::read::{EdgeKind, Language, PackageIdentity};
 use rift_syntax::{SyntaxLimits, SyntaxSource, registry};
 
 fn document(path: &str, source: &str) -> IndexedFile {
@@ -70,7 +70,7 @@ fn workspace(
         revision,
         previous.map(WorkspaceSemantics::graph),
     )
-    .expect("captured relationships")
+    .expect("captured edges")
     .semantics
 }
 
@@ -133,8 +133,8 @@ fn workspace_edits_match_cold_calls_and_keep_held_evidence() {
         let cold = workspace(files, mode, revision, None);
         for (target, count) in [&jobs_id, &tasks_id, &common_id].into_iter().zip(expected) {
             assert_eq!(
-                incremental.relationships().incoming(target),
-                cold.relationships().incoming(target)
+                incremental.edges().incoming(target),
+                cold.edges().incoming(target)
             );
             let occurrences: Vec<_> = incremental.static_usages(target).collect();
             assert_eq!(occurrences, cold.static_usages(target).collect::<Vec<_>>());
@@ -269,9 +269,9 @@ fn dependency_reselection_rebuilds_export_evidence_over_retained_syntax() {
 fn assert_export_target(analysis: &PackageAnalysis, name: &str) {
     let publication = analysis.publication();
     let edges: Vec<_> = publication
-        .relationships
+        .edges
         .iter()
-        .filter(|edge| edge.facets.contains(&RelationshipFacet::Aliases))
+        .filter(|edge| edge.kinds.contains(&EdgeKind::Aliases))
         .collect();
     let [edge] = edges.as_slice() else {
         panic!("expected one explicit dependency alias: {edges:?}");

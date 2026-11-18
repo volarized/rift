@@ -25,10 +25,10 @@ def collect(request, _read_source):
 
     starts = [0, *(match.end() for match in re.finditer(rb"\r\n|\r|\n", text.encode()))]
 
-    def span(node):
+    def span(syntax_element):
         return {
-            "start": starts[node.lineno - 1] + node.col_offset,
-            "end": starts[node.end_lineno - 1] + node.end_col_offset,
+            "start": starts[syntax_element.lineno - 1] + syntax_element.col_offset,
+            "end": starts[syntax_element.end_lineno - 1] + syntax_element.end_col_offset,
         }
 
     observations = []
@@ -41,21 +41,21 @@ def collect(request, _read_source):
 
     pending = [(tree, None)]
     while pending:
-        node, owner = pending.pop()
-        if isinstance(node, ast.Call):
+        syntax_element, owner = pending.pop()
+        if isinstance(syntax_element, ast.Call):
             if len(observations) == request["observations_max"]:
                 return batch("partial")
             observations.append({
-                "occurrence": span(node),
+                "occurrence": span(syntax_element),
                 "enclosing": owner,
                 "target": None,
                 "evidence": "syntax",
             })
         outer = owner
-        if isinstance(node, OWNERS):
-            owner = span(node)
+        if isinstance(syntax_element, OWNERS):
+            owner = span(syntax_element)
         children = []
-        for field, value in ast.iter_fields(node):
+        for field, value in ast.iter_fields(syntax_element):
             child_owner = outer if field == "decorator_list" else owner
             if isinstance(value, ast.AST):
                 children.append((value, child_owner))

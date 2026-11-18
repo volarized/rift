@@ -1,9 +1,6 @@
 use super::{valid_result, validate_request};
 use rift_error::{ErrorValue, RiftError};
-use rift_protocol::{
-    read::GetSymbolInclude,
-    symbol_read::{GetSymbolParams, GetSymbolResult},
-};
+use rift_protocol::symbol_read::{GetSymbolParams, GetSymbolResult};
 use serde_json::{Value, json};
 
 const ID: &str = "rift://symbol/cargo/crates.io/tokio/rust/tokio/Beacon";
@@ -44,6 +41,7 @@ fn found(declarations: Vec<Value>) -> GetSymbolResult {
             }
         }},
         "revision": RELEASE,
+        "pagination": {"page": 1,"pages": u64::from(!declarations.is_empty()),"max_results": 10,"total": declarations.len()},
         "declarations": Value::Array(declarations),
     }))
     .expect("result")
@@ -122,7 +120,7 @@ fn exact_answer_enforces_projection_and_declaration_bounds() {
     let mut foreign = declaration(18);
     foreign["unit"] = json!("rift://source/cargo/crates.io/other/src/lib.rs");
     assert!(!valid_result(&request, &found(vec![foreign]), 100));
-    request.declaration_limit = 1;
+    request.max_results = 1;
     let result = found(vec![declaration(18), declaration(14)]);
     assert!(!valid_result(&request, &result, 100));
 }
@@ -135,20 +133,15 @@ fn request_rejects_local_owners_revision_and_malformed_continuation() {
     .expect("local request");
     assert_request_field(&validate_request(&local).expect_err("local owner"), "id");
     let mut request = request();
-    request.declaration_cursor = Some("next".to_owned());
-    assert!(validate_request(&request).is_ok(), "a cursor stands alone");
-    request.declaration_cursor = Some(String::new());
-    assert_request_field(
-        &validate_request(&request).expect_err("empty cursor"),
-        "declaration_cursor",
-    );
-    request.declaration_cursor = None;
-    request.declaration_limit = 0;
+    request.page = 0;
+    assert_request_field(&validate_request(&request).expect_err("page bound"), "page");
+    request.page = 1;
+    request.max_results = 0;
     assert_request_field(
         &validate_request(&request).expect_err("declaration bound"),
-        "declaration_limit",
+        "max_results",
     );
-    request.declaration_limit = 5;
+    request.max_results = 5;
     request.revision = Some(revision("rift://revision/git/main"));
     assert_request_field(
         &validate_request(&request).expect_err("revision"),
@@ -298,18 +291,20 @@ fn documented_result() -> Value {
 #[test]
 fn canonical_documentation_keeps_original_associations_and_refuses_tampered_facts() {
     let mut request = request();
-    request.include.push(GetSymbolInclude::Documentation);
+    request.include.documentation = true;
     let original = documented_result();
     let result: GetSymbolResult =
         serde_json::from_value(original.clone()).expect("documented result");
     assert!(valid_result(&request, &result, 100));
     let mut source_less = original.clone();
     source_less["declarations"] = json!([]);
+    source_less["pagination"] = json!({"page":1,"pages":0,"max_results":10,"total":0});
     let source_less = serde_json::from_value(source_less).expect("source-less documented symbol");
     assert!(valid_result(&request, &source_less, 5));
     assert!(!valid_result(&request, &source_less, 4));
     let mut intrinsic = original.clone();
     intrinsic["declarations"] = json!([]);
+    intrinsic["pagination"] = json!({"page":1,"pages":0,"max_results":10,"total":0});
     intrinsic["symbol"]["origin"] = json!({"source_kind": "synthetic"});
     let intrinsic = serde_json::from_value(intrinsic).expect("synthetic documented symbol");
     assert!(
@@ -379,9 +374,7 @@ fn canonical_documentation_keeps_original_associations_and_refuses_tampered_fact
         &serde_json::from_value(warning).expect("warning"),
         100
     ));
-    request
-        .include
-        .retain(|include| *include != GetSymbolInclude::Documentation);
+    request.include.documentation = false;
     assert!(!valid_result(&request, &result, 100));
 }
 
@@ -397,6 +390,7 @@ fn canonical_runtime_documentation_preserves_exact_runtime_source_owner() {
         "runtime": "node", "version": "26.11.1"
     }});
     value["declarations"] = json!([]);
+    value["pagination"] = json!({"page":1,"pages":0,"max_results":10,"total":0});
     value["revision"] = json!("rift://revision/stdlib/node@26.11.1");
     value["documentation"]["references"][0]["reference"]["target"] = json!(id);
     for pointer in [
@@ -410,7 +404,7 @@ fn canonical_runtime_documentation_preserves_exact_runtime_source_owner() {
     });
     let mut request = request();
     request.id = rift_protocol::read::SymbolId::parse(id).expect("runtime identity");
-    request.include.push(GetSymbolInclude::Documentation);
+    request.include.documentation = true;
     let result = serde_json::from_value(value.clone()).expect("runtime result");
     assert!(valid_result(&request, &result, 100));
     value["documentation"]["references"][0]["documentation"]["source"]["origin"]["runtime"]["version"] =

@@ -1,7 +1,6 @@
 use super::{
-    Contribution, ContributionKey, ContributionOrigin, ContributionReference,
-    ContributionRelationship, DeclarationBinding, EquivalenceEvidence, PortableSymbolFacts,
-    SemanticReference, SymbolRecord,
+    Contribution, ContributionEdge, ContributionKey, ContributionOrigin, ContributionReference,
+    DeclarationBinding, EquivalenceEvidence, PortableSymbolFacts, SemanticReference, SymbolRecord,
 };
 use get_size2::{GetSize, GetSizeTracker};
 
@@ -35,7 +34,7 @@ heap_fields!(ContributionKey; reference);
 heap_fields!(DeclarationBinding; unit);
 heap_fields!(ContributionOrigin; location);
 heap_fields!(SemanticReference; source, targets);
-heap_fields!(ContributionRelationship; target, occurrence);
+heap_fields!(ContributionEdge; target, occurrence);
 heap_fields!(SymbolRecord; identity, contributions);
 impl GetSize for Contribution {
     fn get_size(&self) -> usize {
@@ -70,7 +69,7 @@ impl GetSize for Contribution {
         let (field, next) = self.references.get_heap_size_with_tracker(tracker);
         bytes = bytes.saturating_add(field);
         tracker = next;
-        let (field, next) = self.relationships.get_heap_size_with_tracker(tracker);
+        let (field, next) = self.edges.get_heap_size_with_tracker(tracker);
         bytes = bytes.saturating_add(field);
         tracker = next;
         (bytes, tracker)
@@ -100,7 +99,7 @@ impl GetSize for PortableSymbolFacts {
         field!(name);
         field!(qualified_name);
         field!(kind);
-        field!(facets);
+        field!(kinds);
         field!(container);
         field!(modifiers);
         field!(visibility);

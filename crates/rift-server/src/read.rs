@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
@@ -11,10 +10,9 @@ pub(crate) use rift_error::RiftError;
 use rift_error::errors;
 use rift_history::Repository;
 use rift_index::{
-    FileDigest, FileRecord, IndexRead, IndexedFile, PathChange, PathChanges, ReadableSymbol,
-    RelationshipStore, SymbolMatch, WorkspaceContentCache, WorkspaceDigests, WorkspaceFingerprint,
-    WorkspaceIndex, WorkspaceIndexLimits, WorkspaceIndexPreparation, WorkspaceIndexWarning,
-    WorkspaceSourcePolicy,
+    EdgeStore, FileDigest, FileRecord, IndexedFile, PathChange, PathChanges, ReadableSymbol,
+    SymbolMatch, WorkspaceContentCache, WorkspaceDigests, WorkspaceFingerprint, WorkspaceIndex,
+    WorkspaceIndexLimits, WorkspaceIndexPreparation, WorkspaceIndexWarning, WorkspaceSourcePolicy,
 };
 use rift_protocol::configuration::HistoryConfiguration;
 use rift_protocol::dependencies::{
@@ -22,8 +20,8 @@ use rift_protocol::dependencies::{
 };
 use rift_protocol::map::WorkspaceMap;
 use rift_protocol::read::{
-    Digest, ExactKind, GetSymbolHit, GetSymbolInclude, GetSymbolParams, GetSymbolResult, Language,
-    NodesParams, NodesResult, PAGE_LIMIT_MAX, Pagination, ProjectPath, ReadWarning, RevisionId,
+    Digest, ExactKind, FacetsParams, FacetsResult, GetSymbolHit, GetSymbolParams, GetSymbolResult,
+    Language, PAGE_LIMIT_MAX, Pagination, ProjectPath, ReadWarning, RevisionId,
     SOURCE_WARNINGS_MAX, SearchScope, SourceLocationKind, SourceUnitId, Symbol, SymbolId,
     TextRange,
 };
@@ -33,8 +31,7 @@ use rift_syntax::{ByteRange, SyntaxProvider, registry};
 use crate::history::{StoredHistory, SymbolTimelines};
 
 mod canonical;
-mod cursor;
-mod nodes;
+mod facets;
 mod symbol;
 pub use canonical::{LocalSymbolViewInput, LocalSymbolViews};
 
@@ -386,8 +383,8 @@ impl ReadService {
     /// The symbol reference adjacency built from this snapshot's normalized graph: which
     /// symbols reference which, in both directions.
     #[must_use]
-    pub fn relationships(&self) -> &RelationshipStore {
-        self.index.relationships()
+    pub fn edges(&self) -> &EdgeStore {
+        self.index.edges()
     }
 
     /// The visibility policy this snapshot reads the filesystem through.
@@ -1024,299 +1021,39 @@ impl ReadService {
         self.index.chunked_text_files()
     }
 
-    /// Reads syntax nodes with their source: every node of one symbol, or the nodes of the
-    /// declaration or unit holding one UTF-8 byte position. The tree the nodes come from is
-    /// the one this service holds; a git `params.revision` was already honored by building
-    /// the service at that commit.
+    /// Reads every declaration of one symbol with its source and syntax structure.
     ///
     /// # Errors
-    ///
-    /// Returns [`RiftError`] for a request selecting neither or both of `symbol` and `path`,
-    /// a cursor minted for another symbol or tree, a symbol with no declaration here, an
-    /// invalid or missing path, or a `position` at or past the file's byte length.
-    pub fn nodes(&self, params: &NodesParams) -> Result<NodesResult, RiftError> {
+    /// Returns [`RiftError`] for an invalid symbol, revision, or continuation, or an absent symbol.
+    pub fn facets(&self, params: &FacetsParams) -> Result<FacetsResult, RiftError> {
         self.accept_revision(params.revision.as_ref())?;
-        match nodes::NodesSelector::of(params, &self.revisions.index_tree_revision)? {
-            nodes::NodesSelector::Position {
-                path,
-                position,
-                cursor,
-            } => self.position_nodes(&path, position, cursor),
-            nodes::NodesSelector::Symbol { id, key, offset } => self.symbol_nodes(id, &key, offset),
-        }
-    }
-
-    /// The nodes of the declaration holding `position` in the file at `path`: every node of
-    /// that declaration's symbol, or the unit's nodes when no declaration holds it.
-    fn position_nodes(
-        &self,
-        path: &CoreProjectPath,
-        position: u64,
-        cursor: Option<&str>,
-    ) -> Result<NodesResult, RiftError> {
-        let Some(file) = self.index.file(path) else {
-            return self.text_nodes(path, position, cursor);
-        };
-        validate_node_position(file.source(), position)?;
-        let mut warnings = self.revisions.warnings();
-        warnings.extend(
-            self.index
-                .warnings()
-                .iter()
-                .filter(|warning| {
-                    matches!(
-                        warning,
-                        WorkspaceIndexWarning::FrameworkContextUnresolved { .. }
-                    ) && warning.path() == path
-                })
-                .map(wire_index_warning),
-        );
-        let page = nodes::position_page(
+        let id = &params.symbol;
+        let key = rift_core::SymbolId::new(id.as_str())?;
+        accept_page(params.page)?;
+        let limit =
+            accepted_max_results(params.max_results, rift_protocol::read::FACETS_MAX_RESULTS)?;
+        let pagination = Pagination::new(params.page, params.max_results, 0);
+        let Some(page) = facets::symbol_page(
             &self.index,
-            (path, position),
-            (cursor, &self.revisions.index_tree_revision),
-            nodes::PageBounds::served(self.index.limits().results_max()),
-        )?
-        .ok_or_else(|| self.missing_file_fault(path))?;
-        Ok(nodes_result(page, self.served_revision()?, warnings))
-    }
-
-    /// The file node of a held text file no syntax provider parses: the unit's only node. A
-    /// file a syntax bound left out of the index refuses as the omission it is.
-    fn text_nodes(
-        &self,
-        path: &CoreProjectPath,
-        position: u64,
-        cursor: Option<&str>,
-    ) -> Result<NodesResult, RiftError> {
-        let text = self
-            .index
-            .text_file(path)
-            .filter(|_| !self.index_names_omission(path));
-        let Some(text) = text else {
-            return Err(self.missing_file_fault(path));
-        };
-        validate_node_position(text.content(), position)?;
-        let unit = file_id(path);
-        let page = nodes::unit_page(
-            nodes::UnitSource {
-                unit: &unit,
-                language: &Language::text(),
-                source: text.content(),
+            (id, &key),
+            pagination.offset(),
+            facets::PageBounds {
+                facets_max: limit,
+                source_bytes_max: rift_protocol::read::FACETS_SOURCE_BYTES_MAX,
             },
-            None,
-            cursor,
-            &self.revisions.index_tree_revision,
-            nodes::PageBounds::served(self.index.limits().results_max()),
-        )?;
-        Ok(nodes_result(
-            page,
-            self.served_revision()?,
-            self.revisions.warnings(),
-        ))
-    }
-
-    /// One page of `id`'s nodes, over every declaration the index binds to it.
-    fn symbol_nodes(
-        &self,
-        id: &SymbolId,
-        key: &rift_core::SymbolId,
-        offset: usize,
-    ) -> Result<NodesResult, RiftError> {
-        let results_max = self.index.limits().results_max();
-        let Some(page) = nodes::symbol_page(
-            &self.index,
-            (id, key),
-            (offset, &self.revisions.index_tree_revision),
-            nodes::PageBounds::served(results_max),
         )?
         else {
             return errors::server::read_symbol_not_found()
                 .id(id.as_str())
                 .fail();
         };
-        Ok(nodes_result(
+        Ok(facets_result(
             page,
             self.served_revision()?,
             self.revisions.warnings(),
+            params.page,
+            params.max_results,
         ))
-    }
-
-    /// Reads syntax nodes for a path selected by workspace discovery but not yet included in
-    /// this partial index. The captured source policy validates the path before and after the
-    /// bounded parse, and the parsed digest must match both reads.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RiftError`] for an invalid or absent path, a path outside the selected source
-    /// set, a parse refusal, or a source that changed during the read.
-    pub fn nodes_for_preparation(&self, params: &NodesParams) -> Result<NodesResult, RiftError> {
-        self.accept_revision(params.revision.as_ref())?;
-        let nodes::NodesSelector::Position {
-            path,
-            position,
-            cursor,
-        } = nodes::NodesSelector::of(params, &self.revisions.index_tree_revision)?
-        else {
-            return self.nodes(params);
-        };
-        if self.file_record(&path).is_some() {
-            return self.nodes(params);
-        }
-        let Some(policy) = self.source_policy.as_deref() else {
-            return errors::server::read_unavailable()
-                .operation("nodes")
-                .detail("workspace discovery has not selected a source path")
-                .fail();
-        };
-        let absolute = self.index.root().join(path.as_str());
-        let before = policy.visible_digest(&absolute).map_err(|error| {
-            if error.slug() == errors::index::workspace_file_too_large::SLUG
-                || self.index_names_omission(&path)
-            {
-                errors::server::read_source_unavailable()
-                    .path(path.as_str())
-                    .error()
-            } else {
-                error
-            }
-        })?;
-        let Some(before) = before else {
-            return self.nodes(params);
-        };
-        let Some(parsed) = self.index.parse_source_file_with_nodes(&path)? else {
-            return self.nodes(params);
-        };
-        let parsed = match parsed {
-            IndexRead::Included(parsed) => parsed,
-            IndexRead::Skipped(_) => {
-                return errors::server::read_source_unavailable()
-                    .path(path.as_str())
-                    .fail();
-            }
-        };
-        let after = policy.visible_digest(&absolute).map_err(|error| {
-            if error.slug() == errors::index::workspace_file_too_large::SLUG
-                || self.index_names_omission(&path)
-            {
-                errors::server::read_unavailable()
-                    .operation("nodes")
-                    .detail("source changed during the targeted read")
-                    .error()
-            } else {
-                error
-            }
-        })?;
-        if before != parsed.file.digest() || after != Some(before) {
-            return errors::server::read_unavailable()
-                .operation("nodes")
-                .detail("source changed during the targeted read")
-                .fail();
-        }
-        validate_node_position(parsed.file.source(), position)?;
-        let mut warnings = self.revisions.warnings();
-        warnings.extend(parsed.warnings);
-        let unit = file_id(&path);
-        let page = nodes::unit_page(
-            nodes::UnitSource {
-                unit: &unit,
-                language: parsed.file.syntax().language(),
-                source: parsed.file.source(),
-            },
-            Some(&nodes::PlacedDocument::new(parsed.document, Vec::new())),
-            cursor,
-            &self.revisions.index_tree_revision,
-            nodes::PageBounds::served(self.index.limits().results_max()),
-        )?;
-        Ok(nodes_result(page, self.served_revision()?, warnings))
-    }
-
-    /// The failure for a path the syntax index does not hold: `content_unavailable` when
-    /// this snapshot's warnings name an omission, the capability a syntax read lacks when
-    /// this snapshot can confirm the path is real, and `not_found` otherwise.
-    fn missing_file_fault(&self, path: &CoreProjectPath) -> RiftError {
-        if self.index_names_omission(path) {
-            return errors::server::read_source_unavailable()
-                .path(path.as_str())
-                .error();
-        }
-        match self.unserved_syntax(path) {
-            Ok(Some(UnservedSyntax::Configurable(capability))) => {
-                errors::server::read_unsupported()
-                    .capability(capability)
-                    .error()
-            }
-            Ok(Some(UnservedSyntax::Unclaimed(extension))) => {
-                errors::server::read_unclaimed_extension()
-                    .extension(extension)
-                    .error()
-            }
-            Ok(None) => errors::server::read_not_found().path(path.as_str()).error(),
-            Err(storage_fault) => storage_fault,
-        }
-    }
-
-    /// Whether this snapshot's own warnings name `path` as left out of the index.
-    fn index_names_omission(&self, path: &CoreProjectPath) -> bool {
-        self.index
-            .warnings()
-            .iter()
-            .any(|warning| warning.path() == path)
-    }
-
-    /// The syntax capability `path` lacks, reported only when this snapshot can
-    /// confirm the path is real.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RiftError`] when two language entries match `path`, or when the
-    /// filesystem cannot answer whether it exists.
-    fn unserved_syntax(&self, path: &CoreProjectPath) -> Result<Option<UnservedSyntax>, RiftError> {
-        let Some(reason) = self.unserved_syntax_reason(path)? else {
-            return Ok(None);
-        };
-        Ok(self.path_is_real(path)?.then_some(reason))
-    }
-
-    /// Why a syntax read cannot serve `path`, or nothing when an enabled language
-    /// entry with a shipped provider claims it.
-    fn unserved_syntax_reason(
-        &self,
-        path: &CoreProjectPath,
-    ) -> Result<Option<UnservedSyntax>, RiftError> {
-        let claim = self
-            .index
-            .language_policy()
-            .language_for_path(Path::new(path.as_str()))?;
-        Ok(match claim {
-            Some(language) if language.enabled() && language.has_syntax() => None,
-            Some(language) => Some(UnservedSyntax::Configurable(format!(
-                "{} files",
-                language.identity()
-            ))),
-            None => Some(UnservedSyntax::Unclaimed(extension_capability(path))),
-        })
-    }
-
-    /// Whether this snapshot can confirm `path` names a real visible file. On the
-    /// current tree the `[source]` policy has to make `path` visible and the
-    /// filesystem has to hold it; a revision snapshot carries no filesystem policy,
-    /// so the tree it was built from is the answer.
-    fn path_is_real(&self, path: &CoreProjectPath) -> Result<bool, RiftError> {
-        let Some(policy) = self.source_policy.as_deref() else {
-            return Ok(true);
-        };
-        let absolute = self.index.root().join(path.as_str());
-        if !policy.visible(&absolute) {
-            return Ok(false);
-        }
-        absolute.try_exists().map_err(|error| {
-            errors::server::read_storage()
-                .path(path.as_str())
-                .operation("stat")
-                .io(&error)
-                .error()
-        })
     }
 
     /// Finds declarations by name, with each hit's version-control timeline
@@ -1332,14 +1069,15 @@ impl ReadService {
     /// argument the read cannot send, and symbol history the workspace's version control
     /// cannot serve.
     pub fn get_symbol(&self, params: &GetSymbolParams) -> Result<GetSymbolResult, RiftError> {
+        accept_page(params.page)?;
         accepted_symbol_name(&params.name)?;
-        let limit = accepted_limit(params.limit)?;
+        let limit = accepted_limit(params.max_results)?;
         let git = is_git_revision(params.revision.as_ref());
         validate_requested_packages(&params.scope, git, &params.packages)?;
         self.validate_dependency_scope(&params.scope, git)?;
         self.accept_revision(params.revision.as_ref())?;
         // The whole ranked match set is collected up to the project index's own
-        // `results_max` bound, so `pagination.total_pages` counts the full result set the
+        // `results_max` bound, so `pagination.pages` counts the full result set the
         // pages divide.
         let results_max = self.index.results_max();
         let mut candidates = if params.scope == SearchScope::Global {
@@ -1368,9 +1106,9 @@ impl ReadService {
             }
         }
         let absent = public_candidates.is_empty() && object_warnings.is_empty();
-        let (window, pagination) = page(public_candidates, params.page_index, limit);
-        let include_history = params.include.contains(&GetSymbolInclude::History);
-        let include_documentation = params.include.contains(&GetSymbolInclude::Documentation);
+        let (window, pagination) = page(public_candidates, params.page, limit);
+        let include_history = params.include.history;
+        let include_documentation = params.include.documentation;
         let mut documentation_bytes_left =
             rift_protocol::documentation::DOCUMENTATION_EXCERPT_BYTES_MAX as usize;
         let mut timelines = if include_history {
@@ -1534,22 +1272,35 @@ fn accepted_symbol_name(name: &str) -> Result<(), RiftError> {
 ///
 /// Returns `invalid_request` naming `limit` when the size is outside its bounds.
 pub fn accepted_limit(requested: u64) -> Result<usize, RiftError> {
-    if requested == 0 {
+    accepted_max_results(requested, PAGE_LIMIT_MAX)
+}
+
+/// Accepts a result count within its surface bound.
+///
+/// # Errors
+/// Returns a typed invalid request for an out-of-range count.
+pub fn accepted_max_results(requested: u64, maximum: u64) -> Result<usize, RiftError> {
+    if requested == 0 || requested > maximum {
         return errors::server::read_invalid()
-            .field("limit")
-            .violation("zero")
+            .field("max_results")
+            .violation(format!("expected 1..={maximum}, received {requested}"))
             .fail();
     }
-    if requested > PAGE_LIMIT_MAX {
+    Ok(usize::try_from(requested).unwrap_or(usize::MAX))
+}
+
+/// Accepts a 1-based page.
+///
+/// # Errors
+/// Returns a typed invalid request for page zero.
+pub fn accept_page(page: u64) -> Result<(), RiftError> {
+    if page == 0 {
         return errors::server::read_invalid()
-            .field("limit")
-            .violation(format!("{requested} exceeds the maximum {PAGE_LIMIT_MAX}"))
+            .field("page")
+            .violation("expected a 1-based page")
             .fail();
     }
-    let Ok(limit) = usize::try_from(requested) else {
-        unreachable!("a limit at or under PAGE_LIMIT_MAX fits usize: requested={requested}")
-    };
-    Ok(limit)
+    Ok(())
 }
 
 const _: () = assert!(PAGE_LIMIT_MAX <= usize::MAX as u64);
@@ -1618,23 +1369,17 @@ fn requested_packages_violation(
 ///
 /// Work is bounded upstream: every caller collects at most the index's `results_max`
 /// results before paging. `limit` is positive - `accepted_limit` refuses zero - so
-/// `total_pages` is `results.len().div_ceil(limit)`, zero for an empty set. A
-/// `page_index` past the last page yields an empty page carrying the requested index
+/// `pages` is `results.len().div_ceil(limit)`, zero for an empty set. A
+/// `page` past the last page yields an empty page carrying the requested index
 /// and the true page count.
-pub(crate) fn page<T>(results: Vec<T>, page_index: u64, limit: usize) -> (Vec<T>, Pagination) {
+pub(crate) fn page<T>(results: Vec<T>, page: u64, limit: usize) -> (Vec<T>, Pagination) {
     assert!(
         limit > 0,
         "page limit must be positive after acceptance: limit={limit}"
     );
     let total = results.len();
-    let total_pages = u64::try_from(total.div_ceil(limit)).unwrap_or(u64::MAX);
-    let pagination = Pagination {
-        page_index,
-        total_pages,
-    };
-    let start = usize::try_from(page_index)
-        .ok()
-        .and_then(|index| index.checked_mul(limit));
+    let pagination = Pagination::new(page, limit as u64, total as u64);
+    let start = Some(pagination.offset());
     let window = match start {
         Some(start) if start < total => results.into_iter().skip(start).take(limit).collect(),
         _ => Vec::new(),
@@ -1653,15 +1398,17 @@ pub(crate) fn results_truncation_warning(results_max: usize) -> ReadWarning {
 
 /// The wire answer of one page, the revision it was read at, and the warnings the read
 /// carries.
-fn nodes_result(
-    page: nodes::NodesPage,
+fn facets_result(
+    page: facets::FacetsPage,
     revision: Revision,
     warnings: Vec<ReadWarning>,
-) -> NodesResult {
-    NodesResult {
+    requested_page: u64,
+    max_results: u64,
+) -> FacetsResult {
+    FacetsResult {
         symbol: page.symbol,
-        nodes: page.nodes,
-        node_cursor: page.node_cursor,
+        declarations: page.declarations,
+        pagination: Pagination::new(requested_page, max_results, page.total as u64),
         revision,
         warnings,
     }
@@ -1802,25 +1549,6 @@ pub(crate) fn language_provider(language: &Language) -> &'static dyn SyntaxProvi
 pub(crate) fn language_selects(filter: &Language, candidate: &Language) -> bool {
     filter.name == candidate.name
         && (filter.dialect.is_none() || filter.dialect == candidate.dialect)
-}
-
-/// Why a syntax read cannot serve one path.
-#[derive(Debug)]
-enum UnservedSyntax {
-    /// A language entry claims the path, and this workspace either turned that
-    /// entry off or ships no grammar for it. Configuration can serve the path.
-    Configurable(String),
-    /// No language entry claims the path, so no shipped grammar parses it.
-    Unclaimed(String),
-}
-
-/// The capability text for a path no language entry claims: the extension
-/// itself, or a statement that the path carries none.
-fn extension_capability(path: &CoreProjectPath) -> String {
-    match Path::new(path.as_str()).extension().and_then(OsStr::to_str) {
-        Some(extension) => format!("{extension} files"),
-        None => "files with no extension".to_owned(),
-    }
 }
 
 pub(crate) fn file_id(path: &CoreProjectPath) -> SourceUnitId {
@@ -1966,19 +1694,6 @@ pub(crate) fn symbol_id(
         .map(|identity| SymbolId(identity.as_str().to_owned())))
 }
 
-fn validate_node_position(source: &str, position: u64) -> Result<(), RiftError> {
-    let source_len = source.len() as u64;
-    if position >= source_len {
-        return errors::server::read_invalid()
-            .field("position")
-            .violation(format!(
-                "{position} is at or past the file's byte length {source_len}"
-            ))
-            .fail();
-    }
-    Ok(())
-}
-
 /// Tree revisions captured when one read service is built, at full SHA-256
 /// length: the `stale_index` comparison runs over the full digests, and only
 /// the truncated wire form reaches a warning.
@@ -2121,17 +1836,13 @@ pub(crate) mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use rift_core::{LanguageFileSelections, SourceVisibility, TextFileInclusion};
-    use rift_index::{
-        LastCapture, WorkspaceIndexPreparation, WorkspaceSourcePolicy,
-        capture_digests_with_languages,
-    };
+    use rift_index::{LastCapture, capture_digests_with_languages};
     use rift_protocol::configuration::{LanguageConfiguration, WorkspaceConfiguration};
     use rift_protocol::read::{
-        GetSymbolInclude, GetSymbolParams, Language, Node, NodeFacet, NodesParams, NodesResult,
-        PAGE_LIMIT_MAX, Pagination, ProjectPath, ReadWarning, RevisionId, SOURCE_WARNINGS_MAX,
-        SearchScope, SymbolId,
+        FacetsParams, GetSymbolParams, Language, PAGE_LIMIT_MAX, Pagination, ProjectPath,
+        ReadWarning, RevisionId, SOURCE_WARNINGS_MAX, SearchScope, SymbolId, SyntaxElement,
+        SyntaxKind,
     };
-    use rift_syntax::{SyntaxLimits, SyntaxSource, registry};
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -2266,26 +1977,6 @@ pub(crate) mod tests {
                 ..DependenciesConfiguration::default()
             },
         )
-    }
-
-    /// One workspace whose `rust` entry is turned off: `lib.rs` stays a real visible
-    /// file that no shipped grammar reaches.
-    fn disabled_rust_fixture() -> TestResult<(TempDir, ReadService)> {
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        let mut configuration = WorkspaceConfiguration::default();
-        configuration.languages.insert(
-            "rust".to_owned(),
-            LanguageConfiguration {
-                enabled: false,
-                ..LanguageConfiguration::default()
-            },
-        );
-        let languages = LanguageFileSelections::from(&configuration);
-        let limits = WorkspaceIndexLimits::default();
-        let text_inclusion = rift_core::TextFileInclusion::default();
-        let service = reads_with(directory.path(), limits, &text_inclusion, &languages)?;
-        Ok((directory, service))
     }
     #[test]
     fn the_context_is_reread_only_when_one_of_its_inputs_changes() -> TestResult {
@@ -2467,32 +2158,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn nodes_on_a_path_a_disabled_language_claims_answer_its_text_file_node() -> TestResult {
-        let (directory, service) = disabled_rust_fixture()?;
-        let source = fs::read_to_string(directory.path().join("lib.rs"))?;
-
-        let answer = service.nodes(&NodesParams::at(ProjectPath("lib.rs".to_owned()), 0))?;
-
-        let [file] = answer.nodes.as_slice() else {
-            panic!("a file no provider parses answers its file node alone: {answer:?}");
-        };
-        assert_eq!(file.kind.0, rift_protocol::read::FILE_NODE_KIND);
-        assert_eq!(file.language, Language::text());
-        assert_eq!(file.source, source);
-        assert_eq!((file.range.start, file.range.end), (0, source.len() as u64));
-        assert_eq!((file.declaration, file.index, file.parent), (None, 0, None));
-        assert!(answer.symbol.is_none(), "a unit's nodes name no symbol");
-        let past = service
-            .nodes(&NodesParams::at(
-                ProjectPath("lib.rs".to_owned()),
-                source.len() as u64,
-            ))
-            .expect_err("a position past the text refuses");
-        assert_eq!(past.slug(), errors::server::read_invalid::SLUG);
-        Ok(())
-    }
-
-    #[test]
     fn a_gitignore_chain_past_the_file_bound_refuses_the_snapshot() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join(".gitignore"), "build\n")?;
@@ -2528,8 +2193,11 @@ pub(crate) mod tests {
             .to_owned())
     }
 
-    /// The item node `service` lists for the symbol a `get_symbol` hit names.
-    fn item_node(service: &ReadService, hit: &serde_json::Value) -> TestResult<Node> {
+    /// The item syntax element `service` lists for the symbol a `get_symbol` hit names.
+    fn item_syntax_element(
+        service: &ReadService,
+        hit: &serde_json::Value,
+    ) -> TestResult<SyntaxElement> {
         let id = SymbolId(
             hit["symbol"]["id"]
                 .as_str()
@@ -2537,11 +2205,12 @@ pub(crate) mod tests {
                 .to_owned(),
         );
         service
-            .nodes(&NodesParams::of(id))?
-            .nodes
+            .facets(&FacetsParams::of(id))?
+            .declarations
             .into_iter()
-            .find(|node| node.index == 0)
-            .ok_or_else(|| "the symbol's item node".into())
+            .flat_map(|declaration| declaration.syntax)
+            .find(|syntax_element| syntax_element.index == 0)
+            .ok_or_else(|| "the symbol's item syntax element".into())
     }
 
     fn fixture() -> TestResult<(TempDir, ReadService)> {
@@ -2580,11 +2249,11 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// `ReadService::relationships` is a pass-through onto the underlying index's own
+    /// `ReadService::edges` is a pass-through onto the underlying index's own
     /// store: an independently built [`WorkspaceIndex`] over the identical source must
     /// report the same adjacency the service serves.
     #[test]
-    fn relationships_pass_through_serves_the_same_edges_the_index_holds() -> TestResult {
+    fn edges_pass_through_serves_the_same_edges_the_index_holds() -> TestResult {
         let directory = tempfile::tempdir()?;
         captured_rust_package(directory.path())?;
         fs::create_dir(directory.path().join("src"))?;
@@ -2609,17 +2278,17 @@ pub(crate) mod tests {
         let beta = rift_core::SymbolId::new(local_identity("rust", &["beacon", "beta"]))?;
         let alpha = rift_core::SymbolId::new(local_identity("rust", &["beacon", "alpha"]))?;
         assert_eq!(
-            service.relationships().is_empty(),
-            independent_index.relationships().is_empty(),
+            service.edges().is_empty(),
+            independent_index.edges().is_empty(),
             "no provider publishes a resolved reference, so both stores are empty"
         );
         assert_eq!(
-            service.relationships().outgoing(&beta),
-            independent_index.relationships().outgoing(&beta)
+            service.edges().outgoing(&beta),
+            independent_index.edges().outgoing(&beta)
         );
         assert_eq!(
-            service.relationships().incoming(&alpha),
-            independent_index.relationships().incoming(&alpha)
+            service.edges().incoming(&alpha),
+            independent_index.edges().incoming(&alpha)
         );
         Ok(())
     }
@@ -2643,536 +2312,30 @@ pub(crate) mod tests {
 
     /// Exercises every Rust declaration kind, a private and a restricted
     /// visibility, and a comment plus an expression statement.
-    const RICH_SOURCE: &str = r#"pub enum Level { Low, High }
-
-pub trait Speaks {
-    fn say(&self);
-}
-
-pub type Alias = u32;
-
-pub const MAX: u32 = 10;
-
-pub static NAME: &str = "beacon";
-
-pub mod inner {
-    pub fn nested() {}
-}
-
-macro_rules! noop {
-    () => {};
-}
-
-struct Hidden;
-
-pub(crate) fn scoped() {}
-
-pub fn compute() -> i32 {
-    // lookout marker
-    let total = 1 + 2;
-    total;
-    0
-}
-"#;
-
-    fn rich_fixture() -> TestResult<(TempDir, ReadService)> {
-        let directory = tempfile::tempdir()?;
-        captured_rust_package(directory.path())?;
-        fs::create_dir(directory.path().join("src"))?;
-        fs::write(directory.path().join("src/lib.rs"), RICH_SOURCE)?;
-        let service = ReadService::build(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &SourceVisibility::default(),
-            &rift_core::TextFileInclusion::default(),
-            HistoryConfiguration::default(),
-        )?;
-        Ok((directory, service))
-    }
-
-    fn any_node_has_facet(result: &NodesResult, facet: &str) -> TestResult<bool> {
-        let value = serde_json::to_value(result)?;
-        let nodes = value["nodes"].as_array().ok_or("nodes must be array")?;
-        Ok(nodes.iter().any(|node| {
-            node["facets"]
-                .as_array()
-                .is_some_and(|facets| facets.contains(&json!(facet)))
-        }))
-    }
 
     #[test]
-    fn nodes_return_typed_rust_facts_from_real_file() -> TestResult {
-        let (_directory, service) = fixture()?;
-        let result = service.nodes(&NodesParams::at(ProjectPath("src/lib.rs".to_owned()), 5))?;
-        let value = serde_json::to_value(result)?;
-
-        assert!(
-            value["nodes"]
-                .as_array()
-                .is_some_and(|nodes| !nodes.is_empty())
-        );
-        assert_eq!(value["nodes"][0]["language"], "rust");
-        assert_eq!(
-            (
-                &value["nodes"][0]["declaration"],
-                &value["nodes"][0]["index"]
-            ),
-            (&json!(0), &json!(0)),
-            "byte 5 answers the struct, whose item node is node 0"
-        );
-        assert!(
-            value.get("warnings").is_none(),
-            "a live nodes result must omit warnings when there is nothing to warn about"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn nodes_reparse_captured_source_with_selected_provider_and_bounds() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        let source_directory = directory.path().join("src");
-        fs::create_dir(&source_directory)?;
-        let path = rift_core::ProjectPath::new("src/lib.rs")?;
-        let source = "pub struct Beacon;\nimpl Beacon { pub fn signal(&self) {} }\n";
-        let source_path = directory.path().join(path.as_str());
-        fs::write(&source_path, source)?;
-        let syntax_limits = SyntaxLimits::new(128, 64, 16)?;
-        let limits = WorkspaceIndexLimits::default().with_syntax(syntax_limits);
-        let service = ReadService::build(
-            directory.path(),
-            limits,
-            &SourceVisibility::default(),
-            &TextFileInclusion::default(),
-            HistoryConfiguration::default(),
-        )?;
-        let file = service
-            .index()
-            .file(&path)
-            .ok_or("indexed source missing")?;
-        let provider = registry::provider_for_language(file.syntax().language())
-            .ok_or("selected syntax provider missing")?;
-        let complete = provider.analyze(
-            SyntaxSource {
-                path: &path,
-                text: file.source(),
-            },
-            syntax_limits,
-        )?;
-        let position = 12;
-        let _ = complete;
-        let expected_nodes = expected_position_nodes(&service, &path, position)?;
-
-        fs::write(&source_path, "pub fn replacement() {}\n".repeat(40))?;
-        let actual = service.nodes(&NodesParams::at(
-            ProjectPath(path.as_str().to_owned()),
-            position,
-        ))?;
-
-        assert_eq!(actual.nodes, expected_nodes);
-        assert!(
-            actual
-                .nodes
-                .iter()
-                .any(|node| node.source.contains("Beacon"))
-        );
-        Ok(())
-    }
-
-    /// The nodes a position read of the held file at `path` answers, read straight from the
-    /// shared node pages.
-    fn expected_position_nodes(
-        service: &ReadService,
-        path: &rift_core::ProjectPath,
-        position: u64,
-    ) -> TestResult<Vec<rift_protocol::read::Node>> {
-        Ok(super::nodes::position_page(
-            service.index(),
-            (path, position),
-            (None, &service.revisions.index_tree_revision),
-            super::nodes::PageBounds::served(service.index().limits().results_max()),
-        )?
-        .ok_or("the index holds the file")?
-        .nodes)
-    }
-
-    #[test]
-    fn nodes_reparse_with_path_selected_typescript_dialect() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        let source_directory = directory.path().join("src");
-        fs::create_dir(&source_directory)?;
-        let path = rift_core::ProjectPath::new("src/View.tsx")?;
-        let source = "const View = () => <section />;\n";
-        fs::write(directory.path().join(path.as_str()), source)?;
-        let service = ReadService::build(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &SourceVisibility::default(),
-            &TextFileInclusion::default(),
-            HistoryConfiguration::default(),
-        )?;
-        let file = service
-            .index()
-            .file(&path)
-            .ok_or("indexed TSX source missing")?;
-        assert_eq!(file.syntax().language().dialect.as_deref(), Some("tsx"));
-        let provider = registry::provider_for_language(file.syntax().language())
-            .ok_or("selected TSX provider missing")?;
-        let complete = provider.analyze(
-            SyntaxSource {
-                path: &path,
-                text: file.source(),
-            },
-            service.index().limits().syntax(),
-        )?;
-        let position = u64::try_from(source.find("section").ok_or("fixture tag missing")?)?;
-        let _ = complete;
-        let expected_nodes = expected_position_nodes(&service, &path, position)?;
-        let actual = service.nodes(&NodesParams::at(
-            ProjectPath(path.as_str().to_owned()),
-            position,
-        ))?;
-
-        assert_eq!(actual.nodes, expected_nodes);
-        assert!(
-            actual
-                .nodes
-                .iter()
-                .any(|node| node.language.dialect.as_deref() == Some("tsx"))
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn nodes_parse_a_discovered_source_before_its_batch_is_prepared() -> TestResult {
+    fn facets_keep_stale_index_warning_without_unrelated_source_warnings() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(
-            directory.path().join("lib.rs"),
-            "pub fn beacon() { let value = 1; }\n",
+            directory.path().join("Cargo.toml"),
+            "[package]\nname='beacon'\nversion='1.0.0'\n[lib]\npath='kept.rs'\n",
         )?;
-        let limits = WorkspaceIndexLimits::default();
-        let visibility = SourceVisibility::default();
-        let text = TextFileInclusion::default();
-        let languages = LanguageFileSelections::default();
-        let mut preparation =
-            WorkspaceIndexPreparation::new(directory.path(), limits, &text, &languages)?;
-        preparation.discover(&visibility, &|| false)?;
-        let source_policy = WorkspaceSourcePolicy::build_with_languages_cancellable(
-            directory.path(),
-            limits,
-            &visibility,
-            &text,
-            &languages,
-            &|| false,
-        )?;
-        let partial = ReadService::from_prepared_index(
-            preparation.empty_snapshot()?,
-            Some(Arc::new(source_policy)),
-            Arc::new(rift_dependency::DependencyContext::default()),
-            HistoryConfiguration::default(),
-            DependenciesConfiguration {
-                resolution: DependencyResolution::Static,
-                ..DependenciesConfiguration::default()
-            },
-        );
-        let settled = reads_with(directory.path(), limits, &text, &languages)?;
-        let params: NodesParams = serde_json::from_value(json!({
-            "path": "lib.rs",
-            "position": 8
-        }))?;
-
-        let actual = partial.nodes_for_preparation(&params.clone())?;
-        let expected = settled.nodes(&params)?;
-        assert_eq!(actual.nodes, expected.nodes);
-        assert!(!actual.nodes.is_empty());
-        assert!(
-            actual.symbol.is_none(),
-            "an unpublished file names no symbol"
-        );
-        assert!(actual.nodes.iter().all(|node| node.declaration.is_none()));
-        Ok(())
-    }
-
-    fn partial_nodes_service(root: &Path, limits: WorkspaceIndexLimits) -> TestResult<ReadService> {
-        let visibility = SourceVisibility::default();
-        let text = TextFileInclusion::default();
-        let languages = LanguageFileSelections::default();
-        let mut preparation = WorkspaceIndexPreparation::new(root, limits, &text, &languages)?;
-        preparation.discover(&visibility, &|| false)?;
-        let source_policy = WorkspaceSourcePolicy::build_with_languages_cancellable(
-            root,
-            limits,
-            &visibility,
-            &text,
-            &languages,
-            &|| false,
-        )?;
-        Ok(ReadService::from_prepared_index(
-            preparation.empty_snapshot()?,
-            Some(Arc::new(source_policy)),
-            Arc::new(rift_dependency::DependencyContext::default()),
-            HistoryConfiguration::default(),
-            DependenciesConfiguration {
-                resolution: DependencyResolution::Static,
-                ..DependenciesConfiguration::default()
-            },
-        ))
-    }
-
-    #[test]
-    fn nodes_results_match_with_unrelated_invalid_and_unparsed_sources() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::create_dir(directory.path().join("src"))?;
-        fs::write(directory.path().join("src/kept.rs"), "pub fn kept() {}\n")?;
-        fs::write(directory.path().join("src/invalid.rs"), [0xff])?;
-        fs::write(
-            directory.path().join("src/large.rs"),
-            format!("// {}\npub fn large() {{}}\n", "x".repeat(256)),
-        )?;
-        let syntax = SyntaxLimits::new(64, 4_096, 64)?;
-        let limits = WorkspaceIndexLimits::default().with_syntax(syntax);
-        let partial = partial_nodes_service(directory.path(), limits)?;
-        let settled = reads_with(
-            directory.path(),
-            limits,
-            &TextFileInclusion::default(),
-            &LanguageFileSelections::default(),
-        )?;
-        let params = NodesParams::at(ProjectPath("src/kept.rs".to_owned()), 0);
-
-        let actual = partial.nodes_for_preparation(&params.clone())?;
-        // A preparing capture answers at its own partial tree; every other field matches.
-        let expected = NodesResult {
-            revision: actual.revision.clone(),
-            ..settled.nodes(&params)?
-        };
-        assert_eq!(actual, expected);
-        assert!(actual.warnings.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn nodes_preparation_returns_content_unavailable_for_own_skipped_source() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("invalid.rs"), [0xff])?;
-        fs::write(
-            directory.path().join("large.rs"),
-            format!("// {}\npub fn large() {{}}\n", "x".repeat(256)),
-        )?;
-        let syntax = SyntaxLimits::new(64, 4_096, 64)?;
-        let limits = WorkspaceIndexLimits::default().with_syntax(syntax);
-        let partial = partial_nodes_service(directory.path(), limits)?;
-        let settled = reads_with(
-            directory.path(),
-            limits,
-            &TextFileInclusion::default(),
-            &LanguageFileSelections::default(),
-        )?;
-
-        for path in ["invalid.rs", "large.rs"] {
-            let params = NodesParams::at(ProjectPath(path.to_owned()), 0);
-            let partial_error = partial
-                .nodes_for_preparation(&params.clone())
-                .expect_err("an omitted source cannot answer nodes");
-            let settled_error = settled
-                .nodes(&params)
-                .expect_err("settled index omits the same source");
-            assert_eq!(
-                partial_error.slug(),
-                errors::server::read_source_unavailable::SLUG
-            );
-            assert_eq!(
-                settled_error.slug(),
-                errors::server::read_source_unavailable::SLUG
-            );
-        }
-
-        let large_directory = tempfile::tempdir()?;
-        fs::write(
-            large_directory.path().join("large.rs"),
-            "pub fn large() {}\n",
-        )?;
-        let limits = WorkspaceIndexLimits::new(64, 8, 8_388_608, 16, 64)?;
-        let partial = partial_nodes_service(large_directory.path(), limits)?;
-        let settled = reads_with(
-            large_directory.path(),
-            limits,
-            &TextFileInclusion::default(),
-            &LanguageFileSelections::default(),
-        )?;
-        let params = NodesParams::at(ProjectPath("large.rs".to_owned()), 0);
-        let partial_error = partial
-            .nodes_for_preparation(&params.clone())
-            .expect_err("a file past the catalog byte bound cannot answer nodes");
-        let settled_error = settled
-            .nodes(&params)
-            .expect_err("settled index leaves the same file out");
-        assert_eq!(
-            partial_error.slug(),
-            errors::server::read_source_unavailable::SLUG
-        );
-        assert_eq!(
-            settled_error.slug(),
-            errors::server::read_source_unavailable::SLUG
-        );
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn nodes_preparation_preserves_unrelated_source_read_errors() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        let partial = partial_nodes_service(directory.path(), WorkspaceIndexLimits::default())?;
-        fs::create_dir(directory.path().join("blocked.rs"))?;
-        let error = partial
-            .nodes_for_preparation(&NodesParams::at(ProjectPath("blocked.rs".to_owned()), 0))
-            .expect_err("reading a directory as source fails");
-        assert_eq!(error.slug(), errors::index::workspace_filesystem::SLUG);
-        Ok(())
-    }
-
-    #[test]
-    fn nodes_keep_stale_index_warning_without_unrelated_source_warnings() -> TestResult {
-        let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("kept.rs"), "pub fn kept() {}\n")?;
         fs::write(directory.path().join("invalid.rs"), [0xff])?;
-        let mut service = nodes_service(directory.path(), &SourceVisibility::default())?;
+        let mut service = facets_service(directory.path(), &SourceVisibility::default())?;
         service.revisions = super::CapturedRevisions {
             tree_revision: "bb".repeat(32),
             index_tree_revision: "aa".repeat(32),
         };
 
-        let result = nodes_at_root(&service, "kept.rs")?;
+        let matched = service.index().symbols("kept", 10)?[0];
+        let id = super::symbol_id(service.index(), matched)?.ok_or("kept identity")?;
+        let result = service.facets(&FacetsParams::of(id))?;
         assert_eq!(result.warnings, service.revisions.warnings());
         assert!(matches!(
             result.warnings.as_slice(),
             [ReadWarning::StaleIndex { .. }]
         ));
-        Ok(())
-    }
-
-    #[test]
-    fn nodes_for_preparation_refuses_a_known_declaration_bound_omission() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("a.rs"), "pub fn first() {}\n")?;
-        fs::write(directory.path().join("b.rs"), "pub fn later() {}\n")?;
-        let limits = WorkspaceIndexLimits::new(64, 1_048_576, 8_388_608, 16, 64)?
-            .with_workspace_bounds(64, 8_388_608, 1)?;
-        let settled = reads_with(
-            directory.path(),
-            limits,
-            &TextFileInclusion::default(),
-            &LanguageFileSelections::default(),
-        )?;
-        let params = NodesParams::at(ProjectPath("b.rs".to_owned()), 0);
-        assert!(
-            settled
-                .file_record(&rift_core::ProjectPath::new("b.rs")?)
-                .is_some()
-        );
-        let error = settled
-            .nodes_for_preparation(&params)
-            .expect_err("a recorded declaration-bound omission must not be reparsed");
-        assert_eq!(error.slug(), errors::server::read_source_unavailable::SLUG);
-        Ok(())
-    }
-
-    #[test]
-    fn nodes_at_the_source_length_and_beyond_refuse_naming_the_position() -> TestResult {
-        let (directory, service) = fixture()?;
-        let source = fs::read_to_string(directory.path().join("src/lib.rs"))?;
-        let length = source.len() as u64;
-
-        for position in [length, length + 1] {
-            let error = service
-                .nodes(&NodesParams::at(
-                    ProjectPath("src/lib.rs".to_owned()),
-                    position,
-                ))
-                .expect_err("a position at or past the file's byte length must refuse");
-            assert_eq!(error.slug(), errors::server::read_invalid::SLUG);
-            assert!(
-                error
-                    .context()
-                    .any(|(key, value)| key == "field" && value == "position")
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn nodes_at_the_last_in_bounds_byte_position_still_answers() -> TestResult {
-        let (directory, service) = fixture()?;
-        let source = fs::read_to_string(directory.path().join("src/lib.rs"))?;
-        let length = source.len() as u64;
-        let result = service.nodes(&NodesParams::at(
-            ProjectPath("src/lib.rs".to_owned()),
-            length - 1,
-        ))?;
-        assert!(
-            !result.nodes.is_empty(),
-            "the last in-bounds byte position must still answer"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn nodes_at_a_byte_inside_a_multi_byte_character_returns_its_enclosing_nodes() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::create_dir(directory.path().join("src"))?;
-        let source = "pub fn beacon() -> &'static str {\n    \"café\"\n}\n";
-        fs::write(directory.path().join("src/lib.rs"), source)?;
-        let service = ReadService::build(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &SourceVisibility::default(),
-            &rift_core::TextFileInclusion::default(),
-            HistoryConfiguration::default(),
-        )?;
-        let cafe_index = source.find("café").ok_or("fixture must hold café")?;
-        // 'é' starts right after "caf" and is two bytes wide; one byte past its start sits
-        // inside its encoding, off any character boundary.
-        let mid_character_position = cafe_index + "caf".len() + 1;
-        assert!(
-            !source.is_char_boundary(mid_character_position),
-            "the chosen position must sit inside the multi-byte character"
-        );
-        let result = service.nodes(&NodesParams::at(
-            ProjectPath("src/lib.rs".to_owned()),
-            u64::try_from(mid_character_position).expect("the fixture offset fits in u64"),
-        ))?;
-        assert!(
-            !result.nodes.is_empty(),
-            "a position mid-character still returns its enclosing nodes"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn nodes_of_the_declaration_at_a_position_carry_their_own_source() -> TestResult {
-        let (directory, service) = fixture()?;
-        let result = service.nodes(&NodesParams::at(ProjectPath("src/lib.rs".to_owned()), 5))?;
-        assert_eq!(
-            result.symbol,
-            Some(SymbolId(local_identity("rust", &["beacon", "Beacon"]))),
-            "byte 5 lies inside `pub struct Beacon;`"
-        );
-        assert!(result.nodes.len() > 1, "the struct holds its own nodes");
-        let text = std::fs::read_to_string(directory.path().join("src/lib.rs"))?;
-        let item = &result.nodes[0];
-        assert_eq!(item.kind.0, "struct_item");
-        assert_eq!(
-            (item.declaration, item.index, item.parent),
-            (Some(0), 0, None)
-        );
-        for node in &result.nodes {
-            let start = usize::try_from(node.range.start)?;
-            let end = usize::try_from(node.range.end)?;
-            assert_eq!(
-                node.source.as_str(),
-                &text[start..end],
-                "each node's source spans its own range, not the requested position"
-            );
-        }
         Ok(())
     }
 
@@ -3217,8 +2380,8 @@ pub fn compute() -> i32 {
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         let hit = &value["hits"][0];
         assert!(
-            hit.get("source").is_none() && hit.get("node").is_none(),
-            "a hit carries no source and no node identity: {hit:#}"
+            hit.get("source").is_none() && hit.get("syntax_element").is_none(),
+            "a hit carries no source and no syntax element identity: {hit:#}"
         );
         assert_eq!(hit["path"], json!("src/lib.rs"));
         assert!(
@@ -3287,7 +2450,7 @@ pub fn compute() -> i32 {
         assert_eq!(symbol["name"], "Beacon");
         assert_eq!(symbol["visibility"], "pub");
         assert!(
-            symbol["facets"]
+            symbol["kinds"]
                 .as_array()
                 .is_some_and(|facets| facets.contains(&json!("public")))
         );
@@ -3310,7 +2473,7 @@ pub fn compute() -> i32 {
         );
         assert_eq!(
             value["pagination"],
-            json!({ "page_index": 0, "total_pages": 1 })
+            json!({"page": 1, "pages": 1, "max_results": 10, "total": 2})
         );
         Ok(())
     }
@@ -3334,7 +2497,7 @@ pub fn compute() -> i32 {
             HistoryConfiguration::default(),
         )?;
         let params: GetSymbolParams =
-            serde_json::from_value(json!({"name": "helper", "limit": 10}))?;
+            serde_json::from_value(json!({"name": "helper", "max_results": 10}))?;
         let result = service.get_symbol(&params)?;
         let names: Vec<&str> = result
             .hits
@@ -3345,11 +2508,11 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
-    /// Pins the serialized symbol and node shape: the document's generic
+    /// Pins the serialized symbol and syntax element shape: the document's generic
     /// kind, facet, visibility, and container fields must serve the exact
     /// bytes the per-kind helpers served before them.
     #[test]
-    fn symbol_and_node_wire_shape_is_unchanged() -> TestResult {
+    fn symbol_and_syntax_element_wire_shape_is_unchanged() -> TestResult {
         let (_directory, service) = fixture()?;
         let params: GetSymbolParams = serde_json::from_value(json!({"name": "signal"}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
@@ -3357,25 +2520,25 @@ pub fn compute() -> i32 {
         let symbol = &value["hits"][0]["symbol"];
         assert_eq!(symbol["language"], json!("rust"));
         assert_eq!(symbol["kind"], json!("function"));
-        assert_eq!(symbol["facets"], json!(["value", "callable", "public"]));
+        assert_eq!(symbol["kinds"], json!(["value", "callable", "public"]));
         assert_eq!(symbol["visibility"], json!("pub"));
         assert_eq!(
             symbol["container"],
             json!(local_identity("rust", &["beacon", "Beacon"]))
         );
 
-        let item = item_node(&service, &value["hits"][0])?;
+        let item = item_syntax_element(&service, &value["hits"][0])?;
         assert_eq!(
             (item.declaration, item.index),
             (Some(0), 0),
-            "the declaration's item node is node 0 of its declaration"
+            "the declaration's item syntax element is syntax element 0 of its declaration"
         );
 
         let top_level: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon"}))?;
         let top_value = serde_json::to_value(service.get_symbol(&top_level)?)?;
         let beacon = &top_value["hits"][0]["symbol"];
         assert_eq!(beacon["kind"], json!("struct"));
-        assert_eq!(beacon["facets"], json!(["type", "public"]));
+        assert_eq!(beacon["kinds"], json!(["type", "public"]));
         assert!(
             beacon.get("container").is_none(),
             "a top-level declaration serves no container"
@@ -3383,11 +2546,11 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
-    /// `projection` left `NodesParams`'s served fields; a request naming it is refused as an
+    /// `projection` left `FacetsParams`'s served fields; a request naming it is refused as an
     /// unknown field, not accepted and silently ignored.
     #[test]
-    fn nodes_rejects_projection_as_an_unknown_field() {
-        let result: Result<NodesParams, _> = serde_json::from_value(json!({
+    fn facets_rejects_projection_as_an_unknown_field() {
+        let result: Result<FacetsParams, _> = serde_json::from_value(json!({
             "path": "src/lib.rs",
             "position": 0,
             "projection": "rift://projection/my-feature-one"
@@ -3402,7 +2565,7 @@ pub fn compute() -> i32 {
     fn symbol_history_on_an_unversioned_workspace_is_a_history_fault() -> TestResult {
         let (_directory, service) = fixture()?;
         let mut params: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon"}))?;
-        params.include = vec![GetSymbolInclude::History];
+        params.include.history = true;
         let error = service
             .get_symbol(&params)
             .expect_err("a workspace without a repository cannot serve history");
@@ -3424,7 +2587,7 @@ pub fn compute() -> i32 {
             },
         )?;
         let mut params: GetSymbolParams = serde_json::from_value(json!({"name": "beacon"}))?;
-        params.include = vec![GetSymbolInclude::History];
+        params.include.history = true;
         let error = service
             .get_symbol(&params)
             .expect_err("a disabled history provider must refuse");
@@ -3491,7 +2654,7 @@ pub fn compute() -> i32 {
             HistoryConfiguration::default(),
         )?;
         let params: GetSymbolParams =
-            serde_json::from_value(json!({"name": "beacon", "include": ["history"]}))?;
+            serde_json::from_value(json!({"name": "beacon", "include": {"history": true}}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         let history = &value["hits"][0]["history"];
         assert_eq!(
@@ -3546,7 +2709,7 @@ pub fn compute() -> i32 {
         rift_history::fixture::git(directory.path(), &["tag", "grown", "main~2"]);
         let service = revision_service(directory.path(), "grown")?;
         let params: GetSymbolParams =
-            serde_json::from_value(json!({"name": "beacon", "include": ["history"]}))?;
+            serde_json::from_value(json!({"name": "beacon", "include": {"history": true}}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         let edges = value["hits"][0]["history"]["edges"]
             .as_array()
@@ -3590,7 +2753,7 @@ pub fn compute() -> i32 {
             HistoryConfiguration::default(),
         )?;
         let params: GetSymbolParams =
-            serde_json::from_value(json!({"name": "beacon", "include": ["history"]}))?;
+            serde_json::from_value(json!({"name": "beacon", "include": {"history": true}}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         let hit = &value["hits"][0];
         assert!(
@@ -3598,8 +2761,8 @@ pub fn compute() -> i32 {
             "include: [\"history\"] must carry history: {hit:#}"
         );
         assert!(
-            hit.get("source").is_none() && hit.get("node").is_none(),
-            "a hit carries no source and no node identity: {hit:#}"
+            hit.get("source").is_none() && hit.get("syntax_element").is_none(),
+            "a hit carries no source and no syntax element identity: {hit:#}"
         );
         Ok(())
     }
@@ -3610,7 +2773,7 @@ pub fn compute() -> i32 {
         let (_directory, service) = fixture()?;
         let omitted: GetSymbolParams = serde_json::from_value(json!({"name": "beacon"}))?;
         let empty: GetSymbolParams =
-            serde_json::from_value(json!({"name": "beacon", "include": []}))?;
+            serde_json::from_value(json!({"name": "beacon", "include": {}}))?;
         let omitted = serde_json::to_value(service.get_symbol(&omitted)?)?;
         let empty = serde_json::to_value(service.get_symbol(&empty)?)?;
         assert_eq!(omitted, empty, "an omitted include answers as include: []");
@@ -3622,23 +2785,9 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
-    #[test]
-    fn nodes_missing_source_is_not_found() -> TestResult {
-        let (_directory, service) = fixture()?;
-        let missing = service.nodes(&NodesParams::at(
-            ProjectPath("src/missing.rs".to_owned()),
-            0,
-        ));
-        assert_eq!(
-            missing.expect_err("missing source must fail").slug(),
-            rift_error::errors::server::read_not_found::SLUG
-        );
-        Ok(())
-    }
-
     /// One read service over `directory` under `visibility`, the shape every
-    /// `nodes` classification test builds.
-    fn nodes_service(
+    /// `kinds` classification test builds.
+    fn facets_service(
         directory: &std::path::Path,
         visibility: &SourceVisibility,
     ) -> Result<ReadService, super::RiftError> {
@@ -3653,119 +2802,6 @@ pub fn compute() -> i32 {
         )
     }
 
-    fn nodes_at_root(service: &ReadService, path: &str) -> Result<NodesResult, super::RiftError> {
-        service.nodes(&NodesParams::at(ProjectPath(path.to_owned()), 0))
-    }
-
-    #[test]
-    fn nodes_on_an_unparsed_path_names_its_extension_without_configuration_advice() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("Cargo.lock"), "# generated\n")?;
-        let service = nodes_service(directory.path(), &SourceVisibility::default())?;
-        let error = nodes_at_root(&service, "Cargo.lock")
-            .expect_err("an unparsed extension must be rejected");
-        assert_eq!(error.slug(), errors::server::read_unclaimed_extension::SLUG);
-        assert!(
-            error
-                .context()
-                .any(|(key, value)| key == "extension" && value == "lock files")
-        );
-        assert!(
-            !error.to_string().contains("configure a provider"),
-            "no configuration can ever add a shipped grammar, so the message must not \
-             suggest one: {error}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn nodes_on_a_source_excluded_unparsed_path_stays_not_found() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("Cargo.lock"), "# generated\n")?;
-        let visibility = SourceVisibility::new(Vec::new(), vec!["Cargo.lock".to_owned()], false);
-        let service = nodes_service(directory.path(), &visibility)?;
-        let error =
-            nodes_at_root(&service, "Cargo.lock").expect_err("an excluded path must be rejected");
-        assert!(
-            (error.slug() == rift_error::errors::server::read_not_found::SLUG),
-            "the workspace asked for this path to be invisible, so nodes cannot name a \
-             capability for it: {error}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn nodes_on_an_absent_unparsed_path_stays_not_found() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        let service = nodes_service(directory.path(), &SourceVisibility::default())?;
-        let error =
-            nodes_at_root(&service, "absent.lock").expect_err("an absent path must be rejected");
-        assert!(
-            (error.slug() == rift_error::errors::server::read_not_found::SLUG),
-            "no file stands at that path, so there is no capability to name: {error}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn nodes_on_a_visible_unparsed_text_file_answer_its_file_node() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("justfile"), "default:\n    echo hi\n")?;
-        let service = nodes_service(directory.path(), &SourceVisibility::default())?;
-        let answer = nodes_at_root(&service, "justfile")?;
-        let kinds = answer
-            .nodes
-            .iter()
-            .map(|node| (node.kind.0.as_str(), node.source.as_str()))
-            .collect::<Vec<_>>();
-        assert_eq!(kinds, [("file", "default:\n    echo hi\n")]);
-        assert_eq!(
-            answer.nodes[0].unit.as_str(),
-            "rift://source/project/justfile"
-        );
-        Ok(())
-    }
-
-    /// A workspace holding one UTF-8-invalid source file beside a valid one: addressing
-    /// the invalid file directly answers `content_unavailable`, a genuinely absent sibling
-    /// path still answers `not_found`, and a valid file's node result names neither.
-    #[test]
-    fn nodes_distinguishes_invalid_utf8_from_absent_and_still_serves_and_warns() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::create_dir(directory.path().join("src"))?;
-        fs::write(directory.path().join("src/lib.rs"), "pub fn kept() {}\n")?;
-        fs::write(directory.path().join("src/invalid.rs"), [0xff])?;
-        let service = nodes_service(directory.path(), &SourceVisibility::default())?;
-
-        let invalid = nodes_at_root(&service, "src/invalid.rs")
-            .expect_err("the addressed file exists but cannot be read");
-        assert!(
-            invalid.slug() == rift_error::errors::server::read_source_unavailable::SLUG,
-            "an invalid-UTF-8 path answers content_unavailable, not not_found: {invalid}"
-        );
-        assert!(
-            invalid
-                .context()
-                .any(|(key, value)| { key == "path" && value == "src/invalid.rs" })
-        );
-
-        let absent = nodes_at_root(&service, "src/missing.rs")
-            .expect_err("a path nothing claims must still fail");
-        assert!(
-            absent.slug() == rift_error::errors::server::read_not_found::SLUG,
-            "an absent sibling path is unaffected: {absent}"
-        );
-        assert!(
-            absent
-                .context()
-                .any(|(key, value)| key == "path" && value == "src/missing.rs")
-        );
-
-        let kept = nodes_at_root(&service, "src/lib.rs")?;
-        assert!(kept.warnings.is_empty());
-        Ok(())
-    }
-
     #[test]
     fn get_symbol_over_a_workspace_with_an_invalid_utf8_file_still_warns_and_serves_others()
     -> TestResult {
@@ -3773,7 +2809,7 @@ pub fn compute() -> i32 {
         fs::create_dir(directory.path().join("src"))?;
         fs::write(directory.path().join("src/lib.rs"), "pub struct Beacon;\n")?;
         fs::write(directory.path().join("src/invalid.rs"), [0xff])?;
-        let service = nodes_service(directory.path(), &SourceVisibility::default())?;
+        let service = facets_service(directory.path(), &SourceVisibility::default())?;
 
         let params: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon"}))?;
         let result = service.get_symbol(&params)?;
@@ -3805,7 +2841,7 @@ pub fn compute() -> i32 {
         for index in 0..=SOURCE_WARNINGS_MAX {
             fs::write(directory.path().join(format!("invalid-{index}.rs")), [0xff])?;
         }
-        let service = nodes_service(directory.path(), &SourceVisibility::default())?;
+        let service = facets_service(directory.path(), &SourceVisibility::default())?;
         let params: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon"}))?;
         let result = service.get_symbol(&params)?;
         assert_eq!(result.hits.len(), 1);
@@ -3836,7 +2872,7 @@ pub fn compute() -> i32 {
 
         let past_the_bound = format!("invalid-{SOURCE_WARNINGS_MAX}.rs");
         fs::remove_file(directory.path().join(past_the_bound))?;
-        let service = nodes_service(directory.path(), &SourceVisibility::default())?;
+        let service = facets_service(directory.path(), &SourceVisibility::default())?;
         let result = service.get_symbol(&params)?;
         assert_eq!(result.warnings.len(), SOURCE_WARNINGS_MAX);
         assert!(
@@ -3866,23 +2902,6 @@ pub fn compute() -> i32 {
             rift_error::errors::index::workspace_invalid_root::SLUG
         );
         assert!(std::error::Error::source(&error).is_some());
-    }
-
-    #[test]
-    fn nodes_rejects_path_outside_project_root() -> TestResult {
-        let (_directory, service) = fixture()?;
-        let error = service
-            .nodes(&NodesParams::at(ProjectPath("/etc/passwd".to_owned()), 0))
-            .expect_err("absolute path must fail");
-        assert_eq!(error.slug(), rift_error::errors::server::read_invalid::SLUG);
-        assert_eq!(
-            std::error::Error::source(&error)
-                .and_then(|source| source.downcast_ref::<RiftError>())
-                .expect("path validation error remains its cause")
-                .slug(),
-            rift_error::errors::core::path_absolute::SLUG
-        );
-        Ok(())
     }
 
     /// `scope` is served again: every member parses under its `snake_case` spelling.
@@ -3982,12 +3001,12 @@ pub fn compute() -> i32 {
             "from": symbol.id,
             "to": symbol.id,
             "kind": symbol.kind,
-            "facets": ["calls"],
+            "kinds": ["calls"],
             "derivation": "syntax"
         });
-        assert!(serde_json::from_value::<rift_protocol::read::Relationship>(edge.clone()).is_ok());
+        assert!(serde_json::from_value::<rift_protocol::read::Edge>(edge.clone()).is_ok());
         edge["to"] = json!(raw_address);
-        assert!(serde_json::from_value::<rift_protocol::read::Relationship>(edge).is_err());
+        assert!(serde_json::from_value::<rift_protocol::read::Edge>(edge).is_err());
         Ok(())
     }
 
@@ -3997,7 +3016,7 @@ pub fn compute() -> i32 {
     }
 
     fn scoped(name: &str, scope: &str) -> TestResult<GetSymbolParams> {
-        let request = json!({"name": name, "scope": scope, "limit": 10});
+        let request = json!({"name": name, "scope": scope, "max_results": 10});
         Ok(serde_json::from_value(request)?)
     }
 
@@ -4034,13 +3053,7 @@ pub fn compute() -> i32 {
         let all = service.get_symbol(&scoped("beacon", "all")?)?;
 
         assert!(global.hits.is_empty(), "{global:?}");
-        assert_eq!(
-            global.pagination,
-            Pagination {
-                page_index: 0,
-                total_pages: 0
-            }
-        );
+        assert_eq!(global.pagination, Pagination::new(1, 10, 0));
         assert_eq!(
             global.warnings,
             vec![ReadWarning::SymbolNotFound {
@@ -4232,41 +3245,6 @@ pub fn compute() -> i32 {
     }
 
     #[test]
-    fn nodes_facets_identify_expression_statement_and_comment() -> TestResult {
-        let (_directory, service) = rich_fixture()?;
-
-        let expression_position = RICH_SOURCE
-            .find("1 + 2")
-            .ok_or("fixture must contain expression")? as u64
-            + 2;
-        let expression = service.nodes(&NodesParams::at(
-            ProjectPath("src/lib.rs".to_owned()),
-            expression_position,
-        ))?;
-        assert!(any_node_has_facet(&expression, "expression")?);
-
-        let statement_position = RICH_SOURCE
-            .find("total;")
-            .ok_or("fixture must contain statement")? as u64;
-        let statement = service.nodes(&NodesParams::at(
-            ProjectPath("src/lib.rs".to_owned()),
-            statement_position,
-        ))?;
-        assert!(any_node_has_facet(&statement, "statement")?);
-
-        let comment_position = RICH_SOURCE
-            .find("lookout")
-            .ok_or("fixture must contain comment")? as u64;
-        let comment = service.nodes(&NodesParams::at(
-            ProjectPath("src/lib.rs".to_owned()),
-            comment_position,
-        ))?;
-        assert!(any_node_has_facet(&comment, "comment")?);
-
-        Ok(())
-    }
-
-    #[test]
     fn storage_fault_renders_path_operation_and_io_in_order() {
         let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "sealed");
         let error = errors::server::read_storage()
@@ -4343,174 +3321,67 @@ pub fn compute() -> i32 {
         Ok((directory, service))
     }
 
-    fn nodes_at_text(service: &ReadService, source: &str, text: &str) -> TestResult<NodesResult> {
-        let position = source.find(text).ok_or("the fixture holds the text")?;
-        Ok(service.nodes(&NodesParams::at(
-            ProjectPath("src/lib.rs".to_owned()),
-            u64::try_from(position)?,
-        ))?)
-    }
-
-    /// A position inside a nested declaration answers that declaration's symbol and its own
-    /// nodes: its item node is index 0 of declaration 0 with no parent, and every parent is
-    /// an index inside the same declaration. A position no declaration holds answers the
-    /// unit, from its file node at 0.
-    #[test]
-    fn a_position_answers_the_nodes_of_the_declaration_holding_it() -> TestResult {
-        let (_directory, service) = service_over(NESTED_SOURCE)?;
-        let answer = nodes_at_text(&service, NESTED_SOURCE, "1\n")?;
-        let light = SymbolId(local_identity("rust", &["beacon", "lamp", "light"]));
-        assert_eq!(answer.symbol, Some(light));
-        let item = answer.nodes.first().ok_or("the function holds nodes")?;
-        assert_eq!(item.kind.0, "function_item");
-        assert_eq!(
-            (item.declaration, item.index, item.parent),
-            (Some(0), 0, None)
-        );
-        for (offset, node) in answer.nodes.iter().enumerate() {
-            assert_eq!(
-                node.index,
-                u64::try_from(offset)?,
-                "indexes count in pre-order"
-            );
-            assert_eq!(node.declaration, Some(0));
-            assert!(node.parent.is_none_or(|parent| parent < node.index));
-        }
-        let unit = nodes_at_text(&service, NESTED_SOURCE, "/// Lamp.")?;
-        assert_eq!(
-            unit.symbol, None,
-            "the module's documentation lies outside every item"
-        );
-        let file = unit.nodes.first().ok_or("the unit holds its file node")?;
-        assert_eq!(
-            (file.kind.0.as_str(), file.declaration, file.index),
-            (rift_protocol::read::FILE_NODE_KIND, None, 0)
-        );
-        Ok(())
-    }
-
-    /// An edit inside one declaration renumbers no node of another declaration.
+    /// An edit inside one declaration renumbers no syntax element of another declaration.
     #[test]
     fn an_edit_in_one_declaration_leaves_another_declarations_indexes() -> TestResult {
         let (_before_directory, before) = service_over(NESTED_SOURCE)?;
         let edited = NESTED_SOURCE.replace("        1\n", "        let one = 1;\n        one\n");
         let (_after_directory, after) = service_over(&edited)?;
-        let address = |node: &rift_protocol::read::Node| {
+        let address = |syntax_element: &rift_protocol::read::SyntaxElement| {
             (
-                node.kind.0.clone(),
-                node.declaration,
-                node.index,
-                node.parent,
+                syntax_element.kind.0.clone(),
+                syntax_element.declaration,
+                syntax_element.index,
+                syntax_element.parent,
             )
         };
-        let dim_before = nodes_at_text(&before, NESTED_SOURCE, "dim")?;
-        let dim_after = nodes_at_text(&after, &edited, "dim")?;
+        let dim_before = before.facets(&FacetsParams::of(SymbolId(local_identity(
+            "rust",
+            &["beacon", "dim"],
+        ))))?;
+        let dim_after = after.facets(&FacetsParams::of(dim_before.symbol.clone()))?;
         assert_eq!(dim_before.symbol, dim_after.symbol);
         assert_eq!(
-            dim_before.nodes.iter().map(address).collect::<Vec<_>>(),
-            dim_after.nodes.iter().map(address).collect::<Vec<_>>(),
+            dim_before.declarations[0]
+                .syntax
+                .iter()
+                .map(address)
+                .collect::<Vec<_>>(),
+            dim_after.declarations[0]
+                .syntax
+                .iter()
+                .map(address)
+                .collect::<Vec<_>>(),
             "the edit inside `light` leaves `dim`'s addresses"
         );
         assert_ne!(
-            dim_before.nodes.first().map(|node| node.range.start),
-            dim_after.nodes.first().map(|node| node.range.start),
+            dim_before.declarations[0]
+                .syntax
+                .first()
+                .map(|syntax_element| syntax_element.range.start),
+            dim_after.declarations[0]
+                .syntax
+                .first()
+                .map(|syntax_element| syntax_element.range.start),
             "the edit moved the bytes"
         );
         Ok(())
     }
 
-    /// A declaration's item node spans the declaration without the attached documentation
+    /// A declaration's item syntax element spans the declaration without the attached documentation
     /// and attributes the declaration's own range covers.
     #[test]
-    fn a_documented_declaration_names_its_item_node() -> TestResult {
+    fn a_documented_declaration_names_its_item_syntax_element() -> TestResult {
         let (directory, service) = documented_fixture()?;
         let params: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon"}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         let hit = &value["hits"][0];
-        let item = item_node(&service, hit)?;
+        let item = item_syntax_element(&service, hit)?;
         assert_eq!((item.declaration, item.index), (Some(0), 0));
         assert_eq!(item.source, "pub struct Beacon;");
         assert_eq!(
             declared_text(directory.path(), hit)?,
             DOCUMENTED_SOURCE.trim_end()
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn nodes_backlink_documented_item_to_its_symbol() -> TestResult {
-        let (_directory, service) = documented_fixture()?;
-        let position = DOCUMENTED_SOURCE
-            .find("Beacon")
-            .ok_or("fixture must contain the struct name")? as u64;
-        let result = service.nodes(&NodesParams::at(
-            ProjectPath("src/lib.rs".to_owned()),
-            position,
-        ))?;
-        let value = serde_json::to_value(result)?;
-        let nodes = value["nodes"].as_array().ok_or("nodes must be array")?;
-        let item = nodes
-            .iter()
-            .find(|node| node["kind"] == "struct_item")
-            .ok_or("fixture must witness the struct_item node")?;
-        assert!(
-            value["symbol"]
-                .as_str()
-                .is_some_and(|id| id.contains("/Beacon")),
-            "the documented struct's nodes name its symbol, got {:?}",
-            value["symbol"]
-        );
-        assert_eq!(
-            (&item["declaration"], &item["index"]),
-            (&json!(0), &json!(0))
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn nodes_backlink_undocumented_item_to_its_symbol() -> TestResult {
-        let (_directory, service) = fixture()?;
-        let position = "pub struct ".len() as u64;
-        let result = service.nodes(&NodesParams::at(
-            ProjectPath("src/lib.rs".to_owned()),
-            position,
-        ))?;
-        let value = serde_json::to_value(result)?;
-        let nodes = value["nodes"].as_array().ok_or("nodes must be array")?;
-        let item = nodes
-            .iter()
-            .find(|node| node["kind"] == "struct_item")
-            .ok_or("fixture must witness the struct_item node")?;
-        assert!(
-            value["symbol"]
-                .as_str()
-                .is_some_and(|id| id.contains("/Beacon")),
-            "the undocumented struct's nodes still name its symbol"
-        );
-        assert_eq!(
-            (&item["declaration"], &item["index"]),
-            (&json!(0), &json!(0))
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn nodes_report_no_symbol_backlink_for_non_symbol_node() -> TestResult {
-        let (_directory, service) = fixture()?;
-        let position = "pub struct Beacon;\n".len() as u64;
-        let result = service.nodes(&NodesParams::at(
-            ProjectPath("src/lib.rs".to_owned()),
-            position,
-        ))?;
-        let value = serde_json::to_value(result)?;
-        let nodes = value["nodes"].as_array().ok_or("nodes must be array")?;
-        let impl_node = nodes
-            .iter()
-            .find(|node| node["kind"] == "impl_item")
-            .ok_or("fixture must witness the impl_item node")?;
-        assert!(
-            value.get("symbol").is_none() && impl_node.get("declaration").is_none(),
-            "impl_item is not itself a declared symbol, so the unit holds it"
         );
         Ok(())
     }
@@ -4558,7 +3429,7 @@ pub fn compute() -> i32 {
         let symbol = &value["hits"][0]["symbol"];
         assert_eq!(symbol["language"], json!("typescript"));
         assert_eq!(symbol["kind"], json!("interface"));
-        assert_eq!(symbol["facets"], json!(["type", "public"]));
+        assert_eq!(symbol["kinds"], json!(["type", "public"]));
         assert_eq!(
             symbol["id"],
             json!(local_identity("typescript", &["beacon", "Route"]))
@@ -4599,7 +3470,7 @@ pub fn compute() -> i32 {
         assert_eq!(value["hits"][0]["symbol"]["language"], json!("rust"));
         assert_eq!(
             value["pagination"],
-            json!({"page_index": 0, "total_pages": 1})
+            json!({"page": 1, "pages": 1, "max_results": 10, "total": 1})
         );
         let dialect_filtered: GetSymbolParams = serde_json::from_value(json!({
             "name": "beacon",
@@ -4625,39 +3496,6 @@ pub fn compute() -> i32 {
             value["hits"][0]["symbol"]["language"],
             json!("typescript:tsx")
         );
-        Ok(())
-    }
-
-    #[test]
-    fn nodes_serve_a_tsx_file_under_the_typescript_wire_kinds() -> TestResult {
-        let (directory, service) = multi_language_fixture()?;
-        let source = fs::read_to_string(directory.path().join("src/App.tsx"))?;
-        let position = source.find("<main>").ok_or("fixture must contain JSX")? as u64;
-        let result = service.nodes(&NodesParams::at(
-            ProjectPath("src/App.tsx".to_owned()),
-            position,
-        ))?;
-        let value = serde_json::to_value(result)?;
-        let nodes = value["nodes"].as_array().ok_or("nodes must be array")?;
-        assert!(!nodes.is_empty());
-        assert!(
-            nodes.iter().all(|node| {
-                node["language"]
-                    .as_str()
-                    .is_some_and(|language| language.starts_with("typescript"))
-            }),
-            "every node carries the typescript language: {nodes:#?}"
-        );
-        assert!(
-            nodes.iter().any(|node| node["kind"] == "jsx_element"),
-            "position sits inside the JSX element: {nodes:#?}"
-        );
-        let jsx = nodes
-            .iter()
-            .find(|node| node["kind"] == "jsx_element")
-            .ok_or("fixture must witness the jsx_element node")?;
-        assert_eq!(jsx["language"], json!("typescript:tsx"));
-        assert_eq!(jsx["facets"], json!(["expression"]));
         Ok(())
     }
 
@@ -4687,7 +3525,7 @@ pub fn compute() -> i32 {
             HistoryConfiguration::default(),
         )?;
         let params: GetSymbolParams =
-            serde_json::from_value(json!({"name": "lookup", "include": ["history"]}))?;
+            serde_json::from_value(json!({"name": "lookup", "include": {"history": true}}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         let history = &value["hits"][0]["history"];
         assert_eq!(
@@ -4708,7 +3546,7 @@ pub fn compute() -> i32 {
     }
 
     /// A markdown heading answers `get_symbol` like any declaration: the
-    /// provider's kind word, empty facets, physical path, and a range over
+    /// provider's kind word, empty kinds, physical path, and a range over
     /// the whole section.
     #[test]
     fn get_symbol_finds_a_markdown_heading_beside_other_languages() -> TestResult {
@@ -4719,8 +3557,8 @@ pub fn compute() -> i32 {
         assert_eq!(symbol["language"], json!("markdown"));
         assert_eq!(symbol["kind"], json!("heading"));
         assert!(
-            symbol.get("facets").is_none(),
-            "no facets must omit the member"
+            symbol.get("kinds").is_none(),
+            "no kinds must omit the member"
         );
         assert!(
             symbol.get("id").is_none(),
@@ -4730,34 +3568,6 @@ pub fn compute() -> i32 {
         assert_eq!(
             declared_text(directory.path(), &value["hits"][0])?,
             "# Beacon Guide\n\nHow the beacon works.\n"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn nodes_serve_a_markdown_file_under_the_markdown_wire_kinds() -> TestResult {
-        let (directory, service) = multi_language_fixture()?;
-        let source = fs::read_to_string(directory.path().join("src/guide.md"))?;
-        let position = source
-            .find("beacon works")
-            .ok_or("fixture must contain the prose line")? as u64;
-        let params = NodesParams::at(ProjectPath("src/guide.md".to_owned()), position);
-        let value = serde_json::to_value(service.nodes(&params)?)?;
-        let nodes = value["nodes"].as_array().ok_or("nodes must be array")?;
-        assert!(!nodes.is_empty());
-        assert!(
-            nodes.iter().all(|node| node["language"] == "markdown"),
-            "every node carries the markdown language: {nodes:#?}"
-        );
-        let section = nodes
-            .iter()
-            .find(|node| node["kind"] == "section")
-            .ok_or("position sits inside the heading's section")?;
-        assert_eq!(section["language"], json!("markdown"));
-        assert_eq!(section["facets"], json!(["declaration"]));
-        assert!(
-            nodes.iter().any(|node| node["kind"] == "paragraph"),
-            "position sits inside the prose paragraph: {nodes:#?}"
         );
         Ok(())
     }
@@ -4780,7 +3590,7 @@ pub fn compute() -> i32 {
         let history = HistoryConfiguration::default();
         let service =
             ReadService::build(directory.path(), limits, &visibility, &inclusion, history)?;
-        let request = json!({"name": "Install", "include": ["history"]});
+        let request = json!({"name": "Install", "include": {"history": true}});
         let params: GetSymbolParams = serde_json::from_value(request)?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         let hit = &value["hits"][0];
@@ -4804,7 +3614,7 @@ pub fn compute() -> i32 {
     }
 
     /// A JSON member answers `get_symbol` like any declaration: the
-    /// provider's kind word, empty facets, physical path, and a range over
+    /// provider's kind word, empty kinds, physical path, and a range over
     /// the whole pair.
     #[test]
     fn get_symbol_finds_a_json_member_beside_other_languages() -> TestResult {
@@ -4815,8 +3625,8 @@ pub fn compute() -> i32 {
         assert_eq!(symbol["language"], json!("json"));
         assert_eq!(symbol["kind"], json!("member"));
         assert!(
-            symbol.get("facets").is_none(),
-            "no facets must omit the member"
+            symbol.get("kinds").is_none(),
+            "no kinds must omit the member"
         );
         assert!(
             symbol.get("id").is_none(),
@@ -4856,7 +3666,7 @@ pub fn compute() -> i32 {
     }
 
     /// A YAML mapping entry answers `get_symbol` like any declaration: the
-    /// composed wire kind, empty facets, physical path, and a range over the
+    /// composed wire kind, empty kinds, physical path, and a range over the
     /// whole pair.
     #[test]
     fn get_symbol_finds_a_yaml_entry_beside_other_languages() -> TestResult {
@@ -4867,8 +3677,8 @@ pub fn compute() -> i32 {
         assert_eq!(symbol["language"], json!("yaml"));
         assert_eq!(symbol["kind"], json!("mapping_entry"));
         assert!(
-            symbol.get("facets").is_none(),
-            "no facets must omit the member"
+            symbol.get("kinds").is_none(),
+            "no kinds must omit the member"
         );
         assert!(
             symbol.get("id").is_none(),
@@ -4880,56 +3690,6 @@ pub fn compute() -> i32 {
             "beacon pipeline:\n  retries: 3\n",
             "the range covers whole lines, so the pair's last line ends it"
         );
-        Ok(())
-    }
-
-    #[test]
-    fn nodes_serve_a_json_file_under_the_json_wire_kinds() -> TestResult {
-        let (directory, service) = multi_language_fixture()?;
-        let source = fs::read_to_string(directory.path().join("settings.json"))?;
-        let position = source.find("8080").ok_or("fixture must contain the port")? as u64;
-        let params = NodesParams::at(ProjectPath("settings.json".to_owned()), position);
-        let value = serde_json::to_value(service.nodes(&params)?)?;
-        let nodes = value["nodes"].as_array().ok_or("nodes must be array")?;
-        assert!(!nodes.is_empty());
-        assert!(
-            nodes.iter().all(|node| node["language"] == "json"),
-            "every node carries the json language: {nodes:#?}"
-        );
-        let pair = nodes
-            .iter()
-            .find(|node| node["kind"] == "pair")
-            .ok_or("position sits inside the port member's pair")?;
-        assert_eq!(pair["language"], json!("json"));
-        assert_eq!(pair["facets"], json!(["declaration"]));
-        assert!(
-            nodes.iter().any(|node| node["kind"] == "number"),
-            "position sits inside the number value: {nodes:#?}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn nodes_serve_a_yaml_file_under_the_yaml_wire_kinds() -> TestResult {
-        let (directory, service) = multi_language_fixture()?;
-        let source = fs::read_to_string(directory.path().join("pipeline.yaml"))?;
-        let position = source
-            .find("retries")
-            .ok_or("fixture must contain the entry")? as u64;
-        let params = NodesParams::at(ProjectPath("pipeline.yaml".to_owned()), position);
-        let value = serde_json::to_value(service.nodes(&params)?)?;
-        let nodes = value["nodes"].as_array().ok_or("nodes must be array")?;
-        assert!(!nodes.is_empty());
-        assert!(
-            nodes.iter().all(|node| node["language"] == "yaml"),
-            "every node carries the yaml language: {nodes:#?}"
-        );
-        let pair = nodes
-            .iter()
-            .find(|node| node["kind"] == "block_mapping_pair")
-            .ok_or("position sits inside the retries entry's pair")?;
-        assert_eq!(pair["language"], json!("yaml"));
-        assert_eq!(pair["facets"], json!(["declaration"]));
         Ok(())
     }
 
@@ -4955,7 +3715,7 @@ pub fn compute() -> i32 {
         let history = HistoryConfiguration::default();
         let service =
             ReadService::build(directory.path(), limits, &visibility, &inclusion, history)?;
-        let request = json!({"name": "server", "include": ["history"]});
+        let request = json!({"name": "server", "include": {"history": true}});
         let params: GetSymbolParams = serde_json::from_value(request)?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         let hit = &value["hits"][0];
@@ -4995,7 +3755,7 @@ pub fn compute() -> i32 {
         let history = HistoryConfiguration::default();
         let service =
             ReadService::build(directory.path(), limits, &visibility, &inclusion, history)?;
-        let request = json!({"name": "retries", "include": ["history"]});
+        let request = json!({"name": "retries", "include": {"history": true}});
         let params: GetSymbolParams = serde_json::from_value(request)?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         let hit = &value["hits"][0];
@@ -5092,38 +3852,13 @@ pub fn compute() -> i32 {
     }
 
     #[test]
-    fn revision_nodes_on_an_unparsed_path_names_the_extension_without_a_policy() -> TestResult {
-        let directory = committed_fixture()?;
-        let service = revision_service(directory.path(), "main")?;
-        let error = service
-            .nodes(&NodesParams {
-                revision: Some(rift_protocol::revision::Revision::parse(
-                    "rift://revision/git/main",
-                )?),
-                ..NodesParams::at(ProjectPath("Cargo.lock".to_owned()), 0)
-            })
-            .expect_err("an unparsed extension must be rejected at a revision too");
-        assert_eq!(error.slug(), errors::server::read_unclaimed_extension::SLUG);
-        assert_eq!(
-            error
-                .context()
-                .find(|(key, _)| *key == "extension")
-                .map(|(_, value)| value),
-            Some("lock files".to_owned()),
-            "a revision snapshot carries no filesystem policy, so the extension alone \
-             decides: nodes can never serve an unclaimed one, whatever tree it reads"
-        );
-        Ok(())
-    }
-
-    #[test]
     fn revision_read_serves_the_committed_declaration() -> TestResult {
         let directory = committed_fixture()?;
         let service = revision_service(directory.path(), "main")?;
         let params: GetSymbolParams = serde_json::from_value(json!({"name": "beacon"}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         assert_eq!(
-            item_node(&service, &value["hits"][0])?.source,
+            item_syntax_element(&service, &value["hits"][0])?.source,
             "pub fn beacon() {}",
             "the committed body answers, not the drifted working tree"
         );
@@ -5157,7 +3892,7 @@ pub fn compute() -> i32 {
             );
             let value = serde_json::to_value(service.get_symbol(&params)?)?;
             assert_eq!(
-                item_node(&service, &value["hits"][0])?.source,
+                item_syntax_element(&service, &value["hits"][0])?.source,
                 "pub fn beacon() {}",
                 "{spelling}"
             );
@@ -5284,55 +4019,6 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
-    /// A nodes answer reports the revision it was read at, and a tree revision the
-    /// service no longer serves refuses before any node is read.
-    #[test]
-    fn nodes_report_the_served_revision_and_refuse_a_moved_tree() -> TestResult {
-        let directory = committed_fixture()?;
-        let working = ReadService::build(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &SourceVisibility::default(),
-            &rift_core::TextFileInclusion::default(),
-            HistoryConfiguration::default(),
-        )?;
-        let request = NodesParams::at(ProjectPath("src/lib.rs".to_owned()), 8);
-        let answer = working.nodes(&request)?;
-        assert_eq!(answer.revision, working.served_revision()?);
-        let pinned = working.nodes(&NodesParams {
-            revision: Some(answer.revision.clone()),
-            ..request.clone()
-        })?;
-        assert_eq!(pinned.nodes, answer.nodes);
-        let moved = working
-            .nodes(&NodesParams {
-                revision: Some(rift_protocol::revision::Revision::tree(&"0".repeat(64))?),
-                ..request
-            })
-            .expect_err("a moved tree is no longer served");
-        assert_eq!(moved.slug(), errors::server::read_revision_unserved::SLUG);
-        Ok(())
-    }
-
-    #[test]
-    fn revision_nodes_list_committed_syntax() -> TestResult {
-        let directory = committed_fixture()?;
-        let service = revision_service(directory.path(), "main")?;
-        let result = service.nodes(&NodesParams {
-            revision: Some(rift_protocol::revision::Revision::parse(
-                "rift://revision/git/main",
-            )?),
-            ..NodesParams::at(ProjectPath("src/lib.rs".to_owned()), 8)
-        })?;
-        let value = serde_json::to_value(result)?;
-        let nodes = value["nodes"].as_array().ok_or("nodes must be array")?;
-        assert!(
-            nodes.iter().any(|node| node["kind"] == "function_item"),
-            "position 8 sits inside the committed `pub fn beacon`"
-        );
-        Ok(())
-    }
-
     #[test]
     fn revision_read_refuses_an_unversioned_workspace_with_the_actionable_message() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -5411,68 +4097,69 @@ pub fn compute() -> i32 {
     }
 
     #[test]
-    fn page_of_an_empty_set_reports_zero_total_pages() {
-        let (window, pagination) = super::page(Vec::<u8>::new(), 0, 5);
+    fn page_of_an_empty_set_reports_zero_pages() {
+        let (window, pagination) = super::page(Vec::<u8>::new(), 1, 5);
         assert_eq!(window, Vec::<u8>::new());
-        assert_eq!(pagination.page_index, 0);
-        assert_eq!(pagination.total_pages, 0);
+        assert_eq!(pagination.page, 1);
+        assert_eq!(pagination.pages, 0);
     }
 
     #[test]
-    fn page_zero_serves_the_first_window_by_default() {
-        let (window, pagination) = super::page(vec![1, 2, 3, 4, 5], 0, 2);
+    fn page_one_serves_the_first_window_by_default() {
+        let (window, pagination) = super::page(vec![1, 2, 3, 4, 5], 1, 2);
         assert_eq!(window, vec![1, 2]);
-        assert_eq!(pagination.page_index, 0);
-        assert_eq!(pagination.total_pages, 3);
+        assert_eq!(pagination.page, 1);
+        assert_eq!(pagination.pages, 3);
     }
 
     #[test]
     fn page_count_is_exact_for_a_set_that_divides_evenly() {
-        let (window, pagination) = super::page(vec![1, 2, 3, 4, 5, 6], 1, 3);
+        let (window, pagination) = super::page(vec![1, 2, 3, 4, 5, 6], 2, 3);
         assert_eq!(window, vec![4, 5, 6]);
-        assert_eq!(pagination.total_pages, 2);
+        assert_eq!(pagination.pages, 2);
     }
 
     #[test]
     fn page_count_rounds_up_and_the_last_page_carries_the_remainder() {
-        let (window, pagination) = super::page(vec![1, 2, 3, 4, 5, 6, 7], 2, 3);
+        let (window, pagination) = super::page(vec![1, 2, 3, 4, 5, 6, 7], 3, 3);
         assert_eq!(window, vec![7]);
-        assert_eq!(pagination.total_pages, 3);
+        assert_eq!(pagination.pages, 3);
     }
 
     #[test]
     fn page_past_the_end_is_empty_and_keeps_the_true_page_count() {
         let (window, pagination) = super::page(vec![1, 2, 3], 9, 2);
         assert_eq!(window, Vec::<i32>::new());
-        assert_eq!(pagination.page_index, 9);
-        assert_eq!(pagination.total_pages, 2);
+        assert_eq!(pagination.page, 9);
+        assert_eq!(pagination.pages, 2);
     }
 
-    /// The window offset is `page_index * limit` at checked boundaries: an index whose
+    /// The window offset is `page * limit` at checked boundaries: an index whose
     /// offset cannot be represented is past every collectable page, never a panic.
     #[test]
-    fn page_index_beyond_arithmetic_range_is_an_empty_page() {
+    fn page_beyond_arithmetic_range_is_an_empty_page() {
         let (window, pagination) = super::page(vec![1, 2, 3], u64::MAX, usize::MAX);
         assert_eq!(window, Vec::<i32>::new());
-        assert_eq!(pagination.page_index, u64::MAX);
-        assert_eq!(pagination.total_pages, 1);
+        assert_eq!(pagination.page, u64::MAX);
+        assert_eq!(pagination.pages, 1);
     }
 
     #[test]
     fn get_symbol_pages_walk_the_full_match_set_without_overlap() -> TestResult {
         let (_directory, service) = fixture()?;
-        let first: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon", "limit": 1}))?;
+        let first: GetSymbolParams =
+            serde_json::from_value(json!({"name": "Beacon", "max_results": 1}))?;
         let first_value = serde_json::to_value(service.get_symbol(&first)?)?;
         assert_eq!(
             first_value["pagination"],
-            json!({ "page_index": 0, "total_pages": 2 })
+            json!({"page": 1, "pages": 2, "max_results": 1, "total": 2})
         );
         let second: GetSymbolParams =
-            serde_json::from_value(json!({"name": "Beacon", "limit": 1, "page_index": 1}))?;
+            serde_json::from_value(json!({"name": "Beacon", "max_results": 1, "page": 2}))?;
         let second_value = serde_json::to_value(service.get_symbol(&second)?)?;
         assert_eq!(
             second_value["pagination"],
-            json!({ "page_index": 1, "total_pages": 2 })
+            json!({"page": 2, "pages": 2, "max_results": 1, "total": 2})
         );
         assert_eq!(second_value["hits"].as_array().map(Vec::len), Some(1));
         assert_ne!(
@@ -5486,12 +4173,12 @@ pub fn compute() -> i32 {
     fn get_symbol_page_past_the_end_is_empty_with_the_true_page_count() -> TestResult {
         let (_directory, service) = fixture()?;
         let params: GetSymbolParams =
-            serde_json::from_value(json!({"name": "Beacon", "limit": 1, "page_index": 40}))?;
+            serde_json::from_value(json!({"name": "Beacon", "max_results": 1, "page": 40}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         assert_eq!(value["hits"], json!([]));
         assert_eq!(
             value["pagination"],
-            json!({ "page_index": 40, "total_pages": 2 })
+            json!({"page": 40, "pages": 2, "max_results": 1, "total": 2})
         );
         Ok(())
     }
@@ -5509,13 +4196,12 @@ pub fn compute() -> i32 {
         assert_eq!(error.slug(), rift_error::errors::server::read_invalid::SLUG);
         assert_eq!(
             error.to_string(),
-            "the request does not match the documented form: field limit, violation 10001 \
-             exceeds the maximum 10000; correct the reported field and resend the request"
+            "the request does not match the documented form: field max_results, violation expected 1..=10000, received 10001; correct the reported field and resend the request"
         );
     }
 
     /// Each index's match set is collected up to `results_max`; a set that reached it warns
-    /// `results_truncated` naming the bound, and `total_pages` counts only what fit.
+    /// `results_truncated` naming the bound, and `pages` counts only what fit.
     #[test]
     fn get_symbol_at_the_result_bound_warns_results_truncated() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -5532,12 +4218,12 @@ pub fn compute() -> i32 {
             HistoryConfiguration::default(),
         )?;
         let params: GetSymbolParams =
-            serde_json::from_value(json!({"name": "Beacon", "limit": 5}))?;
+            serde_json::from_value(json!({"name": "Beacon", "max_results": 5}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         assert_eq!(value["hits"].as_array().map(Vec::len), Some(1));
         assert_eq!(
             value["pagination"],
-            json!({ "page_index": 0, "total_pages": 1 })
+            json!({"page": 1, "pages": 1, "max_results": 5, "total": 1})
         );
         assert!(
             value["warnings"].as_array().is_some_and(|warnings| {
@@ -5574,14 +4260,14 @@ pub fn compute() -> i32 {
     }
 
     #[test]
-    fn language_provider_routes_node_facets_through_the_registry() {
+    fn language_provider_routes_syntax_element_kinds_through_the_registry() {
         let rust = Language {
             name: "rust".to_owned(),
             dialect: None,
         };
         assert_eq!(
-            super::language_provider(&rust).node_facets("function_item"),
-            [NodeFacet::Declaration, NodeFacet::Definition]
+            super::language_provider(&rust).syntax_element_kinds("function_item"),
+            [SyntaxKind::Declaration, SyntaxKind::Definition]
         );
     }
 

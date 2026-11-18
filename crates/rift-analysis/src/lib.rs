@@ -8,14 +8,14 @@ pub use analyzer::namespace::python::build_paths;
 pub mod archive;
 mod chunk;
 pub mod documentation;
+#[cfg(feature = "collector")]
+mod edge;
 mod enclosing;
 #[cfg(feature = "collector")]
 mod framework;
 #[cfg(feature = "collector")]
 mod glob;
 mod input;
-#[cfg(feature = "collector")]
-mod relationship;
 mod revision;
 #[cfg(feature = "collector")]
 mod selection;
@@ -33,6 +33,8 @@ pub use analyzer::{
     public_qualified_names,
 };
 pub use chunk::{TextChunk, text_chunks};
+#[cfg(feature = "collector")]
+pub use edge::{EDGES_MAX, Edge, EdgeStore};
 pub use enclosing::EnclosingDefinitions;
 #[cfg(feature = "collector")]
 pub use framework::{FrameworkContext, ResolvedFramework};
@@ -44,8 +46,6 @@ pub use input::{
 };
 #[cfg(feature = "collector")]
 pub use input::{NamespaceInput, NamespaceModule, PackageDependency};
-#[cfg(feature = "collector")]
-pub use relationship::{RELATIONSHIP_EDGES_MAX, RelationshipEdge, RelationshipStore};
 pub use revision::{
     ManifestError, analyzer_digest, analyzer_manifest_path, analyzer_revision,
     render_analyzer_manifest,

@@ -17,7 +17,7 @@ fn complete_source_inventory_keeps_parser_error_coverage_separate() {
     assert!(coverage.inventory_complete);
     assert!(!coverage.identity_complete);
     assert!(!coverage.applicability_complete);
-    assert!(coverage.relationships.is_empty());
+    assert!(coverage.edges.is_empty());
 }
 
 #[test]
@@ -46,7 +46,7 @@ fn complete_source_inventory_keeps_original_declaration_file_without_entry_conte
     assert!(coverage.inventory_complete);
     assert!(!coverage.identity_complete);
     assert!(!coverage.applicability_complete);
-    assert!(coverage.relationships.is_empty());
+    assert!(coverage.edges.is_empty());
 }
 // Exact blockquote heading bytes from Prettier 3.8.5 THIRD-PARTY-NOTICES.md.
 const REFUSED_HEADING_SOURCE: &str = "> wcwidth.js: a javascript portng of C's wcwidth()\n> ================================================\n>\n";
@@ -88,7 +88,7 @@ fn retained_refused_heading_keeps_source_inventory_complete() {
     assert!(publication.coverage[0].inventory_complete);
     assert!(!publication.coverage[0].identity_complete);
     assert!(!publication.coverage[0].applicability_complete);
-    assert!(publication.coverage[0].relationships.is_empty());
+    assert!(publication.coverage[0].edges.is_empty());
 }
 
 #[test]
