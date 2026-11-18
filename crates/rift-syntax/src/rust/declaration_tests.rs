@@ -181,3 +181,16 @@ fn test_nested_functions_qualify_under_their_enclosing_function() {
         ]
     );
 }
+
+#[test]
+fn test_a_qualified_trait_does_not_take_an_unrelated_local_traits_visibility() {
+    let document = analyze(
+        "pub trait Shape { fn area(&self); }\nstruct Point;\nimpl external::Shape for Point { fn area(&self) {} }\n",
+    );
+    assert_eq!(symbol(&document, "Point::area").visibility, None);
+    assert!(
+        !symbol(&document, "Point::area")
+            .facets
+            .contains(&SymbolFacet::Public)
+    );
+}

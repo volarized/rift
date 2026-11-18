@@ -503,16 +503,13 @@ fn file_traits(root: Node<'_>, text: &str) -> BTreeMap<String, Option<RustVisibi
     traits
 }
 
-/// The trait name an impl's `trait` field spells, without its path and
-/// generic arguments: `Display` in `impl fmt::Display for Point` and `From`
-/// in `impl From<u8> for Point`.
+/// The trait path an impl's `trait` field spells, without generic arguments.
+/// Qualified paths stay qualified, so an external trait cannot take the
+/// visibility of a local trait sharing its last name.
 fn implemented_trait_name<'text>(implementation: Node<'_>, text: &'text str) -> Option<&'text str> {
     let mut name = implementation.child_by_field_name(RustGrammarField::Trait.as_str())?;
     if name.kind() == GENERIC_TYPE_KIND {
         name = name.child_by_field_name(RustGrammarField::Type.as_str())?;
-    }
-    if let Some(last) = name.child_by_field_name(RustGrammarField::Name.as_str()) {
-        name = last;
     }
     text.get(name.byte_range())
 }
