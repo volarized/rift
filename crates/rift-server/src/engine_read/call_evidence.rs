@@ -18,6 +18,7 @@ pub(super) struct CapturedCalls<'read> {
     direction: TraversalDirection,
     edges: Vec<&'read rift_index::RelationshipEdge>,
     truncated: bool,
+    edge_complete: bool,
 }
 
 impl<'read> CapturedCalls<'read> {
@@ -35,16 +36,40 @@ impl<'read> CapturedCalls<'read> {
             edge.facet() == RelationshipFacet::Calls && edge.static_callee().is_some()
         });
         let edges = calls.by_ref().take(TRAVERSAL_NODES_MAX).collect();
+        let edge_complete = reads
+            .index()
+            .symbols_by_identity_page(seed, 0, 1)
+            .is_ok_and(|(declarations, count)| {
+                count == 1
+                    && declarations.first().is_some_and(|declaration| {
+                        let range = (direction == TraversalDirection::Outgoing).then_some(
+                            rift_syntax::ByteRange {
+                                start: declaration.symbol.item_range.start,
+                                end: declaration.symbol.item_range.end,
+                            },
+                        );
+                        reads
+                            .index()
+                            .static_edge_calls_complete(declaration.file.path(), range)
+                    })
+            });
         Self {
             reads,
             direction,
             edges,
             truncated: calls.next().is_some(),
+            edge_complete,
         }
     }
 
     pub(super) fn answer(self) -> Option<GraphCalls> {
-        (!self.edges.is_empty()).then(|| self.combine(GraphCalls::default()))
+        (self.edge_complete || !self.edges.is_empty()).then(|| {
+            let complete = self.edge_complete && !self.truncated;
+            self.combine(GraphCalls {
+                complete,
+                ..GraphCalls::default()
+            })
+        })
     }
 
     pub(super) fn combine(self, mut engine: GraphCalls) -> GraphCalls {
@@ -247,6 +272,113 @@ fn merge_call_neighbors(neighbors: &mut Vec<(SymbolId, Vec<SourceUnitSpan>)>) {
 #[cfg(test)]
 mod tests {
     use rift_protocol::read::SymbolId;
+
+    #[test]
+    fn test_edge_static_calls_answer_complete_and_empty_adjacency() {
+        let directory = tempfile::tempdir().expect("workspace");
+        std::fs::write(
+            directory.path().join("entry.mjs"),
+            "export function root() { leaf(); }\nfunction leaf() {}\n",
+        )
+        .expect("source");
+        let reads = super::ReadService::build(
+            directory.path(),
+            rift_index::WorkspaceIndexLimits::default(),
+            &rift_core::SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            rift_protocol::configuration::HistoryConfiguration::default(),
+        )
+        .expect("captured workspace");
+        for (name, direction, count) in [
+            ("root", super::TraversalDirection::Outgoing, 1),
+            ("leaf", super::TraversalDirection::Incoming, 1),
+            ("leaf", super::TraversalDirection::Outgoing, 0),
+        ] {
+            let seed = super::CoreSymbolId::new(format!(
+                "rift://symbol/local/javascript/.%2Fentry.mjs/{name}"
+            ))
+            .expect("identity");
+            let answer = super::CapturedCalls::read(&reads, &seed, direction)
+                .answer()
+                .expect("static answer");
+            assert!(answer.complete);
+            assert_eq!(answer.local.len(), count);
+        }
+    }
+
+    #[test]
+    fn test_edge_static_completeness_tracks_unresolved_calls_by_direction() {
+        let directory = tempfile::tempdir().expect("workspace");
+        std::fs::write(directory.path().join("entry.mjs"), "export function root() { leaf(); }\nfunction leaf() {}\nfunction unknown(callback) { callback(); }\n").expect("source");
+        let reads = super::ReadService::build(
+            directory.path(),
+            rift_index::WorkspaceIndexLimits::default(),
+            &rift_core::SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            rift_protocol::configuration::HistoryConfiguration::default(),
+        )
+        .expect("captured workspace");
+        let identity = |name| {
+            super::CoreSymbolId::new(format!(
+                "rift://symbol/local/javascript/.%2Fentry.mjs/{name}"
+            ))
+            .expect("identity")
+        };
+        let root = super::CapturedCalls::read(
+            &reads,
+            &identity("root"),
+            super::TraversalDirection::Outgoing,
+        )
+        .answer()
+        .expect("captured call");
+        assert!(root.complete);
+        let incoming = super::CapturedCalls::read(
+            &reads,
+            &identity("leaf"),
+            super::TraversalDirection::Incoming,
+        )
+        .answer()
+        .expect("captured caller");
+        assert!(!incoming.complete);
+        assert!(
+            super::CapturedCalls::read(
+                &reads,
+                &identity("unknown"),
+                super::TraversalDirection::Outgoing
+            )
+            .answer()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn test_edge_incoming_completeness_covers_javascript_and_typescript_sources() {
+        let directory = tempfile::tempdir().expect("workspace");
+        std::fs::write(
+            directory.path().join("entry.mjs"),
+            "export function root() { leaf(); }\nfunction leaf() {}\n",
+        )
+        .expect("source");
+        std::fs::write(
+            directory.path().join("unknown.tsx"),
+            "export function unknown(callback: () => void) { callback(); }\n",
+        )
+        .expect("source");
+        let reads = super::ReadService::build(
+            directory.path(),
+            rift_index::WorkspaceIndexLimits::default(),
+            &rift_core::SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            rift_protocol::configuration::HistoryConfiguration::default(),
+        )
+        .expect("captured workspace");
+        let leaf = super::CoreSymbolId::new("rift://symbol/local/javascript/.%2Fentry.mjs/leaf")
+            .expect("identity");
+        let answer = super::CapturedCalls::read(&reads, &leaf, super::TraversalDirection::Incoming)
+            .answer()
+            .expect("captured edge");
+        assert!(!answer.complete);
+    }
 
     #[test]
     fn incoming_engine_group_preserves_the_authored_initializer_caller() {

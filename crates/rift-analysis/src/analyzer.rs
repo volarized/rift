@@ -453,7 +453,9 @@ fn resolve_package_static(
     );
 }
 
-fn relationship_facet(kind: rift_core::RelationshipKind) -> rift_protocol::read::RelationshipFacet {
+pub(crate) fn relationship_facet(
+    kind: rift_core::RelationshipKind,
+) -> rift_protocol::read::RelationshipFacet {
     match kind {
         rift_core::RelationshipKind::Reference => {
             rift_protocol::read::RelationshipFacet::References
@@ -1618,7 +1620,12 @@ impl Records {
             let Some(id) = record.identity().filter(|id| objects.contains(id.as_str())) else {
                 continue;
             };
-            for edge in semantics.relationships().outgoing(id) {
+            for edge in semantics
+                .relationships()
+                .outgoing(id)
+                .iter()
+                .filter(|edge| !edge.is_graph_edge())
+            {
                 if self.relationships.len() >= limit {
                     self.warn(truncation(
                         "relationships",

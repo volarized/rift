@@ -24,6 +24,7 @@ pub(super) struct Kinds {
     function: [u16; 2],
     named_expression: [u16; 3],
     class: u16,
+    edge_types: Vec<u16>,
     parameters: u16,
     arrow: u16,
     import: u16,
@@ -52,10 +53,25 @@ pub(super) struct Kinds {
 
 pub(super) fn kinds() -> &'static Kinds {
     static KINDS: OnceLock<Kinds> = OnceLock::new();
-    KINDS.get_or_init(|| {
-        let grammar = crate::javascript::javascript_grammar();
-        let id = |name| kind(&grammar, name);
-        let field = |name| field(&grammar, name);
+    KINDS.get_or_init(|| Kinds::resolve_edge(&crate::javascript::javascript_grammar()))
+}
+
+pub(super) fn edge_typescript_kinds(
+    dialect: crate::typescript::TypeScriptDialect,
+) -> &'static Kinds {
+    static TYPESCRIPT: OnceLock<Kinds> = OnceLock::new();
+    static TSX: OnceLock<Kinds> = OnceLock::new();
+    let cache = match dialect {
+        crate::typescript::TypeScriptDialect::TypeScript => &TYPESCRIPT,
+        crate::typescript::TypeScriptDialect::Tsx => &TSX,
+    };
+    cache.get_or_init(|| Kinds::resolve_edge(&dialect.grammar()))
+}
+
+impl Kinds {
+    fn resolve_edge(grammar: &tree_sitter::Language) -> Self {
+        let id = |name| kind(grammar, name);
+        let field = |name| field(grammar, name);
         let program = id("program");
         let function = [
             id("function_declaration"),
@@ -94,6 +110,19 @@ pub(super) fn kinds() -> &'static Kinds {
             function,
             named_expression,
             class: id("class_declaration"),
+            edge_types: if grammar.id_for_node_kind("type_identifier", true) == 0 {
+                Vec::new()
+            } else {
+                [
+                    "abstract_class_declaration",
+                    "interface_declaration",
+                    "type_alias_declaration",
+                    "enum_declaration",
+                ]
+                .into_iter()
+                .map(id)
+                .collect()
+            },
             parameters: id("formal_parameters"),
             arrow,
             import: id("import_statement"),
@@ -128,7 +157,7 @@ pub(super) fn kinds() -> &'static Kinds {
             argument: field("argument"),
             parameter: field("parameter"),
         }
-    })
+    }
 }
 
 impl Kinds {
@@ -141,14 +170,20 @@ impl Kinds {
         let id = node.kind_id();
         if id == self.call {
             self.record_call(node, source, facts)?;
+        } else if id == self.new {
+            if let Some(callee) = node.child_by_field_id(self.constructor) {
+                facts
+                    .calls
+                    .push(call(node, callee, StaticCallee::Unsupported)?);
+            }
         } else if id == self.variable {
             self.record_variable(node, source, facts)?;
-        } else if self.function.contains(&id) || id == self.class {
+        } else if self.function.contains(&id) || id == self.class || self.edge_types.contains(&id) {
             self.record_declaration(node, facts)?;
         } else if id == self.import_specifier || self.is_default_import(node) {
             self.record_import(node, source, facts)?;
         } else if id == self.namespace_import {
-            self.record_namespace_import(node, facts)?;
+            self.record_namespace_import(node, source, facts)?;
         } else if id == self.export_specifier {
             self.record_reexport(node, source, facts)?;
         } else {
@@ -209,7 +244,7 @@ impl Kinds {
         let scope = enclosing(node, &self.scopes);
         let name = node
             .child_by_field_id(self.name)
-            .and_then(|node| identifier(node, self.identifier));
+            .filter(|node| !node.is_missing());
         if let Some((name, scope)) = name.zip(scope) {
             let available = if node.kind_id() == self.class {
                 byte_range(node)?.end
@@ -381,18 +416,25 @@ impl Kinds {
     fn record_namespace_import(
         &self,
         node: Node<'_>,
+        source: &str,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
         let scope = enclosing(node, &self.scopes[..1]);
         let name = node
             .named_child(0)
             .and_then(|node| identifier(node, self.identifier));
-        if let Some((name, scope)) = name.zip(scope) {
+        let statement = enclosing(node, &[self.import]);
+        let module = statement
+            .and_then(|statement| statement.child_by_field_id(self.source))
+            .map(|node| self.literal(node, source))
+            .transpose()?
+            .flatten();
+        if let Some(((name, scope), module)) = name.zip(scope).zip(module) {
             facts.bindings.push(binding(
                 name,
                 scope,
                 byte_range(scope)?.start,
-                StaticBindingKind::Shadow,
+                StaticBindingKind::JavaScriptEdgeNamespace { module },
             )?);
         }
         Ok(())

@@ -66,7 +66,11 @@ fn refusal(publication: &PackagePublication) -> String {
 
 #[test]
 fn built_in_publication_covers_its_relationships_and_no_occurrences() {
-    let publication = click();
+    let publication = publication(
+        &[("click/core.py", "def echo(value):\n    return value\n")],
+        None,
+        &["click"],
+    );
     publication.validate_facts().expect("built-in facts agree");
     for coverage in &publication.coverage {
         assert!(coverage.covers(FactKind::Relationships, None));
@@ -147,7 +151,7 @@ fn occurrences_outside_their_units_or_order_are_refused() {
         let mut changed = publication.clone();
         let mut fact = occurrence(&changed, 0, 3);
         change(&mut fact, length);
-        changed.occurrences.push(fact);
+        changed.occurrences = vec![fact];
         assert!(
             refusal(&changed).contains(expected),
             "{}",

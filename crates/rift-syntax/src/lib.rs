@@ -50,8 +50,8 @@ pub use provider::{SyntaxBound, SyntaxLimits, SyntaxProvider, SyntaxSource};
 pub use python::PythonSyntaxProvider;
 pub use rust::{RustQuery, RustQueryCapture, RustSyntaxProvider};
 pub use static_analysis::{
-    StaticBinding, StaticBindingKind, StaticCall, StaticCallee, StaticFacts, StaticFactsParts,
-    StaticInherentImpl, StaticReexport,
+    HeritageEdge, StaticBinding, StaticBindingKind, StaticCall, StaticCallee, StaticFacts,
+    StaticFactsParts, StaticInherentImpl, StaticReexport,
 };
 pub use toml::TomlSyntaxProvider;
 pub use typescript::{TypeScriptDialect, TypeScriptSyntaxProvider};

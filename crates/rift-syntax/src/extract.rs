@@ -317,7 +317,7 @@ pub(crate) fn extract_with_capture(
 
         let visited = visits.visited(node_index);
         if let Some(capture) = capture.as_deref_mut() {
-            capture.record(node)?;
+            capture.record(visited)?;
         }
         if let Some(binding) = rules.export_binding(visited, text, &qualification)? {
             export_bindings.push(binding);

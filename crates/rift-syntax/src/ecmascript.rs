@@ -1308,9 +1308,19 @@ pub(crate) fn analyze_included(
         kinds,
         &mut rules.exports.bindings,
     )?;
-    let mut capture = (language == &crate::ShippedLanguage::JavaScript.language()
-        && ranges.is_empty())
-    .then(|| crate::static_analysis::Capture::for_javascript(source.text));
+    let mut capture = ranges.is_empty().then(|| {
+        if language.name == "typescript" {
+            crate::static_analysis::Capture::for_edge_typescript(
+                source.text,
+                match language.dialect.as_deref() {
+                    Some("tsx") => crate::typescript::TypeScriptDialect::Tsx,
+                    _ => crate::typescript::TypeScriptDialect::TypeScript,
+                },
+            )
+        } else {
+            crate::static_analysis::Capture::for_javascript(source.text)
+        }
+    });
     let (nodes, symbols, export_bindings) = extract::extract_with_capture(
         tree.root_node(),
         source,

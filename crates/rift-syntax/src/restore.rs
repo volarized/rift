@@ -782,8 +782,15 @@ impl SyntaxFacts {
         validate_macro_invocations(source, limits, &parts)?;
         validate_scope(source, limits, &parts)?;
         if let Some(facts) = &parts.static_facts {
-            if parts.language != ShippedLanguage::Rust.language()
-                && parts.language != ShippedLanguage::JavaScript.language()
+            if ![
+                ShippedLanguage::Rust,
+                ShippedLanguage::JavaScript,
+                ShippedLanguage::TypeScript,
+                ShippedLanguage::TypeScriptTsx,
+                ShippedLanguage::Python,
+            ]
+            .into_iter()
+            .any(|language| parts.language == language.language())
             {
                 return errors::syntax::facts_structure_invalid().fail();
             }

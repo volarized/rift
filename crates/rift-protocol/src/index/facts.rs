@@ -20,7 +20,7 @@ enum FactViolation {
     Unit,
     /// An occurrence's range falls outside its unit's source.
     Range,
-    /// Occurrences are not in strict unit, range, and symbol order.
+    /// Occurrences are not in strict unit, range, symbol, and producer order.
     Order,
     /// A relationship starts at a symbol whose identity does not parse.
     Symbol,
@@ -51,7 +51,7 @@ impl PackagePublication {
     ///
     /// Each fact's language, kind, and producer must be named by one coverage entry, and
     /// each occurrence must lie inside a unit the publication carries, in unit, range, and
-    /// symbol order. The work is linear in the facts and units the publication holds.
+    /// symbol and producer order. The work is linear in the facts and units the publication holds.
     ///
     /// # Errors
     /// Returns `producer_fact_invalid` naming the field and the rule it breaks.
@@ -119,12 +119,13 @@ fn relationship_language(relationship: &Relationship) -> Result<Language, RiftEr
         .map_err(|_| FactViolation::Symbol.error("relationships.from"))
 }
 
-fn occurrence_key(occurrence: &PackageOccurrence) -> (&str, u64, u64, &str) {
+fn occurrence_key(occurrence: &PackageOccurrence) -> (&str, u64, u64, &str, Option<&FactProducer>) {
     (
         occurrence.unit.0.as_str(),
         occurrence.range.start,
         occurrence.range.end,
         occurrence.symbol.as_str(),
+        occurrence.producer.as_ref(),
     )
 }
 

@@ -108,7 +108,7 @@ pub struct PackagePublication {
     /// Normalized relationships, preserving their source occurrences and derivation. A
     /// relationship an external producer wrote names it in `producer`.
     pub relationships: Vec<Relationship>,
-    /// Places a unit's source names a symbol, in unit, range, and symbol order. Absent when
+    /// Places a unit's source names a symbol, in unit, range, symbol, and producer order. Absent when
     /// no producer covered occurrences.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub occurrences: Vec<PackageOccurrence>,

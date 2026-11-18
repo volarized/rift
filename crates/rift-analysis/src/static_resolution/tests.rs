@@ -11,6 +11,124 @@ use rift_syntax::DocumentPlacement;
 
 const WORK_MAX: usize = 10_000;
 
+#[test]
+fn test_edge_heritage_is_captured_for_each_language() {
+    for (path, source, expected) in [
+        ("app.js", "class Base {}\nclass Derived extends Base {}", 1),
+        (
+            "app.ts",
+            "class Base {}\ninterface Task {}\nclass Derived extends Base implements Task {}",
+            2,
+        ),
+        (
+            "app.tsx",
+            "class Base {}\ninterface Task {}\nclass Derived extends Base implements Task {}",
+            2,
+        ),
+        ("app.py", "class Base: pass\nclass Derived(Base): pass\n", 1),
+        (
+            "lib.rs",
+            "trait Task {}\nstruct Worker;\nimpl Task for Worker {}",
+            1,
+        ),
+    ] {
+        let parsed = syntax(path, source);
+        let captured = parsed.facts().static_facts().expect("captured edge syntax");
+        assert_eq!(captured.heritage_edges().len(), expected, "{path}");
+    }
+}
+
+#[test]
+fn test_edge_typescript_calls_follow_import_bindings_in_each_dialect() {
+    for extension in ["ts", "tsx", "mts", "cts"] {
+        let path = format!("app/main.{extension}");
+        let source = "import { leaf as run } from '../lib/jobs';\nexport function root(): number { return run(); }\n";
+        let result = resolution(
+            "typescript",
+            &[
+                (path.as_str(), source),
+                (
+                    "lib/jobs.ts",
+                    "export function leaf(): number { return 1; }",
+                ),
+            ],
+            &[],
+            WORK_MAX,
+        );
+        let edges = calls(&result, &path).collect::<Vec<_>>();
+        assert_eq!(edges.len(), 1, "{extension}: {result:?}");
+        assert_eq!(source_of(edges[0], source), "run()");
+        assert_eq!(edges[0].target_binding.unit().key().as_str(), "lib/jobs.ts");
+    }
+}
+
+#[test]
+fn test_edge_namespace_imports_resolve_calls_and_heritage() {
+    let source = "import * as tasks from './jobs.ts';\nexport function root() { tasks.leaf(); }\nclass Derived extends tasks.Base {}";
+    let result = resolution(
+        "typescript",
+        &[
+            ("main.ts", source),
+            ("jobs.ts", "export function leaf() {}\nexport class Base {}"),
+        ],
+        &[],
+        WORK_MAX,
+    );
+    assert_eq!(calls(&result, "main.ts").count(), 1);
+    assert!(
+        result
+            .occurrences
+            .iter()
+            .any(|edge| edge.edge_kind == Some(rift_protocol::read::RelationshipFacet::Extends))
+    );
+}
+
+#[test]
+fn test_edge_python_calls_follow_local_and_import_bindings() {
+    let source = "from jobs import leaf as run\nimport jobs as tasks\ndef local(): return 1\ndef root():\n    return run() + tasks.leaf() + local()\n";
+    let result = resolution(
+        "python",
+        &[("main.py", source), ("jobs.py", "def leaf(): return 1\n")],
+        &[],
+        WORK_MAX,
+    );
+    let edges = calls(&result, "main.py").collect::<Vec<_>>();
+    let authored = edges
+        .iter()
+        .map(|edge| source_of(edge, source))
+        .collect::<Vec<_>>();
+    assert_eq!(authored, ["run()", "tasks.leaf()", "local()"]);
+    assert_eq!(edges[0].target_binding.unit().key().as_str(), "jobs.py");
+}
+
+#[test]
+fn test_edge_python_imports_keep_relative_bindings_and_reject_dotted_module_shadows() {
+    let result = resolution(
+        "python",
+        &[
+            (
+                "pkg/main.py",
+                "from .jobs import leaf as run\ndef root(): return run()\n",
+            ),
+            ("pkg/jobs.py", "def leaf(): return 1\n"),
+            (
+                "other.py",
+                "import pkg.jobs\ndef root(): return pkg.leaf()\n",
+            ),
+            ("stub.pyi", "def declared(): ...\n"),
+        ],
+        &[],
+        WORK_MAX,
+    );
+    let resolved = calls(&result, "pkg/main.py").collect::<Vec<_>>();
+    assert_eq!(resolved.len(), 1, "{result:?}");
+    assert_eq!(
+        resolved[0].target_binding.unit().key().as_str(),
+        "pkg/jobs.py"
+    );
+    assert_eq!(calls(&result, "other.py").count(), 0);
+}
+
 fn syntax(path: &str, text: &str) -> SyntaxDocument {
     let path = ProjectPath::new(path).expect("fixture path");
     let extension = path.as_str().rsplit_once('.').expect("fixture extension").1;
@@ -207,7 +325,7 @@ fn javascript_rebinding_and_class_prototype_mutation_leave_calls_unresolved() {
                   original(); const task = new Task(); task.run();";
     let result = resolution("javascript", &[("main.mjs", source)], &[], WORK_MAX);
     assert_eq!(calls(&result, "main.mjs").count(), 0);
-    assert_eq!(result.unresolved_sites, 2);
+    assert_eq!(result.unresolved_sites, 3);
 }
 
 #[test]

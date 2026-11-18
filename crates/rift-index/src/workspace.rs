@@ -3780,6 +3780,26 @@ impl WorkspaceIndex {
         self.semantics.relationships()
     }
 
+    /// Whether captured static calls cover the selected declaration or incoming language set.
+    #[must_use]
+    pub fn static_edge_calls_complete(
+        &self,
+        path: &ProjectPath,
+        range: Option<rift_syntax::ByteRange>,
+    ) -> bool {
+        let Ok(unit) = rift_syntax::DocumentPlacement::project_path(path) else {
+            return false;
+        };
+        let Some(file) = self.file(path) else {
+            return false;
+        };
+        self.identity_coverage_complete(file.syntax().language())
+            .unwrap_or(false)
+            && self
+                .semantics
+                .static_edge_calls_complete(unit.unit(), range)
+    }
+
     /// Resolved physical usages of one established target in this publication.
     pub fn static_usages(
         &self,

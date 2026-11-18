@@ -392,8 +392,15 @@ impl SyntaxProvider for PythonSyntaxProvider {
             kinds: python_kinds(),
             overloads: overload::OverloadContext::new(tree.root_node(), source.text, limits)?,
         };
-        let (nodes, symbols) =
-            extract::extract(tree.root_node(), source, limits, &self.language, &rules)?;
+        let mut capture = crate::static_analysis::Capture::for_edge_python(source.text);
+        let (nodes, symbols, _) = extract::extract_with_capture(
+            tree.root_node(),
+            source,
+            limits,
+            &self.language,
+            &rules,
+            Some(&mut capture),
+        )?;
         Ok(SyntaxDocument::new(
             self.language.clone(),
             source.path.clone(),
@@ -402,6 +409,7 @@ impl SyntaxProvider for PythonSyntaxProvider {
             tree.root_node().has_error(),
         )
         .with_source_witness(source.text)
+        .with_static_facts(Some(capture.finish()))
         .with_syntax_limits(limits))
     }
 

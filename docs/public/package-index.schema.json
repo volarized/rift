@@ -2855,7 +2855,7 @@
       "type": "array"
     },
     "occurrences": {
-      "description": "Places a unit's source names a symbol, in unit, range, and symbol order. Absent when\nno producer covered occurrences.",
+      "description": "Places a unit's source names a symbol, in unit, range, symbol, and producer order. Absent when\nno producer covered occurrences.",
       "items": {
         "$ref": "#/$defs/PackageOccurrence"
       },
