@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rift_core::SymbolId;
-use rift_syntax::{SyntaxSource, registry};
+use rift_syntax::SyntaxSource;
 
 use super::SelectedFile;
 use crate::NamespaceInput;
@@ -16,25 +16,14 @@ pub(super) fn retain_valid_declarations(
     }
     // Retained facts release syntax elements. Validate only malformed captured files,
     // under the same bounds, including declarations with zero-width missing tokens.
-    let ranges = file
-        .syntax
-        .symbols()
-        .iter()
-        .map(|symbol| symbol.item_range)
-        .collect::<Vec<_>>();
-    let invalid = registry::provider_for_language(file.syntax.language()).and_then(|provider| {
-        provider
-            .invalid_declarations(
-                SyntaxSource {
-                    path: file.path,
-                    text: file.source,
-                },
-                input.syntax(),
-                &ranges,
-            )
-            .ok()
-    });
-    let Some(invalid) = invalid else {
+    // The facts keep the answer, so a held file is parsed again once, not on every build.
+    let Some(invalid) = file.syntax.invalid_declarations(
+        SyntaxSource {
+            path: file.path,
+            text: file.source,
+        },
+        input.syntax(),
+    ) else {
         return BTreeMap::new();
     };
     let valid = file

@@ -117,6 +117,48 @@ mod tests {
     }
 
     #[test]
+    fn facts_keep_the_validation_answer_and_copies_validate_again() {
+        let path = ProjectPath::new("main.py").expect("source path");
+        let text = "def ok():\n    pass\ndef broken(: pass\n";
+        let source = SyntaxSource { path: &path, text };
+        let provider = PythonSyntaxProvider::default();
+        let facts = provider
+            .analyze(source, SyntaxLimits::DEFAULT)
+            .expect("source facts")
+            .into_facts();
+        let ranges = facts
+            .symbols()
+            .iter()
+            .map(|symbol| symbol.item_range)
+            .collect::<Vec<_>>();
+        let expected = provider
+            .invalid_declarations(source, SyntaxLimits::DEFAULT, &ranges)
+            .expect("declaration validation");
+        assert!(!expected.is_empty());
+        assert_eq!(
+            facts.invalid_declarations(source, SyntaxLimits::DEFAULT),
+            Some(expected.clone())
+        );
+        // The kept answer serves the next call without the source it was computed from.
+        let other = SyntaxSource {
+            path: &path,
+            text: "",
+        };
+        assert_eq!(
+            facts.invalid_declarations(other, SyntaxLimits::DEFAULT),
+            Some(expected)
+        );
+        // Other bounds are validated again rather than answered from the kept result.
+        let limits = SyntaxLimits::new(1, 100, 100).expect("positive bounds");
+        assert_eq!(facts.invalid_declarations(source, limits), None);
+        let copy = facts.as_ref().clone();
+        assert_eq!(
+            copy.invalid_declarations(other, SyntaxLimits::DEFAULT),
+            Some(std::collections::BTreeSet::new())
+        );
+    }
+
+    #[test]
     fn declaration_validation_preserves_syntax_bounds() {
         let path = ProjectPath::new("main.py").expect("source path");
         let source = SyntaxSource {
