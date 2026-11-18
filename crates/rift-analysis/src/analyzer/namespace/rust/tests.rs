@@ -2873,6 +2873,61 @@ fn relative_public_reexports_alias_the_child_module_item() {
 }
 
 #[test]
+fn rust_public_reexports_keep_rust_identity_in_a_mixed_workspace() {
+    let path = ProjectPath::new("src/lib.rs").expect("source path");
+    let text = "mod shapes { pub struct Circle; }\npub use shapes::Circle as Round;\n";
+    let files = [PackageSource::new(&path, text)];
+    let manifest_path = ProjectPath::new("Cargo.toml").expect("manifest path");
+    let metadata = [PackageSource::new(&manifest_path, MANIFEST)];
+    let owner = SymbolOwner::Local;
+    let language = rift_syntax::ShippedLanguage::Toml.language();
+    let limits = rift_syntax::SyntaxLimits::default();
+    let input =
+        NamespaceInput::workspace(&owner, &language, &files, &metadata, &[], (2, 4096, limits))
+            .expect("mixed workspace");
+    let syntax = RustSyntaxProvider::default()
+        .analyze(SyntaxSource { path: &path, text }, limits)
+        .expect("Rust syntax")
+        .into_facts();
+    let selected = [super::super::SelectedFile {
+        path: &path,
+        source: text,
+        syntax: &syntax,
+    }];
+    let prepared = super::prepare(&input, &selected);
+    assert_eq!(prepared.exports.len(), 1);
+    assert_eq!(
+        prepared.exports[0].identity.as_str(),
+        "rift://symbol/local/rust/crate_root/Round"
+    );
+    assert_eq!(
+        prepared.exports[0].target.as_str(),
+        "rift://symbol/local/rust/crate_root/shapes/Circle"
+    );
+}
+
+#[test]
+fn public_reexports_remain_when_an_external_crate_is_declared() {
+    let target = local_alias_analysis(
+        &[
+            (
+                "src/lib.rs",
+                "mod shapes;\npub use shapes::Circle as Round;\nextern crate core;\n",
+            ),
+            ("src/shapes.rs", "pub struct Circle;\n"),
+        ],
+        "[package]\nname='serde_core'\nversion='1.0.228'\n[lib]\npath='src/lib.rs'\n",
+    );
+    assert!(
+        target.publication().relationships.iter().any(|edge| edge
+            .from
+            .as_str()
+            .ends_with("/serde_core/Round")
+            && edge.to.as_str().ends_with("/serde_core/shapes/Circle"))
+    );
+}
+
+#[test]
 fn external_public_reexports_without_admitted_target_remain_unresolved() {
     let target = local_alias_analysis(
         &[("src/lib.rs", "pub trait Serialize {}\n")],

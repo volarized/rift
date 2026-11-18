@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, VecDeque};
 use rift_core::{FileDigest, ProjectPath, SymbolId};
 use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
 use rift_protocol::index::python_identifier_is_valid;
-use rift_syntax::SyntaxFacts;
+use rift_syntax::{ShippedLanguage, SyntaxFacts};
 use serde::Deserialize;
 use unicode_normalization::UnicodeNormalization;
 
@@ -124,7 +124,7 @@ fn library_root(
     let namespace = vec![name];
     if SymbolIdentity::new(
         input.owner().clone(),
-        input.language().clone(),
+        ShippedLanguage::Rust.language(),
         namespace.clone(),
     )
     .is_err()
@@ -566,11 +566,13 @@ fn local_exports(
         };
         let mut alias_path = namespace.clone();
         alias_path.push(name.clone());
-        let Some(identity) =
-            SymbolIdentity::new(input.owner().clone(), input.language().clone(), alias_path)
-                .ok()
-                .and_then(|identity| SymbolId::new(identity.wire_identity()).ok())
-        else {
+        let Some(identity) = SymbolIdentity::new(
+            input.owner().clone(),
+            ShippedLanguage::Rust.language(),
+            alias_path,
+        )
+        .ok()
+        .and_then(|identity| SymbolId::new(identity.wire_identity()).ok()) else {
             continue;
         };
         if identity == target {
@@ -624,7 +626,7 @@ fn external_target(
             continue;
         }
         let (identity, declaration, unit) =
-            dependency.target(path, input.language(), work, work_max)?;
+            dependency.target(path, &ShippedLanguage::Rust.language(), work, work_max)?;
         let name = SymbolIdentity::parse(identity.as_str())
             .ok()?
             .qualified_path()
@@ -685,7 +687,7 @@ fn local_target<'input>(
 )> {
     let requested = SymbolIdentity::new(
         input.owner().clone(),
-        input.language().clone(),
+        ShippedLanguage::Rust.language(),
         path.to_vec(),
     )
     .ok()?
