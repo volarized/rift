@@ -233,3 +233,228 @@ async fn retrieval_projections_keep_ranked_and_regex_results_and_refuse_missing_
     client.cancel().await?;
     Ok(())
 }
+
+fn warning_codes(answer: &Value) -> BTreeSet<&str> {
+    answer["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|warning| warning["code"].as_str())
+        .collect()
+}
+
+fn named_pairs<'a>(
+    answer: &'a Value,
+    from: &str,
+    to: &str,
+) -> TestResult<BTreeSet<(&'a str, &'a str)>> {
+    query::rows(answer)?
+        .iter()
+        .map(|row| Ok((query::literal(row, from)?, query::literal(row, to)?)))
+        .collect()
+}
+
+/// An unresolved framework in one package of the workspace leaves every captured
+/// declaration in place, so the symbol inventory answers and names the framework
+/// condition instead of refusing (#759).
+#[tokio::test]
+async fn an_unresolved_framework_reports_a_warning_beside_the_symbol_inventory() -> TestResult {
+    let (_directory, client, _server_task) = served_workspace(
+        &[
+            ("package.json", "{\"name\":\"core\",\"version\":\"1.0.0\"}"),
+            (
+                "src/core.ts",
+                "export function construct_core(): number {\n  return 1;\n}\n",
+            ),
+            (
+                "docs/package.json",
+                "{\"name\":\"docs\",\"devDependencies\":{\"tailwindcss\":\"^4.0.0\"}}",
+            ),
+            (
+                "docs/layout.tsx",
+                "export function DocsLayout() {\n  return <div className=\"flex\" />;\n}\n",
+            ),
+        ],
+        None,
+    )
+    .await?;
+    let inventory = query_after_population(
+        &client,
+        &QueryParams {
+            query: "SELECT ?name WHERE { ?s a :Symbol; :name ?name }".to_owned(),
+            max_results: 100,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let names: BTreeSet<_> = query::rows(&inventory)?
+        .iter()
+        .map(|row| query::literal(row, "name"))
+        .collect::<Result<_, _>>()?;
+    assert!(
+        names.contains("construct_core") && names.contains("DocsLayout"),
+        "{inventory}"
+    );
+    assert!(
+        warning_codes(&inventory).contains("framework_context_unresolved"),
+        "{inventory}"
+    );
+    client.cancel().await?;
+    Ok(())
+}
+
+const DEPENDENT_METADATA: &str = "[project]\nname='graph-app'\nversion='0.1.0'\ndependencies=['greeting']\n[build-system]\nrequires=['setuptools==80.9.0']\nbuild-backend='setuptools.build_meta'\n[tool.setuptools]\npy-modules=['app']\n";
+const DEPENDENT_SOURCE: &str = "from greeting.core import greet\n\n\
+    def app_helper() -> str:\n    return 'rift'\n\n\
+    def app_caller() -> str:\n    return greet(app_helper())\n";
+
+/// Captured static calls and references answer an inventory query in a project whose
+/// dependency context names packages, and what the engine could not add is a warning,
+/// not a refusal (#760).
+#[tokio::test]
+async fn captured_calls_answer_an_inventory_beside_a_dependency_context() -> TestResult {
+    let (_directory, client, _server_task) = served_workspace(
+        &[
+            ("pyproject.toml", DEPENDENT_METADATA),
+            (
+                "uv.lock",
+                "version = 1\n[[package]]\nname='graph-app'\nversion='0.1.0'\nsource={editable='.'}\n[[package]]\nname='greeting'\nversion='1.0.0'\nsource={registry='https://pypi.org/simple'}\n",
+            ),
+            ("app.py", DEPENDENT_SOURCE),
+        ],
+        Some(CONFIGURATION.to_owned()),
+    )
+    .await?;
+    for (relation, statement) in [
+        (
+            "calls",
+            "SELECT ?from ?to WHERE { ?s :calls ?t . ?s :name ?from . ?t :name ?to }",
+        ),
+        (
+            "references",
+            "SELECT ?from ?to WHERE { ?s :references ?t . ?s :name ?from . ?t :name ?to }",
+        ),
+    ] {
+        let answer = query_after_population(
+            &client,
+            &QueryParams {
+                query: statement.to_owned(),
+                max_results: 100,
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert!(
+            named_pairs(&answer, "from", "to")?.contains(&("app_caller", "app_helper")),
+            "{relation}: {answer}"
+        );
+    }
+    client.cancel().await?;
+    Ok(())
+}
+
+/// An inventory that selects more symbols than the engine requests one query may send
+/// answers from the captured static calls and names the engine analysis it left out (#760).
+#[tokio::test]
+async fn captured_calls_answer_an_inventory_past_the_engine_request_bound() -> TestResult {
+    let mut source = String::from("def bound_leaf() -> int:\n    return 1\n");
+    for index in 0..80 {
+        source.push_str(
+            &[
+                "\ndef bound_caller_",
+                &index.to_string(),
+                "() -> int:\n    return bound_leaf()\n",
+            ]
+            .concat(),
+        );
+    }
+    let (_directory, client, _server_task) = served_workspace(
+        &[("pyproject.toml", METADATA), ("graph.py", &source)],
+        Some(CONFIGURATION.to_owned()),
+    )
+    .await?;
+    let answer = query_after_population(
+        &client,
+        &QueryParams {
+            query: "SELECT ?from ?to WHERE { ?s :calls ?t . ?s :name ?from . ?t :name ?to }"
+                .to_owned(),
+            max_results: 100,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let pairs = named_pairs(&answer, "from", "to")?;
+    assert_eq!(pairs.len(), 80, "{answer}");
+    assert!(
+        pairs.contains(&("bound_caller_79", "bound_leaf")),
+        "{answer}"
+    );
+    assert!(
+        warning_codes(&answer).contains("engine_analysis_unavailable"),
+        "{answer}"
+    );
+    let count = statement(&client, "SELECT (COUNT(?t) AS ?n) WHERE { ?s :calls ?t }").await?;
+    assert_eq!(count["outcome"], "unavailable", "{count}");
+    assert_eq!(count["reason"], "insufficient_coverage", "{count}");
+    assert!(
+        warning_codes(&count).contains("engine_analysis_unavailable"),
+        "{count}"
+    );
+    client.cancel().await?;
+    Ok(())
+}
+
+/// A file left out of the index makes the symbol inventory partial: the captured symbols
+/// answer with the warning that names the file, and a question whose answer claims an
+/// absence refuses with the same warning.
+#[tokio::test]
+async fn a_left_out_file_makes_the_symbol_inventory_partial_but_answered() -> TestResult {
+    let (_directory, client, _server_task) = served_workspace(
+        &[
+            ("pyproject.toml", METADATA),
+            ("graph.py", SOURCE),
+            ("blob.py", "held = 1\0\n"),
+        ],
+        None,
+    )
+    .await?;
+    let inventory = statement(
+        &client,
+        "SELECT ?name WHERE { ?s a :Symbol; :name ?name } ORDER BY ?name",
+    )
+    .await?;
+    assert_eq!(
+        inventory["pagination"]["total"]
+            .as_u64()
+            .map(|total| total > 0),
+        Some(true),
+        "{inventory}"
+    );
+    assert!(
+        warning_codes(&inventory).contains("source_unavailable"),
+        "{inventory}"
+    );
+    for absent in [
+        "SELECT ?s WHERE { ?s a :Symbol; :name 'held' }",
+        "ASK { ?s a :Symbol; :name 'held' }",
+        "SELECT (COUNT(?s) AS ?n) WHERE { ?s a :Symbol }",
+    ] {
+        let answer = statement(&client, absent).await?;
+        assert_eq!(
+            answer["reason"], "insufficient_coverage",
+            "{absent}: {answer}"
+        );
+        assert!(
+            warning_codes(&answer).contains("source_unavailable"),
+            "{absent}: {answer}"
+        );
+    }
+    let witness = statement(&client, "ASK { ?s a :Symbol; :name 'graph_leaf' }").await?;
+    assert_eq!(
+        witness["answer"],
+        json!({"result":"boolean", "value":true}),
+        "{witness}"
+    );
+    client.cancel().await?;
+    Ok(())
+}

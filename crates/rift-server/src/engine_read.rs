@@ -1128,6 +1128,23 @@ pub async fn graph_calls(
     }
 }
 
+/// Reads the calls the captured static pass established for one declaration, without a
+/// language engine. `complete` holds only when static capture covers the declaration.
+///
+/// # Errors
+/// Refuses a seed that is not a canonical identity.
+pub fn captured_graph_calls(
+    reads: &ReadService,
+    seed: &SymbolId,
+    direction: TraversalDirection,
+) -> Result<GraphCalls, RiftError> {
+    let identity =
+        CoreSymbolId::new(seed.as_str().to_owned()).map_err(|_| graph_call_coverage())?;
+    Ok(CapturedCalls::read(reads, &identity, direction)
+        .answer()
+        .unwrap_or_default())
+}
+
 struct CallGraphSource<'source> {
     trees: [&'source std::path::Path; 2],
     source: &'source str,
@@ -1606,6 +1623,21 @@ pub async fn graph_references(
         }
         Err(error) => Err(error),
     }
+}
+
+/// Reads the physical usages the captured static pass resolved for one local declaration,
+/// without a language engine.
+///
+/// # Errors
+/// Refuses a target that is not a canonical identity or a captured path that is invalid.
+pub fn captured_graph_references(
+    reads: &ReadService,
+    target: &SymbolId,
+    require_caller: bool,
+) -> Result<GraphReferences, RiftError> {
+    let identity =
+        CoreSymbolId::new(target.as_str().to_owned()).map_err(|_| graph_reference_coverage())?;
+    captured_references(reads, &identity, target, require_caller)
 }
 
 fn captured_references(

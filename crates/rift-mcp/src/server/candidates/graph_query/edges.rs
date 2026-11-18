@@ -42,9 +42,156 @@ pub(super) struct AcquiredAdjacency {
     view: Option<CapturedView>,
     warnings: Vec<ReadWarning>,
     incomplete: bool,
+    partial: bool,
+}
+
+/// The declarations a whole-inventory read walks and the facts it reads for each.
+struct InventorySelection<'seeds> {
+    seeds: &'seeds [SymbolId],
+    calls: bool,
+    references: bool,
+    enclosing: bool,
+}
+
+/// Calls and references one whole-inventory read collected, and whether part of the
+/// inventory is missing from them.
+#[derive(Default)]
+struct InventoryRead {
+    local: Vec<QueryOccurrence>,
+    local_edges: Vec<(SymbolId, SymbolRelation, SymbolId)>,
+    warnings: Vec<ReadWarning>,
+    partial: bool,
+    records: usize,
+    missing: MissingKinds,
+}
+
+/// The kinds some selected declaration's captured or engine answer left incomplete.
+#[derive(Default)]
+struct MissingKinds {
+    calls: bool,
+    references: bool,
+}
+
+impl InventoryRead {
+    /// Marks the read partial and names the kinds whose answer is incomplete for some
+    /// selected declaration.
+    fn report_missing(&mut self) {
+        let kinds: Vec<EdgeKind> = [
+            (self.missing.calls, EdgeKind::Calls),
+            (self.missing.references, EdgeKind::References),
+        ]
+        .into_iter()
+        .filter_map(|(missing, kind)| missing.then_some(kind))
+        .collect();
+        if kinds.is_empty() {
+            return;
+        }
+        self.partial = true;
+        let named: Vec<&str> = kinds.iter().map(AsRef::as_ref).collect();
+        self.extend_warnings([ReadWarning::EdgeCoverageMissing {
+            detail: format!(
+                "the captured facts do not cover every declaration the inventory selects \
+                 for {}, so edges outside that coverage are missing from this answer",
+                named.join(", ")
+            ),
+            kinds,
+        }]);
+    }
+
+    fn charge(&mut self, records: usize) -> Result<(), RiftError> {
+        let maximum = usize::try_from(RECORDS_MAX).unwrap_or(usize::MAX);
+        self.records = self
+            .records
+            .checked_add(records)
+            .filter(|records| *records <= maximum)
+            .ok_or_else(coverage_failure)?;
+        Ok(())
+    }
+
+    fn extend_warnings(&mut self, warnings: impl IntoIterator<Item = ReadWarning>) {
+        for warning in warnings {
+            if !self.warnings.contains(&warning) {
+                self.warnings.push(warning);
+            }
+        }
+    }
+
+    fn admit_references(
+        &mut self,
+        seed: &SymbolId,
+        occurrences: Vec<QueryOccurrence>,
+    ) -> Result<(), RiftError> {
+        self.charge(occurrences.len())?;
+        for occurrence in occurrences {
+            if let Some(caller) = &occurrence.enclosing {
+                self.local_edges
+                    .push((caller.clone(), SymbolRelation::References, seed.clone()));
+            }
+            self.local.push(occurrence);
+        }
+        Ok(())
+    }
+
+    fn admit_calls(
+        &mut self,
+        seed: &SymbolId,
+        calls: Vec<(SymbolId, Vec<rift_protocol::read::SourceUnitSpan>)>,
+    ) -> Result<(), RiftError> {
+        for (target, occurrences) in calls {
+            self.charge(1usize.saturating_add(occurrences.len()))?;
+            self.local_edges
+                .push((seed.clone(), SymbolRelation::Calls, target));
+        }
+        Ok(())
+    }
+}
+
+/// Reads the inventory from the captured static facts alone.
+fn captured_inventory(
+    reads: &rift_server::ReadService,
+    inventory: &InventorySelection<'_>,
+) -> Result<InventoryRead, RiftError> {
+    let mut read = InventoryRead::default();
+    for seed in inventory.seeds {
+        if inventory.references {
+            let references =
+                rift_server::captured_graph_references(reads, seed, inventory.enclosing)?;
+            read.missing.references |= !references.complete;
+            read.admit_references(seed, references.occurrences)?;
+        }
+        if inventory.calls {
+            let calls =
+                rift_server::captured_graph_calls(reads, seed, TraversalDirection::Outgoing)?;
+            read.missing.calls |= !calls.complete;
+            read.admit_calls(seed, calls.local)?;
+        }
+    }
+    read.report_missing();
+    Ok(read)
 }
 
 impl AcquiredAdjacency {
+    fn admit_inventory(&mut self, read: InventoryRead) -> Result<(), RiftError> {
+        let maximum = usize::try_from(RECORDS_MAX).unwrap_or(usize::MAX);
+        if self.local_edges.len().saturating_add(read.records) > maximum {
+            return Err(coverage_failure());
+        }
+        self.partial |= read.partial;
+        self.local.extend(read.local);
+        self.local_edges.extend(read.local_edges);
+        for warning in read.warnings {
+            if !self.warnings.contains(&warning) {
+                self.warnings.push(warning);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether part of a whole inventory is missing while every acquired fact stands.
+    pub(super) const fn is_partial(&self) -> bool {
+        self.partial
+    }
+
     fn capture_edge_inventory(
         &mut self,
         reads: &rift_server::ReadService,
@@ -356,6 +503,14 @@ impl AcquiredAdjacency {
 }
 
 impl RiftMcp {
+    /// Acquires the calls, references and usages a whole-inventory query reads.
+    ///
+    /// The captured static facts answer first. A language engine adds what it resolves on
+    /// top of them when every established declaration fits the engine requests one query
+    /// may send and the index matches the captured tree; otherwise the inventory answers
+    /// from the captured facts alone and an `engine_analysis_unavailable` warning names
+    /// each language whose engine analysis is missing. Every condition that leaves part of
+    /// the inventory out marks the acquisition partial.
     pub(super) async fn acquire_semantic_inventory(
         &self,
         resolved: &ResolvedWorkspace,
@@ -363,80 +518,167 @@ impl RiftMcp {
         deadline: RequestDeadline,
     ) -> Result<AcquiredAdjacency, RiftError> {
         let reads = &resolved.published.reads;
-        if required.edges
-            && !required.calls
-            && !required.references
-            && required.occurrences.is_none()
-        {
-            let mut acquired = AcquiredAdjacency::default();
-            acquired.capture_edge_inventory(reads)?;
-            return Ok(acquired);
-        }
-        let context = reads.dependency_context();
-        if resolved.stale.is_some() || context.is_degraded() || !context.entries().is_empty() {
-            return Err(coverage_failure());
-        }
-        let references = required.references || required.occurrences.is_some();
-        let enclosing =
-            required.references || required.occurrences.is_some_and(|usage| usage.enclosing);
-        let operations = u64::from(required.calls) + u64::from(references);
-        let maximum = usize::try_from(REQUESTS_MAX / operations.max(1)).unwrap_or(usize::MAX);
-        let capture = Arc::clone(reads);
-        let seeds = self
-            .blocking
-            .run("semantic inventory seeds", move || {
-                capture
-                    .local_search_view_input(true)?
-                    .semantic_seeds(maximum)
-            })
-            .await?;
-        let engines = self.engine_pool_for(&resolved.published).await;
-        let end = deadline.walk_end(resolved.capture_elapsed);
         let mut acquired = AcquiredAdjacency::default();
         if required.edges {
             acquired.capture_edge_inventory(reads)?;
         }
-        let mut remaining = usize::try_from(RECORDS_MAX).unwrap_or(usize::MAX);
-        let roots = rift_server::CalleeRoots::default();
-        for seed in seeds {
-            if references {
-                let references = Box::pin(rift_server::graph_references(
-                    reads, &engines, &seed, enclosing, end,
-                ))
-                .await?;
-                if !references.complete {
-                    return Err(coverage_failure());
-                }
-                remaining = remaining
-                    .checked_sub(references.occurrences.len())
-                    .ok_or_else(coverage_failure)?;
-                acquired.admit_references(&seed, references.occurrences);
+        if !required.calls && !required.references && required.occurrences.is_none() {
+            return Ok(acquired);
+        }
+        let references = required.references || required.occurrences.is_some();
+        let enclosing =
+            required.references || required.occurrences.is_some_and(|usage| usage.enclosing);
+        let capture = Arc::clone(reads);
+        let (seeds, coverage) = self
+            .blocking
+            .run("semantic inventory seeds", move || {
+                capture.local_search_view_input(true)?.inventory_seeds()
+            })
+            .await?;
+        acquired.partial |= coverage == rift_server::InventoryCoverage::Partial;
+        let engines = self.engine_pool_for(&resolved.published).await;
+        let mut served = BTreeMap::new();
+        for seed in &seeds {
+            let identity = SymbolIdentity::parse(seed.as_str())?;
+            let language = identity.language();
+            if engines.engine_for(language).is_some() {
+                served
+                    .entry(language.identity_segment())
+                    .or_insert_with(|| language.clone());
             }
-            if required.calls {
-                let calls = Box::pin(rift_server::graph_calls(
+        }
+        let inventory = InventorySelection {
+            seeds: &seeds,
+            calls: required.calls,
+            references,
+            enclosing,
+        };
+        let operations = u64::from(required.calls) + u64::from(references);
+        let maximum = usize::try_from(REQUESTS_MAX / operations.max(1)).unwrap_or(usize::MAX);
+        let skipped = if served.is_empty() {
+            None
+        } else if resolved.stale.is_some() {
+            Some(
+                "the published index lags the captured tree, so the inventory answers from \
+                 the captured static facts alone"
+                    .to_owned(),
+            )
+        } else if seeds.len() > maximum {
+            Some(format!(
+                "the inventory selects {} declarations, more than the {maximum} engine \
+                 requests one query sends, so it answers from the captured static facts \
+                 alone; select a seed declaration to read the engine's edges",
+                seeds.len()
+            ))
+        } else {
+            None
+        };
+        let engine = if served.is_empty() || skipped.is_some() {
+            None
+        } else {
+            let end = deadline.walk_end(resolved.capture_elapsed);
+            match Box::pin(self.engine_inventory(resolved, &engines, &inventory, end)).await {
+                Ok(engine) => Some(engine),
+                Err(error) if super::lacks_coverage(&error) => None,
+                Err(error) => return Err(error),
+            }
+        };
+        let read = if let Some(engine) = engine {
+            engine
+        } else {
+            let detail = skipped.unwrap_or_else(|| {
+                "the language engine could not answer for the whole inventory, so it answers \
+                 from the captured static facts alone"
+                    .to_owned()
+            });
+            let mut captured = captured_inventory(reads, &inventory)?;
+            for language in served.into_values() {
+                captured.partial = true;
+                captured
+                    .warnings
+                    .push(ReadWarning::EngineAnalysisUnavailable {
+                        language: Some(language),
+                        detail: detail.clone(),
+                    });
+            }
+            captured
+        };
+        acquired.admit_inventory(read)?;
+        Ok(acquired)
+    }
+
+    /// Reads the inventory through the language engines, each seed's answer combined with
+    /// the captured static facts. A seed whose engine answer is incomplete keeps what it
+    /// answered and marks the read partial; callees in package files drop and are counted.
+    async fn engine_inventory(
+        &self,
+        resolved: &ResolvedWorkspace,
+        engines: &rift_server::EnginePool,
+        inventory: &InventorySelection<'_>,
+        end: tokio::time::Instant,
+    ) -> Result<InventoryRead, RiftError> {
+        let reads = &resolved.published.reads;
+        let mut read = InventoryRead::default();
+        let roots = rift_server::CalleeRoots::default();
+        let mut dropped = 0u64;
+        for seed in inventory.seeds {
+            if inventory.references {
+                let answered = Box::pin(rift_server::graph_references(
                     reads,
-                    &engines,
+                    engines,
+                    seed,
+                    inventory.enclosing,
+                    end,
+                ))
+                .await;
+                let references = match answered {
+                    Ok(references) => references,
+                    Err(error) if super::lacks_coverage(&error) => {
+                        rift_server::captured_graph_references(reads, seed, inventory.enclosing)?
+                    }
+                    Err(error) => return Err(error),
+                };
+                read.missing.references |= !references.complete;
+                read.extend_warnings(references.edge_warnings);
+                read.admit_references(seed, references.occurrences)?;
+            }
+            if inventory.calls {
+                let answered = Box::pin(rift_server::graph_calls(
+                    reads,
+                    engines,
                     &roots,
-                    &seed,
+                    seed,
                     TraversalDirection::Outgoing,
                     end,
                 ))
-                .await?;
-                if !calls.complete {
-                    return Err(coverage_failure());
-                }
-                if !calls.packages.is_empty() {
-                    return Err(coverage_failure());
-                }
-                for (target, occurrences) in calls.local {
-                    remaining = remaining
-                        .checked_sub(1 + occurrences.len())
-                        .ok_or_else(coverage_failure)?;
-                    acquired
-                        .local_edges
-                        .push((seed.clone(), SymbolRelation::Calls, target));
-                }
+                .await;
+                let calls = match answered {
+                    Ok(calls) => calls,
+                    Err(error) if super::lacks_coverage(&error) => {
+                        rift_server::captured_graph_calls(
+                            reads,
+                            seed,
+                            TraversalDirection::Outgoing,
+                        )?
+                    }
+                    Err(error) => return Err(error),
+                };
+                read.missing.calls |= !calls.complete;
+                read.partial |= !calls.packages.is_empty();
+                dropped =
+                    dropped.saturating_add(u64::try_from(calls.packages.len()).unwrap_or(u64::MAX));
+                read.extend_warnings(calls.edge_warnings);
+                read.admit_calls(seed, calls.local)?;
             }
+        }
+        read.report_missing();
+        if dropped > 0 {
+            read.extend_warnings([ReadWarning::CalleesDropped {
+                callees: dropped,
+                detail: "the language engine named callees in package files, which a whole \
+                         inventory carries no edge to; select a seed declaration to follow them"
+                    .to_owned(),
+            }]);
         }
         if !self
             .engine_tree_matches(&resolved.published)
@@ -445,7 +687,7 @@ impl RiftMcp {
         {
             return Err(coverage_failure());
         }
-        Ok(acquired)
+        Ok(read)
     }
 
     pub(super) async fn acquire_adjacency(

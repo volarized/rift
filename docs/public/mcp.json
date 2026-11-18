@@ -1557,7 +1557,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "A language engine serves the seed's language, and this read carries none of its\nedges: the engine answered about bytes the served revision does not carry, answered\nmore than the walk's symbol bound holds, or was still analyzing when\n`[server] readiness_timeout` was spent. The indexed edges stand; whatever\nthe engine resolves on top of them is missing. The warning states that an engine's\nanalysis is absent from this answer; it never states that the seed has no such\nneighbor. An engine still analyzing keeps loading, and a later read, served from a\nrevision the engine has caught up with or sent once it reads ready, carries the\nengine's edges again.",
+                "description": "A language engine serves the seed's language, and this read carries none of its\nedges: the engine answered about bytes the served revision does not carry, answered\nmore than the walk's symbol bound holds, was still analyzing when\n`[server] readiness_timeout` was spent, or a whole-inventory query selected more\ndeclarations than the engine requests one query sends. The indexed edges stand; whatever\nthe engine resolves on top of them is missing. The warning states that an engine's\nanalysis is absent from this answer; it never states that the seed has no such\nneighbor. An engine still analyzing keeps loading, and a later read, served from a\nrevision the engine has caught up with or sent once it reads ready, carries the\nengine's edges again.",
                 "properties": {
                   "code": {
                     "const": "engine_analysis_unavailable",
@@ -4815,7 +4815,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "A language engine serves the seed's language, and this read carries none of its\nedges: the engine answered about bytes the served revision does not carry, answered\nmore than the walk's symbol bound holds, or was still analyzing when\n`[server] readiness_timeout` was spent. The indexed edges stand; whatever\nthe engine resolves on top of them is missing. The warning states that an engine's\nanalysis is absent from this answer; it never states that the seed has no such\nneighbor. An engine still analyzing keeps loading, and a later read, served from a\nrevision the engine has caught up with or sent once it reads ready, carries the\nengine's edges again.",
+                "description": "A language engine serves the seed's language, and this read carries none of its\nedges: the engine answered about bytes the served revision does not carry, answered\nmore than the walk's symbol bound holds, was still analyzing when\n`[server] readiness_timeout` was spent, or a whole-inventory query selected more\ndeclarations than the engine requests one query sends. The indexed edges stand; whatever\nthe engine resolves on top of them is missing. The warning states that an engine's\nanalysis is absent from this answer; it never states that the seed has no such\nneighbor. An engine still analyzing keeps loading, and a later read, served from a\nrevision the engine has caught up with or sent once it reads ready, carries the\nengine's edges again.",
                 "properties": {
                   "code": {
                     "const": "engine_analysis_unavailable",
@@ -6211,7 +6211,7 @@
       }
     },
     {
-      "description": "Performs search across the index using a query language. `language` names the query\nlanguage and defaults to `sparql`.",
+      "description": "Performs search across the index using a query language. `language` names the query\nlanguage and defaults to `sparql`.\nA query over the captured inventory answers from partly covered facts, and `warnings`\nname the files, languages, or engines left out. A query whose answer needs every fact - an empty\nresult, a false `ASK`, a count, a negation, an `OPTIONAL` - answers `unavailable` with\n`insufficient_coverage` instead.",
       "input_schema": {
         "$defs": {
           "QueryLanguage": {
@@ -7088,7 +7088,7 @@
                 "description": "The captured read and its expiry."
               },
               "warnings": {
-                "description": "Coverage and discovery limits affecting the query result. For `SERVICE :flows`,\n`traversal_truncated` reports the visited symbol count and names the bound in `detail`.",
+                "description": "Coverage and discovery limits affecting the query result. An answer read from partly\ncovered facts carries the warnings that name what is missing, and every row it returns\nstands. For `SERVICE :flows`, `traversal_truncated` reports the visited symbol count and\nnames the bound in `detail`.",
                 "items": {
                   "$ref": "#/$defs/ReadWarning"
                 },
@@ -7921,7 +7921,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "A language engine serves the seed's language, and this read carries none of its\nedges: the engine answered about bytes the served revision does not carry, answered\nmore than the walk's symbol bound holds, or was still analyzing when\n`[server] readiness_timeout` was spent. The indexed edges stand; whatever\nthe engine resolves on top of them is missing. The warning states that an engine's\nanalysis is absent from this answer; it never states that the seed has no such\nneighbor. An engine still analyzing keeps loading, and a later read, served from a\nrevision the engine has caught up with or sent once it reads ready, carries the\nengine's edges again.",
+                "description": "A language engine serves the seed's language, and this read carries none of its\nedges: the engine answered about bytes the served revision does not carry, answered\nmore than the walk's symbol bound holds, was still analyzing when\n`[server] readiness_timeout` was spent, or a whole-inventory query selected more\ndeclarations than the engine requests one query sends. The indexed edges stand; whatever\nthe engine resolves on top of them is missing. The warning states that an engine's\nanalysis is absent from this answer; it never states that the seed has no such\nneighbor. An engine still analyzing keeps loading, and a later read, served from a\nrevision the engine has caught up with or sent once it reads ready, carries the\nengine's edges again.",
                 "properties": {
                   "code": {
                     "const": "engine_analysis_unavailable",
