@@ -60,6 +60,7 @@ pub struct WorkspaceSemantics {
     syntax_provider: ProviderId,
     static_resolution: StaticResolution,
     static_occurrence_order: Vec<usize>,
+    outside_namespaces: std::collections::BTreeSet<rift_core::SourceUnitId>,
 }
 
 /// One build's captured semantics and documents not included in publication.
@@ -131,6 +132,7 @@ impl PreparedSemantics {
                 syntax_provider: ProviderId::new(SYNTAX_PROVIDER_ID)?,
                 static_resolution: StaticResolution::default(),
                 static_occurrence_order: Vec::new(),
+                outside_namespaces: std::collections::BTreeSet::new(),
             },
             beyond_declaration_bound: self.beyond_declaration_bound,
             refused_contributions: self.refused_contributions,
@@ -436,6 +438,16 @@ impl WorkspaceSemantics {
         &self.graph
     }
 
+    /// Whether no namespace reaches `unit` by construction, so its declarations carry no
+    /// identity because the language assigns none there, not because analysis failed.
+    ///
+    /// A Rust binary, example, integration test, benchmark, or build script, and the
+    /// modules it declares, sits outside every library namespace.
+    #[must_use]
+    pub fn outside_namespaces(&self, unit: &rift_core::SourceUnitId) -> bool {
+        self.outside_namespaces.contains(unit)
+    }
+
     /// Returns the symbol reference adjacency built from this revision's graph.
     #[must_use]
     pub const fn relationships(&self) -> &RelationshipStore {
@@ -519,6 +531,7 @@ impl WorkspaceSemantics {
             syntax_provider,
             static_resolution: StaticResolution::default(),
             static_occurrence_order: Vec::new(),
+            outside_namespaces: std::collections::BTreeSet::new(),
         }
     }
 
@@ -584,6 +597,10 @@ impl get_size2::GetSize for WorkspaceSemantics {
         tracker = next;
         let (field, next) =
             get_size2::GetSize::get_heap_size_with_tracker(&self.syntax_provider, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.outside_namespaces, tracker);
         bytes = bytes.saturating_add(field);
         tracker = next;
         let (static_resolution, tracker) = self.static_resolution.retained_size(tracker);

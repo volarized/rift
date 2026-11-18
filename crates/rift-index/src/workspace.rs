@@ -23,8 +23,8 @@ use rift_core::constants::{
     WORKSPACE_DECLARATIONS_MAX_DEFAULT, WORKSPACE_FILES_MAX_DEFAULT, WORKSPACE_IGNORED_DIRECTORIES,
 };
 use rift_core::{
-    CompositionId, Contribution, LanguageFileSelections, PortableSymbolFacts, ProjectPath,
-    ProviderId, SourceVisibility, SymbolId, TextFileInclusion,
+    CompositionId, LanguageFileSelections, PortableSymbolFacts, ProjectPath, ProviderId,
+    SourceVisibility, SymbolId, TextFileInclusion,
 };
 use rift_error::{ErrorSlug, RiftError, ctx, errors};
 use rift_protocol::configuration::{LargeFileStrategy, SyntaxConfiguration};
@@ -4093,12 +4093,18 @@ impl WorkspaceIndex {
         for record in self.semantics.graph().records() {
             if record.identity().is_none() {
                 for key in record.contributions() {
-                    if let Some(facts) = self
-                        .semantics
-                        .graph()
-                        .contribution(key)
-                        .and_then(Contribution::facts)
+                    let Some(contribution) = self.semantics.graph().contribution(key) else {
+                        continue;
+                    };
+                    // A declaration no namespace reaches has no identity to establish, so
+                    // it leaves exact absence decidable.
+                    if contribution
+                        .source()
+                        .is_some_and(|source| self.semantics.outside_namespaces(source.unit()))
                     {
+                        continue;
+                    }
+                    if let Some(facts) = contribution.facts() {
                         declarations
                             .incomplete_languages
                             .insert(facts.language().identity_segment());
