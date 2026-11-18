@@ -1480,7 +1480,7 @@ pub(crate) enum SupervisorJoin {
     Joined,
     /// The supervisor was still running at the deadline and was aborted. Blocking work it
     /// started keeps running on the blocking pool until it reads its cancellation or the
-    /// process exits.
+    /// process exits. The caller stops waiting at the deadline.
     Aborted,
 }
 
@@ -1534,7 +1534,6 @@ impl IndexSupervisor {
             })
         } else {
             task.abort();
-            let _ = task.await;
             Ok(SupervisorJoin::Aborted)
         }
     }
@@ -1911,34 +1910,58 @@ impl Drop for SupervisorRunning {
 
 /// Holds the filesystem watcher for as long as the index supervisor runs.
 ///
-/// Dropping it with the supervisor - on return, on cancellation, or while a panic unwinds
-/// the task - drops the watcher, which ends its event delivery, reports the repeats of the
-/// watch failures held since the supervisor's last turn, and records that the watch
-/// stopped. A callback the backend delivers after that drop records a first failure, and
-/// its repeats stay uncounted in any record.
-struct WatchRunning {
-    watcher: Option<notify::RecommendedWatcher>,
+/// Native watcher release runs on the blocking pool because it can join a callback thread.
+/// A normal supervisor exit waits for release and reports the held watch failures. Aborting
+/// the supervisor drops that wait; the release continues on the blocking pool.
+struct WatchRunning<Watcher: Send + 'static = notify::RecommendedWatcher> {
+    watcher: Option<Watcher>,
     validation: Arc<IndexValidation>,
 }
 
-impl WatchRunning {
-    fn new(watcher: notify::RecommendedWatcher, validation: &Arc<IndexValidation>) -> Self {
+impl<Watcher: Send + 'static> WatchRunning<Watcher> {
+    fn new(watcher: Watcher, validation: &Arc<IndexValidation>) -> Self {
         Self {
             watcher: Some(watcher),
             validation: Arc::clone(validation),
         }
     }
+
+    /// Moves the native watcher onto the blocking pool.
+    fn release(&mut self) -> JoinHandle<()> {
+        let watcher = self.watcher.take();
+        let parent = rift_tracing::Span::current();
+        tokio::task::spawn_blocking(move || parent.in_scope(|| drop(watcher)))
+    }
+
+    /// Waits for release while the supervisor still has its shutdown budget.
+    ///
+    /// Dropping this wait leaves the blocking worker to finish releasing the watcher.
+    async fn shutdown(mut self) {
+        match self.release().await {
+            Ok(()) => {
+                self.validation.report_watch_failures();
+                rift_tracing::info!(
+                    component = "index",
+                    operation = "index.supervisor",
+                    "index watch stopped"
+                );
+            }
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => rift_tracing::warn!(
+                component = "index",
+                operation = "index.supervisor",
+                %error,
+                "index watch stopped"
+            ),
+        }
+    }
 }
 
-impl Drop for WatchRunning {
+impl<Watcher: Send + 'static> Drop for WatchRunning<Watcher> {
     fn drop(&mut self) {
-        drop(self.watcher.take());
-        self.validation.report_watch_failures();
-        rift_tracing::info!(
-            component = "index",
-            operation = "index.supervisor",
-            "index watch stopped"
-        );
+        if self.watcher.is_some() {
+            drop(self.release());
+        }
     }
 }
 
@@ -4652,13 +4675,21 @@ fn publish_preparation_after(
 /// capture it interrupted finishes on its own thread with nothing left to publish.
 pub(crate) async fn run_index_supervisor_with(
     watcher: notify::RecommendedWatcher,
+    invalidations: mpsc::Receiver<()>,
+    context: IndexSupervisorContext,
+    capture: impl CaptureWorkspace + Clone + Send + 'static,
+) {
+    let watch = WatchRunning::new(watcher, &context.validation);
+    Box::pin(run_index_supervisor_loop(invalidations, context, capture)).await;
+    watch.shutdown().await;
+}
+
+/// Reconciles observations until cancellation, before the native watcher releases.
+async fn run_index_supervisor_loop(
     mut invalidations: mpsc::Receiver<()>,
     context: IndexSupervisorContext,
     capture: impl CaptureWorkspace + Clone + Send + 'static,
 ) {
-    // Declared ahead of the running guard, so it drops after it: the supervisor's end is
-    // recorded, then the watcher's.
-    let _watch = WatchRunning::new(watcher, &context.validation);
     let validation = Arc::clone(&context.validation);
     let published = Arc::clone(&context.published);
     // The guard reports the supervisor's end however it comes: a return, a cancellation, or
@@ -8695,6 +8726,52 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// Issue #741: an abort cannot make running synchronous work yield.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_does_not_wait_for_aborted_work_past_its_deadline() -> TestResult {
+        const WAIT_MAX: Duration = Duration::from_secs(3);
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let (validation, _receiver) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::sync_channel(1);
+        let (ended, finished) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = started.send(());
+            held.recv_timeout(WAIT_MAX * 3)
+                .expect("the test releases the running work");
+            let _ = ended.send(());
+        });
+        *validation.task.lock().await = Some(task);
+        let supervisor = super::IndexSupervisor {
+            validation: Arc::clone(&validation),
+        };
+        tokio::time::timeout(WAIT_MAX, waiting).await??;
+
+        let deadline = tokio::time::Instant::now();
+        let shutdown = crate::http::stop_stage(
+            "index supervisor shutdown",
+            deadline,
+            supervisor.joined_by(deadline),
+        );
+        let stopped = tokio::time::timeout(WAIT_MAX, shutdown).await;
+        release.send(())?;
+        tokio::time::timeout(WAIT_MAX, finished).await??;
+        let outcome = stopped.map_err(|_| "shutdown waited for aborted running work")??;
+        assert_eq!(outcome, super::SupervisorJoin::Aborted);
+        assert!(validation.cancellation.is_cancelled());
+        assert!(validation.task.lock().await.is_none());
+        let ended = drain
+            .queued_records()
+            .into_iter()
+            .find(|record| record.message() == "stop stage ended")
+            .ok_or("the supervisor stop stage must record its completion")?;
+        let fields: serde_json::Value = serde_json::from_str(ended.fields())?;
+        assert_eq!(fields["stage"], "index supervisor shutdown");
+        assert_eq!(fields["outcome"], "timeout");
+        Ok(())
+    }
+
     #[test]
     fn rebuild_is_superseded_when_epoch_already_moved() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -9189,8 +9266,76 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// A supervisor that ends drops its watcher with it and records both ends, the
-    /// supervisor's first.
+    /// A held watcher release cannot hold the supervisor's async task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watch_release_does_not_block_the_supervisor() -> TestResult {
+        const WAIT_MAX: Duration = Duration::from_secs(3);
+        struct HeldWatcher {
+            started: Option<tokio::sync::oneshot::Sender<()>>,
+            release: std::sync::mpsc::Receiver<()>,
+            ended: Option<tokio::sync::oneshot::Sender<()>>,
+        }
+        impl Drop for HeldWatcher {
+            fn drop(&mut self) {
+                let _ = self.started.take().expect("one watcher release").send(());
+                self.release
+                    .recv_timeout(WAIT_MAX * 3)
+                    .expect("the test releases the watcher");
+                let _ = self.ended.take().expect("one watcher completion").send(());
+            }
+        }
+        let (validation, _invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::sync_channel(1);
+        let (ended, finished) = tokio::sync::oneshot::channel();
+        let watcher = HeldWatcher {
+            started: Some(started),
+            release: held,
+            ended: Some(ended),
+        };
+        let watch = super::WatchRunning::new(watcher, &validation);
+        let mut task = tokio::spawn(async move { drop(watch) });
+        tokio::time::timeout(WAIT_MAX, waiting).await??;
+        let stopped = tokio::time::timeout(WAIT_MAX, &mut task).await;
+        release.send(())?;
+        tokio::time::timeout(WAIT_MAX, finished).await??;
+        if stopped.is_err() {
+            tokio::time::timeout(WAIT_MAX, task).await??;
+        }
+        stopped.map_err(|_| "the supervisor waited for the watcher release")??;
+        Ok(())
+    }
+
+    /// A native watcher failure remains an index supervisor failure.
+    #[tokio::test]
+    async fn watcher_release_panic_reaches_supervisor_shutdown() -> TestResult {
+        struct FailedWatcher;
+        impl Drop for FailedWatcher {
+            fn drop(&mut self) {
+                panic!("watcher release failed");
+            }
+        }
+        let (validation, _invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let watch = super::WatchRunning::new(FailedWatcher, &validation);
+        *validation.task.lock().await = Some(tokio::spawn(watch.shutdown()));
+        let supervisor = super::IndexSupervisor { validation };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let error = supervisor
+            .shutdown(deadline)
+            .await
+            .expect_err("watcher release failure must reach the supervisor");
+        assert_eq!(error.slug(), errors::server::read_task::SLUG);
+        let detail = error
+            .context()
+            .find_map(|(key, value)| (key == "detail").then_some(value))
+            .ok_or("watcher release failure must retain its detail")?;
+        assert!(detail.contains("watcher release failed"), "{detail}");
+        Ok(())
+    }
+
+    /// A supervisor records its end before the watcher finishes releasing.
     #[tokio::test(start_paused = true)]
     async fn a_supervisor_that_ends_records_that_its_watch_stopped() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -12495,6 +12640,60 @@ pub(crate) mod tests {
         let (snapshot, failure) = state.snapshot();
         assert_eq!(snapshot.epoch, 0, "a cancelled rebuild publishes nothing");
         assert!(failure.is_none(), "a cancelled rebuild records no failure");
+        Ok(())
+    }
+
+    /// Shutdown cancellation reaches the capture already running on the worker pool.
+    #[tokio::test]
+    async fn shutdown_cancels_the_running_capture() -> TestResult {
+        const WAIT_MAX: Duration = Duration::from_secs(3);
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let (validation, invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let _cancel = validation.cancellation.clone().drop_guard();
+        let published = Arc::new(RwLock::new(IndexState {
+            current: stable_candidate(directory.path(), 0)?,
+            failure: None,
+        }));
+        let watcher = unwatched(directory.path(), &validation)?;
+        let blocking = BlockingExecutor::isolated(1, 60_000);
+        let context = cancellation_context(directory.path(), &validation, &published, &blocking);
+        let runtime = tokio::runtime::Handle::current();
+        let (started, mut waiting) = tokio::sync::mpsc::channel(1);
+        let (ended, mut finished) = tokio::sync::mpsc::channel(1);
+        let capture =
+            move |_: &std::path::Path, _: WorkspaceIndexLimits, request: &RebuildRequest| {
+                let _ = started.blocking_send(());
+                runtime.block_on(request.cancellation.cancelled());
+                let _ = ended.blocking_send(());
+                errors::index::workspace_cancelled().fail()
+            };
+        let task = tokio::spawn(super::run_index_supervisor_with(
+            watcher,
+            invalidations,
+            context,
+            capture,
+        ));
+        *validation.task.lock().await = Some(task);
+        validation.observe_whole_workspace()?;
+        assert_eq!(
+            tokio::time::timeout(WAIT_MAX, waiting.recv()).await?,
+            Some(())
+        );
+        let supervisor = super::IndexSupervisor {
+            validation: Arc::clone(&validation),
+        };
+        let deadline = tokio::time::Instant::now() + WAIT_MAX;
+        tokio::time::timeout(WAIT_MAX, supervisor.shutdown(deadline)).await??;
+        assert_eq!(
+            tokio::time::timeout(WAIT_MAX, finished.recv()).await?,
+            Some(())
+        );
+        blocking
+            .run("sentinel", || Ok::<(), rift_server::RiftError>(()))
+            .await?;
+        assert!(!validation.supervisor_running.load(Ordering::Acquire));
         Ok(())
     }
 
