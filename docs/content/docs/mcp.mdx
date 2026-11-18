@@ -442,12 +442,12 @@ the same request again can help, and the line below states what failed:
 
 <Tab value="invalid_request">
 
-**Tool execution failure, compact text** of a request whose `limit` is below 1:
+**Tool execution failure, compact text** of a request whose `max_results` is below 1:
 
 ```text
 1 error
 	invalid_request · retry never
-		the request does not match the documented form: field limit, violation zero; correct the reported field and resend the request
+		the request does not match the documented form: field max_results, violation expected 1..=10000, received 0; correct the reported field and resend the request
 ```
 
 </Tab>
