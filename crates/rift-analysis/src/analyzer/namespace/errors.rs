@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rift_core::SymbolId;
 use rift_protocol::read::SymbolKind;
-use rift_syntax::{SyntaxSource, registry};
+use rift_syntax::{ByteRange, SyntaxLimits, SyntaxSource};
 
 use super::SelectedFile;
 use crate::NamespaceInput;
@@ -15,27 +15,7 @@ pub(super) fn retain_valid_declarations(
     if !file.syntax.has_errors() {
         return anchors;
     }
-    // Retained facts release syntax elements. Validate only malformed captured files,
-    // under the same bounds, including declarations with zero-width missing tokens.
-    let ranges = file
-        .syntax
-        .symbols()
-        .iter()
-        .map(|symbol| symbol.item_range)
-        .collect::<Vec<_>>();
-    let invalid = registry::provider_for_language(file.syntax.language()).and_then(|provider| {
-        provider
-            .invalid_declarations(
-                SyntaxSource {
-                    path: file.path,
-                    text: file.source,
-                },
-                input.syntax(),
-                &ranges,
-            )
-            .ok()
-    });
-    let Some(invalid) = invalid else {
+    let Some(invalid) = invalid_declarations(file, input.syntax()) else {
         return BTreeMap::new();
     };
     let valid = file
@@ -53,4 +33,23 @@ pub(super) fn retain_valid_declarations(
         .collect::<BTreeSet<_>>();
     anchors.retain(|name, _| valid.contains(name.as_str()));
     anchors
+}
+
+pub(super) fn invalid_declarations(
+    file: &SelectedFile<'_>,
+    limits: SyntaxLimits,
+) -> Option<BTreeSet<ByteRange>> {
+    if !file.syntax.has_errors() {
+        return Some(BTreeSet::new());
+    }
+    // Retained facts release syntax elements. Validate only malformed captured files,
+    // under the same bounds, including declarations with zero-width missing tokens.
+    // The facts keep the answer, so a held file is parsed again once, not on every build.
+    file.syntax.invalid_declarations(
+        SyntaxSource {
+            path: file.path,
+            text: file.source,
+        },
+        limits,
+    )
 }
