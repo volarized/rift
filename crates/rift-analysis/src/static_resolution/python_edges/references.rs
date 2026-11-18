@@ -70,7 +70,7 @@ impl<'source> Index<'source> {
         }
     }
 
-    fn python_identity(
+    pub(in crate::static_resolution) fn python_identity(
         &self,
         file: &File<'source>,
         range: ByteRange,

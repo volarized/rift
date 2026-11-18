@@ -161,8 +161,10 @@ struct File<'source> {
     by_range: BTreeMap<ByteRange, Option<&'source SyntaxSymbol>>,
     by_qualified_name: BTreeMap<&'source str, Option<&'source SyntaxSymbol>>,
     callables: EnclosingDefinitions<&'source SyntaxSymbol>,
+    classes: EnclosingDefinitions<&'source SyntaxSymbol>,
     class_scopes: BTreeSet<ByteRange>,
     assignments: AssignmentTargets<'source>,
+    python_annotations: BTreeMap<u64, ByteRange>,
 }
 
 #[derive(Default)]
@@ -218,8 +220,10 @@ impl<'source> File<'source> {
             by_range: BTreeMap::new(),
             by_qualified_name: BTreeMap::new(),
             callables: EnclosingDefinitions::new([]),
+            classes: EnclosingDefinitions::new([]),
             class_scopes: BTreeSet::new(),
             assignments: AssignmentTargets::default(),
+            python_annotations: BTreeMap::new(),
         };
         file.index_bindings(work)?;
         file.index_symbols(work)?;
@@ -233,6 +237,15 @@ impl<'source> File<'source> {
             }
             let name = self.text(binding.name)?;
             self.by_name.entry(name).or_default().push(binding);
+            match binding.kind {
+                StaticBindingKind::PythonAnnotation { annotation }
+                | StaticBindingKind::PythonInstance {
+                    constructor: annotation,
+                } => {
+                    self.python_annotations.insert(binding.name.end, annotation);
+                }
+                _ => {}
+            }
         }
         for range in self.facts.assignments() {
             if !work.charge() {
@@ -245,6 +258,7 @@ impl<'source> File<'source> {
 
     fn index_symbols(&mut self, work: &mut Work) -> Option<()> {
         let mut callables = Vec::new();
+        let mut classes = Vec::new();
         let python = self.document.facts.language().name == "python";
         for symbol in self.document.facts.symbols() {
             if !work.charge() {
@@ -260,6 +274,7 @@ impl<'source> File<'source> {
                 .or_insert(Some(symbol));
             if python && symbol.kinds.contains(&SymbolKind::Constructible) {
                 self.class_scopes.insert(symbol.item_range);
+                classes.push((symbol.range.start, symbol.range.end, symbol));
             }
             if python && symbol.kinds.contains(&SymbolKind::Callable) {
                 callables.push((symbol.range.start, symbol.range.end, symbol));
@@ -272,6 +287,7 @@ impl<'source> File<'source> {
             }
         }
         self.callables = EnclosingDefinitions::new(callables);
+        self.classes = EnclosingDefinitions::new(classes);
         Some(())
     }
 
@@ -450,7 +466,13 @@ impl<'source> Index<'source> {
             }
             if let Some((range, target)) = self.import_target(file, binding, work) {
                 let occurrence = target.and_then(|target| {
-                    self.occurrence(file, range, range, ReferenceRole::Import, target)
+                    let mut occurrence =
+                        self.occurrence(file, range, range, ReferenceRole::Import, target)?;
+                    if file.document.facts.language().name == "python" {
+                        occurrence.edge_from =
+                            Some(self.python_identity(file, range, file.qualified_target(".")?)?);
+                    }
+                    Some(occurrence)
                 });
                 result.record(occurrence);
             }
@@ -478,7 +500,15 @@ impl<'source> Index<'source> {
             target,
         )?;
         if file.document.facts.language().name == "python"
-            && let Some(caller) = file.enclosing_callable(call.range)
+            && let Some(caller) = file.enclosing_callable(call.range).or_else(|| {
+                file.classes
+                    .resolve(call.range.start, call.range.end)
+                    .map(|symbol| Target {
+                        file: file.document,
+                        symbol,
+                    })
+                    .or_else(|| file.qualified_target("."))
+            })
         {
             let caller = self.occurrence(
                 file,

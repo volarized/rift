@@ -108,6 +108,16 @@ pub enum StaticBindingKind {
         /// Name of the enclosing class.
         class_name: ByteRange,
     },
+    /// A Python binding with an authored type annotation.
+    PythonAnnotation {
+        /// Authored annotation expression.
+        annotation: ByteRange,
+    },
+    /// A Python binding initialized by a named constructor call.
+    PythonInstance {
+        /// Authored constructor path, requiring static resolution.
+        constructor: ByteRange,
+    },
     /// Dotted Python module import without a local alias.
     PythonModule {
         /// Complete imported module path.
@@ -361,8 +371,10 @@ impl StaticBinding {
             } => valid(module) && export.is_none_or(&valid) && valid(require),
             StaticBindingKind::JavaScriptEdgeNamespace { module }
             | StaticBindingKind::PythonModule { module } => valid(module),
-            StaticBindingKind::JavaScriptInstance { constructor } => valid(constructor),
+            StaticBindingKind::JavaScriptInstance { constructor }
+            | StaticBindingKind::PythonInstance { constructor } => valid(constructor),
             StaticBindingKind::PythonReceiver { class_name } => valid(class_name),
+            StaticBindingKind::PythonAnnotation { annotation } => valid(annotation),
             StaticBindingKind::RustUse { path } => valid(path),
             StaticBindingKind::RustReceiver { type_path } => valid(type_path),
             StaticBindingKind::Local

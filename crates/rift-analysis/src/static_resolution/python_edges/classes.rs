@@ -120,7 +120,12 @@ impl<'source> Index<'source> {
         work: &mut Work,
     ) -> Option<Target<'source>> {
         if !class.symbol.kinds.contains(&SymbolKind::Constructible) {
-            return None;
+            let file = self.files.get(class.file.path.as_str())?;
+            let annotation = file.python_annotations.get(&class.symbol.name_range?.end)?;
+            let class = self.python_annotation(file, *annotation, work)?;
+            return self
+                .python_own_member(class, name)
+                .or_else(|| self.python_base_member(class, name, work));
         }
         if let Some(target) = self.python_own_member(class, name) {
             return Some(target);

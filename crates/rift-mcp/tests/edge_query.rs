@@ -15,6 +15,39 @@ use serde_json::json;
 use workspace_client::{TestResult, captured_seed, query_after_population, served_workspace};
 
 #[tokio::test]
+async fn test_python_reexports_keep_imports_and_aliases() -> TestResult {
+    let files = [
+        ("pkg/__init__.py", "from .models import Value as Value\n"),
+        ("pkg/models.py", "class Value: pass\n"),
+        (
+            "main.py",
+            "from pkg import Value\ndef build(): return Value()\n",
+        ),
+    ];
+    let (_directory, client, task) = served_workspace(&files, None).await?;
+    for query in [
+        "ASK { <rift://symbol/local/python/pkg> :imports <rift://symbol/local/python/pkg/models/Value> }",
+        "ASK { <rift://symbol/local/python/pkg/Value> :aliases <rift://symbol/local/python/pkg/models/Value> }",
+        "ASK { <rift://symbol/local/python/main/build> :calls <rift://symbol/local/python/pkg/models/Value> }",
+    ] {
+        let params = QueryParams {
+            query: query.to_owned(),
+            language: QueryLanguage::Sparql,
+            ..Default::default()
+        };
+        let answer = query_after_population(&client, &params).await?;
+        assert_eq!(
+            answer["answer"],
+            json!({"result":"boolean", "value":true}),
+            "{query}: {answer}"
+        );
+    }
+    client.cancel().await?;
+    task.await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_python_rebindings_share_the_existing_symbol_facets() -> TestResult {
     let source = "shared = 0\ndef root():\n    active = False\n    def finish():\n        nonlocal active\n        active = True\n    def publish():\n        global shared\n        shared = 1\n";
     let (_directory, client, task) = served_workspace(&[("main.py", source)], None).await?;
@@ -58,14 +91,21 @@ async fn test_python_rebindings_share_the_existing_symbol_facets() -> TestResult
 
 #[tokio::test]
 async fn test_python_static_member_edges_are_read_through_sparql() -> TestResult {
-    let source = "import models\nclass Base:\n    value: int = 0\n    def run(self): pass\nclass Child(Base):\n    def run(self, value: models.Value) -> models.Value:\n        self.value = value\n        self.value += 1\n        return models.current\n";
+    let source = "import models\nclass Base:\n    value: int = 0\n    def run(self): pass\nclass Child(Base):\n    def run(self, value: models.Value) -> models.Value:\n        self.value = value\n        self.value += 1\n        return models.current\ndef typed(value: models.Value):\n    value.run()\n    value.item = 1\n    models.current = value\n    return value.item\n";
     let files = [
         ("main.py", source),
-        ("models.py", "class Value: pass\ncurrent: Value\n"),
+        (
+            "models.py",
+            "class Value:\n    item: int = 0\n    def run(self): pass\ncurrent: Value\n",
+        ),
     ];
     let (_directory, client, task) = served_workspace(&files, None).await?;
     captured_seed(&client, "Child", "main.py").await?;
     for query in [
+        "ASK { <rift://symbol/local/python/main/typed> :calls <rift://symbol/local/python/models/Value/run> }",
+        "ASK { <rift://symbol/local/python/main/typed> :reads <rift://symbol/local/python/models/Value/item> }",
+        "ASK { <rift://symbol/local/python/main/typed> :writes <rift://symbol/local/python/models/Value/item> }",
+        "ASK { <rift://symbol/local/python/main/typed> :writes <rift://symbol/local/python/models/current> }",
         "ASK { <rift://symbol/local/python/main> :contains <rift://symbol/local/python/main/Child> }",
         "ASK { <rift://symbol/local/python/main/Child> :contains <rift://symbol/local/python/main/Child/run> }",
         "ASK { <rift://symbol/local/python/main/Child/run> :overrides <rift://symbol/local/python/main/Base/run> }",

@@ -39,6 +39,7 @@ pub(super) struct EdgePythonKinds {
     function: u16,
     object: u16,
     member: u16,
+    type_field: u16,
     left: u16,
     right: u16,
 }
@@ -100,6 +101,7 @@ pub(super) fn edge_python_kinds() -> &'static EdgePythonKinds {
             function: field("function"),
             object: field("object"),
             member: field("attribute"),
+            type_field: field("type"),
             left: field("left"),
             right: field("right"),
         }
@@ -168,9 +170,9 @@ impl EdgePythonKinds {
             return Ok(StaticCallee::Direct);
         }
         if callee.kind_id() == self.attribute {
-            let receiver = callee
-                .child_by_field_id(self.object)
-                .filter(|value| matches!(value.kind_id(), id if id == self.identifier || id == self.attribute));
+            let receiver = callee.child_by_field_id(self.object).filter(|value| {
+                [self.identifier, self.attribute, self.call].contains(&value.kind_id())
+            });
             let member = callee
                 .child_by_field_id(self.member)
                 .and_then(|value| identifier(value, self.identifier));
@@ -271,6 +273,10 @@ impl EdgePythonKinds {
                     .or_else(|| parameter.named_child(0))
             };
             if let Some(name) = name.filter(|name| name.kind_id() == self.identifier) {
+                let annotated = parameter
+                    .child_by_field_id(self.type_field)
+                    .map(byte_range)
+                    .transpose()?;
                 facts.bindings.push(binding(
                     name,
                     scope,
@@ -281,7 +287,9 @@ impl EdgePythonKinds {
                         Some(class_name) => StaticBindingKind::PythonReceiver {
                             class_name: byte_range(class_name)?,
                         },
-                        None => StaticBindingKind::Shadow,
+                        None => annotated.map_or(StaticBindingKind::Shadow, |annotation| {
+                            StaticBindingKind::PythonAnnotation { annotation }
+                        }),
                     },
                 )?);
             }
@@ -443,20 +451,58 @@ impl EdgePythonKinds {
         let mut pending = vec![target];
         while let Some(target) = pending.pop() {
             if target.kind_id() == self.identifier {
-                facts.bindings.push(binding(
-                    target,
-                    scope,
-                    byte_range(scope)?.start,
-                    StaticBindingKind::Shadow,
-                )?);
+                let kind = self.edge_assignment_kind(visited, target)?;
+                let available = if matches!(kind, StaticBindingKind::PythonInstance { .. }) {
+                    byte_range(visited.syntax_element())?.end
+                } else {
+                    byte_range(scope)?.start
+                };
+                facts
+                    .bindings
+                    .push(binding(target, scope, available, kind)?);
             } else if target.kind_id() == self.attribute {
                 facts.assignments.push(byte_range(target)?);
+                let kind = self.edge_assignment_kind(visited, target)?;
+                if kind != StaticBindingKind::Shadow {
+                    facts
+                        .bindings
+                        .push(binding(target, scope, byte_range(scope)?.start, kind)?);
+                }
             } else if self.patterns.contains(&target.kind_id()) {
                 let mut cursor = target.walk();
                 pending.extend(target.named_children(&mut cursor));
             }
         }
         Ok(())
+    }
+
+    fn edge_assignment_kind(
+        &self,
+        visited: Visited<'_, '_>,
+        target: Node<'_>,
+    ) -> Result<StaticBindingKind, RiftError> {
+        let assignment = visited.syntax_element();
+        if assignment.kind_id() != self.assignment[0]
+            || assignment.child_by_field_id(self.left) != Some(target)
+        {
+            return Ok(StaticBindingKind::Shadow);
+        }
+        if let Some(annotation) = assignment.child_by_field_id(self.type_field) {
+            return Ok(StaticBindingKind::PythonAnnotation {
+                annotation: byte_range(annotation)?,
+            });
+        }
+        let constructor = assignment
+            .child_by_field_id(self.right)
+            .filter(|value| value.kind_id() == self.call)
+            .and_then(|call| call.child_by_field_id(self.function))
+            .filter(|callee| [self.identifier, self.attribute].contains(&callee.kind_id()));
+        match constructor {
+            Some(constructor) => Ok(StaticBindingKind::PythonInstance {
+                constructor: byte_range(constructor)?,
+            }),
+            None => Ok(StaticBindingKind::Shadow),
+        }
     }
 }
 
