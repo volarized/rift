@@ -220,7 +220,8 @@ Each entry carries the package manager, the name, and exactly one selector: the 
 version a lockfile pins, or the version requirement a manifest declares. A manifest value
 is reported as a requirement unless its form pins one exact version - Cargo's `1.2.3` is a
 caret requirement and `=1.2.3` a pin - so a manifest-only project never invents a resolved
-version. Entries merge by manager, name, and selector, and a requirement is dropped where some
+version. A Cargo dependency naming no `registry` or `registry-index` reads crates.io, the
+registry Cargo resolves it from. Entries merge by manager, name, and selector, and a requirement is dropped where some
 input pins that package's version. The
 [`[dependencies]`](/docs/developer/configuration#dependencies) `packages` list merges with
 what the files state, under the same rules.
@@ -627,7 +628,7 @@ hit. Under `target: "all"`, an attached comment keeps its symbol result when tha
 a file match outside the comment remains a file result.
 
 For example, a guide containing the inline code `Compass` can contribute context to
-`get_symbol` with its established `id` and `include: ["documentation"]`. The reference resolves only
+`get_symbol` with its established `id` and `include: {"documentation": true}`. The reference resolves only
 when the selected declaration set establishes one exact target. Ambiguous names remain unresolved.
 The read returns at most 32 references per symbol and 16 KiB of documentation excerpts across the
 page, with typed warnings for missing bytes or reached bounds.

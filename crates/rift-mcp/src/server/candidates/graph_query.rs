@@ -1329,7 +1329,7 @@ mod tests {
                         B => (C, 3),
                         _ => return json_response(&json!({"outcome":"unavailable","reason":"insufficient_coverage"})),
                     };
-                    let source = request["include"] == json!(["source"]);
+                    let source = request["include"] == json!({"source": true});
                     let (seed_symbol, seed_source) = graph_fixture_symbol(seed, source);
                     let (next_symbol, next_source) = graph_fixture_symbol(next, source);
                     let sources = seed_source.into_iter().chain(next_source).collect::<Vec<_>>();
@@ -1701,7 +1701,7 @@ mod tests {
         );
         let requests = requests.lock().await;
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0]["include"], json!(["source"]));
+        assert_eq!(requests[0]["include"], json!({"source": true}));
         service.abort();
         Ok(())
     }

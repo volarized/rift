@@ -34,7 +34,7 @@ async fn test_collection_documentation_source_uses_smaller_configured_and_advert
     let page: PackageSearchPage = serde_json::from_value(value).expect("documentation page");
     let mut request = search_request();
     request.target = Some(PackageSearchRequestTarget::Documentation);
-    request.include = Some(vec!["source".to_owned()]);
+    request.include = Some(crate::PackageSearchRequestInclude { source: Some(true) });
     let document = "[global]\nmax_source = \"1b\"\n";
     let config = accepted_config(
         document,
@@ -72,7 +72,7 @@ async fn test_collection_documentation_source_uses_smaller_configured_and_advert
             "documentation": documentation, "excerpt": "guide"}]
     });
     let mut request = request;
-    request.include = vec![GetSymbolInclude::Documentation];
+    request.include.documentation = true;
     let error = canonical_symbol_response(value.clone(), &request, 1)
         .await
         .expect_err("configured excerpt bound");
@@ -168,7 +168,7 @@ async fn test_collection_config_and_environment_deliver_source_past_default_boun
     .await
     .expect("fixture server");
     let mut search = search_request();
-    search.include = Some(vec!["source".to_owned()]);
+    search.include = Some(crate::PackageSearchRequestInclude { source: Some(true) });
     let default = GlobalClient::new(server.config()).expect("default client");
     assert_registered_field(
         &default
@@ -222,7 +222,7 @@ async fn test_collection_config_and_environment_deliver_source_past_default_boun
         Some(source_bytes)
     );
     let mut patterns = pattern::pattern_request();
-    patterns.include = Some(vec!["source".to_owned()]);
+    patterns.include = Some(crate::PackagePatternRequestInclude { source: Some(true) });
     let page = client
         .search_package_patterns(&patterns, 20, None)
         .await
@@ -254,7 +254,7 @@ async fn test_collection_operations_use_smaller_advertised_and_configured_bounds
     .await
     .expect("fixture server");
     let mut search = search_request();
-    search.include = Some(vec!["source".to_owned()]);
+    search.include = Some(crate::PackageSearchRequestInclude { source: Some(true) });
     let mut config = server.config();
     config.max_source = 2 << 20;
     let client = GlobalClient::new(config).expect("configured client");

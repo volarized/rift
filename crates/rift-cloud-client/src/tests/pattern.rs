@@ -288,18 +288,6 @@ fn test_pattern_requests_refuse_bounds_before_transport() {
     request.pattern = "x".repeat(SEARCH_PATTERN_CHARS_MAX);
     validate_pattern_request(&request).expect("validation accepted");
 
-    for include in [
-        vec!["score".to_owned()],
-        vec!["source".to_owned(), "source".to_owned()],
-    ] {
-        let mut request = pattern_request();
-        request.include = Some(include);
-        assert_registered_field(
-            &validate_pattern_request(&request).expect_err("registered refusal"),
-            "rift.client.request_invalid",
-            "include",
-        );
-    }
     let mut request = pattern_request();
     request.packages = Some(vec![package_request(), package_request()]);
     assert_registered_field(
@@ -476,7 +464,7 @@ fn test_pattern_declarations_validate_canonical_owner_and_language() {
 fn test_pattern_pages_refuse_past_their_bounds() {
     let capabilities = pattern_capabilities();
     let mut request = pattern_request();
-    request.include = Some(vec!["source".to_owned()]);
+    request.include = Some(crate::PackagePatternRequestInclude { source: Some(true) });
     let mut sourced = pattern_page_json(None);
     sourced["items"][0]["source"] = json!("fn demo");
     sourced["items"][0]["declaration"]["source"] = json!("pub fn demo");

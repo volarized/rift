@@ -501,18 +501,10 @@ mod tests {
         )
         .expect("dependency context");
         assert!(!exact.is_degraded(), "{:?}", exact.degradations());
-        assert_eq!(exact.entries().len(), 2);
-        let requirement = exact
-            .entries()
-            .iter()
-            .find(|entry| entry.registry.is_none())
-            .expect("manifest requirement without registry evidence");
-        assert_eq!(requirement.name, "serde");
-        assert_eq!(requirement.version, None);
-        assert_eq!(requirement.requirement.as_deref(), Some("1"));
         assert_eq!(
-            requirement.availability,
-            rift_protocol::dependencies::PackageAvailability::RegistryUnresolved
+            exact.entries().len(),
+            1,
+            "the lockfile pin drops the manifest's crates.io requirement for the same package"
         );
         let locked = exact
             .entries()
@@ -1032,7 +1024,6 @@ mod tests {
             named,
             [
                 "cargo/serde",
-                "cargo/serde",
                 "npm/typescript",
                 "stdlib/node",
                 "stdlib/python",
@@ -1044,13 +1035,7 @@ mod tests {
             .iter()
             .filter(|entry| entry.manager == "cargo")
             .collect();
-        assert_eq!(cargo.len(), 2);
-        assert!(cargo.iter().any(|entry| {
-            entry.registry.is_none()
-                && entry.requirement.as_deref() == Some("1")
-                && entry.availability
-                    == rift_protocol::dependencies::PackageAvailability::RegistryUnresolved
-        }));
+        assert_eq!(cargo.len(), 1);
         assert!(cargo.iter().any(|entry| {
             entry.registry.as_deref() == Some("crates.io")
                 && entry.version.as_deref() == Some("1.0.228")

@@ -149,6 +149,9 @@ require those input values as stored facts on every result.
 
 `:limit` and `:page_index` select a producer page. Outer `LIMIT` and `OFFSET` apply to the
 SPARQL result after evaluation. Missing producer coverage can make the query unavailable.
+A package answered from the nearest collected release under `package_substituted` is covered.
+A global API read that fails answers `unavailable` with reason `read_failed`, and
+`rift server logs` names its `failure_class`.
 
 ### Pattern [#search-pattern]
 
@@ -373,6 +376,12 @@ object. A runtime symbol's answer names the runtime release it read as `revision
 names the requested identity and up to three actual structural alternatives. An incomplete
 selection answers `unavailable` with a typed reason.
 
+A Rust identity names a path inside a library crate. A declaration in a binary, example,
+integration test, benchmark, or build script, or in a module one of these declares, carries no
+identity, so a Cargo package with a binary still answers a miss with `missing`. A library file
+that failed analysis, or a Rust file neither the library nor another Cargo target declares,
+keeps Rust misses `unavailable` with `insufficient_coverage`.
+
 For `missing`, the server **MUST** set MCP `isError` to `true` and retain the same typed
 answer in `structuredContent` under `--output all`. The `--output text` policy removes
 `structuredContent` while retaining the error flag and compact text.
@@ -383,10 +392,11 @@ bounds retain the definite miss and report incomplete alternative work.
 
 <ReadExample name="missing-symbol" />
 
-`include` selects projections: `documentation` adds bounded referring documentation, and
-`history` adds the logical symbol's history edges. An omitted or empty `include` requests none. The
-server refuses any other entry, `source` included, as an invalid request. A declaration's
-source is read by [`nodes`](#tool-nodes) with `symbol`.
+`include` is an object of boolean members that selects projections: `documentation` adds
+bounded referring documentation, and `history` adds the logical symbol's history edges. An
+omitted member is `false`, and an omitted `include` requests none. The server refuses any other
+member, `source` included, as an invalid request. A declaration's source is read by
+[`nodes`](#tool-nodes) with `symbol`.
 
 `declaration_limit` defaults to 5 and accepts 1 through 10000. `declaration_cursor` continues
 the declarations of the same symbol at the revision the answer names; the server refuses it for
@@ -544,9 +554,9 @@ The server never falls back to the default intake for such a value, so an empty 
 submission off.
 
 The server sends `text` verbatim. It MUST contain at least one non-whitespace character
-and fit within 4,096 UTF-8 bytes. The optional `include_details` array accepts `os`
-for the server's operating system name and `rift_version` for its package version.
-Each entry can appear once. Omit the array or pass an empty array to send only `text`.
+and fit within 4,096 UTF-8 bytes. The optional `include` object takes two boolean members:
+`os` sends the server's operating system name, and `rift_version` its package version. An
+omitted member is `false`. Omit `include` or set both members to `false` to send only `text`.
 The server reads no workspace files, logs, or conversation history to construct the report.
 
 The caller MUST redact secrets, personal data, and private source material before sending

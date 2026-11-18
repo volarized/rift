@@ -2434,9 +2434,8 @@ impl RiftMcp {
         result
     }
 
-    /// Evaluate SPARQL over captured code facts. Use `SERVICE :search` for text and regex
-    /// retrieval and `SERVICE :flows` for call paths around ranked symbols. Continue a
-    /// paged answer with its `next_query`.
+    /// Performs search across the index using a query language. `language` names the query
+    /// language and defaults to `sparql`.
     #[tool(name = "search")]
     async fn search_query(
         &self,
@@ -4450,6 +4449,19 @@ fn file_digest_revision(digest: rift_index::FileDigest) -> String {
     revision
 }
 
+impl RiftMcp {
+    /// The instructions `initialize` and `server/discover` answer: the global index's for a
+    /// workspace whose `[search] default_scope` is `global`, else the workspace's.
+    async fn served_instructions(&self) -> &'static str {
+        let (published, _) = read_published(&self.published).await.snapshot();
+        if published.configuration.search_configuration().default_scope == SearchScope::Global {
+            GLOBAL_INSTRUCTIONS
+        } else {
+            WORKSPACE_INSTRUCTIONS
+        }
+    }
+}
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for RiftMcp {
     /// Routes the call as the generated `call_tool` does, then completes a Rift operating
@@ -4656,16 +4668,21 @@ impl ServerHandler for RiftMcp {
     }
 
     /// Answers as rmcp's default does: keeps the client's parameters as the peer's and
-    /// negotiates the protocol version; records the request's duration.
-    fn initialize(
+    /// negotiates the protocol version; records the request's duration. A workspace whose
+    /// `[search] default_scope` is `global` answers instructions that read the global index.
+    async fn initialize(
         &self,
         request: rmcp::model::InitializeRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<rmcp::model::InitializeResult, ErrorData>> {
-        let answered;
+    ) -> Result<rmcp::model::InitializeResult, ErrorData> {
+        let instructions = self.served_instructions().await;
+        let mut answered;
         let elapsed = rift_tracing::measure_elapsed!("initialize", {
             context.peer.set_peer_info(request.clone());
             answered = self.negotiate_initialize(&request);
+            if let Ok(info) = &mut answered {
+                info.instructions = Some(instructions.to_owned());
+            }
         })
         .ok()
         .map(|((), measurement)| measurement.elapsed());
@@ -4676,7 +4693,7 @@ impl ServerHandler for RiftMcp {
                 elapsed,
                 Ending::of(&answered),
             );
-        std::future::ready(answered)
+        answered
     }
 
     /// Answers as rmcp's default does; records the request's duration.
@@ -4693,6 +4710,22 @@ impl ServerHandler for RiftMcp {
         std::future::ready(Ok(()))
     }
 
+    /// Answers as rmcp's default does, with the instructions `initialize` answers: a
+    /// workspace whose `[search] default_scope` is `global` describes the global index.
+    async fn discover(
+        &self,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::DiscoverResult, ErrorData> {
+        let mut info = self.get_info();
+        info.instructions = Some(self.served_instructions().await.to_owned());
+        Ok(rmcp::model::DiscoverResult::from_server_info(
+            self.supported_protocol_versions().into_owned(),
+            info,
+        ))
+    }
+
+    /// Carries no instructions: `initialize` and `discover` add the ones the published
+    /// configuration selects.
     fn get_info(&self) -> ServerConfig {
         let mut info = ServerConfig::new(
             ServerCapabilities::builder()
@@ -4700,18 +4733,24 @@ impl ServerHandler for RiftMcp {
                 .enable_resources()
                 .build(),
         )
-        .with_server_info(Implementation::new("rift", env!("CARGO_PKG_VERSION")))
-        .with_instructions(
-            "Read the current workspace: get_symbol and search find \
-             declarations, nodes lists syntax nodes at a byte position. \
-             The rift://workspace resource reads effective configuration \
-             and source files. `rift server logs` reads the server's recorded diagnostics, \
-             including while a tool refuses.",
-        );
+        .with_server_info(Implementation::new("rift", env!("CARGO_PKG_VERSION")));
         info.meta = Some(crate::identity::identity_meta(&self.identity));
         info
     }
 }
+
+/// The `initialize` instructions of a server reading its workspace.
+const WORKSPACE_INSTRUCTIONS: &str = "Read the current workspace: get_symbol and search find \
+     declarations, nodes lists syntax nodes at a byte position. \
+     The rift://workspace resource reads effective configuration \
+     and source files. `rift server logs` reads the server's recorded diagnostics, \
+     including while a tool refuses.";
+
+/// The `initialize` instructions of a server whose `[search] default_scope` is `global`: it
+/// reads the global index of package and runtime releases, not a workspace.
+const GLOBAL_INSTRUCTIONS: &str = "Read the global index of package and runtime releases: \
+     search finds their declarations, naming releases with `:packages` in `SERVICE :search`; \
+     get_symbol reads one symbol at a release `revision`; nodes lists its syntax nodes.";
 
 /// The engine pool held across requests, replaced when accepted LSP configuration changes.
 ///
@@ -4907,6 +4946,81 @@ fn workspace_languages(
 
 #[cfg(test)]
 mod tests {
+    /// `initialize` describes the global index on a server whose `[search] default_scope`
+    /// is `global`, and the workspace on one reading it by default.
+    #[tokio::test]
+    async fn initialize_instructions_follow_the_default_scope() -> TestResult {
+        assert_instructions_follow_the_default_scope(rmcp::ClientLifecycleMode::Initialize).await
+    }
+
+    /// `server/discover` answers the instructions `initialize` does, for both scopes.
+    #[tokio::test]
+    async fn discover_instructions_follow_the_default_scope() -> TestResult {
+        assert_instructions_follow_the_default_scope(rmcp::ClientLifecycleMode::Discover {
+            preferred_versions: vec![rmcp::model::ProtocolVersion::V_2026_07_28],
+        })
+        .await
+    }
+
+    /// Opens a client with `lifecycle` against a workspace reading its index by default and
+    /// one whose `[search] default_scope` is `global`, and asserts the instructions it reads
+    /// and the `search` examples `tools/list` answers. The listing also opens the session a
+    /// `server/discover` probe leaves unselected.
+    async fn assert_instructions_follow_the_default_scope(
+        lifecycle: rmcp::ClientLifecycleMode,
+    ) -> TestResult {
+        use rmcp::ClientServiceExt as _;
+        for (configuration, expected, reads_global) in [
+            ("", super::WORKSPACE_INSTRUCTIONS, false),
+            (
+                "[global]\nenabled = false\n\n[search]\ndefault_scope = \"global\"\n",
+                super::GLOBAL_INSTRUCTIONS,
+                true,
+            ),
+        ] {
+            let directory = tempfile::tempdir()?;
+            super::hermetic_workspace(directory.path(), configuration)?;
+            fs::write(directory.path().join("lib.rs"), "fn alpha() {}\n")?;
+            let root = directory.path().canonicalize()?;
+            let server = RiftMcp::build_settled(&root, WorkspaceIndexLimits::default()).await?;
+            let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+            let server_task = tokio::spawn(async move {
+                let service = server
+                    .serve(server_transport)
+                    .await
+                    .expect("server must initialize");
+                service.waiting().await.expect("server must stop cleanly");
+            });
+            let client = ().serve_with_lifecycle(client_transport, lifecycle.clone()).await?;
+            let instructions = client
+                .peer_info()
+                .and_then(|info| info.instructions.clone());
+            assert_eq!(
+                instructions.as_deref(),
+                Some(expected),
+                "{lifecycle:?} {configuration:?}"
+            );
+            let mut expected_tools = RiftMcp::tool_router().list_all();
+            if reads_global {
+                crate::schema::serve_global_examples(&mut expected_tools);
+            }
+            let search_examples = |tools: &[rmcp::model::Tool]| {
+                tools
+                    .iter()
+                    .find(|tool| tool.name == "search")
+                    .and_then(|tool| tool.input_schema.get("examples").cloned())
+            };
+            assert_eq!(
+                search_examples(&client.list_all_tools().await?),
+                search_examples(&expected_tools),
+                "{lifecycle:?} {configuration:?}"
+            );
+            client.cancel().await?;
+            server_task.await?;
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn external_create_of_a_text_file_populates_lexical_search() -> TestResult {
         let (directory, server) = fixture().await?;
@@ -5683,7 +5797,7 @@ done
         let client = ().serve(client_transport).await?;
         let request =
             CallToolRequestParams::new("search_retrieval").with_arguments(arguments(&json!({
-                "pattern": "beacon", "target": "symbol", "scope": "local", "include": ["source"]
+                "pattern": "beacon", "target": "symbol", "scope": "local", "include": {"source": true}
             }))?);
         let answer = client.call_tool(request.clone()).await?;
         let partial: SearchResult = serde_json::from_value(
@@ -6372,7 +6486,7 @@ done
     /// Reads physical declarations through the public pattern search without requiring identity.
     async fn search_symbols(server: &RiftMcp, name: &str) -> Result<SearchResult, rmcp::ErrorData> {
         let params = serde_json::from_value(json!({
-            "pattern": name, "target": "symbol", "scope": "local", "include": ["source"]
+            "pattern": name, "target": "symbol", "scope": "local", "include": {"source": true}
         }))
         .expect("test search parameters must deserialize");
         server
@@ -8607,7 +8721,7 @@ done
         let published = current_publication(server).await;
         let id = captured_traversal_seed(&published.reads, "beacon")?;
         let params = serde_json::from_value(json!({
-            "id": id, "include": ["history"]
+            "id": id, "include": {"history": true}
         }))?;
         let answer = tokio::time::timeout(
             UNWAITED_READ_MAX,

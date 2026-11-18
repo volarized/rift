@@ -2383,9 +2383,9 @@
                         "registry": "crates.io"
                       }
                     ],
-                    "include": [
-                      "source"
-                    ]
+                    "include": {
+                      "source": true
+                    }
                   }
                 }
               }
@@ -2891,7 +2891,7 @@
         "name": "limit",
         "in": "query",
         "required": false,
-        "description": "Maximum entries in one page.",
+        "description": "Maximum entries in one page, at most the `page_limit_max` the capabilities advertise; the server refuses a larger one.",
         "schema": {
           "type": "integer",
           "minimum": 1,
@@ -4021,15 +4021,15 @@
             "maxItems": 16
           },
           "include": {
-            "description": "Optional fields to include.",
-            "items": {
-              "type": "string",
-              "enum": [
-                "source"
-              ]
-            },
-            "type": "array",
-            "maxItems": 1
+            "description": "Optional fields to include. An omitted member is `false`.",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "source": {
+                "description": "Attaches the declaration's source to each hit.",
+                "type": "boolean"
+              }
+            }
           },
           "packages": {
             "description": "Selected exact package versions. Omitted or empty, use the newest collected stable version of each package, or its newest prerelease when no stable version is collected.",
@@ -4284,16 +4284,19 @@
             "description": "Optional language filter."
           },
           "include": {
-            "description": "Optional fields to include.",
-            "items": {
-              "type": "string",
-              "enum": [
-                "source",
-                "documentation"
-              ]
-            },
-            "type": "array",
-            "maxItems": 2
+            "description": "Optional fields to include. An omitted member is `false`.",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "source": {
+                "description": "Attaches each declaration's source.",
+                "type": "boolean"
+              },
+              "documentation": {
+                "description": "Attaches each declaration's documentation.",
+                "type": "boolean"
+              }
+            }
           },
           "packages": {
             "description": "Selected exact package versions.",
@@ -4431,15 +4434,15 @@
             "maxItems": 20000
           },
           "include": {
-            "description": "Optional fields to include.",
-            "items": {
-              "type": "string",
-              "enum": [
-                "source"
-              ]
-            },
-            "type": "array",
-            "maxItems": 1
+            "description": "Optional fields to include. An omitted member is `false`.",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "source": {
+                "description": "Attaches the line where each match begins and the source of its enclosing declaration.",
+                "type": "boolean"
+              }
+            }
           }
         },
         "required": [
@@ -4464,7 +4467,7 @@
             "maximum": 9007199254740991
           },
           "source": {
-            "description": "The declaration's source, when the request includes `source`.",
+            "description": "The declaration's source, when `include.source` is `true`.",
             "type": "string",
             "maxLength": 67108864
           }
@@ -4505,7 +4508,7 @@
             "$ref": "#/components/schemas/PackagePatternDeclaration"
           },
           "source": {
-            "description": "The line where the match begins, without its line ending, when the request includes `source`.",
+            "description": "The line where the match begins, without its line ending, when `include.source` is `true`.",
             "type": "string",
             "maxLength": 67108864
           }
@@ -5309,7 +5312,7 @@
           "score": {
             "type": "number",
             "format": "double",
-            "description": "The ranking value attached to this hit and used to merge duplicate hits.\nExact original identifier spelling ranks before this value under `relevance`.\nPresent on the wire when `include` names `score`; comparable within one answer\nand nowhere else."
+            "description": "The ranking value attached to this hit and used to merge duplicate hits.\nExact original identifier spelling ranks before this value under `relevance`.\nPresent on the wire when `include.score` is `true`; comparable within one answer\nand nowhere else."
           },
           "matched_by": {
             "type": "array",
@@ -5321,7 +5324,7 @@
           },
           "source": {
             "type": "string",
-            "description": "The source text around the hit, requested with `include: [\"source\"]`. Covers the\nhit's `range`; a caller that needs the range already has it there."
+            "description": "The source text around the hit, requested with `include: {\"source\": true}`. Covers the\nhit's `range`; a caller that needs the range already has it there."
           },
           "range": {
             "description": "Byte range of the hit within `path` or `unit`. Absent for a symbol whose source is\nunavailable or synthetic.",
@@ -6030,15 +6033,23 @@
         "description": "One answer per submitted position, in request order."
       },
       "GetSymbolInclude": {
-        "description": "One optional `get_symbol` hit field the caller may opt into through `include`.",
-        "type": "string",
-        "enum": [
-          "history",
-          "documentation"
-        ],
-        "x-enum-descriptions": [
-          "The hit's version-control timeline.",
-          "Bounded documentation referring to the exact declaration."
+        "description": "The optional `get_symbol` projections the caller opts into. An omitted member is `false`.",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "documentation": {
+            "type": "boolean",
+            "description": "Attaches bounded documentation referring to the exact declaration."
+          },
+          "history": {
+            "type": "boolean",
+            "description": "Attaches the symbol's version-control timeline."
+          }
+        },
+        "examples": [
+          {
+            "documentation": true
+          }
         ]
       },
       "GetSymbolParams": {
@@ -6050,11 +6061,8 @@
             "description": "Canonical identity. Ownership and language come from this address."
           },
           "include": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/GetSymbolInclude"
-            },
-            "description": "Requested projections. Omitted or empty requests none. A declaration's source is read\nby `nodes` with `symbol`."
+            "description": "Requested projections. Omitted requests none. A declaration's source is read by\n`nodes` with `symbol`.",
+            "$ref": "#/components/schemas/GetSymbolInclude"
           },
           "revision": {
             "description": "The revision to read. A git revision reads that commit of a project, a tree\nrevision reads the served working tree, and a release revision selects the release\nof a package or runtime `id`'s owner. Omitted reads the served working tree, or for\na package the version the workspace's dependencies pin, else the newest collected\nrelease. The server refuses a tree revision once the index serves another tree.",
@@ -6082,9 +6090,9 @@
         "examples": [
           {
             "id": "rift://symbol/local/rust/app/parser/parse",
-            "include": [
-              "documentation"
-            ]
+            "include": {
+              "documentation": true
+            }
           }
         ],
         "rift:since": "v0.0.4"
@@ -7981,11 +7989,8 @@
             "$ref": "#/components/schemas/PathSelector"
           },
           "include": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/SearchInclude"
-            },
-            "description": "Extra payload to attach to every hit. Every entry costs response bytes per hit, so\nthe caller requests only what it will read."
+            "$ref": "#/components/schemas/SearchInclude",
+            "description": "Extra payload to attach to every hit. Every selected member costs response bytes per\nhit, so the caller requests only what it will read."
           },
           "limit": {
             "type": "integer",
@@ -8028,9 +8033,9 @@
               "exclude": [],
               "force_include": []
             },
-            "include": [
-              "source"
-            ],
+            "include": {
+              "source": true
+            },
             "limit": 20,
             "page_index": 0
           },
@@ -8077,9 +8082,9 @@
                 "src/**"
               ]
             },
-            "include": [
-              "source"
-            ],
+            "include": {
+              "source": true
+            },
             "limit": 25
           },
           {
@@ -8292,15 +8297,23 @@
         "description": "Project-relative glob using *, ?, **, and character classes. Forward-slash separated on\nevery platform, whatever separator the host OS uses natively."
       },
       "SearchInclude": {
-        "description": "Extra payload to attach to every hit. Every entry costs response bytes per hit, so the\ncaller requests only what it will read.",
-        "type": "string",
-        "enum": [
-          "source",
-          "score"
-        ],
-        "x-enum-descriptions": [
-          "The source text around each hit.",
-          "The ranking value attached to each hit. Exact original identifier spelling ranks before\nthis value."
+        "description": "Extra payload to attach to every hit. An omitted member is `false`. Every selected member\ncosts response bytes per hit, so the caller requests only what it will read.",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "source": {
+            "type": "boolean",
+            "description": "Attaches the source text around each hit."
+          },
+          "score": {
+            "type": "boolean",
+            "description": "Attaches the ranking value of each hit. Exact original identifier spelling ranks before\nthis value."
+          }
+        },
+        "examples": [
+          {
+            "source": true
+          }
         ]
       },
       "SearchChange": {
@@ -9295,13 +9308,19 @@
         "description": "Original relationship records for one requested subject on this page."
       },
       "RelationshipInclude": {
-        "description": "An optional projection of records in a relationship page.",
-        "type": "string",
-        "enum": [
-          "source"
-        ],
-        "x-enum-descriptions": [
-          "Exact UTF-8 bytes of the selected source units."
+        "description": "The optional projections of records in a relationship page. An omitted member is `false`.",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "source": {
+            "type": "boolean",
+            "description": "Attaches the exact UTF-8 bytes of the selected source units."
+          }
+        },
+        "examples": [
+          {
+            "source": true
+          }
         ]
       },
       "RelationshipOccurrence": {
@@ -9444,12 +9463,8 @@
             "maxItems": 20000
           },
           "include": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/RelationshipInclude"
-            },
             "description": "Requested exact projections; source bytes use the same selected publication.",
-            "maxItems": 1
+            "$ref": "#/components/schemas/RelationshipInclude"
           },
           "view": {
             "description": "Original serving context. Continuation never selects latest.",

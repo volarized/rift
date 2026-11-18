@@ -1,9 +1,6 @@
 use super::{valid_result, validate_request};
 use rift_error::{ErrorValue, RiftError};
-use rift_protocol::{
-    read::GetSymbolInclude,
-    symbol_read::{GetSymbolParams, GetSymbolResult},
-};
+use rift_protocol::symbol_read::{GetSymbolParams, GetSymbolResult};
 use serde_json::{Value, json};
 
 const ID: &str = "rift://symbol/cargo/crates.io/tokio/rust/tokio/Beacon";
@@ -298,7 +295,7 @@ fn documented_result() -> Value {
 #[test]
 fn canonical_documentation_keeps_original_associations_and_refuses_tampered_facts() {
     let mut request = request();
-    request.include.push(GetSymbolInclude::Documentation);
+    request.include.documentation = true;
     let original = documented_result();
     let result: GetSymbolResult =
         serde_json::from_value(original.clone()).expect("documented result");
@@ -379,9 +376,7 @@ fn canonical_documentation_keeps_original_associations_and_refuses_tampered_fact
         &serde_json::from_value(warning).expect("warning"),
         100
     ));
-    request
-        .include
-        .retain(|include| *include != GetSymbolInclude::Documentation);
+    request.include.documentation = false;
     assert!(!valid_result(&request, &result, 100));
 }
 
@@ -410,7 +405,7 @@ fn canonical_runtime_documentation_preserves_exact_runtime_source_owner() {
     });
     let mut request = request();
     request.id = rift_protocol::read::SymbolId::parse(id).expect("runtime identity");
-    request.include.push(GetSymbolInclude::Documentation);
+    request.include.documentation = true;
     let result = serde_json::from_value(value.clone()).expect("runtime result");
     assert!(valid_result(&request, &result, 100));
     value["documentation"]["references"][0]["documentation"]["source"]["origin"]["runtime"]["version"] =

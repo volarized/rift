@@ -1206,13 +1206,6 @@ fn test_request_relationships_are_validated_before_transport() {
         "prefix",
     );
     let mut search = search_request();
-    search.include = Some(vec!["score".to_owned()]);
-    assert_registered_field(
-        &(validate_search_request(&search)).expect_err("registered refusal"),
-        "rift.client.request_invalid",
-        "include",
-    );
-    let mut search = search_request();
     search.phase = Some(PackageSearchRequestPhase::Broad);
     assert_registered_field(
         &(validate_search_request(&search)).expect_err("registered refusal"),
@@ -1282,7 +1275,7 @@ async fn test_documentation_request_requires_advertised_capability() {
     assert!(validate_search_request_for_capabilities(&request, 20, None, &capabilities).is_ok());
 
     let mut symbol = symbol_request();
-    symbol.include = vec![GetSymbolInclude::Documentation];
+    symbol.include.documentation = true;
     let (server, client) = operation_client(OperationFixture::Valid).await;
     let error = client
         .get_symbol(&symbol)
@@ -1705,6 +1698,11 @@ async fn test_fixture_documented_problem_statuses_decode() {
         let (server, client) = operation_client(OperationFixture::Problem(status)).await;
         let result = client.search_packages(&search_request(), 20, None).await;
         let error = result.expect_err("documented HTTP refusal");
+        if status == StatusCode::BAD_REQUEST {
+            assert_refused_request(&error, "request", "fixture problem");
+            assert_eq!(server.state.requests.load(Ordering::SeqCst), 2);
+            continue;
+        }
         let expected_slug = if status == StatusCode::FORBIDDEN {
             "rift.client.remote_permission_denied"
         } else {
@@ -1748,6 +1746,74 @@ async fn operation_failure(
             .find_declarations(&declaration::declaration_request())
             .await
             .err(),
+    }
+}
+
+/// `error` is the caller's own invalid request naming `field` and `violation`.
+fn assert_refused_request(error: &RiftError, field: &str, violation: &str) {
+    assert_eq!(
+        error.slug().as_str(),
+        "rift.client.request_invalid",
+        "{error}"
+    );
+    assert_eq!(error_text_field(error, "field"), field);
+    assert_eq!(error_text_field(error, "violation"), violation);
+}
+
+/// A 400 refusal names the request field and violation its problem details state, as
+/// members or in the registered refusal message, else its whole detail against the request.
+#[test]
+fn test_bad_request_problem_names_the_refused_field() {
+    let meta = ResponseMeta {
+        status: 400,
+        content_type: Some("application/problem+json".to_owned()),
+        etag: None,
+        cache_control: None,
+        www_authenticate: None,
+        retry_after: None,
+        rate_limit_limit: None,
+        rate_limit_remaining: None,
+        rate_limit_reset: None,
+    };
+    let problem = |detail: &str, members: serde_json::Value| {
+        let mut value = serde_json::json!({
+            "type": "about:blank",
+            "title": "Bad Request",
+            "status": 400,
+            "detail": detail,
+        });
+        if let (Some(target), Some(extra)) = (value.as_object_mut(), members.as_object()) {
+            target.extend(extra.clone());
+        }
+        serde_json::from_value::<ProblemDetails>(value).expect("problem details")
+    };
+    for (problem, field, violation) in [
+        (
+            Some(problem(
+                "the request does not match the documented form: field declaration_cursor, \
+                 violation declaration cursor failed validation",
+                serde_json::json!({}),
+            )),
+            "declaration_cursor",
+            "declaration cursor failed validation",
+        ),
+        (
+            Some(problem(
+                "refused",
+                serde_json::json!({ "field": "limit", "violation": "exceeds 200" }),
+            )),
+            "limit",
+            "exceeds 200",
+        ),
+        (
+            Some(problem("cursor expired", serde_json::json!({}))),
+            "request",
+            "cursor expired",
+        ),
+        (None, "request", "the global API refused the request"),
+    ] {
+        let error = failure::remote("get_symbol", &meta, problem.as_ref());
+        assert_refused_request(&error, field, violation);
     }
 }
 
@@ -1819,6 +1885,17 @@ async fn test_fixture_every_operation_answers_problem_statuses() {
             let actual = operation_failure(&client, endpoint)
                 .await
                 .expect("HTTP refusal");
+            if status == StatusCode::BAD_REQUEST {
+                assert_refused_request(&actual, "request", "fixture problem");
+                assert!(
+                    operation_failure(&client, Endpoint::Capabilities)
+                        .await
+                        .is_none(),
+                    "a refused request is not recorded as the endpoint's failure"
+                );
+                assert_eq!(server.state.requests.load(Ordering::SeqCst), 2);
+                continue;
+            }
             assert_remote_error(&actual, &expected);
             assert_eq!(server.state.requests.load(Ordering::SeqCst), 2);
             let cached = operation_failure(&client, Endpoint::Capabilities)
@@ -3046,7 +3123,7 @@ async fn test_fixture_enforces_active_server_bounds() {
 
     let (server, client) = operation_client(OperationFixture::TightSourceBound).await;
     let mut request = search_request();
-    request.include = Some(vec!["source".to_owned()]);
+    request.include = Some(crate::PackageSearchRequestInclude { source: Some(true) });
     assert_registered_field(
         &(client.search_packages(&request, 20, None).await).expect_err("registered refusal"),
         "rift.client.response_invalid",
@@ -3081,16 +3158,16 @@ fn generated_exact_symbol_shapes_keep_shared_requests_and_typed_outcomes() {
     use rift_protocol::symbol_read::{GetSymbolParams, GetSymbolResult};
     const ID: &str = "rift://symbol/cargo/crates.io/tokio/rust/tokio/Beacon";
     let request: GetSymbolParams = serde_json::from_value(json!({
-        "id": ID, "include": ["history", "documentation"], "declaration_limit": 5,
+        "id": ID, "include": {"history": true, "documentation": true}, "declaration_limit": 5,
     }))
     .expect("shared request");
     let wire = serde_json::to_value(&request).expect("shared request encoding");
     let generated = crate::generated::GetSymbolParams {
         id: request.id.as_str().to_owned(),
-        include: Some(vec![
-            crate::generated::GetSymbolInclude::History,
-            crate::generated::GetSymbolInclude::Documentation,
-        ]),
+        include: Some(crate::generated::GetSymbolInclude {
+            documentation: Some(true),
+            history: Some(true),
+        }),
         declaration_limit: Some(request.declaration_limit),
         declaration_cursor: request.declaration_cursor.clone(),
         revision: request.revision.as_ref().map(ToString::to_string),
@@ -3101,7 +3178,13 @@ fn generated_exact_symbol_shapes_keep_shared_requests_and_typed_outcomes() {
     );
     assert_eq!(generated.id, request.id.as_str());
     assert_eq!(generated.declaration_limit, Some(5));
-    assert_eq!(generated.include.expect("requested includes").len(), 2);
+    assert_eq!(
+        generated.include,
+        Some(crate::generated::GetSymbolInclude {
+            documentation: Some(true),
+            history: Some(true),
+        })
+    );
     for value in [
         json!({"outcome": "found", "symbol": {"id": ID, "language": "rust", "name": "Beacon", "kind": "struct"}, "revision": "rift://revision/cargo/crates.io/tokio@1.50.0", "declarations": []}),
         json!({"outcome": "missing", "symbol_not_found": {"id": ID, "alternatives": []}, "revision": "rift://revision/cargo/crates.io/tokio@1.50.0"}),

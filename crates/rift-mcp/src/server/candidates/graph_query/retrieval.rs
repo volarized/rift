@@ -159,7 +159,14 @@ fn retrieval_coverage_for<'warning>(
     current: bool,
 ) -> Option<SymbolUnavailableReason> {
     let mut preparing = false;
-    for warning in warnings.filter(|warning| incomplete_retrieval(warning)) {
+    let mut incomplete = false;
+    for warning in warnings {
+        if failed_retrieval(warning) {
+            return Some(SymbolUnavailableReason::ReadFailed);
+        }
+        if !incomplete_retrieval(warning) {
+            continue;
+        }
         if current
             && matches!(
                 warning,
@@ -168,12 +175,31 @@ fn retrieval_coverage_for<'warning>(
         {
             preparing = true;
         } else {
-            return Some(SymbolUnavailableReason::InsufficientCoverage);
+            incomplete = true;
         }
     }
-    preparing.then_some(SymbolUnavailableReason::IndexPreparing)
+    if incomplete {
+        Some(SymbolUnavailableReason::InsufficientCoverage)
+    } else {
+        preparing.then_some(SymbolUnavailableReason::IndexPreparing)
+    }
 }
 
+/// Whether `warning` names a global API read that failed: the answer lacks the package
+/// hits because the request failed, not because the index lacks them.
+fn failed_retrieval(warning: &ReadWarning) -> bool {
+    matches!(
+        warning,
+        ReadWarning::GlobalApiUnavailable { .. }
+            | ReadWarning::GlobalPublicationIncompatible { .. }
+            | ReadWarning::GlobalResponseInvalid { .. }
+    )
+}
+
+/// Whether `warning` leaves the selected producer pages short of the facts they select.
+///
+/// A `package_substituted` entry is answered completely from the nearest collected release,
+/// so it leaves nothing out.
 fn incomplete_retrieval(warning: &ReadWarning) -> bool {
     if let ReadWarning::PackageContextDegraded { resolver, .. } = warning {
         return resolver.split('/').next() != Some(rift_dependency::STANDARD_LIBRARY_MANAGER);
@@ -193,13 +219,9 @@ fn incomplete_retrieval(warning: &ReadWarning) -> bool {
             | ReadWarning::HistoryStoreFilling { .. }
             | ReadWarning::ChangeTruncated { .. }
             | ReadWarning::GlobalAccessDisabled
-            | ReadWarning::GlobalApiUnavailable { .. }
-            | ReadWarning::GlobalPublicationIncompatible { .. }
-            | ReadWarning::GlobalResponseInvalid { .. }
             | ReadWarning::GlobalPageWarning { .. }
             | ReadWarning::PackageAbsent { .. }
             | ReadWarning::PackageRequirementAbsent { .. }
-            | ReadWarning::PackageSubstituted { .. }
     )
 }
 
@@ -232,6 +254,74 @@ mod tests {
             ),
             Some(SymbolUnavailableReason::InsufficientCoverage)
         );
+    }
+
+    fn substituted() -> ReadWarning {
+        ReadWarning::PackageSubstituted {
+            entry: rift_protocol::dependencies::PackageContextEntry::new(
+                "cargo",
+                "tokio",
+                rift_protocol::dependencies::PackageSelector::Version("1.47.1".to_owned()),
+                rift_protocol::dependencies::PackageAvailability::Canonical,
+            ),
+            package: rift_protocol::read::PackageIdentity {
+                manager: "cargo".to_owned(),
+                registry: "crates.io".to_owned(),
+                name: "tokio".to_owned(),
+                version: "1.51.3".to_owned(),
+            },
+        }
+    }
+
+    #[test]
+    fn a_substituted_release_answers_completely() {
+        assert_eq!(retrieval_coverage(&[substituted()], true), None);
+        assert_eq!(
+            retrieval_coverage(
+                &[
+                    substituted(),
+                    ReadWarning::PackageAbsent {
+                        package: rift_protocol::read::PackageIdentity {
+                            manager: "cargo".to_owned(),
+                            registry: "crates.io".to_owned(),
+                            name: "missing-helper".to_owned(),
+                            version: "0.1.0".to_owned(),
+                        },
+                    },
+                ],
+                true,
+            ),
+            Some(SymbolUnavailableReason::InsufficientCoverage),
+            "an absent package still leaves its hits out"
+        );
+    }
+
+    #[test]
+    fn a_failed_global_read_is_not_missing_coverage() {
+        use rift_protocol::read::GlobalFailureClass;
+        for failed in [
+            ReadWarning::GlobalApiUnavailable {
+                failure_class: GlobalFailureClass::RetryExhausted,
+            },
+            ReadWarning::GlobalResponseInvalid {
+                failure_class: GlobalFailureClass::InvalidResponse,
+            },
+            ReadWarning::GlobalPublicationIncompatible {
+                failure_class: GlobalFailureClass::CorpusRevision,
+            },
+        ] {
+            assert_eq!(
+                retrieval_coverage(
+                    &[
+                        ReadWarning::LexicalRankingTruncated { matches_max: 1 },
+                        failed.clone()
+                    ],
+                    true,
+                ),
+                Some(SymbolUnavailableReason::ReadFailed),
+                "{failed:?}"
+            );
+        }
     }
 
     #[test]

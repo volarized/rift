@@ -18,7 +18,7 @@ pub(crate) fn corpus() -> Vec<(&'static str, Value)> {
     let mut requests = vec![
         ("get_symbol", json!({ "name": "beacon_one" })),
         ("search", json!({ "query": "beacon", "limit": 1 })),
-        ("search", json!({ "query": "beacon", "include": [] })),
+        ("search", json!({ "query": "beacon", "include": {} })),
         // The fixture global API's collected package answers these: a package hit
         // carries `unit` in place of `path`.
         (
@@ -30,14 +30,17 @@ pub(crate) fn corpus() -> Vec<(&'static str, Value)> {
         // `introduced` version from the walk's first commit.
         (
             "get_symbol",
-            json!({ "name": "beacon_one", "include": ["history"] }),
+            json!({ "name": "beacon_one", "include": {"history": true} }),
         ),
         ("search", json!({ "query": "beacon" })),
         (
             "search",
-            json!({ "query": "beacon", "include": ["source"] }),
+            json!({ "query": "beacon", "include": {"source": true} }),
         ),
-        ("search", json!({ "query": "beacon", "include": ["score"] })),
+        (
+            "search",
+            json!({ "query": "beacon", "include": {"score": true} }),
+        ),
         (
             "search",
             json!({
@@ -127,8 +130,7 @@ pub(crate) async fn prepared_corpus(
                 .as_str()
                 .ok_or("corpus declaration name")?
                 .to_owned();
-            let mut discovery =
-                json!({"query": name, "target": "symbol", "include": ["source"], "limit": 1000});
+            let mut discovery = json!({"query": name, "target": "symbol", "include": {"source": true}, "limit": 1000});
             for field in ["scope", "packages", "revision"] {
                 if let Some(value) = request.get(field) {
                     discovery[field] = value.clone();
@@ -258,7 +260,7 @@ fn pattern_search_corpus() -> Vec<(&'static str, Value)> {
         ("search", json!({ "pattern": "beacon" })),
         (
             "search",
-            json!({ "pattern": r"fn beacon_\w+\(", "target": "file", "include": ["source"] }),
+            json!({ "pattern": r"fn beacon_\w+\(", "target": "file", "include": {"source": true} }),
         ),
         (
             "search",
@@ -279,7 +281,7 @@ fn pattern_search_corpus() -> Vec<(&'static str, Value)> {
                 "pattern": r"fn \w*beacon",
                 "scope": "global",
                 "target": "all",
-                "include": ["source"]
+                "include": {"source": true}
             }),
         ),
     ]
@@ -297,7 +299,7 @@ fn dependency_scope_search_corpus() -> Vec<(&'static str, Value)> {
         ),
         (
             "search",
-            json!({ "query": "beacon", "scope": "all", "include": ["source"] }),
+            json!({ "query": "beacon", "scope": "all", "include": {"source": true} }),
         ),
         (
             "search",
@@ -418,14 +420,14 @@ fn change_search_corpus() -> Vec<(&'static str, Value)> {
             "search",
             json!({
                 "change": { "base": "baseline", "head": "HEAD" },
-                "include": ["source"]
+                "include": {"source": true}
             }),
         ),
         (
             "search",
             json!({
                 "change": { "base": "baseline", "head": { "kind": "working_tree" } },
-                "include": ["source"]
+                "include": {"source": true}
             }),
         ),
         (

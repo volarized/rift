@@ -571,7 +571,7 @@
     "arguments": {
       "id": "rift://symbol/cargo/crates.io/itoa/rust/itoa/Buffer",
       "revision": "rift://revision/cargo/crates.io/itoa@1.0.18",
-      "include": ["documentation"]
+      "include": { "documentation": true }
     },
     "text": "\tpub struct Buffer\n\trift://source/cargo/crates.io/itoa/src/lib.rs:72 \u00b7 bytes 2357..2427\n\trift://symbol/cargo/crates.io/itoa/rust/itoa/Buffer\n\tdependency rift://revision/cargo/crates.io/itoa@1.0.18\n\n\tA correctly sized stack allocation for the formatted integer to be written\n\tinto.\n\n\t# Example\n\n\t```\n\tlet mut buffer = itoa::Buffer::new();\n\tlet printed = buffer.format(1234);\n\tassert_eq!(printed, \"1234\");\n\t```\nrelease 1.0.18\n",
     "json": {

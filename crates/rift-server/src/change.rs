@@ -864,7 +864,7 @@ mod tests {
 
         let answer = fixture.search(&json!({
             "change": {"base": "baseline"},
-            "include": ["source"]
+            "include": {"source": true}
         }))?;
 
         assert_eq!(
@@ -1852,7 +1852,7 @@ mod tests {
 
         let answer = fixture.search(&json!({
             "change": {"base": "baseline"},
-            "include": ["score"]
+            "include": {"score": true}
         }))?;
 
         assert!(answer.results[0].score.is_none(), "{answer:?}");

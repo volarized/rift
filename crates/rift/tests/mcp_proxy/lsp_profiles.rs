@@ -111,7 +111,7 @@ async fn configure_engine(root: &Path, profile: Option<&str>, script: &str) -> T
 fn search() -> TestResult<Value> {
     let selected = |scope: &str| {
         format!(
-            r#"{{ SERVICE <{}> {{ ?hit :query "beacon"; :target "symbol"; :scope "{scope}"; :paths '{{"include":["lib.rs"]}}'^^rdf:JSON; :order "path"; :include '["source"]'^^rdf:JSON; :symbol ?symbol; :source ?source; :path ?path . ?symbol :name ?name . }} }}"#,
+            r#"{{ SERVICE <{}> {{ ?hit :query "beacon"; :target "symbol"; :scope "{scope}"; :paths '{{"include":["lib.rs"]}}'^^rdf:JSON; :order "path"; :include '{{"source":true}}'^^rdf:JSON; :symbol ?symbol; :source ?source; :path ?path . ?symbol :name ?name . }} }}"#,
             "urn:rift:vocabulary:search",
         )
     };
@@ -334,7 +334,7 @@ async fn require_profile_scope(
 ) -> TestResult {
     let arguments = query::retrieval(&serde_json::from_value(json!({
         "query":"beacon", "target":"symbol", "scope":"local:docs",
-        "paths":{"include":["lib.rs"]}, "include":["source"],
+        "paths":{"include":["lib.rs"]}, "include":{"source": true},
     }))?)?;
     let scoped = proxied_call(client, "search", &serde_json::to_value(arguments)?).await?;
     assert!(
@@ -371,7 +371,7 @@ async fn require_profile_pattern(
 ) -> TestResult {
     let arguments = query::retrieval(&serde_json::from_value(json!({
         "pattern":"pub fn beacon", "target":"symbol", "scope":"local:docs",
-        "paths":{"include":["lib.rs"]}, "include":["source"],
+        "paths":{"include":["lib.rs"]}, "include":{"source": true},
     }))?)?;
     let patterned = proxied_call(client, "search", &serde_json::to_value(arguments)?).await?;
     let symbol = hit(&patterned)?;

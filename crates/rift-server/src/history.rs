@@ -1622,7 +1622,10 @@ mod tests {
         let matched = service.index().symbols("tick", 1)?[0];
         let mut request = GetSymbolParams {
             id: timeline_identity(&service, matched)?,
-            include: vec![rift_protocol::read::GetSymbolInclude::History],
+            include: rift_protocol::read::GetSymbolInclude {
+                history: true,
+                ..rift_protocol::read::GetSymbolInclude::default()
+            },
             revision: None,
             declaration_limit: 2,
             declaration_cursor: None,
@@ -1663,7 +1666,10 @@ mod tests {
         let matched = service.index().symbols("beacon_one", 1)?[0];
         let request = GetSymbolParams {
             id: timeline_identity(&service, matched)?,
-            include: vec![rift_protocol::read::GetSymbolInclude::History],
+            include: rift_protocol::read::GetSymbolInclude {
+                history: true,
+                ..rift_protocol::read::GetSymbolInclude::default()
+            },
             revision: None,
             declaration_limit: 1,
             declaration_cursor: None,

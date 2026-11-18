@@ -110,10 +110,133 @@ pub(super) fn prepare(
     }
     let mut prepared = super::PreparedNamespace {
         anchors,
+        outside_namespaces: target_paths(input, &inventory, &originals, &assigned),
         ..Default::default()
     };
     local_exports(input, selected, &requested, &mut prepared);
     prepared
+}
+
+/// Original paths of the Cargo targets other than a library, and of the modules they
+/// declare, that no library namespace reaches.
+///
+/// A library namespace is the only Rust namespace that establishes identities, so a
+/// declaration in one of these files carries none by construction. A file no target
+/// reaches stays outside this set: its declarations may belong to a library module that
+/// a file which failed analysis, or a module declaration no path resolves, hides.
+fn target_paths(
+    input: &NamespaceInput<'_>,
+    inventory: &BTreeMap<&str, &super::SelectedFile<'_>>,
+    originals: &BTreeMap<&str, &str>,
+    assigned: &BTreeMap<String, Vec<String>>,
+) -> std::collections::BTreeSet<String> {
+    let mut reached = std::collections::BTreeSet::new();
+    let mut pending = target_roots(input, inventory)
+        .into_iter()
+        .map(|root| {
+            let directory = root
+                .rsplit_once('/')
+                .map_or("", |(parent, _)| parent)
+                .to_owned();
+            (root, directory)
+        })
+        .collect::<VecDeque<_>>();
+    while let Some((path, directory)) = pending.pop_front() {
+        let Some(file) = inventory.get(path.as_str()) else {
+            continue;
+        };
+        if !reached.insert(path.clone())
+            || originals.get(path.as_str()).copied() != Some(file.source)
+            || !source_is_valid(file.syntax, file.source)
+        {
+            continue;
+        }
+        for (child, _) in module_children(file, &directory, inventory) {
+            let child_directory = child
+                .strip_suffix("/mod.rs")
+                .or_else(|| child.strip_suffix(".rs"))
+                .unwrap_or(&child)
+                .to_owned();
+            pending.push_back((child, child_directory));
+        }
+    }
+    reached.retain(|path| !assigned.contains_key(path));
+    reached
+}
+
+/// Crate roots of the captured Cargo targets other than a library: the build script,
+/// binaries, examples, integration tests, and benchmarks at their conventional paths or
+/// at the `path` a manifest names.
+fn target_roots(
+    input: &NamespaceInput<'_>,
+    inventory: &BTreeMap<&str, &super::SelectedFile<'_>>,
+) -> std::collections::BTreeSet<String> {
+    const SECTIONS: [&str; 4] = ["bin", "example", "test", "bench"];
+    const DIRECTORIES: [&str; 4] = ["src/bin", "examples", "tests", "benches"];
+    let mut roots = std::collections::BTreeSet::new();
+    for source in input.files().iter().chain(input.context_sources()) {
+        let manifest = source.path().as_str();
+        let parent = if manifest == "Cargo.toml" {
+            ""
+        } else if let Some(parent) = manifest.strip_suffix("/Cargo.toml") {
+            parent
+        } else {
+            continue;
+        };
+        if source.text().len() > input.syntax().source_bytes_max() {
+            continue;
+        }
+        let Ok(metadata) = toml::from_str::<toml::Table>(source.text()) else {
+            continue;
+        };
+        let Some(package) = metadata.get("package").and_then(toml::Value::as_table) else {
+            continue;
+        };
+        let joined = |relative: &str| {
+            ProjectPath::new(relative)
+                .ok()
+                .filter(|relative| !relative.as_str().is_empty())
+                .map(|relative| {
+                    if parent.is_empty() {
+                        relative.as_str().to_owned()
+                    } else {
+                        format!("{parent}/{}", relative.as_str())
+                    }
+                })
+        };
+        let explicit = SECTIONS
+            .iter()
+            .filter_map(|section| metadata.get(*section).and_then(toml::Value::as_array))
+            .flatten()
+            .filter_map(|target| target.get("path").and_then(toml::Value::as_str))
+            .chain(package.get("build").and_then(toml::Value::as_str))
+            .chain(["build.rs", "src/main.rs"]);
+        roots.extend(explicit.filter_map(joined));
+        for directory in DIRECTORIES {
+            let Some(directory) = joined(directory) else {
+                continue;
+            };
+            let prefix = format!("{directory}/");
+            roots.extend(
+                inventory
+                    .range(prefix.as_str()..)
+                    .map(|(path, _)| *path)
+                    .take_while(|path| path.starts_with(&prefix))
+                    .filter(|path| {
+                        let relative = &path[prefix.len()..];
+                        relative
+                            .strip_suffix(".rs")
+                            .is_some_and(|stem| !stem.contains('/'))
+                            || relative
+                                .strip_suffix("/main.rs")
+                                .is_some_and(|stem| !stem.contains('/'))
+                    })
+                    .map(|path| (*path).to_owned()),
+            );
+        }
+    }
+    roots.retain(|root| inventory.contains_key(root.as_str()));
+    roots
 }
 
 fn library_root(
