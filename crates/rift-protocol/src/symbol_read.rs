@@ -352,7 +352,8 @@ impl GetSymbolResult {
         }
     }
 
-    /// Checks exact identity, revision, and declaration associations at a serving boundary.
+    /// Checks exact identity, revision, declaration associations, and the attached history at a
+    /// serving boundary.
     #[must_use]
     pub fn is_valid_for(&self, requested: &SymbolId) -> bool {
         let Ok(identity) = crate::identity::SymbolIdentity::parse(requested.as_str()) else {
@@ -366,9 +367,13 @@ impl GetSymbolResult {
                 Self::Found {
                     symbol,
                     declarations,
+                    history,
                     ..
                 } => {
                     symbol.id.as_ref() == Some(requested)
+                        && history
+                            .as_ref()
+                            .is_none_or(|history| history.is_valid_for(requested))
                         && identity.language() == &symbol.language
                         && u64::try_from(declarations.len())
                             .is_ok_and(|length| length <= PAGE_LIMIT_MAX)
