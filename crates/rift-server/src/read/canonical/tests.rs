@@ -621,3 +621,74 @@ fn assert_measured_held_source(
         original
     );
 }
+
+#[test]
+fn query_material_keeps_original_expiry_and_releases_at_the_provider_bound() {
+    let (_directory, reads, _) = fixture(true);
+    let store = LocalSymbolViews::new(usize::MAX, [42; 32]);
+    let now = SystemTime::now();
+    let expires = now + Duration::from_secs(30);
+    let input = captured_input(&reads)
+        .with_query([1; 32], b"answer".to_vec(), Some(expires))
+        .with_sources(&reads.index)
+        .expect("sources")
+        .with_warnings(vec![rift_protocol::read::ReadWarning::GlobalAccessDisabled])
+        .expect("warnings");
+    let view = store
+        .capture_at(input, now)
+        .expect("capture")
+        .expect("view");
+    let (held, bytes) = store.query_at(&[1; 32], now).expect("query");
+    assert_eq!(held, view);
+    assert_eq!(&*bytes, b"answer");
+    assert_eq!(
+        view.expires_at,
+        chrono::DateTime::<chrono::Utc>::from(expires).to_rfc3339()
+    );
+    assert!(store.query_at(&[2; 32], now).is_none());
+    assert!(
+        store
+            .query_at(&[1; 32], expires - Duration::from_secs(1))
+            .is_some()
+    );
+    assert!(store.query_at(&[1; 32], expires).is_none());
+    assert!(store.state.lock().expect("state").views.is_empty());
+}
+
+#[test]
+fn query_material_uses_the_existing_byte_and_view_bounds() {
+    let (_directory, reads, _) = fixture(true);
+    let now = SystemTime::now();
+    let measured = LocalSymbolViews::new(usize::MAX, [43; 32]);
+    capture(&measured, &reads, now);
+    let budget = measured.state.lock().expect("state").material_bytes();
+    let limited = LocalSymbolViews::new(budget, [44; 32]);
+    capture(&limited, &reads, now);
+    let input = captured_input(&reads).with_query([1; 32], vec![0; 1024], None);
+    assert!(
+        limited
+            .capture_at(input, now)
+            .expect("byte bound")
+            .is_none()
+    );
+    assert!(limited.query_at(&[1; 32], now).is_none());
+    assert_eq!(limited.state.lock().expect("state").views.len(), 1);
+    for ordinal in 0..VIEW_SLOTS {
+        let mut key = [0; 32];
+        key[..8].copy_from_slice(&(ordinal as u64).to_be_bytes());
+        let input = captured_input(&reads).with_query(key, vec![0], None);
+        let admitted = measured.capture_at(input, now).expect("capture");
+        assert_eq!(admitted.is_some(), ordinal < VIEW_SLOTS - 1);
+    }
+    assert_eq!(
+        measured.state.lock().expect("state").views.len(),
+        VIEW_SLOTS
+    );
+    assert!(
+        measured
+            .query_at(&[0; 32], now + VIEW_LIFETIME - Duration::from_secs(1))
+            .is_some()
+    );
+    assert!(measured.query_at(&[0; 32], now + VIEW_LIFETIME).is_none());
+    assert!(measured.state.lock().expect("state").views.is_empty());
+}
