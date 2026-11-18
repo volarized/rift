@@ -46,6 +46,25 @@ pub(super) struct AcquiredAdjacency {
 }
 
 impl AcquiredAdjacency {
+    fn capture_edge_inventory(
+        &mut self,
+        reads: &rift_server::ReadService,
+    ) -> Result<(), RiftError> {
+        self.incomplete |= !reads.relationships().is_complete();
+        let maximum = usize::try_from(RECORDS_MAX).map_err(|_| coverage_failure())?;
+        for edge in reads.relationships().edges() {
+            if self.local_edges.len() >= maximum {
+                return Err(coverage_failure());
+            }
+            self.local_edges.push((
+                SymbolId(edge.from().as_str().to_owned()),
+                relation(edge.facet())?,
+                SymbolId(edge.to().as_str().to_owned()),
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) const fn is_incomplete(&self) -> bool {
         self.incomplete
     }
@@ -340,6 +359,15 @@ impl RiftMcp {
         deadline: RequestDeadline,
     ) -> Result<AcquiredAdjacency, RiftError> {
         let reads = &resolved.published.reads;
+        if required.edges
+            && !required.calls
+            && !required.references
+            && required.occurrences.is_none()
+        {
+            let mut acquired = AcquiredAdjacency::default();
+            acquired.capture_edge_inventory(reads)?;
+            return Ok(acquired);
+        }
         let context = reads.dependency_context();
         if resolved.stale.is_some() || context.is_degraded() || !context.entries().is_empty() {
             return Err(coverage_failure());
@@ -361,6 +389,9 @@ impl RiftMcp {
         let engines = self.engine_pool_for(&resolved.published).await;
         let end = deadline.walk_end(resolved.capture_elapsed);
         let mut acquired = AcquiredAdjacency::default();
+        if required.edges {
+            acquired.capture_edge_inventory(reads)?;
+        }
         let mut remaining = usize::try_from(RECORDS_MAX).unwrap_or(usize::MAX);
         let roots = rift_server::CalleeRoots::default();
         for seed in seeds {
@@ -566,7 +597,7 @@ impl<'request> AdjacencyWalk<'request> {
         claim_request(&mut self.remaining)?;
         let reads = &self.resolved.published.reads;
         let direction = self.step.direction;
-        let (engines, roots) = self.local.as_ref().ok_or_else(coverage_failure)?;
+        let (engines, _) = self.local.as_ref().ok_or_else(coverage_failure)?;
         let deadline = self.deadline.walk_end(self.resolved.capture_elapsed);
         match (direction, self.step.facet) {
             (TraversalDirection::Incoming, RelationshipFacet::References) => {
@@ -590,59 +621,138 @@ impl<'request> AdjacencyWalk<'request> {
                     Err(error) => return Err(error),
                 };
                 self.acquired.incomplete |= !references.complete;
+                self.acquired.warnings.extend(references.edge_warnings);
                 let occurrences = references.occurrences;
                 charge_records(&mut self.remaining, occurrences.len())?;
                 frontier.extend(occurrences.iter().filter_map(|item| item.enclosing.clone()));
                 self.acquired.admit_references(seed, occurrences);
             }
-            (_, RelationshipFacet::Calls) => {
-                let answer = if let Some(target) = self.acquired.installed.get(seed) {
-                    if direction != TraversalDirection::Outgoing {
-                        return Err(coverage_failure());
-                    }
-                    Box::pin(rift_server::installed_graph_calls(
-                        reads,
-                        engines,
-                        roots,
-                        seed,
-                        (
-                            &target.callee,
-                            &target.symbol.language,
-                            &target.unit,
-                            &target.source,
-                        ),
-                        deadline,
-                    ))
-                    .await
-                } else {
-                    Box::pin(rift_server::graph_calls(
-                        reads, engines, roots, seed, direction, deadline,
-                    ))
-                    .await
-                };
-                let mut calls = match answer {
-                    Ok(calls) => calls,
-                    Err(error)
-                        if error.slug() == errors::server::search_coverage_unavailable::SLUG =>
-                    {
-                        self.acquired.incomplete = true;
-                        return Ok(());
-                    }
-                    Err(error) => return Err(error),
-                };
-                self.acquired.incomplete |= !calls.complete;
-                let details = self
-                    .selected
-                    .is_some_and(|selection| selection.symbol_details);
-                if let Err(error) = self.name_package_calls(&mut calls, details).await {
-                    if self.selected.is_some() || !super::lacks_coverage(&error) {
-                        return Err(error);
-                    }
-                    self.acquired.incomplete = true;
+            (TraversalDirection::Outgoing, RelationshipFacet::References) => {
+                let references = Box::pin(rift_server::outgoing_reference_edges(
+                    reads, engines, seed, deadline,
+                ))
+                .await?;
+                self.acquired.incomplete |= !references.complete;
+                self.acquired.warnings.extend(references.edge_warnings);
+                charge_records(&mut self.remaining, references.occurrences.len())?;
+                for occurrence in references.occurrences {
+                    frontier.insert(occurrence.target.clone());
+                    self.acquired.local_edges.push((
+                        seed.clone(),
+                        SymbolRelation::References,
+                        occurrence.target.clone(),
+                    ));
+                    self.acquired.local.push(occurrence);
                 }
-                self.admit_local_calls(seed, calls, frontier)?;
             }
-            _ => return Err(coverage_failure()),
+            (_, RelationshipFacet::Calls) => self.edge_call_step(seed, frontier).await?,
+            (_, kind @ (RelationshipFacet::Extends | RelationshipFacet::Implements)) => {
+                let (edges, warnings) = Box::pin(rift_server::graph_heritage_edges(
+                    reads, engines, seed, kind, direction, deadline,
+                ))
+                .await?;
+                self.edge_static_step(seed, kind, frontier)?;
+                self.acquired.incomplete |= warnings.iter().any(|warning| {
+                    matches!(warning, ReadWarning::EngineAnalysisUnavailable { .. })
+                });
+                self.acquired.warnings.extend(warnings);
+                charge_records(&mut self.remaining, edges.len())?;
+                for edge in edges {
+                    let neighbor = match direction {
+                        TraversalDirection::Outgoing => edge.to.clone(),
+                        TraversalDirection::Incoming => edge.from.clone(),
+                    };
+                    frontier.insert(neighbor);
+                    self.acquired
+                        .local_edges
+                        .push((edge.from, relation(kind)?, edge.to));
+                }
+            }
+            (_, facet) => self.edge_static_step(seed, facet, frontier)?,
+        }
+        Ok(())
+    }
+
+    async fn edge_call_step(
+        &mut self,
+        seed: &SymbolId,
+        frontier: &mut BTreeSet<SymbolId>,
+    ) -> Result<(), RiftError> {
+        let reads = &self.resolved.published.reads;
+        let (engines, roots) = self.local.as_ref().ok_or_else(coverage_failure)?;
+        let direction = self.step.direction;
+        let deadline = self.deadline.walk_end(self.resolved.capture_elapsed);
+        let answer = if let Some(target) = self.acquired.installed.get(seed) {
+            if direction != TraversalDirection::Outgoing {
+                return Err(coverage_failure());
+            }
+            Box::pin(rift_server::installed_graph_calls(
+                reads,
+                engines,
+                roots,
+                seed,
+                (
+                    &target.callee,
+                    &target.symbol.language,
+                    &target.unit,
+                    &target.source,
+                ),
+                deadline,
+            ))
+            .await
+        } else {
+            Box::pin(rift_server::graph_calls(
+                reads, engines, roots, seed, direction, deadline,
+            ))
+            .await
+        };
+        let mut calls = match answer {
+            Ok(calls) => calls,
+            Err(error) if error.slug() == errors::server::search_coverage_unavailable::SLUG => {
+                self.acquired.incomplete = true;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+
+        self.acquired.incomplete |= !calls.complete;
+        self.acquired.warnings.append(&mut calls.edge_warnings);
+        let details = self
+            .selected
+            .is_some_and(|selection| selection.symbol_details);
+        if let Err(error) = self.name_package_calls(&mut calls, details).await {
+            if self.selected.is_some() || !super::lacks_coverage(&error) {
+                return Err(error);
+            }
+            self.acquired.incomplete = true;
+        }
+        self.admit_local_calls(seed, calls, frontier)?;
+        Ok(())
+    }
+
+    fn edge_static_step(
+        &mut self,
+        seed: &SymbolId,
+        kind: RelationshipFacet,
+        frontier: &mut BTreeSet<SymbolId>,
+    ) -> Result<(), RiftError> {
+        let store = self.resolved.published.reads.relationships();
+        self.acquired.incomplete |= !store.is_complete();
+        let identity = rift_core::SymbolId::new(seed.as_str())?;
+        let adjacent = match self.step.direction {
+            TraversalDirection::Incoming => store.incoming(&identity),
+            TraversalDirection::Outgoing => store.outgoing(&identity),
+        };
+        let relation = relation(kind)?;
+        for edge in adjacent.iter().filter(|edge| edge.facet() == kind) {
+            charge_records(&mut self.remaining, 1)?;
+            let from = SymbolId(edge.from().as_str().to_owned());
+            let to = SymbolId(edge.to().as_str().to_owned());
+            frontier.insert(match self.step.direction {
+                TraversalDirection::Incoming => from.clone(),
+                TraversalDirection::Outgoing => to.clone(),
+            });
+            self.acquired.local_edges.push((from, relation, to));
         }
         Ok(())
     }
@@ -1105,6 +1215,14 @@ fn relation(facet: RelationshipFacet) -> Result<SymbolRelation, RiftError> {
     match facet {
         RelationshipFacet::Calls => Ok(SymbolRelation::Calls),
         RelationshipFacet::References => Ok(SymbolRelation::References),
+        RelationshipFacet::Imports => Ok(SymbolRelation::Imports),
+        RelationshipFacet::Aliases => Ok(SymbolRelation::Aliases),
+        RelationshipFacet::Extends => Ok(SymbolRelation::Extends),
+        RelationshipFacet::Implements => Ok(SymbolRelation::Implements),
+        RelationshipFacet::Declares => Ok(SymbolRelation::Declares),
+        RelationshipFacet::Reads => Ok(SymbolRelation::Reads),
+        RelationshipFacet::Writes => Ok(SymbolRelation::Writes),
+        RelationshipFacet::HasType => Ok(SymbolRelation::HasType),
         _ => Err(coverage_failure()),
     }
 }

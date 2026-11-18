@@ -352,6 +352,15 @@ fn facet(name: &str) -> Option<RelationshipFacet> {
     match name {
         "calls" => Some(RelationshipFacet::Calls),
         "references" => Some(RelationshipFacet::References),
+        "imports" => Some(RelationshipFacet::Imports),
+        "aliases" => Some(RelationshipFacet::Aliases),
+        "extends" => Some(RelationshipFacet::Extends),
+        "implements" => Some(RelationshipFacet::Implements),
+        "declares" => Some(RelationshipFacet::Declares),
+        "reads" => Some(RelationshipFacet::Reads),
+        "writes" => Some(RelationshipFacet::Writes),
+        "hasType" => Some(RelationshipFacet::HasType),
+
         _ => None,
     }
 }

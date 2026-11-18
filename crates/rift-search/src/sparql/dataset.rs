@@ -108,6 +108,22 @@ pub enum SymbolRelation {
     Calls,
     /// The source mentions the target.
     References,
+    /// The source brings the target into scope.
+    Imports,
+    /// The source is another name for the target.
+    Aliases,
+    /// The source inherits from the target.
+    Extends,
+    /// The source fulfils the target's interface.
+    Implements,
+    /// The source declares the target.
+    Declares,
+    /// The source reads the target's value.
+    Reads,
+    /// The source assigns to the target.
+    Writes,
+    /// The source is typed by the target.
+    HasType,
     /// The source was renamed from the target.
     RenamedFrom,
 }
@@ -548,6 +564,14 @@ impl SymbolRelation {
         match self {
             Self::Calls => VocabularyProperty::Calls,
             Self::References => VocabularyProperty::References,
+            Self::Imports => VocabularyProperty::Imports,
+            Self::Aliases => VocabularyProperty::Aliases,
+            Self::Extends => VocabularyProperty::Extends,
+            Self::Implements => VocabularyProperty::Implements,
+            Self::Declares => VocabularyProperty::Declares,
+            Self::Reads => VocabularyProperty::Reads,
+            Self::Writes => VocabularyProperty::Writes,
+            Self::HasType => VocabularyProperty::HasType,
             Self::RenamedFrom => VocabularyProperty::RenamedFrom,
         }
     }

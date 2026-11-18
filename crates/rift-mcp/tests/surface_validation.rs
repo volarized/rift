@@ -1240,6 +1240,14 @@ async fn outgoing_walks_over_scripted_engines_match_the_served_schemas() -> Test
         !workspace_client::query::rows(&structured)?.is_empty(),
         "{structured}"
     );
+    assert!(
+        structured["warnings"]
+            .as_array()
+            .is_some_and(|warnings| warnings
+                .iter()
+                .any(|warning| warning["code"] == "engine_readiness_unconfirmed")),
+        "{structured}"
+    );
     client.cancel().await?;
     Ok(())
 }
