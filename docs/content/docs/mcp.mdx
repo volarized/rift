@@ -130,7 +130,7 @@ LIMIT 5
 
 The service's `:query` is the ranked text. The outer request's `query` is SPARQL.
 Project `:source` or `:score` when needed. Use outer `ORDER BY`, `LIMIT`, and `OFFSET`
-to order and select the rows. The service's `:limit` and `:page_index` select a producer page
+to order and select the rows. The service's `:max_results` and `:page` select a producer page
 before SPARQL evaluates filters, joins, and aggregates.
 
 ### Hybrid search [#search-hybrid]
@@ -237,16 +237,10 @@ An incomplete history store cannot establish a complete answer.
 
 ### Paging and retained results
 
-The response's `pagination.next_query` is the next request's SPARQL statement. Send it
-unchanged as `query` to read the next transport page of the original execution. A source
-edit does not replace its rows, blank nodes, or selected source bytes.
-
-The continuation names one retained page and expires with the original view. After expiry,
-run the original statement again to start a new execution. SPARQL `LIMIT` and `OFFSET`
-apply before the transport pages are formed.
-
-See the [protocol reference](/docs/developer/protocol/mcp#search) for result terms, bounds,
-required facts, and migration from the former selector fields.
+`page` starts at 1 and defaults to 1. `max_results` defaults to 10. The response carries
+`pagination: { page, pages, max_results, total }`. A page past the last returns an empty list.
+Send the returned `revision` with later pages. SPARQL `LIMIT` and `OFFSET` bound the result
+set before paging. `ASK` returns a boolean without pagination.
 
 ## Symbols [#tool-get_symbol]
 
@@ -298,9 +292,8 @@ at most 32 of them; `co_changes_truncated` counts what either bound left out.
 The local server fills its history store in the background; an incomplete history answers
 `complete: false` until the store holds the selected revision.
 
-`declaration_limit` bounds returned declarations; a returned `declaration_cursor` continues
-the same symbol at the revision the answer names. Once the index serves another tree, the
-cursor refuses and the read starts again without it. It is not hit paging.
+`max_results` bounds returned declarations. Send `page` and the reported `revision` for
+later declarations. The server refuses a tree revision once the index serves another tree.
 
 <span id="get_symbol-scope" />
 
@@ -317,8 +310,8 @@ A package or runtime identity names an owner across releases. Discover it with
 If the requested release has no complete coverage, `search` can return an unavailable
 answer. Check `rift server logs` for the release and the coverage details.
 
-Several declaration bindings share one identity. `declaration_limit` and its returned cursor
-continue those bindings at the same revision:
+Several declaration bindings share one identity. `page` and `max_results` select those bindings
+at the same revision:
 
 <ReadExample name="multi-declaration-full" />
 
@@ -361,9 +354,7 @@ names, or at the version the project's dependencies pin when the request names n
 The declaration's `source.span.unit` names its source unit, such as
 `rift://source/cargo/crates.io/demo/src/lib.rs`.
 
-If the answer includes `facet_cursor`, send it with the same symbol and revision to
-continue declarations. After an edit, read again before using the returned byte ranges.
-See the [facets reference](/docs/developer/protocol/mcp#tool-facets) for the response shape.
+Send `page` with the same symbol and revision to read later declarations.
 
 ## Feedback [#tool-feedback]
 
@@ -400,9 +391,8 @@ the local index. See [Index](/docs/developer/architecture#index) for local updat
 ## Reading results [#reads]
 
 `search` projects the variables named in `SELECT`, returns a boolean for `ASK`, or returns
-RDF triples for a graph query. Follow `pagination.next_query` to read the next page of the
-same execution. An exact `get_symbol` read bounds declaration bindings with
-`declaration_limit` and continues with `declaration_cursor` at the reported revision.
+RDF triples for a graph query. `page` and `max_results` select answer rows. Exact `get_symbol`
+and `facets` reads select declarations with the same pair at the reported revision.
 
 A query that requires missing facts returns `outcome: "unavailable"`. A completed query can
 return an empty result when its required facts are available. Run `rift server logs` to

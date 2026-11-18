@@ -20,7 +20,7 @@ Read `rift://map` first for served languages, workspace layout, and language ser
 | The exact symbol identity is known. | `get_symbol` |
 | A package or runtime declaration is needed. | `search` (with `:scope "global"` or `"all"` in `SERVICE :search`; read the returned symbol IRI with `get_symbol`) |
 | A package version the project does not use, or a package it lacks, is needed. | `search` (with `:packages` and `:scope "global"` or `"all"` in `SERVICE :search`; read the returned IRI with `get_symbol`, naming the hit's release as `revision`) |
-| The source and syntax structure of a symbol's declarations are needed. | `facets` (with `symbol`; return `facet_cursor` with the same symbol and revision to continue) |
+| The source and syntax structure of a symbol's declarations are needed. | `facets` (with `symbol`; send `page` with the same symbol and revision to continue) |
 | The declarations that reference a symbol, its impact (what changes when it does), or a path between two symbols is needed. | `search` (with SPARQL property paths) |
 | The declarations two revisions, or a revision and the working tree, hold differently are needed. | `search` (with `:change` in `SERVICE :search`) |
 | The commit that made a change, found by its message, is needed. | `search` (with `:target "commit"` in `SERVICE :search`) |
@@ -37,7 +37,7 @@ Read `rift://map` first for served languages, workspace layout, and language ser
 - Regex: `SELECT ?p {SERVICE :search {?h :pattern "TODO|FIXME"; :target "file"; :path ?p}}`
 - Count: `SELECT (COUNT(?u) AS ?n) {<symbol-id> :usages ?u}`
 
-Follow `pagination.next_query` unchanged for transport pages. Read exact symbols and facets with the selected `revision`. Missing required facts return a typed unavailable outcome.
+Pass `page` and `max_results` to read another page at the same `revision`. Read exact symbols and facets with the selected `revision`. Missing required facts return a typed unavailable outcome.
 
 ## When a call refuses
 

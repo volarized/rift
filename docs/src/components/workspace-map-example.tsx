@@ -39,7 +39,7 @@ const exampleMap = {
       availability: "canonical",
     },
   ],
-  pagination: { page_index: 0, total_pages: 1 },
+  pagination: { page: 0, pages: 1 },
 };
 
 const languageNames: Record<string, string> = {

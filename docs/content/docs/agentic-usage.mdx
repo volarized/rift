@@ -116,8 +116,8 @@ The hook puts the search in a SPARQL `query` that calls `SERVICE :search`.
 
 - For `Grep`, the hook passes the same [regex](/docs/mcp#search-pattern) as `:pattern`. It
   maps `path`, `glob`, and `type` to the `include` list in `:paths`, and adds `(?i)` for
-  `-i`. The hook maps `head_limit` to `:limit` and an `offset` at a page boundary to
-  `:page_index`.
+  `-i`. The hook maps `head_limit` to `:max_results` and an `offset` at a page boundary to
+  `:page`.
 - For `Glob`, the hook selects `:target "file"` and passes the regex `\A` as `:pattern`.
   The pattern matches once per indexed file selected by `:paths`, and the query returns
   its path.
