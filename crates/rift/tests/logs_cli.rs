@@ -523,7 +523,12 @@ async fn repository_foreground(
         }
         tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
     }
-    Err("the repository server did not publish its election document".into())
+    Err(format!(
+        "the repository server did not publish its election document in {}: {:?}",
+        state_directory.display(),
+        rift_mcp::probe_state_directory(state_directory),
+    )
+    .into())
 }
 
 /// Stops the repository server through `rift server stop --repository` in `root` and
@@ -545,7 +550,16 @@ async fn stop_repository_foreground(root: &Path, child: &mut RepositoryForegroun
             );
             return Ok(());
         }
-        tokio::time::timeout_at(deadline, tokio::time::sleep(PRESENCE_POLL_INTERVAL)).await?;
+        if tokio::time::Instant::now() + PRESENCE_POLL_INTERVAL >= deadline {
+            return Err(format!(
+                "the repository server outlived its stop by {REPOSITORY_STOP_MAX:?}; the stop \
+                 printed {:?} and {:?}",
+                String::from_utf8_lossy(&stopped.stdout),
+                String::from_utf8_lossy(&stopped.stderr),
+            )
+            .into());
+        }
+        tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
     }
 }
 
