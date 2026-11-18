@@ -65,11 +65,9 @@ from rift_dev.machine import machine, machine_line
 from rift_dev.nextest_run import CollectionSummary, retained_collector
 from rift_dev.query import (
     bindings,
-    declaration_request,
     iri,
     literal,
     optional_iri,
-    project_source_unit,
     retrieval_batch_request,
     retrieval_request,
 )
@@ -232,6 +230,8 @@ NEXTJS_SAMPLE_PATHS = (
 )
 CORPUS_COLUMNS = ("symbol", "name", "kind", "language", "path", "unit", "start", "end")
 PATH_HIT_LIMIT = 1000
+# A sampled declaration without a canonical identity is checked against its hit's source.
+SAMPLE_COLUMNS = (*CORPUS_COLUMNS, "source")
 
 
 def catalog_paths(workspace: JsonObject) -> dict[str, list[str]]:
@@ -320,9 +320,9 @@ async def _read_sample_query(
     requests = [sample_path_request(path) for path in paths]
     multiple = len(paths) > 1
     request = (
-        retrieval_batch_request(requests, CORPUS_COLUMNS)
+        retrieval_batch_request(requests, SAMPLE_COLUMNS)
         if multiple
-        else corpus_request(requests[0])
+        else retrieval_request(requests[0], SAMPLE_COLUMNS)
     )
     answer = await settled_local(client, "search", request)
     warnings(answer)
@@ -780,7 +780,7 @@ class Corpus:
             answer = await settled_local(
                 client,
                 "search",
-                corpus_request(sample_path_request(path, query)),
+                retrieval_request(sample_path_request(path, query), SAMPLE_COLUMNS),
             )
             warnings(answer)
             found = bindings(answer)
@@ -1229,20 +1229,13 @@ class Corpus:
                 )
                 require(path.read_bytes() == content, f"read changed {path}")
                 return 0
-            # Search reads the captured declaration when no canonical symbol identity exists.
-            request = declaration_request(literal(hit, "name"))
-            query = string_value(request.get("query"), "declaration query").rstrip()
-            request["query"] = query.removesuffix("}") + (
-                f" FILTER(?unit = <{project_source_unit(unit)}> && ?end = {end}) }}"
+            # A declaration without a canonical identity has no graph symbol to read, and
+            # graph coverage can exclude its file. The retrieval read that sampled it
+            # carries its source.
+            require(
+                literal(hit, "source").encode() == content[start:end],
+                f"search source disagrees with captured bytes at {path}:{start}-{end}",
             )
-            answer = await client.call("search", request)
-            rows = bindings(answer)
-            require(bool(rows), f"search omitted declaration source at {path}:{end}")
-            for row in rows:
-                source_start = int(literal(row, "start"))
-                source_end = int(literal(row, "end"))
-                require(0 <= source_start <= source_end <= len(content), "declaration range exceeds source")
-                require(literal(row, "source").encode() == content[source_start:source_end], f"search source disagrees at {path}")
             require(path.read_bytes() == content, f"read changed {path}")
             return 0
 
@@ -1308,7 +1301,8 @@ class Corpus:
             if any(
                 element.get("index") == 0
                 and unit_path(element) == unit
-                and object_value(element.get("range"), "element range").get("end") == end
+                and object_value(element.get("range"), "element range").get("end")
+                == end
                 for element in elements
             ):
                 return

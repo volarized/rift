@@ -229,7 +229,9 @@ def facet_syntax(answer: JsonObject) -> list[JsonObject]:
     return [
         object_value(element, "syntax element")
         for value in array_value(answer.get("declarations"), "facets declarations")
-        for element in array_value(object_value(value, "declaration").get("syntax"), "syntax")
+        for element in array_value(
+            object_value(value, "declaration").get("syntax"), "syntax"
+        )
     ]
 
 
