@@ -1152,7 +1152,12 @@ mod tests {
         .expect("unproved declaration does not prevent documentation publication");
         let path = rift_core::ProjectPath::new("module.py").expect("source path");
         let file = workspace.file(&path).expect("retained source");
-        assert_eq!(file.syntax().symbols()[0].name, "unproved");
+        assert!(
+            file.syntax()
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.name == "unproved")
+        );
         let index = workspace.documentation().index();
         assert!(!index.sources.is_empty());
         assert!(index.blocks.iter().all(|block| block.symbol.is_none()));

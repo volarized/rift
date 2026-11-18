@@ -1,3 +1,6 @@
+pub(super) mod exports;
+pub(super) use exports::prepare as prepare_exports;
+
 use crate::ArchiveMemberKind;
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -20,7 +20,12 @@
 //! - A definition's docstring - the body's leading string expression - is
 //!   carried as plain-text documentation with the quotes stripped. A
 //!   module-level `name.__doc__ = "literal"` documents the module-level
-//!   definition it names instead.
+//!   definition it names instead, without a documentation range, since the
+//!   string sits outside the definition's span. A literal string statement directly after
+//!   an assignment that declares one variable documents that variable.
+//! - A module-level `from module import name as name`, the typing
+//!   convention's explicit re-export, records an export binding; the
+//!   namespace places it as an alias in the importing module.
 //! - Python states no authored visibility, so `visibility` stays `None`;
 //!   the leading-underscore convention is a reading habit, not syntax.
 
@@ -52,6 +57,10 @@ const DECORATED_KIND: &str = "decorated_definition";
 const BLOCK_KIND: &str = "block";
 /// Grammar spelling of the module root.
 const MODULE_KIND: &str = "module";
+/// Provider-local name of the module itself, separate from Python identifiers.
+pub(crate) const MODULE_QUALIFIED_NAME: &str = ".";
+/// Grammar spelling of a comment before a module docstring.
+const COMMENT_KIND: &str = "comment";
 /// Grammar spelling of a statement holding one expression.
 const EXPRESSION_STATEMENT_KIND: &str = "expression_statement";
 /// Grammar spelling of a string literal.
@@ -91,6 +100,14 @@ const CALL_KIND: &str = "call";
 const TYPED_PARAMETER_KIND: &str = "typed_parameter";
 /// Grammar spelling of the string's opening delimiter with its prefix.
 const STRING_START_KIND: &str = "string_start";
+/// Grammar spelling of a `from module import name` statement.
+const IMPORT_FROM_KIND: &str = "import_from_statement";
+/// Grammar spelling of one `name as alias` import.
+const ALIASED_IMPORT_KIND: &str = "aliased_import";
+/// Grammar field holding the module a `from` import reads.
+const MODULE_NAME_FIELD: &str = "module_name";
+/// Grammar field holding the name an aliased import binds.
+const ALIAS_FIELD: &str = "alias";
 /// Targets that bind every name they hold: `a, b`, `(a, b)`, `[a, *b]`.
 const TARGET_PATTERN_KINDS: [&str; 4] = [
     "pattern_list",
@@ -143,6 +160,7 @@ struct PythonKinds {
     decorated: u16,
     block: u16,
     module: u16,
+    comment: u16,
     expression_statement: u16,
     string: u16,
     string_content: u16,
@@ -155,6 +173,8 @@ struct PythonKinds {
     call: u16,
     typed_parameter: u16,
     string_start: u16,
+    import_from: u16,
+    aliased_import: u16,
     target_patterns: Vec<u16>,
     declaring_statements: Vec<u16>,
     declaring_clauses: Vec<u16>,
@@ -165,6 +185,8 @@ struct PythonKinds {
     object: NonZeroU16,
     attribute_name: NonZeroU16,
     parameters: NonZeroU16,
+    module_name: NonZeroU16,
+    alias: NonZeroU16,
 }
 
 impl PythonKinds {
@@ -182,6 +204,7 @@ impl PythonKinds {
             decorated: kind_id(language, DECORATED_KIND),
             block: kind_id(language, BLOCK_KIND),
             module: kind_id(language, MODULE_KIND),
+            comment: kind_id(language, COMMENT_KIND),
             expression_statement: kind_id(language, EXPRESSION_STATEMENT_KIND),
             string: kind_id(language, STRING_KIND),
             string_content: kind_id(language, STRING_CONTENT_KIND),
@@ -194,6 +217,8 @@ impl PythonKinds {
             call: kind_id(language, CALL_KIND),
             typed_parameter: kind_id(language, TYPED_PARAMETER_KIND),
             string_start: kind_id(language, STRING_START_KIND),
+            import_from: kind_id(language, IMPORT_FROM_KIND),
+            aliased_import: kind_id(language, ALIASED_IMPORT_KIND),
             target_patterns: TARGET_PATTERN_KINDS
                 .map(|kind| kind_id(language, kind))
                 .to_vec(),
@@ -210,6 +235,8 @@ impl PythonKinds {
             object: field_id(language, OBJECT_FIELD),
             attribute_name: field_id(language, ATTRIBUTE_FIELD),
             parameters: field_id(language, PARAMETERS_FIELD),
+            module_name: field_id(language, MODULE_NAME_FIELD),
+            alias: field_id(language, ALIAS_FIELD),
         }
     }
 }
@@ -316,9 +343,7 @@ impl PythonRules {
         self.string_text(string, text)
     }
 
-    /// One definition's declaration facts, shared by `def` and `class`. A
-    /// module-level definition a literal `__doc__` assignment names takes
-    /// that documentation; any other takes its docstring.
+    /// One definition's declaration facts, shared by `def` and `class`.
     fn definition_declaration(
         &self,
         visited: Visited<'_, '_>,
@@ -334,14 +359,7 @@ impl PythonRules {
             Some(body) => Some(extract::byte_range(body)?),
             None => None,
         };
-        let assigned = self
-            .at_module_level(visited)
-            .then(|| self.assigned_docs.get(&name))
-            .flatten();
-        let (content, documentation_ranges) = match assigned {
-            Some(assigned) => assigned.clone(),
-            None => self.docstring(node, text)?,
-        };
+        let (content, documentation_ranges) = self.docstring(node, text)?;
         let (documentation, documentation_ranges) = if content.is_empty() {
             (Vec::new(), Vec::new())
         } else {
@@ -364,13 +382,42 @@ impl PythonRules {
         }))
     }
 
-    /// Whether a definition sits directly in the module, decorated or not.
-    fn at_module_level(&self, visited: Visited<'_, '_>) -> bool {
-        let holder = visited
-            .parent()
-            .filter(|parent| parent.node().kind_id() == self.kinds.decorated)
-            .map_or(visited.parent(), Visited::parent);
-        holder.is_some_and(|holder| holder.node().kind_id() == self.kinds.module)
+    /// The file's module declaration and leading literal docstring. Empty files
+    /// carry no declaration because a source binding requires a non-empty range.
+    fn module_declaration(
+        &self,
+        node: Node<'_>,
+        text: &str,
+    ) -> Result<Option<Declaration>, RiftError> {
+        if node.start_byte() == node.end_byte() {
+            return Ok(None);
+        }
+        let mut cursor = node.walk();
+        let string = node
+            .named_children(&mut cursor)
+            .find(|child| child.kind_id() != self.kinds.comment)
+            .and_then(|statement| literal_string(self.kinds, statement, text));
+        let (content, documentation_ranges) = match string {
+            Some(string) => self.string_text(string, text)?,
+            None => (String::new(), Vec::new()),
+        };
+        let documentation = if content.is_empty() {
+            Vec::new()
+        } else {
+            vec![Documentation {
+                format: DocumentationFormat::Plain,
+                text: content,
+            }]
+        };
+        Ok(Some(Declaration {
+            name: MODULE_KIND.to_owned(),
+            kind: MODULE_KIND,
+            facets: vec![SymbolFacet::Namespace, SymbolFacet::Module],
+            visibility: None,
+            body_range: None,
+            documentation,
+            documentation_ranges,
+        }))
     }
 
     /// Whether a `def` sits directly in a class body, decorated or not.
@@ -726,7 +773,205 @@ fn assigned_docs(
     Ok(docs)
 }
 
+/// The literal string a statement holds alone, as in a docstring; `None`
+/// for any other statement and for a formatted string, whose text depends on
+/// running the module.
+fn literal_string<'tree>(
+    kinds: &PythonKinds,
+    statement: Node<'tree>,
+    text: &str,
+) -> Option<Node<'tree>> {
+    if statement.kind_id() != kinds.expression_statement || statement.named_child_count() != 1 {
+        return None;
+    }
+    let string = statement
+        .named_child(0)
+        .filter(|expression| expression.kind_id() == kinds.string)?;
+    let formatted = string
+        .named_child(0)
+        .filter(|start| start.kind_id() == kinds.string_start)
+        .and_then(|start| text.get(start.byte_range()))
+        .is_none_or(|start| start.contains(['f', 'F', 'b', 'B']));
+    (!formatted).then_some(string)
+}
+
+/// Documents each variable that one assignment declares alone with the
+/// literal string statement directly after it, the attribute docstring
+/// convention: `LIMIT = 10` followed by `"""Most rows per page."""`. The
+/// declaration's span extends over that string, as it does over attached doc
+/// comments in other languages. A declaration that already carries
+/// documentation keeps it.
+///
+/// Runs after the bounded walk accepted the tree, and reads each statement
+/// list once, so the work is linear in the tree's size.
+fn attach_attribute_docs(
+    rules: &PythonRules,
+    root: Node<'_>,
+    text: &str,
+    symbols: &mut [crate::SyntaxSymbol],
+) -> Result<(), RiftError> {
+    let documented = rules.attribute_docs(root, text)?;
+    for symbol in symbols {
+        if symbol.kind != VARIABLE_KIND_WORD || !symbol.documentation.is_empty() {
+            continue;
+        }
+        if let Some(((content, ranges), end)) = documented.get(&symbol.item_range) {
+            symbol.documentation = vec![Documentation {
+                format: DocumentationFormat::Plain,
+                text: content.clone(),
+            }]
+            .into();
+            symbol.documentation_ranges.clone_from(ranges);
+            symbol.range.end = symbol.range.end.max(*end);
+        }
+    }
+    Ok(())
+}
+
+type AttributeDocs = BTreeMap<crate::ByteRange, (StringText, u64)>;
+
+impl PythonRules {
+    fn attach_assigned_docs(&self, symbols: &mut [crate::SyntaxSymbol]) {
+        for symbol in symbols {
+            if symbol.container.is_some() || symbol.kind == MODULE_KIND {
+                continue;
+            }
+            let Some((content, _)) = self.assigned_docs.get(&symbol.name) else {
+                continue;
+            };
+            symbol.documentation = if content.is_empty() {
+                Vec::new()
+            } else {
+                vec![Documentation {
+                    format: DocumentationFormat::Plain,
+                    text: content.clone(),
+                }]
+            }
+            .into();
+            // Assigned documentation sits outside the declaration's source range.
+            symbol.documentation_ranges.clear();
+        }
+    }
+
+    fn single_assignment(&self, assignment: Node<'_>) -> bool {
+        let kinds = self.kinds;
+        if assignment.kind_id() != kinds.assignment {
+            return false;
+        }
+        let single = assignment
+            .child_by_field_id(kinds.left.get())
+            .is_some_and(|target| [kinds.identifier, kinds.attribute].contains(&target.kind_id()));
+        let chained = assignment
+            .child_by_field_id(kinds.right.get())
+            .is_some_and(|value| value.kind_id() == kinds.assignment);
+        single && !chained
+    }
+
+    fn attribute_block_docs(
+        &self,
+        block: Node<'_>,
+        text: &str,
+        documented: &mut AttributeDocs,
+    ) -> Result<(), RiftError> {
+        let mut cursor = block.walk();
+        let mut previous: Option<Node<'_>> = None;
+        for statement in block.named_children(&mut cursor) {
+            let last = previous.replace(statement);
+            let Some(assignment) = last
+                .filter(|last| last.kind_id() == self.kinds.expression_statement)
+                .and_then(|last| last.named_child(0))
+                .filter(|assignment| self.single_assignment(*assignment))
+            else {
+                continue;
+            };
+            let Some(string) = literal_string(self.kinds, statement, text) else {
+                continue;
+            };
+            let (content, ranges) = self.string_text(string, text)?;
+            if content.is_empty() {
+                continue;
+            }
+            let end = extract::byte_range(statement)?.end;
+            documented.insert(extract::byte_range(assignment)?, ((content, ranges), end));
+        }
+        Ok(())
+    }
+
+    /// Reads every accepted syntax element and statement list once.
+    fn attribute_docs(&self, root: Node<'_>, text: &str) -> Result<AttributeDocs, RiftError> {
+        let mut documented = BTreeMap::new();
+        let mut cursor = root.walk();
+        'walk: loop {
+            let node = cursor.node();
+            if [self.kinds.module, self.kinds.block].contains(&node.kind_id()) {
+                self.attribute_block_docs(node, text, &mut documented)?;
+            }
+            if cursor.goto_first_child() {
+                continue;
+            }
+            loop {
+                if cursor.goto_next_sibling() {
+                    continue 'walk;
+                }
+                if !cursor.goto_parent() {
+                    break 'walk;
+                }
+            }
+        }
+        Ok(documented)
+    }
+}
+
 impl GrammarRules for PythonRules {
+    /// A module-level `from module import name as name`, which re-exports
+    /// `name` by the typing convention, binds `local` to the imported name,
+    /// `exported` to the alias, and `source` to the module as written.
+    fn export_binding(
+        &self,
+        visited: Visited<'_, '_>,
+        text: &str,
+        _qualification: &str,
+    ) -> Result<Option<crate::SyntaxExportBinding>, RiftError> {
+        let node = visited.node();
+        if node.kind_id() != self.kinds.aliased_import {
+            return Ok(None);
+        }
+        let Some(statement) = visited
+            .parent()
+            .filter(|parent| parent.node().kind_id() == self.kinds.import_from)
+        else {
+            return Ok(None);
+        };
+        if self.statement_scope(statement) != Some(DeclarationScope::Module) {
+            return Ok(None);
+        }
+        let (Some(name), Some(alias), Some(module)) = (
+            node.child_by_field_id(self.kinds.name.get()),
+            node.child_by_field_id(self.kinds.alias.get()),
+            statement
+                .node()
+                .child_by_field_id(self.kinds.module_name.get()),
+        ) else {
+            return Ok(None);
+        };
+        let spelled = |node: Node<'_>| text.get(node.byte_range());
+        if name.named_child_count() != 1
+            || spelled(name).is_none()
+            || spelled(name) != spelled(alias)
+        {
+            return Ok(None);
+        }
+        Ok(Some(crate::SyntaxExportBinding {
+            kind: crate::SyntaxExportKind::Named,
+            range: extract::byte_range(statement.node())?,
+            local: Some(extract::byte_range(name)?),
+            exported: Some(extract::byte_range(alias)?),
+            source: Some(extract::byte_range(module)?),
+            container: None,
+            type_only: false,
+        }))
+    }
+
     fn python_overload(
         &self,
         visited: Visited<'_, '_>,
@@ -758,6 +1003,9 @@ impl GrammarRules for PythonRules {
     ) -> Result<Option<Declaration>, RiftError> {
         let node = visited.node();
         let id = node.kind_id();
+        if id == self.kinds.module {
+            return self.module_declaration(node, text);
+        }
         if id == self.kinds.function {
             if self.is_method(visited) {
                 let facets = self.method_facets(visited, text);
@@ -916,8 +1164,21 @@ impl SyntaxProvider for PythonSyntaxProvider {
             assigned_docs: BTreeMap::new(),
         };
         rules.assigned_docs = assigned_docs(&rules, tree.root_node(), source.text)?;
-        let (nodes, symbols) =
-            extract::extract(tree.root_node(), source, limits, &self.language, &rules)?;
+        let (nodes, mut symbols, export_bindings) = extract::extract_with_export_bindings(
+            tree.root_node(),
+            source,
+            limits,
+            &self.language,
+            &rules,
+        )?;
+        if let Some(module) = symbols
+            .first_mut()
+            .filter(|symbol| symbol.kind == MODULE_KIND)
+        {
+            MODULE_QUALIFIED_NAME.clone_into(&mut module.qualified_name);
+        }
+        rules.attach_assigned_docs(&mut symbols);
+        attach_attribute_docs(&rules, tree.root_node(), source.text, &mut symbols)?;
         Ok(SyntaxDocument::new(
             self.language.clone(),
             source.path.clone(),
@@ -925,13 +1186,14 @@ impl SyntaxProvider for PythonSyntaxProvider {
             symbols,
             tree.root_node().has_error(),
         )
+        .with_export_bindings(export_bindings)
         .with_source_witness(source.text)
         .with_syntax_limits(limits))
     }
 
     fn node_facets(&self, kind: &str) -> Vec<NodeFacet> {
         let mut facets = Vec::new();
-        if kind.ends_with("_definition") {
+        if kind == MODULE_KIND || kind.ends_with("_definition") {
             facets.extend([NodeFacet::Declaration, NodeFacet::Definition]);
         }
         if kind == BLOCK_KIND {
@@ -957,6 +1219,7 @@ pub(crate) fn restored_symbol_kind(name: &str) -> Option<&'static str> {
         VARIABLE_KIND_WORD,
         METHOD_KIND_WORD,
         TYPE_ALIAS_KIND_WORD,
+        MODULE_KIND,
     ]
     .into_iter()
     .find(|word| *word == name)
@@ -1190,7 +1453,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             names,
-            ["a", "b"],
+            [".", "a", "b"],
             "an attribute outside a method declares nothing"
         );
     }

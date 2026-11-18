@@ -165,6 +165,9 @@ pub(crate) fn prepare_context(
             );
         }
     }
+    if roots_accepted {
+        python::prepare_exports(input, selected, &captured, &roots, &mut prepared);
+    }
     prepared
 }
 
@@ -190,18 +193,23 @@ fn identity_anchors_with_roots(
     };
     let mut anchors = BTreeMap::new();
     for symbol in syntax.symbols() {
-        let Some(name) = python_declaration_name(symbol) else {
-            continue;
+        let qualified_path = if symbol.kind == "module" {
+            module.clone()
+        } else {
+            let Some(name) = python_declaration_name(symbol) else {
+                continue;
+            };
+            if symbol.qualified_name != name {
+                continue;
+            }
+            let names = name.split('.').collect::<Vec<_>>();
+            if !names.iter().all(|name| python_identifier_is_valid(name)) {
+                continue;
+            }
+            let mut qualified_path = module.clone();
+            qualified_path.extend(names.into_iter().map(str::to_owned));
+            qualified_path
         };
-        if symbol.qualified_name != name {
-            continue;
-        }
-        let names = name.split('.').collect::<Vec<_>>();
-        if !names.iter().all(|name| python_identifier_is_valid(name)) {
-            continue;
-        }
-        let mut qualified_path = module.clone();
-        qualified_path.extend(names.into_iter().map(str::to_owned));
         let Ok(identity) = SymbolIdentity::new(
             input.owner().clone(),
             syntax.language().clone(),

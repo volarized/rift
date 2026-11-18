@@ -8471,10 +8471,13 @@ done
             &references,
         )?;
         let rendered = serde_json::to_value(answer)?;
-        assert_eq!(
-            rendered["results"][0]["hit"]["symbol"]["name"], "caller",
-            "{rendered:#}"
-        );
+        let names = rendered["results"]
+            .as_array()
+            .ok_or("reference results")?
+            .iter()
+            .map(|hit| hit["hit"]["symbol"]["name"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, [Some("main"), Some("caller")], "{rendered:#}");
         server.engine_pool().await.shutdown().await;
         Ok(())
     }

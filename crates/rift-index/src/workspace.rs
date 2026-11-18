@@ -13957,7 +13957,7 @@ mod tests {
         assert_eq!(built.left_out.len(), 0);
         assert!(built.warnings.is_empty());
         let graph = built.semantics.graph();
-        assert_eq!(graph.records().len(), 3);
+        assert_eq!(graph.records().len(), 6);
         let wide_records = graph
             .records()
             .iter()
@@ -13965,6 +13965,7 @@ mod tests {
                 record.contributions().iter().any(|key| {
                     graph
                         .contribution(key)
+                        .filter(|value| value.facts().is_some_and(|facts| facts.name() == name))
                         .and_then(|value| value.source())
                         .is_some_and(|binding| {
                             matches!(

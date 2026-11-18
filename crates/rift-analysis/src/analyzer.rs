@@ -2770,7 +2770,7 @@ mod tests {
                     return Some(syntax.clone());
                 }
                 let syntax = source.parse().expect("fixture syntax");
-                assert_eq!(syntax.facts().symbols().len(), per_file);
+                assert_eq!(syntax.facts().symbols().len(), per_file + 1);
                 provider_calls += 1;
                 parsed = Some(syntax.clone());
                 Some(syntax)

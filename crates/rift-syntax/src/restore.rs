@@ -826,6 +826,7 @@ fn validate_export_bindings(
         ShippedLanguage::JavaScript.language(),
         ShippedLanguage::TypeScript.language(),
         ShippedLanguage::TypeScriptTsx.language(),
+        ShippedLanguage::Python.language(),
     ]
     .contains(&parts.language)
     {

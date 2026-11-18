@@ -21,6 +21,7 @@ fn declared(document: &SyntaxDocument) -> Vec<(&str, Option<&str>, &str)> {
     document
         .symbols()
         .iter()
+        .filter(|symbol| symbol.kind != MODULE_KIND)
         .map(|symbol| {
             (
                 symbol.qualified_name.as_str(),
@@ -65,6 +66,7 @@ fn test_class_bodies_declare_methods_with_member_categories() {
     let declarations = document
         .symbols()
         .iter()
+        .filter(|symbol| symbol.kind != MODULE_KIND)
         .map(|symbol| {
             (
                 symbol.qualified_name.as_str(),
@@ -222,7 +224,7 @@ fn test_instance_attributes_assigned_in_methods_declare_class_members() {
 #[test]
 fn test_a_literal_doc_assignment_documents_the_named_declaration() {
     let text = "def keys(d):\n    pass\n\ndef values(d):\n    pass\n\n\
-                keys.__doc__ = \"Return an iterator over keys.\"\n\
+                keys.__doc__ = \"Return an iterator over keys.\"\ncallback = lambda: None\ncallback.__doc__ = \"Run callback.\"\n\
                 values.__doc__ = f\"Return {1}.\"\n\
                 def wrap():\n    keys.__doc__ = 'Nested.'\n";
     let document = analyze(text);
@@ -234,9 +236,124 @@ fn test_a_literal_doc_assignment_documents_the_named_declaration() {
             text: "Return an iterator over keys.".to_owned(),
         }]
     );
-    assert_eq!(
-        spelled(text, keys.documentation_ranges[0]),
-        "Return an iterator over keys."
+    assert!(
+        keys.documentation_ranges.is_empty(),
+        "the assigned string sits outside the declaration"
     );
     assert!(symbol(&document, "values").documentation.is_empty());
+    let callback = symbol(&document, "callback");
+    assert_eq!(callback.documentation[0].text, "Run callback.");
+    assert!(callback.documentation_ranges.is_empty());
+}
+
+/// A string statement directly after an assignment that declares one name
+/// documents that name, at module level, in a class body, and for an
+/// instance attribute; after a tuple target, or as a formatted string, it
+/// documents nothing.
+#[test]
+fn test_a_string_after_an_assignment_documents_the_assigned_name() {
+    let text = "LIMIT = 10\n\"\"\"Most rows per page.\"\"\"\n\
+                A, B = 1, 2\n\"Pair.\"\nG = H = 1\n\"Chain.\"\n\
+                class Model:\n    kind: str = 'model'\n    \"\"\"The model kind.\"\"\"\n    \
+                late = 1\n    f\"Formatted {late}.\"\n    \
+                def __init__(self):\n        self.name = 'x'\n        \"The display name.\"\n";
+    let document = analyze(text);
+    let doc = |qualified: &str| {
+        symbol(&document, qualified)
+            .documentation
+            .first()
+            .map(|doc| doc.text.clone())
+    };
+    assert_eq!(doc("LIMIT").as_deref(), Some("Most rows per page."));
+    let limit = symbol(&document, "LIMIT");
+    assert_eq!(
+        spelled(text, limit.documentation_ranges[0]),
+        "Most rows per page."
+    );
+    assert_eq!(
+        spelled(text, limit.range),
+        "LIMIT = 10\n\"\"\"Most rows per page.\"\"\""
+    );
+    assert_eq!(doc("A"), None);
+    assert_eq!(doc("B"), None);
+    assert_eq!(doc("G"), None);
+    assert_eq!(doc("H"), None);
+    assert_eq!(doc("Model.kind").as_deref(), Some("The model kind."));
+    assert_eq!(doc("Model.late"), None);
+    assert_eq!(doc("Model.name").as_deref(), Some("The display name."));
+}
+
+/// A module-level `from module import name as name`, the explicit
+/// re-export spelling, records an export binding naming the imported name,
+/// the exported name, and the module; a renamed, plain, nested, or dotted
+/// import records none.
+#[test]
+fn test_redundant_import_aliases_record_export_bindings() {
+    let text = "from .applications import FastAPI as FastAPI, Other\n\
+                from pkg.models import Model as Model\n\
+                from . import routing as routing\n\
+                from .x import a as b\nfrom .y import c\nimport os as os\n\
+                try:\n    from ._speed import fast as fast\nexcept ImportError:\n    pass\n\
+                def run():\n    from .z import d as d\n";
+    let document = analyze(text);
+    let bindings = document
+        .facts()
+        .export_bindings()
+        .expect("Python captures export bindings")
+        .iter()
+        .map(|binding| {
+            (
+                binding.kind,
+                binding.local.map(|range| spelled(text, range)),
+                binding.exported.map(|range| spelled(text, range)),
+                binding.source.map(|range| spelled(text, range)),
+            )
+        })
+        .collect::<Vec<_>>();
+    let named = crate::SyntaxExportKind::Named;
+    assert_eq!(
+        bindings,
+        [
+            (
+                named,
+                Some("FastAPI"),
+                Some("FastAPI"),
+                Some(".applications")
+            ),
+            (named, Some("Model"), Some("Model"), Some("pkg.models")),
+            (named, Some("routing"), Some("routing"), Some(".")),
+            (named, Some("fast"), Some("fast"), Some("._speed")),
+        ]
+    );
+}
+
+#[test]
+fn test_module_declaration_retains_documentation_and_distinct_bound_names() {
+    let text = "# Module comment.\n\"\"\"Module docstring.\"\"\"\nmodule = 1\n";
+    let document = analyze(text);
+    let module = document
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.kind == "module")
+        .expect("each Python file declares its module");
+    assert_eq!(module.qualified_name, ".");
+    assert_eq!(module.facets, [SymbolFacet::Namespace, SymbolFacet::Module]);
+    assert_eq!(module.container, None);
+    assert_eq!(spelled(text, module.range), text);
+    assert_eq!(module.documentation[0].text, "Module docstring.");
+    assert_eq!(
+        spelled(text, module.documentation_ranges[0]),
+        "Module docstring."
+    );
+    assert_eq!(symbol(&document, "module").kind, "variable");
+    assert!(analyze("").symbols().is_empty());
+    for text in ["# Comment.\n", "f\"{value}\"\n", "b\"bytes\"\n"] {
+        let document = analyze(text);
+        let module = document
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.kind == "module")
+            .expect("a module without documentation still declares");
+        assert!(module.documentation.is_empty());
+    }
 }

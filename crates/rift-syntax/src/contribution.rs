@@ -267,7 +267,7 @@ impl SyntaxPublicationBuilder {
                 |logical| Some(logical.identity.clone()),
             );
             let language = logical.map_or_else(|| syntax.language(), |logical| &logical.language);
-            let mut facts = symbol.facts(language);
+            let mut facts = symbol.placed_facts(language, anchor.as_ref());
             if let Some(container) = &symbol.container {
                 let ordinal = enclosing_ordinal(latest.get(container.as_str()).copied(), symbol);
                 let container_address = declaration_address(
@@ -434,10 +434,41 @@ impl crate::SyntaxSymbol {
     /// Copies retained declaration facts without admitting a portable identity.
     #[must_use]
     pub fn facts(&self, language: &rift_protocol::read::Language) -> PortableSymbolFacts {
+        self.facts_named(language, self.name.clone(), self.qualified_name.clone())
+    }
+
+    /// A Python module takes its name from the accepted import path at placement.
+    fn placed_facts(
+        &self,
+        language: &rift_protocol::read::Language,
+        anchor: Option<&SymbolId>,
+    ) -> PortableSymbolFacts {
+        let module = anchor
+            .filter(|_| {
+                language.name == "python"
+                    && self.qualified_name == crate::python::MODULE_QUALIFIED_NAME
+            })
+            .and_then(|id| rift_protocol::identity::SymbolIdentity::parse(id.as_str()).ok());
+        let Some(module) = module else {
+            return self.facts(language);
+        };
+        let path = module.qualified_path();
+        let Some(name) = path.last() else {
+            return self.facts(language);
+        };
+        self.facts_named(language, name.clone(), path.join("."))
+    }
+
+    fn facts_named(
+        &self,
+        language: &rift_protocol::read::Language,
+        name: String,
+        qualified_name: String,
+    ) -> PortableSymbolFacts {
         let mut facts = PortableSymbolFacts::new(
             language.clone(),
-            self.name.clone(),
-            self.qualified_name.clone(),
+            name,
+            qualified_name,
             ExactKind(self.kind.to_owned()),
         )
         .facets(self.facets.clone())
