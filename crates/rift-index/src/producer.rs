@@ -304,6 +304,7 @@ fn resolve_edge(
         kinds,
         to,
         occurrence,
+        provider,
         derivation,
         confidence,
         extensions,
@@ -332,6 +333,7 @@ fn resolve_edge(
         kinds,
         to,
         occurrence,
+        provider,
         derivation,
         confidence,
         producer: Some(producer.clone()),
@@ -370,6 +372,7 @@ fn canonical_order(left: &Edge, right: &Edge) -> Ordering {
     (&left.from, &left.to, &left.kind)
         .cmp(&(&right.from, &right.to, &right.kind))
         .then_with(|| span(left).cmp(&span(right)))
+        .then_with(|| left.provider.cmp(&right.provider))
         .then_with(|| left.derivation.cmp(&right.derivation))
         .then_with(|| left.kinds.cmp(&right.kinds))
         .then_with(|| match (left.confidence, right.confidence) {

@@ -2424,7 +2424,7 @@ impl<'de> serde::Deserialize<'de> for MatchedField {
         }
     }
 }
-/// One auditable step in a search traversal. `edge` retains its occurrence and
+/// One auditable step in a search traversal. `edge` retains its occurrence, provider, and
 /// derivation; `direction` records how the walk followed it.
 #[derive(
     Debug,
@@ -2586,6 +2586,8 @@ pub struct Edge {
     /// One byte range in a source-catalog unit.
     #[validate(nested)]
     pub occurrence: Option<SourceUnitSpan>,
+    /// Which analysis produced an edge.
+    pub provider: EdgeProvider,
     /// How this edge was established. Every edge reaches Rift from a provider, and this field
     /// records whether the provider resolved the edge semantically, read it from syntax, or
     /// inferred it.
@@ -4338,6 +4340,43 @@ pub struct FacetDeclaration {
     pub regions: Option<Vec<FacetRegion>>,
     /// The declaration's syntax structure.
     pub syntax: Vec<SyntaxElement>,
+}
+/// Which analysis produced an edge.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
+pub enum EdgeProvider {
+    /// Static analysis captured into the index.
+    #[serde(rename = "static")]
+    #[default]
+    Static,
+    /// A language engine embedded in Rift, such as ty.
+    #[serde(rename = "engine")]
+    Engine,
+    /// A language server reached through LSP.
+    #[serde(rename = "lsp")]
+    Lsp,
+}
+impl core::fmt::Display for EdgeProvider {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Static => write!(f, "static"),
+            Self::Engine => write!(f, "engine"),
+            Self::Lsp => write!(f, "lsp"),
+        }
+    }
+}
+impl<'de> serde::Deserialize<'de> for EdgeProvider {
+    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_ascii_lowercase().as_str() {
+            "static" => Ok(EdgeProvider::Static),
+            "engine" => Ok(EdgeProvider::Engine),
+            "lsp" => Ok(EdgeProvider::Lsp),
+            _ => Err(serde::de::Error::unknown_variant(&s, &["static", "engine", "lsp"])),
+        }
+    }
 }
 /// Returns supported package managers, features, publication revisions, and active bounds.
 #[derive(Debug, Clone, validator::Validate, oas3_gen_support::Default)]

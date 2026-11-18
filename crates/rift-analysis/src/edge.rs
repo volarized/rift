@@ -69,6 +69,7 @@ impl Edge {
                     end: self.occurrence.range().end(),
                 },
             }),
+            provider: rift_protocol::read::EdgeProvider::Static,
             derivation: rift_protocol::read::EdgeDerivation::Resolution,
             confidence: None,
             extensions: rift_protocol::read::Extensions::default(),

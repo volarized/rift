@@ -91,6 +91,7 @@ impl<'read> CapturedCalls<'read> {
                 engine.complete = false;
                 continue;
             }
+            engine.edges.push(edge.to_protocol());
             engine.local.push((neighbor, vec![span]));
         }
         for (neighbor, mut ranges) in local {
@@ -103,6 +104,13 @@ impl<'read> CapturedCalls<'read> {
             let unlocated = ranges.is_empty();
             ranges.retain(|range| !removed.contains(&call_key(range)));
             unlocated || !ranges.is_empty()
+        });
+        engine.edges.retain(|edge| {
+            edge.provider == rift_protocol::read::EdgeProvider::Static
+                || edge
+                    .occurrence
+                    .as_ref()
+                    .is_none_or(|span| !removed.contains(&call_key(span)))
         });
         merge_call_neighbors(&mut engine.local);
         engine

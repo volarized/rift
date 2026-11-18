@@ -106,13 +106,13 @@ fn call_facts(publication: &PackagePublication) -> ProducerFacts {
                 "kinds": ["calls"],
                 "to": ECHO,
                 "occurrence": {"unit": "UNIT", "range": {"start": CALL.0, "end": CALL.1}},
-                "derivation": "resolution",
+                "provider": "static", "derivation": "resolution",
             }, {
                 "from": SHOUT,
                 "kind": "reference",
                 "kinds": ["references"],
                 "to": ECHO,
-                "derivation": "heuristic",
+                "provider": "static", "derivation": "heuristic",
                 "confidence": 0.5,
             }],
             "occurrences": [{
@@ -300,7 +300,7 @@ fn producer_facts_naming_a_symbol_keep_it_and_still_resolve_their_range() {
                 "kinds": ["calls"],
                 "to": ECHO,
                 "occurrence": {"unit": "UNIT", "range": {"start": 0, "end": 200}},
-                "derivation": "resolution",
+                "provider": "static", "derivation": "resolution",
             }],
         }),
     );
@@ -331,7 +331,7 @@ fn producer_facts_outside_their_coverage_or_address_are_refused() {
         (
             json!({"kinds": ["occurrences"], "edges": [{
                 "from": SHOUT, "kind": "call", "kinds": ["calls"], "to": ECHO,
-                "derivation": "resolution",
+                "provider": "static", "derivation": "resolution",
             }]}),
             "field kinds, violation uncovered",
         ),
@@ -341,13 +341,13 @@ fn producer_facts_outside_their_coverage_or_address_are_refused() {
         ),
         (
             json!({"edges": [{
-                "kind": "call", "kinds": ["calls"], "to": ECHO, "derivation": "resolution",
+                "kind": "call", "kinds": ["calls"], "to": ECHO, "provider": "static", "derivation": "resolution",
             }]}),
             "field edges.from, violation missing",
         ),
         (
             json!({"edges": [{
-                "kind": "call", "kinds": ["calls"], "to": ECHO, "derivation": "resolution",
+                "kind": "call", "kinds": ["calls"], "to": ECHO, "provider": "static", "derivation": "resolution",
                 "occurrence": {"unit": "UNIT", "range": {"start": 34, "end": 35}},
             }]}),
             "field edges.occurrence, violation outside_declaration",
@@ -425,7 +425,7 @@ fn producer_extensions_reach_the_stored_edge() {
             "kinds": ["edges"],
             "edges": [{
                 "from": SHOUT, "kind": "call", "kinds": ["calls"], "to": ECHO,
-                "derivation": "resolution", "extensions": extension,
+                "provider": "static", "derivation": "resolution", "extensions": extension,
             }],
         }),
     );
@@ -588,4 +588,32 @@ fn an_extractor_for_an_uncovered_language_never_runs() {
         "{error}"
     );
     assert_eq!(extractor.runs.get(), 0);
+}
+
+#[test]
+fn producer_edge_provider_survives_package_publication_storage() {
+    use rift_protocol::read::EdgeProvider;
+    for provider in [
+        EdgeProvider::Static,
+        EdgeProvider::Engine,
+        EdgeProvider::Lsp,
+    ] {
+        let publication = click();
+        let mut input = call_facts(&publication);
+        for edge in &mut input.edges {
+            edge.provider = provider;
+        }
+        let output = accept_producer_facts(publication, input, SyntaxLimits::default())
+            .expect("accepted facts");
+        let restored: PackagePublication =
+            serde_json::from_value(serde_json::to_value(&output).expect("stored publication"))
+                .expect("restored publication");
+        let imported = restored
+            .edges
+            .iter()
+            .filter(|edge| edge.producer.is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(imported.len(), 2);
+        assert!(imported.iter().all(|edge| edge.provider == provider));
+    }
 }

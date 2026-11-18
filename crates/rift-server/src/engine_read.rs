@@ -13,9 +13,9 @@ use rift_lsp::session::EngineSession;
 use rift_lsp::uri::TreeRoot;
 use rift_protocol::edge_read::QueryOccurrence;
 use rift_protocol::read::{
-    Edge, EdgeDerivation, EdgeKind, ExactKind, Extensions, GraphHop, HopDirection, Language,
-    ReadWarning, SearchParams, SearchParamsTarget, SearchTraversal, SourceUnitId, SourceUnitSpan,
-    Symbol, SymbolId, TextRange, TraversalDirection,
+    Edge, EdgeDerivation, EdgeKind, EdgeProvider, ExactKind, Extensions, GraphHop, HopDirection,
+    Language, ReadWarning, SearchParams, SearchParamsTarget, SearchTraversal, SourceUnitId,
+    SourceUnitSpan, Symbol, SymbolId, TextRange, TraversalDirection,
 };
 use rift_syntax::SyntaxSymbol;
 use tokio::time::Instant;
@@ -166,7 +166,7 @@ impl EngineReferences {
             let caller = SymbolId(callee.caller().as_str().to_owned());
             let edges = self.outgoing.entry(callee.caller().clone()).or_default();
             if !edges.iter().any(|edge| edge.edge.to == id) {
-                edges.push(call_hop(&caller, id));
+                edges.push(call_hop(&caller, id, callee.edge_provider()));
                 edges.sort_by(|left, right| left.edge.to.cmp(&right.edge.to));
             }
             self.package_declarations.entry(end).or_insert(declaration);
@@ -571,30 +571,24 @@ fn readiness_unconfirmed_warning(processes: &BTreeSet<String>) -> ReadWarning {
 /// overload is its own declaration (`max`, `max~1`, and on), so overloads
 /// stay apart. A call of the seed to itself draws no edge, as an incoming
 /// reference from inside the seed draws none.
-fn callee_hops(seed: &SymbolId, callees: impl IntoIterator<Item = SymbolId>) -> Vec<GraphHop> {
+fn callee_hops(
+    seed: &SymbolId,
+    callees: impl IntoIterator<Item = SymbolId>,
+    provider: EdgeProvider,
+) -> Vec<GraphHop> {
     callees
         .into_iter()
         .filter(|callee| callee != seed)
         .collect::<BTreeSet<_>>()
         .into_iter()
-        .map(|callee| call_hop(seed, callee))
+        .map(|callee| call_hop(seed, callee, provider))
         .collect()
 }
 
 /// The outgoing edge from `from` to the declaration `to` it calls.
-fn call_hop(from: &SymbolId, to: SymbolId) -> GraphHop {
+fn call_hop(from: &SymbolId, to: SymbolId, provider: EdgeProvider) -> GraphHop {
     GraphHop {
-        edge: Edge {
-            producer: None,
-            from: from.clone(),
-            to,
-            kind: ExactKind(EdgeKind::Calls.as_ref().to_owned()),
-            kinds: vec![EdgeKind::Calls],
-            occurrence: None,
-            derivation: EdgeDerivation::Resolution,
-            confidence: None,
-            extensions: Extensions::default(),
-        },
+        edge: graph_edge(from, to, EdgeKind::Calls, None, provider),
         direction: HopDirection::Outgoing,
     }
 }
@@ -631,11 +625,12 @@ async fn extend_callees(
                 dropped,
                 language,
                 unconfirmed,
+                provider,
             } => {
                 references.dropped_callees = references.dropped_callees.saturating_add(dropped);
                 references.unconfirmed.extend(unconfirmed);
                 let seed = SymbolId(identity.as_str().to_owned());
-                (callee_hops(&seed, callees), held, language)
+                (callee_hops(&seed, callees, provider), held, language)
             }
             SymbolCallees::NotServed => continue,
             SymbolCallees::Unprepared { kind } if identity == *walk.seed => {
@@ -686,6 +681,8 @@ enum SymbolCallees {
     /// The callees the engine named inside this tree and in package files, and the count
     /// it named under no root.
     Resolved {
+        /// The analysis selected for the declaration.
+        provider: EdgeProvider,
         /// Callee declarations, one per call the engine named, repeats included.
         callees: Vec<SymbolId>,
         /// Callees in package files, waiting for the global API to name them.
@@ -755,12 +752,19 @@ async fn resolve_symbol_callees(
         Err(error) => return error.fail(),
     };
     let trees = [slot.workspace_root(), reads.index().root()];
-    match map_callees(reads, report, identity, (walk.roots, &trees)) {
+    match map_callees(
+        reads,
+        report,
+        identity,
+        (walk.roots, &trees),
+        slot.edge_provider(),
+    ) {
         Ok(MappedCallees {
             callees,
             held,
             dropped,
         }) => Ok(SymbolCallees::Resolved {
+            provider: slot.edge_provider(),
             callees,
             held,
             dropped,
@@ -872,6 +876,7 @@ fn map_callees(
     report: CalleeReport,
     caller: &CoreSymbolId,
     (roots, trees): (&CalleeRoots, &[&std::path::Path]),
+    provider: EdgeProvider,
 ) -> Result<MappedCallees, RiftError> {
     let calls =
         report.calls.map_err(|observed| {
@@ -887,6 +892,7 @@ fn map_callees(
     for call in &calls {
         let item = &call.to;
         let call = NamedCallee {
+            provider,
             uri: &item.uri,
             name: &item.name,
             position: item.selection_range.start,
@@ -927,12 +933,88 @@ use call_evidence::CapturedCalls;
 pub struct GraphCalls {
     /// Canonical neighbors in the current tree.
     pub local: Vec<(SymbolId, Vec<SourceUnitSpan>)>,
+    /// Original edges with their analysis and physical occurrences.
+    pub edges: Vec<Edge>,
     /// Outgoing targets in admitted dependency sources, awaiting exact identity resolution.
     pub packages: Vec<(PackageCallee, Vec<SourceUnitSpan>)>,
     /// Whether a configured engine covered the requested direction.
     pub complete: bool,
     /// Original observations linked to a captured authored call site.
     pub corroboration: Vec<CallCorroboration>,
+}
+
+impl GraphCalls {
+    /// Names a package call with the analysis that produced it.
+    pub fn name_package_call(
+        &mut self,
+        callee: &PackageCallee,
+        target: SymbolId,
+        occurrences: Vec<SourceUnitSpan>,
+    ) {
+        let seed = SymbolId(callee.caller().as_str().to_owned());
+        self.push_local(
+            &seed,
+            target,
+            occurrences,
+            TraversalDirection::Outgoing,
+            callee.edge_provider(),
+        );
+    }
+
+    fn push_local(
+        &mut self,
+        seed: &SymbolId,
+        neighbor: SymbolId,
+        occurrences: Vec<SourceUnitSpan>,
+        direction: TraversalDirection,
+        provider: EdgeProvider,
+    ) {
+        let (from, to) = match direction {
+            TraversalDirection::Outgoing => (seed, &neighbor),
+            TraversalDirection::Incoming => (&neighbor, seed),
+        };
+        if occurrences.is_empty() {
+            self.edges.push(graph_edge(
+                from,
+                to.clone(),
+                EdgeKind::Calls,
+                None,
+                provider,
+            ));
+        } else {
+            self.edges.extend(occurrences.iter().map(|span| {
+                graph_edge(
+                    from,
+                    to.clone(),
+                    EdgeKind::Calls,
+                    Some(span.clone()),
+                    provider,
+                )
+            }));
+        }
+        self.local.push((neighbor, occurrences));
+    }
+}
+
+fn graph_edge(
+    from: &SymbolId,
+    to: SymbolId,
+    kind: EdgeKind,
+    occurrence: Option<SourceUnitSpan>,
+    provider: EdgeProvider,
+) -> Edge {
+    Edge {
+        from: from.clone(),
+        to,
+        kind: ExactKind(kind.as_ref().to_owned()),
+        kinds: vec![kind],
+        occurrence,
+        provider,
+        derivation: EdgeDerivation::Resolution,
+        confidence: None,
+        producer: None,
+        extensions: Extensions::default(),
+    }
 }
 
 /// An engine's original destination before projection into canonical adjacency.
@@ -1022,6 +1104,7 @@ pub async fn graph_calls(
         &identity,
         report,
         &CallGraphSource {
+            provider: slot.edge_provider(),
             trees: [slot.workspace_root(), reads.index().root()],
             source: file.source(),
             unit: crate::read::source_unit_id(file.path()),
@@ -1042,6 +1125,7 @@ struct CallGraphSource<'source> {
     source: &'source str,
     unit: SourceUnitId,
     direction: TraversalDirection,
+    provider: EdgeProvider,
 }
 
 fn map_graph_calls(
@@ -1060,6 +1144,7 @@ fn map_graph_calls(
     for call in report.calls.map_err(|_| unavailable())? {
         let item = &call.to;
         let at = NamedCallee {
+            provider: held.provider,
             uri: &item.uri,
             name: &item.name,
             position: item.selection_range.start,
@@ -1109,7 +1194,13 @@ fn map_graph_calls(
                     "graph calls",
                 )?;
                 if let Some(target) = target {
-                    result.local.push((target, occurrences));
+                    result.push_local(
+                        &SymbolId(identity.as_str().to_owned()),
+                        target,
+                        occurrences,
+                        held.direction,
+                        held.provider,
+                    );
                 } else {
                     result.complete = false;
                 }
@@ -1211,6 +1302,7 @@ pub async fn installed_graph_calls(
         &identity,
         report,
         &CallGraphSource {
+            provider: slot.edge_provider(),
             trees: [slot.workspace_root(), reads.index().root()],
             source: text,
             unit: unit.clone(),
@@ -1247,7 +1339,13 @@ async fn resolve_symbol_references(
         Err(error) => return error.fail(),
     };
     symbol_references(
-        map_references(reads, identity, report, slot.workspace_root()),
+        map_references(
+            reads,
+            identity,
+            report,
+            slot.workspace_root(),
+            slot.edge_provider(),
+        ),
         language,
         unconfirmed,
     )
@@ -1464,6 +1562,8 @@ async fn references_on_engine(
 pub struct GraphReferences {
     /// Captured physical usages.
     pub occurrences: Vec<QueryOccurrence>,
+    /// Reference edges with their analysis and physical occurrences.
+    pub edges: Vec<Edge>,
     /// Whether a configured provider covered the request.
     pub complete: bool,
 }
@@ -1492,7 +1592,8 @@ pub async fn graph_references(
     .await
     {
         Ok(engine) => Ok(GraphReferences {
-            occurrences: merge_reference_occurrences(captured.occurrences, engine)?,
+            occurrences: merge_reference_occurrences(captured.occurrences, engine.occurrences)?,
+            edges: captured.edges.into_iter().chain(engine.edges).collect(),
             complete: captured.complete,
         }),
         Err(error)
@@ -1553,6 +1654,7 @@ fn captured_references(
         });
     }
     Ok(GraphReferences {
+        edges: reference_edges(&occurrences, EdgeProvider::Static),
         occurrences,
         complete,
     })
@@ -1587,7 +1689,7 @@ async fn engine_graph_references(
     target: &SymbolId,
     require_caller: bool,
     deadline: Instant,
-) -> Result<Vec<QueryOccurrence>, RiftError> {
+) -> Result<GraphReferences, RiftError> {
     let unavailable = graph_reference_coverage;
     let identity = CoreSymbolId::new(target.as_str().to_owned()).map_err(|_| unavailable())?;
     let (declarations, count) = reads.index().symbols_by_identity_page(&identity, 0, 1)?;
@@ -1612,6 +1714,7 @@ async fn engine_graph_references(
         })
         .collect::<Result<_, RiftError>>()?;
     let mut found = BTreeMap::new();
+    let mut edges = Vec::new();
     for declaration in declarations {
         let file = declaration.file;
         let slot = engines
@@ -1639,6 +1742,7 @@ async fn engine_graph_references(
         }
         let root = TreeRoot::new(slot.workspace_root())?;
         let canonical = TreeRoot::new(reads.index().root())?;
+        let provider = slot.edge_provider();
         let mut positions = BTreeMap::new();
         for location in report.locations.map_err(|_| unavailable())? {
             let path = root
@@ -1661,15 +1765,7 @@ async fn engine_graph_references(
             if found.len() == TRAVERSAL_SYMBOLS_MAX {
                 return Err(unavailable());
             }
-            let enclosing = if let Some(symbol) = file.enclosing_symbol(key.1, key.2) {
-                let id = symbol_id(reads.index(), crate::search::declared(file, symbol))?;
-                if require_caller && id.is_none() {
-                    return Err(unavailable());
-                }
-                id
-            } else {
-                None
-            };
+            let enclosing = reference_enclosing(reads, file, (key.1, key.2), require_caller)?;
             let occurrence = QueryOccurrence {
                 target: target.clone(),
                 enclosing,
@@ -1682,10 +1778,46 @@ async fn engine_graph_references(
                 },
                 kind: EdgeKind::References,
             };
+            edges.extend(reference_edges(std::slice::from_ref(&occurrence), provider));
             found.insert(key, occurrence);
         }
     }
-    Ok(found.into_values().collect())
+    Ok(GraphReferences {
+        occurrences: found.into_values().collect(),
+        edges,
+        complete: true,
+    })
+}
+
+fn reference_enclosing(
+    reads: &ReadService,
+    file: &IndexedFile,
+    range: (u64, u64),
+    require_caller: bool,
+) -> Result<Option<SymbolId>, RiftError> {
+    let Some(symbol) = file.enclosing_symbol(range.0, range.1) else {
+        return Ok(None);
+    };
+    let identity = symbol_id(reads.index(), crate::search::declared(file, symbol))?;
+    if require_caller && identity.is_none() {
+        return Err(graph_reference_coverage());
+    }
+    Ok(identity)
+}
+
+fn reference_edges(occurrences: &[QueryOccurrence], provider: EdgeProvider) -> Vec<Edge> {
+    occurrences
+        .iter()
+        .filter_map(|occurrence| {
+            Some(graph_edge(
+                occurrence.enclosing.as_ref()?,
+                occurrence.target.clone(),
+                EdgeKind::References,
+                Some(occurrence.source.clone()),
+                provider,
+            ))
+        })
+        .collect()
 }
 
 fn graph_reference_coverage() -> RiftError {
@@ -1699,6 +1831,7 @@ fn map_references(
     target: &CoreSymbolId,
     report: ReferenceReport,
     workspace_root: &std::path::Path,
+    provider: EdgeProvider,
 ) -> Result<Vec<GraphHop>, RiftError> {
     let locations = report.locations.map_err(|observed| errors::server::read_engine_answer().operation("engine references").detail(format!("reference locations {observed} exceed the {TRAVERSAL_SYMBOLS_MAX}-symbol traversal bound")).error())?;
     let root = TreeRoot::new(workspace_root).map_err(|error| {
@@ -1723,17 +1856,13 @@ fn map_references(
     Ok(callers
         .into_iter()
         .map(|caller| GraphHop {
-            edge: Edge {
-                producer: None,
-                from: caller,
-                to: SymbolId(target.as_str().to_owned()),
-                kind: ExactKind(EdgeKind::References.as_ref().to_owned()),
-                kinds: vec![EdgeKind::References],
-                occurrence: None,
-                derivation: EdgeDerivation::Resolution,
-                confidence: None,
-                extensions: Extensions::default(),
-            },
+            edge: graph_edge(
+                &caller,
+                SymbolId(target.as_str().to_owned()),
+                EdgeKind::References,
+                None,
+                provider,
+            ),
             direction: HopDirection::Incoming,
         })
         .collect())
@@ -1844,7 +1973,7 @@ mod tests {
     use rift_lsp::capabilities::PositionEncoding;
     use rift_lsp::uri::TreeRoot;
     use rift_protocol::configuration::{HistoryConfiguration, LspConfiguration};
-    use rift_protocol::read::{ExactKind, GetSymbolParams, SearchParams, SymbolId};
+    use rift_protocol::read::{EdgeProvider, ExactKind, GetSymbolParams, SearchParams, SymbolId};
     use serde_json::json;
 
     use super::{
@@ -1874,6 +2003,7 @@ mod tests {
         let hops = super::callee_hops(
             &id("seed"),
             ["max", "maximum", "max", "join", "seed", "maximum"].map(id),
+            EdgeProvider::Engine,
         );
         let reached: Vec<_> = hops
             .iter()
@@ -1968,6 +2098,7 @@ mod tests {
         let caller = rift_core::SymbolId::new(symbol(&reads, "larger").0)?;
         let roots = CalleeRoots::default();
         let held = super::CallGraphSource {
+            provider: EdgeProvider::Lsp,
             trees: [directory.path(), directory.path()],
             source,
             unit: crate::read::source_unit_id(&ProjectPath::new("lib.rs")?),
@@ -2032,7 +2163,13 @@ mod tests {
             encoding: PositionEncoding::Utf16,
         };
         let caller = rift_core::SymbolId::new(symbol(&reads, "larger").0)?;
-        let mapped = map_callees(&reads, report, &caller, (&roots, &[directory.path()]))?;
+        let mapped = map_callees(
+            &reads,
+            report,
+            &caller,
+            (&roots, &[directory.path()]),
+            EdgeProvider::Lsp,
+        )?;
         assert_eq!(mapped.callees, [symbol(&reads, "beacon")]);
         assert_eq!(mapped.dropped, 2);
         let held: Vec<(String, String, u32, u32)> = mapped
@@ -2086,8 +2223,13 @@ mod tests {
                 encoding: PositionEncoding::Utf16,
             };
             let roots = CalleeRoots::default();
-            let Err(error) = map_callees(&reads, report, &caller, (&roots, &[directory.path()]))
-            else {
+            let Err(error) = map_callees(
+                &reads,
+                report,
+                &caller,
+                (&roots, &[directory.path()]),
+                EdgeProvider::Lsp,
+            ) else {
                 panic!("an unmappable answer is refused");
             };
             assert!(
@@ -2107,6 +2249,7 @@ mod tests {
         let caller = rift_core::SymbolId::new("rift://symbol/python/app.py/hello")?;
         let uri: lsp_types::Uri = format!("vendored://stdlib/{stub}").parse()?;
         let call = crate::callee::NamedCallee {
+            provider: EdgeProvider::Engine,
             uri: &uri,
             name,
             position: Position {
@@ -2420,7 +2563,7 @@ mod tests {
             encoding: PositionEncoding::Utf16,
             full: true,
         };
-        let edges = map_references(&reads, &target, report, directory.path())?;
+        let edges = map_references(&reads, &target, report, directory.path(), EdgeProvider::Lsp)?;
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].edge.from, symbol(&reads, "caller"));
         assert_eq!(edges[0].edge.to, seed);
@@ -2443,14 +2586,18 @@ mod tests {
                 encoding: PositionEncoding::Utf16,
                 full: true,
             };
-            assert!(map_references(&reads, &seed, report, directory.path()).is_err());
+            assert!(
+                map_references(&reads, &seed, report, directory.path(), EdgeProvider::Lsp).is_err()
+            );
         }
         let overflow = ReferenceReport {
             locations: Err(super::TRAVERSAL_SYMBOLS_MAX + 1),
             encoding: PositionEncoding::Utf16,
             full: true,
         };
-        assert!(map_references(&reads, &seed, overflow, directory.path()).is_err());
+        assert!(
+            map_references(&reads, &seed, overflow, directory.path(), EdgeProvider::Lsp).is_err()
+        );
         Ok(())
     }
 
@@ -2469,7 +2616,10 @@ mod tests {
             encoding: PositionEncoding::Utf16,
             full: true,
         };
-        assert!(map_references(&reads, &target, report, directory.path())?.is_empty());
+        assert!(
+            map_references(&reads, &target, report, directory.path(), EdgeProvider::Lsp)?
+                .is_empty()
+        );
         let mut refused = location(directory.path(), "lib.rs", 0, 0, 1);
         refused.uri = "https://example.com/lib.rs".parse()?;
         let report = ReferenceReport {
@@ -2477,8 +2627,8 @@ mod tests {
             encoding: PositionEncoding::Utf16,
             full: true,
         };
-        let error =
-            map_references(&reads, &target, report, directory.path()).expect_err("scheme refused");
+        let error = map_references(&reads, &target, report, directory.path(), EdgeProvider::Lsp)
+            .expect_err("scheme refused");
         assert_eq!(error.slug(), errors::lsp::uri_scheme_refused::SLUG);
         assert!(
             error
@@ -2702,7 +2852,8 @@ mod tests {
             encoding: PositionEncoding::Utf16,
             full: true,
         };
-        let edge = map_references(&reads, &target, report, directory.path())?.remove(0);
+        let edge =
+            map_references(&reads, &target, report, directory.path(), EdgeProvider::Lsp)?.remove(0);
         let prior_edges = (0..super::TRAVERSAL_SYMBOLS_MAX)
             .map(|index| {
                 let mut edge = edge.clone();
@@ -3358,7 +3509,11 @@ done
         let prior_edges = (0..super::TRAVERSAL_SYMBOLS_MAX)
             .map(|index| {
                 let end = SymbolId(format!("rift://symbol/python/prior.py/callee_{index}"));
-                super::call_hop(&SymbolId(prior.as_str().to_owned()), end)
+                super::call_hop(
+                    &SymbolId(prior.as_str().to_owned()),
+                    end,
+                    EdgeProvider::Engine,
+                )
             })
             .collect();
         let mut references = EngineReferences {

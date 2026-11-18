@@ -99,6 +99,13 @@ a [`get_symbol`](/docs/mcp#tool-get_symbol) declaration binding, addressed by `u
 of the `path` a project declaration carries. The logical symbol identity remains separate from
 that physical source address.
 
+## Edge provider
+
+Every `Edge` carries `provider`: `static` for static analysis
+captured into the index, `engine` for a language engine embedded in Rift, or `lsp` for a
+language server reached through LSP. Its `derivation` records resolution, syntax, or heuristic
+analysis; its optional `producer` names the external producer. Package edges carry the same fields.
+
 ## History facts
 
 The `history` family is resolved from the workspace's version-control history rather than from

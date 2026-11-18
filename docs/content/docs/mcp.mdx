@@ -189,6 +189,23 @@ is `global` reads this service with no `:scope`.
 
 Global edge queries read facts already collected for the selected package or runtime.
 
+### Edge provider
+
+Every edge carries a [`provider`](/docs/developer/protocol/core#edge-provider) that names
+which analysis produced it: `static`, `engine`, or `lsp`. The edge's `derivation` records how it
+was established, and its optional `producer` names an external producer.
+
+A query can check for edges from static analysis with `:provider`:
+
+```sparql
+ASK {
+  <symbol-id> :calls ?target .
+  ?edge a :Edge; :from <symbol-id>; :to ?target; :kinds :calls; :provider "static" .
+}
+```
+
+The same pattern checks for embedded engine edges with `"engine"` or LSP edges with `"lsp"`.
+
 ### References and calls [#search-traversal]
 
 A canonical symbol identity anchors a graph question. These requests use a returned

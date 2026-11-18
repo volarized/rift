@@ -903,6 +903,10 @@
           "$ref": "#/$defs/FactProducer",
           "description": "The external producer that emitted the edge, named by a package publication that\ncarries its facts. Absent for an edge Rift's own analysis produced."
         },
+        "provider": {
+          "$ref": "#/$defs/EdgeProvider",
+          "description": "Which analysis produced this edge."
+        },
         "to": {
           "$ref": "#/$defs/SymbolId",
           "description": "The symbol the edge points at. One Rift cannot read carries the `external` origin;\nthe edge is the same either way."
@@ -913,6 +917,7 @@
         "kind",
         "kinds",
         "to",
+        "provider",
         "derivation"
       ],
       "type": "object"
@@ -1102,6 +1107,26 @@
         {
           "const": "binds",
           "description": "The source binds a name or value to the target.",
+          "type": "string"
+        }
+      ]
+    },
+    "EdgeProvider": {
+      "description": "Which analysis produced an edge.",
+      "oneOf": [
+        {
+          "const": "static",
+          "description": "Static analysis captured into the index.",
+          "type": "string"
+        },
+        {
+          "const": "engine",
+          "description": "A language engine embedded in Rift, such as ty.",
+          "type": "string"
+        },
+        {
+          "const": "lsp",
+          "description": "A language server reached through LSP.",
           "type": "string"
         }
       ]

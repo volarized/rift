@@ -241,6 +241,7 @@ impl GraphQuery {
         let (edges, details): (Vec<_>, Vec<_>) = triples
             .into_iter()
             .partition(|edge| property(edge).and_then(kind).is_some());
+        let details = edge_details(&edges, &details)?;
         let (symbol_details, syntax_elements) = endpoint_details(&edges, &details)?;
         let mut selected = adjacency_patterns(&edges).or_else(|| layered_patterns(&edges))?;
         selected.symbol_details = symbol_details;
@@ -278,6 +279,38 @@ fn query_pattern(query: &GraphQuery) -> &QueryExpression {
             _ => return expression,
         };
     }
+}
+
+fn edge_details<'query>(
+    edges: &[&TriplePattern],
+    details: &[&'query TriplePattern],
+) -> Option<Vec<&'query TriplePattern>> {
+    let mut remaining = Vec::new();
+    for &detail in details {
+        let describes_edge = details.iter().any(|from| {
+            property(from) == Some("from")
+                && from.subject == detail.subject
+                && details.iter().any(|to| {
+                    property(to) == Some("to")
+                        && to.subject == from.subject
+                        && edges
+                            .iter()
+                            .any(|edge| edge.subject == from.object && edge.object == to.object)
+                })
+        });
+        if describes_edge {
+            if !matches!(
+                property(detail),
+                Some("from" | "to" | "provider" | "kinds" | "derivation" | "kind")
+            ) && !is_class(detail, "Edge")
+            {
+                return None;
+            }
+        } else {
+            remaining.push(detail);
+        }
+    }
+    Some(remaining)
 }
 
 fn endpoint_details(

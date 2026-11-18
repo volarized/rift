@@ -1297,6 +1297,7 @@
                                   "contains"
                                 ],
                                 "to": "rift://symbol/pypi/pypi.org/idna/python/idna/codec/Codec/decode",
+                                "provider": "static",
                                 "derivation": "resolution",
                                 "producer": {
                                   "name": "canonical-containment",
@@ -1313,6 +1314,7 @@
                                   "contains"
                                 ],
                                 "to": "rift://symbol/pypi/pypi.org/idna/python/idna/codec/Codec/encode",
+                                "provider": "static",
                                 "derivation": "resolution",
                                 "producer": {
                                   "name": "canonical-containment",
@@ -5544,7 +5546,7 @@
           "edge",
           "direction"
         ],
-        "description": "One auditable step in a search traversal. `edge` retains its occurrence and\nderivation; `direction` records how the walk followed it."
+        "description": "One auditable step in a search traversal. `edge` retains its occurrence, provider, and\nderivation; `direction` records how the walk followed it."
       },
       "TraversalDirection": {
         "description": "Which edge direction a search traversal walks from each visited symbol. A language\nengine supplies the edges of both: its references for `incoming`, its call hierarchy for\n`outgoing`.",
@@ -5648,6 +5650,10 @@
             "description": "Exact physical occurrence when this edge was read from source, independent of\nwhether the provider supplied a source syntax element.",
             "$ref": "#/components/schemas/SourceUnitSpan"
           },
+          "provider": {
+            "$ref": "#/components/schemas/EdgeProvider",
+            "description": "Which analysis produced this edge."
+          },
           "derivation": {
             "$ref": "#/components/schemas/EdgeDerivation",
             "description": "How this edge was established."
@@ -5674,6 +5680,7 @@
           "kind",
           "kinds",
           "to",
+          "provider",
           "derivation"
         ],
         "description": "One directed edge between two symbols. Its occurrence is where it was read from, and its\nderivation is how much the provider knew when it was read."
@@ -9082,6 +9089,20 @@
           "syntax"
         ],
         "description": "One kind: a declaration with its location, source, and syntax structure."
+      },
+      "EdgeProvider": {
+        "description": "Which analysis produced an edge.",
+        "type": "string",
+        "enum": [
+          "static",
+          "engine",
+          "lsp"
+        ],
+        "x-enum-descriptions": [
+          "Static analysis captured into the index.",
+          "A language engine embedded in Rift, such as ty.",
+          "A language server reached through LSP."
+        ]
       }
     },
     "headers": {

@@ -1228,7 +1228,7 @@ mod tests {
                     let result = json!({
                         "groups": [{"seed":seed,"complete":true,"edges":[{
                             "id": format!("{number:064x}"),
-                            "edge":{"from":seed,"to":next,"kind":facet,"kinds":[facet],"derivation":"resolution"}
+                            "edge":{"from":seed,"to":next,"kind":facet,"kinds":[facet],"provider": "static", "derivation":"resolution"}
                         }]}],
                         "symbols":[seed_symbol,next_symbol],
                         "sources":sources,
@@ -1279,7 +1279,7 @@ mod tests {
                     "groups": [{"seed":seed,"complete":true,"edges":[{
                         "id": format!("{id:064x}"),
                         "edge":{"from":caller,"to":seed,"kind":"calls",
-                            "kinds":["calls"],"derivation":"resolution"}
+                            "kinds":["calls"],"provider": "static", "derivation":"resolution"}
                     }]}],
                     "symbols":[symbol(seed),symbol(caller)],
                     "analyzer_revision":"analyzer-v1","corpus_revision":"corpus-v1",
@@ -1549,7 +1549,8 @@ mod tests {
         let server =
             RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
         let statement = format!(
-            "SELECT ?source ?unit ?start ?end {{ <{ROOT}> :calls ?target . \
+            "SELECT ?source ?unit ?start ?end ?provider {{ <{ROOT}> :calls ?target . \
+             ?edge a :Edge; :from <{ROOT}>; :to ?target; :provider ?provider . \
              ?syntax_element :of ?target; :index 0; :source ?source; :range [ :unit ?unit; :start ?start; :end ?end ] }}"
         );
         let response = server
@@ -1577,6 +1578,7 @@ mod tests {
             row["unit"]["value"],
             "rift://source/cargo/crates.io/demo/src/a.rs"
         );
+        assert_eq!(row["provider"]["value"], "static");
         assert_eq!(row["start"]["value"], "10");
         assert_eq!(row["end"]["value"], "29");
 

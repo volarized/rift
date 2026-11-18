@@ -1598,6 +1598,7 @@ them before writing. Its output is one `ProducerFacts` JSON value per language:
         "unit": "rift://source/pypi/pypi.org/demo/demo/core.py",
         "range": { "start": 64, "end": 68 }
       },
+      "provider": "static",
       "derivation": "resolution",
       "extensions": {
         "dev.demo-indexer.precision": { "version": 1, "data": { "class": "compiler binding" } }
@@ -1617,7 +1618,7 @@ them before writing. Its output is one `ProducerFacts` JSON value per language:
 - `format` is the input format the producer wrote. The importer accepts
   `PRODUCER_FACTS_FORMAT_REVISION`, which is `1`, and refuses any other value.
 - `kinds` names the fact kinds the producer emitted for `language`; a kind may carry no fact.
-- An edge names its `from` symbol, or only its `occurrence`, and its `derivation`. A
+- An edge names its `from` symbol, or only its `occurrence`, and its `provider` and `derivation`. A
   `heuristic` edge may carry a `confidence` from 0 to 1.
 - `extensions` carries edge evidence the model has no field for, under reverse-domain keys:
   a producer's own observation id, or a precision class such as `compiler binding`. Rift
