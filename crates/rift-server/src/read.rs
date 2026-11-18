@@ -1024,7 +1024,8 @@ impl ReadService {
     /// Reads every declaration of one symbol with its source and syntax structure.
     ///
     /// # Errors
-    /// Returns [`RiftError`] for an invalid symbol, revision, or continuation, or an absent symbol.
+    /// Returns [`RiftError`] for an invalid symbol or revision, a `page` or `max_results` outside
+    /// its bounds, or an absent symbol.
     pub fn facets(&self, params: &FacetsParams) -> Result<FacetsResult, RiftError> {
         self.accept_revision(params.revision.as_ref())?;
         let id = &params.symbol;
