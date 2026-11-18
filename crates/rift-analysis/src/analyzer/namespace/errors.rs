@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rift_core::SymbolId;
+use rift_protocol::read::SymbolKind;
 use rift_syntax::{SyntaxSource, registry};
 
 use super::SelectedFile;
@@ -41,7 +42,13 @@ pub(super) fn retain_valid_declarations(
         .syntax
         .symbols()
         .iter()
-        .filter(|symbol| !invalid.contains(&symbol.item_range))
+        .filter(|symbol| {
+            // File modules have no source name or header. Their range can equal
+            // a broken declaration's range when the file has no trailing newline.
+            let file_module =
+                symbol.name_range.is_none() && symbol.kinds.contains(&SymbolKind::Module);
+            file_module || !invalid.contains(&symbol.item_range)
+        })
         .map(|symbol| symbol.qualified_name.as_str())
         .collect::<BTreeSet<_>>();
     anchors.retain(|name, _| valid.contains(name.as_str()));
