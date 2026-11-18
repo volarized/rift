@@ -42,12 +42,12 @@ impl RiftMcp {
         .await
     }
 
-    /// Reads the nodes of a package or runtime symbol from the global API, which holds the
+    /// Reads the facets of a package or runtime symbol from the global API, which holds the
     /// facts of that symbol's release.
-    pub(in crate::server) async fn global_nodes(
+    pub(in crate::server) async fn global_facets(
         &self,
-        params: &rift_protocol::read::NodesParams,
-    ) -> Result<Json<rift_protocol::read::NodesResult>, super::ToolFailure> {
+        params: &rift_protocol::read::FacetsParams,
+    ) -> Result<Json<rift_protocol::read::FacetsResult>, super::ToolFailure> {
         let deadline = self.request_deadline().await;
         let resolved = self
             .published_workspace(super::wire::ErrorPhase::Read, deadline)
@@ -59,7 +59,7 @@ impl RiftMcp {
         let configuration = resolved.published.configuration.global_configuration();
         let mut selected = params.clone();
         if selected.revision.is_none() {
-            selected.revision = selected.symbol.as_ref().and_then(|symbol| {
+            selected.revision = Some(&selected.symbol).and_then(|symbol| {
                 let identity = SymbolIdentity::parse(symbol.as_str()).ok()?;
                 crate::global::workspace_release(
                     resolved.published.reads.dependency_context(),
@@ -69,8 +69,8 @@ impl RiftMcp {
         }
         within_deadline(
             deadline,
-            "nodes",
-            self.global.symbol_nodes(&configuration, &selected),
+            "facets",
+            self.global.symbol_kinds(&configuration, &selected),
         )
         .await
         .map(Json)

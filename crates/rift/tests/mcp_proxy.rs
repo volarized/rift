@@ -97,7 +97,7 @@ use surface_corpus::SurfaceFixture;
 use tokio::sync::Notify;
 
 /// The tools the workspace server advertises, in served order.
-const SERVED_TOOL_NAMES: [&str; 4] = ["feedback", "get_symbol", "nodes", "search"];
+const SERVED_TOOL_NAMES: [&str; 4] = ["facets", "feedback", "get_symbol", "search"];
 
 #[test]
 fn proxied_engine_bound_covers_two_retry_sequences_and_election() {
@@ -352,12 +352,13 @@ async fn repository_workspace_reads(
             .any(|hit| hit["name"]["value"] == name),
         "{search}"
     );
-    let nodes = proxied_call(client, "nodes", &json!({"path":"lib.rs","position":8}))
+    let symbol_id = workspace_client::captured_seed(client, name, "lib.rs").await?;
+    let syntax_elements = proxied_call(client, "facets", &json!({"symbol":symbol_id}))
         .await
-        .map_err(|error| format!("nodes: {error:?}"))?;
+        .map_err(|error| format!("kinds: {error:?}"))?;
     assert!(
-        position_source(&nodes).is_some_and(|source| source.contains(name)),
-        "{nodes}"
+        position_source(&syntax_elements).is_some_and(|source| source.contains(name)),
+        "{syntax_elements}"
     );
     Ok(revision)
 }
@@ -547,7 +548,7 @@ fn repository_linked_workspaces(
     names: &[&str],
 ) -> TestResult<(tempfile::TempDir, Vec<PathBuf>)> {
     fixture_git(main, &["init", "-q"])?;
-    fixture_git(main, &["add", "lib.rs", "rift.toml"])?;
+    fixture_git(main, &["add", "lib.rs", "rift.toml", "Cargo.toml"])?;
     fixture_git(
         main,
         &[
@@ -579,186 +580,11 @@ fn repository_linked_workspaces(
     Ok((linked_parent, roots))
 }
 
-#[tokio::test]
-async fn named_path_nodes_select_linked_worktrees_and_their_revisions() -> TestResult {
-    let main = laid_out_workspace(
-        &[("lib.rs", "pub fn baseline() {}\n")],
-        "[search]\nresults = 2\n",
-    )?;
-    let (_linked_parent, roots) =
-        repository_linked_workspaces(main.path(), &["baseline", "review", "topic"])?;
-    let [_, review, topic] = roots.as_slice() else {
-        return Err("expected two linked worktrees".into());
-    };
-    fs::write(review.join("lib.rs"), "pub fn committed_review() {}\n")?;
-    fixture_git(review, &["add", "lib.rs"])?;
-    fixture_git(
-        review,
-        &[
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "-qm",
-            "change the review worktree's commit",
-        ],
-    )?;
-    fs::write(review.join("lib.rs"), "pub fn review() {}\n")?;
-    let umbrella = laid_out_workspace(
-        &[("lib.rs", "pub fn umbrella() {}\n")],
-        &format!(
-            "[mcp.extra]\nrepository = {}\nreview = {}\ntopic = {}\n",
-            json!(main.path()),
-            json!(review),
-            json!(topic)
-        ),
-    )?;
-    let _umbrella_stop = StopOnDrop::new(umbrella.path());
-    let _main_stop = StopOnDrop::new(main.path());
-    let _review_stop = StopOnDrop::new(review);
-    let _topic_stop = StopOnDrop::new(topic);
-    let client = proxy_client(umbrella.path()).await?;
-    await_workspace_ready(&client).await?;
-    let input_schema = listed_tools(&client)
-        .await?
-        .into_iter()
-        .find(|tool| tool.name == "nodes")
-        .ok_or("nodes must be advertised")?
-        .input_schema;
-    let schema = jsonschema::validator_for(&json!(input_schema.as_ref()))?;
-
-    assert_worktree_node_reads(&client, &schema).await?;
-    assert_worktree_scope_refusals(&client, &schema).await?;
-    client.cancel().await?;
-    Ok(())
-}
-
-async fn assert_worktree_node_reads(
-    client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
-    schema: &jsonschema::Validator,
-) -> TestResult {
-    for (scope, source) in [
-        (None, "pub fn umbrella() {}"),
-        (Some("local"), "pub fn umbrella() {}"),
-        (Some("local@repository"), "pub fn baseline() {}"),
-        (Some("local@review"), "pub fn review() {}"),
-        (Some("local@topic"), "pub fn topic() {}"),
-    ] {
-        let mut request = json!({"path": "lib.rs", "position": 8});
-        if let Some(scope) = scope {
-            request["scope"] = json!(scope);
-        }
-        assert!(schema.is_valid(&request), "{request}");
-        let answer = proxied_call(client, "nodes", &request).await?;
-        assert_eq!(
-            position_source(&answer).map(str::trim_end),
-            Some(source),
-            "{request}: {answer}"
-        );
-    }
-
-    let found = workspace_client::query_after_population(
-        client,
-        &rift_protocol::query::QueryParams {
-            query: "SELECT DISTINCT ?path { SERVICE :search { ?hit :pattern 'fn review'; \
-                    :target 'file'; :scope 'local@review'; :path ?path } } LIMIT 2"
-                .to_owned(),
-            language: rift_protocol::query::QueryLanguage::Sparql,
-        },
-    )
-    .await?;
-    let [hit] = workspace_client::query::rows(&found)? else {
-        return Err(format!("expected one path in the review worktree: {found}").into());
-    };
-    assert_eq!(workspace_client::query::literal(hit, "path")?, "lib.rs");
-
-    let committed = proxied_call(
-        client,
-        "nodes",
-        &json!({
-            "path": "lib.rs", "position": 8, "scope": "local@review",
-            "revision": "rift://revision/git/HEAD",
-        }),
-    )
-    .await?;
-    assert_eq!(
-        position_source(&committed).map(str::trim_end),
-        Some("pub fn committed_review() {}")
-    );
-    assert!(
-        committed["revision"]
-            .as_str()
-            .is_some_and(|revision| revision.starts_with("rift://revision/git/")
-                && revision != "rift://revision/git/HEAD"),
-        "{committed}"
-    );
-
-    let mut review_page =
-        json!({"path": "lib.rs", "position": 8, "scope": "local@review", "syntax": true});
-    let first = proxied_call(client, "nodes", &review_page).await?;
-    assert_eq!(
-        first["nodes"][0]["source"].as_str().map(str::trim_end),
-        Some("pub fn review() {}")
-    );
-    review_page["node_cursor"] = first["node_cursor"]
-        .as_str()
-        .ok_or("the first page must supply a cursor")?
-        .into();
-    let continued = proxied_call(client, "nodes", &review_page).await?;
-    assert_eq!(continued["revision"], first["revision"]);
-    assert_eq!(continued["symbol"], first["symbol"]);
-    assert_eq!(continued["nodes"][0]["index"], 2);
-    Ok(())
-}
-
 /// Source at the requested position, inside a declaration or in the unit excerpt.
 fn position_source(answer: &serde_json::Value) -> Option<&str> {
     answer["declarations"][0]["source"]["text"]
         .as_str()
         .or_else(|| answer["excerpt"]["text"].as_str())
-}
-
-async fn assert_worktree_scope_refusals(
-    client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
-    schema: &jsonschema::Validator,
-) -> TestResult {
-    for (request, valid_shape) in [
-        (
-            json!({"path": "lib.rs", "position": 8, "scope": "all"}),
-            false,
-        ),
-        (
-            json!({"path": "lib.rs", "position": 8, "scope": null}),
-            false,
-        ),
-        (
-            json!({"path": "lib.rs", "position": 8, "scope": "global"}),
-            false,
-        ),
-        (
-            json!({"path": "lib.rs", "position": 8, "scope": "local@unregistered"}),
-            true,
-        ),
-        (
-            json!({"symbol": "rift://symbol/local/rust/umbrella", "scope": "local"}),
-            false,
-        ),
-    ] {
-        assert_eq!(schema.is_valid(&request), valid_shape, "{request}");
-        let response = within(
-            "unavailable nodes scope",
-            client.call_tool(workspace_client::tool_request("nodes", &request)),
-        )
-        .await?;
-        let Err(rmcp::ServiceError::McpError(failure)) = response else {
-            return Err(format!("expected a nodes scope refusal: {response:?}").into());
-        };
-        assert_eq!(
-            failure.data.as_ref().and_then(|data| data.get("code")),
-            Some(&json!("invalid_request"))
-        );
-        assert!(failure.message.contains("scope"), "{failure:?}");
-    }
-    Ok(())
 }
 
 /// All internal root routes share one elected process and retain separate workspace facts.
@@ -767,7 +593,13 @@ async fn repository_foreground_routes_four_linked_workspaces_and_restarts_change
 -> TestResult {
     let names = ["amber", "cedar", "indigo", "quartz"];
     let main = laid_out_workspace(
-        &[("lib.rs", "pub fn amber() {}\n")],
+        &[
+            ("lib.rs", "pub fn amber() {}\n"),
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='1.0.0'\n[lib]\npath='lib.rs'\n",
+            ),
+        ],
         &harness::assigned_port_key()?,
     )?;
     let (_linked_parent, roots) = repository_linked_workspaces(main.path(), &names)?;
@@ -1278,10 +1110,15 @@ async fn both_proxies_write_the_same_text_and_continue_retained_pages() -> TestR
                 .as_ref()
                 .ok_or("all proxy must return structured content")?;
             assert_proxy_texts(&all, &text, &request, &all_result, &text_result).await?;
-            let Some(next_query) = reference["pagination"]["next_query"].as_str() else {
+            let page = reference["pagination"]["page"].as_u64().unwrap_or(1);
+            let pages = reference["pagination"]["pages"].as_u64().unwrap_or(0);
+            if page >= pages {
                 break;
-            };
-            request = json!({"query": next_query});
+            }
+            request["page"] = json!(page + 1);
+            if let Some(revision) = reference.get("revision") {
+                request["revision"] = revision.clone();
+            }
         }
     }
 
@@ -1319,41 +1156,35 @@ async fn assert_paged_index_text(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     result: &CallToolResult,
 ) -> TestResult {
-    use rift_protocol::query::{QueryConfiguration, QueryReadResult};
-    use rift_search::sparql::{GraphLimits, GraphQuery};
-
-    let (body, next_query) = text_of(result)?
-        .split_once("next query · ")
-        .ok_or("paged query text needs a continuation")?;
-    let next_query = next_query.trim_end();
-    let page_size = QueryConfiguration::default().page_size;
+    let max_results = rift_protocol::read::MAX_RESULTS_DEFAULT;
     let mut expected = String::from("?index\n");
-    for index in 0..page_size {
+    for index in 0..max_results {
         writeln!(expected, "{index}")?;
     }
-    expected.push_str("page 1/2\n");
-    assert_eq!(body, expected);
-
-    let selection = GraphQuery::parse(next_query, &GraphLimits::default())?
-        .page_selection()
-        .ok_or("next query selects a retained page")?;
-    assert_eq!(selection.page, 1);
-    let held = proxied_result(client, "search", &json!({"query": next_query})).await?;
-    assert_ne!(held.is_error, Some(true), "{held:?}");
-    assert_eq!(text_of(&held)?, format!("?index\n{page_size}\npage 2/2\n"));
-
-    if let Some(structured) = &result.structured_content {
-        let QueryReadResult::Results(own) = serde_json::from_value(structured.clone())? else {
-            return Err("paged index query returns structured bindings".into());
-        };
-        let view = own.view.ok_or("the first page retains a view")?;
-        assert_eq!(view.id, selection.view);
-        assert_eq!(own.pagination.next_query.as_deref(), Some(next_query));
-        let retained = held
-            .structured_content
-            .ok_or("the second page has structured content")?;
-        assert_eq!(retained["view"], serde_json::to_value(view)?);
+    let total = max_results + 1;
+    writeln!(expected, "page 1/2, total {total} results")?;
+    assert_eq!(text_of(result)?, expected);
+    let query = format!(
+        "SELECT ?index {{ VALUES ?index {{ {} }} }} ORDER BY ?index",
+        (0..=max_results)
+            .map(|index| index.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let mut request = json!({"query":query,"page":2,"max_results":max_results});
+    if let Some(revision) = result
+        .structured_content
+        .as_ref()
+        .and_then(|answer| answer.get("revision"))
+    {
+        request["revision"] = revision.clone();
     }
+    let held = proxied_result(client, "search", &request).await?;
+    assert_ne!(held.is_error, Some(true), "{held:?}");
+    assert_eq!(
+        text_of(&held)?,
+        format!("?index\n{max_results}\npage 2/2, total {total} results\n")
+    );
     Ok(())
 }
 
@@ -2096,9 +1927,9 @@ async fn live_proxied_read_resolves_incoming_references() -> TestResult {
         })
         .ok_or_else(|| format!("incoming references must reach total: {result}"))?;
     let exact = proxied_call(&client, "get_symbol", &json!({"id":caller})).await?;
-    let nodes = proxied_call(
+    let syntax_elements = proxied_call(
         &client,
-        "nodes",
+        "facets",
         &json!({"symbol":caller,"revision":exact["revision"]}),
     )
     .await?;
@@ -2114,8 +1945,8 @@ async fn live_proxied_read_resolves_incoming_references() -> TestResult {
         .get(start..end)
         .ok_or("original caller range")?;
     assert_eq!(
-        nodes["declarations"][0]["source"]["text"], original,
-        "{nodes}"
+        syntax_elements["declarations"][0]["source"]["text"], original,
+        "{syntax_elements}"
     );
     let workspace = within(
         "workspace resource",
@@ -2146,7 +1977,7 @@ async fn live_proxied_read_resolves_incoming_references() -> TestResult {
 }
 
 #[tokio::test]
-async fn proxy_query_nodes_and_source_keep_recorded_bytes_after_index_removal() -> TestResult {
+async fn proxy_query_refuses_a_revision_after_index_removal() -> TestResult {
     use workspace_client::query;
     let directory = laid_out_workspace(
         &[
@@ -2162,25 +1993,30 @@ async fn proxy_query_nodes_and_source_keep_recorded_bytes_after_index_removal() 
     await_workspace_ready(&client).await?;
     let request = query::declaration("beacon", "lib.rs");
     let original = workspace_client::query_after_population(&client, &request).await?;
-    let [node] = query::rows(&original)? else {
-        return Err(format!("one original declaration node: {original}").into());
+    let [syntax_element] = query::rows(&original)? else {
+        return Err(format!("one original declaration syntax element: {original}").into());
     };
-    let symbol = query::iri(node, "symbol")?;
-    assert_eq!(query::iri(node, "unit")?, "rift://source/project/lib.rs");
-    let start = query::literal(node, "start")?.parse::<usize>()?;
-    let end = query::literal(node, "end")?.parse::<usize>()?;
-    let source = LIBRARY.get(start..end).ok_or("original node range")?;
-    assert_eq!(query::literal(node, "source")?, source);
+    let symbol = query::iri(syntax_element, "symbol")?;
+    assert_eq!(
+        query::iri(syntax_element, "unit")?,
+        "rift://source/project/lib.rs"
+    );
+    let start = query::literal(syntax_element, "start")?.parse::<usize>()?;
+    let end = query::literal(syntax_element, "end")?.parse::<usize>()?;
+    let source = LIBRARY
+        .get(start..end)
+        .ok_or("original syntax element range")?;
+    assert_eq!(query::literal(syntax_element, "source")?, source);
     let exact = proxied_call(&client, "get_symbol", &json!({"id":symbol})).await?;
     assert_eq!(exact["symbol"]["id"], symbol);
-    let nodes = proxied_call(
+    let syntax_elements = proxied_call(
         &client,
-        "nodes",
+        "facets",
         &json!({"symbol":symbol,"revision":exact["revision"]}),
     )
     .await?;
-    assert_eq!(nodes["declarations"][0]["source"]["text"], source);
-    let replay = query::retained_page(&original, 0)?;
+    assert_eq!(syntax_elements["declarations"][0]["source"]["text"], source);
+    let pinned = serde_json::to_value(query::result_page(&request, &original, 1)?)?;
     for removed in [false, true] {
         if removed {
             fs::remove_file(root.join("lib.rs"))?;
@@ -2205,12 +2041,18 @@ async fn proxy_query_nodes_and_source_keep_recorded_bytes_after_index_removal() 
             observed,
             "current index must observe the edit or removal before the held read"
         );
-        let held = proxied_call(&client, "search", &json!({"query":replay})).await?;
+        let failure = workspace_client::failed_call(
+            client
+                .call_tool(
+                    CallToolRequestParams::new("search")
+                        .with_arguments(pinned.as_object().cloned().ok_or("pinned request")?),
+                )
+                .await,
+        )?;
         assert_eq!(
-            held["answer"], original["answer"],
-            "retained node source and range"
+            failure.code,
+            rift_protocol::error::ErrorCode::ResourceNotFound
         );
-        assert_eq!(held["view"], original["view"], "retained view and expiry");
     }
     client.cancel().await?;
     failure_window.passed();

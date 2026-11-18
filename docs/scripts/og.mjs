@@ -1,13 +1,13 @@
 /**
- * Generates public/og.png — the 1280x640 social card used as the Open Graph
+ * Generates public/og.png - the 1280x640 social card used as the Open Graph
  * image for the docs and as the repository's social preview on GitHub.
  *
  *   node scripts/og.mjs           # -> public/og.png
  *   node scripts/og.mjs out.png   # -> arbitrary path
  *
  * The card is laid out in HTML and photographed by a headless Chrome, because
- * the two things that make it look like the site — Geist Mono and Inter, and a
- * hairline mesh that has to survive downsampling — are a browser's job. It is
+ * the two things that make it look like the site - Geist Mono and Inter, and a
+ * hairline mesh that has to survive downsampling - are a browser's job. It is
  * shot at 2x and reduced to 1280x640 by sharp, so the strings stay crisp.
  *
  * Needs a Chrome/Chromium on the machine (set CHROME to override the search)
@@ -32,7 +32,10 @@ const HEIGHT = 640;
 const SUPERSAMPLE = 2;
 
 const TITLE = "rift";
-const TAGLINE = ["Agentic development toolkit for", "reading and discovering codebases."];
+const TAGLINE = [
+  "Agentic development toolkit for reading,",
+  "discovering, and exploring codebases.",
+];
 
 /** The four values of the design system. */
 const VOID = "#08080A";
@@ -118,7 +121,7 @@ const UA =
   "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 /**
- * The latin cut of one Google font, inlined as a data: URI — the card has to
+ * The latin cut of one Google font, inlined as a data: URI - the card has to
  * render from a file:// URL with no network fetches of its own.
  */
 async function webfont(family, weight) {

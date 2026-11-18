@@ -11,12 +11,12 @@ mod documentation_store;
 mod language;
 mod lazy_database;
 mod lexical;
-mod located_node;
+mod located_syntax_element;
 mod producer;
 mod semantic;
 mod trigram_store;
 
-mod relationship;
+mod edge;
 mod revision;
 mod vector;
 mod workspace;
@@ -30,18 +30,18 @@ pub use content_cache::WorkspaceContentCache;
 pub use database::{
     DatabaseName, DatabasePool, DatabaseReadings, HeldConnection, WorkspaceDatabase,
 };
+pub use edge::{EDGES_MAX, Edge, EdgeStore};
 pub use language::{EffectiveLanguage, WorkspaceLanguagePolicy};
 pub use lazy_database::LazyDatabase;
 pub use lexical::{
     LexicalChange, LexicalIndexLimits, LexicalMatch, LexicalRanking, LexicalSearchIndex,
     LexicalStamp, PublishedIndex, RevisionScoped, is_connection_unavailable,
 };
-pub use located_node::{LocatedNode, NodeAddress, whole_range};
+pub use located_syntax_element::{LocatedSyntax, SyntaxAddress, whole_range};
 pub use producer::{
-    ExtractionInput, FactExtractor, PRODUCER_FACTS_MAX, PublicationNodes, accept_extracted_facts,
+    ExtractionInput, FactExtractor, PRODUCER_FACTS_MAX, PublicationSyntax, accept_extracted_facts,
     accept_producer_facts,
 };
-pub use relationship::{RELATIONSHIP_EDGES_MAX, RelationshipEdge, RelationshipStore};
 pub use revision::RevisionPaths;
 pub use rift_analysis::documentation::{
     DocumentationCollection, documentation_context, documentation_context_with_budget,
@@ -57,7 +57,7 @@ pub use rift_error::RiftError;
 pub use trigram_store::{PatternCandidate, PatternCandidates, TrigramBatch, UnindexedRows};
 pub use vector::{StoredVector, VectorStore};
 pub use workspace::{
-    IndexRead, IndexedFile, IndexedFileNodes, ReadableSymbol, SymbolMatch, TextSourceFile,
+    IndexRead, IndexedFile, IndexedFileSyntax, ReadableSymbol, SymbolMatch, TextSourceFile,
     WorkspaceFingerprint, WorkspaceIndex, WorkspaceIndexLimits, WorkspaceIndexPreparation,
     WorkspaceIndexWarning, WorkspaceMapPaths, WorkspaceSourcePolicy, capture_digests,
     capture_digests_with_languages, capture_digests_with_languages_cancellable,

@@ -137,9 +137,9 @@ fn every_provider_fixture_with_neither_fact_attached_returns_two_empty_lists() {
         {
             assert!(
                 document.symbols().is_empty(),
-                "Angular template facts contain structural nodes"
+                "Angular template facts contain structural syntax elements"
             );
-            assert!(!document.nodes().is_empty());
+            assert!(!document.syntax_elements().is_empty());
             continue;
         }
         let symbol = declared_symbol(&document);

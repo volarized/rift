@@ -59,28 +59,28 @@ export function collect(ts, request, admitted) {
   }
   const checker = admitted?.checker ?? localChecker(ts, source);
   const bytes = offsets(text);
-  const span = node => ({ start: bytes[node.getStart(source)], end: bytes[node.getEnd()] });
+  const span = syntaxElement => ({ start: bytes[syntaxElement.getStart(source)], end: bytes[syntaxElement.getEnd()] });
   const observations = [];
   const pending = [[source, null]];
   while (pending.length) {
-    const [node, owner] = pending.pop();
-    if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
+    const [syntaxElement, owner] = pending.pop();
+    if (ts.isCallExpression(syntaxElement) || ts.isNewExpression(syntaxElement)) {
       if (observations.length === request.observations_max) {
         return { coverage: "partial", observations };
       }
-      const targetNode = checker.getResolvedSignature(node)?.declaration;
-      const target = targetNode?.getSourceFile() === source ? { unit, source_sha256: sha256, range: span(targetNode) } : null;
+      const targetSyntax = checker.getResolvedSignature(syntaxElement)?.declaration;
+      const target = targetSyntax?.getSourceFile() === source ? { unit, source_sha256: sha256, range: span(targetSyntax) } : null;
       observations.push({
         id: String(observations.length),
-        occurrence: span(node),
+        occurrence: span(syntaxElement),
         enclosing: owner,
         target,
         evidence: target === null ? "syntax" : "candidate",
       });
     }
-    const childOwner = ts.isFunctionLike(node) || ts.isClassLike(node) ? span(node) : owner;
+    const childOwner = ts.isFunctionLike(syntaxElement) || ts.isClassLike(syntaxElement) ? span(syntaxElement) : owner;
     const children = [];
-    node.forEachChild(child => { children.push(child); });
+    syntaxElement.forEachChild(child => { children.push(child); });
     for (const child of children.reverse()) pending.push([child, childOwner]);
   }
   return { coverage: "complete", observations };

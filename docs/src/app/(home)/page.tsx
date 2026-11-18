@@ -95,7 +95,7 @@ const DIFFERENCES: {
   {
     statement: "Structured code reads.",
     title: "MCP tools and resources",
-    body: "Agents find declarations, inspect syntax, and follow relationships through MCP tools.",
+    body: "Agents find declarations, inspect syntax, and follow edges through MCP tools.",
     line: "tsucs1",
     tilt: 0.9,
     spin: 0.4,
@@ -121,7 +121,7 @@ export default function HomePage() {
             </h1>
 
             <Body className="max-w-115">
-              Rift is an agentic development toolkit for reading, discovering, and editing
+              Rift is an agentic development toolkit for reading, discovering, and exploring
               codebases.
             </Body>
           </div>

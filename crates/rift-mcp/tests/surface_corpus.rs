@@ -17,7 +17,7 @@ retry = { attempts = 2, delay = \"1ms\", delay_limit = \"1ms\" }\n";
 pub(crate) fn corpus() -> Vec<(&'static str, Value)> {
     let mut requests = vec![
         ("get_symbol", json!({ "name": "beacon_one" })),
-        ("search", json!({ "query": "beacon", "limit": 1 })),
+        ("search", json!({ "query": "beacon", "max_results": 1 })),
         ("search", json!({ "query": "beacon", "include": {} })),
         // The fixture global API's collected package answers these: a package hit
         // carries `unit` in place of `path`.
@@ -45,17 +45,17 @@ pub(crate) fn corpus() -> Vec<(&'static str, Value)> {
             "search",
             json!({
                 "query": "beacon",
-                "limit": 1,
+                "max_results": 1,
                 "paths": { "include": ["lib.rs"] }
             }),
         ),
         (
             "search",
-            json!({ "query": "beacon", "limit": 1, "page_index": 100 }),
+            json!({ "query": "beacon", "max_results": 1, "page": 100 }),
         ),
         (
             "search",
-            json!({ "query": "beacon", "limit": 1, "page_index": 50 }),
+            json!({ "query": "beacon", "max_results": 1, "page": 50 }),
         ),
         (
             "search",
@@ -69,22 +69,14 @@ pub(crate) fn corpus() -> Vec<(&'static str, Value)> {
                 "paths": { "force_include": ["hidden.rs"] }
             }),
         ),
-        ("nodes", json!({ "path": "lib.rs", "position": 0 })),
-        ("nodes", json!({ "path": "lib.rs", "position": 8 })),
+        ("facets", json!({ "symbol_name": "beacon_one" })),
         (
-            "nodes",
-            json!({ "path": "lib.rs", "position": 8, "syntax": true }),
-        ),
-        ("nodes", json!({ "symbol_name": "beacon_one" })),
-        ("nodes", json!({ "path": "notes.txt", "position": 0 })),
-        ("nodes", json!({ "path": "justfile", "position": 0 })),
-        (
-            "nodes",
-            json!({ "path": "packages/@scope/name/package.json", "position": 4 }),
+            "facets",
+            json!({ "symbol_name": "literal_at_source", "symbol_path": "packages/@scope/name/shape.rs" }),
         ),
         (
-            "nodes",
-            json!({ "path": "notes for café.json", "position": 4 }),
+            "facets",
+            json!({ "symbol_name": "escaped_source", "symbol_path": "notes for café.rs" }),
         ),
     ];
     requests.extend(dependency_scope_search_corpus());
@@ -99,7 +91,7 @@ pub(crate) fn corpus() -> Vec<(&'static str, Value)> {
         ("search", json!({"language":"sparql", "query":"ASK { ?symbol a :Symbol; :name 'beacon_one' }"})),
         ("search", json!({"language":"sparql", "query":"CONSTRUCT { ?symbol :name 'beacon_one' } WHERE { ?symbol a :Symbol; :name 'beacon_one' }"})),
         ("search", json!({"language":"sparql", "query":"SELECT (BNODE() AS ?blank) (<urn:fixture:term> AS ?iri) (1 AS ?number) ('hello'@en AS ?language) WHERE {}"})),
-        ("search", json!({"language":"sparql", "query":format!("SELECT ?index {{ VALUES ?index {{ {} }} }} ORDER BY ?index", (0..=rift_protocol::query::QueryConfiguration::default().page_size).map(|index| index.to_string()).collect::<Vec<_>>().join(" "))})),
+        ("search", json!({"language":"sparql", "query":format!("SELECT ?index {{ VALUES ?index {{ {} }} }} ORDER BY ?index", (0..=rift_protocol::read::MAX_RESULTS_DEFAULT).map(|index| index.to_string()).collect::<Vec<_>>().join(" "))})),
     ]);
     requests
         .into_iter()
@@ -130,7 +122,7 @@ pub(crate) async fn prepared_corpus(
                 .as_str()
                 .ok_or("corpus declaration name")?
                 .to_owned();
-            let mut discovery = json!({"query": name, "target": "symbol", "include": {"source": true}, "limit": 1000});
+            let mut discovery = json!({"query": name, "target": "symbol", "include": {"source": true}, "max_results": 1000});
             for field in ["scope", "packages", "revision"] {
                 if let Some(value) = request.get(field) {
                     discovery[field] = value.clone();
@@ -153,12 +145,14 @@ pub(crate) async fn prepared_corpus(
             }
             object.insert("id".to_owned(), json!(id));
         }
-        if *tool == "nodes"
+        if *tool == "facets"
             && let Some(name) = request["symbol_name"].as_str()
         {
-            let id = crate::workspace_client::captured_seed(client, name, "lib.rs").await?;
+            let path = request["symbol_path"].as_str().unwrap_or("lib.rs");
+            let id = crate::workspace_client::captured_seed(client, name, path).await?;
             let object = request.as_object_mut().ok_or("corpus request object")?;
             object.remove("symbol_name");
+            object.remove("symbol_path");
             object.insert("symbol".to_owned(), json!(id));
         }
         if *tool == "search" {
@@ -247,7 +241,7 @@ fn commit_search_corpus() -> Vec<(&'static str, Value)> {
         ("search", json!({ "target": "commit", "query": "witness" })),
         (
             "search",
-            json!({ "target": "commit", "query": "fixture change", "limit": 1 }),
+            json!({ "target": "commit", "query": "fixture change", "max_results": 1 }),
         ),
     ]
 }
@@ -402,8 +396,8 @@ fn revision_read_corpus() -> Vec<(&'static str, Value)> {
             json!({ "query": "beacon", "revision": "rift://revision/git/main" }),
         ),
         (
-            "nodes",
-            json!({ "path": "lib.rs", "position": 0, "revision": "rift://revision/git/main" }),
+            "facets",
+            json!({ "symbol_name": "beacon_one", "revision": "rift://revision/git/main" }),
         ),
     ]
 }
@@ -513,7 +507,7 @@ impl SurfaceFixture {
             directory.path().join("pyproject.toml"),
             "[build-system]\nrequires=['setuptools==80.9.0']\nbuild-backend='setuptools.build_meta'\n[tool.setuptools]\npy-modules=['traversal_callee','traversal_caller']\n",
         )?;
-        // No syntax provider claims it; `nodes` names the missing extension.
+        // No syntax provider claims it; search still reads its source.
         fs::write(directory.path().join("justfile"), "default:\n    echo hi\n")?;
         // An npm scoped package directory, so the corpus mints an identity whose path holds the
         // `@` RFC 3986 keeps literal. An identity pattern that left `@` out refused the
@@ -528,6 +522,22 @@ impl SurfaceFixture {
         fs::write(
             directory.path().join("notes for café.json"),
             "{\n  \"beacon\": \"escaped\"\n}\n",
+        )?;
+        fs::write(
+            directory.path().join("packages/@scope/name/shape.rs"),
+            "pub fn literal_at_source() {}\n",
+        )?;
+        fs::write(
+            directory.path().join("notes for café.rs"),
+            "pub fn escaped_source() {}\n",
+        )?;
+        let path = directory.path().join("lib.rs");
+        let library = fs::read_to_string(&path)?;
+        fs::write(
+            path,
+            format!(
+                "{library}\n#[path=\"packages/@scope/name/shape.rs\"] pub mod scoped;\n#[path=\"notes for café.rs\"] pub mod escaped;\n"
+            ),
         )?;
         // A committed baseline, so the corpus can prove revision-addressed reads:
         // `hidden.rs` stays gitignored and uncommitted, everything else lands in

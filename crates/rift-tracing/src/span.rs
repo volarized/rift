@@ -143,8 +143,8 @@ macro_rules! __rift_function_name {
 /// `raw`, the `type_name` of an item `f` declared inside a function body, without its
 /// trailing `::f` and `::{{closure}}` segments: the function that declares the body.
 ///
-/// `rift_mcp::server::Server::nodes::{{closure}}::f`, the item inside an async method,
-/// names `rift_mcp::server::Server::nodes`.
+/// `rift_mcp::server::Server::syntax elements::{{closure}}::f`, the item inside an async method,
+/// names `rift_mcp::server::Server::syntax elements`.
 #[doc(hidden)]
 #[must_use]
 pub fn function_name(raw: &'static str) -> &'static str {

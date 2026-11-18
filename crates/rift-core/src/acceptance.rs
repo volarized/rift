@@ -3,7 +3,7 @@
 //!
 //! Every key a configuration model declares by a fixed name has one variable:
 //! `RIFT_` followed by the key's path, members joined by `_` and uppercased.
-//! `[providers.syntax] max_nodes` is `RIFT_PROVIDERS_SYNTAX_MAX_NODES`. A
+//! `[providers.syntax] max_syntax_elements` is `RIFT_PROVIDERS_SYNTAX_MAX_SYNTAX_ELEMENTS`. A
 //! variable's value replaces the document's, and the merged configuration
 //! passes the same shape checks the document alone does; the caller then
 //! checks its bounds.
@@ -454,18 +454,18 @@ mod tests {
 
     #[test]
     fn test_a_variable_prevails_over_the_document_and_the_default() {
-        let document = "[providers.syntax]\nmax_nodes = 1000\nmax_depth = 64\n";
+        let document = "[providers.syntax]\nmax_syntax_elements = 1000\nmax_depth = 64\n";
         let (configuration, variables) = accept(
             Some(document),
             &[
-                ("RIFT_PROVIDERS_SYNTAX_MAX_NODES", "5000000"),
+                ("RIFT_PROVIDERS_SYNTAX_MAX_SYNTAX_ELEMENTS", "5000000"),
                 ("RIFT_PROVIDERS_SYNTAX_MAX_FILE", "16mb"),
             ],
         )
         .expect("both variables name keys");
 
         let syntax = configuration.providers.syntax;
-        assert_eq!(syntax.max_nodes, 5_000_000);
+        assert_eq!(syntax.max_syntax_elements, 5_000_000);
         assert_eq!(syntax.max_file, ByteSize::from_bytes(16 << 20));
         assert_eq!(
             syntax.max_depth, 64,
@@ -475,7 +475,7 @@ mod tests {
             variables,
             [
                 "RIFT_PROVIDERS_SYNTAX_MAX_FILE",
-                "RIFT_PROVIDERS_SYNTAX_MAX_NODES"
+                "RIFT_PROVIDERS_SYNTAX_MAX_SYNTAX_ELEMENTS"
             ]
         );
     }
@@ -596,8 +596,8 @@ mod tests {
     #[test]
     fn test_a_value_outside_the_key_shape_refuses_naming_the_variable() {
         for (variable, value) in [
-            ("RIFT_PROVIDERS_SYNTAX_MAX_NODES", "many"),
-            ("RIFT_PROVIDERS_SYNTAX_MAX_NODES", "1\nlogs = 2"),
+            ("RIFT_PROVIDERS_SYNTAX_MAX_SYNTAX_ELEMENTS", "many"),
+            ("RIFT_PROVIDERS_SYNTAX_MAX_SYNTAX_ELEMENTS", "1\nlogs = 2"),
             ("RIFT_PROVIDERS_SYNTAX_MAX_FILE", "16MB"),
         ] {
             let error = accept(None, &[(variable, value)]).expect_err(value);
@@ -615,7 +615,7 @@ mod tests {
         let error = accept(
             None,
             &[
-                ("RIFT_PROVIDERS_SYNTAX_MAX_NODES", "5000000"),
+                ("RIFT_PROVIDERS_SYNTAX_MAX_SYNTAX_ELEMENTS", "5000000"),
                 ("RIFT_SERVER_PORT_RANGE_MIN", "41000"),
             ],
         )
@@ -629,7 +629,7 @@ mod tests {
     #[test]
     fn test_a_variable_naming_a_table_and_no_key_refuses() {
         for variable in [
-            "RIFT_PROVIDERS_SYNTAX_MAX_NODE",
+            "RIFT_PROVIDERS_SYNTAX_MAX_SYNTAX_ELEMENT",
             // Without the shipped names, no language member is known.
             "RIFT_LANGUAGES_PYTHON_ENABLED",
         ] {
@@ -639,12 +639,11 @@ mod tests {
                 "{error:?}"
             );
         }
-        let error =
-            accept(None, &[("RIFT_PROVIDERS_SYNTAX_MAX_NODE", "1")]).expect_err("misspelled");
-        assert!(
-            context_value(&error, "accepted")
-                .is_some_and(|accepted| accepted.contains("RIFT_PROVIDERS_SYNTAX_MAX_NODES"))
-        );
+        let error = accept(None, &[("RIFT_PROVIDERS_SYNTAX_MAX_SYNTAX_ELEMENT", "1")])
+            .expect_err("misspelled");
+        assert!(context_value(&error, "accepted").is_some_and(|accepted| {
+            accepted.contains("RIFT_PROVIDERS_SYNTAX_MAX_SYNTAX_ELEMENTS")
+        }));
     }
 
     #[test]
@@ -654,7 +653,7 @@ mod tests {
             &[
                 ("RIFT_API_TOKEN", "secret"),
                 ("RIFT_LIVE_SEARCH", "1"),
-                ("RIFTX_PROVIDERS_SYNTAX_MAX_NODES", "1"),
+                ("RIFTX_PROVIDERS_SYNTAX_MAX_SYNTAX_ELEMENTS", "1"),
                 ("PATH", "/usr/bin"),
             ],
         )
@@ -666,7 +665,7 @@ mod tests {
     #[test]
     fn test_a_variable_that_is_not_unicode_refuses() {
         let environment = ConfigurationEnvironment {
-            variables: vec![("RIFT_PROVIDERS_SYNTAX_MAX_NODES".to_owned(), None)],
+            variables: vec![("RIFT_PROVIDERS_SYNTAX_MAX_SYNTAX_ELEMENTS".to_owned(), None)],
         };
         let error = accept_configuration::<WorkspaceConfiguration>(None, &environment)
             .expect_err("a key's variable must be UTF-8");
@@ -680,7 +679,7 @@ mod tests {
     fn test_a_document_refusal_keeps_its_location_beside_variables() {
         let error = accept(
             Some("[execution]\nmax_codes = \"16kb\"\n"),
-            &[("RIFT_PROVIDERS_SYNTAX_MAX_NODES", "5000000")],
+            &[("RIFT_PROVIDERS_SYNTAX_MAX_SYNTAX_ELEMENTS", "5000000")],
         )
         .expect_err("the document names an unknown key");
         assert_eq!(error.slug().as_str(), "rift.core.configuration_malformed");
@@ -710,22 +709,22 @@ mod tests {
             declared,
             "two keys must never share a variable"
         );
-        assert!(names.contains(&"RIFT_PROVIDERS_SYNTAX_MAX_NODES".to_owned()));
+        assert!(names.contains(&"RIFT_PROVIDERS_SYNTAX_MAX_SYNTAX_ELEMENTS".to_owned()));
     }
 
     #[test]
     fn test_invalid_names_the_variables_that_overrode_keys_or_else_the_file() {
         let violation = rift_protocol::configuration::ConfigurationViolation::LimitOutOfRange {
-            field: "providers.syntax.max_nodes",
+            field: "providers.syntax.max_syntax_elements",
             value: 0,
             min: 1,
             max: 100_000_000,
         };
         let overridden = crate::configuration::configuration_violation_error(&violation).with(
-            ErrorContext::new("variables", "RIFT_PROVIDERS_SYNTAX_MAX_NODES"),
+            ErrorContext::new("variables", "RIFT_PROVIDERS_SYNTAX_MAX_SYNTAX_ELEMENTS"),
         );
         assert!(overridden.context().any(|(key, value)| {
-            key == "variables" && value == "RIFT_PROVIDERS_SYNTAX_MAX_NODES"
+            key == "variables" && value == "RIFT_PROVIDERS_SYNTAX_MAX_SYNTAX_ELEMENTS"
         }));
         assert!(!overridden.context().any(|(key, _)| key == "file"));
 

@@ -3,7 +3,7 @@
 use crate::extract::{self, Declaration, GrammarRules, Visited};
 use crate::{ShippedLanguage, SyntaxDocument, SyntaxLimits, SyntaxProvider, SyntaxSource};
 use rift_error::RiftError;
-use rift_protocol::read::{Language, NodeFacet};
+use rift_protocol::read::{Language, SyntaxKind};
 use std::sync::OnceLock;
 use tree_sitter::{Language as Grammar, Node};
 
@@ -34,14 +34,14 @@ impl SyntaxProvider for HtmlSyntaxProvider {
         let document = analyze_base(source, limits, &self.language)?;
         crate::embedded::append(source, limits, &document)
     }
-    fn node_facets(&self, kind: &str) -> Vec<NodeFacet> {
+    fn syntax_element_kinds(&self, kind: &str) -> Vec<SyntaxKind> {
         match kind {
             "element" | "script_element" | "style_element" | "attribute" => {
-                vec![NodeFacet::Declaration]
+                vec![SyntaxKind::Declaration]
             }
-            "comment" => vec![NodeFacet::Comment],
-            "attribute_value" | "text" => vec![NodeFacet::Literal],
-            "tag_name" | "attribute_name" => vec![NodeFacet::Identifier],
+            "comment" => vec![SyntaxKind::Comment],
+            "attribute_value" | "text" => vec![SyntaxKind::Literal],
+            "tag_name" | "attribute_name" => vec![SyntaxKind::Identifier],
             _ => Vec::new(),
         }
     }
@@ -87,11 +87,11 @@ struct HtmlRules {
     kinds: &'static HtmlKinds,
 }
 impl HtmlRules {
-    fn name<'tree>(&self, node: Node<'tree>) -> Option<(Node<'tree>, &'static str)> {
-        let (parent, wanted, kind) = if self.kinds.elements.contains(&node.kind_id()) {
-            (node.named_child(0)?, self.kinds.tag, ELEMENT)
-        } else if node.kind_id() == self.kinds.attribute {
-            (node, self.kinds.name, ATTRIBUTE)
+    fn name<'tree>(&self, syntax_element: Node<'tree>) -> Option<(Node<'tree>, &'static str)> {
+        let (parent, wanted, kind) = if self.kinds.elements.contains(&syntax_element.kind_id()) {
+            (syntax_element.named_child(0)?, self.kinds.tag, ELEMENT)
+        } else if syntax_element.kind_id() == self.kinds.attribute {
+            (syntax_element, self.kinds.name, ATTRIBUTE)
         } else {
             return None;
         };
@@ -108,7 +108,7 @@ impl GrammarRules for HtmlRules {
         visited: Visited<'_, '_>,
         text: &str,
     ) -> Result<Option<Declaration>, RiftError> {
-        let Some((child, kind)) = self.name(visited.node()) else {
+        let Some((child, kind)) = self.name(visited.syntax_element()) else {
             return Ok(None);
         };
         let Some(name) = text.get(child.byte_range()).filter(|name| !name.is_empty()) else {
@@ -117,26 +117,26 @@ impl GrammarRules for HtmlRules {
         Ok(Some(Declaration {
             name: name.to_owned(),
             kind,
-            facets: Vec::new(),
+            kinds: Vec::new(),
             visibility: None,
             body_range: None,
             documentation: Vec::new(),
             documentation_ranges: Vec::new(),
         }))
     }
-    fn container_name(&self, node: Node<'_>, text: &str) -> Option<String> {
-        if !self.kinds.elements.contains(&node.kind_id()) {
+    fn container_name(&self, syntax_element: Node<'_>, text: &str) -> Option<String> {
+        if !self.kinds.elements.contains(&syntax_element.kind_id()) {
             return None;
         }
-        self.name(node)
+        self.name(syntax_element)
             .and_then(|(child, _)| text.get(child.byte_range()))
             .map(str::to_owned)
     }
     fn declaration_start(&self, visited: Visited<'_, '_>, _: &str) -> usize {
-        visited.node().start_byte()
+        visited.syntax_element().start_byte()
     }
-    fn name_range(&self, node: Node<'_>) -> Result<Option<crate::ByteRange>, RiftError> {
-        self.name(node)
+    fn name_range(&self, syntax_element: Node<'_>) -> Result<Option<crate::ByteRange>, RiftError> {
+        self.name(syntax_element)
             .map(|(child, _)| extract::byte_range(child))
             .transpose()
     }

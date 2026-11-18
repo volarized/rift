@@ -46,7 +46,7 @@ pub const REQUIREMENT_ANY: &str = ">=0";
 #[serde(rename_all = "snake_case")]
 pub enum DependencyResolution {
     /// A standard library version no pin names is read from `rustc --version` or
-    /// `node --version`, and the static reading stands when the probe fails.
+    /// `syntax element --version`, and the static reading stands when the probe fails.
     Auto,
     /// No program runs. Every standard library version comes from the pins and project
     /// files alone.
@@ -376,7 +376,7 @@ pub struct DependenciesConfiguration {
     /// File, directory, manifest, package, and version probe collection bounds.
     pub collection: DependenciesCollectionConfiguration,
     /// Whether a standard library version probe runs: `auto` runs `rustc --version` or
-    /// `node --version` when no pin names the version, `static` reads the pins and project
+    /// `syntax element --version` when no pin names the version, `static` reads the pins and project
     /// files alone and runs no program.
     #[serde(default = "default_dependencies_resolution")]
     pub resolution: DependencyResolution,

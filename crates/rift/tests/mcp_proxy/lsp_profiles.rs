@@ -6,9 +6,8 @@ use std::path::Path;
 
 use crate::workspace_client::query;
 use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
-use rift_protocol::query::{QueryAnswer, QueryLanguage, QueryParams};
+use rift_protocol::query::{QueryLanguage, QueryParams};
 use rift_protocol::read::SymbolId;
-use rift_protocol::symbol_read::CapturedView;
 use rift_protocol::symbol_read::GetSymbolResult;
 use serde_json::{Value, json};
 
@@ -123,6 +122,7 @@ fn search() -> TestResult<Value> {
             selected("local:docs"),
         ),
         language: QueryLanguage::Sparql,
+        ..Default::default()
     })?)
 }
 
@@ -130,16 +130,6 @@ fn search() -> TestResult<Value> {
 struct ProfileSymbol {
     id: SymbolId,
     source: String,
-}
-
-fn retained_page(answer: &Value, page: u64) -> TestResult<Value> {
-    let retained: QueryAnswer = serde_json::from_value(answer["answer"].clone())?;
-    let view: CapturedView = serde_json::from_value(answer["view"].clone())?;
-    let query = rift_search::sparql::continuation_query(&retained, &view.id, page)?;
-    Ok(serde_json::to_value(QueryParams {
-        query,
-        language: QueryLanguage::Sparql,
-    })?)
 }
 
 fn hit(answer: &Value) -> TestResult<ProfileSymbol> {
@@ -172,16 +162,16 @@ async fn symbol_read(
     };
     assert_eq!(symbol.id.as_ref(), Some(id), "{answer}");
     assert_eq!(declarations.len(), 1, "{answer}");
-    let nodes = proxied_call(
+    let syntax_elements = proxied_call(
         client,
-        "nodes",
-        &json!({"symbol":id, "revision":answer["revision"], "syntax":true}),
+        "facets",
+        &json!({"symbol":id, "revision":answer["revision"]}),
     )
     .await?;
     assert_eq!(
-        nodes["nodes"][0]["source"].as_str(),
+        syntax_elements["declarations"][0]["source"]["text"].as_str(),
         Some(hit.source.as_str()),
-        "{nodes}"
+        "{syntax_elements}"
     );
     assert_eq!(
         declarations[0].path.as_ref().map(|path| path.0.as_str()),
@@ -270,10 +260,11 @@ async fn caller_read(
     let rows = query::rows(&answer)?;
     assert_eq!(rows.len(), 1, "{answer}");
     let caller = query::iri(&rows[0], "symbol")?;
-    let nodes = proxied_call(client, "nodes", &json!({"symbol":caller, "syntax":true})).await?;
+    let syntax_elements = proxied_call(client, "facets", &json!({"symbol":caller})).await?;
     assert_eq!(
-        nodes["nodes"][0]["source"], "pub fn caller() -> u32 {\n    beacon()\n}",
-        "{nodes}"
+        syntax_elements["declarations"][0]["source"]["text"],
+        "pub fn caller() -> u32 {\n    beacon()\n}",
+        "{syntax_elements}"
     );
     assert_eq!(
         SymbolIdentity::parse(query::iri(&rows[0], "symbol")?)?.owner(),
@@ -281,19 +272,6 @@ async fn caller_read(
         "{answer}"
     );
     Ok(())
-}
-
-fn engine_requests(logs: &Path) -> TestResult<Vec<Value>> {
-    let mut requests = Vec::new();
-    for name in ["main", "docs"] {
-        for line in fs::read_to_string(logs.join(format!("{name}.requests")))?.lines() {
-            let message: Value = serde_json::from_str(line)?;
-            if message.get("id").is_some() {
-                requests.push(json!({"engine": name, "request": message}));
-            }
-        }
-    }
-    Ok(requests)
 }
 
 async fn require_engine_root(logs: &Path, name: &str, root: &Path) -> TestResult {
@@ -320,6 +298,7 @@ async fn require_profile_source_scope(
             "PREFIX : <urn:rift:vocabulary:> SELECT ?symbol { ?symbol a :Symbol; :language 'toml' }"
                 .to_owned(),
         language: QueryLanguage::Sparql,
+        ..Default::default()
     })?;
     let answer = proxied_call(client, "search", &arguments).await?;
     assert!(
@@ -425,7 +404,7 @@ async fn cli_profiles_combine_search_preserve_views_and_select_each_project_engi
             ("docs/lib.rs", &docs_source),
             ("docs/caller.rs", CALLER_SOURCE),
         ],
-        "[source]\ninclude = [\"Cargo.toml\", \"lib.rs\", \"caller.rs\", \"docs/lib.rs\", \"docs/caller.rs\"]\n[search.text]\ninclude = [\"Cargo.toml\"]\n[languages.toml]\nenabled = false\n[search.query]\npage_size = 1\n[global]\nenabled = false\n",
+        "[source]\ninclude = [\"Cargo.toml\", \"lib.rs\", \"caller.rs\", \"docs/lib.rs\", \"docs/caller.rs\"]\n[search.text]\ninclude = [\"Cargo.toml\"]\n[languages.toml]\nenabled = false\n[search.query]\n[global]\nenabled = false\n",
     )?;
     let root = directory.path();
     let docs = root.join("docs");
@@ -450,20 +429,15 @@ async fn cli_profiles_combine_search_preserve_views_and_select_each_project_engi
     require_profile_source_scope(&docs_client).await?;
     docs_client.cancel().await?;
     require_profile_scope(&client).await?;
-    let first = proxied_call(&client, "search", &search()?).await?;
-    assert_eq!(first["pagination"]["total_pages"], 2, "{first}");
+    let mut request = search()?;
+    request["max_results"] = json!(1);
+    let first = proxied_call(&client, "search", &request).await?;
+    assert_eq!(first["pagination"]["pages"], 2, "{first}");
     let view = first["view"].clone();
     let _: rift_protocol::symbol_read::CapturedView = serde_json::from_value(view.clone())
         .map_err(|error| format!("merged search view absent or invalid: {error}; {first}"))?;
-    let second_arguments = serde_json::to_value(QueryParams {
-        query: first["pagination"]["next_query"]
-            .as_str()
-            .ok_or("second query absent")?
-            .to_owned(),
-        language: QueryLanguage::Sparql,
-    })?;
-    let second = proxied_call(&client, "search", &second_arguments).await?;
-    assert_eq!(second["view"], view, "pagination keeps original expiry");
+    request["page"] = json!(2);
+    let second = proxied_call(&client, "search", &request).await?;
     let hits = [hit(&first)?, hit(&second)?];
     let mut owners = BTreeSet::new();
     for hit in &hits {
@@ -471,18 +445,6 @@ async fn cli_profiles_combine_search_preserve_views_and_select_each_project_engi
         caller_read(&client, hit, logs.path()).await?;
     }
     assert_eq!(owners, BTreeSet::from(["main", "docs"]));
-    let requests = engine_requests(logs.path())?;
-    fs::write(root.join("lib.rs"), main_source.replace("11", "33"))?;
-    fs::write(docs.join("lib.rs"), docs_source.replace("22", "44"))?;
-    let held_first = proxied_call(&client, "search", &retained_page(&first, 0)?).await?;
-    let held_second = proxied_call(&client, "search", &second_arguments).await?;
-    assert_eq!(held_first, first, "captured source and expiry stay fixed");
-    assert_eq!(held_second, second, "both backend views stay fixed");
-    assert_eq!(
-        engine_requests(logs.path())?,
-        requests,
-        "held reads must not issue engine requests"
-    );
     require_engine_root(logs.path(), "main", root).await?;
     require_engine_root(logs.path(), "docs", &docs).await?;
     client.cancel().await?;

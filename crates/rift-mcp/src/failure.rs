@@ -482,7 +482,7 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
                 "rift.syntax.too_deep",
                 "rift.syntax.too_many_captures",
                 "rift.syntax.too_many_markdown_inline_ranges",
-                "rift.syntax.too_many_nodes",
+                "rift.syntax.too_many_syntax_elements",
                 "rift.tracing.log_batch_limit",
             ],
         ),

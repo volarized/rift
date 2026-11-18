@@ -1,6 +1,6 @@
 //! Compare incremental and cold read-service facts after file replacement and restore.
 //!
-//! Keep complete file digests, index documents, documentation metadata, and relationship
+//! Keep complete file digests, index documents, documentation metadata, and edge
 //! reads in equality checks; the fixture must retain live files named only by the earlier tree.
 
 use std::collections::BTreeSet;
@@ -17,15 +17,15 @@ use rift_protocol::{
     configuration::HistoryConfiguration,
     map::WorkspaceMap,
     read::{
-        GetSymbolInclude, GetSymbolParams, GetSymbolResult, NodesParams, ReadWarning,
-        SYMBOL_ALTERNATIVES_MAX, SearchScope, SyntaxFramework,
+        GetSymbolInclude, GetSymbolParams, GetSymbolResult, ReadWarning, SYMBOL_ALTERNATIVES_MAX,
+        SearchScope,
     },
 };
 use rift_server::ReadService;
 use tempfile::TempDir;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
-type RelationshipRow = (String, String, String, String, u64, u64);
+type EdgeRow = (String, String, String, String, u64, u64);
 const SYMBOL_PAGES_MAX: u64 = 32;
 
 const SOURCE_A: &str = "pub struct Beacon;\npub fn old() {}\n";
@@ -65,80 +65,6 @@ fn build(root: &Path) -> TestResult<ReadService> {
         &TextFileInclusion::default(),
         HistoryConfiguration::default(),
     )?)
-}
-
-#[test]
-fn unresolved_angular_template_urls_keep_source_nodes_and_path_owned_warnings() -> TestResult {
-    for template in ["https://example.test/view.html", "view.html?mode=preview"] {
-        let directory = tempfile::tempdir()?;
-        let source = format!(
-            "import {{ Component }} from '@angular/core';\n@Component({{ templateUrl: '{template}' }})\nexport class Beacon {{ label = '灯'; }}\n"
-        );
-        let plain = "<p class=\"flex\">灯{{title}}</p>";
-        fs::write(directory.path().join("component.ts"), &source)?;
-        fs::write(directory.path().join("view.html"), plain)?;
-        let service = build(directory.path())?;
-        let declaration = service.get_symbol(&GetSymbolParams {
-            name: "Beacon".to_owned(),
-            language: None,
-            scope: SearchScope::Local,
-            packages: Vec::new(),
-            include: GetSymbolInclude::default(),
-            limit: 10,
-            page_index: 0,
-            revision: None,
-        })?;
-        let hit = declaration.hits.first().ok_or("Beacon declaration")?;
-        assert_eq!(
-            hit.path.as_ref().ok_or("declaration path")?.0,
-            "component.ts"
-        );
-        let start = usize::try_from(hit.range.start)?;
-        let end = usize::try_from(hit.range.end)?;
-        let declared = source
-            .get(start..end)
-            .ok_or("declaration range inside the file")?;
-        assert!(declared.contains("class Beacon"), "{declared}");
-
-        let position = u64::try_from(source.find("灯").ok_or("Unicode source")?)?;
-        let nodes = service.nodes(&NodesParams::at(
-            rift_protocol::read::ProjectPath("component.ts".to_owned()),
-            position,
-        ))?;
-        assert!(!nodes.nodes.is_empty());
-        for node in &nodes.nodes {
-            assert_eq!(node.language.identity_segment(), "typescript");
-            let start = usize::try_from(node.range.start)?;
-            let end = usize::try_from(node.range.end)?;
-            assert_eq!(node.source, source[start..end]);
-        }
-        assert!(nodes.warnings.iter().any(|warning| matches!(
-            warning,
-            ReadWarning::FrameworkContextUnresolved {
-                unit,
-                framework: SyntaxFramework::Angular,
-                detail,
-            } if unit.0 == "rift://source/project/component.ts" && !detail.is_empty()
-        )));
-        let plain_nodes = service.nodes(&NodesParams::at(
-            rift_protocol::read::ProjectPath("view.html".to_owned()),
-            u64::try_from(plain.find("灯").ok_or("plain Unicode source")?)?,
-        ))?;
-        assert!(!plain_nodes.nodes.is_empty());
-        for node in &plain_nodes.nodes {
-            assert_eq!(node.language.identity_segment(), "html");
-            let start = usize::try_from(node.range.start)?;
-            let end = usize::try_from(node.range.end)?;
-            assert_eq!(node.source, plain[start..end]);
-        }
-        assert!(
-            !plain_nodes
-                .warnings
-                .iter()
-                .any(|warning| matches!(warning, ReadWarning::FrameworkContextUnresolved { .. }))
-        );
-    }
-    Ok(())
 }
 
 fn updated(previous: &ReadService, root: &Path) -> TestResult<ReadService> {
@@ -193,31 +119,24 @@ fn case_source_paths(root: &Path) -> TestResult<BTreeSet<String>> {
         .collect())
 }
 
-fn relationship_rows(
-    service: &ReadService,
-    ids: &BTreeSet<SymbolId>,
-) -> TestResult<BTreeSet<RelationshipRow>> {
-    let relationships = service.relationships();
-    if !relationships.is_complete() || relationships.dropped_edges() != 0 {
+fn edge_rows(service: &ReadService, ids: &BTreeSet<SymbolId>) -> TestResult<BTreeSet<EdgeRow>> {
+    let edges = service.edges();
+    if !edges.is_complete() || edges.dropped_edges() != 0 {
         return Err(format!(
-            "relationship store incomplete: dropped_edges={}",
-            relationships.dropped_edges()
+            "edge store incomplete: dropped_edges={}",
+            edges.dropped_edges()
         )
         .into());
     }
     let mut rows = BTreeSet::new();
     for id in ids {
-        for edge in relationships
-            .outgoing(id)
-            .iter()
-            .chain(relationships.incoming(id))
-        {
+        for edge in edges.outgoing(id).iter().chain(edges.incoming(id)) {
             let occurrence = edge.occurrence();
             let range = occurrence.range();
             rows.insert((
                 edge.from().as_str().to_owned(),
                 edge.to().as_str().to_owned(),
-                serde_json::to_string(&edge.facet())?,
+                serde_json::to_string(&edge.kind())?,
                 occurrence.unit().to_string(),
                 range.start(),
                 range.end(),
@@ -234,7 +153,7 @@ fn symbol_pages(
     current_names: &BTreeSet<String>,
 ) -> TestResult<Vec<serde_json::Value>> {
     let mut pages = Vec::new();
-    let mut page_index = 0;
+    let mut page = 1;
     loop {
         let result = service.get_symbol(&GetSymbolParams {
             name: name.to_owned(),
@@ -242,18 +161,18 @@ fn symbol_pages(
             scope: SearchScope::Local,
             packages: Vec::new(),
             include: GetSymbolInclude::default(),
-            limit: 1,
-            page_index,
+            max_results: 1,
+            page,
             revision: None,
         })?;
-        let total_pages = result.pagination.total_pages;
-        if total_pages > SYMBOL_PAGES_MAX {
+        let page_count = result.pagination.pages;
+        if page_count > SYMBOL_PAGES_MAX {
             return Err(format!("symbol lookup exceeded {SYMBOL_PAGES_MAX} pages: {name}").into());
         }
         validate_symbol_page(&result, name, current_ids, current_names)?;
         pages.push(serde_json::to_value(&result)?);
-        page_index += 1;
-        if page_index >= total_pages {
+        page += 1;
+        if page > page_count {
             return Ok(pages);
         }
     }
@@ -268,7 +187,7 @@ fn validate_symbol_page(
     current_names: &BTreeSet<String>,
 ) -> TestResult {
     match result.warnings.as_slice() {
-        [] if !result.hits.is_empty() || result.pagination.total_pages > 0 => Ok(()),
+        [] if !result.hits.is_empty() || result.pagination.pages > 0 => Ok(()),
         [
             ReadWarning::SymbolNotFound {
                 name: requested,
@@ -278,8 +197,8 @@ fn validate_symbol_page(
         ] if requested == name
             && !current_names.contains(name)
             && result.hits.is_empty()
-            && result.pagination.total_pages == 0
-            && result.pagination.page_index == 0
+            && result.pagination.pages == 0
+            && result.pagination.page == 1
             && detail.is_none() =>
         {
             let distinct = alternatives
@@ -382,7 +301,7 @@ fn symbol_page_validation_rejects_incomplete_or_invalid_misses() -> TestResult {
     let existing: GetSymbolResult = serde_json::from_value(existing)?;
     assert!(validate_symbol_page(&existing, "Beacon", &current_ids, &current_names).is_err());
     let mut continuation = miss;
-    continuation.pagination.page_index = 1;
+    continuation.pagination.page = 2;
     assert!(validate_symbol_page(&continuation, "Absent", &current_ids, &current_names).is_err());
     Ok(())
 }
@@ -445,9 +364,9 @@ fn assert_matches_cold(
         "incremental documentation blocks, links, and references must equal a cold build"
     );
     assert_eq!(
-        relationship_rows(incremental, symbol_ids)?,
-        relationship_rows(&cold, symbol_ids)?,
-        "incremental semantic relationship edges must equal a cold build"
+        edge_rows(incremental, symbol_ids)?,
+        edge_rows(&cold, symbol_ids)?,
+        "incremental semantic edges must equal a cold build"
     );
     Ok(())
 }

@@ -1,5 +1,5 @@
-//! `search`'s bounded relationship `traversal` lane: a breadth-first walk from one seed symbol
-//! across `RelationshipStore`'s edges, merged into `search`'s hit set. Extracted from `search`
+//! `search`'s bounded edge `traversal` lane: a breadth-first walk from one seed symbol
+//! across `EdgeStore`'s edges, merged into `search`'s hit set. Extracted from `search`
 //! so that module stays below its size bound.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -9,12 +9,12 @@ use rift_core::SymbolId as CoreSymbolId;
 use rift_error::errors;
 use rift_index::TraversalWalk;
 use rift_index::{
-    IndexedFile, PathMatcher, RelationshipEdge, RelationshipStore, SymbolMatch, WorkspaceIndex,
+    Edge as IndexedEdge, EdgeStore, IndexedFile, PathMatcher, SymbolMatch, WorkspaceIndex,
 };
 use rift_protocol::read::{
-    GraphHop, HopDirection, MatchedField, ReadWarning, Relationship, RelationshipFacet,
-    SEARCH_TRAVERSAL_DEPTH_MAX, SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_FACETS_MAX, SearchHit,
-    SearchHitTarget, SearchTraversal, SymbolId, TraversalDirection,
+    Edge, EdgeKind, GraphHop, HopDirection, MatchedField, ReadWarning, SEARCH_TRAVERSAL_DEPTH_MAX,
+    SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_KINDS_MAX, SearchHit, SearchHitTarget,
+    SearchTraversal, SymbolId, TraversalDirection,
 };
 use rift_ranking::IdentifierMatchClass;
 use rift_syntax::SyntaxSymbol;
@@ -23,7 +23,7 @@ use crate::engine_read::{EngineReferences, PackageDeclaration};
 use crate::read::{ReadService, RiftError};
 use crate::search::{HitPayloads, build_symbol_hit, find_symbol_hit_mut, includes};
 
-/// Refuses `traversal` when `depth` or `facets` breaks the bound its schema advertises.
+/// Refuses `traversal` when `depth` or `kinds` breaks the bound its schema advertises.
 /// `schemars`' `range`/`length` constraints are advisory only, so this mirrors them the same
 /// way `validate_path_selector` mirrors [`PathPattern`]'s.
 ///
@@ -38,12 +38,12 @@ pub(crate) fn validate_traversal(traversal: &SearchTraversal) -> Result<(), Rift
             ))
             .fail();
     }
-    if traversal.facets.len() > SEARCH_TRAVERSAL_FACETS_MAX {
+    if traversal.kinds.len() > SEARCH_TRAVERSAL_KINDS_MAX {
         return errors::server::read_invalid()
             .field("traversal")
             .violation(format!(
-                "facets carries {} entries, more than {SEARCH_TRAVERSAL_FACETS_MAX}",
-                traversal.facets.len()
+                "kinds carries {} entries, more than {SEARCH_TRAVERSAL_KINDS_MAX}",
+                traversal.kinds.len()
             ))
             .fail();
     }
@@ -52,35 +52,34 @@ pub(crate) fn validate_traversal(traversal: &SearchTraversal) -> Result<(), Rift
 
 /// The capability a refused walk names: nothing this workspace holds can answer it.
 ///
-/// A walk follows the relationship store's edges and the incoming references or outgoing
+/// A walk follows the edge store's edges and the incoming references or outgoing
 /// calls a configured language engine resolves. With an empty store and no engine answer
 /// for the seed, the walk has no edge source at all, and a resend of the same request
 /// changes nothing.
-pub(crate) const TRAVERSAL_CAPABILITY: &str =
-    "relationship traversal (no language engine serves the seed)";
+pub(crate) const TRAVERSAL_CAPABILITY: &str = "edge traversal (no language engine serves the seed)";
 
-/// Most distinct symbols one traversal may visit beyond `seed`. `RelationshipStore`'s
+/// Most distinct symbols one traversal may visit beyond `seed`. `EdgeStore`'s
 /// adjacency lists are themselves sorted, so a walk that breaches this bound stops
 /// discovering new symbols and truncates the same way on every call over the same graph.
-pub(crate) const TRAVERSAL_NODES_MAX: usize = 10_000;
+pub(crate) const TRAVERSAL_SYMBOLS_MAX: usize = 10_000;
 
 /// What one traversal lane reports beside the hits it merged: the coverage the request asked
-/// for that no provider populates, and whether the walk stopped at its node bound.
+/// for that no provider populates, and whether the walk stopped at its syntax element bound.
 #[derive(Debug, Default)]
 pub(crate) struct TraversalReport {
     pub(crate) coverage_missing: Option<ReadWarning>,
     pub(crate) truncated: bool,
 }
 
-/// Fourth hit-collection lane: a bounded relationship walk from `seed`, merged into
+/// Fourth hit-collection lane: a bounded edge walk from `seed`, merged into
 /// `results` alongside whatever the lexical and ranked lanes already placed there. Runs after
 /// them so a symbol also reached by the walk absorbs it instead of duplicating it.
 ///
 /// # Errors
 ///
-/// Returns `not_found` naming a seed that resolves to neither a relationship-store node nor
+/// Returns `not_found` naming a seed that resolves to neither an edge-store syntax element nor
 /// a lexical declaration, and [`RiftError`] naming the engine capability when the seed
-/// resolves but neither the relationship store nor a configured language engine can answer
+/// resolves but neither the edge store nor a configured language engine can answer
 /// for it.
 pub(crate) fn collect_traversal_hits(
     reads: &ReadService,
@@ -91,7 +90,7 @@ pub(crate) fn collect_traversal_hits(
     payloads: HitPayloads,
     results: &mut Vec<SearchHit>,
 ) -> Result<TraversalReport, RiftError> {
-    let store = reads.relationships();
+    let store = reads.edges();
     let walked_seed = resolve_traversal_seed(reads, seed)?;
     // A dropped engine contribution answers with its warning: no resend of the same
     // request clears the condition, so a refusal would only hide what the warning names.
@@ -101,18 +100,18 @@ pub(crate) fn collect_traversal_hits(
     };
     let indexed = adjacent
         .iter()
-        .any(|edge| traversal.facets.is_empty() || traversal.facets.contains(&edge.facet()));
+        .any(|edge| traversal.kinds.is_empty() || traversal.kinds.contains(&edge.kind()));
     if !indexed && !references.resolved(seed) && references.analysis_unavailable().is_none() {
         return errors::server::read_unsupported()
             .capability(TRAVERSAL_CAPABILITY)
             .fail();
     }
-    let coverage_missing = relationship_coverage_missing(traversal);
+    let coverage_missing = edge_coverage_missing(traversal);
     let walk = walk_traversal_with_references(
         store,
         &walked_seed,
         traversal,
-        TRAVERSAL_NODES_MAX,
+        TRAVERSAL_SYMBOLS_MAX,
         references,
     );
     let merge = WalkMerge {
@@ -145,7 +144,7 @@ pub(crate) struct WalkMerge<'merge> {
 /// them.
 ///
 /// A discovery `results` already holds absorbs the walk; any other becomes a new hit
-/// tagged [`MatchedField::Relationship`]. A package declaration an outgoing edge ends at
+/// tagged [`MatchedField::Edge`]. A package declaration an outgoing edge ends at
 /// becomes a hit addressed by its `unit`, unless a `paths` selector narrows the answer to
 /// project files.
 ///
@@ -168,7 +167,7 @@ pub(crate) fn merge_walk_hits(
             {
                 results.push(package_traversal_hit(declaration, path));
             }
-            // Any other graph node with no lexical declaration in this snapshot: the store
+            // Any other graph syntax element with no lexical declaration in this snapshot: the store
             // outlived the file it was built from. Skipping it is the same choice
             // `merge_symbol_hit` makes for a ranked unit whose declaration is likewise gone.
             continue;
@@ -181,82 +180,77 @@ pub(crate) fn merge_walk_hits(
     Ok(())
 }
 
-/// Whether this snapshot can start a walk at `identity`: a relationship-store node, or a
+/// Whether this snapshot can start a walk at `identity`: an edge-store syntax element, or a
 /// lexical declaration the store simply holds no edge for. A real, isolated declaration is
 /// walkable; its walk finds nothing.
 pub(crate) fn walkable(reads: &ReadService, identity: &CoreSymbolId) -> Result<bool, RiftError> {
-    let store = reads.relationships();
+    let store = reads.edges();
     Ok(!store.outgoing(identity).is_empty()
         || !store.incoming(identity).is_empty()
         || resolve_graph_symbol(reads.index(), identity)?.is_some())
 }
 
-/// The relationship coverage `traversal` asks for that no lane populates: the requested
-/// facets outside every lane's image.
+/// The edge coverage `traversal` asks for that no lane populates: the requested
+/// kinds outside every lane's image.
 ///
-/// Answers `None` when every requested facet has a lane: an empty answer then means the
+/// Answers `None` when every requested kind has a lane: an empty answer then means the
 /// walk ran and the seed has no neighbor under the request.
-pub(crate) fn relationship_coverage_missing(traversal: &SearchTraversal) -> Option<ReadWarning> {
-    relationship_coverage_warning(unproducible_facets(&traversal.facets, traversal.direction))
+pub(crate) fn edge_coverage_missing(traversal: &SearchTraversal) -> Option<ReadWarning> {
+    edge_coverage_warning(unproducible_kinds(&traversal.kinds, traversal.direction))
 }
 
-/// The facet a language engine's hops carry in `direction`: an incoming hop is a
+/// The kind a language engine's hops carry in `direction`: an incoming hop is a
 /// reference the engine resolved, and an outgoing hop is a call its call hierarchy names.
-pub(crate) fn engine_facet(direction: TraversalDirection) -> RelationshipFacet {
+pub(crate) fn engine_kind(direction: TraversalDirection) -> EdgeKind {
     match direction {
-        TraversalDirection::Incoming => RelationshipFacet::References,
-        TraversalDirection::Outgoing => RelationshipFacet::Calls,
+        TraversalDirection::Incoming => EdgeKind::References,
+        TraversalDirection::Outgoing => EdgeKind::Calls,
     }
 }
 
-/// The relationship facets a lane populates for a walk in `direction`.
+/// The edge kinds a lane populates for a walk in `direction`.
 ///
-/// The language engine lane alone produces edges, [`engine_facet`] of the direction. No
+/// The language engine lane alone produces edges, [`engine_kind`] of the direction. No
 /// provider publishes a resolved reference into the index, so the store holds no edge of
-/// any other facet.
-pub(crate) fn produced_relationship_facets(
-    direction: TraversalDirection,
-) -> BTreeSet<RelationshipFacet> {
-    BTreeSet::from([engine_facet(direction)])
+/// any other kind.
+pub(crate) fn produced_edge_kinds(direction: TraversalDirection) -> BTreeSet<EdgeKind> {
+    BTreeSet::from([engine_kind(direction)])
 }
 
-/// The requested facets no lane populates, in the request's own order, deduplicated.
+/// The requested kinds no lane populates, in the request's own order, deduplicated.
 ///
-/// An empty `requested` list asks for every facet the walk can follow, so it names no gap.
+/// An empty `requested` list asks for every kind the walk can follow, so it names no gap.
 ///
-/// `validate_traversal` refuses a list longer than `SEARCH_TRAVERSAL_FACETS_MAX` before this
+/// `validate_traversal` refuses a list longer than `SEARCH_TRAVERSAL_KINDS_MAX` before this
 /// runs, which bounds both the scan and the deduplication it carries.
-pub(crate) fn unproducible_facets(
-    requested: &[RelationshipFacet],
+pub(crate) fn unproducible_kinds(
+    requested: &[EdgeKind],
     direction: TraversalDirection,
-) -> Vec<RelationshipFacet> {
-    let produced = produced_relationship_facets(direction);
-    let mut missing: Vec<RelationshipFacet> = Vec::new();
-    for facet in requested {
-        if !produced.contains(facet) && !missing.contains(facet) {
-            missing.push(*facet);
+) -> Vec<EdgeKind> {
+    let produced = produced_edge_kinds(direction);
+    let mut missing: Vec<EdgeKind> = Vec::new();
+    for kind in requested {
+        if !produced.contains(kind) && !missing.contains(kind) {
+            missing.push(*kind);
         }
     }
     missing
 }
 
-/// The `relationship_coverage_missing` warning naming the facets no lane populates, or
-/// `None` when `facets` names no gap.
-pub(crate) fn relationship_coverage_warning(facets: Vec<RelationshipFacet>) -> Option<ReadWarning> {
-    let detail = facet_gap_clause(&facets)?;
-    Some(ReadWarning::RelationshipCoverageMissing { facets, detail })
+/// The `edge_coverage_missing` warning naming the kinds no lane populates, or
+/// `None` when `kinds` names no gap.
+pub(crate) fn edge_coverage_warning(kinds: Vec<EdgeKind>) -> Option<ReadWarning> {
+    let detail = kind_gap_clause(&kinds)?;
+    Some(ReadWarning::EdgeCoverageMissing { kinds, detail })
 }
 
-/// The detail clause for a facet gap, naming each facet in its wire spelling.
-fn facet_gap_clause(facets: &[RelationshipFacet]) -> Option<String> {
-    let named: Vec<String> = facets
-        .iter()
-        .map(|facet| facet.as_ref().to_owned())
-        .collect();
+/// The detail clause for a kind gap, naming each kind in its wire spelling.
+fn kind_gap_clause(kinds: &[EdgeKind]) -> Option<String> {
+    let named: Vec<String> = kinds.iter().map(|kind| kind.as_ref().to_owned()).collect();
     let (subject, reference) = match named.len() {
         0 => return None,
-        1 => ("facet", "it"),
-        _ => ("facets", "them"),
+        1 => ("kind", "it"),
+        _ => ("kinds", "them"),
     };
     Some(format!(
         "no lane populates the requested {subject} {named}, so the walk followed no edge \
@@ -266,7 +260,7 @@ fn facet_gap_clause(facets: &[RelationshipFacet]) -> Option<String> {
 }
 
 /// Resolves a traversal's `seed`, refusing `not_found` naming it when the identity exists
-/// neither as a relationship-store node nor as a lexical declaration.
+/// neither as an edge-store syntax element nor as a lexical declaration.
 fn resolve_traversal_seed(reads: &ReadService, seed: &SymbolId) -> Result<CoreSymbolId, RiftError> {
     let identity = CoreSymbolId::new(seed.0.clone()).map_err(|_error| {
         errors::server::read_not_found()
@@ -298,71 +292,67 @@ pub(crate) fn resolve_graph_symbol<'a>(
 /// narrowing that fits a walk under it.
 pub(crate) fn traversal_truncation_warning() -> ReadWarning {
     ReadWarning::TraversalTruncated {
-        visited: TRAVERSAL_NODES_MAX as u64,
+        visited: TRAVERSAL_SYMBOLS_MAX as u64,
         detail: format!(
-            "the traversal walk stopped at its {TRAVERSAL_NODES_MAX}-symbol bound; \
-             narrow facets, lower depth, or start from a less-connected seed to walk \
+            "the traversal walk stopped at its {TRAVERSAL_SYMBOLS_MAX}-symbol bound; \
+             narrow kinds, lower depth, or start from a less-connected seed to walk \
              the rest"
         ),
     }
 }
 
-/// Traversal under an explicit node cap for deterministic truncation tests.
+/// Traversal under an explicit symbol cap for deterministic truncation tests.
 #[cfg(test)]
 fn walk_traversal_capped(
-    store: &RelationshipStore,
+    store: &EdgeStore,
     seed: &CoreSymbolId,
     traversal: &SearchTraversal,
-    nodes_max: usize,
+    symbols_max: usize,
 ) -> TraversalWalk {
     walk_traversal_with_references(
         store,
         seed,
         traversal,
-        nodes_max,
+        symbols_max,
         &EngineReferences::default(),
     )
 }
 
-/// Walks `store` breadth-first from `seed`, honoring `traversal`'s facet filter and depth
+/// Walks `store` breadth-first from `seed`, honoring `traversal`'s kind filter and depth
 /// bound. BFS visits each symbol at its shortest path first and never requeues a symbol
 /// already discovered, so every returned path is the shortest one `store` has to it.
 ///
 /// The walk never reports `seed` itself, since `SearchTraversal.seed` states the seed is
-/// never a hit. One `nodes_max` budget covers the whole walk.
+/// never a hit. One `symbols_max` budget covers the whole walk.
 pub(crate) fn walk_traversal_with_references(
-    store: &RelationshipStore,
+    store: &EdgeStore,
     seed: &CoreSymbolId,
     traversal: &SearchTraversal,
-    nodes_max: usize,
+    symbols_max: usize,
     references: &EngineReferences,
 ) -> TraversalWalk {
-    rift_index::walk_traversal_capped(seed, traversal, nodes_max, |current, direction| {
+    rift_index::walk_traversal_capped(seed, traversal, symbols_max, |current, direction| {
         combined_edges(store, current, references, direction)
             .into_iter()
-            .filter(|edge| edge.eligible(&traversal.facets))
+            .filter(|edge| edge.eligible(&traversal.kinds))
             .filter_map(|edge| edge.next().map(|next| (next, edge.hop())))
     })
 }
 
 enum TraversalEdge<'edge> {
-    Indexed(&'edge RelationshipEdge, HopDirection),
-    Confirmed(&'edge RelationshipEdge, &'edge GraphHop),
+    Indexed(&'edge IndexedEdge, HopDirection),
+    Confirmed(&'edge IndexedEdge, &'edge GraphHop),
     Resolved(&'edge GraphHop),
 }
 
 impl TraversalEdge<'_> {
-    fn eligible(&self, facets: &[RelationshipFacet]) -> bool {
-        if facets.is_empty() {
+    fn eligible(&self, kinds: &[EdgeKind]) -> bool {
+        if kinds.is_empty() {
             return true;
         }
         match self {
-            Self::Indexed(edge, _) | Self::Confirmed(edge, _) => facets.contains(&edge.facet()),
-            Self::Resolved(hop) => hop
-                .relationship
-                .facets
-                .iter()
-                .any(|facet| facets.contains(facet)),
+            Self::Indexed(edge, _) | Self::Confirmed(edge, _) => kinds.contains(&edge.kind()),
+            Self::Resolved(hop) => hop.edge.kinds.iter().any(|kind| kinds.contains(kind)),
         }
     }
 
@@ -376,8 +366,8 @@ impl TraversalEdge<'_> {
             },
             Self::Resolved(hop) => {
                 let next = match hop.direction {
-                    HopDirection::Outgoing => &hop.relationship.to,
-                    HopDirection::Incoming => &hop.relationship.from,
+                    HopDirection::Outgoing => &hop.edge.to,
+                    HopDirection::Incoming => &hop.edge.from,
                 };
                 CoreSymbolId::new(next.0.clone()).ok()
             }
@@ -389,7 +379,7 @@ impl TraversalEdge<'_> {
             Self::Indexed(edge, direction) => graph_hop(edge, *direction),
             Self::Confirmed(edge, resolved) => {
                 let mut hop = graph_hop(edge, resolved.direction);
-                hop.relationship.derivation = resolved.relationship.derivation;
+                hop.edge.derivation = resolved.edge.derivation;
                 hop
             }
             Self::Resolved(hop) => (*hop).clone(),
@@ -403,7 +393,7 @@ impl TraversalEdge<'_> {
 /// hops a language engine resolved for this read, incoming references or outgoing calls.
 /// A store edge an engine also named is reported once, as the engine's confirmation of it.
 fn combined_edges<'edge>(
-    store: &'edge RelationshipStore,
+    store: &'edge EdgeStore,
     current: &CoreSymbolId,
     references: &'edge EngineReferences,
     direction: TraversalDirection,
@@ -420,22 +410,22 @@ fn combined_edges<'edge>(
             HopDirection::Outgoing,
         ),
     };
-    let neighbor = |relationship: &'edge Relationship| match hop_direction {
-        HopDirection::Incoming => relationship.from.0.as_str(),
-        HopDirection::Outgoing => relationship.to.0.as_str(),
+    let neighbor = |edge: &'edge Edge| match hop_direction {
+        HopDirection::Incoming => edge.from.0.as_str(),
+        HopDirection::Outgoing => edge.to.0.as_str(),
     };
     let mut resolved: BTreeMap<_, _> = engine_hops
         .iter()
-        .map(|hop| (neighbor(&hop.relationship), hop))
+        .map(|hop| (neighbor(&hop.edge), hop))
         .collect();
-    let facet = engine_facet(direction);
+    let kind = engine_kind(direction);
     let mut edges = Vec::new();
     for edge in stored {
         let stored_neighbor = match hop_direction {
             HopDirection::Incoming => edge.from(),
             HopDirection::Outgoing => edge.to(),
         };
-        let confirmed = (edge.facet() == facet)
+        let confirmed = (edge.kind() == kind)
             .then(|| resolved.remove(stored_neighbor.as_str()))
             .flatten();
         edges.push(match confirmed {
@@ -447,13 +437,13 @@ fn combined_edges<'edge>(
     edges
 }
 
-/// Builds one traversal step's wire relationship from the edge it followed. `RelationshipStore`
-/// retains only a reference's portable facet, not the provider's original exact kind, so
-/// `kind` is the facet's own serde spelling: the binding lane's exact kind IS its portable
-/// facet spelling, the least invented value this lane can honestly report.
-fn graph_hop(edge: &RelationshipEdge, direction: HopDirection) -> GraphHop {
+/// Builds one traversal step's wire edge from the edge it followed. `EdgeStore`
+/// retains only a reference's portable kind, not the provider's original exact kind, so
+/// `kind` is the kind's own serde spelling: the binding lane's exact kind IS its portable
+/// kind spelling, the least invented value this lane can honestly report.
+fn graph_hop(edge: &IndexedEdge, direction: HopDirection) -> GraphHop {
     GraphHop {
-        relationship: edge.to_protocol(),
+        edge: edge.to_protocol(),
         direction,
     }
 }
@@ -468,7 +458,7 @@ pub(crate) fn distance_score(distance: u64) -> f64 {
 }
 
 /// Merges one reached symbol: an existing hit for the same identity absorbs the walk;
-/// otherwise the traversal places a new symbol hit tagged [`MatchedField::Relationship`].
+/// otherwise the traversal places a new symbol hit tagged [`MatchedField::Edge`].
 fn merge_traversal_hit(
     index: &WorkspaceIndex,
     results: &mut Vec<SearchHit>,
@@ -492,7 +482,7 @@ fn merge_traversal_hit(
         index,
         matched,
         Some(distance_score(distance)),
-        vec![MatchedField::Relationship],
+        vec![MatchedField::Edge],
         merge.payloads,
     )?;
     hit.traversal_path = Some(path);
@@ -514,7 +504,7 @@ pub(crate) fn package_traversal_hit(
             symbol: Box::new(declaration.symbol.clone()),
         },
         score: Some(distance_score(distance)),
-        matched_by: vec![MatchedField::Relationship],
+        matched_by: vec![MatchedField::Edge],
         source: None,
         range: None,
         line: None,
@@ -526,13 +516,13 @@ pub(crate) fn package_traversal_hit(
     }
 }
 
-/// Records that `existing` was also reached by the walk: adds [`MatchedField::Relationship`]
+/// Records that `existing` was also reached by the walk: adds [`MatchedField::Edge`]
 /// when absent, and attaches the walk's path and distance. Every other payload stays
 /// untouched - a lexical or ranked match's score already means more than a graph distance
 /// would, and a changed declaration keeps the `change` block that named what differs.
 fn absorb_traversal_match(existing: &mut SearchHit, path: Vec<GraphHop>, distance: u64) {
-    if !existing.matched_by.contains(&MatchedField::Relationship) {
-        existing.matched_by.push(MatchedField::Relationship);
+    if !existing.matched_by.contains(&MatchedField::Edge) {
+        existing.matched_by.push(MatchedField::Edge);
     }
     existing.traversal_path = Some(path);
     existing.distance = Some(distance);
@@ -546,12 +536,11 @@ pub(crate) mod tests {
     use std::sync::Arc;
 
     use rift_core::{LanguageFileSelections, SourceVisibility};
-    use rift_index::{RelationshipStore, WorkspaceIndexLimits};
+    use rift_index::{EdgeStore, WorkspaceIndexLimits};
     use rift_protocol::configuration::HistoryConfiguration;
     use rift_protocol::read::{
-        ExactKind, Extensions, MatchedField, ReadWarning, RelationshipDerivation,
-        RelationshipFacet, SearchHitTarget, SearchParams, SearchResult, SearchTraversal,
-        TraversalDirection,
+        EdgeDerivation, EdgeKind, ExactKind, Extensions, MatchedField, ReadWarning,
+        SearchHitTarget, SearchParams, SearchResult, SearchTraversal, TraversalDirection,
     };
     use rift_provider::{
         NormalizedGraph, Normalizer, ProviderPublication, PublicationLimits, PublicationSet,
@@ -560,7 +549,7 @@ pub(crate) mod tests {
     use tempfile::TempDir;
 
     use super::{
-        CoreSymbolId, EngineReferences, GraphHop, Relationship, TRAVERSAL_NODES_MAX,
+        CoreSymbolId, Edge, EngineReferences, GraphHop, TRAVERSAL_SYMBOLS_MAX,
         walk_traversal_capped,
     };
     use crate::read::ReadService;
@@ -568,9 +557,9 @@ pub(crate) mod tests {
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-    // -- `walk_traversal` fixture: a small synthetic relationship graph, built through the
-    // same public Contribution/NormalizedGraph API `RelationshipStore`'s own tests use, so
-    // the walk's direction, facet, depth, and shortest-path behavior is proven without
+    // -- `walk_traversal` fixture: a small synthetic edge graph, built through the
+    // same public Contribution/NormalizedGraph API `EdgeStore`'s own tests use, so
+    // the walk's direction, kind, depth, and shortest-path behavior is proven without
     // depending on what a real syntax provider happens to classify a reference as.
     //
     //   root --calls--> branch_a --calls--> leaf
@@ -711,7 +700,7 @@ pub(crate) mod tests {
     /// `root` calls `branch_a` and `branch_b`, each of which calls `leaf`; `root` also
     /// imports `helper` directly, so one hop from `root` mixes a `calls` pair with one
     /// `imports` edge.
-    pub(crate) fn call_graph_store() -> RelationshipStore {
+    pub(crate) fn call_graph_store() -> EdgeStore {
         let contributions = vec![
             graph_definition("root", graph_identity("root").as_str(), (0, 40)),
             graph_definition("branch_a", graph_identity("branch_a").as_str(), (40, 80)),
@@ -749,11 +738,11 @@ pub(crate) mod tests {
                 "leaf",
             ),
         ];
-        RelationshipStore::build(&graph_normalized(contributions))
+        EdgeStore::build(&graph_normalized(contributions))
     }
 
     /// A recursive declaration: `loop_fn` calls itself, so the walk meets its own seed.
-    fn recursive_store() -> RelationshipStore {
+    fn recursive_store() -> EdgeStore {
         let contributions = vec![
             graph_definition("loop_fn", graph_identity("loop_fn").as_str(), (0, 40)),
             graph_definition("caller", graph_identity("caller").as_str(), (40, 80)),
@@ -770,18 +759,14 @@ pub(crate) mod tests {
                 "loop_fn",
             ),
         ];
-        RelationshipStore::build(&graph_normalized(contributions))
+        EdgeStore::build(&graph_normalized(contributions))
     }
 
-    fn traversal_request(
-        seed: &CoreSymbolId,
-        depth: u64,
-        facets: Vec<RelationshipFacet>,
-    ) -> SearchTraversal {
+    fn traversal_request(seed: &CoreSymbolId, depth: u64, kinds: Vec<EdgeKind>) -> SearchTraversal {
         SearchTraversal {
             seed: Some(rift_protocol::read::SymbolId(seed.as_str().to_owned())),
             direction: TraversalDirection::Incoming,
-            facets,
+            kinds,
             depth,
             to: None,
         }
@@ -793,7 +778,7 @@ pub(crate) mod tests {
         let leaf = graph_symbol_id(graph_identity("leaf").as_str());
         let request = traversal_request(&leaf, 1, vec![]);
         let discovered =
-            walk_traversal_capped(&store, &leaf, &request, TRAVERSAL_NODES_MAX).discovered;
+            walk_traversal_capped(&store, &leaf, &request, TRAVERSAL_SYMBOLS_MAX).discovered;
         let reached: Vec<&str> = discovered.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(
             reached,
@@ -807,30 +792,30 @@ pub(crate) mod tests {
             assert_eq!(path[0].direction, super::HopDirection::Incoming);
             // The edge's own `from`/`to` stay in their stored orientation: walking backward
             // never swaps them.
-            assert_eq!(path[0].relationship.from.0, reached_id.as_str());
-            assert_eq!(path[0].relationship.to.0, leaf.as_str());
+            assert_eq!(path[0].edge.from.0, reached_id.as_str());
+            assert_eq!(path[0].edge.to.0, leaf.as_str());
         }
     }
 
     #[test]
-    fn walk_traversal_facet_filter_keeps_only_the_named_facets() {
+    fn walk_traversal_kind_filter_keeps_only_the_named_kinds() {
         let store = call_graph_store();
         let helper = graph_symbol_id(graph_identity("helper").as_str());
-        let reached = |facets: Vec<RelationshipFacet>| {
-            let request = traversal_request(&helper, 1, facets);
-            walk_traversal_capped(&store, &helper, &request, TRAVERSAL_NODES_MAX)
+        let reached = |kinds: Vec<EdgeKind>| {
+            let request = traversal_request(&helper, 1, kinds);
+            walk_traversal_capped(&store, &helper, &request, TRAVERSAL_SYMBOLS_MAX)
                 .discovered
                 .into_iter()
                 .map(|(id, _)| id.as_str().to_owned())
                 .collect::<Vec<String>>()
         };
         assert_eq!(
-            reached(vec![RelationshipFacet::Imports]),
+            reached(vec![EdgeKind::Imports]),
             [graph_identity("root").as_str()],
             "the one edge arriving at helper is an imports edge"
         );
         assert!(
-            reached(vec![RelationshipFacet::Calls]).is_empty(),
+            reached(vec![EdgeKind::Calls]).is_empty(),
             "a calls filter follows no imports edge"
         );
     }
@@ -843,7 +828,7 @@ pub(crate) mod tests {
         let leaf = graph_symbol_id(graph_identity("leaf").as_str());
         let request = traversal_request(&leaf, 2, vec![]);
         let discovered =
-            walk_traversal_capped(&store, &leaf, &request, TRAVERSAL_NODES_MAX).discovered;
+            walk_traversal_capped(&store, &leaf, &request, TRAVERSAL_SYMBOLS_MAX).discovered;
         let root_hits: Vec<_> = discovered
             .iter()
             .filter(|(id, _)| id.as_str() == graph_identity("root").as_str())
@@ -863,10 +848,10 @@ pub(crate) mod tests {
     }
 
     /// An explicit low cap truncates discovery deterministically, the way
-    /// `RelationshipStore::build_capped` truncates edges: already-enqueued nodes still drain,
-    /// but no new node is discovered once the budget is spent.
+    /// `EdgeStore::build_capped` truncates edges: already-enqueued syntax elements still drain,
+    /// but no new syntax element is discovered once the budget is spent.
     #[test]
-    fn walk_traversal_capped_stops_discovering_new_nodes_past_its_bound() {
+    fn walk_traversal_capped_stops_discovering_new_symbols_past_its_bound() {
         let store = call_graph_store();
         let leaf = graph_symbol_id(graph_identity("leaf").as_str());
         let request = traversal_request(&leaf, 2, vec![]);
@@ -879,7 +864,7 @@ pub(crate) mod tests {
         assert_eq!(
             discovered.len(),
             2,
-            "a cap of 2 must discover exactly 2 new nodes: {discovered:?}"
+            "a cap of 2 must discover exactly 2 new symbols: {discovered:?}"
         );
         let reached: Vec<&str> = discovered.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(
@@ -900,7 +885,7 @@ pub(crate) mod tests {
         let loop_fn = graph_symbol_id(graph_identity("loop_fn").as_str());
         let request = traversal_request(&loop_fn, 2, vec![]);
         let discovered =
-            walk_traversal_capped(&store, &loop_fn, &request, TRAVERSAL_NODES_MAX).discovered;
+            walk_traversal_capped(&store, &loop_fn, &request, TRAVERSAL_SYMBOLS_MAX).discovered;
 
         let reached: Vec<&str> = discovered.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(
@@ -920,118 +905,115 @@ pub(crate) mod tests {
         let ReadWarning::TraversalTruncated { visited, detail } = warning else {
             panic!("expected the traversal truncation variant: {warning:?}");
         };
-        assert_eq!(visited, TRAVERSAL_NODES_MAX as u64);
+        assert_eq!(visited, TRAVERSAL_SYMBOLS_MAX as u64);
         assert!(
-            detail.contains(&TRAVERSAL_NODES_MAX.to_string()),
+            detail.contains(&TRAVERSAL_SYMBOLS_MAX.to_string()),
             "the detail names the bound: {detail}"
         );
     }
 
-    /// An empty `facets` list asks for every facet the walk can follow, and the one facet
+    /// An empty `kinds` list asks for every kind the walk can follow, and the one kind
     /// the engine lane populates names no gap.
     #[test]
-    fn unproducible_facets_names_nothing_for_an_empty_or_fully_produced_list() {
-        assert!(super::unproducible_facets(&[], TraversalDirection::Incoming).is_empty());
+    fn unproducible_kinds_names_nothing_for_an_empty_or_fully_produced_list() {
+        assert!(super::unproducible_kinds(&[], TraversalDirection::Incoming).is_empty());
         assert!(
-            super::unproducible_facets(
-                &[RelationshipFacet::References],
-                TraversalDirection::Incoming
-            )
-            .is_empty()
+            super::unproducible_kinds(&[EdgeKind::References], TraversalDirection::Incoming)
+                .is_empty()
         );
     }
 
     /// The engine lane resolves references incoming and calls outgoing, so every other
-    /// facet names a gap.
+    /// kind names a gap.
     #[test]
-    fn produced_relationship_facets_hold_the_engine_facet_of_the_direction() {
+    fn produced_edge_kinds_hold_the_engine_kind_of_the_direction() {
         assert_eq!(
-            super::produced_relationship_facets(TraversalDirection::Incoming),
-            std::collections::BTreeSet::from([RelationshipFacet::References])
+            super::produced_edge_kinds(TraversalDirection::Incoming),
+            std::collections::BTreeSet::from([EdgeKind::References])
         );
         assert_eq!(
-            super::produced_relationship_facets(TraversalDirection::Outgoing),
-            std::collections::BTreeSet::from([RelationshipFacet::Calls])
+            super::produced_edge_kinds(TraversalDirection::Outgoing),
+            std::collections::BTreeSet::from([EdgeKind::Calls])
         );
         assert_eq!(
-            super::unproducible_facets(
-                &[RelationshipFacet::References, RelationshipFacet::Calls],
+            super::unproducible_kinds(
+                &[EdgeKind::References, EdgeKind::Calls],
                 TraversalDirection::Outgoing
             ),
-            [RelationshipFacet::References]
+            [EdgeKind::References]
         );
     }
 
-    /// The gap lists exactly the requested facets no lane populates, keeping the request's
+    /// The gap lists exactly the requested kinds no lane populates, keeping the request's
     /// own order, and never the produced ones beside them.
     #[test]
-    fn unproducible_facets_keeps_only_the_unproduced_ones_in_request_order() {
+    fn unproducible_kinds_keeps_only_the_unproduced_ones_in_request_order() {
         assert_eq!(
-            super::unproducible_facets(
+            super::unproducible_kinds(
                 &[
-                    RelationshipFacet::Implements,
-                    RelationshipFacet::References,
-                    RelationshipFacet::Extends,
+                    EdgeKind::Implements,
+                    EdgeKind::References,
+                    EdgeKind::Extends,
                 ],
                 TraversalDirection::Incoming
             ),
-            [RelationshipFacet::Implements, RelationshipFacet::Extends]
+            [EdgeKind::Implements, EdgeKind::Extends]
         );
         assert_eq!(
-            super::unproducible_facets(
-                &[RelationshipFacet::Extends, RelationshipFacet::Implements,],
+            super::unproducible_kinds(
+                &[EdgeKind::Extends, EdgeKind::Implements,],
                 TraversalDirection::Incoming
             ),
-            [RelationshipFacet::Extends, RelationshipFacet::Implements]
+            [EdgeKind::Extends, EdgeKind::Implements]
         );
     }
 
-    /// A caller repeating one facet gets it named once: the warning reports the set that
+    /// A caller repeating one kind gets it named once: the warning reports the set that
     /// has no provider, not the request's own repetition.
     #[test]
-    fn unproducible_facets_names_a_repeated_facet_once() {
+    fn unproducible_kinds_names_a_repeated_kind_once() {
         assert_eq!(
-            super::unproducible_facets(
+            super::unproducible_kinds(
                 &[
-                    RelationshipFacet::Implements,
-                    RelationshipFacet::Implements,
-                    RelationshipFacet::Extends,
-                    RelationshipFacet::Implements,
+                    EdgeKind::Implements,
+                    EdgeKind::Implements,
+                    EdgeKind::Extends,
+                    EdgeKind::Implements,
                 ],
                 TraversalDirection::Incoming
             ),
-            [RelationshipFacet::Implements, RelationshipFacet::Extends]
+            [EdgeKind::Implements, EdgeKind::Extends]
         );
     }
 
     #[test]
-    fn relationship_coverage_warning_is_absent_when_no_facet_names_a_gap() {
-        assert!(super::relationship_coverage_warning(Vec::new()).is_none());
+    fn edge_coverage_warning_is_absent_when_no_kind_names_a_gap() {
+        assert!(super::edge_coverage_warning(Vec::new()).is_none());
     }
 
-    /// A facet gap names each unproduced facet in its wire spelling.
+    /// A kind gap names each unproduced kind in its wire spelling.
     #[test]
-    fn relationship_coverage_warning_names_every_unproduced_facet() {
-        let gap = vec![RelationshipFacet::Implements, RelationshipFacet::Extends];
+    fn edge_coverage_warning_names_every_unproduced_kind() {
+        let gap = vec![EdgeKind::Implements, EdgeKind::Extends];
         assert_eq!(
-            super::relationship_coverage_warning(gap.clone()),
-            Some(ReadWarning::RelationshipCoverageMissing {
-                facets: gap,
-                detail: "no lane populates the requested facets implements, extends, so \
+            super::edge_coverage_warning(gap.clone()),
+            Some(ReadWarning::EdgeCoverageMissing {
+                kinds: gap,
+                detail: "no lane populates the requested kinds implements, extends, so \
                          the walk followed no edge under them"
                     .to_owned(),
             })
         );
     }
 
-    /// One unproduced facet names itself in the singular.
+    /// One unproduced kind names itself in the singular.
     #[test]
-    fn relationship_coverage_warning_names_one_unproduced_facet_in_the_singular() {
+    fn edge_coverage_warning_names_one_unproduced_kind_in_the_singular() {
         assert_eq!(
-            super::relationship_coverage_warning(vec![RelationshipFacet::Implements]),
-            Some(ReadWarning::RelationshipCoverageMissing {
-                facets: vec![RelationshipFacet::Implements],
-                detail: "no lane populates the requested facet implements, so the walk \
+            super::edge_coverage_warning(vec![EdgeKind::Implements]),
+            Some(ReadWarning::EdgeCoverageMissing {
+                kinds: vec![EdgeKind::Implements],
+                detail: "no lane populates the requested kind implements, so the walk \
                          followed no edge under it"
                     .to_owned(),
             })
@@ -1045,7 +1027,7 @@ pub(crate) mod tests {
         // `root` has outgoing edges, and nothing arrives at it.
         let request = traversal_request(&root, 2, vec![]);
         let discovered =
-            walk_traversal_capped(&store, &root, &request, TRAVERSAL_NODES_MAX).discovered;
+            walk_traversal_capped(&store, &root, &request, TRAVERSAL_SYMBOLS_MAX).discovered;
         assert!(discovered.is_empty(), "{discovered:?}");
     }
 
@@ -1058,14 +1040,14 @@ pub(crate) mod tests {
     /// One incoming reference a language engine resolved: `from` references `to`.
     fn engine_hop(from: &str, to: &str) -> GraphHop {
         GraphHop {
-            relationship: Relationship {
+            edge: Edge {
                 producer: None,
                 from: rift_protocol::read::SymbolId(from.to_owned()),
-                kind: ExactKind(RelationshipFacet::References.as_ref().to_owned()),
-                facets: vec![RelationshipFacet::References],
+                kind: ExactKind(EdgeKind::References.as_ref().to_owned()),
+                kinds: vec![EdgeKind::References],
                 to: rift_protocol::read::SymbolId(to.to_owned()),
                 occurrence: None,
-                derivation: RelationshipDerivation::Resolution,
+                derivation: EdgeDerivation::Resolution,
                 confidence: None,
                 extensions: Extensions::default(),
             },
@@ -1133,7 +1115,7 @@ pub(crate) mod tests {
         Ok((directory, service, references))
     }
 
-    /// A workspace with no configured language engine: its relationship store is empty,
+    /// A workspace with no configured language engine: its edge store is empty,
     /// and no engine answers for a seed in it.
     fn engineless_fixture() -> TestResult<(TempDir, ReadService)> {
         let directory = tempfile::tempdir()?;
@@ -1170,10 +1152,7 @@ pub(crate) mod tests {
             .find(|hit| matches!(&hit.hit, SearchHitTarget::Symbol { symbol } if symbol.name == "branch_a"))
             .ok_or("branch_a must be reached at depth 1")?;
         assert_eq!(hit.distance, Some(1));
-        assert!(
-            hit.matched_by.contains(&MatchedField::Relationship),
-            "{hit:?}"
-        );
+        assert!(hit.matched_by.contains(&MatchedField::Edge), "{hit:?}");
         assert!(!hit.matched_by.contains(&MatchedField::Name), "{hit:?}");
         Ok(())
     }
@@ -1287,10 +1266,7 @@ pub(crate) mod tests {
             .find(|hit| matches!(&hit.hit, SearchHitTarget::Symbol { symbol } if symbol.name == "branch_a"))
             .ok_or("branch_a must be a hit")?;
         assert!(hit.matched_by.contains(&MatchedField::Name), "{hit:?}");
-        assert!(
-            hit.matched_by.contains(&MatchedField::Relationship),
-            "{hit:?}"
-        );
+        assert!(hit.matched_by.contains(&MatchedField::Edge), "{hit:?}");
         assert_eq!(
             hit.traversal_path.as_ref().map(Vec::len),
             Some(1),
@@ -1358,25 +1334,25 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// The one `relationship_coverage_missing` warning `result` carries, or `None` when it
+    /// The one `edge_coverage_missing` warning `result` carries, or `None` when it
     /// carries no warning at all or more than one.
     fn coverage_warning(result: &SearchResult) -> Option<&ReadWarning> {
         result
             .warnings
             .first()
             .filter(|_| result.warnings.len() == 1)
-            .filter(|warning| matches!(warning, ReadWarning::RelationshipCoverageMissing { .. }))
+            .filter(|warning| matches!(warning, ReadWarning::EdgeCoverageMissing { .. }))
     }
 
-    /// An empty answer over a produced facet stays bare, so the warning keeps naming an
+    /// An empty answer over a produced kind stays bare, so the warning keeps naming an
     /// absent lane alone.
     #[test]
-    fn search_traversal_over_a_produced_facet_carries_no_coverage_warning() -> TestResult {
+    fn search_traversal_over_a_produced_kind_carries_no_coverage_warning() -> TestResult {
         let (_directory, service, references) = live_reference_graph_fixture()?;
         let request = json!({
             "traversal": {
                 "seed": graph_identity("leaf").as_str(),
-                "facets": ["references"]
+                "kinds": ["references"]
             }
         });
         let params: SearchParams = serde_json::from_value(request)?;
@@ -1392,13 +1368,12 @@ pub(crate) mod tests {
     /// `implements` reaches no lane, so the walk could not have answered it. The produced
     /// `references` beside it still answers, and the warning names the one gap.
     #[test]
-    fn search_traversal_over_an_unproduced_facet_warns_relationship_coverage_missing() -> TestResult
-    {
+    fn search_traversal_over_an_unproduced_kind_warns_edge_coverage_missing() -> TestResult {
         let (_directory, service, references) = live_reference_graph_fixture()?;
         let request = json!({
             "traversal": {
                 "seed": graph_identity("leaf").as_str(),
-                "facets": ["implements", "references"]
+                "kinds": ["implements", "references"]
             }
         });
         let params: SearchParams = serde_json::from_value(request)?;
@@ -1410,8 +1385,8 @@ pub(crate) mod tests {
         assert!(
             coverage_warning(&result).is_some_and(|warning| matches!(
                 warning,
-                ReadWarning::RelationshipCoverageMissing { facets, .. }
-                    if *facets == [RelationshipFacet::Implements]
+                ReadWarning::EdgeCoverageMissing { kinds, .. }
+                    if *kinds == [EdgeKind::Implements]
             )),
             "{:#?}",
             result.warnings
@@ -1470,11 +1445,11 @@ pub(crate) mod tests {
         assert_eq!(error.slug().as_str(), "rift.server.read_unsupported");
     }
 
-    /// `depth` and `facets.len()` carry `schemars` `range`/`length` constraints that serde
+    /// `depth` and `kinds.len()` carry `schemars` `range`/`length` constraints that serde
     /// deserialization never enforces on its own - the values below parse cleanly and only
     /// `validate_traversal` (through `validate_search`) refuses them.
     #[test]
-    fn validate_search_refuses_traversal_depth_and_facets_out_of_bound() {
+    fn validate_search_refuses_traversal_depth_and_kinds_out_of_bound() {
         let over_depth: SearchParams = serde_json::from_value(json!({
             "traversal": {
                 "seed": graph_identity("root").as_str(),
@@ -1486,23 +1461,23 @@ pub(crate) mod tests {
             .expect_err("depth 3 must be refused at the request-validation boundary");
         assert_eq!(error.slug().as_str(), "rift.server.read_invalid");
 
-        let padded_facets = vec![json!("calls"); super::SEARCH_TRAVERSAL_FACETS_MAX + 1];
-        let over_facets: SearchParams = serde_json::from_value(json!({
+        let padded_kinds = vec![json!("calls"); super::SEARCH_TRAVERSAL_KINDS_MAX + 1];
+        let over_kinds: SearchParams = serde_json::from_value(json!({
             "traversal": {
                 "seed": graph_identity("root").as_str(),
-                "facets": padded_facets
+                "kinds": padded_kinds
             }
         }))
-        .expect("a duplicate-padded facets list still parses");
-        let error = crate::search::validate_search(&over_facets)
-            .expect_err("more facets than RelationshipFacet has variants must be refused");
+        .expect("a duplicate-padded kinds list still parses");
+        let error = crate::search::validate_search(&over_kinds)
+            .expect_err("more kinds than EdgeKind has variants must be refused");
         assert_eq!(error.slug().as_str(), "rift.server.read_invalid");
     }
     #[test]
     fn confirmed_reference_preserves_indexed_occurrence_and_one_hit() {
         let caller = graph_symbol_id(graph_identity("caller").as_str());
         let target = graph_symbol_id(graph_identity("target").as_str());
-        let store = RelationshipStore::build(&graph_normalized(vec![
+        let store = EdgeStore::build(&graph_normalized(vec![
             graph_definition("caller", caller.as_str(), (0, 40)),
             graph_definition("target", target.as_str(), (40, 80)),
             graph_reference(
@@ -1515,24 +1490,24 @@ pub(crate) mod tests {
         let edge = &store.incoming(&target)[0];
         let prior = super::graph_hop(edge, rift_protocol::read::HopDirection::Incoming);
         let mut confirmed = prior.clone();
-        confirmed.relationship.occurrence = None;
+        confirmed.edge.occurrence = None;
         let references = crate::EngineReferences::from_incoming(std::collections::BTreeMap::from(
             [(target.clone(), vec![confirmed])],
         ));
-        let request = traversal_request(&target, 1, vec![RelationshipFacet::References]);
+        let request = traversal_request(&target, 1, vec![EdgeKind::References]);
         let walk = super::walk_traversal_with_references(
             &store,
             &target,
             &request,
-            TRAVERSAL_NODES_MAX,
+            TRAVERSAL_SYMBOLS_MAX,
             &references,
         );
         assert_eq!(walk.discovered.len(), 1);
         assert_eq!(walk.discovered[0].0, caller);
         assert_eq!(walk.discovered[0].1[0], prior);
         assert_eq!(
-            walk.discovered[0].1[0].relationship.derivation,
-            rift_protocol::read::RelationshipDerivation::Resolution
+            walk.discovered[0].1[0].edge.derivation,
+            rift_protocol::read::EdgeDerivation::Resolution
         );
     }
 
@@ -1542,7 +1517,7 @@ pub(crate) mod tests {
     fn confirmed_call_preserves_indexed_occurrence_and_one_hit() {
         let caller = graph_symbol_id(graph_identity("caller").as_str());
         let target = graph_symbol_id(graph_identity("target").as_str());
-        let store = RelationshipStore::build(&graph_normalized(vec![
+        let store = EdgeStore::build(&graph_normalized(vec![
             graph_definition("caller", caller.as_str(), (0, 40)),
             graph_definition("target", target.as_str(), (40, 80)),
             graph_reference(
@@ -1555,26 +1530,26 @@ pub(crate) mod tests {
         let edge = &store.outgoing(&caller)[0];
         let prior = super::graph_hop(edge, rift_protocol::read::HopDirection::Outgoing);
         let mut confirmed = prior.clone();
-        confirmed.relationship.occurrence = None;
+        confirmed.edge.occurrence = None;
         let references = crate::EngineReferences::from_outgoing(BTreeMap::from([(
             caller.clone(),
             vec![confirmed],
         )]));
-        let mut request = traversal_request(&caller, 1, vec![RelationshipFacet::Calls]);
+        let mut request = traversal_request(&caller, 1, vec![EdgeKind::Calls]);
         request.direction = TraversalDirection::Outgoing;
         let walk = super::walk_traversal_with_references(
             &store,
             &caller,
             &request,
-            TRAVERSAL_NODES_MAX,
+            TRAVERSAL_SYMBOLS_MAX,
             &references,
         );
         assert_eq!(walk.discovered.len(), 1);
         assert_eq!(walk.discovered[0].0, target);
         assert_eq!(walk.discovered[0].1[0], prior);
         assert_eq!(
-            walk.discovered[0].1[0].relationship.derivation,
-            rift_protocol::read::RelationshipDerivation::Resolution
+            walk.discovered[0].1[0].edge.derivation,
+            rift_protocol::read::EdgeDerivation::Resolution
         );
     }
 }

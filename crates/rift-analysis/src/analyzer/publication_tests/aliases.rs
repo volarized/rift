@@ -112,20 +112,15 @@ fn explicit_alias_keeps_defining_object_and_original_export_span() {
         }));
     }
     let edge = publication
-        .relationships
+        .edges
         .iter()
         .find(|edge| {
             edge.from == alias
                 && edge.to == definition
-                && edge
-                    .facets
-                    .contains(&rift_protocol::read::RelationshipFacet::Aliases)
+                && edge.kinds.contains(&rift_protocol::read::EdgeKind::Aliases)
         })
-        .expect("explicit alias relationship");
-    assert_eq!(
-        edge.derivation,
-        rift_protocol::read::RelationshipDerivation::Syntax
-    );
+        .expect("explicit alias edge");
+    assert_eq!(edge.derivation, rift_protocol::read::EdgeDerivation::Syntax);
     assert!(edge.confidence.is_none());
     let occurrence = edge
         .occurrence
@@ -168,7 +163,7 @@ fn missing_entry_contract_keeps_both_physical_languages_unresolved() {
     );
     assert!(publication.objects.iter().all(|object| object.id.is_none()));
     assert!(publication.declarations.is_empty());
-    assert!(publication.relationships.is_empty());
+    assert!(publication.edges.is_empty());
     assert!(
         publication
             .coverage
@@ -201,7 +196,7 @@ fn alias_collision_retains_definitions_without_arbitrary_target() {
     );
     assert!(
         !publication
-            .relationships
+            .edges
             .iter()
             .any(|edge| edge.from == lexical && edge.to == other)
     );
@@ -220,20 +215,15 @@ fn public_alias_keeps_original_export_binding_and_incoming_target() {
     let definition = identity(&publication.owner, &["prettier", "format2"]);
     let alias = identity(&publication.owner, &["prettier", "format"]);
     let edge = publication
-        .relationships
+        .edges
         .iter()
         .find(|edge| {
             edge.from == alias
                 && edge.to == definition
-                && edge
-                    .facets
-                    .contains(&rift_protocol::read::RelationshipFacet::Aliases)
+                && edge.kinds.contains(&rift_protocol::read::EdgeKind::Aliases)
         })
-        .expect("explicit alias relationship");
-    assert_eq!(
-        edge.derivation,
-        rift_protocol::read::RelationshipDerivation::Syntax
-    );
+        .expect("explicit alias edge");
+    assert_eq!(edge.derivation, rift_protocol::read::EdgeDerivation::Syntax);
     assert!(edge.confidence.is_none());
     let occurrence = edge
         .occurrence
@@ -266,7 +256,7 @@ fn public_alias_keeps_original_export_binding_and_incoming_target() {
     assert_eq!(&unit.source[start..end], binding.source);
     assert_eq!(
         publication
-            .relationships
+            .edges
             .iter()
             .filter(|incoming| incoming.to == definition
                 && incoming.from == binding.symbol
@@ -284,12 +274,12 @@ fn public_alias_keeps_original_export_binding_and_incoming_target() {
         .expect("established alias object");
     assert!(
         alias_object
-            .facets
-            .contains(&rift_protocol::read::SymbolFacet::Alias)
+            .kinds
+            .contains(&rift_protocol::read::SymbolKind::Alias)
     );
     assert!(
         alias_object
-            .facets
-            .contains(&rift_protocol::read::SymbolFacet::Public)
+            .kinds
+            .contains(&rift_protocol::read::SymbolKind::Public)
     );
 }

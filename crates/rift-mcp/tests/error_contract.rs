@@ -50,8 +50,8 @@ async fn served_tool_failures_are_completed_error_results() -> TestResult {
                 "query": "beacon", "paths": { "include": ["[unclosed"] }
             }))?)?)?,
         ),
-        ("get_symbol", json!({ "name": "beacon", "limit": 0 })),
-        ("nodes", json!({ "path": "missing.rs", "position": 0 })),
+        ("get_symbol", json!({ "name": "beacon", "max_results": 0 })),
+        ("facets", json!({ "path": "missing.rs", "position": 0 })),
         (
             "get_symbol",
             json!({ "name": "beacon", "include": {"history": true} }),
@@ -67,7 +67,7 @@ async fn served_tool_failures_are_completed_error_results() -> TestResult {
             }))?)?)?,
         ),
         (
-            "nodes",
+            "facets",
             json!({ "path": "lib.rs", "position": 0, "revision": "rift://revision/git/HEAD~1" }),
         ),
     ];

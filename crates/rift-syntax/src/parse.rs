@@ -29,11 +29,12 @@ pub(crate) fn document(
     let tree = parser
         .parse(source.text, None)
         .ok_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())?;
-    let (nodes, symbols) = extract::extract(tree.root_node(), source, limits, language, rules)?;
+    let (syntax_elements, symbols) =
+        extract::extract(tree.root_node(), source, limits, language, rules)?;
     Ok(SyntaxDocument::new(
         language.clone(),
         source.path.clone(),
-        nodes,
+        syntax_elements,
         symbols,
         tree.root_node().has_error(),
     )

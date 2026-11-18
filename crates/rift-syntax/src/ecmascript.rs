@@ -9,7 +9,7 @@
 //! Decisions this module fixes for the family:
 //! - Qualified names join with `.`, the member access spelling
 //!   (`Router.route`), the way `rust` joins with `::`.
-//! - The `Public` facet marks a declaration the module exports. An `export`
+//! - The `Public` kind marks a declaration the module exports. An `export`
 //!   statement wrapping a declaration adds it, and so does an export naming a
 //!   module-scope declaration: `a` and `b` in `export { a, b as c }`, `a` in
 //!   `export default a` and the TypeScript `export = a`, and the declarations
@@ -24,7 +24,7 @@
 //!   module's declarations, so it marks none here. An anonymous function in a
 //!   literal property assignment (`exports.run = function () {}`) retains the
 //!   property binding and the original function source. The binding carries no
-//!   `Public` facet without supported module export context. Named function and
+//!   `Public` kind without supported module export context. Named function and
 //!   class expressions assigned to an export add no declaration.
 //! - `export` is not a visibility spelling: the `visibility` field carries
 //!   only an authored `accessibility_modifier` (`public`, `private`,
@@ -42,7 +42,7 @@
 //!   `export_statement`, or the `lexical_declaration` or `variable_declaration`
 //!   holding it as its first declarator - and extends over the `JSDoc`
 //!   comments directly attached before that statement. Decorators remain
-//!   children of the declared node.
+//!   children of the declared syntax element.
 //! - A `method_signature` or `property_signature` declares a `method` or a
 //!   `property` only inside an interface or class body, qualified by it
 //!   (`Array.map`); the same kinds inside a type literal (`{ size: number }`)
@@ -52,7 +52,7 @@
 //!   stripped and `@` tags kept as written. A `//` or `/* */` comment is not
 //!   documentation, and it stops the walk, as a blank line does. A
 //!   `Signature` renders for a callable declaration from `body_range` and the
-//!   `Callable` facet, and a bodyless one, an overload or a member signature,
+//!   `Callable` kind, and a bodyless one, an overload or a member signature,
 //!   renders its own text.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -60,7 +60,7 @@ use std::num::NonZeroU16;
 
 use rift_core::line::{LINE_FEED, LineEnding, lines_inclusive, without_ending};
 use rift_error::errors;
-use rift_protocol::read::{Documentation, DocumentationFormat, Language, NodeFacet, SymbolFacet};
+use rift_protocol::read::{Documentation, DocumentationFormat, Language, SymbolKind, SyntaxKind};
 mod commonjs;
 
 use tree_sitter::{Node, Parser};
@@ -200,19 +200,19 @@ impl EcmaScriptSymbolKind {
         }
     }
 
-    /// Portable facets for this kind, before an export adds `Public`.
-    fn facets(self) -> Vec<SymbolFacet> {
+    /// Portable kinds for this kind, before an export adds `Public`.
+    fn kinds(self) -> Vec<SymbolKind> {
         match self {
-            Self::Function | Self::Method => vec![SymbolFacet::Value, SymbolFacet::Callable],
-            Self::Class | Self::Interface | Self::Enum => vec![SymbolFacet::Type],
-            Self::TypeAlias => vec![SymbolFacet::Type, SymbolFacet::Alias],
-            Self::Variable | Self::Property => vec![SymbolFacet::Value],
-            Self::Namespace => vec![SymbolFacet::Namespace],
+            Self::Function | Self::Method => vec![SymbolKind::Value, SymbolKind::Callable],
+            Self::Class | Self::Interface | Self::Enum => vec![SymbolKind::Type],
+            Self::TypeAlias => vec![SymbolKind::Type, SymbolKind::Alias],
+            Self::Variable | Self::Property => vec![SymbolKind::Value],
+            Self::Namespace => vec![SymbolKind::Namespace],
         }
     }
 
     /// The grammar field spanning this kind's implementation part. Every
-    /// kind declares one; a node that omits it - a bodyless signature, a
+    /// kind declares one; a syntax element that omits it - a bodyless signature, a
     /// valueless declarator - carries no body range.
     const fn body_field(self) -> EcmaScriptGrammarField {
         match self {
@@ -235,9 +235,9 @@ impl EcmaScriptSymbolKind {
 /// Grammar field this module reads, common to all three pinned grammars.
 #[derive(Debug, Clone, Copy)]
 enum EcmaScriptGrammarField {
-    /// `name` field on declaration nodes.
+    /// `name` field on declaration syntax elements.
     Name,
-    /// `body` field on block-bodied declaration nodes.
+    /// `body` field on block-bodied declaration syntax elements.
     Body,
     /// `value` field on `variable_declarator`, `type_alias_declaration`,
     /// `pair`, and a default `export_statement`.
@@ -453,18 +453,20 @@ impl EcmaScriptKinds {
         kinds
     }
 
-    /// Whether `node` is a member signature outside an interface or class
+    /// Whether `syntax element` is a member signature outside an interface or class
     /// body, such as `{ size: number }` in a type annotation.
     fn is_type_literal_member(&self, visited: Visited<'_, '_>) -> bool {
-        self.member_signatures.contains(&visited.node().kind_id())
-            && !visited
-                .parent()
-                .is_some_and(|parent| self.member_bodies.contains(&parent.node().kind_id()))
+        self.member_signatures
+            .contains(&visited.syntax_element().kind_id())
+            && !visited.parent().is_some_and(|parent| {
+                self.member_bodies
+                    .contains(&parent.syntax_element().kind_id())
+            })
     }
 
-    /// The symbol kind `node` declares; `None` for a kind outside the table.
-    fn symbol_kind(&self, node: Node<'_>) -> Option<EcmaScriptSymbolKind> {
-        let id = node.kind_id();
+    /// The symbol kind `syntax element` declares; `None` for a kind outside the table.
+    fn symbol_kind(&self, syntax_element: Node<'_>) -> Option<EcmaScriptSymbolKind> {
+        let id = syntax_element.kind_id();
         self.declarations
             .iter()
             .find(|(kind, _)| *kind == id)
@@ -485,27 +487,29 @@ impl EcmaScriptKinds {
         }
     }
 
-    /// `node`'s child in `field`; `None` when the node omits it.
+    /// `syntax element`'s child in `field`; `None` when the syntax element omits it.
     fn child<'tree>(
         &self,
-        node: Node<'tree>,
+        syntax_element: Node<'tree>,
         field: EcmaScriptGrammarField,
     ) -> Option<Node<'tree>> {
-        node.child_by_field_id(self.field(field).get())
+        syntax_element.child_by_field_id(self.field(field).get())
     }
 
-    /// Whether `node` is a `let`, `const`, or `var` statement holding
+    /// Whether `syntax element` is a `let`, `const`, or `var` statement holding
     /// declarators.
-    fn is_declaration_statement(&self, node: Node<'_>) -> bool {
-        node.kind_id() == self.lexical_declaration || node.kind_id() == self.variable_declaration
+    fn is_declaration_statement(&self, syntax_element: Node<'_>) -> bool {
+        syntax_element.kind_id() == self.lexical_declaration
+            || syntax_element.kind_id() == self.variable_declaration
     }
 
-    /// Whether `node` is the plain identifier `spelling`.
-    fn is_identifier(&self, node: Node<'_>, text: &str, spelling: &str) -> bool {
-        node.kind_id() == self.identifier && text.get(node.byte_range()) == Some(spelling)
+    /// Whether `syntax element` is the plain identifier `spelling`.
+    fn is_identifier(&self, syntax_element: Node<'_>, text: &str, spelling: &str) -> bool {
+        syntax_element.kind_id() == self.identifier
+            && text.get(syntax_element.byte_range()) == Some(spelling)
     }
 
-    /// The nodes one top-level statement exports without wrapping a
+    /// The syntax elements one top-level statement exports without wrapping a
     /// declaration: an identifier naming a local declaration, or an object
     /// literal the module exports whole.
     fn statement_exports<'tree>(&self, statement: Node<'tree>, text: &str) -> Vec<Node<'tree>> {
@@ -579,17 +583,17 @@ impl EcmaScriptKinds {
     /// This records the physical binding; module and build evidence decide public export.
     fn export_function<'tree>(
         &self,
-        node: Node<'tree>,
+        syntax_element: Node<'tree>,
         text: &str,
     ) -> Option<(Node<'tree>, Node<'tree>)> {
-        if node.kind_id() != self.assignment_expression {
+        if syntax_element.kind_id() != self.assignment_expression {
             return None;
         }
-        let left = self.child(node, EcmaScriptGrammarField::Left)?;
+        let left = self.child(syntax_element, EcmaScriptGrammarField::Left)?;
         if self.export_target(left, text) != Some(ExportTarget::Property) {
             return None;
         }
-        let function = self.child(node, EcmaScriptGrammarField::Right)?;
+        let function = self.child(syntax_element, EcmaScriptGrammarField::Right)?;
         if function.kind_id() != self.function_expression
             || self.child(function, EcmaScriptGrammarField::Name).is_some()
         {
@@ -611,25 +615,25 @@ impl EcmaScriptKinds {
         (exports_variable || module_exports).then_some(ExportTarget::Property)
     }
 
-    /// Whether `node` spells `module.exports`.
-    fn is_module_exports(&self, node: Node<'_>, text: &str) -> bool {
-        let Some(object) = self.member_object(node) else {
+    /// Whether `syntax element` spells `module.exports`.
+    fn is_module_exports(&self, syntax_element: Node<'_>, text: &str) -> bool {
+        let Some(object) = self.member_object(syntax_element) else {
             return false;
         };
         let module_variable = self.is_identifier(object, text, MODULE_VARIABLE);
         let exports_property = self
-            .child(node, EcmaScriptGrammarField::Property)
+            .child(syntax_element, EcmaScriptGrammarField::Property)
             .and_then(|property| text.get(property.byte_range()))
             == Some(EXPORTS_NAME);
         module_variable && exports_property
     }
 
-    /// The `object` of a `member_expression`; `None` for any other node.
-    fn member_object<'tree>(&self, node: Node<'tree>) -> Option<Node<'tree>> {
-        if node.kind_id() != self.member_expression {
+    /// The `object` of a `member_expression`; `None` for any other syntax element.
+    fn member_object<'tree>(&self, syntax_element: Node<'tree>) -> Option<Node<'tree>> {
+        if syntax_element.kind_id() != self.member_expression {
             return None;
         }
-        self.child(node, EcmaScriptGrammarField::Object)
+        self.child(syntax_element, EcmaScriptGrammarField::Object)
     }
 
     /// The identifier one property of an exported object literal names: `a`
@@ -647,10 +651,10 @@ impl EcmaScriptKinds {
     }
 }
 
-/// Every named child of `node`, in order, read in one cursor walk.
-fn named_children(node: Node<'_>) -> impl Iterator<Item = Node<'_>> {
-    let mut cursor = node.walk();
-    let children: Vec<_> = node.named_children(&mut cursor).collect();
+/// Every named child of `syntax element`, in order, read in one cursor walk.
+fn named_children(syntax_element: Node<'_>) -> impl Iterator<Item = Node<'_>> {
+    let mut cursor = syntax_element.walk();
+    let children: Vec<_> = syntax_element.named_children(&mut cursor).collect();
     children.into_iter()
 }
 
@@ -659,7 +663,7 @@ fn named_children(node: Node<'_>) -> impl Iterator<Item = Node<'_>> {
 ///
 /// The read visits the program's statements, their export clauses and
 /// assignment chains, and the properties of an object literal exported
-/// whole, each node once, so its work is linear in the source
+/// whole, each syntax element once, so its work is linear in the source
 /// `source_bytes_max` admits. An assignment nested in a block or a function
 /// is not read.
 #[derive(Debug, Default)]
@@ -688,7 +692,7 @@ impl<'text> ModuleExports<'text> {
             }
             if let Some(object) = kinds
                 .assignment_export(statement, text)
-                .filter(|node| node.kind_id() == kinds.object_literal)
+                .filter(|syntax_element| syntax_element.kind_id() == kinds.object_literal)
             {
                 exports.record_bindings(statement, object, kinds)?;
             }
@@ -724,7 +728,7 @@ impl<'text> ModuleExports<'text> {
         Ok(())
     }
 
-    /// Records one exported node: an identifier's name, or an object literal
+    /// Records one exported syntax element: an identifier's name, or an object literal
     /// with the names its properties give.
     fn add(&mut self, exported: Node<'_>, text: &'text str, kinds: &EcmaScriptKinds) {
         if exported.kind_id() == kinds.identifier {
@@ -741,12 +745,12 @@ impl<'text> ModuleExports<'text> {
     }
 }
 
-/// Resolves one node kind id, proving the pinned grammar defines it.
+/// Resolves one syntax element kind id, proving the pinned grammar defines it.
 fn kind_id(language: &tree_sitter::Language, kind: &str) -> u16 {
     let id = language.id_for_node_kind(kind, true);
     assert!(
         id != 0,
-        "pinned ECMAScript grammar must define node kind used by symbol \
+        "pinned ECMAScript grammar must define syntax_element kind used by symbol \
          extraction: kind={kind}"
     );
     id
@@ -786,19 +790,21 @@ impl EcmaScriptRules<'_> {
     /// The export statement directly carrying this declaration.
     fn declaration_export<'tree>(&self, visited: Visited<'_, 'tree>) -> Option<Node<'tree>> {
         let mut parent = visited.parent()?;
-        if self.kinds.is_declaration_statement(parent.node()) {
+        if self.kinds.is_declaration_statement(parent.syntax_element()) {
             parent = parent.parent()?;
         }
-        if self.kinds.ambient_declaration == Some(parent.node().kind_id()) {
+        if self.kinds.ambient_declaration == Some(parent.syntax_element().kind_id()) {
             parent = parent.parent()?;
         }
-        (parent.node().kind_id() == self.kinds.export_statement).then(|| parent.node())
+        (parent.syntax_element().kind_id() == self.kinds.export_statement)
+            .then(|| parent.syntax_element())
     }
 
     /// Whether a direct grammar token marks this export form.
-    fn has_token(node: Node<'_>, tokens: &[u16]) -> bool {
-        let mut cursor = node.walk();
-        node.children(&mut cursor)
+    fn has_token(syntax_element: Node<'_>, tokens: &[u16]) -> bool {
+        let mut cursor = syntax_element.walk();
+        syntax_element
+            .children(&mut cursor)
             .any(|child| tokens.contains(&child.kind_id()))
     }
 
@@ -808,22 +814,25 @@ impl EcmaScriptRules<'_> {
         visited: Visited<'_, '_>,
         qualification: &str,
     ) -> Result<Option<SyntaxExportBinding>, RiftError> {
-        let node = visited.node();
+        let syntax_element = visited.syntax_element();
         let Some(statement) = visited
             .parent()
-            .filter(|parent| parent.node().kind_id() == self.kinds.export_clause)
+            .filter(|parent| parent.syntax_element().kind_id() == self.kinds.export_clause)
             .and_then(Visited::parent)
-            .filter(|parent| parent.node().kind_id() == self.kinds.export_statement)
-            .map(Visited::node)
+            .filter(|parent| parent.syntax_element().kind_id() == self.kinds.export_statement)
+            .map(Visited::syntax_element)
         else {
             return Ok(None);
         };
-        let Some(local) = self.kinds.child(node, EcmaScriptGrammarField::Name) else {
+        let Some(local) = self
+            .kinds
+            .child(syntax_element, EcmaScriptGrammarField::Name)
+        else {
             return Ok(None);
         };
         let exported = self
             .kinds
-            .child(node, EcmaScriptGrammarField::Alias)
+            .child(syntax_element, EcmaScriptGrammarField::Alias)
             .unwrap_or(local);
         Ok(Some(SyntaxExportBinding {
             kind: SyntaxExportKind::Named,
@@ -836,7 +845,7 @@ impl EcmaScriptRules<'_> {
                 .map(extract::byte_range)
                 .transpose()?,
             container: (!qualification.is_empty()).then(|| qualification.to_owned()),
-            type_only: Self::has_token(node, &self.kinds.type_tokens)
+            type_only: Self::has_token(syntax_element, &self.kinds.type_tokens)
                 || Self::has_token(statement, &self.kinds.type_tokens),
         }))
     }
@@ -847,8 +856,8 @@ impl EcmaScriptRules<'_> {
         visited: Visited<'_, '_>,
         qualification: &str,
     ) -> Result<Option<SyntaxExportBinding>, RiftError> {
-        let node = visited.node();
-        let Some(kind) = self.kinds.symbol_kind(node) else {
+        let syntax_element = visited.syntax_element();
+        let Some(kind) = self.kinds.symbol_kind(syntax_element) else {
             return Ok(None);
         };
         let Some(statement) = self.declaration_export(visited) else {
@@ -856,7 +865,7 @@ impl EcmaScriptRules<'_> {
         };
         let local = self
             .kinds
-            .child(node, EcmaScriptGrammarField::Name)
+            .child(syntax_element, EcmaScriptGrammarField::Name)
             .filter(|name| {
                 kind != EcmaScriptSymbolKind::Variable || name.kind_id() == self.kinds.identifier
             })
@@ -888,37 +897,42 @@ impl EcmaScriptRules<'_> {
     /// Statement forms without a named clause or a direct declaration.
     fn statement_binding(
         &self,
-        node: Node<'_>,
+        syntax_element: Node<'_>,
         qualification: &str,
     ) -> Result<Option<SyntaxExportBinding>, RiftError> {
-        let source = self.kinds.child(node, EcmaScriptGrammarField::Source);
-        let namespace =
-            named_children(node).find(|child| child.kind_id() == self.kinds.namespace_export);
-        let is_default = Self::has_token(node, &[self.kinds.default_token]);
+        let source = self
+            .kinds
+            .child(syntax_element, EcmaScriptGrammarField::Source);
+        let namespace = named_children(syntax_element)
+            .find(|child| child.kind_id() == self.kinds.namespace_export);
+        let is_default = Self::has_token(syntax_element, &[self.kinds.default_token]);
         let kind = if source.is_some() && namespace.is_some() {
             SyntaxExportKind::Namespace
-        } else if source.is_some() && Self::has_token(node, &[self.kinds.star_token]) {
+        } else if source.is_some() && Self::has_token(syntax_element, &[self.kinds.star_token]) {
             SyntaxExportKind::All
         } else if is_default
-            && !named_children(node).any(|child| self.kinds.symbol_kind(child).is_some())
+            && !named_children(syntax_element).any(|child| self.kinds.symbol_kind(child).is_some())
         {
             SyntaxExportKind::Default
         } else {
             return Ok(None);
         };
         let local = (kind == SyntaxExportKind::Default)
-            .then(|| self.kinds.child(node, EcmaScriptGrammarField::Value))
+            .then(|| {
+                self.kinds
+                    .child(syntax_element, EcmaScriptGrammarField::Value)
+            })
             .flatten()
             .filter(|value| value.kind_id() == self.kinds.identifier);
         let exported = namespace.and_then(|namespace| namespace.named_child(0));
         Ok(Some(SyntaxExportBinding {
             kind,
-            range: extract::byte_range(node)?,
+            range: extract::byte_range(syntax_element)?,
             local: local.map(extract::byte_range).transpose()?,
             exported: exported.map(extract::byte_range).transpose()?,
             source: source.map(extract::byte_range).transpose()?,
             container: (!qualification.is_empty()).then(|| qualification.to_owned()),
-            type_only: Self::has_token(node, &self.kinds.type_tokens),
+            type_only: Self::has_token(syntax_element, &self.kinds.type_tokens),
         }))
     }
 
@@ -927,18 +941,19 @@ impl EcmaScriptRules<'_> {
     /// single name.
     fn declaration_name(
         &self,
-        node: Node<'_>,
+        syntax_element: Node<'_>,
         kind: EcmaScriptSymbolKind,
         text: &str,
     ) -> Option<String> {
-        let name = node.child_by_field_id(self.kinds.field(EcmaScriptGrammarField::Name).get())?;
+        let name = syntax_element
+            .child_by_field_id(self.kinds.field(EcmaScriptGrammarField::Name).get())?;
         if kind == EcmaScriptSymbolKind::Variable && name.kind_id() != self.kinds.identifier {
             return None;
         }
         text.get(name.byte_range()).map(Into::into)
     }
 
-    /// Whether the module exports the declaration `node` names `name`: an
+    /// Whether the module exports the declaration `syntax element` names `name`: an
     /// `export_statement` wraps it, an export names it at module scope, or it
     /// is a method of an object literal the module exports whole.
     fn exported(&self, visited: Visited<'_, '_>, name: &str) -> bool {
@@ -946,34 +961,33 @@ impl EcmaScriptRules<'_> {
         let named = self.exports.names.contains(name) && self.at_module_scope(visited);
         let in_exported_object = visited
             .parent()
-            .is_some_and(|parent| self.exports.objects.contains(&parent.node().id()));
+            .is_some_and(|parent| self.exports.objects.contains(&parent.syntax_element().id()));
         wrapped || named || in_exported_object
     }
 
-    /// The statement carrying `node`: the declaration itself, the
+    /// The statement carrying `syntax element`: the declaration itself, the
     /// `lexical_declaration` or `variable_declaration` holding it as its
     /// first declarator, its TypeScript `ambient_declaration`, and the
     /// `export_statement` wrapping them. A
     /// `JSDoc` block written above `export` or `const` stands before this
-    /// node, since the grammar makes `export` the declaration's previous
+    /// syntax element, since the grammar makes `export` the declaration's previous
     /// sibling.
     fn statement<'walk, 'tree>(&self, visited: Visited<'walk, 'tree>) -> Visited<'walk, 'tree> {
         let mut front = visited;
         if let Some(parent) = front.parent().filter(|parent| {
-            self.kinds.is_declaration_statement(parent.node())
-                && parent.node().named_child(0) == Some(front.node())
+            self.kinds.is_declaration_statement(parent.syntax_element())
+                && parent.syntax_element().named_child(0) == Some(front.syntax_element())
+        }) {
+            front = parent;
+        }
+        if let Some(parent) = front.parent().filter(|parent| {
+            self.kinds.ambient_declaration == Some(parent.syntax_element().kind_id())
         }) {
             front = parent;
         }
         if let Some(parent) = front
             .parent()
-            .filter(|parent| self.kinds.ambient_declaration == Some(parent.node().kind_id()))
-        {
-            front = parent;
-        }
-        if let Some(parent) = front
-            .parent()
-            .filter(|parent| parent.node().kind_id() == self.kinds.export_statement)
+            .filter(|parent| parent.syntax_element().kind_id() == self.kinds.export_statement)
         {
             front = parent;
         }
@@ -988,10 +1002,10 @@ impl EcmaScriptRules<'_> {
         let mut run = Vec::new();
         let mut front = front;
         while let Some(previous) = front.previous_sibling() {
-            if !self.attaches(previous.node(), front.node(), text) {
+            if !self.attaches(previous.syntax_element(), front.syntax_element(), text) {
                 break;
             }
-            run.push(previous.node());
+            run.push(previous.syntax_element());
             front = previous;
         }
         run
@@ -1052,38 +1066,41 @@ impl EcmaScriptRules<'_> {
         self.declaration_export(visited).is_some()
     }
 
-    /// Whether `node` declares at module scope: its statement - the node
+    /// Whether `syntax element` declares at module scope: its statement - the syntax element
     /// itself, or a declarator's declaration statement - sits directly in the
     /// program.
     fn at_module_scope(&self, visited: Visited<'_, '_>) -> bool {
         let statement = visited
             .parent()
-            .filter(|parent| self.kinds.is_declaration_statement(parent.node()))
+            .filter(|parent| self.kinds.is_declaration_statement(parent.syntax_element()))
             .unwrap_or(visited);
         statement
             .parent()
-            .is_some_and(|parent| parent.node().kind_id() == self.kinds.program)
+            .is_some_and(|parent| parent.syntax_element().kind_id() == self.kinds.program)
     }
 
-    /// The authored `accessibility_modifier` text on `node`; `None` when the
+    /// The authored `accessibility_modifier` text on `syntax element`; `None` when the
     /// grammar spells none or the declaration carries none.
-    fn accessibility(&self, node: Node<'_>, text: &str) -> Option<String> {
+    fn accessibility(&self, syntax_element: Node<'_>, text: &str) -> Option<String> {
         let modifier = self.kinds.accessibility_modifier?;
-        let mut cursor = node.walk();
-        node.named_children(&mut cursor)
+        let mut cursor = syntax_element.walk();
+        syntax_element
+            .named_children(&mut cursor)
             .find(|child| child.kind_id() == modifier)
             .and_then(|child| text.get(child.byte_range()))
             .map(Into::into)
     }
 
-    /// The kind's body or value field span; `None` when this node omits the
+    /// The kind's body or value field span; `None` when this syntax element omits the
     /// field - a bodyless signature, a valueless declarator.
     fn body_range(
         &self,
-        node: Node<'_>,
+        syntax_element: Node<'_>,
         kind: EcmaScriptSymbolKind,
     ) -> Result<Option<ByteRange>, RiftError> {
-        let Some(body) = node.child_by_field_id(self.kinds.field(kind.body_field()).get()) else {
+        let Some(body) =
+            syntax_element.child_by_field_id(self.kinds.field(kind.body_field()).get())
+        else {
             return Ok(None);
         };
         extract::byte_range(body).map(Some)
@@ -1097,24 +1114,27 @@ impl GrammarRules for EcmaScriptRules<'_> {
         _text: &str,
         qualification: &str,
     ) -> Result<Option<SyntaxExportBinding>, RiftError> {
-        let node = visited.node();
-        if let Some(binding) = self.exports.bindings.get(&node.id()) {
+        let syntax_element = visited.syntax_element();
+        if let Some(binding) = self.exports.bindings.get(&syntax_element.id()) {
             Ok(Some(binding.clone()))
-        } else if node.kind_id() == self.kinds.export_specifier {
+        } else if syntax_element.kind_id() == self.kinds.export_specifier {
             self.specifier_binding(visited, qualification)
-        } else if node.kind_id() == self.kinds.export_statement {
-            self.statement_binding(node, qualification)
+        } else if syntax_element.kind_id() == self.kinds.export_statement {
+            self.statement_binding(syntax_element, qualification)
         } else {
             self.declaration_binding(visited, qualification)
         }
     }
 
-    fn name_range(&self, node: Node<'_>) -> Result<Option<crate::ByteRange>, RiftError> {
-        let name = node
+    fn name_range(&self, syntax_element: Node<'_>) -> Result<Option<crate::ByteRange>, RiftError> {
+        let name = syntax_element
             .child_by_field_id(self.kinds.field(EcmaScriptGrammarField::Name).get())
             .or_else(|| {
-                (node.kind_id() == self.kinds.assignment_expression)
-                    .then(|| self.kinds.child(node, EcmaScriptGrammarField::Left))
+                (syntax_element.kind_id() == self.kinds.assignment_expression)
+                    .then(|| {
+                        self.kinds
+                            .child(syntax_element, EcmaScriptGrammarField::Left)
+                    })
                     .flatten()
                     .and_then(|left| self.kinds.child(left, EcmaScriptGrammarField::Property))
             });
@@ -1122,7 +1142,7 @@ impl GrammarRules for EcmaScriptRules<'_> {
     }
 
     fn renders_signature(&self, visited: Visited<'_, '_>) -> bool {
-        self.kinds.symbol_kind(visited.node()) != Some(EcmaScriptSymbolKind::Variable)
+        self.kinds.symbol_kind(visited.syntax_element()) != Some(EcmaScriptSymbolKind::Variable)
     }
 
     fn declaration(
@@ -1130,8 +1150,8 @@ impl GrammarRules for EcmaScriptRules<'_> {
         visited: Visited<'_, '_>,
         text: &str,
     ) -> Result<Option<Declaration>, RiftError> {
-        let node = visited.node();
-        if let Some((property, function)) = self.kinds.export_function(node, text) {
+        let syntax_element = visited.syntax_element();
+        if let Some((property, function)) = self.kinds.export_function(syntax_element, text) {
             let Some(name) = text.get(property.byte_range()) else {
                 return Ok(None);
             };
@@ -1139,26 +1159,27 @@ impl GrammarRules for EcmaScriptRules<'_> {
             return Ok(Some(Declaration {
                 name: name.to_owned(),
                 kind: EcmaScriptSymbolKind::Function.word(),
-                facets: EcmaScriptSymbolKind::Function.facets(),
+                kinds: EcmaScriptSymbolKind::Function.kinds(),
                 visibility: None,
                 body_range: body.map(extract::byte_range).transpose()?,
                 documentation: Vec::new(),
                 documentation_ranges: Vec::new(),
             }));
         }
-        let Some(kind) = self.kinds.symbol_kind(node) else {
+        let Some(kind) = self.kinds.symbol_kind(syntax_element) else {
             return Ok(None);
         };
         if self.kinds.is_type_literal_member(visited) {
             return Ok(None);
         }
-        let Some(name) = self.declaration_name(node, kind, text) else {
+        let Some(name) = self.declaration_name(syntax_element, kind, text) else {
             return Ok(None);
         };
-        let mut facets = kind.facets();
+        let mut kinds = kind.kinds();
         if kind == EcmaScriptSymbolKind::Variable
             && self.kinds.declaration_type.is_some_and(|field| {
-                node.child_by_field_id(field.get())
+                syntax_element
+                    .child_by_field_id(field.get())
                     .is_some_and(|annotation| {
                         Some(annotation.kind_id()) == self.kinds.type_annotation
                             && annotation.named_child(0).is_some_and(|declared| {
@@ -1167,46 +1188,47 @@ impl GrammarRules for EcmaScriptRules<'_> {
                     })
             })
         {
-            facets.push(SymbolFacet::Callable);
+            kinds.push(SymbolKind::Callable);
         }
         if self.exported(visited, &name) {
-            facets.push(SymbolFacet::Public);
+            kinds.push(SymbolKind::Public);
         }
         let (documentation, documentation_ranges) =
             self.attached_jsdoc(self.statement(visited), text)?;
         Ok(Some(Declaration {
             name,
             kind: kind.word(),
-            facets,
-            visibility: self.accessibility(node, text),
-            body_range: self.body_range(node, kind)?,
+            kinds,
+            visibility: self.accessibility(syntax_element, text),
+            body_range: self.body_range(syntax_element, kind)?,
             documentation,
             documentation_ranges,
         }))
     }
 
-    fn child_qualification(&self, node: Node<'_>, text: &str, parent: &str) -> String {
-        let global = self.kinds.global_namespace == Some(node.kind_id())
-            || (self.kinds.ambient_declaration == Some(node.kind_id())
+    fn child_qualification(&self, syntax_element: Node<'_>, text: &str, parent: &str) -> String {
+        let global = self.kinds.global_namespace == Some(syntax_element.kind_id())
+            || (self.kinds.ambient_declaration == Some(syntax_element.kind_id())
                 && self
                     .kinds
                     .global_token
-                    .is_some_and(|token| Self::has_token(node, &[token])));
+                    .is_some_and(|token| Self::has_token(syntax_element, &[token])));
         if global {
             return "global".to_owned();
         }
-        self.container_name(node, text).map_or_else(
+        self.container_name(syntax_element, text).map_or_else(
             || parent.to_owned(),
             |name| extract::qualify(self.qualification_separator(), parent, &name),
         )
     }
 
-    fn container_name(&self, node: Node<'_>, text: &str) -> Option<String> {
-        let kind = self.kinds.symbol_kind(node)?;
+    fn container_name(&self, syntax_element: Node<'_>, text: &str) -> Option<String> {
+        let kind = self.kinds.symbol_kind(syntax_element)?;
         if !kind.opens_scope() {
             return None;
         }
-        let name = node.child_by_field_id(self.kinds.field(EcmaScriptGrammarField::Name).get())?;
+        let name = syntax_element
+            .child_by_field_id(self.kinds.field(EcmaScriptGrammarField::Name).get())?;
         text.get(name.byte_range()).map(Into::into)
     }
 
@@ -1216,7 +1238,7 @@ impl GrammarRules for EcmaScriptRules<'_> {
         let statement = self.statement(visited);
         self.jsdoc_run(statement, text)
             .last()
-            .map_or(statement.node().start_byte(), Node::start_byte)
+            .map_or(statement.syntax_element().start_byte(), Node::start_byte)
     }
 
     fn qualification_separator(&self) -> &'static str {
@@ -1249,7 +1271,7 @@ fn jsdoc_text(comment: &str) -> String {
 }
 
 /// Parses one source through a pinned ECMAScript grammar and extracts its
-/// named nodes and declarations, the shared `analyze` behind all three
+/// named syntax elements and declarations, the shared `analyze` behind all three
 /// providers.
 ///
 /// # Errors
@@ -1311,7 +1333,7 @@ pub(crate) fn analyze_included(
     let mut capture = (language == &crate::ShippedLanguage::JavaScript.language()
         && ranges.is_empty())
     .then(|| crate::static_analysis::Capture::for_javascript(source.text));
-    let (nodes, symbols, export_bindings) = extract::extract_with_capture(
+    let (syntax_elements, symbols, export_bindings) = extract::extract_with_capture(
         tree.root_node(),
         source,
         limits,
@@ -1322,7 +1344,7 @@ pub(crate) fn analyze_included(
     Ok(SyntaxDocument::new(
         language.clone(),
         source.path.clone(),
-        nodes,
+        syntax_elements,
         symbols,
         tree.root_node().has_error(),
     )
@@ -1332,10 +1354,10 @@ pub(crate) fn analyze_included(
     .with_syntax_limits(limits))
 }
 
-/// Portable structural facets for one ECMAScript grammar node kind, shared
+/// Portable structural kinds for one ECMAScript grammar syntax element kind, shared
 /// by all three providers: every declaration kind the rules interpret maps
 /// to `Declaration`, and the grammar's suffix conventions classify the rest.
-pub(crate) fn node_facets(kind: &str) -> Vec<NodeFacet> {
+pub(crate) fn syntax_element_kinds(kind: &str) -> Vec<SyntaxKind> {
     match kind {
         FUNCTION_DECLARATION_KIND
         | GENERATOR_FUNCTION_DECLARATION_KIND
@@ -1346,41 +1368,41 @@ pub(crate) fn node_facets(kind: &str) -> Vec<NodeFacet> {
         | ENUM_DECLARATION_KIND
         | TYPE_ALIAS_DECLARATION_KIND
         | INTERNAL_MODULE_KIND
-        | MODULE_KIND => vec![NodeFacet::Declaration, NodeFacet::Definition],
+        | MODULE_KIND => vec![SyntaxKind::Declaration, SyntaxKind::Definition],
         FUNCTION_SIGNATURE_KIND | METHOD_SIGNATURE_KIND | PROPERTY_SIGNATURE_KIND => {
-            vec![NodeFacet::Declaration]
+            vec![SyntaxKind::Declaration]
         }
         LEXICAL_DECLARATION_KIND | VARIABLE_DECLARATION_KIND => {
-            vec![NodeFacet::Declaration, NodeFacet::Statement]
+            vec![SyntaxKind::Declaration, SyntaxKind::Statement]
         }
-        EXPORT_STATEMENT_KIND => vec![NodeFacet::Export, NodeFacet::Statement],
-        "import_statement" => vec![NodeFacet::Import, NodeFacet::Statement],
-        "statement_block" => vec![NodeFacet::Block],
-        CLASS_BODY_KIND | INTERFACE_BODY_KIND | "enum_body" => vec![NodeFacet::Body],
-        "required_parameter" | "optional_parameter" => vec![NodeFacet::Parameter],
-        "decorator" => vec![NodeFacet::Annotation],
-        "comment" | "html_comment" => vec![NodeFacet::Comment],
-        "type_annotation" => vec![NodeFacet::TypeExpression],
+        EXPORT_STATEMENT_KIND => vec![SyntaxKind::Export, SyntaxKind::Statement],
+        "import_statement" => vec![SyntaxKind::Import, SyntaxKind::Statement],
+        "statement_block" => vec![SyntaxKind::Block],
+        CLASS_BODY_KIND | INTERFACE_BODY_KIND | "enum_body" => vec![SyntaxKind::Body],
+        "required_parameter" | "optional_parameter" => vec![SyntaxKind::Parameter],
+        "decorator" => vec![SyntaxKind::Annotation],
+        "comment" | "html_comment" => vec![SyntaxKind::Comment],
+        "type_annotation" => vec![SyntaxKind::TypeExpression],
         "arrow_function" | "jsx_element" | "jsx_self_closing_element" => {
-            vec![NodeFacet::Expression]
+            vec![SyntaxKind::Expression]
         }
-        suffixed => suffix_facets(suffixed),
+        suffixed => suffix_kinds(suffixed),
     }
 }
 
 /// The grammar's spelling conventions for kinds outside the named table.
-fn suffix_facets(kind: &str) -> Vec<NodeFacet> {
-    let mut facets = Vec::new();
+fn suffix_kinds(kind: &str) -> Vec<SyntaxKind> {
+    let mut kinds = Vec::new();
     if kind.ends_with("_statement") {
-        facets.push(NodeFacet::Statement);
+        kinds.push(SyntaxKind::Statement);
     }
     if kind.ends_with("_expression") {
-        facets.push(NodeFacet::Expression);
+        kinds.push(SyntaxKind::Expression);
     }
     if kind.ends_with("_type") {
-        facets.push(NodeFacet::TypeExpression);
+        kinds.push(SyntaxKind::TypeExpression);
     }
-    facets
+    kinds
 }
 
 pub(crate) fn restored_symbol_kind(kinds: &EcmaScriptKinds, name: &str) -> Option<&'static str> {
@@ -1419,8 +1441,10 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "must define node kind used by symbol extraction: \
-                               kind=interface_declaration")]
+    #[should_panic(
+        expected = "must define syntax_element kind used by symbol extraction: \
+                               kind=interface_declaration"
+    )]
     fn test_typescript_table_refuses_a_grammar_without_the_typescript_kinds() {
         let _ = EcmaScriptKinds::resolve_typescript(&tree_sitter_javascript::LANGUAGE.into());
     }
@@ -1445,10 +1469,10 @@ mod tests {
     }
 
     /// Every declaration kind the rules interpret carries the `Declaration`
-    /// facet, so the node table stays exhaustive over the interpreted
+    /// kind, so the syntax element table stays exhaustive over the interpreted
     /// vocabulary.
     #[test]
-    fn test_node_facets_classify_every_interpreted_declaration_kind() {
+    fn test_syntax_element_kinds_classify_every_interpreted_declaration_kind() {
         for kind in [
             FUNCTION_DECLARATION_KIND,
             GENERATOR_FUNCTION_DECLARATION_KIND,
@@ -1466,34 +1490,52 @@ mod tests {
             VARIABLE_DECLARATION_KIND,
         ] {
             assert!(
-                node_facets(kind).contains(&NodeFacet::Declaration),
+                syntax_element_kinds(kind).contains(&SyntaxKind::Declaration),
                 "kind {kind} must classify as a declaration"
             );
         }
     }
 
     #[test]
-    fn test_node_facets_classify_structure_boundaries_and_suffix_conventions() {
+    fn test_syntax_element_kinds_classify_structure_boundaries_and_suffix_conventions() {
         assert_eq!(
-            node_facets("export_statement"),
-            [NodeFacet::Export, NodeFacet::Statement]
+            syntax_element_kinds("export_statement"),
+            [SyntaxKind::Export, SyntaxKind::Statement]
         );
         assert_eq!(
-            node_facets("import_statement"),
-            [NodeFacet::Import, NodeFacet::Statement]
+            syntax_element_kinds("import_statement"),
+            [SyntaxKind::Import, SyntaxKind::Statement]
         );
-        assert_eq!(node_facets("statement_block"), [NodeFacet::Block]);
-        assert_eq!(node_facets("class_body"), [NodeFacet::Body]);
-        assert_eq!(node_facets("interface_body"), [NodeFacet::Body]);
-        assert_eq!(node_facets("enum_body"), [NodeFacet::Body]);
-        assert_eq!(node_facets("required_parameter"), [NodeFacet::Parameter]);
-        assert_eq!(node_facets("decorator"), [NodeFacet::Annotation]);
-        assert_eq!(node_facets("comment"), [NodeFacet::Comment]);
-        assert_eq!(node_facets("type_annotation"), [NodeFacet::TypeExpression]);
-        assert_eq!(node_facets("jsx_element"), [NodeFacet::Expression]);
-        assert_eq!(node_facets("return_statement"), [NodeFacet::Statement]);
-        assert_eq!(node_facets("binary_expression"), [NodeFacet::Expression]);
-        assert_eq!(node_facets("predefined_type"), [NodeFacet::TypeExpression]);
-        assert_eq!(node_facets("identifier"), []);
+        assert_eq!(syntax_element_kinds("statement_block"), [SyntaxKind::Block]);
+        assert_eq!(syntax_element_kinds("class_body"), [SyntaxKind::Body]);
+        assert_eq!(syntax_element_kinds("interface_body"), [SyntaxKind::Body]);
+        assert_eq!(syntax_element_kinds("enum_body"), [SyntaxKind::Body]);
+        assert_eq!(
+            syntax_element_kinds("required_parameter"),
+            [SyntaxKind::Parameter]
+        );
+        assert_eq!(syntax_element_kinds("decorator"), [SyntaxKind::Annotation]);
+        assert_eq!(syntax_element_kinds("comment"), [SyntaxKind::Comment]);
+        assert_eq!(
+            syntax_element_kinds("type_annotation"),
+            [SyntaxKind::TypeExpression]
+        );
+        assert_eq!(
+            syntax_element_kinds("jsx_element"),
+            [SyntaxKind::Expression]
+        );
+        assert_eq!(
+            syntax_element_kinds("return_statement"),
+            [SyntaxKind::Statement]
+        );
+        assert_eq!(
+            syntax_element_kinds("binary_expression"),
+            [SyntaxKind::Expression]
+        );
+        assert_eq!(
+            syntax_element_kinds("predefined_type"),
+            [SyntaxKind::TypeExpression]
+        );
+        assert_eq!(syntax_element_kinds("identifier"), []);
     }
 }

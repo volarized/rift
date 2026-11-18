@@ -18,10 +18,12 @@ impl GraphDatasetBuilder {
         selection: &RetrievalSelection,
         result: &SearchResult,
     ) -> Result<(), RiftError> {
+        // `page` is 1-based: the first hit of page `p` is hit `(p - 1) * max_results`.
         let offset = selection
             .request
-            .page_index
-            .checked_mul(selection.request.limit.unwrap_or(0))
+            .page
+            .saturating_sub(1)
+            .checked_mul(selection.request.max_results.unwrap_or(0))
             .ok_or_else(projection_failure)?;
         for (index, hit) in result.results.iter().enumerate() {
             let index = offset
@@ -40,19 +42,19 @@ impl GraphDatasetBuilder {
                 self.limits.triples_max(),
             )?;
             if let Some(view) = &result.view {
-                let view_node = child(&id.clone().into(), "view", 0);
+                let view_syntax_element = child(&id.clone().into(), "view", 0);
                 triples.push(Triple::new(
                     id.clone(),
                     vocabulary("view"),
-                    view_node.clone(),
+                    view_syntax_element.clone(),
                 ));
                 triples.push(Triple::new(
-                    view_node.clone(),
+                    view_syntax_element.clone(),
                     vocabulary("id"),
                     Literal::from(view.id.as_str().to_owned()),
                 ));
                 triples.push(Triple::new(
-                    view_node,
+                    view_syntax_element,
                     vocabulary("expires_at"),
                     Literal::from(view.expires_at.clone()),
                 ));
@@ -124,7 +126,7 @@ fn project_fields(
                 Value::Array(values) => {
                     for (index, value) in values.into_iter().enumerate() {
                         let child = child(&subject, &key, index);
-                        if matches!(key.as_str(), "facets" | "evidence" | "modifiers") {
+                        if matches!(key.as_str(), "kinds" | "evidence" | "modifiers") {
                             emit(&subject, &key, value, child, &mut pending, triples)?;
                         } else {
                             triples.push(Triple::new(
@@ -197,12 +199,12 @@ fn emit(
         Value::Object(_) | Value::Array(_) => {
             Literal::new_typed_literal(value.to_string(), named(RDF_JSON)?).into()
         }
-        Value::String(value) if matches!(key, "facets" | "derivation") => vocabulary(&value).into(),
+        Value::String(value) if matches!(key, "kinds" | "derivation") => vocabulary(&value).into(),
         Value::String(value)
             if value.starts_with("rift://")
                 && matches!(
                     key,
-                    "id" | "unit" | "container" | "symbol" | "node" | "evidence"
+                    "id" | "unit" | "container" | "symbol" | "syntax_element" | "evidence"
                 ) =>
         {
             named(&value)?.into()
@@ -239,4 +241,58 @@ fn projection_failure() -> RiftError {
     errors::search::query_evaluation_failed()
         .detail("could not project the retained retrieval result")
         .error()
+}
+
+#[cfg(test)]
+mod tests {
+    use rift_protocol::query::QueryAnswer;
+    use rift_protocol::read::SearchResult;
+    use serde_json::json;
+
+    use crate::sparql::{GraphDataset, GraphLimits, GraphQuery, QueryCancellation};
+
+    #[test]
+    fn retrieval_index_counts_hits_from_the_first_page() -> Result<(), Box<dyn std::error::Error>> {
+        for (page, expected) in [(1, ["0", "1"]), (3, ["4", "5"])] {
+            let limits = GraphLimits::default();
+            let query = GraphQuery::parse(
+                &format!(
+                    "SELECT ?index {{ SERVICE :search {{ ?hit :pattern 'beacon'; \
+                     :max_results 2; :page {page}; :index ?index }} }} ORDER BY ?index"
+                ),
+                &limits,
+            )?;
+            let [selection] = query.retrieval_requests() else {
+                return Err("one retrieval service".into());
+            };
+            let hit = |path: &str| json!({"hit": {"target": "file", "size": 1}, "path": path});
+            let result: SearchResult = serde_json::from_value(json!({
+                "results": [hit("a.rs"), hit("b.rs")],
+                "pagination": {"page": page, "pages": 3, "max_results": 2, "total": 6},
+            }))?;
+            let mut builder = GraphDataset::builder(limits);
+            builder.insert_retrieval(selection, &result)?;
+            let answer: QueryAnswer = builder
+                .build()
+                .evaluate(&query, &QueryCancellation::new())?
+                .into();
+            let QueryAnswer::Bindings { bindings, .. } = answer else {
+                return Err("SELECT answers bindings".into());
+            };
+            let rows = serde_json::to_value(&bindings)?;
+            let indexes = rows
+                .as_array()
+                .ok_or("bindings encode as an array")?
+                .iter()
+                .map(|row| {
+                    row["index"]["value"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(indexes, expected, "page {page}");
+        }
+        Ok(())
+    }
 }

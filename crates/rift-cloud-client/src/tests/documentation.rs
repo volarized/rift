@@ -83,8 +83,10 @@ fn mixed_symbol_request() -> GetSymbolParams {
 #[tokio::test]
 async fn native_http_reads_preserve_old_and_current_documentation() {
     let (search, symbols) = stored_pages();
-    let expected_search: PackageSearchPage =
+    let mut expected_search: PackageSearchPage =
         serde_json::from_value(search.clone()).expect("stored search");
+    expected_search.pagination =
+        rift_protocol::read::Pagination::new(1, 20, expected_search.items.len() as u64);
     let (_server, client) = operation_client(OperationFixture::Documentation {
         search,
         symbols: symbols.clone(),
@@ -92,7 +94,7 @@ async fn native_http_reads_preserve_old_and_current_documentation() {
     .await;
     assert_eq!(
         client
-            .search_packages(&mixed_search_request(), 20, None)
+            .search_packages(&mixed_search_request(), 20, 1)
             .await
             .expect("stored search"),
         expected_search
@@ -132,16 +134,17 @@ async fn native_http_all_search_keeps_lexical_source_beside_stored_documentation
         .as_array_mut()
         .expect("search items")
         .push(lexical);
-    let expected: PackageSearchPage =
+    let mut expected: PackageSearchPage =
         serde_json::from_value(search.clone()).expect("mixed target page");
     let (_server, client) =
         operation_client(OperationFixture::Documentation { search, symbols }).await;
     let mut request = mixed_search_request();
     request.target = Some(PackageSearchRequestTarget::All);
     let actual = client
-        .search_packages(&request, 20, None)
+        .search_packages(&request, 20, 1)
         .await
         .expect("lexical and documentation reads");
+    expected.pagination = rift_protocol::read::Pagination::new(1, 20, expected.items.len() as u64);
     assert_eq!(actual, expected);
     for item in actual.items {
         let candidate = PackageSearchCandidate::try_from(item).expect("candidate converts");
@@ -179,7 +182,7 @@ async fn native_http_stored_documentation_refuses_foreign_origins_and_invalid_re
             operation_client(OperationFixture::Documentation { search, symbols }).await;
         assert_registered_field(
             &client
-                .search_packages(&mixed_search_request(), 20, None)
+                .search_packages(&mixed_search_request(), 20, 1)
                 .await
                 .expect_err("stored documentation refusal"),
             "rift.client.response_invalid",
@@ -236,7 +239,7 @@ fn request() -> PackageSearchRequest {
 fn refuses_search(value: Value, field: &'static str) {
     let value = serde_json::from_value(value).expect("generated page");
     assert_registered_field(
-        &validate_search_page(&request(), &capabilities(), &value, None, SOURCE_BYTES_MAX)
+        &validate_search_page(&request(), &capabilities(), &value, SOURCE_BYTES_MAX)
             .expect_err("documentation refusal"),
         "rift.client.response_invalid",
         field,
@@ -246,7 +249,7 @@ fn refuses_search(value: Value, field: &'static str) {
 #[test]
 fn documentation_pages_validate_identity_fields_and_requested_source() {
     let value: PackageSearchPage = serde_json::from_value(page()).expect("generated page");
-    validate_search_page(&request(), &capabilities(), &value, None, SOURCE_BYTES_MAX)
+    validate_search_page(&request(), &capabilities(), &value, SOURCE_BYTES_MAX)
         .expect("valid documentation page");
     let candidate = PackageSearchCandidate::try_from(value.items[0].clone()).expect("candidate");
     assert_eq!(
@@ -260,32 +263,19 @@ fn documentation_pages_validate_identity_fields_and_requested_source() {
     let mut without_source = request();
     without_source.include = None;
     assert_registered_field(
-        &validate_search_page(
-            &without_source,
-            &capabilities(),
-            &value,
-            None,
-            SOURCE_BYTES_MAX,
-        )
-        .expect_err("unrequested documentation source refusal"),
+        &validate_search_page(&without_source, &capabilities(), &value, SOURCE_BYTES_MAX)
+            .expect_err("unrequested documentation source refusal"),
         "rift.client.response_invalid",
         "source",
     );
     assert!(
-        validate_search_page(
-            &search_request(),
-            &capabilities(),
-            &value,
-            None,
-            SOURCE_BYTES_MAX
-        )
-        .is_err()
+        validate_search_page(&search_request(), &capabilities(), &value, SOURCE_BYTES_MAX).is_err()
     );
     let mut no_feature = capabilities();
     no_feature
         .supported_features
         .retain(|feature| feature != "documentation_search");
-    assert!(validate_search_page(&request(), &no_feature, &value, None, SOURCE_BYTES_MAX).is_err());
+    assert!(validate_search_page(&request(), &no_feature, &value, SOURCE_BYTES_MAX).is_err());
 }
 
 #[test]
@@ -294,7 +284,7 @@ fn discovery_documentation_accepts_omitted_or_empty_package_selection() {
     for packages in [None, Some(Vec::new())] {
         let mut request = request();
         request.packages = packages;
-        validate_search_page(&request, &capabilities(), &value, None, SOURCE_BYTES_MAX)
+        validate_search_page(&request, &capabilities(), &value, SOURCE_BYTES_MAX)
             .expect("discovery documentation");
     }
     let mut request = request();
@@ -302,7 +292,7 @@ fn discovery_documentation_accepts_omitted_or_empty_package_selection() {
     other.name = "other".to_owned();
     request.packages = Some(vec![other]);
     assert_registered_field(
-        &validate_search_page(&request, &capabilities(), &value, None, SOURCE_BYTES_MAX)
+        &validate_search_page(&request, &capabilities(), &value, SOURCE_BYTES_MAX)
             .expect_err("registered refusal"),
         "rift.client.response_invalid",
         "documentation",
@@ -334,7 +324,6 @@ fn documentation_pages_refuse_foreign_packages_and_invalid_metadata() {
             json!("rift-package-index-v1"),
             "publication_format",
         ),
-        ("/next_cursor", json!(""), "cursor"),
         (
             "/warnings",
             json!([{"code":"source_unavailable","detail":""}]),
@@ -420,7 +409,7 @@ async fn symbol_answer_carrying_declaration_source_is_refused() {
     )
     .await
     .expect("declaration without source");
-    for field in ["source", "source_complete", "node"] {
+    for field in ["source", "source_complete", "syntax_element"] {
         let mut value = symbol_result_json("demo", "first");
         value["declarations"][0][field] = json!("demo");
         assert!(

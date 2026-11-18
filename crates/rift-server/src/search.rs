@@ -1,6 +1,6 @@
 //! `search` tool execution: lexical symbol and content-line search over syntax-indexed and
 //! `[search.text]` files alike, narrowed or extended by a request's `paths` selector. Extracted
-//! from `read` so that module stays below its size bound. The bounded relationship `traversal`
+//! from `read` so that module stays below its size bound. The bounded edge `traversal`
 //! lane lives in the sibling `traversal` module.
 
 mod body;
@@ -274,7 +274,7 @@ impl ReadService {
             store,
             references,
             |results, selected, payloads, limit| {
-                let (mut results, pagination) = page(results, params.page_index, limit);
+                let (mut results, pagination) = page(results, params.page, limit);
                 let warnings = self.populate_search_payloads(&mut results, selected, payloads)?;
                 Ok(((results, pagination), warnings))
             },
@@ -313,7 +313,7 @@ impl ReadService {
         let payloads = HitPayloads::requested(params);
         // The whole candidate pool is collected up to the index's own `results_max` bound -
         // bounded work whatever the page size - then ordered and truncated to that same
-        // bound, so `pagination.total_pages` counts the full result set and every page is
+        // bound, so `pagination.pages` counts the full result set and every page is
         // one window of the same ordering.
         let fetch_limit = self.index().results_max();
 
@@ -875,7 +875,8 @@ fn lockfile_warning(lockfiles: &[ProjectPath]) -> Option<ReadWarning> {
 /// Returns `invalid_request` naming `limit` for zero, or for a limit past
 /// `PAGE_LIMIT_MAX`.
 pub fn search_page_limit(params: &SearchParams) -> Result<usize, RiftError> {
-    accepted_limit(params.limit.unwrap_or(SEARCH_RESULTS_DEFAULT as u64))
+    crate::read::accept_page(params.page)?;
+    accepted_limit(params.max_results.unwrap_or(SEARCH_RESULTS_DEFAULT as u64))
 }
 
 pub(crate) fn validate_search(params: &SearchParams) -> Result<(), RiftError> {
@@ -906,7 +907,7 @@ pub(crate) fn validate_search(params: &SearchParams) -> Result<(), RiftError> {
         if params.scope == SearchScope::Global {
             return errors::server::read_invalid()
                 .field("traversal")
-                .violation("the relationship graph serves the project alone")
+                .violation("the edge graph serves the project alone")
                 .fail();
         }
     }
@@ -919,7 +920,7 @@ pub(crate) fn validate_search(params: &SearchParams) -> Result<(), RiftError> {
 /// serves the current tree alone, so a committed revision has none. A comparison against
 /// the working tree is refused the same way: the walk from its changed declarations is not
 /// served. No resend of the same request clears that.
-pub(crate) const CHANGE_TRAVERSAL_CAPABILITY: &str = "relationship traversal beside a comparison";
+pub(crate) const CHANGE_TRAVERSAL_CAPABILITY: &str = "edge traversal beside a comparison";
 
 /// Refuses a `traversal` that names no `seed`, and one riding beside `change`.
 ///
@@ -2268,7 +2269,7 @@ impl Tower {
             "unpaged hits must not scan source for lines"
         );
         super::order_hits(&mut hits, ResultOrder::Identity);
-        let (mut selected, _) = crate::read::page(hits, 1, 1);
+        let (mut selected, _) = crate::read::page(hits, 2, 1);
         fs::write(directory.path().join("lib.rs"), "pub fn moved() {}\n")?;
         super::populate_symbol_lines(&mut selected, service.index(), None)?;
         assert_eq!(selected.len(), 1);
@@ -2303,7 +2304,7 @@ impl Tower {
         let store = answered(&database, &service, "page").await?;
         for order in ["relevance", "identity", "path"] {
             let mut request = json!({
-                "query": "page", "target": "symbol", "limit": 10,
+                "query": "page", "target": "symbol", "max_results": 10,
                 "order": order, "include": {"source": true, "score": true},
                 "paths": {"force_include": ["forced.rs"]}
             });
@@ -2322,10 +2323,10 @@ impl Tower {
                 };
                 assert_eq!(hit.line, Some(line));
             }
-            request["limit"] = json!(1);
+            request["max_results"] = json!(1);
             let mut pages = Vec::new();
-            for page_index in 0..4 {
-                request["page_index"] = json!(page_index);
+            for page in 1..=4 {
+                request["page"] = json!(page);
                 let page = service.search(&serde_json::from_value(request.clone())?, &store)?;
                 assert_eq!(page.warnings, full.warnings);
                 pages.extend(page.results);
@@ -2361,7 +2362,7 @@ impl Tower {
         let params: SearchParams = serde_json::from_value(json!({
             "query": "Route",
             "target": "symbol",
-            "limit": 5
+            "max_results": 5
         }))?;
         let answer = service.search(&params, &StoreAnswer::identifier_only())?;
         let value = serde_json::to_value(answer)?;
@@ -2397,7 +2398,7 @@ impl Tower {
         let params: SearchParams = serde_json::from_value(json!({
             "query": "Beacon Notes",
             "target": "symbol",
-            "limit": 5
+            "max_results": 5
         }))?;
         let value = serde_json::to_value(service.search(&params, &store)?)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
@@ -2438,7 +2439,7 @@ impl Tower {
             let request = json!({
                 "query": query,
                 "target": "symbol",
-                "limit": 5
+                "max_results": 5
             });
             let params: SearchParams = serde_json::from_value(request)?;
             let value = serde_json::to_value(service.search(&params, &answer)?)?;
@@ -2462,7 +2463,7 @@ impl Tower {
         let store = answered(&directory.path().join("search.db"), &service, "Beacon").await?;
         let params: SearchParams = serde_json::from_value(json!({
             "query": "Beacon",
-            "limit": 4,
+            "max_results": 4,
             "include": {"score": true}
         }))?;
         let result = service.search(&params, &store)?;
@@ -2512,7 +2513,7 @@ impl Tower {
         );
         assert_eq!(
             serde_json::to_value(&result.pagination)?,
-            json!({ "page_index": 0, "total_pages": 1 })
+            json!({"page": 1, "pages": 1, "max_results": 4, "total": 4})
         );
         let scores: Vec<f64> = result.results.iter().filter_map(|hit| hit.score).collect();
         assert_eq!(scores.len(), 4, "{result:#?}");
@@ -2550,7 +2551,7 @@ impl Tower {
         let params: SearchParams = serde_json::from_value(json!({
             "query": "beacon",
             "target": "symbol",
-            "limit": 10
+            "max_results": 10
         }))?;
         let result = service.search(&params, &StoreAnswer::identifier_only())?;
         assert_eq!(
@@ -2583,7 +2584,7 @@ impl Tower {
             "query": "lookout",
             "target": "file",
             "paths": {"include": ["src/**"]},
-            "limit": 10
+            "max_results": 10
         }))?;
         let result = service.search(&params, &store)?;
         assert_eq!(hit_identities(&result), ["src/keep.txt"], "{result:#?}");
@@ -2622,7 +2623,7 @@ impl Tower {
         let params: SearchParams = serde_json::from_value(json!({
             "query": "lookout",
             "target": "file",
-            "limit": 10
+            "max_results": 10
         }))?;
         let result = service.search(&params, &store)?;
         assert_eq!(hit_identities(&result), ["notes.txt"], "{result:#?}");
@@ -2700,7 +2701,7 @@ impl Tower {
         let params: SearchParams = serde_json::from_value(json!({
             "query": "word",
             "target": "file",
-            "limit": 10
+            "max_results": 10
         }))?;
         let result = service.search(&params, &store)?;
         assert_eq!(hit_identities(&result), ["guide.txt"], "{result:#?}");
@@ -2726,7 +2727,7 @@ impl Tower {
             .join(" ");
         let params: SearchParams = serde_json::from_value(json!({
             "query": query,
-            "limit": 10
+            "max_results": 10
         }))?;
         let result = service.search(&params, &StoreAnswer::identifier_only())?;
         assert!(
@@ -2767,7 +2768,7 @@ impl Tower {
         let params: SearchParams = serde_json::from_value(json!({
             "query": "lookout",
             "target": "file",
-            "limit": 10
+            "max_results": 10
         }))?;
         let result = service.search(&params, &store)?;
         assert_eq!(hit_identities(&result), ["docs/note#1"], "{result:#?}");
@@ -2782,7 +2783,7 @@ impl Tower {
         let params: SearchParams = serde_json::from_value(json!({
             "query": "beacon",
             "target": "symbol",
-            "limit": 10
+            "max_results": 10
         }))?;
         let answer = service.search(&params, &StoreAnswer::identifier_only())?;
         let value = serde_json::to_value(answer)?;
@@ -2812,7 +2813,7 @@ impl Tower {
             "query": "Beacon",
             "target": "symbol",
             "include": {"source": true},
-            "limit": 1
+            "max_results": 1
         }))?;
         let answer = service.search(&params, &StoreAnswer::identifier_only())?;
         let value = serde_json::to_value(answer)?;
@@ -2833,7 +2834,7 @@ impl Tower {
     {
         let (directory, service) = fixture()?;
         let store = answered(&directory.path().join("search.db"), &service, "Beacon").await?;
-        let request = json!({ "query": "Beacon", "limit": 10 });
+        let request = json!({ "query": "Beacon", "max_results": 10 });
         let params: SearchParams = serde_json::from_value(request)?;
         let value = serde_json::to_value(service.search(&params, &store)?)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
@@ -2862,7 +2863,7 @@ impl Tower {
         let params: SearchParams = serde_json::from_value(json!({
             "query": "beacon",
             "target": "symbol",
-            "limit": 10
+            "max_results": 10
         }))?;
         let result = service.search(&params, &StoreAnswer::identifier_only())?;
         assert_eq!(
@@ -2887,7 +2888,7 @@ impl Tower {
         let params: SearchParams = serde_json::from_value(json!({
             "query": "beacon",
             "target": "symbol",
-            "limit": 10,
+            "max_results": 10,
             "include": {"score": true}
         }))?;
         let result = service.search(&params, &StoreAnswer::identifier_only())?;
@@ -2920,7 +2921,7 @@ impl Tower {
         let params: SearchParams = serde_json::from_value(json!({
             "query": "beacon",
             "target": "symbol",
-            "limit": 10
+            "max_results": 10
         }))?;
         let result = service.search(&params, &StoreAnswer::identifier_only())?;
         assert_eq!(
@@ -2969,12 +2970,12 @@ impl Tower {
         Ok(())
     }
 
-    /// `target: "node"` left `SearchParamsTarget`'s served variants; a request naming it is
+    /// `target: "syntax element"` left `SearchParamsTarget`'s served variants; a request naming it is
     /// refused at deserialization, not accepted and silently ignored.
     #[test]
-    fn search_target_node_is_refused_as_an_unknown_enum_value() {
+    fn search_target_syntax_element_is_refused_as_an_unknown_enum_value() {
         let result: Result<SearchParams, _> =
-            serde_json::from_value(json!({"query": "Beacon", "target": "node"}));
+            serde_json::from_value(json!({"query": "Beacon", "target": "syntax_element"}));
         assert!(
             result.is_err(),
             "a withdrawn target value must fail deserialization"
@@ -3003,15 +3004,15 @@ impl Tower {
         );
 
         let zero_limit: SearchParams =
-            serde_json::from_value(json!({"query": "Beacon", "limit": 0}))?;
+            serde_json::from_value(json!({"query": "Beacon", "max_results": 0}))?;
         let error = service
             .search(&zero_limit, &StoreAnswer::identifier_only())
             .expect_err("zero limit must fail");
         assert_eq!(error.slug(), rift_error::errors::server::read_invalid::SLUG);
         assert_eq!(
             error.to_string(),
-            "the request does not match the documented form: field limit, \
-             violation zero; correct the reported field and resend the request"
+            "the request does not match the documented form: field max_results, \
+             violation expected 1..=10000, received 0; correct the reported field and resend the request"
         );
         Ok(())
     }
@@ -3061,7 +3062,7 @@ impl Tower {
         let params: SearchParams = serde_json::from_value(json!({
             "query": "beacon",
             "target": "symbol",
-            "limit": 2
+            "max_results": 2
         }))?;
         let value =
             serde_json::to_value(service.search(&params, &StoreAnswer::identifier_only())?)?;
@@ -3069,7 +3070,7 @@ impl Tower {
         assert_eq!(results.len(), 1, "{results:#?}");
         assert_eq!(
             value["pagination"],
-            json!({ "page_index": 0, "total_pages": 1 })
+            json!({"page": 1, "pages": 1, "max_results": 2, "total": 1})
         );
         assert!(
             value["warnings"].as_array().is_some_and(|warnings| {
@@ -3107,7 +3108,7 @@ impl Tower {
         let declarations: SearchParams = serde_json::from_value(json!({
             "query": "Beacon",
             "target": "symbol",
-            "limit": 5
+            "max_results": 5
         }))?;
         let result = service.search(&declarations, &store)?;
         assert!(!result.results.is_empty());
@@ -3121,7 +3122,7 @@ impl Tower {
         let files: SearchParams = serde_json::from_value(json!({
             "query": "Beacon",
             "target": "file",
-            "limit": 5
+            "max_results": 5
         }))?;
         let files = service.search(&files, &store)?;
         assert!(
@@ -3181,7 +3182,7 @@ impl Tower {
         let params: SearchParams = serde_json::from_value(json!({
             "query": sentence,
             "target": "file",
-            "limit": 10
+            "max_results": 10
         }))?;
         let value = serde_json::to_value(service.search(&params, &store)?)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
@@ -3231,7 +3232,7 @@ impl Tower {
         let params: SearchParams = serde_json::from_value(json!({
             "query": "cargo test --workspace",
             "target": "file",
-            "limit": 5
+            "max_results": 5
         }))?;
         let value = serde_json::to_value(service.search(&params, &store)?)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
@@ -3267,7 +3268,7 @@ impl Tower {
             let params: SearchParams = serde_json::from_value(json!({
                 "query": name,
                 "target": "symbol",
-                "limit": 1
+                "max_results": 1
             }))?;
             let answer = service.search(&params, &StoreAnswer::identifier_only())?;
             let value = serde_json::to_value(answer)?;
@@ -3279,7 +3280,7 @@ impl Tower {
                     "unexpected visibility for {name}"
                 );
                 assert!(
-                    !hit["facets"]
+                    !hit["kinds"]
                         .as_array()
                         .is_some_and(|facets| facets.contains(&json!("public"))),
                     "{name} must not carry public facet"
@@ -3361,7 +3362,7 @@ impl Tower {
         let params: SearchParams = serde_json::from_value(json!({
             "query": "beacon",
             "target": "symbol",
-            "limit": 10,
+            "max_results": 10,
             "paths": {"exclude": ["other.rs"]}
         }))?;
         let result = service.search(&params, &StoreAnswer::identifier_only())?;
@@ -3381,7 +3382,7 @@ impl Tower {
         let params: SearchParams = serde_json::from_value(json!({
             "query": "beacon",
             "target": "symbol",
-            "limit": 10,
+            "max_results": 10,
             "paths": {"include": ["src/**"], "exclude": ["src/nested/**"]}
         }))?;
         let result = service.search(&params, &StoreAnswer::identifier_only())?;
@@ -3399,7 +3400,7 @@ impl Tower {
         let params: SearchParams = serde_json::from_value(json!({
             "query": "beacon",
             "target": "symbol",
-            "limit": 10,
+            "max_results": 10,
             "paths": {"include": ["src/*.rs"]}
         }))?;
         let result = service.search(&params, &StoreAnswer::identifier_only())?;
@@ -3417,7 +3418,7 @@ impl Tower {
         let params: SearchParams = serde_json::from_value(json!({
             "query": "beacon",
             "target": "symbol",
-            "limit": 10,
+            "max_results": 10,
             "paths": {"include": ["src/**"]}
         }))?;
         let result = service.search(&params, &StoreAnswer::identifier_only())?;
@@ -3490,12 +3491,12 @@ impl Tower {
         let narrow: SearchParams = serde_json::from_value(json!({
             "query": "beacon",
             "paths": {"include": ["**/*.rs"]},
-            "limit": 1
+            "max_results": 1
         }))?;
         let wide: SearchParams = serde_json::from_value(json!({
             "query": "beacon",
             "paths": {"include": ["**/*.rs"]},
-            "limit": 3
+            "max_results": 3
         }))?;
         let narrow_result = service.search(&narrow, &StoreAnswer::identifier_only())?;
         let wide_result = service.search(&wide, &StoreAnswer::identifier_only())?;
@@ -3507,19 +3508,19 @@ impl Tower {
     fn search_pages_partition_the_ordered_pool_without_overlap() -> TestResult {
         let (_directory, service) = multi_file_fixture()?;
         let mut seen = Vec::new();
-        for page_index in 0..3_u64 {
+        for page in 1..=3_u64 {
             let request = json!({
                 "query": "beacon",
                 "target": "symbol",
-                "limit": 1,
-                "page_index": page_index
+                "max_results": 1,
+                "page": page
             });
             let params: SearchParams = serde_json::from_value(request)?;
             let answer = service.search(&params, &StoreAnswer::identifier_only())?;
             let value = serde_json::to_value(answer)?;
             assert_eq!(
                 value["pagination"],
-                json!({ "page_index": page_index, "total_pages": 3 })
+                json!({"page": page, "pages": 3, "max_results": 1, "total": 3})
             );
             assert!(
                 value["results"][0]["hit"]["symbol"]["name"]
@@ -3553,8 +3554,8 @@ impl Tower {
         let request = json!({
             "query": "beacon",
             "target": "symbol",
-            "limit": 1,
-            "page_index": 30
+            "max_results": 1,
+            "page": 30
         });
         let params: SearchParams = serde_json::from_value(request)?;
         let answer = service.search(&params, &StoreAnswer::identifier_only())?;
@@ -3562,7 +3563,7 @@ impl Tower {
         assert_eq!(value["results"], json!([]));
         assert_eq!(
             value["pagination"],
-            json!({ "page_index": 30, "total_pages": 3 })
+            json!({"page": 30, "pages": 3, "max_results": 1, "total": 3})
         );
         Ok(())
     }
@@ -3574,7 +3575,7 @@ impl Tower {
             "query": "beacon",
             "target": "symbol",
             "order": "path",
-            "limit": 10
+            "max_results": 10
         }))?;
         let result = service.search(&params, &StoreAnswer::identifier_only())?;
         let paths: Vec<String> = result
@@ -3598,7 +3599,7 @@ impl Tower {
             "query": "beacon",
             "target": "symbol",
             "order": "identity",
-            "limit": 10
+            "max_results": 10
         }))?;
         let result = service.search(&params, &StoreAnswer::identifier_only())?;
         let ids = hit_identities(&result);
@@ -3631,13 +3632,13 @@ impl Tower {
             HistoryConfiguration::default(),
         )?;
         let mut narrow_ids = Vec::new();
-        for page_index in 0..2_u64 {
+        for page in 1..=2_u64 {
             let request = json!({
                 "query": "beacon",
                 "target": "symbol",
                 "order": "path",
-                "limit": 1,
-                "page_index": page_index
+                "max_results": 1,
+                "page": page
             });
             let params: SearchParams = serde_json::from_value(request)?;
             let result = service.search(&params, &StoreAnswer::identifier_only())?;
@@ -3647,7 +3648,7 @@ impl Tower {
             "query": "beacon",
             "target": "symbol",
             "order": "path",
-            "limit": 2
+            "max_results": 2
         }))?;
         let wide_ids = hit_identities(&service.search(&wide, &StoreAnswer::identifier_only())?);
         assert_eq!(
@@ -4041,7 +4042,7 @@ impl Tower {
                 "query": marker,
                 "target": "file",
                 "paths": { "include": [path] },
-                "limit": 10
+                "max_results": 10
             }))?;
             let value = serde_json::to_value(service.search(&params, &answer)?)?;
             assert_eq!(
@@ -4075,7 +4076,7 @@ impl Tower {
         let params: SearchParams = serde_json::from_value(json!({
             "query": "wire symbol beta",
             "target": "file",
-            "limit": 10
+            "max_results": 10
         }))?;
         let value = serde_json::to_value(service.search(&params, &store)?)?;
         let results = value["results"].as_array().ok_or("results array")?;
@@ -4458,7 +4459,8 @@ impl Tower {
     async fn search_matched_by_carries_the_identifier_and_the_full_text_columns() -> TestResult {
         let (directory, service) = fixture()?;
         let store = answered(&directory.path().join("search.db"), &service, "Beacon").await?;
-        let params: SearchParams = serde_json::from_value(json!({"query": "Beacon", "limit": 50}))?;
+        let params: SearchParams =
+            serde_json::from_value(json!({"query": "Beacon", "max_results": 50}))?;
         let answer = service.search(&params, &store)?;
 
         let declarations: Vec<&SearchHit> = answer
@@ -4522,7 +4524,7 @@ impl Tower {
         let params: SearchParams = serde_json::from_value(json!({
             "query": "alpha beta",
             "target": "file",
-            "limit": 10
+            "max_results": 10
         }))?;
         let result = service.search(&params, &store)?;
         let mut identities = hit_identities(&result);
@@ -4570,7 +4572,7 @@ impl Tower {
         let params: SearchParams = serde_json::from_value(json!({
             "query": "word",
             "target": "file",
-            "limit": 50
+            "max_results": 50
         }))?;
         let result = service.search(&params, &store)?;
         assert_eq!(
@@ -4588,7 +4590,7 @@ impl Tower {
         let (directory, service) = fixture()?;
         let store = answered(&directory.path().join("search.db"), &service, "Beacon").await?;
         let params: SearchParams = serde_json::from_value(
-            json!({"query": "Beacon", "include": {"score": true}, "limit": 50}),
+            json!({"query": "Beacon", "include": {"score": true}, "max_results": 50}),
         )?;
         let answer = service.search(&params, &store)?;
         let identities = hit_identities(&answer);
@@ -4927,7 +4929,7 @@ impl Tower {
         let all = service.search(&request("all")?, &StoreAnswer::identifier_only())?;
 
         assert!(global.results.is_empty(), "{:?}", global.results);
-        assert_eq!(global.pagination.total_pages, 0);
+        assert_eq!(global.pagination.pages, 0);
         assert!(global.warnings.is_empty(), "{:?}", global.warnings);
         assert_eq!(located_names(&all), [("beacon".to_owned(), false)]);
         assert!(all.warnings.is_empty(), "{:?}", all.warnings);
@@ -4945,7 +4947,7 @@ impl Tower {
 
         let error = service
             .search(&params, &StoreAnswer::identifier_only())
-            .expect_err("the relationship graph serves the project alone");
+            .expect_err("the edge graph serves the project alone");
 
         assert!(
             (error.slug() == rift_error::errors::server::read_invalid::SLUG),
@@ -4957,7 +4959,7 @@ impl Tower {
                 .any(|(key, value)| { key == "field" && value == "traversal" })
         );
         assert!(error.context().any(|(key, value)| {
-            key == "violation" && value == "the relationship graph serves the project alone"
+            key == "violation" && value == "the edge graph serves the project alone"
         }));
         Ok(())
     }

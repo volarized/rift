@@ -148,7 +148,7 @@ pub(crate) fn merge_candidate_pools(
         });
     }
     super::order_search_hits(&mut hits, params.order);
-    let (results, pagination) = super::page_window(hits, params.page_index, limit);
+    let (results, pagination) = super::page_window(hits, params.page, limit);
     Ok(SearchResult {
         view: None,
         revision: None,

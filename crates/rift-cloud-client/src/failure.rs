@@ -15,7 +15,7 @@ pub(crate) fn remote(
     }
     if unsupported_operation(operation, meta, problem) {
         return rift_error::errors::server::read_unsupported()
-            .capability("global relationship operation")
+            .capability("global edge operation")
             .error();
     }
     let metadata = serde_json::json!({

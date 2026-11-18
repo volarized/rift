@@ -1,4 +1,4 @@
-//! Nested Angular template nodes use declared included grammar names.
+//! Nested Angular template syntax elements use declared included grammar names.
 
 use std::sync::Arc;
 
@@ -9,7 +9,7 @@ use rift_syntax::{
 };
 
 #[test]
-fn typescript_inline_angular_styles_restore_nested_css_node_names() {
+fn typescript_inline_angular_styles_restore_nested_css_syntax_element_names() {
     for shipped in [ShippedLanguage::TypeScript, ShippedLanguage::TypeScriptTsx] {
         assert_nested_template(shipped);
     }
@@ -40,12 +40,21 @@ fn assert_nested_template(shipped: ShippedLanguage) {
         document.source_digest(),
         Some(&FileDigest::of(text.as_bytes()))
     );
-    assert!(document.nodes().iter().any(|node| node.kind == "rule_set"));
+    assert!(
+        document
+            .syntax_elements()
+            .iter()
+            .any(|syntax_element| syntax_element.kind == "rule_set")
+    );
     let names = SyntaxNames::new(document.language()).expect("TypeScript names");
-    for node in document.nodes() {
-        assert!(names.node_kind(node.kind).is_some(), "{}", node.kind);
+    for syntax_element in document.syntax_elements() {
+        assert!(
+            names.syntax_element_kind(syntax_element.kind).is_some(),
+            "{}",
+            syntax_element.kind
+        );
     }
-    assert!(names.node_kind("function_item").is_none());
+    assert!(names.syntax_element_kind("function_item").is_none());
     assert!(
         document
             .symbols()
@@ -58,25 +67,8 @@ fn assert_nested_template(shipped: ShippedLanguage) {
             .iter()
             .any(|symbol| symbol.name == "lamp")
     );
-    let restored = SyntaxFacts::from_parts(
-        text,
-        limits,
-        SyntaxFactsParts {
-            origin: document.facts().origin(),
-            language: document.language().clone(),
-            symbols: document.symbols().to_vec(),
-            left_out_symbols: document.facts().left_out_symbols().to_vec(),
-            has_errors: document.has_errors(),
-            left_out_declarations: document.left_out_declaration_count(),
-            markdown_facts: document.facts().markdown_facts().cloned(),
-            export_bindings: document.facts().export_bindings().map(<[_]>::to_vec),
-            macro_invocations: document.facts().macro_invocations().map(<[_]>::to_vec),
-            scope: document.facts().scope().map(<[_]>::to_vec),
-            static_facts: document.facts().static_facts().cloned(),
-            source_digest: FileDigest::of(text.as_bytes()),
-        },
-    )
-    .expect("checked nested template facts");
+    let restored = SyntaxFacts::from_parts(text, limits, captured_parts(text, &document))
+        .expect("checked nested template facts");
     assert_eq!(&restored, document.facts());
     assert_aggregate_bounds(source, &document, &ranges, shipped);
     let mut symbols = document.symbols().to_vec();
@@ -89,18 +81,8 @@ fn assert_nested_template(shipped: ShippedLanguage) {
         text,
         limits,
         SyntaxFactsParts {
-            origin: document.facts().origin(),
-            language: document.language().clone(),
             symbols,
-            left_out_symbols: document.facts().left_out_symbols().to_vec(),
-            has_errors: document.has_errors(),
-            left_out_declarations: document.left_out_declaration_count(),
-            markdown_facts: document.facts().markdown_facts().cloned(),
-            export_bindings: document.facts().export_bindings().map(<[_]>::to_vec),
-            macro_invocations: document.facts().macro_invocations().map(<[_]>::to_vec),
-            scope: document.facts().scope().map(<[_]>::to_vec),
-            static_facts: document.facts().static_facts().cloned(),
-            source_digest: FileDigest::of(text.as_bytes()),
+            ..captured_parts(text, &document)
         },
     );
     assert_eq!(
@@ -112,6 +94,24 @@ fn assert_nested_template(shipped: ShippedLanguage) {
     );
 }
 
+/// Captured fields reused by valid and invalid restoration checks.
+fn captured_parts(text: &str, document: &SyntaxDocument) -> SyntaxFactsParts {
+    SyntaxFactsParts {
+        origin: document.facts().origin(),
+        language: document.language().clone(),
+        symbols: document.symbols().to_vec(),
+        left_out_symbols: document.facts().left_out_symbols().to_vec(),
+        has_errors: document.has_errors(),
+        left_out_declarations: document.left_out_declaration_count(),
+        markdown_facts: document.facts().markdown_facts().cloned(),
+        export_bindings: document.facts().export_bindings().map(<[_]>::to_vec),
+        macro_invocations: document.facts().macro_invocations().map(<[_]>::to_vec),
+        scope: document.facts().scope().map(<[_]>::to_vec),
+        static_facts: document.facts().static_facts().cloned(),
+        source_digest: FileDigest::of(text.as_bytes()),
+    }
+}
+
 fn assert_aggregate_bounds(
     source: SyntaxSource<'_>,
     document: &SyntaxDocument,
@@ -121,7 +121,7 @@ fn assert_aggregate_bounds(
     let limits = SyntaxLimits::default();
     let exact = SyntaxLimits::new(
         source.text.len(),
-        document.nodes().len(),
+        document.syntax_elements().len(),
         limits.syntax_depth_max(),
     )
     .expect("exact aggregate bounds");
@@ -132,10 +132,13 @@ fn assert_aggregate_bounds(
         .expect("host fits exact aggregate bound");
     let exact_document = append_angular_templates(source, exact, &exact_raw, ranges)
         .expect("nested template fits exact aggregate bound");
-    assert_eq!(exact_document.nodes().len(), document.nodes().len());
+    assert_eq!(
+        exact_document.syntax_elements().len(),
+        document.syntax_elements().len()
+    );
     let below = SyntaxLimits::new(
         source.text.len(),
-        document.nodes().len() - 1,
+        document.syntax_elements().len() - 1,
         limits.syntax_depth_max(),
     )
     .expect("lower aggregate bound");
@@ -149,7 +152,7 @@ fn assert_aggregate_bounds(
             .expect_err("nested template exceeds aggregate bound")
             .slug()
             .as_str(),
-        "rift.syntax.too_many_nodes"
+        "rift.syntax.too_many_syntax_elements"
     );
 }
 #[test]
@@ -184,7 +187,12 @@ fn assert_component_count(text: &str, count: usize) {
         .syntax_provider()
         .analyze(source, SyntaxLimits::default())
         .expect("TypeScript source");
-    assert!(document.nodes().iter().any(|node| node.kind == "decorator"));
+    assert!(
+        document
+            .syntax_elements()
+            .iter()
+            .any(|syntax_element| syntax_element.kind == "decorator")
+    );
     let components = rift_syntax::angular_components(source, &document);
     assert_eq!(components.len(), count, "parameter binding: {text}");
 }

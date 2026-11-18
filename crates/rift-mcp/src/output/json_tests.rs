@@ -16,10 +16,7 @@ fn search_answer() -> SearchResult {
         view: None,
         revision: None,
         results: Vec::new(),
-        pagination: Pagination {
-            page_index: 0,
-            total_pages: 0,
-        },
+        pagination: Pagination::new(1, 10, 0),
         warnings: vec![ReadWarning::GlobalAccessDisabled],
     }
 }

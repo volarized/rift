@@ -3,9 +3,9 @@
 use std::fmt;
 
 use rift_core::{
-    Contribution, ContributionKey, ContributionOrigin, ContributionRelationship,
-    DeclarationBinding, EquivalenceEvidence, Extensions, PortableSymbolFacts, ProviderId,
-    ProviderRevision, ProviderSymbolId, SemanticReference, SourceApplicability,
+    Contribution, ContributionEdge, ContributionKey, ContributionOrigin, DeclarationBinding,
+    EquivalenceEvidence, Extensions, PortableSymbolFacts, ProviderId, ProviderRevision,
+    ProviderSymbolId, SemanticReference, SourceApplicability,
 };
 
 use crate::{
@@ -23,7 +23,7 @@ pub struct DirectFactInput {
     source: Option<DeclarationBinding>,
     equivalence: Vec<EquivalenceEvidence>,
     references: Vec<SemanticReference>,
-    relationships: Vec<ContributionRelationship>,
+    edges: Vec<ContributionEdge>,
     namespaced: Extensions,
 }
 
@@ -44,7 +44,7 @@ impl DirectFactInput {
             source: None,
             equivalence: Vec::new(),
             references: Vec::new(),
-            relationships: Vec::new(),
+            edges: Vec::new(),
             namespaced,
         }
     }
@@ -77,10 +77,10 @@ impl DirectFactInput {
         self
     }
 
-    /// Sets portable Relationships.
+    /// Sets portable Edges.
     #[must_use]
-    pub fn relationships(mut self, relationships: Vec<ContributionRelationship>) -> Self {
-        self.relationships = relationships;
+    pub fn edges(mut self, edges: Vec<ContributionEdge>) -> Self {
+        self.edges = edges;
         self
     }
 
@@ -100,7 +100,7 @@ impl DirectFactInput {
         builder
             .equivalence(self.equivalence)
             .references(self.references)
-            .relationships(self.relationships)
+            .edges(self.edges)
             .namespaced(self.namespaced)
             .build()
             .map_err(|error| {
@@ -221,12 +221,12 @@ mod tests {
     use std::sync::Arc;
 
     use rift_core::{
-        ContributionOrigin, ContributionReference, ContributionRelationship, DeclarationBinding,
+        ContributionEdge, ContributionOrigin, ContributionReference, DeclarationBinding, EdgeKind,
         EquivalenceEvidence, ExactKind, ExtensionKey, ExtensionValue, Extensions, IndexRevision,
         Language, PortableSymbolFacts, ProviderId, ProviderRevision, ProviderSymbolId,
-        ReferenceRole, RelationshipKind, SemanticReference, SourceApplicability, SourceKind,
-        SourceLocation, SourcePath, SourceRange, SourceResolverId, SourceRevision, SourceUnitId,
-        SymbolResolution, TreeRevision,
+        ReferenceRole, SemanticReference, SourceApplicability, SourceKind, SourceLocation,
+        SourcePath, SourceRange, SourceResolverId, SourceRevision, SourceUnitId, SymbolResolution,
+        TreeRevision,
     };
     use serde_json::json;
 
@@ -356,7 +356,7 @@ mod tests {
             vec![target.clone()],
         )
         .expect("reference");
-        let relationship = ContributionRelationship::new(RelationshipKind::Implementation, target);
+        let edge = ContributionEdge::new(EdgeKind::Implementation, target);
         let generated = DirectFactInput::new(
             ProviderSymbolId::new("generated:Beacon").expect("symbol"),
             exact(),
@@ -376,7 +376,7 @@ mod tests {
         .source(output_binding.clone())
         .equivalence(vec![EquivalenceEvidence::Declaration(output_binding)])
         .references(vec![reference])
-        .relationships(vec![relationship]);
+        .edges(vec![edge]);
         let output = DirectFactAdapter::new(
             provider(),
             revision(),
@@ -389,10 +389,7 @@ mod tests {
 
         assert_eq!(contribution.applicability(), exact());
         assert_eq!(contribution.references()[0].role(), ReferenceRole::Call);
-        assert_eq!(
-            contribution.relationships()[0].kind(),
-            RelationshipKind::Implementation
-        );
+        assert_eq!(contribution.edges()[0].kind(), EdgeKind::Implementation);
         let generated = contribution
             .namespaced()
             .0

@@ -2,7 +2,7 @@
 
 [![Rift - agentic development toolkit for codebases](docs/public/og.png)](https://volar.sh/rift/)
 
-Rift is an agentic development toolkit for reading, discovering, and editing codebases.
+Rift is an agentic development toolkit for reading, discovering, and exploring codebases.
 
 📖 [Read the documentation](https://volar.sh/rift/docs/)
 
@@ -39,7 +39,7 @@ installer resolves the latest release.
 ## MCP
 
 Run `rift mcp` from a codebase. Rift exposes structured reads through `search`, `get_symbol`, and
-`nodes` over stdio MCP. Later reads include filesystem changes made by a formatter or another
+`facets` over stdio MCP. Later reads include filesystem changes made by a formatter or another
 process.
 
 This repository's `.mcp.json` runs the local build through Cargo. An installed client configuration

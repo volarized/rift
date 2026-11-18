@@ -4,6 +4,7 @@ description: A new perspective to development lifecycle and codebase intelligenc
 ---
 
 import { CodebaseIntelligence, CodebaseLanguages } from "@/components/codebase-intelligence";
+import { SymbolEdges } from "@/components/symbol-edges";
 import { VersionBadge } from "@/components/version-badge";
 
 ## Preface
@@ -64,6 +65,38 @@ in two modes:
 The information provided by both of these servers is inherently deterministic because it is
 based on source code facts and derived from them by logically aligned algorithms.
 
+## Symbols, facets, and edges
+
+We consider the whole codebase a collection of symbols. Symbols are logical objects, represented
+by several facets. Symbols can logically relate to one another; each such logical relation is an
+edge. Edges can be different in terms of their source and contribution - some of them are
+collected via static analysis, some of them use language-specific engines, and some of them are
+retrieved via the standard LSP protocol.
+
+A facet is one declaration of a symbol: its location, its source, and its syntax structure. A
+symbol declared once has one facet. Prettier's `format` function is declared twice in its
+`index.d.ts`, so its symbol has two facets.
+
+An edge connects one symbol to another, such as a call from a function to its callee. In the
+[MCP guide's example project](/docs/mcp#agent-workflow-caption), `main` calls `load_config`, and
+`load_config` calls `parse_config`, so each call is an edge.
+
+The source of an edge decides where it lives:
+
+- [Static analysis](#static-analysis) joins syntax facts into edges that the index stores.
+- A [language engine](#semantics) embedded in Rift's process, such as ty for Python, answers with
+  edges for one read, and those edges do not enter the index.
+- A language server, such as rust-analyzer, answers through the standard LSP protocol, and its
+  edges belong to one read as well.
+
+A [flow](/docs/developer/protocol/mcp#search-flows) is a path of edges. `SERVICE :flows` matches
+symbols through ranked text retrieval and follows call edges into and out of them, so a flow
+through `load_config` can run from `main` to `parse_config`.
+
+Let's take a look at how these fit together in the example project:
+
+<SymbolEdges />
+
 ## Layers of intelligence
 
 The title of this chapter might sound a bit like marketing, but practically it represents a
@@ -116,10 +149,10 @@ greatly required in the codebase. For instance, we won't be able to say what the
 When you call an imported function, syntax gives Rift the call and the import as separate facts.
 The static analyzer joins those facts when the source shows how the name was bound. For example,
 `import { spawn as run } from "./tasks.js"` binds `run` to the `spawn` export. When the analyzer
-can follow that export to its declaration, Rift records a relationship from `run()` to that
+can follow that export to its declaration, Rift records an edge from `run()` to that
 declaration.
 
-Rift can use these relationships to answer questions about callers and callees from the index.
+Rift can use these edges to answer questions about callers and callees from the index.
 A call that needs more information, such as a method on a value whose type must be inferred,
 needs analysis from a language engine.
 
@@ -129,15 +162,15 @@ A [language engine](/docs/developer/configuration#languages-and-lsp) runs the la
 analysis. Rift uses language servers through the Language Server Protocol (LSP) and language
 engines embedded in its own process.
 
-For [relationship traversal](/docs/mcp#search-traversal), a language engine can return references
+For [edge traversal](/docs/mcp#search-traversal), a language engine can return references
 to a declaration or the calls it makes. Rift maps the source locations returned by the engine
 back to indexed declarations. Rift can also request diagnostics from the engine.
 
-#### Relationship traversal [#relationship-graph]
+#### Edge traversal [#edge-traversal]
 
 <VersionBadge version="v0.0.35" languages={["Rust", "TypeScript", "Python"]} />
 
-Incoming traversal follows relationships within the current project to the declarations that
+Incoming traversal follows edges within the current project to the declarations that
 refer to the requested declaration. A language engine supplies additional reference locations
 where available. Rift uses syntax to identify the declaration containing each location.
 
@@ -230,7 +263,7 @@ from the local or global index.
 ## Languages and providers
 
 Rift selects a syntax provider by file type. [Tree-sitter](https://tree-sitter.github.io/tree-sitter/)
-parses the source into declarations and syntax nodes. For project files, byte ranges identify the
+parses the source into declarations and their syntax trees. For project files, byte ranges identify the
 text each read returns. The static analyzer connects calls to declarations when it can resolve
 their targets from syntax. Language engines provide facts that require the language's own
 resolution rules.

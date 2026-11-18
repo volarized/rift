@@ -24,8 +24,8 @@ fn local_component_bindings_do_not_own_templates() {
             .expect("TypeScript source");
         assert!(
             rift_syntax::angular_components(source, &document).is_empty(),
-            "local binding: {declaration}; nodes={:?}",
-            document.nodes()
+            "local binding: {declaration}; syntax_elements={:?}",
+            document.syntax_elements()
         );
     }
 }
@@ -42,7 +42,7 @@ fn single_arrow_parameter_does_not_inherit_component_import_ownership() {
         .expect("TypeScript source");
     assert!(
         rift_syntax::angular_components(source, &document).is_empty(),
-        "single arrow parameter; nodes={:?}",
-        document.nodes()
+        "single arrow parameter; syntax_elements={:?}",
+        document.syntax_elements()
     );
 }

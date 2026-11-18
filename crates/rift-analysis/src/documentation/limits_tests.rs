@@ -228,7 +228,7 @@ fn accepted_notebook_parser_bounds_are_checked() {
     assert!(notebook::decode_notebook(text, &identity).is_ok());
     for configuration in [
         rift_protocol::documentation::DocumentationConfiguration {
-            max_nodes: 1,
+            max_syntax_elements: 1,
             ..Default::default()
         },
         rift_protocol::documentation::DocumentationConfiguration {

@@ -111,7 +111,7 @@ async fn scoped_documentation_search(
         "query": query,
         "scope": scope,
         "target": "documentation",
-        "limit": 100
+        "max_results": 100
     }))?;
     let answer = answer(store, service, query).await?;
     Ok(service.search(&params, &answer)?)
@@ -127,7 +127,7 @@ async fn search_for(
         "query": query,
         "target": target,
         "include": {"source": true, "score": true},
-        "limit": 100
+        "max_results": 100
     }))?;
     Ok(service.search(&params, &answer(store, service, query).await?)?)
 }
@@ -176,7 +176,7 @@ async fn required_documentation_formats_search_captured_content() -> TestResult 
     let service = service(directory.path())?;
     let store = stored(directory.path(), &service).await?;
     let params: SearchParams = serde_json::from_value(
-        json!({"query":"compass","target":"documentation","include":{"source": true},"limit":100}),
+        json!({"query":"compass","target":"documentation","include":{"source": true},"max_results":100}),
     )?;
     let results = service.search(&params, &answer(&store, &service, "compass").await?)?;
     assert_eq!(results.results.len(), 6, "{results:#?}");
@@ -217,11 +217,11 @@ async fn heading_and_baseline_match_project_once_before_pagination() -> TestResu
     let store = stored(directory.path(), &service).await?;
     for target in ["documentation", "all"] {
         let params: SearchParams = serde_json::from_value(
-            json!({"query":"Compass","target":target,"limit":1,"include":{"source": true}}),
+            json!({"query":"Compass","target":target,"max_results":1,"include":{"source": true}}),
         )?;
         let result = service.search(&params, &answer(&store, &service, "Compass").await?)?;
         assert_eq!(result.results.len(), 1);
-        assert_eq!(result.pagination.total_pages, 1);
+        assert_eq!(result.pagination.pages, 1);
         assert!(matches!(
             result.results[0].hit,
             SearchHitTarget::Documentation { .. }
@@ -259,7 +259,7 @@ async fn page_excerpt_budget_respects_utf8_and_coalesces_same_source_warnings() 
         "query":"compass",
         "target":"documentation",
         "include":{"source": true},
-        "limit":100
+        "max_results":100
     }))?;
 
     let result = service.search(&params, &answer(&store, &service, "compass").await?)?;
@@ -773,7 +773,7 @@ fn search_with_answer(
         "query": query,
         "target": target,
         "include": {"source": true, "score": true},
-        "limit": 100
+        "max_results": 100
     }))?;
     Ok(service.search(&params, answer)?)
 }

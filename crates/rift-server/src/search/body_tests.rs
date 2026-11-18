@@ -248,7 +248,7 @@ async fn body_matches_follow_a_direct_match_and_never_repeat_it() -> TestResult 
     Ok(())
 }
 
-/// Pages cut the list the body matches expanded: `total_pages` counts every declaration
+/// Pages cut the list the body matches expanded: `pages` counts every declaration
 /// the pool placed, and the second page serves the next window of the same order.
 #[tokio::test]
 async fn pages_window_the_list_body_matches_expanded() -> TestResult {
@@ -263,17 +263,17 @@ async fn pages_window_the_list_body_matches_expanded() -> TestResult {
     let whole = search(
         &service,
         &answer,
-        json!({"query": "quokka", "target": "symbol", "limit": 10}),
+        json!({"query": "quokka", "target": "symbol", "max_results": 10}),
     )?;
     assert_eq!(whole.results.len(), 5);
     let mut paged = Vec::new();
-    for page_index in 0..3 {
+    for page in 1..=3 {
         let page = search(
             &service,
             &answer,
-            json!({"query": "quokka", "target": "symbol", "limit": 2, "page_index": page_index}),
+            json!({"query": "quokka", "target": "symbol", "max_results": 2, "page": page}),
         )?;
-        assert_eq!(page.pagination.total_pages, 3);
+        assert_eq!(page.pagination.pages, 3);
         paged.extend(spelled(&page));
     }
     assert_eq!(paged, spelled(&whole), "three windows of one ordered list");

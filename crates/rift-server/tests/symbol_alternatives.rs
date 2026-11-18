@@ -159,7 +159,7 @@ fn empty_project_keeps_missed_name_and_empty_alternatives() -> TestResult {
     let result = lookup(&service, json!({"name": "beacpn", "language": "rust"}))?;
     assert!(result.hits.is_empty());
     assert!(alternatives(&result)?.is_empty());
-    assert_eq!(result.pagination.total_pages, 0);
+    assert_eq!(result.pagination.pages, 0);
     Ok(())
 }
 
@@ -189,7 +189,7 @@ fn exact_prefix_and_substring_matches_and_exhausted_pages_have_no_alternatives()
         json!({"name": "beacon", "language": "rust"}),
         json!({"name": "beac", "language": "rust"}),
         json!({"name": "acon", "language": "rust"}),
-        json!({"name": "beacon", "language": "rust", "limit": 1, "page_index": 20}),
+        json!({"name": "beacon", "language": "rust", "max_results": 1, "page": 20}),
     ] {
         let result = lookup(&service, request)?;
         assert!(
@@ -198,7 +198,7 @@ fn exact_prefix_and_substring_matches_and_exhausted_pages_have_no_alternatives()
                 .iter()
                 .any(|warning| matches!(warning, ReadWarning::SymbolNotFound { .. }))
         );
-        assert!(result.pagination.total_pages > 0);
+        assert!(result.pagination.pages > 0);
     }
     Ok(())
 }

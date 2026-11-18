@@ -112,7 +112,7 @@ pub use crate::search::{
     ChangeTree, CommitHit, GraphHop, HopDirection, MatchedField, PathPattern, PathPatternViolation,
     PathSelector, ResultOrder, SEARCH_CHANGE_HEAD_DEFAULT, SEARCH_CHANGE_PATHS_MAX,
     SEARCH_PATTERN_CHARS_MAX, SEARCH_TRAVERSAL_DEPTH_DEFAULT, SEARCH_TRAVERSAL_DEPTH_MAX,
-    SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_FACETS_MAX, SearchChange, SearchHit,
+    SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_KINDS_MAX, SearchChange, SearchHit,
     SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget, SearchResult,
     SearchTraversal, SymbolChange, TraversalDirection,
 };
@@ -315,19 +315,21 @@ impl GetSymbolInclude {
     {
         "name": "ReadService",
         "language": "rust",
-        "include": {"history": true},
-        "limit": 5,
-        "page_index": 0
+        "include": {
+            "history": true
+        },
+        "max_results": 5,
+        "page": 1
     },
     {
         "name": "Deserialize",
-        "limit": 10,
-        "page_index": 1
+        "max_results": 10,
+        "page": 1
     },
     {
         "name": "spawn",
         "scope": "all",
-        "limit": 5
+        "max_results": 5
     },
     {
         "name": "spawn",
@@ -339,7 +341,7 @@ impl GetSymbolInclude {
                 "version": "1.47.1"
             }
         ],
-        "limit": 5
+        "max_results": 5
     }
 ]))]
 pub struct GetSymbolParams {
@@ -369,20 +371,21 @@ pub struct GetSymbolParams {
     #[schemars(length(max = 64))]
     pub packages: Vec<RequestedPackage>,
     /// Optional hit fields to attach. Omitted attaches neither `history` nor
-    /// `documentation`. A declaration's source is read by `nodes` with `symbol`.
+    /// `documentation`. A declaration's source is read by `facets` with `symbol`.
     #[serde(default, skip_serializing_if = "GetSymbolInclude::is_empty")]
     pub include: GetSymbolInclude,
     /// Most hits to return in one page, at most 10,000; the server refuses a larger
-    /// `limit` naming the field. The server's result bound caps the set itself, and an
+    /// `max_results` naming the field. The server's result bound caps the set itself, and an
     /// answer whose set reached it warns `results_truncated`.
-    #[serde(default = "default_get_symbol_params_limit")]
+    #[serde(default = "default_max_results")]
     #[schemars(range(min = 1_u64, max = PAGE_LIMIT_MAX))]
-    pub limit: u64,
-    /// Zero-based page of the result set to serve, sized by `limit`. A `page_index` past
+    pub max_results: u64,
+    /// 1-based page of the result set to serve, sized by `max_results`. A `page` past
     /// the last page returns an empty page whose `pagination` carries the requested
-    /// `page_index` and the true `total_pages`.
-    #[serde(default = "default_get_symbol_params_page_index")]
-    pub page_index: u64,
+    /// `page` and the true `pages`.
+    #[serde(default = "default_get_symbol_params_page")]
+    #[schemars(range(min = 1_u64))]
+    pub page: u64,
     /// The revision to read: a git revision reads that commit, a tree revision the served
     /// working tree. Omitted reads the served working tree. The server refuses a git
     /// revision when the workspace has no version-control repository, and a tree revision
@@ -391,12 +394,8 @@ pub struct GetSymbolParams {
     pub revision: Option<crate::revision::Revision>,
 }
 
-fn default_get_symbol_params_limit() -> u64 {
-    5
-}
-
-fn default_get_symbol_params_page_index() -> u64 {
-    PAGE_INDEX_DEFAULT
+fn default_get_symbol_params_page() -> u64 {
+    PAGE_DEFAULT
 }
 
 /// One page of declarations matching a name.
@@ -412,7 +411,7 @@ fn default_get_symbol_params_page_index() -> u64 {
                     "language": "rust",
                     "name": "load_config",
                     "kind": "function",
-                    "facets": [
+                    "kinds": [
                         "value",
                         "callable",
                         "public"
@@ -524,15 +523,17 @@ fn default_get_symbol_params_page_index() -> u64 {
             }
         ],
         "pagination": {
-            "page_index": 0,
-            "total_pages": 1
+            "page": 1,
+            "pages": 1,
+            "max_results": 10,
+            "total": 1
         }
     }
 ]))]
 pub struct GetSymbolResult {
     /// The declarations on this page, best match first.
     pub hits: Vec<GetSymbolHit>,
-    /// Where this page sits in the full result set under the request's `limit`.
+    /// Where this page sits in the full result set under the request's `max_results`.
     pub pagination: Pagination,
     /// Warnings attached to this result. Absent when there is nothing to warn about.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -667,50 +668,50 @@ fn is_language_word(word: &str) -> bool {
         })
 }
 
-/// One node of a source unit's syntax tree, with its source text, addressed by its place inside
-/// a symbol. A node inside a declaration's item subtree is node `index` of declaration
-/// `declaration` of the symbol the read names; a node outside every declaration is node `index`
-/// of its `unit`. Indexes count in pre-order from 0 at the declaration's item node, or from 0 at
-/// the unit's file node, and skip the subtrees of nested declarations, whose nodes belong to the
-/// nested symbol. The address names a place at the read's revision: an edit renumbers the nodes
+/// One syntax element of a source unit's syntax tree, with its source text, addressed by its place inside
+/// a symbol. A syntax element inside a declaration's item subtree is syntax element `index` of declaration
+/// `declaration` of the symbol the read names; a syntax element outside every declaration is syntax element `index`
+/// of its `unit`. Indexes count in pre-order from 0 at the declaration's item syntax element, or from 0 at
+/// the unit's file syntax element, and skip the subtrees of nested declarations, whose syntax elements belong to the
+/// nested symbol. The address names a place at the read's revision: an edit renumbers the syntax elements
 /// after it.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-#[schemars(transform = schema::declare_node_empty_defaults)]
-pub struct Node {
-    /// Ordinal of the declaration holding this node among the declarations of the symbol the
-    /// read names, from 0 in the order a symbol read lists them. Absent for a node outside
-    /// every declaration: the file node, an import, a top-level statement.
+#[schemars(transform = schema::declare_syntax_element_empty_defaults)]
+pub struct SyntaxElement {
+    /// Ordinal of the declaration holding this syntax element among the declarations of the symbol the
+    /// read names, from 0 in the order a symbol read lists them. Absent for a syntax element outside
+    /// every declaration: the file syntax element, an import, a top-level statement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
     pub declaration: Option<u64>,
-    /// Pre-order position of this node inside its declaration's item subtree, or inside its
-    /// unit when `declaration` is absent. The item node and the unit's file node are 0.
+    /// Pre-order position of this syntax element inside its declaration's item subtree, or inside its
+    /// unit when `declaration` is absent. The item syntax element and the unit's file syntax element are 0.
     #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
     pub index: u64,
-    /// The source unit the node is written in: a project file, as
-    /// `rift://source/project/src/lib.rs`, or a package or runtime source unit for a node of
+    /// The source unit the syntax element is written in: a project file, as
+    /// `rift://source/project/src/lib.rs`, or a package or runtime source unit for a syntax element of
     /// a package or runtime symbol. It names no revision; the answer's `revision` does.
     pub unit: SourceUnitId,
-    /// The grammar that produced this node. It belongs to the identity because two
+    /// The grammar that produced this syntax element. It belongs to the identity because two
     /// providers can produce different trees over the same file bytes.
     pub language: Language,
-    /// What the node is in the provider's vocabulary, such as `fn_item`, `mapping.key`, or
+    /// What the syntax element is in the provider's vocabulary, such as `fn_item`, `mapping.key`, or
     /// `selector.class`.
     pub kind: ExactKind,
     /// Portable structural classification, so a query can ask for bodies or imports without
     /// knowing the grammar that produced them. Absent when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub facets: Vec<NodeFacet>,
+    pub kinds: Vec<SyntaxKind>,
     /// The bytes it spans, as offsets into the file.
     pub range: TextRange,
-    /// The node's exact source text: the bytes `range` spans at the read's revision.
+    /// The syntax element's exact source text: the bytes `range` spans at the read's revision.
     pub source: String,
-    /// The node's named parts, including its function body and documentation. Absent when empty.
+    /// The syntax element's named parts, including its function body and documentation. Absent when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub regions: Vec<NodeRegion>,
-    /// `index` of the node this one is nested inside, in the same declaration or unit. Absent
-    /// for node 0.
+    pub regions: Vec<FacetRegion>,
+    /// `index` of the syntax element this one is nested inside, in the same declaration or unit. Absent
+    /// for syntax element 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
     pub parent: Option<u64>,
@@ -720,13 +721,13 @@ pub struct Node {
     pub extensions: Extensions,
 }
 
-/// Portable structural facets, so a filter can ask for bodies or imports without knowing the
+/// Portable structural kinds, so a filter can ask for bodies or imports without knowing the
 /// grammar that produced them.
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
 #[serde(rename_all = "snake_case")]
-pub enum NodeFacet {
+pub enum SyntaxKind {
     /// Introduces a name.
     Declaration,
     /// Supplies the implementation behind a declared name.
@@ -765,11 +766,11 @@ pub enum NodeFacet {
     Test,
 }
 
-/// The kind of the node that spans one whole source unit. Every source unit has one, the
-/// outermost node of its tree, whether or not a syntax provider parses the unit.
-pub const FILE_NODE_KIND: &str = "file";
+/// The kind of the syntax element that spans one whole source unit. Every source unit has one, the
+/// outermost syntax element of its tree, whether or not a syntax provider parses the unit.
+pub const FILE_SYNTAX_ELEMENT_KIND: &str = "file";
 
-/// The language of a source unit no syntax provider parses. Its only node is its file node.
+/// The language of a source unit no syntax provider parses. Its only syntax element is its file syntax element.
 pub const TEXT_LANGUAGE_NAME: &str = "text";
 
 impl Language {
@@ -784,286 +785,281 @@ impl Language {
     }
 }
 
-/// One named part of a node, and the bytes it spans.
+/// One named part of a syntax element, and the bytes it spans.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct NodeRegion {
-    /// Which part of the node this is.
+pub struct FacetRegion {
+    /// Which part of the syntax element this is.
     pub role: RegionRole,
-    /// Offsets into the file, on the same scale as `Node.range`.
+    /// Offsets into the file, on the same scale as `SyntaxElement.range`.
     pub range: TextRange,
 }
 
-/// Lists syntax nodes with their source: every node of one `symbol`, or the nodes of the
-/// innermost declaration holding one `position` in one file, or of that file's unit when no
-/// declaration holds it. Each node carries its kind, range, source text, and place, including
-/// expressions smaller than a declaration.
-#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
+/// Reads every declaration of one symbol with its location, source, and syntax structure.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-#[schemars(transform = schema::require_one_node_selector)]
 #[schemars(extend("rift:since" = "v0.0.4"))]
 #[schemars(extend("examples" = [
     {
         "symbol": "rift://symbol/local/rust/app/config/load_config"
-    },
-    {
-        "path": "src/config.rs",
-        "position": 338
     }
 ]))]
-pub struct NodesParams {
-    /// The symbol whose nodes the read lists: each declaration's item node, then the
-    /// descendants that belong to that declaration and not to a declaration nested in it,
-    /// outermost first per declaration. A package or runtime symbol's nodes come from the
-    /// global API. The caller MUST omit `path` and `position` beside it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub symbol: Option<SymbolId>,
-    /// Project-relative file to inspect. The caller MUST send it together with `position`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(length(min = 1))]
-    pub path: Option<ProjectPath>,
-    /// UTF-8 byte offset inside the declaration whose nodes the read lists - one position,
-    /// not a range; the nodes themselves carry the spans. The read lists the nodes of the
-    /// innermost declaration holding the node at the position, or of the file's unit when no
-    /// declaration holds it. A position inside a multi-byte character is valid; a position at
-    /// or past the file's byte length refuses.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
-    pub position: Option<u64>,
-    /// Continuation a preceding read returned, bound to the symbol or unit its answer listed
-    /// and the tree revision it read. The caller MUST send it with the selector of that read;
-    /// the server refuses it for another symbol or unit and once the tree has moved.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(length(min = 1, max = 4096))]
-    pub node_cursor: Option<String>,
-    /// The revision to read: a git revision reads that commit, a tree revision the served
-    /// working tree, and a release revision selects the release of a package or runtime
-    /// `symbol`'s owner. Omitted reads the served working tree, or for a package the version
-    /// the workspace's dependencies pin, else the newest collected release. The server refuses
-    /// a git revision when the workspace has no version-control repository, and a tree
-    /// revision once the index serves another tree.
+pub struct FacetsParams {
+    /// The symbol whose declarations the server reads. A package or runtime symbol is read
+    /// through the global API.
+    pub symbol: SymbolId,
+    /// Results per page, at most 100.
+    #[serde(default = "default_max_results")]
+    #[schemars(range(min = 1_u64, max = FACETS_MAX_RESULTS))]
+    pub max_results: u64,
+    /// The 1-based page to read.
+    #[serde(default = "default_page")]
+    #[schemars(range(min = 1_u64))]
+    pub page: u64,
+    /// The revision to read. Omitted reads the served working tree, or the selected package
+    /// or runtime release. The server refuses a tree revision once the index serves another tree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<crate::revision::Revision>,
 }
 
-impl NodesParams {
-    /// A read of the nodes of the declaration or unit holding `position` in the file at `path`.
-    #[must_use]
-    pub fn at(path: ProjectPath, position: u64) -> Self {
-        Self {
-            path: Some(path),
-            position: Some(position),
-            ..Self::default()
-        }
-    }
-
-    /// A read of every node of `symbol`.
+impl FacetsParams {
+    /// Reads every declaration of `symbol`.
     #[must_use]
     pub fn of(symbol: SymbolId) -> Self {
         Self {
-            symbol: Some(symbol),
-            ..Self::default()
+            symbol,
+            page: PAGE_DEFAULT,
+            max_results: MAX_RESULTS_DEFAULT,
+            revision: None,
         }
     }
 }
 
-/// Most source bytes the nodes of one `nodes` answer carry together. A symbol read stops
-/// before the node that would cross it and returns `node_cursor`; a page always holds at
-/// least one node, whose own size `[providers.syntax] max_file` bounds.
-pub const NODES_SOURCE_BYTES_MAX: u64 = 1_048_576;
+/// Most source bytes in one facets page.
+pub const FACETS_SOURCE_BYTES_MAX: u64 = 1_048_576;
 
-/// The nodes a read selected, each with its source text and its place inside its symbol or
-/// unit.
+/// Most declarations returned by one facets read.
+pub const FACETS_DECLARATIONS_MAX: usize = 100;
+/// Most declarations returned in one facets page.
+pub const FACETS_MAX_RESULTS: u64 = FACETS_DECLARATIONS_MAX as u64;
+fn default_max_results() -> u64 {
+    MAX_RESULTS_DEFAULT
+}
+fn default_page() -> u64 {
+    PAGE_DEFAULT
+}
+
+/// Declarations of one symbol, each with its location, source, and syntax structure.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-#[schemars(transform = schema::declare_nodes_result_empty_defaults)]
+#[schemars(transform = schema::declare_facets_result_empty_defaults)]
 #[schemars(extend("examples" = [
     {
         "symbol": "rift://symbol/local/rust/app/config/Config",
-        "nodes": [
+        "declarations": [
             {
                 "declaration": 0,
-                "index": 0,
-                "unit": "rift://source/project/src/config.rs",
-                "language": "rust",
                 "kind": "struct_item",
-                "facets": [
-                    "declaration",
-                    "definition"
-                ],
                 "range": {
-                    "start": 105,
-                    "end": 160
+                    "end": 160,
+                    "start": 105
                 },
-                "source": "pub struct Config {\n    pub root: std::path::PathBuf,\n}"
-            },
-            {
-                "declaration": 0,
-                "index": 1,
-                "unit": "rift://source/project/src/config.rs",
-                "language": "rust",
-                "kind": "visibility_modifier",
-                "range": {
-                    "start": 105,
-                    "end": 108
+                "source": {
+                    "span": {
+                        "unit": "rift://source/project/src/config.rs",
+                        "range": {
+                            "end": 160,
+                            "start": 105
+                        }
+                    },
+                    "text": "pub struct Config {\n    pub root: std::path::PathBuf,\n}"
                 },
-                "source": "pub",
-                "parent": 0
-            },
-            {
-                "declaration": 0,
-                "index": 2,
-                "unit": "rift://source/project/src/config.rs",
-                "language": "rust",
-                "kind": "type_identifier",
-                "range": {
-                    "start": 116,
-                    "end": 122
-                },
-                "source": "Config",
-                "parent": 0
-            },
-            {
-                "declaration": 0,
-                "index": 3,
-                "unit": "rift://source/project/src/config.rs",
-                "language": "rust",
-                "kind": "field_declaration_list",
-                "range": {
-                    "start": 123,
-                    "end": 160
-                },
-                "source": "{\n    pub root: std::path::PathBuf,\n}",
-                "parent": 0
-            },
-            {
-                "declaration": 0,
-                "index": 4,
-                "unit": "rift://source/project/src/config.rs",
-                "language": "rust",
-                "kind": "field_declaration",
-                "facets": [
-                    "declaration",
-                    "definition"
-                ],
-                "range": {
-                    "start": 129,
-                    "end": 157
-                },
-                "source": "pub root: std::path::PathBuf",
-                "parent": 3
-            },
-            {
-                "declaration": 0,
-                "index": 5,
-                "unit": "rift://source/project/src/config.rs",
-                "language": "rust",
-                "kind": "visibility_modifier",
-                "range": {
-                    "start": 129,
-                    "end": 132
-                },
-                "source": "pub",
-                "parent": 4
-            },
-            {
-                "declaration": 0,
-                "index": 6,
-                "unit": "rift://source/project/src/config.rs",
-                "language": "rust",
-                "kind": "field_identifier",
-                "range": {
-                    "start": 133,
-                    "end": 137
-                },
-                "source": "root",
-                "parent": 4
-            },
-            {
-                "declaration": 0,
-                "index": 7,
-                "unit": "rift://source/project/src/config.rs",
-                "language": "rust",
-                "kind": "scoped_type_identifier",
-                "range": {
-                    "start": 139,
-                    "end": 157
-                },
-                "source": "std::path::PathBuf",
-                "parent": 4
-            },
-            {
-                "declaration": 0,
-                "index": 8,
-                "unit": "rift://source/project/src/config.rs",
-                "language": "rust",
-                "kind": "scoped_identifier",
-                "range": {
-                    "start": 139,
-                    "end": 148
-                },
-                "source": "std::path",
-                "parent": 7
-            },
-            {
-                "declaration": 0,
-                "index": 9,
-                "unit": "rift://source/project/src/config.rs",
-                "language": "rust",
-                "kind": "identifier",
-                "range": {
-                    "start": 139,
-                    "end": 142
-                },
-                "source": "std",
-                "parent": 8
-            },
-            {
-                "declaration": 0,
-                "index": 10,
-                "unit": "rift://source/project/src/config.rs",
-                "language": "rust",
-                "kind": "identifier",
-                "range": {
-                    "start": 144,
-                    "end": 148
-                },
-                "source": "path",
-                "parent": 8
-            },
-            {
-                "declaration": 0,
-                "index": 11,
-                "unit": "rift://source/project/src/config.rs",
-                "language": "rust",
-                "kind": "type_identifier",
-                "range": {
-                    "start": 150,
-                    "end": 157
-                },
-                "source": "PathBuf",
-                "parent": 7
+                "syntax": [
+                    {
+                        "declaration": 0,
+                        "kinds": [
+                            "declaration",
+                            "definition"
+                        ],
+                        "index": 0,
+                        "kind": "struct_item",
+                        "language": "rust",
+                        "range": {
+                            "end": 160,
+                            "start": 105
+                        },
+                        "source": "pub struct Config {\n    pub root: std::path::PathBuf,\n}",
+                        "unit": "rift://source/project/src/config.rs"
+                    },
+                    {
+                        "declaration": 0,
+                        "index": 1,
+                        "kind": "visibility_modifier",
+                        "language": "rust",
+                        "parent": 0,
+                        "range": {
+                            "end": 108,
+                            "start": 105
+                        },
+                        "source": "pub",
+                        "unit": "rift://source/project/src/config.rs"
+                    },
+                    {
+                        "declaration": 0,
+                        "index": 2,
+                        "kind": "type_identifier",
+                        "language": "rust",
+                        "parent": 0,
+                        "range": {
+                            "end": 122,
+                            "start": 116
+                        },
+                        "source": "Config",
+                        "unit": "rift://source/project/src/config.rs"
+                    },
+                    {
+                        "declaration": 0,
+                        "index": 3,
+                        "kind": "field_declaration_list",
+                        "language": "rust",
+                        "parent": 0,
+                        "range": {
+                            "end": 160,
+                            "start": 123
+                        },
+                        "source": "{\n    pub root: std::path::PathBuf,\n}",
+                        "unit": "rift://source/project/src/config.rs"
+                    },
+                    {
+                        "declaration": 0,
+                        "kinds": [
+                            "declaration",
+                            "definition"
+                        ],
+                        "index": 4,
+                        "kind": "field_declaration",
+                        "language": "rust",
+                        "parent": 3,
+                        "range": {
+                            "end": 157,
+                            "start": 129
+                        },
+                        "source": "pub root: std::path::PathBuf",
+                        "unit": "rift://source/project/src/config.rs"
+                    },
+                    {
+                        "declaration": 0,
+                        "index": 5,
+                        "kind": "visibility_modifier",
+                        "language": "rust",
+                        "parent": 4,
+                        "range": {
+                            "end": 132,
+                            "start": 129
+                        },
+                        "source": "pub",
+                        "unit": "rift://source/project/src/config.rs"
+                    },
+                    {
+                        "declaration": 0,
+                        "index": 6,
+                        "kind": "field_identifier",
+                        "language": "rust",
+                        "parent": 4,
+                        "range": {
+                            "end": 137,
+                            "start": 133
+                        },
+                        "source": "root",
+                        "unit": "rift://source/project/src/config.rs"
+                    },
+                    {
+                        "declaration": 0,
+                        "index": 7,
+                        "kind": "scoped_type_identifier",
+                        "language": "rust",
+                        "parent": 4,
+                        "range": {
+                            "end": 157,
+                            "start": 139
+                        },
+                        "source": "std::path::PathBuf",
+                        "unit": "rift://source/project/src/config.rs"
+                    },
+                    {
+                        "declaration": 0,
+                        "index": 8,
+                        "kind": "scoped_identifier",
+                        "language": "rust",
+                        "parent": 7,
+                        "range": {
+                            "end": 148,
+                            "start": 139
+                        },
+                        "source": "std::path",
+                        "unit": "rift://source/project/src/config.rs"
+                    },
+                    {
+                        "declaration": 0,
+                        "index": 9,
+                        "kind": "identifier",
+                        "language": "rust",
+                        "parent": 8,
+                        "range": {
+                            "end": 142,
+                            "start": 139
+                        },
+                        "source": "std",
+                        "unit": "rift://source/project/src/config.rs"
+                    },
+                    {
+                        "declaration": 0,
+                        "index": 10,
+                        "kind": "identifier",
+                        "language": "rust",
+                        "parent": 8,
+                        "range": {
+                            "end": 148,
+                            "start": 144
+                        },
+                        "source": "path",
+                        "unit": "rift://source/project/src/config.rs"
+                    },
+                    {
+                        "declaration": 0,
+                        "index": 11,
+                        "kind": "type_identifier",
+                        "language": "rust",
+                        "parent": 7,
+                        "range": {
+                            "end": 157,
+                            "start": 150
+                        },
+                        "source": "PathBuf",
+                        "unit": "rift://source/project/src/config.rs"
+                    }
+                ]
             }
         ],
-        "revision": "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11"
+        "revision": "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11",
+        "pagination": {
+            "page": 1,
+            "pages": 1,
+            "max_results": 10,
+            "total": 1
+        }
     }
 ]))]
-pub struct NodesResult {
-    /// The symbol whose declarations hold the listed nodes: the requested one for a `symbol`
-    /// read, the innermost declaration's symbol for a `position` read. Absent when the nodes
-    /// belong to a unit outside every declaration.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub symbol: Option<SymbolId>,
-    /// Nodes the read selected, in pre-order: per declaration, in the order a symbol read
-    /// lists them, or the unit's nodes from its file node on.
-    pub nodes: Vec<Node>,
-    /// Continuation for the rest of an answer whose nodes crossed its node count or source
-    /// byte bound. Absent when the answer holds the last node.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub node_cursor: Option<String>,
-    /// The revision this answer was read at: a commit, a release, or a working tree.
+pub struct FacetsResult {
+    /// The symbol whose declarations this answer carries.
+    pub symbol: SymbolId,
+    /// Declarations in symbol order, with each declaration's syntax elements in pre-order.
+    pub declarations: Vec<crate::facets_read::FacetDeclaration>,
+    /// The requested page and complete declaration count.
+    pub pagination: Pagination,
+    /// The revision this answer was read at.
     pub revision: crate::revision::Revision,
-    /// Warnings attached to this result. Absent when there is nothing to warn about.
+    /// Conditions affecting this answer. Absent when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<ReadWarning>,
 }
@@ -1188,23 +1184,54 @@ impl RuntimeIdentity {
     }
 }
 
-/// Default `page_index` for a paginated request: the first page.
-pub const PAGE_INDEX_DEFAULT: u64 = 0;
-
-/// Largest `limit` a paginated request may name; the server refuses a larger one.
+/// Default page for a paginated request.
+pub const PAGE_DEFAULT: u64 = 1;
+/// Default number of results in one page.
+pub const MAX_RESULTS_DEFAULT: u64 = 10;
+/// Most results in one declaration lookup page.
 pub const PAGE_LIMIT_MAX: u64 = 10_000;
 
-/// Where one page sits in the full result set the request's `limit` divides.
+/// The requested page and the size of its complete result set.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Pagination {
-    /// The zero-based page this answer serves.
-    #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
-    pub page_index: u64,
-    /// The page count of the full result set under the request's `limit`, computed within
-    /// the server's result bound. Zero when the result set is empty.
-    #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
-    pub total_pages: u64,
+    /// The 1-based page this answer serves.
+    #[schemars(range(min = 1_u64))]
+    pub page: u64,
+    /// Page count, zero when the result set is empty.
+    pub pages: u64,
+    /// Results per page.
+    #[schemars(range(min = 1_u64))]
+    pub max_results: u64,
+    /// Total results within the server's result bound.
+    pub total: u64,
+}
+
+impl Pagination {
+    /// Computes the page count from the complete result count.
+    ///
+    /// # Panics
+    /// Panics when `max_results` is zero.
+    #[must_use]
+    pub fn new(page: u64, max_results: u64, total: u64) -> Self {
+        assert!(max_results > 0, "accepted max_results must be positive");
+        Self {
+            page,
+            pages: total.div_ceil(max_results),
+            max_results,
+            total,
+        }
+    }
+
+    /// The first result of this page, or the largest offset on overflow.
+    #[must_use]
+    pub fn offset(&self) -> usize {
+        self.page
+            .checked_sub(1)
+            .and_then(|page| page.checked_mul(self.max_results))
+            .and_then(|offset| usize::try_from(offset).ok())
+            .unwrap_or(usize::MAX)
+    }
 }
 
 /// One parameter of a `Signature`: what it is called, the types bound to it, and how a call
@@ -1482,7 +1509,7 @@ pub enum ReadWarning {
         matches_max: u64,
     },
     /// The server reached `results_max`, its result bound, before ordering and paging:
-    /// what the bound cut never reaches any page, and `total_pages` counts only what fit.
+    /// what the bound cut never reaches any page, and `pages` counts only what fit.
     /// The bound cuts the ranked candidates and the hit set alike. The warning means the
     /// bound was reached; a set of exactly `results_max` hits carries it too. Narrow
     /// `query` or `paths`.
@@ -1587,9 +1614,9 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         detail: String,
     },
-    /// A traversal walk stopped at its node bound before exhausting the reachable graph,
+    /// A traversal walk stopped at its symbol bound before exhausting the reachable graph,
     /// so hits reachable beyond the bound are missing from this answer. Narrow the walk -
-    /// a tighter `facets` list, a smaller `depth`, or a less-connected seed - to fit it
+    /// a tighter `kinds` list, a smaller `depth`, or a less-connected seed - to fit it
     /// under the bound.
     TraversalTruncated {
         /// Symbols the walk visited before it stopped, equal to the bound it hit.
@@ -1598,24 +1625,24 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         detail: String,
     },
-    /// No lane populates part of the relationship coverage the traversal asked for, so the
+    /// No lane populates part of the edge coverage the traversal asked for, so the
     /// walk had nothing to follow there whatever the graph holds. The warning states that a
     /// lane is absent; it never states that the seed has no such neighbor. An empty answer
     /// carrying it means the walk could not run; an empty answer without it means the walk
     /// ran and the seed has no neighbor under the request.
-    RelationshipCoverageMissing {
-        /// The requested facets no lane populates, in the request's own order,
-        /// deduplicated. Absent when every requested facet has a lane.
+    EdgeCoverageMissing {
+        /// The requested kinds no lane populates, in the request's own order,
+        /// deduplicated. Absent when every requested kind has a lane.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        facets: Vec<RelationshipFacet>,
+        kinds: Vec<EdgeKind>,
         /// Why the warning was raised - prose for a reader; nothing keys on it.
         #[schemars(length(max = 4096))]
         detail: String,
     },
     /// A language engine serves the seed's language, and this read carries none of its
     /// edges: the engine answered about bytes the served revision does not carry, answered
-    /// more than the walk's node bound holds, or was still analyzing when
-    /// `[server] readiness_timeout` was spent. The indexed relationships stand; whatever
+    /// more than the walk's symbol bound holds, or was still analyzing when
+    /// `[server] readiness_timeout` was spent. The indexed edges stand; whatever
     /// the engine resolves on top of them is missing. The warning states that an engine's
     /// analysis is absent from this answer; it never states that the seed has no such
     /// neighbor. An engine still analyzing keeps loading, and a later read, served from a
@@ -1824,14 +1851,14 @@ pub enum GlobalPageWarningCode {
     Unknown,
 }
 
-/// One named part of a node. A language marks these out inside a declaration, so an
+/// One named part of a syntax element. A language marks these out inside a declaration, so an
 /// operation can address the body of a function without addressing its documentation.
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum RegionRole {
-    /// The stretch that best identifies the node when presented.
+    /// The stretch that best identifies the syntax element when presented.
     Selection,
     /// The name being declared.
     Name,
@@ -1839,11 +1866,11 @@ pub enum RegionRole {
     Header,
     /// The implementation, without documentation or header.
     Body,
-    /// The interior of the node without its delimiters.
+    /// The interior of the syntax element without its delimiters.
     Content,
     /// The doc comment attached to the declaration.
     Documentation,
-    /// The full extent including what surrounds the node proper.
+    /// The full extent including what surrounds the syntax element proper.
     Enclosing,
 }
 
@@ -1851,8 +1878,8 @@ pub enum RegionRole {
 /// derivation is how much the provider knew when it was read.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-#[schemars(transform = schema::declare_relationship_empty_defaults)]
-pub struct Relationship {
+#[schemars(transform = schema::declare_edge_empty_defaults)]
+pub struct Edge {
     /// The symbol the edge starts at.
     pub from: SymbolId,
     /// What the edge is in this provider's vocabulary, such as `import`, `use`, or
@@ -1861,16 +1888,16 @@ pub struct Relationship {
     /// Portable classification, so a query for `imports` finds local kinds such as `import`
     /// and `use` alike.
     #[schemars(length(min = 1))]
-    pub facets: Vec<RelationshipFacet>,
+    pub kinds: Vec<EdgeKind>,
     /// The symbol the edge points at. One Rift cannot read carries the `external` origin;
     /// the edge is the same either way.
     pub to: SymbolId,
     /// Exact physical occurrence when this edge was read from source, independent of
-    /// whether the provider supplied a source node.
+    /// whether the provider supplied a source syntax element.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub occurrence: Option<SourceUnitSpan>,
     /// How this edge was established.
-    pub derivation: RelationshipDerivation,
+    pub derivation: EdgeDerivation,
     /// How likely a `heuristic` edge is to hold, from 0 to 1. Absent for any other
     /// derivation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1893,7 +1920,7 @@ pub struct Relationship {
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
 #[serde(rename_all = "snake_case")]
-pub enum RelationshipDerivation {
+pub enum EdgeDerivation {
     /// The provider resolved the edge semantically, so a consumer may act on it directly.
     Resolution,
     /// The edge was read from syntax alone, without semantic resolution.
@@ -1903,7 +1930,7 @@ pub enum RelationshipDerivation {
 }
 
 /// One portable category an edge falls into. The local kinds `import` and `use` can share
-/// the `imports` facet, which lets one query cross languages.
+/// the `imports` kind, which lets one query cross languages.
 #[derive(
     Clone,
     Copy,
@@ -1920,7 +1947,7 @@ pub enum RelationshipDerivation {
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
-pub enum RelationshipFacet {
+pub enum EdgeKind {
     /// The source contains the target within its scope.
     Contains,
     /// The source declares the target.
@@ -2450,8 +2477,8 @@ pub struct SourceUnitSpan {
     pub range: TextRange,
 }
 
-/// Readable Symbol assembled from normalized Contributions. Source structure lives in Node
-/// and is connected through Relationship.
+/// Readable Symbol assembled from normalized Contributions. Source structure lives in `SyntaxElement`
+/// and is connected through Edge.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[schemars(transform = schema::declare_symbol_empty_defaults)]
 pub struct Symbol {
@@ -2470,9 +2497,9 @@ pub struct Symbol {
     /// `table`.
     pub kind: ExactKind,
     /// Portable classification for cross-language queries, absent when empty. The local
-    /// kinds `trait` and `interface` can both carry the `type` facet.
+    /// kinds `trait` and `interface` can both carry the `type` kind.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub facets: Vec<SymbolFacet>,
+    pub kinds: Vec<SymbolKind>,
     /// Where the declaration belongs and how it was produced. Absent when it says a
     /// project declaration, authored, with no package - the common case.
     #[serde(
@@ -2556,13 +2583,13 @@ impl Symbol {
     }
 }
 
-/// One portable category a symbol falls into. Kinds are language-specific; facets are
-/// shared, so a filter written once applies to every served language.
+/// One portable category a symbol falls into, shared across served languages.
+/// The language-specific `kind` names the declaration in its provider's vocabulary.
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
 #[serde(rename_all = "snake_case")]
-pub enum SymbolFacet {
+pub enum SymbolKind {
     /// A named scope that groups declarations.
     Namespace,
     /// A compilation or import unit.
@@ -2880,7 +2907,12 @@ pub enum SymbolVersionKind {
 /// another, so that `end` is never below `start` is asserted by the surface
 /// validation tests instead.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[schemars(extend("examples" = [{"start": 0, "end": 0}]))]
+#[schemars(extend("examples" = [
+    {
+        "start": 0,
+        "end": 0
+    }
+]))]
 pub struct TextRange {
     /// First byte of the range, counted from the start of the file.
     #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
@@ -2974,9 +3006,9 @@ mod tests {
     use crate::dependencies::{PackageAvailability, PackageContextEntry, PackageSelector};
 
     use super::{
-        Digest, Duration, GLOBAL_WARNING_DETAIL_CHARS_MAX, GetSymbolParams, GlobalFailureClass,
-        GlobalPageWarningCode, LANGUAGE_IDENTITY_PATTERN, Language, PAGE_INDEX_DEFAULT,
-        PAGE_LIMIT_MAX, PackageIdentity, REVISION_ID_BYTES_MAX, ReadWarning, RelationshipFacet,
+        Digest, Duration, EdgeKind, GLOBAL_WARNING_DETAIL_CHARS_MAX, GetSymbolParams,
+        GlobalFailureClass, GlobalPageWarningCode, LANGUAGE_IDENTITY_PATTERN, Language,
+        PAGE_DEFAULT, PAGE_LIMIT_MAX, PackageIdentity, REVISION_ID_BYTES_MAX, ReadWarning,
         RevisionId, RevisionIdViolation, SOURCE_WARNINGS_MAX, SearchScope, SourceUnitId, Symbol,
         SymbolId,
     };
@@ -3289,13 +3321,13 @@ mod tests {
         );
     }
 
-    /// Each relationship facet label matches the spelling serde emits.
+    /// Each edge kind label matches the spelling serde emits.
     #[test]
-    fn relationship_facet_labels_match_serde() {
-        for facet in RelationshipFacet::VARIANTS {
+    fn edge_kind_labels_match_serde() {
+        for kind in EdgeKind::VARIANTS {
             assert_eq!(
-                serde_json::to_value(facet).expect("serializes"),
-                json!(facet.as_ref())
+                serde_json::to_value(kind).expect("serializes"),
+                json!(kind.as_ref())
             );
         }
     }
@@ -3360,12 +3392,9 @@ mod tests {
     /// from the schema; this pins the advertised default to the constant the field's
     /// default function returns.
     #[test]
-    fn get_symbol_params_schema_page_index_default_equals_the_enforced_constant() {
+    fn get_symbol_params_schema_page_default_equals_the_enforced_constant() {
         let schema = serde_json::to_value(schema_for!(GetSymbolParams)).expect("schema");
-        assert_eq!(
-            schema["properties"]["page_index"]["default"],
-            json!(PAGE_INDEX_DEFAULT)
-        );
+        assert_eq!(schema["properties"]["page"]["default"], json!(PAGE_DEFAULT));
     }
 
     /// A `global_page_warning` carries the global API's `detail` as it arrived, so its
@@ -3385,13 +3414,13 @@ mod tests {
         );
     }
 
-    /// The schema's `maximum` on `limit` and `accepted_limit`'s refusal both read
+    /// The schema's `maximum` on `max_results` and `accepted_limit`'s refusal both read
     /// `PAGE_LIMIT_MAX`; this pins the advertised maximum to that one constant.
     #[test]
     fn get_symbol_params_schema_limit_maximum_equals_the_enforced_constant() {
         let schema = serde_json::to_value(schema_for!(GetSymbolParams)).expect("schema");
         assert_eq!(
-            schema["properties"]["limit"]["maximum"],
+            schema["properties"]["max_results"]["maximum"],
             json!(PAGE_LIMIT_MAX)
         );
     }
@@ -3420,7 +3449,7 @@ mod tests {
     }
 
     /// `include: {"source": true}` names no `GetSymbolInclude` member: a declaration's source
-    /// is read by `nodes`. A request naming it is refused at deserialization, and the refusal
+    /// is read by `facets`. A request naming it is refused at deserialization, and the refusal
     /// names the accepted members.
     #[test]
     fn get_symbol_include_refuses_source_and_names_the_accepted_values() {
@@ -3606,7 +3635,7 @@ mod tests {
             "language": "rust",
             "name": "Beacon",
             "kind": "struct",
-            "facets": ["type"],
+            "kinds": ["type"],
             "origin": {
                 "location": "dependency",
                 "package": { "manager": "cargo", "registry": "crates.io", "name": "beacon-core", "version": "0.1.0" },
@@ -3637,7 +3666,7 @@ mod tests {
             "language": "rust",
             "name": "Beacon",
             "kind": "struct",
-            "facets": ["type"]
+            "kinds": ["type"]
         });
         let symbol: Symbol =
             serde_json::from_value(common.clone()).expect("Symbol without origin decodes");
@@ -4024,28 +4053,28 @@ mod tests {
         assert_eq!(parsed, warning);
     }
 
-    /// An empty facet list is omitted, so absence is the signal a caller reads.
+    /// An empty kind list is omitted, so absence is the signal a caller reads.
     #[test]
-    fn the_relationship_coverage_warning_omits_an_empty_facet_list() {
+    fn the_edge_coverage_warning_omits_an_empty_kind_list() {
         let cases = [
             (
-                ReadWarning::RelationshipCoverageMissing {
-                    facets: vec![RelationshipFacet::Implements],
-                    detail: "no lane populates the requested facet implements".to_owned(),
+                ReadWarning::EdgeCoverageMissing {
+                    kinds: vec![EdgeKind::Implements],
+                    detail: "no lane populates the requested kind implements".to_owned(),
                 },
                 json!({
-                    "code": "relationship_coverage_missing",
-                    "facets": ["implements"],
-                    "detail": "no lane populates the requested facet implements",
+                    "code": "edge_coverage_missing",
+                    "kinds": ["implements"],
+                    "detail": "no lane populates the requested kind implements",
                 }),
             ),
             (
-                ReadWarning::RelationshipCoverageMissing {
-                    facets: Vec::new(),
+                ReadWarning::EdgeCoverageMissing {
+                    kinds: Vec::new(),
                     detail: "no lane populates the requested coverage".to_owned(),
                 },
                 json!({
-                    "code": "relationship_coverage_missing",
+                    "code": "edge_coverage_missing",
                     "detail": "no lane populates the requested coverage",
                 }),
             ),
@@ -4192,7 +4221,7 @@ mod tests {
             "package_requirement_absent",
             "package_unavailable",
             "package_context_degraded",
-            "relationship_coverage_missing",
+            "edge_coverage_missing",
             "history_store_filling",
         ] {
             assert!(
@@ -4331,4 +4360,21 @@ mod retained_name_tests {
             assert!(!symbol_name_is_retained(name, usize::MAX));
         }
     }
+}
+
+/// Most results returned in one global search or pattern page.
+pub const GLOBAL_MAX_RESULTS: u64 = 1000;
+
+/// The selected page of global search or pattern results.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GlobalPageParams {
+    /// The 1-based page to read.
+    #[serde(default = "default_page")]
+    #[schemars(range(min = 1_u64))]
+    pub page: u64,
+    /// Results per page, at most 1000.
+    #[serde(default = "default_max_results")]
+    #[schemars(range(min = 1_u64, max = GLOBAL_MAX_RESULTS))]
+    pub max_results: u64,
 }
