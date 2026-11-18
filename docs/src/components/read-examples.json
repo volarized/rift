@@ -12,11 +12,7 @@
         "language": "rust",
         "name": "load_config",
         "kind": "function",
-        "facets": [
-          "value",
-          "callable",
-          "public"
-        ],
+        "facets": ["value", "callable", "public"],
         "visibility": "pub",
         "signatures": [
           {
@@ -44,13 +40,9 @@
             "end": 355
           },
           "line": 11,
-          "signature_indices": [
-            0
-          ],
+          "signature_indices": [0],
           "type_indices": [],
-          "documentation_indices": [
-            0
-          ]
+          "documentation_indices": [0]
         }
       ]
     }
@@ -68,11 +60,7 @@
         "language": "rust",
         "name": "load_config",
         "kind": "function",
-        "facets": [
-          "value",
-          "callable",
-          "public"
-        ],
+        "facets": ["value", "callable", "public"],
         "visibility": "pub",
         "signatures": [
           {
@@ -100,13 +88,9 @@
             "end": 59
           },
           "line": 2,
-          "signature_indices": [
-            0
-          ],
+          "signature_indices": [0],
           "type_indices": [],
-          "documentation_indices": [
-            0
-          ]
+          "documentation_indices": [0]
         }
       ]
     }
@@ -582,10 +566,7 @@
               "unit": "rift://source/project/src/config.rs",
               "language": "rust",
               "kind": "function_item",
-              "facets": [
-                "declaration",
-                "definition"
-              ],
+              "facets": ["declaration", "definition"],
               "range": {
                 "start": 218,
                 "end": 355
@@ -767,10 +748,7 @@
               "unit": "rift://source/project/src/config.rs",
               "language": "rust",
               "kind": "let_declaration",
-              "facets": [
-                "declaration",
-                "definition"
-              ],
+              "facets": ["declaration", "definition"],
               "range": {
                 "start": 287,
                 "end": 329
@@ -797,9 +775,7 @@
               "unit": "rift://source/project/src/config.rs",
               "language": "rust",
               "kind": "try_expression",
-              "facets": [
-                "expression"
-              ],
+              "facets": ["expression"],
               "range": {
                 "start": 298,
                 "end": 328
@@ -813,9 +789,7 @@
               "unit": "rift://source/project/src/config.rs",
               "language": "rust",
               "kind": "call_expression",
-              "facets": [
-                "expression"
-              ],
+              "facets": ["expression"],
               "range": {
                 "start": 298,
                 "end": 327
@@ -920,9 +894,7 @@
               "unit": "rift://source/project/src/config.rs",
               "language": "rust",
               "kind": "call_expression",
-              "facets": [
-                "expression"
-              ],
+              "facets": ["expression"],
               "range": {
                 "start": 334,
                 "end": 353
@@ -962,9 +934,7 @@
               "unit": "rift://source/project/src/config.rs",
               "language": "rust",
               "kind": "reference_expression",
-              "facets": [
-                "expression"
-              ],
+              "facets": ["expression"],
               "range": {
                 "start": 347,
                 "end": 352
