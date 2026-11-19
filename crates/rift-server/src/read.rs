@@ -380,6 +380,37 @@ impl ReadService {
         crate::map::build_preparation_map(source, text, self.revisions.wire_index_tree_revision())
     }
 
+    /// Whether static edge producers have complete captured identities and bounds.
+    ///
+    /// # Errors
+    /// Returns the captured identity directory failure.
+    pub fn static_edges_complete(&self) -> Result<bool, RiftError> {
+        if !self.index.edges().is_complete() {
+            return Ok(false);
+        }
+        for file in self
+            .index
+            .files()
+            .filter(|file| file.syntax().static_facts().is_some())
+        {
+            if !self
+                .index
+                .identity_coverage_complete(file.syntax().language())?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Whether a configured engine serves a captured source language.
+    #[must_use]
+    pub fn uses_edge_engines(&self, engines: &crate::EnginePool) -> bool {
+        self.index
+            .files()
+            .any(|file| engines.engine_for(file.syntax().language()).is_some())
+    }
+
     /// The symbol reference adjacency built from this snapshot's normalized graph: which
     /// symbols reference which, in both directions.
     #[must_use]
@@ -2481,7 +2512,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             value["pagination"],
-            json!({"page": 1, "pages": 1, "max_results": 10, "total": 2})
+            json!({"page": 1, "pages": 1, "max_results": 10, "total": 3})
         );
         Ok(())
     }
@@ -2546,7 +2577,10 @@ pub(crate) mod tests {
         let top_value = serde_json::to_value(service.get_symbol(&top_level)?)?;
         let beacon = &top_value["hits"][0]["symbol"];
         assert_eq!(beacon["kind"], json!("struct"));
-        assert_eq!(beacon["kinds"], json!(["type", "public"]));
+        assert_eq!(
+            beacon["kinds"],
+            json!(["type", "public", "member_container"])
+        );
         assert!(
             beacon.get("container").is_none(),
             "a top-level declaration serves no container"
@@ -4190,20 +4224,28 @@ pub(crate) mod tests {
         let first_value = serde_json::to_value(service.get_symbol(&first)?)?;
         assert_eq!(
             first_value["pagination"],
-            json!({"page": 1, "pages": 2, "max_results": 1, "total": 2})
+            json!({"page": 1, "pages": 3, "max_results": 1, "total": 3})
         );
         let second: GetSymbolParams =
             serde_json::from_value(json!({"name": "Beacon", "max_results": 1, "page": 2}))?;
         let second_value = serde_json::to_value(service.get_symbol(&second)?)?;
         assert_eq!(
             second_value["pagination"],
-            json!({"page": 2, "pages": 2, "max_results": 1, "total": 2})
+            json!({"page": 2, "pages": 3, "max_results": 1, "total": 3})
         );
         assert_eq!(second_value["hits"].as_array().map(Vec::len), Some(1));
         assert_ne!(
-            first_value["hits"][0]["symbol"]["id"], second_value["hits"][0]["symbol"]["id"],
+            first_value["hits"][0]["range"], second_value["hits"][0]["range"],
             "consecutive pages must serve distinct declarations"
         );
+        assert_eq!(
+            first_value["hits"][0]["symbol"]["id"], second_value["hits"][0]["symbol"]["id"],
+            "the type declaration and its implementation are facets of one symbol"
+        );
+        let third: GetSymbolParams =
+            serde_json::from_value(json!({"name": "Beacon", "max_results": 1, "page": 3}))?;
+        let third_value = serde_json::to_value(service.get_symbol(&third)?)?;
+        assert_eq!(third_value["hits"][0]["symbol"]["name"], "signal");
         Ok(())
     }
 
@@ -4216,7 +4258,7 @@ pub(crate) mod tests {
         assert_eq!(value["hits"], json!([]));
         assert_eq!(
             value["pagination"],
-            json!({"page": 40, "pages": 2, "max_results": 1, "total": 2})
+            json!({"page": 40, "pages": 3, "max_results": 1, "total": 3})
         );
         Ok(())
     }

@@ -128,7 +128,20 @@ pub struct StaticReexport {
     pub export: ByteRange,
 }
 
-/// One inherent Rust implementation and the type its methods belong to.
+/// One Rust use path, including its enclosing groups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticRustUse {
+    /// Leaf path or wildcard range.
+    pub range: ByteRange,
+    /// Each group prefix followed by the leaf path.
+    pub path: Vec<ByteRange>,
+    /// Scope where the import applies.
+    pub scope: ByteRange,
+    /// Whether the path imports every visible member.
+    pub glob: bool,
+}
+
+/// One Rust implementation and the type its methods belong to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StaticInherentImpl {
     /// Authored implementation range.
@@ -160,7 +173,9 @@ pub struct StaticFactsParts {
     pub assignments: Vec<ByteRange>,
     /// Scopes with unsupported binding shapes.
     pub unsupported_bindings: Vec<ByteRange>,
-    /// Authored Rust inherent implementations.
+    /// Rust use paths.
+    pub rust_uses: Vec<StaticRustUse>,
+    /// Authored Rust implementations.
     pub inherent_impls: Vec<StaticInherentImpl>,
     /// Items whose admission depends on unresolved Rust configuration.
     pub conditional_items: Vec<ByteRange>,
@@ -245,7 +260,13 @@ impl StaticFacts {
         &self.0.unsupported_bindings
     }
 
-    /// Rust inherent implementation headers.
+    /// Rust use paths with their captured group components.
+    #[must_use]
+    pub fn rust_uses(&self) -> &[StaticRustUse] {
+        &self.0.rust_uses
+    }
+
+    /// Rust implementation headers.
     #[must_use]
     pub fn inherent_impls(&self) -> &[StaticInherentImpl] {
         &self.0.inherent_impls
@@ -270,10 +291,18 @@ impl StaticFacts {
             vector_capacity(&self.0.assignments),
             vector_capacity(&self.0.unsupported_bindings),
             vector_capacity(&self.0.inherent_impls),
+            vector_capacity(&self.0.rust_uses),
             vector_capacity(&self.0.conditional_items),
         ]
         .into_iter()
         .fold(0, usize::saturating_add)
+        .saturating_add(
+            self.0
+                .rust_uses
+                .iter()
+                .map(|row| vector_capacity(&row.path))
+                .fold(0, usize::saturating_add),
+        )
     }
 
     pub(crate) fn validate(&self, source: &str, limits: SyntaxLimits) -> Result<(), RiftError> {
@@ -289,12 +318,20 @@ impl StaticFacts {
             self.assignments().len(),
             self.unsupported_bindings().len(),
             self.inherent_impls().len(),
+            self.rust_uses().len(),
             self.conditional_items().len(),
         ];
         if lengths
             .into_iter()
             .any(|length| length > limits.syntax_elements_max())
         {
+            return errors::syntax::facts_count_exceeded().fail();
+        }
+        let components = self
+            .rust_uses()
+            .iter()
+            .try_fold(0_usize, |count, row| count.checked_add(row.path.len()));
+        if components.is_none_or(|count| count > limits.syntax_elements_max()) {
             return errors::syntax::facts_count_exceeded().fail();
         }
         let valid = |range: ByteRange| {
@@ -339,6 +376,18 @@ impl StaticFacts {
         let implementations = self.inherent_impls().iter().all(|row| {
             valid(row.range) && valid(row.type_path) && contains(row.range, row.type_path)
         });
+        let imports = self.rust_uses().iter().all(|row| {
+            valid(row.range)
+                && valid(row.scope)
+                && row.scope.encloses(row.range)
+                && !row.path.is_empty()
+                && row.path.len() <= limits.syntax_depth_max()
+                && row
+                    .path
+                    .iter()
+                    .copied()
+                    .all(|range| valid(range) && row.scope.encloses(range))
+        });
         let conditional = self.conditional_items().iter().copied().all(valid);
         if !(edges
             && references
@@ -349,6 +398,7 @@ impl StaticFacts {
             && assignments
             && unsupported
             && implementations
+            && imports
             && conditional)
         {
             return errors::syntax::facts_range_invalid().fail();
@@ -412,7 +462,7 @@ fn vector_capacity<T>(items: &Vec<T>) -> usize {
 enum Grammar {
     Python(&'static python_edges::EdgePythonKinds),
     JavaScript(&'static javascript::Kinds),
-    Rust(&'static rust::Kinds),
+    Rust(&'static rust::Kinds, rift_core::LoopBudget),
 }
 
 pub(crate) struct Capture<'source> {
@@ -453,9 +503,12 @@ impl<'source> Capture<'source> {
         }
     }
 
-    pub(crate) fn for_rust(source: &'source str) -> Self {
+    pub(crate) fn for_rust(source: &'source str, limits: SyntaxLimits) -> Self {
         Self {
-            grammar: Grammar::Rust(rust::kinds()),
+            grammar: Grammar::Rust(
+                rust::kinds(),
+                rift_core::LoopBudget::new(limits.syntax_elements_max()),
+            ),
             edge_heritage: heritage_edges::edge_rust_kinds(),
             source,
             facts: StaticFacts::default(),
@@ -471,12 +524,14 @@ impl<'source> Capture<'source> {
             return Ok(());
         }
         self.edge_heritage.record_edge(visited, &mut self.facts.0)?;
-        match self.grammar {
+        match &mut self.grammar {
             Grammar::Python(kinds) => kinds.record_edge(visited, &mut self.facts.0),
             Grammar::JavaScript(kinds) => {
                 kinds.record(syntax_element, self.source, &mut self.facts.0)
             }
-            Grammar::Rust(kinds) => kinds.record(syntax_element, self.source, &mut self.facts.0),
+            Grammar::Rust(kinds, budget) => {
+                kinds.record(syntax_element, self.source, &mut self.facts.0, budget)
+            }
         }
     }
 

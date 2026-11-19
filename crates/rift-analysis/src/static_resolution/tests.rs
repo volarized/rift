@@ -965,7 +965,7 @@ fn javascript_cycles_malformed_sources_and_work_exhaustion_remain_distinct() {
 }
 
 #[test]
-fn rust_uses_admitted_module_paths_and_excludes_trait_and_conditional_candidates() {
+fn rust_uses_admitted_module_paths_and_excludes_conditional_candidates() {
     let source = "mod tasks;\n\
                   use crate::tasks::run as start;\n\
                   struct Job;\n\
@@ -995,6 +995,7 @@ fn rust_uses_admitted_module_paths_and_excludes_trait_and_conditional_candidates
                 "job.execute()",
                 "rift://symbol/local/rust/fixture/Job/execute"
             ),
+            ("job.wrong()", "rift://symbol/local/rust/fixture/Job/wrong"),
         ]
     );
     assert!(!result.exhausted);
@@ -1013,4 +1014,79 @@ fn rust_shadowed_value_and_conditional_module_do_not_reach_decoys() {
     );
     assert_eq!(calls(&result, "src/lib.rs").count(), 0);
     assert_eq!(result.unresolved_sites, 2);
+}
+
+#[test]
+fn test_rust_grouped_imports_and_known_receivers_resolve_calls() {
+    let source = "mod jobs; use crate::jobs::{Task, leaf as run}; fn root(task: &Task) { run(); Task::new(); task.execute(); }";
+    let result = resolution(
+        "rust",
+        &[
+            ("src/lib.rs", source),
+            (
+                "src/jobs.rs",
+                "pub struct Task; pub fn leaf() {} impl Task { pub fn new() -> Self { Self } pub fn execute(&self) {} }",
+            ),
+        ],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    let found = calls(&result, "src/lib.rs")
+        .map(|edge| source_of(edge, source))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        found,
+        ["run()", "Task::new()", "task.execute()"],
+        "{result:?}"
+    );
+}
+
+#[test]
+fn test_rust_generic_impl_self_and_trait_calls_resolve() {
+    let source = "trait Run { fn run(&self); } struct Task<T> { value: T } impl<T> Task<T> { fn new() {} fn execute(&self) { Self::new(); self.run(); } } impl<T> Run for Task<T> { fn run(&self) { self.execute(); } }";
+    let result = resolution(
+        "rust",
+        &[("src/lib.rs", source)],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    let found = calls(&result, "src/lib.rs")
+        .map(|edge| source_of(edge, source))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        found,
+        ["Self::new()", "self.run()", "self.execute()"],
+        "{result:?}"
+    );
+}
+
+#[test]
+fn test_rust_nested_use_groups_keep_module_aliases_and_globs() {
+    for source in [
+        "mod jobs; use crate::jobs::{self as tasks, *}; fn root() { leaf(); tasks::leaf(); }",
+        "mod jobs; use jobs::{self as tasks, *}; fn root() { leaf(); tasks::leaf(); }",
+    ] {
+        let result = resolution(
+            "rust",
+            &[("src/lib.rs", source), ("src/jobs.rs", "pub fn leaf() {}")],
+            &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+            WORK_MAX,
+        );
+        let found = calls(&result, "src/lib.rs")
+            .map(|edge| source_of(edge, source))
+            .collect::<Vec<_>>();
+        assert_eq!(found, ["leaf()", "tasks::leaf()"], "{result:?}");
+    }
+}
+
+#[test]
+fn test_rust_tuple_bindings_keep_unrelated_calls() {
+    let source = "fn leaf() {} fn root() { let (left, right) = (0, 1); leaf(); }";
+    let result = resolution(
+        "rust",
+        &[("src/lib.rs", source)],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    assert_eq!(calls(&result, "src/lib.rs").count(), 1, "{result:?}");
 }

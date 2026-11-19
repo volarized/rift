@@ -36,23 +36,20 @@ impl<'read> CapturedCalls<'read> {
             .iter()
             .filter(|edge| edge.kind() == EdgeKind::Calls && edge.static_callee().is_some());
         let edges = calls.by_ref().take(TRAVERSAL_SYMBOLS_MAX).collect();
-        let edge_complete = reads
-            .index()
-            .symbols_by_identity_page(seed, 0, 1)
-            .is_ok_and(|(declarations, count)| {
-                count == 1
-                    && declarations.first().is_some_and(|declaration| {
-                        let range = (direction == TraversalDirection::Outgoing).then_some(
-                            rift_syntax::ByteRange {
-                                start: declaration.symbol.item_range.start,
-                                end: declaration.symbol.item_range.end,
-                            },
-                        );
-                        reads
-                            .index()
-                            .static_edge_calls_complete(declaration.file.path(), range)
-                    })
-            });
+        let edge_complete = super::edge_declarations(reads, seed).is_ok_and(|declarations| {
+            !declarations.is_empty()
+                && declarations.iter().all(|declaration| {
+                    let range = (direction == TraversalDirection::Outgoing).then_some(
+                        rift_syntax::ByteRange {
+                            start: declaration.symbol.item_range.start,
+                            end: declaration.symbol.item_range.end,
+                        },
+                    );
+                    reads
+                        .index()
+                        .static_edge_calls_complete(declaration.file.path(), range)
+                })
+        });
         Self {
             reads,
             direction,
@@ -62,9 +59,13 @@ impl<'read> CapturedCalls<'read> {
         }
     }
 
+    pub(super) const fn is_complete(&self) -> bool {
+        self.edge_complete && !self.truncated
+    }
+
     pub(super) fn answer(self) -> Option<GraphCalls> {
         (self.edge_complete || !self.edges.is_empty()).then(|| {
-            let complete = self.edge_complete && !self.truncated;
+            let complete = self.is_complete();
             self.combine(GraphCalls {
                 complete,
                 ..GraphCalls::default()

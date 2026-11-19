@@ -2126,6 +2126,46 @@ async fn search_traversal_outgoing_over_an_unavailable_global_api_drops_package_
     Ok(())
 }
 
+/// An unnamed runtime target does not invalidate a separately established local call.
+/// Complete lists and negative answers still require the missing provider coverage.
+#[tokio::test]
+async fn search_calls_prove_local_witness_when_a_runtime_target_has_no_collection() -> TestResult {
+    let configuration = format!("[global]\nenabled = false\n{OUTGOING_ENGINE}");
+    let (_directory, client, _server_task) = workspace_client::served_prepared_workspace(
+        OUTGOING_FILES,
+        Some(configuration),
+        python_runtime_environment::prepare,
+    )
+    .await?;
+    let caller = captured_seed(&client, "counted", "extra.py").await?;
+    let leaf = captured_seed(&client, "leaf", "graph.py").await?;
+    for query in [
+        format!("ASK {{ <{caller}> :calls <{leaf}> }}"),
+        format!("ASK {{ <{caller}> :calls ?t FILTER(?t IN (<{leaf}>)) }}"),
+    ] {
+        let answer =
+            call_retrying_acceptance(&client, tool_request("search", &json!({"query":query})))
+                .await?;
+        assert_eq!(
+            answer["answer"],
+            json!({"result":"boolean","value":true}),
+            "{answer}"
+        );
+    }
+    for query in [
+        format!("SELECT ?t {{ <{caller}> :calls ?t }}"),
+        format!("ASK {{ <{caller}> :calls <rift://symbol/local/python/absent> }}"),
+        format!("ASK {{ <{caller}> :calls ?t FILTER NOT EXISTS {{ ?t :calls ?other }} }}"),
+    ] {
+        let answer =
+            call_retrying_acceptance(&client, tool_request("search", &json!({"query":query})))
+                .await?;
+        assert_eq!(answer["reason"], "insufficient_coverage", "{answer}");
+    }
+    client.cancel().await?;
+    Ok(())
+}
+
 /// A global API whose capabilities leave out the declarations feature names no callee:
 /// every package callee drops, the answer names the feature the global API lacks, and no
 /// declarations request is sent.

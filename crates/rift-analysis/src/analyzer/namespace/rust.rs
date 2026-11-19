@@ -822,6 +822,9 @@ fn local_target<'input>(
             continue;
         };
         for symbol in file.syntax.symbols() {
+            if symbol.kind == "impl_item" {
+                continue;
+            }
             *work = work.checked_add(1)?;
             if *work > work_max {
                 return None;

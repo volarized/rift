@@ -515,9 +515,20 @@ impl WorkspaceSemantics {
         edges_max: usize,
     ) {
         let work_max = edges_max.saturating_mul(16);
-        let resolution = crate::static_resolution::resolve(&self.graph, sources, input, work_max);
+        let mut resolution =
+            crate::static_resolution::resolve(&self.graph, sources, input, work_max);
         self.edges
             .add_static(&self.graph, &resolution.occurrences, edges_max);
+        resolution.occurrences.retain(|occurrence| {
+            !matches!(
+                occurrence.edge_kind,
+                Some(
+                    rift_protocol::read::EdgeKind::Contains
+                        | rift_protocol::read::EdgeKind::Overrides
+                )
+            )
+        });
+
         self.static_occurrence_order = (0..resolution.occurrences.len()).collect();
         self.static_occurrence_order.sort_unstable_by_key(|index| {
             (

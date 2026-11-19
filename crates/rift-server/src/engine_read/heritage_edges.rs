@@ -26,6 +26,67 @@ struct EdgeEngineReport {
     encoding: PositionEncoding,
 }
 
+/// Reads engine heritage facts targeting the bounded captured type inventory.
+///
+/// # Errors
+/// Refuses incomplete identities, unsupported kinds, exceeded bounds or engine failures.
+///
+/// # Cancel safety
+/// Dropping the future cancels the current exchange and retains no inventory.
+pub async fn graph_heritage_inventory(
+    reads: &ReadService,
+    engines: &EnginePool,
+    kinds: &[EdgeKind],
+    requests_max: usize,
+    deadline: Instant,
+) -> Result<(Vec<Edge>, Vec<ReadWarning>), RiftError> {
+    if kinds
+        .iter()
+        .any(|kind| !matches!(kind, EdgeKind::Extends | EdgeKind::Implements))
+    {
+        return Err(graph_reference_coverage());
+    }
+    let maximum = requests_max / kinds.len().max(1);
+    let view = reads.index().symbol_view()?;
+    if !view.objects_complete() {
+        return Err(graph_reference_coverage());
+    }
+    let mut targets = Vec::new();
+    for (identity, object) in view.objects() {
+        if object?
+            .facts()
+            .symbol_kinds()
+            .contains(&rift_protocol::read::SymbolKind::Type)
+        {
+            if targets.len() == maximum {
+                return Err(graph_reference_coverage());
+            }
+            targets.push(SymbolId(identity.as_str().to_owned()));
+        }
+    }
+    let mut edges = Vec::new();
+    let mut warnings = Vec::new();
+    for target in targets {
+        for &kind in kinds {
+            let (found, reported) = Box::pin(graph_heritage_edges(
+                reads,
+                engines,
+                &target,
+                kind,
+                TraversalDirection::Incoming,
+                deadline,
+            ))
+            .await?;
+            if edges.len().saturating_add(found.len()) > TRAVERSAL_SYMBOLS_MAX {
+                return Err(graph_reference_coverage());
+            }
+            edges.extend(found);
+            warnings.extend(reported);
+        }
+    }
+    Ok((edges, warnings))
+}
+
 /// Reads inheritance edges from the capabilities the selected engine advertises.
 ///
 /// # Errors
