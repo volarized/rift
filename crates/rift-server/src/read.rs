@@ -380,6 +380,37 @@ impl ReadService {
         crate::map::build_preparation_map(source, text, self.revisions.wire_index_tree_revision())
     }
 
+    /// Whether static edge producers have complete captured identities and bounds.
+    ///
+    /// # Errors
+    /// Returns the captured identity directory failure.
+    pub fn static_edges_complete(&self) -> Result<bool, RiftError> {
+        if !self.index.edges().is_complete() {
+            return Ok(false);
+        }
+        for file in self
+            .index
+            .files()
+            .filter(|file| file.syntax().static_facts().is_some())
+        {
+            if !self
+                .index
+                .identity_coverage_complete(file.syntax().language())?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Whether a configured engine serves a captured source language.
+    #[must_use]
+    pub fn uses_edge_engines(&self, engines: &crate::EnginePool) -> bool {
+        self.index
+            .files()
+            .any(|file| engines.engine_for(file.syntax().language()).is_some())
+    }
+
     /// The symbol reference adjacency built from this snapshot's normalized graph: which
     /// symbols reference which, in both directions.
     #[must_use]
