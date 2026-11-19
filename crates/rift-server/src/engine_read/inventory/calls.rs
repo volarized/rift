@@ -10,10 +10,23 @@ use super::GraphCalls;
 pub(super) fn merge_calls(
     hierarchy: Vec<(SymbolId, GraphCalls)>,
     definitions: Vec<(SymbolId, GraphCalls)>,
+    locations: Vec<(SymbolId, SourceUnitSpan, u64)>,
 ) -> Vec<(SymbolId, GraphCalls)> {
+    let mut authored = BTreeMap::<_, BTreeMap<_, _>>::new();
+    for (caller, source, at) in locations {
+        authored
+            .entry(caller)
+            .or_default()
+            .insert((source.unit.0, source.range.start, source.range.end), at);
+    }
     let sites: BTreeMap<_, _> = definitions
         .iter()
-        .map(|(seed, calls)| (seed.clone(), DefinitionSites::new(calls)))
+        .map(|(seed, calls)| {
+            (
+                seed.clone(),
+                DefinitionSites::new(calls, authored.get(seed)),
+            )
+        })
         .collect();
     let mut answers: BTreeMap<_, _> = definitions.into_iter().collect();
     for (seed, mut native) in hierarchy {
@@ -32,65 +45,50 @@ pub(super) fn merge_calls(
     answers.into_iter().collect()
 }
 
+type AuthoredSites = BTreeMap<(String, u64, u64), u64>;
+
 struct DefinitionSites {
-    units: BTreeMap<String, CallIntervals>,
+    units: BTreeMap<String, BTreeMap<u64, Vec<(u64, u64)>>>,
 }
 
 impl DefinitionSites {
-    fn new(calls: &GraphCalls) -> Self {
-        let mut units = BTreeMap::<_, Vec<_>>::new();
+    fn new(calls: &GraphCalls, authored: Option<&AuthoredSites>) -> Self {
+        let mut units = BTreeMap::<_, BTreeMap<_, Vec<_>>>::new();
         for (_, ranges) in &calls.local {
             for source in ranges {
+                let key = (source.unit.0.clone(), source.range.start, source.range.end);
+                let Some(at) = authored.and_then(|authored| authored.get(&key)) else {
+                    continue;
+                };
                 units
-                    .entry(source.unit.as_str().to_owned())
+                    .entry(source.unit.0.clone())
+                    .or_default()
+                    .entry(*at)
                     .or_default()
                     .push((source.range.start, source.range.end));
             }
         }
-        Self {
-            units: units
-                .into_iter()
-                .map(|(unit, ranges)| (unit, CallIntervals::new(ranges)))
-                .collect(),
-        }
+        Self { units }
     }
 
     fn remove_repeated(&self, calls: &mut GraphCalls) {
         let retain = |ranges: &mut Vec<SourceUnitSpan>| {
             let located = !ranges.is_empty();
             ranges.retain(|source| {
-                !self
-                    .units
-                    .get(source.unit.as_str())
-                    .is_some_and(|spans| spans.contains(source))
+                !self.units.get(source.unit.as_str()).is_some_and(|points| {
+                    points
+                        .range(source.range.start..source.range.end)
+                        .any(|(_, spans)| {
+                            spans.iter().any(|(start, end)| {
+                                *start <= source.range.start && source.range.end <= *end
+                            })
+                        })
+                })
             });
             !located || !ranges.is_empty()
         };
         calls.local.retain_mut(|(_, ranges)| retain(ranges));
         calls.packages.retain_mut(|(_, ranges)| retain(ranges));
-    }
-}
-
-struct CallIntervals {
-    spans: Vec<(u64, u64)>,
-}
-
-impl CallIntervals {
-    fn new(mut spans: Vec<(u64, u64)>) -> Self {
-        spans.sort_unstable();
-        let mut end = 0;
-        for span in &mut spans {
-            end = end.max(span.1);
-            span.1 = end;
-        }
-        Self { spans }
-    }
-
-    fn contains(&self, source: &SourceUnitSpan) -> bool {
-        self.spans
-            .partition_point(|(start, _)| *start <= source.range.start)
-            .checked_sub(1)
-            .is_some_and(|position| self.spans[position].1 >= source.range.end)
     }
 }
 
@@ -104,6 +102,33 @@ mod tests {
             unit: SourceUnitId("rift://source/project/lib.rs".to_owned()),
             range: TextRange { start, end },
         }
+    }
+
+    #[test]
+    fn native_calls_inside_arguments_survive_a_resolved_outer_call() {
+        let caller = SymbolId("rift://symbol/local/rust/test/caller".to_owned());
+        let outer = SymbolId("rift://symbol/local/rust/test/outer".to_owned());
+        let expanded = SymbolId("rift://symbol/local/rust/test/expanded".to_owned());
+        let definition = GraphCalls {
+            local: vec![(outer.clone(), vec![span(10, 30)])],
+            complete: true,
+            ..GraphCalls::default()
+        };
+        let hierarchy = GraphCalls {
+            local: vec![
+                (outer.clone(), vec![span(10, 13)]),
+                (expanded.clone(), vec![span(20, 25)]),
+            ],
+            complete: true,
+            ..GraphCalls::default()
+        };
+        let merged = merge_calls(
+            vec![(caller.clone(), hierarchy)],
+            vec![(caller.clone(), definition)],
+            vec![(caller, span(10, 30), 12)],
+        );
+        assert!(merged[0].1.local.contains(&(outer, vec![span(10, 30)])));
+        assert!(merged[0].1.local.contains(&(expanded, vec![span(20, 25)])));
     }
 
     #[test]
@@ -123,7 +148,8 @@ mod tests {
         };
         let merged = merge_calls(
             vec![(caller.clone(), hierarchy)],
-            vec![(caller, definition)],
+            vec![(caller.clone(), definition)],
+            vec![(caller, span(10, 30), 12)],
         );
         assert_eq!(merged[0].1.local, vec![(local, vec![span(10, 30)])]);
     }
@@ -142,7 +168,14 @@ mod tests {
             complete: false,
             ..GraphCalls::default()
         };
-        let merged = merge_calls(vec![(caller.clone(), native)], vec![(caller, defined)]);
+        let merged = merge_calls(
+            vec![(caller.clone(), native)],
+            vec![(caller.clone(), defined)],
+            vec![
+                (caller.clone(), span(10, 30), 12),
+                (caller, span(15, 20), 17),
+            ],
+        );
         let [(_, calls)] = merged.as_slice() else {
             panic!("one caller")
         };

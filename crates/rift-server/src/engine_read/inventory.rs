@@ -565,6 +565,17 @@ impl EngineInventoryAnswer {
             };
             calls.push((seed, answer));
         }
+        let sites = self
+            .definitions
+            .iter()
+            .map(|definition| {
+                (
+                    definition.caller.clone(),
+                    definition.source.clone(),
+                    definition.at,
+                )
+            })
+            .collect();
         let definitions = resolve_definitions(
             reads,
             &self.workspace_root,
@@ -577,7 +588,7 @@ impl EngineInventoryAnswer {
                     .static_facts()
                     .is_some_and(|facts| facts.unsupported_bindings().is_empty()),
         )?;
-        let calls = calls::merge_calls(calls, definitions);
+        let calls = calls::merge_calls(calls, definitions, sites);
         let reference_definitions = std::sync::Arc::new(self.reference_definitions);
         let mut references = Vec::new();
         for (seed, locations) in self.references {
@@ -837,10 +848,12 @@ struct InventoryCallSite {
     source: rift_protocol::read::SourceUnitSpan,
     utf8: Position,
     utf16: Position,
+    at: u64,
 }
 
 #[derive(Debug)]
 struct InventoryDefinition {
+    at: u64,
     caller: SymbolId,
     source: rift_protocol::read::SourceUnitSpan,
     locations: Vec<Location>,
@@ -877,6 +890,7 @@ fn inventory_call_sites(
             .map(|(offset, _)| start + offset)
             .ok_or_else(graph_call_coverage)?;
         sites.push(InventoryCallSite {
+            at: offset as u64,
             caller,
             source: rift_protocol::read::SourceUnitSpan {
                 unit: crate::read::source_unit_id(file.path()),
@@ -923,6 +937,7 @@ async fn read_definitions(
         for (site, locations) in chunk.iter().zip(answers) {
             report.charge(locations.len().saturating_add(1))?;
             report.definitions.push(InventoryDefinition {
+                at: site.at,
                 caller: site.caller.clone(),
                 source: site.source.clone(),
                 locations,
@@ -1056,6 +1071,7 @@ mod tests {
             PositionEncoding::Utf8,
             BTreeSet::from([caller.clone()]),
             vec![InventoryDefinition {
+                at: sites[0].at,
                 caller: caller.clone(),
                 source: sites[0].source.clone(),
                 locations: vec![Location {
