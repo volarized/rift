@@ -2481,7 +2481,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             value["pagination"],
-            json!({"page": 1, "pages": 1, "max_results": 10, "total": 2})
+            json!({"page": 1, "pages": 1, "max_results": 10, "total": 3})
         );
         Ok(())
     }
@@ -2546,7 +2546,10 @@ pub(crate) mod tests {
         let top_value = serde_json::to_value(service.get_symbol(&top_level)?)?;
         let beacon = &top_value["hits"][0]["symbol"];
         assert_eq!(beacon["kind"], json!("struct"));
-        assert_eq!(beacon["kinds"], json!(["type", "public"]));
+        assert_eq!(
+            beacon["kinds"],
+            json!(["type", "public", "member_container"])
+        );
         assert!(
             beacon.get("container").is_none(),
             "a top-level declaration serves no container"
@@ -4190,20 +4193,28 @@ pub(crate) mod tests {
         let first_value = serde_json::to_value(service.get_symbol(&first)?)?;
         assert_eq!(
             first_value["pagination"],
-            json!({"page": 1, "pages": 2, "max_results": 1, "total": 2})
+            json!({"page": 1, "pages": 3, "max_results": 1, "total": 3})
         );
         let second: GetSymbolParams =
             serde_json::from_value(json!({"name": "Beacon", "max_results": 1, "page": 2}))?;
         let second_value = serde_json::to_value(service.get_symbol(&second)?)?;
         assert_eq!(
             second_value["pagination"],
-            json!({"page": 2, "pages": 2, "max_results": 1, "total": 2})
+            json!({"page": 2, "pages": 3, "max_results": 1, "total": 3})
         );
         assert_eq!(second_value["hits"].as_array().map(Vec::len), Some(1));
         assert_ne!(
-            first_value["hits"][0]["symbol"]["id"], second_value["hits"][0]["symbol"]["id"],
+            first_value["hits"][0]["range"], second_value["hits"][0]["range"],
             "consecutive pages must serve distinct declarations"
         );
+        assert_eq!(
+            first_value["hits"][0]["symbol"]["id"], second_value["hits"][0]["symbol"]["id"],
+            "the type declaration and its implementation are facets of one symbol"
+        );
+        let third: GetSymbolParams =
+            serde_json::from_value(json!({"name": "Beacon", "max_results": 1, "page": 3}))?;
+        let third_value = serde_json::to_value(service.get_symbol(&third)?)?;
+        assert_eq!(third_value["hits"][0]["symbol"]["name"], "signal");
         Ok(())
     }
 
@@ -4216,7 +4227,7 @@ pub(crate) mod tests {
         assert_eq!(value["hits"], json!([]));
         assert_eq!(
             value["pagination"],
-            json!({"page": 40, "pages": 2, "max_results": 1, "total": 2})
+            json!({"page": 40, "pages": 3, "max_results": 1, "total": 3})
         );
         Ok(())
     }
