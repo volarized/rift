@@ -51,7 +51,10 @@ use rift_syntax::{
 use sha2::{Digest as _, Sha256};
 
 use crate::LocatedSyntax;
-use crate::capture::{CaptureBoundary, CapturedPath, LastCapture, capture_path, root_identity};
+use crate::capture::{
+    CaptureBoundary, CapturedPath, LastCapture, capture_io_error, capture_path, path_was_removed,
+    root_identity,
+};
 use crate::change_set::{FileDigest, FileRecord, PathChanges, WorkspaceDigests, tree_revision_of};
 use crate::chunk::text_chunks;
 use crate::content_cache::WorkspaceContentCache;
@@ -5585,7 +5588,7 @@ fn compiled_gitignore(
 ) -> Result<(Gitignore, FileDigest), RiftError> {
     const UTF8_BYTE_ORDER_MARK: char = '\u{feff}';
 
-    let file = fs::File::open(path).map_err(|error| catalog_io_error(path, error))?;
+    let file = fs::File::open(path).map_err(|error| capture_io_error(path, error))?;
     let bytes = read_file_bytes(file, path, limits)?;
     if bytes.len() > limits.file_bytes_max() {
         return errors::index::workspace_file_too_large()
@@ -6452,10 +6455,9 @@ fn walked_entry(
 
 /// Whether `error` reports a path strictly below `root` that no longer exists.
 fn removed_below(root: &Path, error: &ignore::Error) -> bool {
-    error
-        .io_error()
-        .is_some_and(|source| source.kind() == std::io::ErrorKind::NotFound)
-        && walk_source_path(error).is_some_and(|path| path != root && path.starts_with(root))
+    error.io_error().is_some()
+        && walk_source_path(error)
+            .is_some_and(|path| path != root && path.starts_with(root) && path_was_removed(&path))
 }
 
 fn walk_error(root: &Path, error: ignore::Error) -> RiftError {
@@ -6803,10 +6805,10 @@ fn catalog_file(
     path: &Path,
     limits: WorkspaceIndexLimits,
 ) -> Result<IndexRead<TextSourceFile>, RiftError> {
-    let handle = fs::File::open(path).map_err(|error| catalog_io_error(path, error))?;
+    let handle = fs::File::open(path).map_err(|error| capture_io_error(path, error))?;
     let metadata = handle
         .metadata()
-        .map_err(|error| catalog_io_error(path, error))?;
+        .map_err(|error| capture_io_error(path, error))?;
     let bytes = read_file_bytes(handle, path, limits)?;
     let project_path = project_path_below(root, path)?;
     if bytes.len() > limits.file_bytes_max() {
@@ -6845,20 +6847,6 @@ fn catalog_file(
     Ok(IndexRead::Included(file))
 }
 
-fn catalog_io_error(path: &Path, source: std::io::Error) -> RiftError {
-    if source.kind() == std::io::ErrorKind::NotFound {
-        errors::index::workspace_changed_during_capture()
-            .path(path)
-            .source(source)
-            .error()
-    } else {
-        errors::index::workspace_filesystem()
-            .path(path)
-            .source(source)
-            .error()
-    }
-}
-
 #[cfg(unix)]
 pub(crate) fn metadata_is_executable(metadata: &fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -6882,12 +6870,7 @@ pub(crate) fn read_file_bytes(
     reader
         .take(limits.file_bytes_max().saturating_add(1) as u64)
         .read_to_end(&mut bytes)
-        .map_err(|error| {
-            errors::index::workspace_filesystem()
-                .path(path)
-                .source(error)
-                .error()
-        })?;
+        .map_err(|error| capture_io_error(path, error))?;
     Ok(bytes)
 }
 
@@ -10807,7 +10790,10 @@ mod tests {
         }
 
         let limits = WorkspaceIndexLimits::new(5, 4, 100, 4, 5).expect("limits");
-        let error = super::read_file_bytes(FailedReader, Path::new("failed.rs"), limits)
+        let directory = tempfile::tempdir().expect("workspace");
+        let path = directory.path().join("failed.rs");
+        fs::write(&path, "source").expect("existing source file");
+        let error = super::read_file_bytes(FailedReader, &path, limits)
             .expect_err("a failed read must not become an omitted file");
         assert_eq!(error.slug(), errors::index::workspace_filesystem::SLUG);
         assert!(error.to_string().contains("failed.rs"), "{error}");
@@ -14997,6 +14983,71 @@ mod tests {
             });
             assert!(indexed.get(&kept).is_some(), "check {passed}: {indexed:?}");
             assert!(visible.get(&kept).is_some(), "check {passed}: {visible:?}");
+        }
+    }
+
+    /// A walk drops a removed entry even after a permission error (#785).
+    #[test]
+    fn test_walk_drops_removed_entries_after_a_permission_error() {
+        for remove_parent in [false, true] {
+            let directory = tempfile::tempdir().expect("workspace");
+            let root = directory.path();
+            let parent = root.join("nested");
+            fs::create_dir(&parent).expect("parent directory");
+            let path = parent.join("gone.rs");
+            fs::write(&path, "pub fn removed() {}\n").expect("source");
+            let error = ignore::Error::WithPath {
+                path: path.clone(),
+                err: Box::new(ignore::Error::Io(std::io::Error::from(
+                    std::io::ErrorKind::PermissionDenied,
+                ))),
+            };
+            if remove_parent {
+                fs::remove_dir_all(&parent).expect("remove parent after the failure");
+            } else {
+                fs::remove_file(&path).expect("remove entry after the failure");
+            }
+            let entry = super::walked_entry(root, Err(error)).expect("removed entry is absent");
+            assert!(entry.is_none());
+        }
+    }
+
+    #[test]
+    fn test_walk_refuses_a_permission_error_for_an_existing_entry() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path();
+        let path = root.join("kept.rs");
+        fs::write(&path, "pub fn kept() {}\n").expect("source");
+        let error = ignore::Error::WithPath {
+            path: path.clone(),
+            err: Box::new(ignore::Error::Io(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            ))),
+        };
+        let error = super::walked_entry(root, Err(error)).expect_err("existing entry refuses");
+        assert_eq!(error.slug(), errors::index::workspace_filesystem::SLUG);
+        assert_eq!(error_path(&error), Some(path));
+        let source = std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<ignore::Error>())
+            .and_then(ignore::Error::io_error)
+            .expect("original walk error");
+        assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn test_walk_refuses_a_missing_root_or_a_path_outside_the_root() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path().join("removed");
+        for path in [&root, directory.path()] {
+            let error = ignore::Error::WithPath {
+                path: path.to_path_buf(),
+                err: Box::new(ignore::Error::Io(std::io::Error::from(
+                    std::io::ErrorKind::NotFound,
+                ))),
+            };
+            let error = super::walked_entry(&root, Err(error)).expect_err("walk boundary refuses");
+            assert_eq!(error.slug(), errors::index::workspace_filesystem::SLUG);
+            assert_eq!(error_path(&error).as_deref(), Some(path));
         }
     }
 
