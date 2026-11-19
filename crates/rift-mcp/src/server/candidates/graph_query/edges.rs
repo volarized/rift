@@ -48,11 +48,28 @@ impl AcquiredAdjacency {
     fn capture_edge_inventory(
         &mut self,
         reads: &rift_server::ReadService,
+        required: rift_search::sparql::SemanticInventory,
     ) -> Result<(), RiftError> {
-        self.incomplete |= !reads.edges().is_complete();
+        self.incomplete |= !reads.static_edges_complete()?;
         let maximum = usize::try_from(RECORDS_MAX).map_err(|_| coverage_failure())?;
         for edge in reads.edges().edges() {
-            if self.local_edges.len() >= maximum {
+            let usage = (required.adjacency.references || required.occurrences.is_some())
+                && matches!(
+                    edge.kind(),
+                    EdgeKind::Calls
+                        | EdgeKind::References
+                        | EdgeKind::Imports
+                        | EdgeKind::Aliases
+                        | EdgeKind::Reads
+                        | EdgeKind::Writes
+                        | EdgeKind::HasType
+                );
+            let records = self
+                .local_edges
+                .len()
+                .saturating_add(self.local.len())
+                .saturating_add(if usage { 3 } else { 1 });
+            if records > maximum {
                 return Err(coverage_failure());
             }
             self.local_edges.push((
@@ -60,6 +77,25 @@ impl AcquiredAdjacency {
                 relation(edge.kind())?,
                 SymbolId(edge.to().as_str().to_owned()),
             ));
+            if usage {
+                let target = SymbolId(edge.to().as_str().to_owned());
+                let caller = SymbolId(edge.from().as_str().to_owned());
+                self.local_edges
+                    .push((caller.clone(), SymbolRelation::References, target.clone()));
+                let binding = edge.occurrence();
+                self.local.push(QueryOccurrence {
+                    target,
+                    enclosing: Some(caller),
+                    source: rift_protocol::read::SourceUnitSpan {
+                        unit: rift_protocol::read::SourceUnitId(binding.unit().to_string()),
+                        range: rift_protocol::read::TextRange {
+                            start: binding.range().start(),
+                            end: binding.range().end(),
+                        },
+                    },
+                    kind: edge.kind(),
+                });
+            }
         }
         Ok(())
     }
@@ -363,23 +399,51 @@ impl RiftMcp {
         deadline: RequestDeadline,
     ) -> Result<AcquiredAdjacency, RiftError> {
         let reads = &resolved.published.reads;
-        if required.edges
-            && !required.calls
-            && !required.references
-            && required.occurrences.is_none()
+        let engines = self.engine_pool_for(&resolved.published).await;
+        let captured_only = !reads.uses_edge_engines(&engines);
+        let full_adjacency = required.complete_adjacency
+            && (required.adjacency.calls
+                || required.adjacency.references
+                || required.occurrences.is_some());
+        if (captured_only && !full_adjacency)
+            || (!required.adjacency.calls
+                && !required.adjacency.references
+                && !required.adjacency.type_uses
+                && required.occurrences.is_none())
         {
             let mut acquired = AcquiredAdjacency::default();
-            acquired.capture_edge_inventory(reads)?;
+            acquired.capture_edge_inventory(reads, required)?;
             return Ok(acquired);
         }
+        if required.adjacency.type_uses
+            && !required.adjacency.calls
+            && !required.adjacency.references
+            && required.occurrences.is_none()
+        {
+            return self
+                .acquire_type_inventory(resolved, required, &engines, deadline)
+                .await;
+        }
+        self.acquire_engine_inventory(resolved, required, &engines, deadline)
+            .await
+    }
+
+    async fn acquire_engine_inventory(
+        &self,
+        resolved: &ResolvedWorkspace,
+        required: rift_search::sparql::SemanticInventory,
+        engines: &rift_server::EnginePool,
+        deadline: RequestDeadline,
+    ) -> Result<AcquiredAdjacency, RiftError> {
+        let reads = &resolved.published.reads;
         let context = reads.dependency_context();
         if resolved.stale.is_some() || context.is_degraded() || !context.entries().is_empty() {
             return Err(coverage_failure());
         }
-        let references = required.references || required.occurrences.is_some();
-        let enclosing =
-            required.references || required.occurrences.is_some_and(|usage| usage.enclosing);
-        let operations = u64::from(required.calls) + u64::from(references);
+        let references = required.adjacency.references || required.occurrences.is_some();
+        let enclosing = required.adjacency.references
+            || required.occurrences.is_some_and(|usage| usage.enclosing);
+        let operations = u64::from(required.adjacency.calls) + u64::from(references);
         let maximum = usize::try_from(REQUESTS_MAX / operations.max(1)).unwrap_or(usize::MAX);
         let capture = Arc::clone(reads);
         let seeds = self
@@ -390,18 +454,17 @@ impl RiftMcp {
                     .semantic_seeds(maximum)
             })
             .await?;
-        let engines = self.engine_pool_for(&resolved.published).await;
         let end = deadline.walk_end(resolved.capture_elapsed);
         let mut acquired = AcquiredAdjacency::default();
         if required.edges {
-            acquired.capture_edge_inventory(reads)?;
+            acquired.capture_edge_inventory(reads, required)?;
         }
         let mut remaining = usize::try_from(RECORDS_MAX).unwrap_or(usize::MAX);
         let roots = rift_server::CalleeRoots::default();
         for seed in seeds {
             if references {
                 let references = Box::pin(rift_server::graph_references(
-                    reads, &engines, &seed, enclosing, end,
+                    reads, engines, &seed, enclosing, end,
                 ))
                 .await?;
                 if !references.complete {
@@ -412,10 +475,10 @@ impl RiftMcp {
                     .ok_or_else(coverage_failure)?;
                 acquired.admit_references(&seed, references.occurrences);
             }
-            if required.calls {
+            if required.adjacency.calls {
                 let calls = Box::pin(rift_server::graph_calls(
                     reads,
-                    &engines,
+                    engines,
                     &roots,
                     &seed,
                     TraversalDirection::Outgoing,
@@ -436,6 +499,44 @@ impl RiftMcp {
                         .local_edges
                         .push((seed.clone(), SymbolRelation::Calls, target));
                 }
+            }
+        }
+        if !self
+            .engine_tree_matches(&resolved.published)
+            .await
+            .map_err(|_| coverage_failure())?
+        {
+            return Err(coverage_failure());
+        }
+        Ok(acquired)
+    }
+
+    async fn acquire_type_inventory(
+        &self,
+        resolved: &ResolvedWorkspace,
+        required: rift_search::sparql::SemanticInventory,
+        engines: &rift_server::EnginePool,
+        deadline: RequestDeadline,
+    ) -> Result<AcquiredAdjacency, RiftError> {
+        let reads = &resolved.published.reads;
+        let mut acquired = AcquiredAdjacency::default();
+        acquired.capture_edge_inventory(reads, required)?;
+        let report = Box::pin(rift_server::graph_type_uses(
+            reads,
+            engines,
+            deadline.walk_end(resolved.capture_elapsed),
+        ))
+        .await?;
+        acquired.incomplete |= !report.complete;
+        acquired.warnings.extend(report.edge_warnings);
+        for occurrence in report.occurrences {
+            if acquired.local_edges.len() == usize::try_from(RECORDS_MAX).unwrap_or(usize::MAX) {
+                return Err(coverage_failure());
+            }
+            if let Some(caller) = occurrence.enclosing {
+                acquired
+                    .local_edges
+                    .push((caller, SymbolRelation::HasType, occurrence.target));
             }
         }
         if !self
@@ -1223,6 +1324,8 @@ fn relation(kind: EdgeKind) -> Result<SymbolRelation, RiftError> {
         EdgeKind::Extends => Ok(SymbolRelation::Extends),
         EdgeKind::Implements => Ok(SymbolRelation::Implements),
         EdgeKind::Declares => Ok(SymbolRelation::Declares),
+        EdgeKind::Contains => Ok(SymbolRelation::Contains),
+        EdgeKind::Overrides => Ok(SymbolRelation::Overrides),
         EdgeKind::Reads => Ok(SymbolRelation::Reads),
         EdgeKind::Writes => Ok(SymbolRelation::Writes),
         EdgeKind::HasType => Ok(SymbolRelation::HasType),

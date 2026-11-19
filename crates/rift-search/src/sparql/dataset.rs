@@ -118,6 +118,10 @@ pub enum SymbolRelation {
     Implements,
     /// The source declares the target.
     Declares,
+    /// The source contains the target within its scope.
+    Contains,
+    /// The source replaces an inherited member.
+    Overrides,
     /// The source reads the target's value.
     Reads,
     /// The source assigns to the target.
@@ -577,6 +581,8 @@ impl SymbolRelation {
             Self::Extends => VocabularyProperty::Extends,
             Self::Implements => VocabularyProperty::Implements,
             Self::Declares => VocabularyProperty::Declares,
+            Self::Contains => VocabularyProperty::Contains,
+            Self::Overrides => VocabularyProperty::Overrides,
             Self::Reads => VocabularyProperty::Reads,
             Self::Writes => VocabularyProperty::Writes,
             Self::HasType => VocabularyProperty::HasType,

@@ -15,15 +15,26 @@ pub struct OccurrenceSelection {
     pub enclosing: bool,
 }
 
+/// Resolved adjacency needed by a query over the selected domain.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SemanticAdjacency {
+    /// The query can inspect call edges.
+    pub calls: bool,
+    /// The query can inspect type uses resolved at captured type positions.
+    pub type_uses: bool,
+    /// The query can inspect caller-to-target reference edges.
+    pub references: bool,
+}
+
 /// The semantic and physical facts needed from a complete selected domain.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SemanticInventory {
     /// The query can inspect captured edge kinds.
     pub edges: bool,
-    /// The query can inspect call edges.
-    pub calls: bool,
-    /// The query can inspect caller-to-target reference edges.
-    pub references: bool,
+    /// Resolved edge kinds the query can inspect.
+    pub adjacency: SemanticAdjacency,
+    /// Embedded graph patterns require complete provider adjacency.
+    pub complete_adjacency: bool,
     /// The query can inspect physical occurrences.
     pub occurrences: Option<OccurrenceSelection>,
 }
@@ -33,12 +44,18 @@ impl GraphQuery {
     /// can inspect is a symbol, an established edge, or a physical reference.
     #[must_use]
     pub fn semantic_inventory(&self) -> Option<SemanticInventory> {
-        self.admission().semantics.filter(|requirements| {
-            requirements.edges
-                || requirements.calls
-                || requirements.references
-                || requirements.occurrences.is_some()
-        })
+        self.admission()
+            .semantics
+            .map(|mut requirements| {
+                requirements.complete_adjacency = self.admission().embedded_patterns > 0;
+                requirements
+            })
+            .filter(|requirements| {
+                requirements.edges
+                    || requirements.adjacency.calls
+                    || requirements.adjacency.references
+                    || requirements.occurrences.is_some()
+            })
     }
 }
 
@@ -52,11 +69,15 @@ impl SemanticInventory {
             let name = predicate.as_str().strip_prefix(VOCABULARY_NAMESPACE);
             match name {
                 Some("name" | "revision") => {}
-                Some("calls") => self.calls = true,
-                Some("references") => self.references = true,
+                Some("calls") => self.adjacency.calls = true,
+                Some("references") => self.adjacency.references = true,
+                Some("hasType") => {
+                    self.edges = true;
+                    self.adjacency.type_uses = true;
+                }
                 Some(
-                    "imports" | "aliases" | "extends" | "implements" | "declares" | "reads"
-                    | "writes" | "hasType",
+                    "imports" | "aliases" | "extends" | "implements" | "declares" | "contains"
+                    | "overrides" | "reads" | "writes",
                 ) => self.edges = true,
                 Some("usages") => {
                     self.occurrences.get_or_insert_default();
@@ -95,11 +116,15 @@ impl SemanticInventory {
             match path {
                 PropertyPathExpression::Link(predicate) => {
                     match predicate.as_str().strip_prefix(VOCABULARY_NAMESPACE) {
-                        Some("calls") => self.calls = true,
-                        Some("references") => self.references = true,
+                        Some("calls") => self.adjacency.calls = true,
+                        Some("references") => self.adjacency.references = true,
+                        Some("hasType") => {
+                            self.edges = true;
+                            self.adjacency.type_uses = true;
+                        }
                         Some(
-                            "imports" | "aliases" | "extends" | "implements" | "declares" | "reads"
-                            | "writes" | "hasType",
+                            "imports" | "aliases" | "extends" | "implements" | "declares"
+                            | "contains" | "overrides" | "reads" | "writes",
                         ) => self.edges = true,
                         Some("usages") => {
                             self.occurrences.get_or_insert_default();

@@ -72,6 +72,10 @@ pub enum VocabularyProperty {
     Implements,
     /// The source declares the target.
     Declares,
+    /// The source contains the target within its scope.
+    Contains,
+    /// The source replaces an inherited member.
+    Overrides,
     /// The source reads the target's value.
     Reads,
     /// The source assigns to the target.
@@ -281,6 +285,16 @@ impl VocabularyProperty {
                 &[SYMBOL],
                 Resource(SYMBOL),
                 "The source declares the target.",
+            ),
+            Self::Contains => (
+                &[SYMBOL],
+                Resource(SYMBOL),
+                "The source contains the target within its scope.",
+            ),
+            Self::Overrides => (
+                &[SYMBOL],
+                Resource(SYMBOL),
+                "The source replaces an inherited member.",
             ),
             Self::Reads => (
                 &[SYMBOL],

@@ -357,6 +357,8 @@ fn kind(name: &str) -> Option<EdgeKind> {
         "extends" => Some(EdgeKind::Extends),
         "implements" => Some(EdgeKind::Implements),
         "declares" => Some(EdgeKind::Declares),
+        "contains" => Some(EdgeKind::Contains),
+        "overrides" => Some(EdgeKind::Overrides),
         "reads" => Some(EdgeKind::Reads),
         "writes" => Some(EdgeKind::Writes),
         "hasType" => Some(EdgeKind::HasType),

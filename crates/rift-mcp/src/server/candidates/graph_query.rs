@@ -389,7 +389,7 @@ fn project_semantic_inventory(
     acquired.project_local(
         dataset,
         input,
-        required.edges || required.references || required.calls,
+        required.edges || required.adjacency.references || required.adjacency.calls,
         required.occurrences,
     )
 }
