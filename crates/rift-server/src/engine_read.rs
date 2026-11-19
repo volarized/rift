@@ -1,6 +1,11 @@
 //! Edge traversal through configured language engines: incoming references,
 //! and outgoing calls through call hierarchy.
 
+mod inventory;
+pub use inventory::{
+    EngineInventory, EngineInventoryAnswer, EngineInventoryFile, EngineInventorySelection,
+};
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use lsp_types::{CallHierarchyOutgoingCall, Location, Position, Range, Uri};
@@ -994,7 +999,7 @@ use call_evidence::CapturedCalls;
 pub use heritage_edges::graph_heritage_edges;
 
 /// Calls established for one selected local declaration.
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub struct GraphCalls {
     /// Canonical neighbors in the current tree.
     pub local: Vec<(SymbolId, Vec<SourceUnitSpan>)>,
@@ -1006,6 +1011,17 @@ pub struct GraphCalls {
     pub corroboration: Vec<CallCorroboration>,
     /// Typed warnings from the engine edge read.
     pub edge_warnings: Vec<ReadWarning>,
+}
+
+impl GraphCalls {
+    /// Adds calls and keeps both answers' coverage and observations.
+    pub fn merge(&mut self, other: Self) {
+        self.complete &= other.complete;
+        self.local.extend(other.local);
+        self.packages.extend(other.packages);
+        self.corroboration.extend(other.corroboration);
+        self.edge_warnings.extend(other.edge_warnings);
+    }
 }
 
 /// An engine's original destination before projection into canonical adjacency.
@@ -1027,7 +1043,7 @@ pub enum CallProvider {
 }
 
 /// Independent call evidence attached to the same authored site.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct CallCorroboration {
     /// Invocation span supplied by static resolution.
     pub authored: SourceUnitSpan,
@@ -1397,6 +1413,7 @@ fn symbol_references(
     }
 }
 
+#[derive(Debug)]
 struct ReferenceTarget {
     path: ProjectPath,
     language: String,
@@ -1457,17 +1474,19 @@ impl ReferenceTarget {
         file: &IndexedFile,
         symbol: &SyntaxSymbol,
     ) -> Result<Self, RiftError> {
-        let source = file.source();
+        let mut target = Self::file(workspace_root, canonical_root, file)?;
         let offset = declaration_name_offset(file, symbol)?;
-        let index = LineIndex::new(source);
-        let position = |encoding| {
-            index.position(encoding, offset).map_err(|error| {
-                errors::server::read_task()
-                    .operation("reference position conversion")
-                    .detail(error.detail())
-                    .error()
-            })
-        };
+        let index = LineIndex::new(file.source());
+        target.utf8 = index.position(PositionEncoding::Utf8, offset)?;
+        target.utf16 = index.position(PositionEncoding::Utf16, offset)?;
+        Ok(target)
+    }
+
+    fn file(
+        workspace_root: &std::path::Path,
+        canonical_root: &std::path::Path,
+        file: &IndexedFile,
+    ) -> Result<Self, RiftError> {
         Ok(Self {
             path: file.path().clone(),
             language: file.syntax().language().name.clone(),
@@ -1487,9 +1506,9 @@ impl ReferenceTarget {
                         .detail(error.detail())
                         .error()
                 })?,
-            source: source.to_owned(),
-            utf8: position(PositionEncoding::Utf8)?,
-            utf16: position(PositionEncoding::Utf16)?,
+            source: file.source().to_owned(),
+            utf8: Position::default(),
+            utf16: Position::default(),
         })
     }
 }
@@ -1739,15 +1758,6 @@ async fn engine_graph_references(
     if declarations.is_empty() {
         return Err(unavailable());
     }
-    let excluded: BTreeSet<_> = declarations
-        .iter()
-        .filter_map(|declaration| {
-            declaration
-                .symbol
-                .name_range
-                .map(|range| (declaration.file.path().clone(), range.start, range.end))
-        })
-        .collect();
     let mut found = BTreeMap::new();
     let mut edge_warnings = Vec::new();
     for declaration in declarations {
@@ -1778,35 +1788,82 @@ async fn engine_graph_references(
                 .name()
                 .to_owned()])));
         }
-        let root = TreeRoot::new(slot.workspace_root())?;
-        let canonical = TreeRoot::new(reads.index().root())?;
-        let mut positions = BTreeMap::new();
-        for location in report.locations.map_err(|_| unavailable())? {
-            let path = root
-                .project_path(&location.uri)
-                .or_else(|_| canonical.project_path(&location.uri))
-                .map_err(|_| unavailable())?;
-            let file = reads.index().file(&path).ok_or_else(unavailable)?;
-            let positions = positions
-                .entry(file.path())
-                .or_insert_with(|| LineIndex::new(file.source()));
-            let start = positions.byte_offset(report.encoding, location.range.start)?;
-            let end = positions.byte_offset(report.encoding, location.range.end)?;
-            if file.source().get(start..end).is_none() {
-                return Err(unavailable());
-            }
-            let key = (path, start as u64, end as u64);
-            if excluded.contains(&key) || found.contains_key(&key) {
-                continue;
-            }
-            if found.len() == TRAVERSAL_SYMBOLS_MAX {
-                return Err(unavailable());
-            }
-            let enclosing = edge_enclosing_symbol(reads, file, key.1, key.2)?;
-            if require_caller && enclosing.is_none() {
-                continue;
-            }
-            let occurrence = QueryOccurrence {
+        let mapped =
+            map_inventory_references(reads, target, report, slot.workspace_root(), require_caller)?;
+        for occurrence in mapped.occurrences {
+            let key = (
+                occurrence.source.unit.0.clone(),
+                occurrence.source.range.start,
+                occurrence.source.range.end,
+            );
+            found.insert(key, occurrence);
+        }
+    }
+    Ok(GraphReferences {
+        occurrences: found.into_values().collect(),
+        complete: true,
+        edge_warnings,
+    })
+}
+
+/// Maps the local part of an engine reference answer into the captured index.
+fn map_inventory_references(
+    reads: &ReadService,
+    target: &SymbolId,
+    report: ReferenceReport,
+    workspace_root: &std::path::Path,
+    require_caller: bool,
+) -> Result<GraphReferences, RiftError> {
+    let identity = CoreSymbolId::new(target.as_str())?;
+    let excluded: BTreeSet<_> = edge_declarations(reads, &identity)?
+        .into_iter()
+        .filter_map(|declaration| {
+            declaration
+                .symbol
+                .name_range
+                .map(|range| (declaration.file.path().clone(), range.start, range.end))
+        })
+        .collect();
+    let roots = [
+        TreeRoot::new(workspace_root)?,
+        TreeRoot::new(reads.index().root())?,
+    ];
+    let mut positions = BTreeMap::new();
+    let mut found = BTreeMap::new();
+    for location in report.locations.map_err(|_| graph_reference_coverage())? {
+        let path = roots[0]
+            .project_path(&location.uri)
+            .or_else(|_| roots[1].project_path(&location.uri));
+        let path = match path {
+            Ok(path) => path,
+            Err(error) if error.slug() == errors::lsp::uri_outside_root::SLUG => continue,
+            Err(error) => return Err(error),
+        };
+        let Some(file) = reads.index().file(&path) else {
+            continue;
+        };
+        let positions = positions
+            .entry(file.path())
+            .or_insert_with(|| LineIndex::new(file.source()));
+        let start = positions.byte_offset(report.encoding, location.range.start)?;
+        let end = positions.byte_offset(report.encoding, location.range.end)?;
+        if file.source().get(start..end).is_none() {
+            return Err(graph_reference_coverage());
+        }
+        let key = (path, start as u64, end as u64);
+        if excluded.contains(&key) || found.contains_key(&key) {
+            continue;
+        }
+        if found.len() == TRAVERSAL_SYMBOLS_MAX {
+            return Err(graph_reference_coverage());
+        }
+        let enclosing = edge_enclosing_symbol(reads, file, key.1, key.2)?;
+        if require_caller && enclosing.is_none() {
+            continue;
+        }
+        found.insert(
+            key.clone(),
+            QueryOccurrence {
                 target: target.clone(),
                 enclosing,
                 source: SourceUnitSpan {
@@ -1817,14 +1874,13 @@ async fn engine_graph_references(
                     },
                 },
                 kind: EdgeKind::References,
-            };
-            found.insert(key, occurrence);
-        }
+            },
+        );
     }
     Ok(GraphReferences {
         occurrences: found.into_values().collect(),
-        complete: true,
-        edge_warnings,
+        complete: report.full,
+        edge_warnings: Vec::new(),
     })
 }
 
@@ -1899,6 +1955,15 @@ fn edge_declarations<'read>(
     reads: &'read ReadService,
     identity: &CoreSymbolId,
 ) -> Result<Vec<rift_index::SymbolMatch<'read>>, RiftError> {
+    let mut declarations = all_edge_declarations(reads, identity)?;
+    declarations.retain(|declaration| declaration.symbol.name_range.is_some());
+    Ok(declarations)
+}
+
+fn all_edge_declarations<'read>(
+    reads: &'read ReadService,
+    identity: &CoreSymbolId,
+) -> Result<Vec<rift_index::SymbolMatch<'read>>, RiftError> {
     let limit = reads.index().results_max().min(TRAVERSAL_SYMBOLS_MAX);
     let (mut declarations, total) = reads.index().symbols_by_identity_page(identity, 0, limit)?;
     if total > TRAVERSAL_SYMBOLS_MAX || declarations.len() != total.min(limit) {
@@ -1916,7 +1981,6 @@ fn edge_declarations<'read>(
         }
         declarations.extend(page);
     }
-    declarations.retain(|declaration| declaration.symbol.name_range.is_some());
     Ok(declarations)
 }
 
@@ -2727,6 +2791,38 @@ mod tests {
             super::project_definition(&reads, &path, (location, PositionEncoding::Utf8), false)?
                 .is_none()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn graph_reference_mapping_keeps_local_locations_beside_outside_locations() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn beacon() {}\npub fn caller() { beacon(); }\n",
+        )?;
+        let reads = reads(directory.path())?;
+        let target = symbol(&reads, "beacon");
+        let report = ReferenceReport {
+            locations: Ok(vec![
+                location(outside.path(), "other.rs", 0, 0, 3),
+                location(directory.path(), "lib.rs", 0, 7, 13),
+                location(directory.path(), "not_indexed.rs", 0, 0, 3),
+                location(directory.path(), "lib.rs", 1, 18, 24),
+            ]),
+            encoding: PositionEncoding::Utf16,
+            full: true,
+        };
+        let answer =
+            super::map_inventory_references(&reads, &target, report, directory.path(), true)?;
+        assert!(answer.complete);
+        assert_eq!(answer.occurrences.len(), 1);
+        assert_eq!(
+            answer.occurrences[0].enclosing,
+            Some(symbol(&reads, "caller"))
+        );
+        assert_eq!(answer.occurrences[0].target, target);
         Ok(())
     }
 

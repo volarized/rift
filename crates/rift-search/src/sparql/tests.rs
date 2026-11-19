@@ -757,3 +757,27 @@ fn test_graph_query_parse_refuses_inline_rows_joining_past_solution_bound() {
     assert_eq!(error.slug(), errors::search::query_answer_limit::SLUG);
     assert!(error.to_string().contains("joined VALUES rows"), "{error}");
 }
+
+#[test]
+fn semantic_inventory_requests_engine_types_and_heritage() {
+    let limits = GraphLimits::default();
+    for (predicate, selected) in [
+        ("hasType", "types"),
+        ("extends", "extends"),
+        ("implements", "implements"),
+    ] {
+        for query in [
+            format!("SELECT ?s ?t {{ ?s :{predicate} ?t }}"),
+            format!("SELECT ?s ?t {{ ?s :{predicate}+ ?t }}"),
+        ] {
+            let parsed = GraphQuery::parse(&query, &limits).expect("query");
+            let required = parsed.semantic_inventory().expect("inventory");
+            let enabled = match selected {
+                "types" => required.types.definitions,
+                "extends" => required.types.extends,
+                _ => required.types.implements,
+            };
+            assert!(enabled, "{query}: {required:?}");
+        }
+    }
+}

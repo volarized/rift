@@ -1,4 +1,5 @@
 mod graph_query;
+pub(crate) use graph_query::EngineInventoryCache;
 pub(crate) use graph_query::{QueryPageOptions, query_page, retrieval::collect_retrieval};
 mod symbol;
 use std::sync::{Arc, Mutex};

@@ -8,7 +8,8 @@
 //! references and diagnostics need no embedded-specific path.
 //!
 //! The served surface is the subset the server itself asks engines for:
-//! `initialize`, document open and close, `textDocument/references`, call
+//! `initialize`, document open and close, references, definitions, inferred types,
+//! implementations, type hierarchy, call
 //! hierarchy (`textDocument/prepareCallHierarchy`, `callHierarchy/incomingCalls`,
 //! and `callHierarchy/outgoingCalls`), and the `textDocument/diagnostic` pull.
 //! Ranges cross the wire in UTF-8 positions, the encoding the answer
@@ -21,6 +22,7 @@
 //! the time an exchange runs. The Python environment comes from the tree alone:
 //! the one its ty configuration names, else its `.venv`, else none.
 
+mod edges;
 mod hermetic;
 
 use std::collections::HashMap;
@@ -232,6 +234,44 @@ fn handle_message(message: &Value, root: &Path, documents: &DocumentStore) -> Ha
         ("initialize", Some(id)) => Handled::Reply(reply(&id, &initialize_result())),
         ("shutdown", Some(id)) => Handled::Reply(reply(&id, &Value::Null)),
 
+        ("textDocument/definition", Some(id)) => answered(
+            &id,
+            root,
+            documents,
+            &params,
+            DOCUMENT_URI,
+            edges::definitions,
+        ),
+        ("textDocument/typeDefinition", Some(id)) => answered(
+            &id,
+            root,
+            documents,
+            &params,
+            DOCUMENT_URI,
+            edges::type_definitions,
+        ),
+        ("textDocument/implementation", Some(id)) => answered(
+            &id,
+            root,
+            documents,
+            &params,
+            DOCUMENT_URI,
+            edges::implementations,
+        ),
+        ("textDocument/prepareTypeHierarchy", Some(id)) => answered(
+            &id,
+            root,
+            documents,
+            &params,
+            DOCUMENT_URI,
+            edges::prepare_types,
+        ),
+        ("typeHierarchy/supertypes", Some(id)) => {
+            answered(&id, root, documents, &params, ITEM_URI, edges::supertypes)
+        }
+        ("typeHierarchy/subtypes", Some(id)) => {
+            answered(&id, root, documents, &params, ITEM_URI, edges::subtypes)
+        }
         ("textDocument/references", Some(id)) => {
             answered(&id, root, documents, &params, DOCUMENT_URI, references)
         }
@@ -314,14 +354,18 @@ fn error_reply(id: &Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
-/// The capabilities this engine advertises: UTF-8 positions, references,
-/// call hierarchy, and the diagnostic pull. No file-operation capability is
+/// The capabilities this engine advertises: UTF-8 positions, references, definitions,
+/// inferred types, implementations, type hierarchy, call hierarchy, and the diagnostic pull. No file-operation capability is
 /// declared, so moves warn instead of asking.
 fn initialize_result() -> Value {
     json!({
         "capabilities": {
             "positionEncoding": "utf-8",
             "referencesProvider": true,
+            "typeDefinitionProvider": true,
+            "definitionProvider": true,
+            "implementationProvider": true,
+            "typeHierarchyProvider": true,
             "callHierarchyProvider": true,
             "diagnosticProvider": {
                 "interFileDependencies": true,

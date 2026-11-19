@@ -25,10 +25,11 @@ pub use configuration::{
 };
 pub use engine::{EnginePool, EngineSlot, LspProcessKey};
 pub use engine_read::{
-    CallCorroboration, CallDestination, CallProvider, EngineReferences, GraphCalls,
-    GraphReferences, captured_graph_calls, captured_graph_references, graph_calls,
-    graph_heritage_edges, graph_references, installed_graph_calls, outgoing_reference_edges,
-    resolve_engine_references, uses_engine_references,
+    CallCorroboration, CallDestination, CallProvider, EngineInventory, EngineInventoryAnswer,
+    EngineInventoryFile, EngineInventorySelection, EngineReferences, GraphCalls, GraphReferences,
+    captured_graph_calls, captured_graph_references, graph_calls, graph_heritage_edges,
+    graph_references, installed_graph_calls, outgoing_reference_edges, resolve_engine_references,
+    uses_engine_references,
 };
 pub use history::{FillCounts, FillProgress, StoredHistory};
 pub use history_fill::{

@@ -814,7 +814,7 @@ async fn live_rust_analyzer_walks_answer_a_rename_in_an_unopened_file() -> TestR
         "incoming before",
         &beacon,
         "incoming",
-        &["larger", "total"],
+        &["caller", "larger", "total", "walk"],
     )
     .await?;
     eprintln!("live: warm after {:?}", started.elapsed());
@@ -846,7 +846,7 @@ async fn live_rust_analyzer_walks_answer_a_rename_in_an_unopened_file() -> TestR
         "incoming after",
         &beacon2,
         "incoming",
-        &["again", "larger", "total"],
+        &["again", "caller", "larger", "total", "walk"],
     )
     .await?;
     eprintln!("live: incoming fresh after {:?}", edited.elapsed());

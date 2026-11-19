@@ -25,6 +25,7 @@ pub(crate) mod retrieval;
 
 use super::super::RequestDeadline;
 use edges::AcquiredAdjacency;
+pub(crate) use edges::EngineInventoryCache;
 
 /// Settings and presentation retained with one query execution.
 pub(crate) struct QueryPageOptions<'a> {
@@ -511,8 +512,14 @@ impl AcquiredGraph {
             configuration,
             mut warnings,
         } = self;
-        if acquired.is_incomplete() && !query.admits_partial_witness() {
-            return Ok(insufficient_coverage(warnings).into());
+        if acquired.is_incomplete() {
+            warnings.push(ReadWarning::EdgeCoverageMissing {
+                kinds: Vec::new(),
+                detail: "the selected edge read is incomplete, so edges outside its captured and engine coverage are missing from this answer".to_owned(),
+            });
+            if !query.admits_partial_rows() && !query.admits_partial_witness() {
+                return Ok(insufficient_coverage(warnings).into());
+            }
         }
         let input = reads.local_search_view_input(true)?;
         let mut dataset = GraphDataset::builder(limits);
@@ -562,8 +569,9 @@ impl AcquiredGraph {
         if coverage == ProjectedRetrievals::Unavailable {
             return Ok(insufficient_coverage(warnings).into());
         }
-        let partial =
-            coverage == ProjectedRetrievals::Partial || inventory == InventoryCoverage::Partial;
+        let partial = acquired.is_incomplete()
+            || coverage == ProjectedRetrievals::Partial
+            || inventory == InventoryCoverage::Partial;
         if partial && !query.admits_partial_rows() && !query.admits_partial_witness() {
             return Ok(insufficient_coverage(warnings).into());
         }
@@ -576,7 +584,7 @@ impl AcquiredGraph {
         let Some(answer) =
             evaluate_acquired_query(&dataset.build(), query, cancellation, &acquired)?
         else {
-            return Ok(query_unavailable(SymbolUnavailableReason::InsufficientCoverage).into());
+            return Ok(insufficient_coverage(warnings).into());
         };
         // Over partial coverage an empty answer would claim an absence the missing facts may
         // contradict, so it refuses with the warnings that name what is missing.
@@ -653,10 +661,10 @@ fn evaluate_acquired_query(
     acquired: &AcquiredAdjacency,
 ) -> Result<Option<QueryAnswer>, RiftError> {
     let answer: QueryAnswer = dataset.evaluate(query, cancellation)?.into();
-    Ok(
-        (!acquired.is_incomplete() || matches!(answer, QueryAnswer::Boolean { value: true }))
-            .then_some(answer),
-    )
+    Ok((!acquired.is_incomplete()
+        || matches!(answer, QueryAnswer::Boolean { value: true })
+        || (query.admits_partial_rows() && !claims_absence(&answer)))
+    .then_some(answer))
 }
 
 /// Selects one fixed-size answer page within the accepted response byte bound.

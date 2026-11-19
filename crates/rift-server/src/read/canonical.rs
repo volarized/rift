@@ -164,12 +164,7 @@ impl LocalSymbolViewInput {
         let mut seeds = Vec::new();
         for (id, object) in index.objects() {
             let object = object?;
-            // A Python file module has no source name token for an engine request.
-            // Its declaration remains in the captured symbol inventory.
             let facts = object.facts();
-            if facts.language().name == "python" && facts.kind().0 == "module" {
-                continue;
-            }
             if !index.identity_coverage_complete(facts.language()) {
                 coverage = InventoryCoverage::Partial;
             }

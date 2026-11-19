@@ -15,6 +15,17 @@ pub struct OccurrenceSelection {
     pub enclosing: bool,
 }
 
+/// Required type definitions and inheritance from semantic providers.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TypeSelection {
+    /// The query can inspect inferred type definitions.
+    pub definitions: bool,
+    /// The query can inspect class inheritance.
+    pub extends: bool,
+    /// The query can inspect interface implementations.
+    pub implements: bool,
+}
+
 /// The semantic and physical facts needed from a complete selected domain.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SemanticInventory {
@@ -24,6 +35,8 @@ pub struct SemanticInventory {
     pub calls: bool,
     /// The query can inspect caller-to-target reference edges.
     pub references: bool,
+    /// The type definitions and inheritance a query can inspect.
+    pub types: TypeSelection,
     /// The query can inspect physical occurrences.
     pub occurrences: Option<OccurrenceSelection>,
 }
@@ -54,10 +67,19 @@ impl SemanticInventory {
                 Some("name" | "revision") => {}
                 Some("calls") => self.calls = true,
                 Some("references") => self.references = true,
-                Some(
-                    "imports" | "aliases" | "extends" | "implements" | "declares" | "reads"
-                    | "writes" | "hasType",
-                ) => self.edges = true,
+                Some("hasType") => {
+                    self.edges = true;
+                    self.types.definitions = true;
+                }
+                Some("extends") => {
+                    self.edges = true;
+                    self.types.extends = true;
+                }
+                Some("implements") => {
+                    self.edges = true;
+                    self.types.implements = true;
+                }
+                Some("imports" | "aliases" | "declares" | "reads" | "writes") => self.edges = true,
                 Some("usages") => {
                     self.occurrences.get_or_insert_default();
                 }
@@ -97,10 +119,21 @@ impl SemanticInventory {
                     match predicate.as_str().strip_prefix(VOCABULARY_NAMESPACE) {
                         Some("calls") => self.calls = true,
                         Some("references") => self.references = true,
-                        Some(
-                            "imports" | "aliases" | "extends" | "implements" | "declares" | "reads"
-                            | "writes" | "hasType",
-                        ) => self.edges = true,
+                        Some("hasType") => {
+                            self.edges = true;
+                            self.types.definitions = true;
+                        }
+                        Some("extends") => {
+                            self.edges = true;
+                            self.types.extends = true;
+                        }
+                        Some("implements") => {
+                            self.edges = true;
+                            self.types.implements = true;
+                        }
+                        Some("imports" | "aliases" | "declares" | "reads" | "writes") => {
+                            self.edges = true;
+                        }
                         Some("usages") => {
                             self.occurrences.get_or_insert_default();
                         }
