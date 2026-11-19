@@ -1,6 +1,7 @@
 //! File groups for bounded engine edge inventory reads.
 
 mod calls;
+mod types;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -55,6 +56,7 @@ struct InventoryPosition {
     symbol: SymbolId,
     utf8: Position,
     utf16: Position,
+    declared_type: Option<Vec<(Position, Position)>>,
     type_declaration: bool,
     implementation_kind: Option<EdgeKind>,
 }
@@ -71,6 +73,7 @@ impl ReadService {
     ) -> Result<Vec<EngineInventoryFile>, RiftError> {
         let mut grouped = BTreeMap::<ProjectPath, EngineInventoryFile>::new();
         let mut lines = BTreeMap::new();
+        let mut declared_types = BTreeMap::new();
         for seed in seeds {
             let identity = CoreSymbolId::new(seed.as_str())?;
             for declaration in all_edge_declarations(self, &identity)? {
@@ -85,10 +88,29 @@ impl ReadService {
                     .entry(file.path().clone())
                     .or_insert_with(|| LineIndex::new(file.source()));
                 let offset = usize::try_from(range.start).map_err(|_| graph_call_coverage())?;
+                if selection.types.definitions && !declared_types.contains_key(file.path()) {
+                    declared_types.insert(file.path().clone(), types::declared_types(file)?);
+                }
+                let declared_type = declared_types
+                    .get(file.path())
+                    .and_then(|types| types.get(&range.start))
+                    .map(|offsets| {
+                        offsets
+                            .iter()
+                            .map(|offset| {
+                                Ok((
+                                    index.position(PositionEncoding::Utf8, *offset)?,
+                                    index.position(PositionEncoding::Utf16, *offset)?,
+                                ))
+                            })
+                            .collect::<Result<Vec<_>, RiftError>>()
+                    })
+                    .transpose()?;
                 group.positions.push(InventoryPosition {
                     symbol: seed.clone(),
                     utf8: index.position(PositionEncoding::Utf8, offset)?,
                     utf16: index.position(PositionEncoding::Utf16, offset)?,
+                    declared_type,
                     type_declaration: symbol.kinds.contains(&SymbolKind::Type),
                     implementation_kind: super::heritage_edges::implementation_kind(symbol),
                 });
@@ -424,10 +446,8 @@ async fn read_positions(
             let locations = report.locations(chunk, answers)?;
             report.references.extend(locations);
         }
-        if selection.types.definitions && session.capabilities().definitions.type_definition {
-            let answers = session.type_definition_batch(&requests).await?;
-            let locations = report.locations(chunk, answers)?;
-            report.types.extend(locations);
+        if selection.types.definitions {
+            types::read(session, path, chunk, &requests, maximum, &mut report).await?;
         }
         if selection.types.extends || selection.types.implements {
             read_heritage(session, chunk, &requests, selection, &mut report).await?;
