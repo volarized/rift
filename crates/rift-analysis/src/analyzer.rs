@@ -481,11 +481,18 @@ fn place_namespace(
         .iter()
         .map(|held| &held.placement)
         .collect::<Vec<_>>();
-    let mut aliases = namespace::placed_aliases(&namespace, &selected, &placements, || {
-        errors::analysis::package_provider_failed()
-            .package(package_label(package))
-            .error()
-    })?;
+    let mut aliases = namespace::placed_aliases(
+        &input.namespace_input(),
+        &mut namespace,
+        &selected,
+        &placements,
+        input.limits().declarations_max(),
+        || {
+            errors::analysis::package_provider_failed()
+                .package(package_label(package))
+                .error()
+        },
+    )?;
     for held in analyzed {
         held.public_names.extend(
             namespace
@@ -3159,10 +3166,13 @@ mod tests {
                 ("Runner", true),
                 ("Runner.#secret", false),
                 ("Runner.run", true),
+                ("default", true),
+                ("default.Runner", true),
+                ("default.helper", true),
+                ("default.start", true),
                 ("helper", true),
                 ("internal", false),
                 ("load", true),
-                ("start", true),
             ]
         );
     }

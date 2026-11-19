@@ -12,6 +12,469 @@ use rift_syntax::DocumentPlacement;
 const WORK_MAX: usize = 10_000;
 
 #[test]
+fn test_typescript_named_value_imports_keep_import_edges() {
+    let result = resolution(
+        "typescript",
+        &[
+            ("main.ts", "import { value } from './core.js';"),
+            ("core.ts", "export const value = 1;"),
+        ],
+        &[],
+        WORK_MAX,
+    );
+    assert_eq!(
+        result
+            .occurrences
+            .iter()
+            .filter(|edge| edge.role == ReferenceRole::Import && target(edge).ends_with("/value"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn test_typescript_type_usage_excludes_same_named_value_functions() {
+    let source = "function bigint() {} enum Task { Value } interface Value { count: bigint; value: Task.Value; }";
+    let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);
+    assert_eq!(
+        result
+            .occurrences
+            .iter()
+            .filter(|edge| edge.role == ReferenceRole::Type && target(edge).ends_with("/bigint"))
+            .count(),
+        0
+    );
+    assert_eq!(
+        result
+            .occurrences
+            .iter()
+            .filter(|edge| edge.role == ReferenceRole::Type && target(edge).ends_with("/Task/Value"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn test_typescript_base_members_exclude_locals_in_a_same_named_function() {
+    let source = "interface Base {} const Base = () => { const run = () => {}; }; interface Derived extends Base { run(): void; }";
+    let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);
+    assert_eq!(
+        result
+            .occurrences
+            .iter()
+            .filter(|edge| edge.edge_kind == Some(rift_protocol::read::EdgeKind::Overrides))
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn test_typescript_static_blocks_and_nested_headers_keep_their_receivers() {
+    let source = "class Base { static leaf() {} static make() { return Base; } static init() { class Nested extends this.make() {} } static { this.leaf(); } }";
+    let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);
+    assert_eq!(
+        calls(&result, "main.ts")
+            .map(|call| source_of(call, source))
+            .collect::<Vec<_>>(),
+        ["this.make()", "this.leaf()"]
+    );
+}
+
+#[test]
+fn test_typescript_callable_initializers_keep_the_outer_caller() {
+    let source = "function leaf() {} function make() { return leaf; } export function root() { const run: () => void = make(); run(); }";
+    let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);
+    let calls = calls(&result, "main.ts").collect::<Vec<_>>();
+    assert_eq!(calls.len(), 2);
+    assert!(calls.iter().all(|call| call.edge_from.as_ref().is_some_and(
+        |source| source.as_str() == "rift://symbol/local/typescript/.%2Fmain.ts/root"
+    )));
+}
+
+#[test]
+fn test_typescript_anonymous_functions_do_not_keep_class_receivers() {
+    let source = "function factory(callback) {} class Base { leaf() {} run() { factory(function () { this.leaf(); }); const arrow = () => this.leaf(); } }";
+    let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);
+    let calls = calls(&result, "main.ts")
+        .filter(|call| target(call).ends_with("/leaf"))
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].callee_range.start,
+        u64::try_from(source.rfind("this.leaf").expect("arrow receiver")).expect("source offset")
+    );
+}
+
+#[test]
+fn test_typescript_parse_errors_keep_calls_with_partial_coverage() {
+    let source = "export function root() { leaf(); const = ; } function leaf() {}";
+    let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);
+    assert_eq!(calls(&result, "main.ts").count(), 1);
+    assert!(
+        result
+            .edge_calls
+            .values()
+            .any(|coverage| !coverage.unavailable && !coverage.unresolved.is_empty())
+    );
+}
+
+#[test]
+fn test_typescript_object_functions_do_not_keep_class_receivers() {
+    let source = "class Base { leaf() {} run() { const handlers = { task() { this.leaf(); }, assigned: function () { this.leaf(); }, arrow: () => this.leaf() }; } }";
+    let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);
+    let calls = calls(&result, "main.ts").collect::<Vec<_>>();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].callee_range.start,
+        u64::try_from(source.rfind("this.leaf").expect("arrow receiver")).expect("source offset")
+    );
+}
+
+#[test]
+fn test_typescript_cts_require_keeps_commonjs_calls() {
+    let source = "const core = require('./core.cjs'); export function root() { core.leaf(); }";
+    let result = resolution(
+        "typescript",
+        &[
+            ("main.cts", source),
+            ("core.cts", "exports.leaf = function () {};"),
+        ],
+        &[],
+        WORK_MAX,
+    );
+    assert_eq!(calls(&result, "main.cts").count(), 1);
+}
+
+#[test]
+fn test_typescript_recursive_arrow_calls_keep_their_declaration() {
+    let source = "const run = () => { run(); };";
+    let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);
+    assert_eq!(calls(&result, "main.ts").count(), 1);
+}
+
+#[test]
+fn test_typescript_calls_use_the_enclosing_callable() {
+    let source = "function leaf() {} export function root() { const value = leaf(); }";
+    let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);
+    let call = calls(&result, "main.ts").next().expect("call target");
+    assert_eq!(
+        call.edge_from.as_ref().map(rift_core::SymbolId::as_str),
+        Some("rift://symbol/local/typescript/.%2Fmain.ts/root")
+    );
+}
+
+#[test]
+fn test_typescript_receiver_heritage_stays_unresolved_without_recursion() {
+    let result = resolution(
+        "typescript",
+        &[("main.ts", "class Derived extends this.Base {}")],
+        &[],
+        256,
+    );
+    assert!(!result.exhausted);
+    assert!(
+        !result
+            .occurrences
+            .iter()
+            .any(|edge| edge.edge_kind == Some(rift_protocol::read::EdgeKind::Extends))
+    );
+}
+
+#[test]
+fn test_typescript_loop_bindings_shadow_outer_calls() {
+    let source = "function run() {} export function root(values) { for (const [name, run] of values) { run(); } run(); }";
+    let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);
+    assert_eq!(calls(&result, "main.ts").count(), 1);
+}
+
+#[test]
+fn test_typescript_computed_assignments_keep_unrelated_facts() {
+    let source = "interface Input {} class Base { run() {} } class Derived extends Base implements Input { run() {} } export function leaf() {} export function root(values, key) { values[key] = 1; leaf(); } let replaced = () => 1; [replaced] = values; export function stop() { replaced(); }";
+    let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);
+    assert_eq!(
+        calls(&result, "main.ts")
+            .map(|edge| source_of(edge, source))
+            .collect::<Vec<_>>(),
+        ["leaf()"]
+    );
+    for kind in [
+        rift_protocol::read::EdgeKind::Extends,
+        rift_protocol::read::EdgeKind::Implements,
+        rift_protocol::read::EdgeKind::Overrides,
+    ] {
+        assert!(
+            result
+                .occurrences
+                .iter()
+                .any(|edge| edge.edge_kind == Some(kind)),
+            "missing {kind:?}"
+        );
+    }
+}
+
+#[test]
+fn test_typescript_super_constructor_and_parenthesized_values_resolve() {
+    let source = "import { jobs } from './index.js'; class Base {} export class Derived extends Base { constructor() { super(); } } const run = (() => 1); export function root() { run(); jobs /* name */ . leaf(); }";
+    let result = resolution(
+        "typescript",
+        &[
+            ("main.ts", source),
+            ("index.ts", "export * as jobs from './jobs.js';"),
+            ("jobs.ts", "export function leaf() {}"),
+        ],
+        &[],
+        WORK_MAX,
+    );
+    assert_eq!(
+        calls(&result, "main.ts")
+            .map(|edge| source_of(edge, source))
+            .collect::<Vec<_>>(),
+        ["super()", "run()", "jobs /* name */ . leaf()"]
+    );
+}
+
+#[test]
+fn test_typescript_anonymous_default_functions_resolve_through_reexports() {
+    let source = "import run from './index.js'; export function root() { run(); }";
+    let result = resolution(
+        "typescript",
+        &[
+            ("main.ts", source),
+            ("index.ts", "export { default } from './job.js';"),
+            ("job.ts", "export default function () { return 1; }"),
+        ],
+        &[],
+        WORK_MAX,
+    );
+    assert_eq!(calls(&result, "main.ts").count(), 1);
+}
+
+#[test]
+fn test_typescript_namespace_member_reads_name_the_module() {
+    let source = "import * as core from './index.js'; export function root() { return core.jobs; }";
+    let result = resolution(
+        "typescript",
+        &[
+            ("main.ts", source),
+            ("index.ts", "export * as jobs from './jobs.js';"),
+            ("jobs.ts", "export function leaf() {}"),
+        ],
+        &[],
+        WORK_MAX,
+    );
+    assert!(
+        result
+            .occurrences
+            .iter()
+            .any(|edge| edge.role == ReferenceRole::Read
+                && target(edge) == "rift://symbol/local/typescript/.%2Fjobs.ts")
+    );
+}
+
+#[test]
+fn test_typescript_namespace_import_retains_an_empty_module() {
+    let result = resolution(
+        "typescript",
+        &[
+            (
+                "main.ts",
+                "import * as values from './empty.js'; export const value = 1;",
+            ),
+            ("empty.ts", ""),
+        ],
+        &[],
+        WORK_MAX,
+    );
+    assert!(
+        result
+            .occurrences
+            .iter()
+            .any(|edge| edge.role == ReferenceRole::Import
+                && target(edge) == "rift://symbol/local/typescript/.%2Fempty.ts")
+    );
+}
+
+#[test]
+fn test_typescript_export_namespaces_and_default_objects_resolve_calls() {
+    let source = "import * as core from './index.js'; import value from './object.js'; export function root() { core.jobs.run(); value.run(); }";
+    let result = resolution(
+        "typescript",
+        &[
+            ("main.ts", source),
+            ("index.ts", "export * as jobs from './jobs.js';"),
+            (
+                "jobs.ts",
+                "export interface run {} export const run = () => 1;",
+            ),
+            ("object.ts", "export default { run: () => 1 };"),
+        ],
+        &[],
+        WORK_MAX,
+    );
+    assert_eq!(
+        calls(&result, "main.ts")
+            .map(|edge| source_of(edge, source))
+            .collect::<Vec<_>>(),
+        ["core.jobs.run()", "value.run()"]
+    );
+}
+
+#[test]
+fn test_typescript_duplicate_exports_do_not_select_a_call_target() {
+    let result = resolution(
+        "typescript",
+        &[
+            (
+                "main.ts",
+                "import { run } from './index.js'; export function root() { run(); }",
+            ),
+            (
+                "index.ts",
+                "export { first as run, second as run } from './jobs.js';",
+            ),
+            (
+                "jobs.ts",
+                "export function first() {} export function second() {}",
+            ),
+        ],
+        &[],
+        WORK_MAX,
+    );
+    assert_eq!(calls(&result, "main.ts").count(), 0);
+}
+
+#[test]
+fn test_typescript_static_calls_resolve_bases_constructors_and_export_stars() {
+    // #761: all targets are declared in the selected source.
+    let source = "import * as core from './index.js';\nimport Default from './base.js';\nclass Derived extends Default { run() { this.leaf(); super.leaf(); Derived.make(); } }\nexport function root() { core.leaf(); new Default(); new core.Base(); }";
+    let result = resolution(
+        "typescript",
+        &[
+            ("main.ts", source),
+            ("index.ts", "export * from './base.js';"),
+            (
+                "base.ts",
+                "export function leaf() {}\nexport default class Base { leaf() {} static make() {} }\nexport { Base };",
+            ),
+        ],
+        &[],
+        WORK_MAX,
+    );
+    let actual = calls(&result, "main.ts")
+        .map(|edge| source_of(edge, source))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        [
+            "this.leaf()",
+            "super.leaf()",
+            "Derived.make()",
+            "core.leaf()",
+            "new Default()",
+            "new core.Base()"
+        ],
+        "{result:?}"
+    );
+}
+
+#[test]
+fn test_typescript_value_members_do_not_override_type_members() {
+    let source = "interface Base { value: string; run(): void } interface Derived extends Base {} const Derived = { value: 'a', run() {} };";
+    let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);
+    assert!(
+        !result
+            .occurrences
+            .iter()
+            .any(|edge| edge.edge_kind == Some(rift_protocol::read::EdgeKind::Overrides))
+    );
+}
+
+#[test]
+fn test_typescript_overrides_keep_type_and_value_declarations_separate() {
+    let source = "interface Base { readonly value: string; run(): void } const Base = 1; interface Derived extends Base { readonly value: string; run(): void } const Derived = 1;";
+    let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);
+    assert_eq!(
+        result
+            .occurrences
+            .iter()
+            .filter(|edge| edge.edge_kind == Some(rift_protocol::read::EdgeKind::Overrides))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn test_typescript_static_members_keep_access_type_and_override_edges() {
+    use rift_protocol::read::EdgeKind;
+
+    // #762-#765: authored containment, access, override, and type facts.
+    let source = "import * as config from './config.js';\ninterface Value {}\ninterface Task<T> {}\nclass Base { value: Value; run(input: Task<Value>): Value { return this.value; } }\nclass Derived extends Base { run(input: Task<Value>): Value { this.value = config.value; this.value++; return this.value; } }";
+    let result = resolution(
+        "typescript",
+        &[
+            ("main.ts", source),
+            ("config.ts", "export const value = 1;"),
+        ],
+        &[],
+        WORK_MAX,
+    );
+    for kind in [
+        EdgeKind::Contains,
+        EdgeKind::Reads,
+        EdgeKind::Writes,
+        EdgeKind::Overrides,
+        EdgeKind::HasType,
+        EdgeKind::Imports,
+    ] {
+        assert!(
+            result
+                .occurrences
+                .iter()
+                .any(|edge| edge.edge_kind == Some(kind)
+                    || match kind {
+                        EdgeKind::Reads => edge.role == ReferenceRole::Read,
+                        EdgeKind::Writes => edge.role == ReferenceRole::Write,
+                        EdgeKind::HasType =>
+                            edge.role == ReferenceRole::Type && edge.edge_kind.is_none(),
+                        EdgeKind::Imports => edge.role == ReferenceRole::Import,
+                        _ => false,
+                    }),
+            "missing {kind:?}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn test_typescript_generic_class_and_interface_heritage_resolves_in_each_dialect() {
+    use rift_protocol::read::EdgeKind;
+
+    // #754 and #755: class type arguments and interface headers keep their bases.
+    let source = "export abstract class Base<T> {}\ninterface Value {}\ninterface Task<T> extends Value {}\nclass Derived extends Base<Value> implements Task<Value> {}";
+    for extension in ["ts", "tsx", "mts", "cts"] {
+        let path = format!("main.{extension}");
+        let result = resolution("typescript", &[(path.as_str(), source)], &[], WORK_MAX);
+        let edges = result
+            .occurrences
+            .iter()
+            .filter_map(|edge| {
+                let kind = edge.edge_kind?;
+                matches!(kind, EdgeKind::Extends | EdgeKind::Implements)
+                    .then_some((kind, target(edge).rsplit('/').next()?))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            edges,
+            [
+                (EdgeKind::Extends, "Value"),
+                (EdgeKind::Extends, "Base"),
+                (EdgeKind::Implements, "Task")
+            ],
+            "{extension}: {result:?}"
+        );
+    }
+}
+
+#[test]
 fn test_edge_heritage_is_captured_for_each_language() {
     for (path, source, expected) in [
         ("app.js", "class Base {}\nclass Derived extends Base {}", 1),
@@ -58,7 +521,16 @@ fn test_edge_typescript_calls_follow_import_bindings_in_each_dialect() {
         let edges = calls(&result, &path).collect::<Vec<_>>();
         assert_eq!(edges.len(), 1, "{extension}: {result:?}");
         assert_eq!(source_of(edges[0], source), "run()");
-        assert_eq!(edges[0].target_binding.unit().key().as_str(), "lib/jobs.ts");
+        assert_eq!(
+            edges[0]
+                .target_binding
+                .as_ref()
+                .expect("target declaration")
+                .unit()
+                .key()
+                .as_str(),
+            "lib/jobs.ts"
+        );
     }
 }
 
@@ -98,7 +570,16 @@ fn test_edge_python_calls_follow_local_and_import_bindings() {
         .map(|edge| source_of(edge, source))
         .collect::<Vec<_>>();
     assert_eq!(authored, ["run()", "tasks.leaf()", "local()"]);
-    assert_eq!(edges[0].target_binding.unit().key().as_str(), "jobs.py");
+    assert_eq!(
+        edges[0]
+            .target_binding
+            .as_ref()
+            .expect("target declaration")
+            .unit()
+            .key()
+            .as_str(),
+        "jobs.py"
+    );
 }
 
 #[test]
@@ -123,7 +604,13 @@ fn test_edge_python_imports_keep_relative_bindings_and_reject_dotted_module_shad
     let resolved = calls(&result, "pkg/main.py").collect::<Vec<_>>();
     assert_eq!(resolved.len(), 1, "{result:?}");
     assert_eq!(
-        resolved[0].target_binding.unit().key().as_str(),
+        resolved[0]
+            .target_binding
+            .as_ref()
+            .expect("target declaration")
+            .unit()
+            .key()
+            .as_str(),
         "pkg/jobs.py"
     );
     assert_eq!(calls(&result, "other.py").count(), 0);
@@ -147,7 +634,10 @@ fn resolution(
     let language = Language::from_identity_segment(language).expect("fixture language");
     let parsed = sources
         .iter()
-        .map(|(path, text)| syntax(path, text))
+        .map(|(path, text)| {
+            let document = syntax(path, text);
+            (document.path().clone(), document.into_facts())
+        })
         .collect::<Vec<_>>();
     let metadata_paths = metadata
         .iter()
@@ -161,10 +651,10 @@ fn resolution(
     let selected = parsed
         .iter()
         .zip(sources)
-        .map(|(document, (_, source))| SelectedFile {
-            path: document.path(),
+        .map(|((path, facts), (_, source))| SelectedFile {
+            path,
             source,
-            syntax: document.facts(),
+            syntax: facts,
         })
         .collect::<Vec<_>>();
     let package_sources = selected
@@ -304,6 +794,10 @@ fn javascript_default_import_and_local_class_method_keep_authored_targets() {
         calls,
         [
             (
+                "new Task()",
+                "rift://symbol/local/javascript/.%2Fmain.mjs/Task"
+            ),
+            (
                 "task.run()",
                 "rift://symbol/local/javascript/.%2Fmain.mjs/Task/run"
             ),
@@ -324,8 +818,20 @@ fn javascript_rebinding_and_class_prototype_mutation_leave_calls_unresolved() {
                   Task.prototype.run = replacement;\n\
                   original(); const task = new Task(); task.run();";
     let result = resolution("javascript", &[("main.mjs", source)], &[], WORK_MAX);
-    assert_eq!(calls(&result, "main.mjs").count(), 0);
-    assert_eq!(result.unresolved_sites, 3);
+    assert_eq!(
+        calls(&result, "main.mjs")
+            .map(|edge| source_of(edge, source))
+            .collect::<Vec<_>>(),
+        ["new Task()"]
+    );
+    assert_eq!(
+        result
+            .edge_calls
+            .values()
+            .map(|coverage| coverage.unresolved.len())
+            .sum::<usize>(),
+        2
+    );
 }
 
 #[test]
@@ -342,10 +848,18 @@ fn javascript_module_level_occurrence_keeps_its_physical_target() {
     let call = calls.next().expect("module-level call");
     assert_eq!(source_of(call, source), "run()");
     assert_eq!(
-        call.target_binding.unit().to_string(),
+        call.target_binding
+            .as_ref()
+            .expect("target declaration")
+            .unit()
+            .to_string(),
         "rift://source/project/tasks.mjs"
     );
-    let range = call.target_binding.range();
+    let range = call
+        .target_binding
+        .as_ref()
+        .expect("target declaration")
+        .range();
     let start = usize::try_from(range.start()).expect("fixture range start");
     let end = usize::try_from(range.end()).expect("fixture range end");
     assert_eq!(&tasks[start..end], "function run() {}");
@@ -400,7 +914,12 @@ fn javascript_js_modules_follow_the_nearest_explicit_package_mode() {
     assert_eq!(calls(&result, "common/main.js").count(), 1);
     assert_eq!(calls(&result, "esm/main.js").count(), 0);
     let missing = resolution("javascript", &files, &[], WORK_MAX);
-    assert!(missing.occurrences.is_empty());
+    assert!(
+        !missing
+            .occurrences
+            .iter()
+            .any(|edge| edge.role == ReferenceRole::Call)
+    );
 }
 
 #[test]
@@ -411,7 +930,11 @@ fn javascript_empty_analysis_completes_without_an_unresolved_site() {
         &[],
         WORK_MAX,
     );
-    assert!(result.occurrences.is_empty());
+    assert_eq!(result.occurrences.len(), 1);
+    assert_eq!(
+        result.occurrences[0].edge_kind,
+        Some(rift_protocol::read::EdgeKind::Contains)
+    );
     assert_eq!(result.analyzed_sources, 1);
     assert_eq!(result.unavailable_sources, 0);
     assert_eq!(result.unresolved_sites, 0);
@@ -426,7 +949,12 @@ fn javascript_cycles_malformed_sources_and_work_exhaustion_remain_distinct() {
         ("bad.mjs", "function {"),
     ];
     let result = resolution("javascript", &sources, &[], WORK_MAX);
-    assert!(result.occurrences.is_empty());
+    assert!(
+        !result
+            .occurrences
+            .iter()
+            .any(|edge| edge.role == ReferenceRole::Call)
+    );
     assert_eq!(result.analyzed_sources, 2);
     assert_eq!(result.unavailable_sources, 1);
     assert_eq!(result.unresolved_sites, 2);

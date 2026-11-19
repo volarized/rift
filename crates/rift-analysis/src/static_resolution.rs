@@ -1,6 +1,11 @@
 //! Resolves captured call and import sites against admitted source declarations.
 
 mod javascript;
+mod javascript_edges;
+mod javascript_exports;
+mod javascript_members;
+mod javascript_reexports;
+mod javascript_scopes;
 mod python_edges;
 mod rust;
 #[cfg(test)]
@@ -35,7 +40,7 @@ pub(crate) struct StaticSource<'source> {
 pub(crate) struct StaticOccurrence {
     pub(crate) binding: DeclarationBinding,
     pub(crate) target: NormalizedTarget,
-    pub(crate) target_binding: DeclarationBinding,
+    pub(crate) target_binding: Option<DeclarationBinding>,
     pub(crate) source_digest: FileDigest,
     pub(crate) callee_range: ByteRange,
     pub(crate) role: ReferenceRole,
@@ -61,6 +66,39 @@ pub(crate) struct EdgeCallCoverage {
     pub(crate) unresolved: Vec<ByteRange>,
 }
 
+impl EdgeCallCoverage {
+    fn captured(document: &StaticSource<'_>) -> Self {
+        let mut coverage = Self {
+            language: document.facts.language().clone(),
+            unavailable: admitted_facts(document).is_none(),
+            unresolved: Vec::new(),
+        };
+        if document.facts.has_errors()
+            && matches!(
+                document.facts.language().name.as_str(),
+                "javascript" | "typescript"
+            )
+        {
+            if let Ok(end) = u64::try_from(document.source.len()) {
+                coverage.unresolved.push(ByteRange { start: 0, end });
+            } else {
+                coverage.unavailable = true;
+            }
+        }
+        coverage
+    }
+}
+
+pub(crate) fn prepare_javascript_reexports(
+    input: &NamespaceInput<'_>,
+    prepared: &mut crate::analyzer::namespace::PreparedNamespace,
+    selected: &[crate::analyzer::namespace::SelectedFile<'_>],
+    placements: &[&DocumentPlacement],
+    aliases_max: usize,
+) {
+    javascript_reexports::prepare(input, prepared, selected, placements, aliases_max);
+}
+
 /// Runs one static pass over a captured source selection.
 pub(crate) fn resolve(
     graph: &NormalizedGraph,
@@ -74,11 +112,7 @@ pub(crate) fn resolve(
         .map(|document| {
             (
                 document.placement.unit().clone(),
-                EdgeCallCoverage {
-                    language: document.facts.language().clone(),
-                    unavailable: admitted_facts(document).is_none(),
-                    unresolved: Vec::new(),
-                },
+                EdgeCallCoverage::captured(document),
             )
         })
         .collect();
@@ -159,7 +193,7 @@ struct File<'source> {
     facts: &'source StaticFacts,
     by_name: Bindings<'source>,
     by_range: BTreeMap<ByteRange, Option<&'source SyntaxSymbol>>,
-    by_qualified_name: BTreeMap<&'source str, Option<&'source SyntaxSymbol>>,
+    by_qualified_name: BTreeMap<&'source str, Vec<&'source SyntaxSymbol>>,
     assignments: AssignmentTargets<'source>,
 }
 
@@ -246,8 +280,14 @@ impl<'source> File<'source> {
             }
             self.by_qualified_name
                 .entry(&symbol.qualified_name)
-                .and_modify(|entry| *entry = None)
-                .or_insert(Some(symbol));
+                .or_default()
+                .push(symbol);
+            if symbol.name == "default" && symbol.name_range != Some(symbol.item_range) {
+                self.by_range
+                    .entry(symbol.item_range)
+                    .and_modify(|entry| *entry = None)
+                    .or_insert(Some(symbol));
+            }
             if let Some(range) = symbol.name_range {
                 self.by_range
                     .entry(range)
@@ -270,9 +310,13 @@ impl<'source> File<'source> {
     }
 
     fn qualified_target(&self, name: &str) -> Option<Target<'source>> {
+        let candidates = self.by_qualified_name.get(name)?;
+        if candidates.len() != 1 {
+            return None;
+        }
         Some(Target {
             file: self.document,
-            symbol: self.by_qualified_name.get(name).copied().flatten()?,
+            symbol: candidates[0],
         })
     }
 
@@ -338,7 +382,7 @@ struct Index<'source> {
     provider: ProviderId,
     files: BTreeMap<&'source str, File<'source>>,
     rust: rust::Namespaces<'source>,
-    javascript: javascript::PackageModes,
+    javascript: javascript::PackageModes<'source>,
     edge_python: python_edges::EdgePythonModules,
     syntax_publication: rift_core::ProviderRevision,
     unavailable_sources: usize,
@@ -371,7 +415,7 @@ impl<'source> Index<'source> {
         }
         let edge_python = python_edges::EdgePythonModules::build_edge(&files, work)?;
         let rust = rust::Namespaces::new(&files, work)?;
-        let javascript = javascript::PackageModes::new(namespace, work)?;
+        let javascript = javascript::PackageModes::new(namespace, &files, work)?;
         let provider = ProviderId::new(SYNTAX_PROVIDER_ID).ok()?;
         let syntax_publication = graph.publications().provider(&provider)?.revision();
         Some(Self {
@@ -400,7 +444,7 @@ impl<'source> Index<'source> {
                 return;
             }
             let target = self.call_target(file, call, work);
-            let occurrence = target.and_then(|target| {
+            let mut occurrence = target.and_then(|target| {
                 self.occurrence(
                     file,
                     call.range,
@@ -409,6 +453,13 @@ impl<'source> Index<'source> {
                     target,
                 )
             });
+            if matches!(
+                file.document.facts.language().name.as_str(),
+                "javascript" | "typescript"
+            ) && let Some(occurrence) = &mut occurrence
+            {
+                occurrence.edge_from = self.javascript_call_from(file, call.range, work);
+            }
             if occurrence
                 .as_ref()
                 .is_none_or(|occurrence| !matches!(occurrence.target, NormalizedTarget::Symbol(_)))
@@ -435,6 +486,12 @@ impl<'source> Index<'source> {
                 });
                 result.record(occurrence);
             }
+        }
+        if matches!(
+            file.document.facts.language().name.as_str(),
+            "javascript" | "typescript"
+        ) {
+            self.javascript_edges(file, work, result);
         }
         if !work.exhausted {
             result.analyzed_sources += 1;
@@ -556,7 +613,7 @@ impl<'source> Index<'source> {
         Some(StaticOccurrence {
             binding: DeclarationBinding::new(file.document.placement.unit().clone(), range),
             target: normalized,
-            target_binding: target_binding.clone(),
+            target_binding: Some(target_binding.clone()),
             source_digest: *file.document.facts.source_digest()?,
             callee_range,
             role,
@@ -578,8 +635,13 @@ impl StaticResolution {
 fn admitted_facts<'source>(
     document: &'source StaticSource<'source>,
 ) -> Option<&'source StaticFacts> {
-    if document.facts.has_errors()
-        || document.facts.source_digest() != Some(&FileDigest::of(document.source.as_bytes()))
+    if document.facts.source_digest().is_none()
+        || (document.facts.has_errors()
+            && (document.facts.symbols().is_empty()
+                || !matches!(
+                    document.facts.language().name.as_str(),
+                    "javascript" | "typescript"
+                )))
     {
         return None;
     }

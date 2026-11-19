@@ -12,7 +12,7 @@ use crate::{ExactPackageInput, NamespaceInput, PackageImportRoot, PackageImportR
 mod errors;
 pub(crate) mod python;
 mod rust;
-mod typescript;
+pub(crate) mod typescript;
 
 use self::errors::retain_valid_declarations;
 
@@ -57,11 +57,20 @@ pub(crate) struct PreparedNamespace {
 }
 
 pub(crate) fn placed_aliases(
-    prepared: &PreparedNamespace,
+    input: &NamespaceInput<'_>,
+    prepared: &mut PreparedNamespace,
     selected: &[SelectedFile<'_>],
     placements: &[&rift_syntax::DocumentPlacement],
+    aliases_max: usize,
     invalid: impl Fn() -> rift_error::RiftError,
 ) -> Result<BTreeMap<String, Vec<rift_syntax::PlacedAlias>>, rift_error::RiftError> {
+    crate::static_resolution::prepare_javascript_reexports(
+        input,
+        prepared,
+        selected,
+        placements,
+        aliases_max,
+    );
     let positions = selected
         .iter()
         .enumerate()

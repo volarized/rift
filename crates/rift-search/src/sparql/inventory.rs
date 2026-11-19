@@ -59,7 +59,7 @@ impl SemanticInventory {
                 Some("references") => self.references = true,
                 Some(
                     "imports" | "aliases" | "extends" | "implements" | "declares" | "reads"
-                    | "writes" | "hasType",
+                    | "writes" | "hasType" | "contains" | "overrides",
                 ) => self.edges = true,
                 Some("usages") => {
                     self.occurrences.get_or_insert_default();
@@ -102,7 +102,7 @@ impl SemanticInventory {
                         Some("references") => self.references = true,
                         Some(
                             "imports" | "aliases" | "extends" | "implements" | "declares" | "reads"
-                            | "writes" | "hasType",
+                            | "writes" | "hasType" | "contains" | "overrides",
                         ) => self.edges = true,
                         Some("usages") => {
                             self.occurrences.get_or_insert_default();

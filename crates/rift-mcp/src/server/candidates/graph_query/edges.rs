@@ -1236,6 +1236,8 @@ fn relation(kind: EdgeKind) -> Result<SymbolRelation, RiftError> {
         EdgeKind::Aliases => Ok(SymbolRelation::Aliases),
         EdgeKind::Extends => Ok(SymbolRelation::Extends),
         EdgeKind::Implements => Ok(SymbolRelation::Implements),
+        EdgeKind::Contains => Ok(SymbolRelation::Contains),
+        EdgeKind::Overrides => Ok(SymbolRelation::Overrides),
         EdgeKind::Declares => Ok(SymbolRelation::Declares),
         EdgeKind::Reads => Ok(SymbolRelation::Reads),
         EdgeKind::Writes => Ok(SymbolRelation::Writes),

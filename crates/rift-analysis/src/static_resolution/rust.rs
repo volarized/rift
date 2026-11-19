@@ -168,7 +168,7 @@ impl<'source> Namespaces<'source> {
                 }
                 self.method(file, type_path, file.text(member)?, work)
             }
-            StaticCallee::Unsupported => None,
+            StaticCallee::Unsupported | StaticCallee::Constructor => None,
         }
     }
 
