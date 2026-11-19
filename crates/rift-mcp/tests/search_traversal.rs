@@ -732,6 +732,26 @@ async fn live_walk(
     Err(format!("{label} never answered {expected:?}").into())
 }
 
+/// Incoming neighbors retain one caller-to-target edge, followed against its direction.
+fn assert_direct_incoming(answer: &Value, seed: &str) -> TestResult {
+    for hit in results(answer) {
+        assert_eq!(hit["distance"], json!(1), "{hit}");
+        let path = hit["traversal_path"]
+            .as_array()
+            .ok_or("an incoming neighbor carries its path")?;
+        assert_eq!(path.len(), 1, "{hit}");
+        let hop = &path[0];
+        assert_eq!(hop["direction"], "incoming", "{hit}");
+        assert_eq!(
+            hop["edge"]["from"], hit["hit"]["symbol"]["id"],
+            "the reached declaration holds the reference: {hit}"
+        );
+        assert_eq!(hop["edge"]["to"], seed, "{hit}");
+        eprintln!("live incoming edge: {hop}");
+    }
+    Ok(())
+}
+
 /// Reads the established seed from the captured fixture before the first engine walk.
 async fn live_seed(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
@@ -774,6 +794,7 @@ const LIVE_WALK_ATTEMPTS_MAX: usize = 10;
 /// opens only through the server's feed. `beacon` becomes `beacon2` in hub.rs, below a
 /// new `helper`, and caller.rs gains `again`. The outgoing walk from `larger` opens only
 /// walk.rs, and the incoming read of `beacon2` opens only hub.rs.
+/// Incoming walks also reach `caller` and `walk` through their module-scope imports.
 #[tokio::test]
 async fn live_rust_analyzer_walks_answer_a_rename_in_an_unopened_file() -> TestResult {
     if !live_engine_gate::engine_live() {
@@ -809,14 +830,15 @@ async fn live_rust_analyzer_walks_answer_a_rename_in_an_unopened_file() -> TestR
         json!(2),
         "`max` and `len` sit in the standard library: {answer}"
     );
-    live_walk(
+    let (_, incoming) = live_walk(
         &client,
         "incoming before",
         &beacon,
         "incoming",
-        &["larger", "total"],
+        &["caller", "larger", "total", "walk"],
     )
     .await?;
+    assert_direct_incoming(&incoming, &beacon)?;
     eprintln!("live: warm after {:?}", started.elapsed());
 
     std::fs::write(
@@ -841,14 +863,15 @@ async fn live_rust_analyzer_walks_answer_a_rename_in_an_unopened_file() -> TestR
         live_walk(&client, "outgoing after", &larger, "outgoing", &["beacon2"]).await?;
     eprintln!("live: outgoing fresh after {:?}", edited.elapsed());
     let beacon2 = live_seed(&client, "beacon2", "rust").await?;
-    let (incoming, _) = live_walk(
+    let (incoming, answer) = live_walk(
         &client,
         "incoming after",
         &beacon2,
         "incoming",
-        &["again", "larger", "total"],
+        &["again", "caller", "larger", "total", "walk"],
     )
     .await?;
+    assert_direct_incoming(&answer, &beacon2)?;
     eprintln!("live: incoming fresh after {:?}", edited.elapsed());
     assert_eq!(
         (outgoing, incoming),
