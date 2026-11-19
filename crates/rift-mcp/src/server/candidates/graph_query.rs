@@ -692,7 +692,7 @@ mod tests {
         crate::server::hermetic_workspace(directory.path(), "")?;
         std::fs::write(
             directory.path().join("entry.ts"),
-            "function leaf() {}\nexport function root() { leaf(); }\nexport const unused = { first: 1, second: 2, third: 3 };\n",
+            "interface Value {}\ntype Alias = Value;\nconst unused = { first: 1, second: 2, third: 3 };\n",
         )?;
         let root = directory.path().canonicalize()?;
         let server =

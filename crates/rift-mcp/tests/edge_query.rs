@@ -15,6 +15,39 @@ use serde_json::json;
 use workspace_client::{TestResult, captured_seed, query_after_population, served_workspace};
 
 #[tokio::test]
+async fn test_typescript_deferred_calls_and_declared_receivers_are_queryable() -> TestResult {
+    let (_directory, client, task) = served_workspace(
+        &[
+            ("entry.ts", "import type { Box } from './types.js'; let value = 0; export function root(input: Box) { value += 1; input.run(); later(); return input.value; } const later = () => {};"),
+            ("types.ts", "export interface Box { run(): void; value: number; }"),
+        ],
+        None,
+    ).await?;
+    let params = QueryParams {
+        query: "SELECT ?name { ?source :calls ?target . ?target :name ?name } ORDER BY ?name"
+            .into(),
+        ..QueryParams::default()
+    };
+    let answer = query_after_population(&client, &params).await?;
+    let rows = workspace_client::query::rows(&answer)?;
+    let names = rows
+        .iter()
+        .map(|row| workspace_client::query::literal(row, "name"))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(names, ["later", "run"], "{answer}");
+    let params = QueryParams {
+        query: "SELECT (COUNT(*) AS ?n) { ?source :writes ?target }".into(),
+        ..QueryParams::default()
+    };
+    let answer = query_after_population(&client, &params).await?;
+    let rows = workspace_client::query::rows(&answer)?;
+    assert_eq!(workspace_client::query::literal(&rows[0], "n")?, "1");
+    client.cancel().await?;
+    task.await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_static_usage_records_keep_kind_and_enclosing_symbol_together() -> TestResult {
     let (_directory, client, task) = served_workspace(
         &[
@@ -61,7 +94,8 @@ async fn test_static_inventory_projects_repeated_occurrences_with_dataset_bounds
         "leaf();".repeat(count)
     );
     let (_directory, client, task) = served_workspace(&[("entry.ts", &source)], None).await?;
-    for (predicate, expected) in [("calls", 1), ("references", 1), ("usages", count)] {
+    // Each invocation contributes a call occurrence and a callee read.
+    for (predicate, expected) in [("calls", 1), ("references", 1), ("usages", 2 * count)] {
         let params = QueryParams {
             query: format!("SELECT (COUNT(*) AS ?count) {{ ?s :{predicate} ?t }}"),
             ..QueryParams::default()

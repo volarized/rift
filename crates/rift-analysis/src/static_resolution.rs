@@ -200,6 +200,7 @@ struct File<'source> {
     by_qualified_name: BTreeMap<&'source str, Vec<&'source SyntaxSymbol>>,
     callables: EnclosingDefinitions<&'source SyntaxSymbol>,
     assignments: AssignmentTargets<'source>,
+    declared_types: BTreeMap<ByteRange, Option<ByteRange>>,
 }
 
 #[derive(Default)]
@@ -256,6 +257,7 @@ impl<'source> File<'source> {
             by_qualified_name: BTreeMap::new(),
             callables: EnclosingDefinitions::new([]),
             assignments: AssignmentTargets::default(),
+            declared_types: BTreeMap::new(),
         };
         file.index_bindings(work)?;
         file.index_symbols(work)?;
@@ -269,6 +271,15 @@ impl<'source> File<'source> {
             }
             let name = self.text(binding.name)?;
             self.by_name.entry(name).or_default().push(binding);
+        }
+        for &(name, annotation) in self.facts.declared_types() {
+            if !work.charge() {
+                return None;
+            }
+            self.declared_types
+                .entry(name)
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(annotation));
         }
         for range in self.facts.assignments() {
             if !work.charge() {

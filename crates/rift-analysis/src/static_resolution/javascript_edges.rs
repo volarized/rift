@@ -136,7 +136,14 @@ impl<'source> Index<'source> {
             return None;
         }
         let (name, member) = file.text(range)?.split_once('.')?;
-        let binding = super::javascript::js_binding(file, name.trim(), range.start, role, work)?;
+        let binding = super::javascript::js_binding(
+            file,
+            &self.javascript,
+            name.trim(),
+            range.start,
+            role,
+            work,
+        )?;
         let resolver = super::javascript_exports::Exports {
             files: &self.files,
             modes: &self.javascript,
