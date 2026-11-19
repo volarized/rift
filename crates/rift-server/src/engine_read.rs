@@ -1210,12 +1210,20 @@ fn map_graph_calls(
         }
         match neighbor {
             CalleeFile::Project(path) => {
-                let target = project_declaration(
-                    reads,
-                    &path,
-                    (item.selection_range, report.encoding),
-                    "graph calls",
-                )?;
+                let target = match held.direction {
+                    TraversalDirection::Outgoing => project_definition(
+                        reads,
+                        &path,
+                        (item.selection_range, report.encoding),
+                        false,
+                    )?,
+                    TraversalDirection::Incoming => project_declaration(
+                        reads,
+                        &path,
+                        (item.selection_range, report.encoding),
+                        "graph calls",
+                    )?,
+                };
                 if let Some(target) = target {
                     result.local.push((target, occurrences));
                 } else {
@@ -2079,6 +2087,41 @@ fn project_declaration(
     symbol_id(reads.index(), crate::search::declared(file, symbol))
 }
 
+/// Names an engine definition only when its range belongs to a declaration's name.
+fn project_definition(
+    reads: &ReadService,
+    path: &ProjectPath,
+    (range, encoding): (Range, PositionEncoding),
+    require_type: bool,
+) -> Result<Option<SymbolId>, RiftError> {
+    let Some(file) = reads.index().file(path) else {
+        return Ok(None);
+    };
+    let lines = LineIndex::new(file.source());
+    let start = lines.byte_offset(encoding, range.start)? as u64;
+    let end = lines.byte_offset(encoding, range.end)? as u64;
+    let Some(symbol) = file.enclosing_symbol(start, end) else {
+        return Ok(None);
+    };
+    let Some(name) = symbol.name_range else {
+        return Ok(None);
+    };
+    let named =
+        (name.start <= start && end <= name.end) || (start <= name.start && name.end <= end);
+    if !named
+        || symbol
+            .kinds
+            .contains(&rift_protocol::read::SymbolKind::Module)
+        || (require_type
+            && !symbol
+                .kinds
+                .contains(&rift_protocol::read::SymbolKind::Type))
+    {
+        return Ok(None);
+    }
+    symbol_id(reads.index(), crate::search::declared(file, symbol))
+}
+
 /// Reads the exact name range retained by the syntax provider.
 fn declaration_name_offset(file: &IndexedFile, symbol: &SyntaxSymbol) -> Result<usize, RiftError> {
     let range = symbol.name_range.ok_or_else(|| {
@@ -2667,6 +2710,23 @@ mod tests {
         assert!(declaration_name_offset(file, &invalid).is_err());
         invalid.name_range = None;
         assert!(declaration_name_offset(file, &invalid).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn definition_mapping_requires_a_declared_name() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn caller() -> u32 { 0 }\n",
+        )?;
+        let reads = reads(directory.path())?;
+        let path = ProjectPath::new("lib.rs")?;
+        let location = Range::new(Position::new(0, 19), Position::new(0, 22));
+        assert!(
+            super::project_definition(&reads, &path, (location, PositionEncoding::Utf8), false)?
+                .is_none()
+        );
         Ok(())
     }
 

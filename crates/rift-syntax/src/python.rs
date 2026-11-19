@@ -993,6 +993,10 @@ impl GrammarRules for PythonRules {
             Some(syntax_element)
         } else if syntax_element.kind_id() == self.kinds.attribute {
             syntax_element.child_by_field_id(self.kinds.attribute_name.get())
+        } else if syntax_element.kind_id() == self.kinds.assignment {
+            syntax_element
+                .child_by_field_id(self.kinds.left.get())
+                .filter(|target| target.kind_id() == self.kinds.identifier)
         } else if syntax_element.kind_id() == self.kinds.type_alias_statement {
             self.type_alias_name(syntax_element)
         } else {
@@ -1451,6 +1455,25 @@ mod tests {
                 .any(|symbol| symbol.name == "local"),
             "a function-local assignment declares nothing"
         );
+    }
+
+    #[test]
+    fn test_assignment_declarations_keep_their_name_ranges() {
+        let source = "value = make()\nclass Widget:\n    retries = 2\n";
+        let document = analyze(source);
+        for name in ["value", "Widget.retries"] {
+            let declaration = symbol(&document, name);
+            let range = declaration
+                .name_range
+                .expect("an assignment has a name token");
+            assert_eq!(
+                source.get(
+                    usize::try_from(range.start).expect("name start")
+                        ..usize::try_from(range.end).expect("name end")
+                ),
+                Some(declaration.name.as_str())
+            );
+        }
     }
 
     #[test]

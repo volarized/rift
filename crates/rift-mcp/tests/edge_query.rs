@@ -300,7 +300,7 @@ async fn test_edge_cold_calls_wait_and_reference_answers_need_no_declaration_mar
         ),
         (
             "lib.rs",
-            "pub struct Worker;\npub fn leaf() {}\npub fn root(callback: fn()) { callback(); }\npub fn take(worker: Worker) {}\npub trait Task {}\npub struct Base;\nimpl Worker {}\n",
+            "pub struct Worker;\npub fn leaf() {}\npub fn root(callback: fn()) { callback(); }\npub fn take(worker: Worker) {}\npub trait Task {}\npub struct Base;\nimpl Task for Worker {}\n",
         ),
     ];
     let (_directory, client, task) = served_workspace(&files, Some(configuration)).await?;
