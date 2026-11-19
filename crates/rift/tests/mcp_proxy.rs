@@ -1918,7 +1918,16 @@ async fn live_proxied_read_resolves_incoming_references() -> TestResult {
         &json!({"query":format!("SELECT DISTINCT ?caller {{ ?caller :references <{seed}> }}")}),
     )
     .await?;
-    let caller = query::rows(&result)?
+    let callers = query::rows(&result)?;
+    assert_eq!(callers.len(), 2, "{result}");
+    assert!(
+        callers
+            .iter()
+            .any(|row| query::iri(row, "caller").is_ok_and(|id| id.ends_with("/caller"))),
+        "the module-scope import also references beacon: {result}"
+    );
+    eprintln!("live proxied incoming references: {callers:?}");
+    let caller = callers
         .iter()
         .find_map(|row| {
             query::iri(row, "caller")
@@ -1962,7 +1971,12 @@ async fn live_proxied_read_resolves_incoming_references() -> TestResult {
         .iter()
         .find(|language| language["language"] == "rust")
         .ok_or("workspace must report Rust")?;
-    assert_eq!(rust["lsp"]["state"], "ready", "{configuration}");
+    assert_eq!(rust["lsp"]["process"], "rust", "{configuration}");
+    // Reference reads settle without flycheck; the resource reports all engine work.
+    assert!(
+        matches!(rust["lsp"]["state"].as_str(), Some("analyzing" | "ready")),
+        "{configuration}"
+    );
     assert_eq!(
         fs::read_to_string(root.join("hub.rs"))?,
         harness::RUST_PROJECT_HUB
