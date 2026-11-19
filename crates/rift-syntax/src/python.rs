@@ -8,12 +8,10 @@
 //! Decisions this module fixes:
 //! - Qualified names join scopes with `.`, the language's own spelling:
 //!   a method files as `Widget.open`, a nested function as `outer.inner`.
-//! - An assignment declares a `variable` symbol only at module level or
-//!   directly in a class body, the suites of an `if` or a `try` statement
-//!   there included. Each name a tuple or list target binds declares, and so
+//! - An assignment declares a `variable` symbol in its enclosing module,
+//!   class, or function. Each name a tuple or list target binds declares, and so
 //!   does each target of a chained assignment. A `type` statement declares a
-//!   `type_alias` under the same rule. Function-local assignments declare
-//!   nothing: locals would drown the file's real surface in noise.
+//!   `type_alias` under the same rule.
 //! - A `def` directly in a class body declares a `method` of the class. An
 //!   attribute a method assigns through its first parameter (`self.name =
 //!   name`) declares a `variable` of the class.
@@ -43,6 +41,7 @@ use crate::failure::RiftError;
 use crate::provider::{SyntaxLimits, SyntaxProvider, SyntaxSource};
 
 mod overload;
+mod variable_scopes;
 
 #[cfg(test)]
 mod declaration_tests;
@@ -270,13 +269,15 @@ enum DeclarationScope {
     /// Directly in a class body, the suites of its `if` and `try`
     /// statements included.
     Class,
+    /// Inside a function body.
+    Local,
 }
 
 impl DeclarationScope {
     /// Portable kinds a variable declared in this scope carries.
     fn variable_kinds(self) -> Vec<SymbolKind> {
         match self {
-            Self::Module => vec![SymbolKind::Value],
+            Self::Module | Self::Local => vec![SymbolKind::Value],
             Self::Class => vec![SymbolKind::Value, SymbolKind::Member],
         }
     }
@@ -382,16 +383,12 @@ impl PythonRules {
         }))
     }
 
-    /// The file's module declaration and leading literal docstring. Empty files
-    /// carry no declaration because a source binding requires a non-empty range.
+    /// The file's module declaration and leading literal docstring.
     fn module_declaration(
         &self,
         syntax_element: Node<'_>,
         text: &str,
     ) -> Result<Option<Declaration>, RiftError> {
-        if syntax_element.start_byte() == syntax_element.end_byte() {
-            return Ok(None);
-        }
         let mut cursor = syntax_element.walk();
         let string = syntax_element
             .named_children(&mut cursor)
@@ -495,9 +492,7 @@ impl PythonRules {
         kinds
     }
 
-    /// Where a statement declares: the module, or a class body, climbing
-    /// through the suites of `if` and `try` statements. `None` inside a
-    /// function or any other compound statement.
+    /// The enclosing module, class, or function of a statement.
     ///
     /// Each step climbs one recorded parent, so the work is bounded by the
     /// tree's depth.
@@ -516,6 +511,9 @@ impl PythonRules {
             if owner_id == self.kinds.class {
                 return Some(DeclarationScope::Class);
             }
+            if owner_id == self.kinds.function {
+                return Some(DeclarationScope::Local);
+            }
             let compound = if self.kinds.declaring_clauses.contains(&owner_id) {
                 owner.parent()?
             } else {
@@ -526,7 +524,8 @@ impl PythonRules {
                 .declaring_statements
                 .contains(&compound.syntax_element().kind_id())
             {
-                return None;
+                holder = owner.parent()?;
+                continue;
             }
             holder = compound.parent()?;
         }
@@ -995,6 +994,10 @@ impl GrammarRules for PythonRules {
             syntax_element.child_by_field_id(self.kinds.attribute_name.get())
         } else if syntax_element.kind_id() == self.kinds.type_alias_statement {
             self.type_alias_name(syntax_element)
+        } else if syntax_element.kind_id() == self.kinds.assignment {
+            syntax_element
+                .child_by_field_id(self.kinds.left.get())
+                .filter(|target| target.kind_id() == self.kinds.identifier)
         } else {
             syntax_element.child_by_field_id(self.kinds.name.get())
         };
@@ -1188,6 +1191,8 @@ impl SyntaxProvider for PythonSyntaxProvider {
         }
         rules.attach_assigned_docs(&mut symbols);
         attach_attribute_docs(&rules, tree.root_node(), source.text, &mut symbols)?;
+        let static_facts = capture.finish();
+        variable_scopes::apply(&mut symbols, &static_facts, source.text, limits)?;
         Ok(SyntaxDocument::new(
             self.language.clone(),
             source.path.clone(),
@@ -1197,7 +1202,7 @@ impl SyntaxProvider for PythonSyntaxProvider {
         )
         .with_export_bindings(export_bindings)
         .with_source_witness(source.text)
-        .with_static_facts(Some(capture.finish()))
+        .with_static_facts(Some(static_facts))
         .with_syntax_limits(limits))
     }
 
@@ -1444,13 +1449,7 @@ mod tests {
         assert_eq!(symbol(&document, "LIMIT").kind, "variable");
         assert_eq!(symbol(&document, "LIMIT").kinds, [SymbolKind::Value]);
         assert_eq!(symbol(&document, "Widget.retries").kind, "variable");
-        assert!(
-            !document
-                .symbols()
-                .iter()
-                .any(|symbol| symbol.name == "local"),
-            "a function-local assignment declares nothing"
-        );
+        assert_eq!(symbol(&document, "Widget.open.local").kind, "variable");
     }
 
     #[test]

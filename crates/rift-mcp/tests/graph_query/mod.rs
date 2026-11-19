@@ -272,11 +272,34 @@ async fn embedded_edge_provider_filters_inferred_python_calls() -> TestResult {
         ("pyproject.toml", METADATA),
         (
             "graph.py",
-            "class Worker:\n    def perform(self) -> int:\n        return 1\n\ndef root(worker: Worker) -> int:\n    return worker.perform()\n",
+            "class Worker:\n    def perform(self) -> int:\n        return 1\n\ndef direct() -> int:\n    return 0\n\ndef root(workers: list[Worker]) -> int:\n    direct()\n    return workers[0].perform()\n",
         ),
     ];
-    let (_directory, client, task) =
+    let (directory, client, task) =
         served_workspace(&files, Some(CONFIGURATION.to_owned())).await?;
+    let captured = rift_server::ReadService::build(
+        directory.path(),
+        rift_index::WorkspaceIndexLimits::default(),
+        &rift_core::SourceVisibility::default(),
+        &rift_core::TextFileInclusion::default(),
+        rift_protocol::configuration::HistoryConfiguration::default(),
+    )?;
+    let root = rift_core::SymbolId::new(identity(&client, "root").await?)?;
+    let outgoing = captured.edges().outgoing(&root);
+    assert!(
+        outgoing
+            .iter()
+            .any(|edge| edge.kind() == rift_protocol::read::EdgeKind::Calls
+                && edge.to().as_str().ends_with("/direct")),
+        "the static fixture captures the direct call: {outgoing:?}"
+    );
+    assert!(
+        !outgoing
+            .iter()
+            .any(|edge| edge.kind() == rift_protocol::read::EdgeKind::Calls
+                && edge.to().as_str().ends_with("/perform")),
+        "the method receiver requires subscript inference: {outgoing:?}"
+    );
     assert_edge_provider(&client, "root", "engine").await?;
     client.cancel().await?;
     task.await?;

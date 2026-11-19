@@ -393,7 +393,7 @@ mod tests {
         use rift_protocol::read::{TextRange, TraversalDirection};
 
         let directory = tempfile::tempdir().expect("workspace");
-        let source = "function callee() {}\nexport function outer() { const token = callee(); return token; }\nfunction other() {}\n";
+        let source = "function callee() {}\nexport function outer() { const token = () => callee(); return token; }\nfunction other() {}\n";
         std::fs::write(directory.path().join("entry.mjs"), source).expect("source");
         let reads = super::ReadService::build(
             directory.path(),

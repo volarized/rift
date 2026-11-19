@@ -290,7 +290,13 @@ impl SyntaxPublicationBuilder {
             latest.insert(symbol.qualified_name.as_str(), symbol);
             let source = rift_core::DeclarationBinding::new(
                 placement.unit().clone(),
-                SourceRange::new(symbol.item_range.start, symbol.item_range.end)?,
+                if symbol.kind == "module"
+                    && symbol.item_range == (crate::ByteRange { start: 0, end: 0 })
+                {
+                    SourceRange::empty()
+                } else {
+                    SourceRange::new(symbol.item_range.start, symbol.item_range.end)?
+                },
             );
             let mut contribution = Contribution::builder(
                 ContributionKey::new(self.provider.clone(), self.publication, provider_symbol),
@@ -685,6 +691,37 @@ mod tests {
         assert_eq!(
             facts.documentation_blocks().as_ptr(),
             symbol.documentation.as_ptr()
+        );
+    }
+
+    #[test]
+    fn empty_python_module_publishes_its_empty_source_range() {
+        let provider = crate::PythonSyntaxProvider::default();
+        let path = ProjectPath::new("pkg/__init__.py").expect("path");
+        let source = SyntaxSource {
+            path: &path,
+            text: "",
+        };
+        let document = provider
+            .analyze(source, SyntaxLimits::default())
+            .expect("empty module");
+        let limits = rift_provider::PublicationLimits::new(1, 1, 1).expect("limits");
+        let mut builder = SyntaxPublicationBuilder::new(
+            publication(1),
+            source_revision(1),
+            tree_revision(1),
+            limits,
+        )
+        .expect("builder");
+        builder
+            .add_document(&document)
+            .expect("empty module source");
+        let publication = builder.build().expect("publication");
+        let contributions = publication.contributions();
+        assert_eq!(contributions.len(), 1);
+        assert_eq!(
+            contributions[0].source().expect("source").range(),
+            rift_core::SourceRange::empty()
         );
     }
 

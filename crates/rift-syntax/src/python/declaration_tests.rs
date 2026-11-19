@@ -49,6 +49,32 @@ fn spelled(text: &str, range: crate::ByteRange) -> &str {
     &text[start..end]
 }
 
+#[test]
+fn test_annotated_locals_keep_the_enclosing_callable_and_source_range() {
+    let text = "def build():\n    visited: list[str] = []\n    if True:\n        pending: int\n    def nested():\n        result: str = ''\n";
+    let document = analyze(text);
+    for (name, container, source) in [
+        ("build.visited", "build", "visited: list[str] = []"),
+        ("build.pending", "build", "pending: int"),
+        ("build.nested.result", "build.nested", "result: str = ''"),
+    ] {
+        let declaration = symbol(&document, name);
+        assert_eq!(declaration.container.as_deref(), Some(container));
+        assert_eq!(spelled(text, declaration.range), source);
+        assert_eq!(declaration.kinds, [SymbolKind::Value]);
+    }
+}
+
+#[test]
+fn test_empty_python_module_keeps_a_source_facet() {
+    let document = analyze("");
+    let module = symbol(&document, ".");
+    assert_eq!(module.kind, "module");
+    assert_eq!(module.range, crate::ByteRange { start: 0, end: 0 });
+    assert_eq!(module.item_range, module.range);
+    assert!(module.name_range.is_none());
+}
+
 /// A `def` directly in a class body declares a `method` member of the
 /// class; `__init__` constructs it, `staticmethod` and `classmethod` belong
 /// to the class, and `property` reads like a field. A class owns members,
@@ -170,6 +196,7 @@ fn test_module_level_conditional_suites_declare_module_variables() {
             ("json", None, "variable"),
             ("DONE", None, "variable"),
             ("run", None, "function"),
+            ("run.local", Some("run"), "variable"),
             ("Config", None, "class"),
             ("Config.DEBUG", Some("Config"), "variable"),
         ]
@@ -342,7 +369,7 @@ fn test_module_declaration_retains_documentation_and_distinct_bound_names() {
         "Module docstring."
     );
     assert_eq!(symbol(&document, "module").kind, "variable");
-    assert!(analyze("").symbols().is_empty());
+    assert_eq!(symbol(&analyze(""), ".").kind, "module");
     for text in ["# Comment.\n", "f\"{value}\"\n", "b\"bytes\"\n"] {
         let document = analyze(text);
         let module = document
@@ -352,4 +379,80 @@ fn test_module_declaration_retains_documentation_and_distinct_bound_names() {
             .expect("a module without documentation still declares");
         assert!(module.documentation.is_empty());
     }
+}
+
+#[test]
+fn test_python_member_accesses_keep_assignment_roles() {
+    use rift_core::ReferenceRole;
+    let text = "class Task:\n    def run(self):\n        self.first, self.second = (1, 2)\n        self.first += 1\n        self.declared: int\n        self.child.value = 2\n";
+    let document = analyze(text);
+    let accesses = document
+        .facts()
+        .static_facts()
+        .expect("captured facts")
+        .references()
+        .iter()
+        .filter(|reference| reference.role != ReferenceRole::Type)
+        .map(|reference| (spelled(text, reference.target), reference.role))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        accesses,
+        [
+            ("self.first", ReferenceRole::Write),
+            ("self.second", ReferenceRole::Write),
+            ("self.first", ReferenceRole::Read),
+            ("self.first", ReferenceRole::Write),
+            ("self.child.value", ReferenceRole::Write),
+            ("self.child", ReferenceRole::Read),
+        ]
+    );
+}
+
+#[test]
+fn test_python_rebindings_keep_the_declared_variable_scope() {
+    let text = "shared = 0\ndef root():\n    active = False\n    def finish():\n        nonlocal active\n        active = True\n    def publish():\n        global shared\n        shared = 1\n";
+    let document = analyze(text);
+    for (name, qualified, container) in [
+        ("active", "root.active", Some("root")),
+        ("shared", "shared", None),
+    ] {
+        let declarations = document
+            .symbols()
+            .iter()
+            .filter(|symbol| symbol.name == name)
+            .collect::<Vec<_>>();
+        assert_eq!(declarations.len(), 2);
+        for (ordinal, symbol) in declarations.into_iter().enumerate() {
+            assert_eq!(symbol.qualified_name, qualified);
+            assert_eq!(symbol.container.as_deref(), container);
+            assert_eq!(symbol.declaration_ordinal, ordinal);
+        }
+    }
+}
+
+#[test]
+fn test_python_rebindings_keep_class_members_and_skip_class_scopes() {
+    let source = "shared = 0\nclass Holder:\n    global shared\n    shared = 1\n    def run(self):\n        self.shared = 2\ndef root():\n    value = 0\n    class Inner:\n        value = 1\n        def run(self):\n            nonlocal value\n            value = 2\n";
+    let document = analyze(source);
+    let values = document
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.name == "value")
+        .map(|symbol| symbol.qualified_name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(values, ["root.value", "root.Inner.value", "root.value"]);
+    let shared = document
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.name == "shared")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        shared
+            .iter()
+            .map(|symbol| symbol.qualified_name.as_str())
+            .collect::<Vec<_>>(),
+        ["shared", "shared", "Holder.shared"]
+    );
+    assert!(!shared[1].kinds.contains(&SymbolKind::Member));
+    assert!(shared[2].kinds.contains(&SymbolKind::Member));
 }

@@ -132,6 +132,12 @@ pub struct SourceRange {
 }
 
 impl SourceRange {
+    /// Returns the source range of an empty source unit.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self { start: 0, end: 0 }
+    }
+
     /// Constructs a non-empty half-open range.
     ///
     /// # Errors
@@ -1248,6 +1254,8 @@ mod tests {
 
     #[test]
     fn invalid_ranges_and_origins_name_their_fields() {
+        assert_eq!(SourceRange::empty().start(), 0);
+        assert_eq!(SourceRange::empty().end(), 0);
         let range_error = SourceRange::new(4, 4).expect_err("empty range");
         assert_eq!(
             range_error.slug().as_str(),
