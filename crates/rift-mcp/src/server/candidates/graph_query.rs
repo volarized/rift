@@ -1762,6 +1762,149 @@ mod tests {
         Ok(())
     }
 
+    /// Asserts that whole-inventory and seeded reads of one workspace answer static edges to
+    /// `expected` dependency and standard-library symbols, and that the inventory names
+    /// the edge kinds whose sites static analysis left without a target.
+    async fn assert_external_edges(
+        files: &[(&str, &str)],
+        heritage: &str,
+        expected: &[&str],
+    ) -> TestResult {
+        let directory = tempfile::tempdir()?;
+        crate::server::hermetic_workspace(directory.path(), "")?;
+        for (path, text) in files {
+            let path = directory.path().join(path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, text)?;
+        }
+        let root = directory.path().canonicalize()?;
+        let server =
+            RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
+        let caller = static_endpoint(&server, "encode").await?;
+        let mut answers = String::new();
+        for query in [
+            "SELECT ?a ?b { ?a :calls ?b }".to_owned(),
+            format!("SELECT ?a ?b {{ ?a {heritage} ?b }}"),
+        ] {
+            let output = server
+                .graph_query(QueryParams {
+                    query: query.clone(),
+                    language: QueryLanguage::Sparql,
+                    max_results: 100,
+                    ..Default::default()
+                })
+                .await
+                .map_err(|failure| format!("{failure:?}"))?
+                .0
+                .result;
+            assert!(
+                matches!(&output, QueryReadResult::Results(_)),
+                "{query}: {output:?}"
+            );
+            let rendered = format!("{output:?}");
+            assert!(
+                rendered.contains("EdgeCoverageMissing") && rendered.contains("Calls"),
+                "{query}: {rendered}"
+            );
+            answers.push_str(&rendered);
+        }
+        for target in expected {
+            assert!(answers.contains(target), "{target} not in {answers}");
+        }
+        let target = expected.first().ok_or("an expected target")?;
+        let seeded = server
+            .graph_query(QueryParams {
+                query: format!("ASK {{ <{caller}> :calls <{target}> }}"),
+                language: QueryLanguage::Sparql,
+                ..Default::default()
+            })
+            .await
+            .map_err(|failure| format!("{failure:?}"))?
+            .0
+            .result;
+        assert!(
+            matches!(&seeded, QueryReadResult::Results(result)
+                if matches!(&result.answer, QueryAnswer::Boolean { value: true })),
+            "{caller}: {seeded:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graph_query_serves_rust_edges_to_dependency_and_standard_library_symbols() -> TestResult
+    {
+        let files = [
+            (
+                "Cargo.toml",
+                "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nserde_json = \"1\"\n",
+            ),
+            (
+                "src/lib.rs",
+                "use std::fmt;\npub struct Task;\nimpl fmt::Display for Task {\n    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { Ok(()) }\n}\npub fn encode(task: &Task) -> String { task.label(); serde_json::to_string(&1).unwrap_or_default() }\n",
+            ),
+        ];
+        assert_external_edges(
+            &files,
+            ":implements",
+            &[
+                "rift://symbol/cargo/crates.io/serde_json/rust/serde_json/to_string",
+                "rift://symbol/stdlib/rust/rust/std/fmt/Display",
+            ],
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn graph_query_serves_python_edges_to_dependency_and_standard_library_symbols()
+    -> TestResult {
+        let files = [
+            (
+                "pyproject.toml",
+                "[project]\nname = 'app'\nversion = '0.1.0'\ndependencies = ['greeting==1.0.0']\n[build-system]\nrequires=['setuptools==80.9.0']\nbuild-backend='setuptools.build_meta'\n[tool.setuptools]\npy-modules=['app']\n",
+            ),
+            (
+                "app.py",
+                "import os\nfrom greeting.core import greet, Base\n\nclass Child(Base):\n    pass\n\ndef encode(items):\n    greet()\n    items.sort()\n    return len(os.path.join('a', 'b'))\n",
+            ),
+        ];
+        assert_external_edges(
+            &files,
+            ":extends",
+            &[
+                "rift://symbol/pypi/pypi.org/greeting/python/greeting/core/greet",
+                "rift://symbol/stdlib/cpython/python/builtins/len",
+                "rift://symbol/pypi/pypi.org/greeting/python/greeting/core/Base",
+            ],
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn graph_query_serves_typescript_edges_to_dependency_and_standard_library_symbols()
+    -> TestResult {
+        let files = [
+            (
+                "package.json",
+                "{\"name\":\"app\",\"version\":\"1.0.0\",\"dependencies\":{\"zod\":\"4.6.7\"}}",
+            ),
+            (
+                "src/app.ts",
+                "import { parse, ZodType } from \"zod\";\nexport class Shape implements ZodType {}\nexport function encode() { undeclared(); return parse(1); }\n",
+            ),
+        ];
+        assert_external_edges(
+            &files,
+            ":implements",
+            &[
+                "rift://symbol/npm/npmjs.org/zod/typescript/zod/parse",
+                "rift://symbol/npm/npmjs.org/zod/typescript/zod/ZodType",
+            ],
+        )
+        .await
+    }
+
     async fn static_endpoint(
         server: &RiftMcp,
         name: &str,

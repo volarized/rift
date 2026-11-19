@@ -51,6 +51,17 @@ impl AcquiredAdjacency {
         required: rift_search::sparql::SemanticInventory,
     ) -> Result<(), RiftError> {
         self.incomplete |= !reads.static_edges_complete()?;
+        let omitted = reads.static_targets_omitted();
+        if !omitted.is_empty() {
+            let sites = omitted.values().copied().fold(0, u64::saturating_add);
+            self.warnings.push(ReadWarning::EdgeCoverageMissing {
+                kinds: omitted.keys().copied().collect(),
+                detail: format!(
+                    "static analysis left {sites} sites without a target, so edges of these \
+                     kinds may be missing from this answer"
+                ),
+            });
+        }
         let maximum = usize::try_from(RECORDS_MAX).map_err(|_| coverage_failure())?;
         for edge in reads.edges().edges() {
             let usage = (required.adjacency.references || required.occurrences.is_some())
