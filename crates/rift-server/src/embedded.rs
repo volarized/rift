@@ -672,7 +672,7 @@ fn references(
         database,
         params.pointer("/textDocument/uri").unwrap_or(&Value::Null),
     )?;
-    database.project().open_file(database, file);
+    open_file(database, file);
     let program_file = database.program_file(file);
     let text = source_text(database, file);
     let text = exchange.conversion_text(text.as_str());
@@ -695,6 +695,13 @@ fn references(
         }
     }
     Ok(Value::Array(locations))
+}
+
+/// Keeps semantic reads from resetting ty's open-file inputs for an already open file.
+fn open_file(database: &mut ProjectDatabase, file: File) {
+    if !database.is_open_file(file) {
+        database.project().open_file(database, file);
+    }
 }
 
 /// One reference target as a `file://` URI and UTF-8 range; `None` for a
@@ -735,7 +742,7 @@ fn prepared_call_hierarchy(
         database,
         params.pointer(DOCUMENT_URI).unwrap_or(&Value::Null),
     )?;
-    database.project().open_file(database, file);
+    open_file(database, file);
     let program_file = database.program_file(file);
     let text = source_text(database, file);
     let text = exchange.conversion_text(text.as_str());
@@ -763,7 +770,7 @@ fn call_hierarchy_anchor(
     params: &Value,
 ) -> Result<(File, TextSize), AnswerRefusal> {
     let file = file_at(database, params.pointer(ITEM_URI).unwrap_or(&Value::Null))?;
-    database.project().open_file(database, file);
+    open_file(database, file);
     let text = source_text(database, file);
     let offset = offset_at(
         exchange.conversion_text(text.as_str()),
@@ -894,7 +901,7 @@ fn pulled_diagnostics(
         database,
         params.pointer("/textDocument/uri").unwrap_or(&Value::Null),
     )?;
-    database.project().open_file(database, file);
+    open_file(database, file);
     let text = source_text(database, file);
     let text = exchange.conversion_text(text.as_str());
     let mut items = Vec::new();
@@ -1864,6 +1871,39 @@ mod tests {
             handle_message(&open, directory.path(), &empty_documents()),
             Handled::Silent
         ));
+    }
+
+    #[test]
+    fn repeated_references_keep_the_file_open_without_resetting_the_project() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let path = directory.path().join("service.py");
+        std::fs::write(&path, "def serve():\n    pass\n\nserve()\n").expect("source");
+        let request = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "textDocument/references",
+            "params": {"textDocument": {"uri": uri_of(&path)},
+                "position": {"line": 0, "character": 4},
+                "context": {"includeDeclaration": false}},
+        });
+        let documents = empty_documents();
+        let first = handle_message(&request, directory.path(), &documents);
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("ty_project=debug")
+            .install()
+            .expect("recorder");
+        let second = handle_message(&request, directory.path(), &documents);
+        drop(recorder);
+        let (Handled::Reply(first), Handled::Reply(second)) = (first, second) else {
+            panic!("references must reply");
+        };
+        assert_eq!(first["result"].as_array().map(Vec::len), Some(1));
+        assert_eq!(first["result"], second["result"]);
+        let records = drain.queued_records();
+        assert!(
+            !records
+                .iter()
+                .any(|record| record.message().starts_with("Opening file")),
+            "an already open file must not reset the project's open files: {records:?}"
+        );
     }
 
     #[test]
