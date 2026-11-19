@@ -189,6 +189,20 @@ impl<'read> CapturedCalls<'read> {
             let Some(callee) = edge.static_callee() else {
                 continue;
             };
+            // A static edge to a dependency or standard-library symbol names the spelled
+            // public path. An engine that names a dependency declaration at the same call
+            // supplies the defining identity, so its answer stands alone.
+            let external = rift_protocol::identity::SymbolIdentity::parse(neighbor.as_str())
+                .is_ok_and(|identity| !identity.owner().is_local());
+            if external
+                && comparison.at(&span, callee).any(|(_, destinations)| {
+                    destinations.iter().any(|(_, destination)| {
+                        matches!(destination, CallDestination::Dependency(_))
+                    })
+                })
+            {
+                continue;
+            }
             let conflict = comparison.corroborate(
                 &span,
                 callee,

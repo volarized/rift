@@ -3776,6 +3776,12 @@ impl WorkspaceIndex {
         self.semantics.edges()
     }
 
+    /// Sites the static pass left without a target, counted per edge kind.
+    #[must_use]
+    pub fn static_targets_omitted(&self) -> &BTreeMap<rift_protocol::read::EdgeKind, u64> {
+        self.semantics.static_targets_omitted()
+    }
+
     /// Whether captured static calls cover the selected declaration or incoming language set.
     #[must_use]
     pub fn static_edge_calls_complete(

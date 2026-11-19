@@ -197,7 +197,12 @@ impl<'source> Index<'source> {
         }
     }
 
-    fn builtin_require(&self, file: &File<'source>, position: u64, work: &mut Work) -> bool {
+    pub(super) fn builtin_require(
+        &self,
+        file: &File<'source>,
+        position: u64,
+        work: &mut Work,
+    ) -> bool {
         self.javascript.mode(file.document.path.as_str(), work) == ModuleMode::CommonJs
             && !file.blocked(position, work)
             && matches!(

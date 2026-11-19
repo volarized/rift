@@ -54,6 +54,23 @@ impl<'source> Index<'source> {
                 }
                 Some(occurrence)
             });
+            if occurrence.is_none()
+                && reference.role == ReferenceRole::Type
+                && let Some(external) =
+                    self.external_type(file, reference.range, work)
+                        .and_then(|target| {
+                            Self::external_occurrence(
+                                file,
+                                reference.range,
+                                reference.range,
+                                reference.role,
+                                target,
+                            )
+                        })
+            {
+                result.external.push(external);
+                continue;
+            }
             result.record(occurrence);
         }
         for symbol in file.document.facts.symbols() {

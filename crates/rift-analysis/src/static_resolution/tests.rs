@@ -562,3 +562,5 @@ fn test_rust_tuple_bindings_keep_unrelated_calls() {
     );
     assert_eq!(calls(&result, "src/lib.rs").count(), 1, "{result:?}");
 }
+
+mod external;

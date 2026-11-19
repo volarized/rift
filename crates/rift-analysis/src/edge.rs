@@ -29,7 +29,7 @@ use rift_protocol::read::EdgeKind;
 use rift_provider::{NormalizedGraph, NormalizedReference, NormalizedTarget};
 
 use crate::EnclosingDefinitions;
-use crate::static_resolution::StaticOccurrence;
+use crate::static_resolution::{ExternalOccurrence, StaticOccurrence};
 
 /// Most edges one [`EdgeStore`] holds across both directions combined.
 ///
@@ -364,9 +364,10 @@ impl EdgeStore {
         &mut self,
         graph: &NormalizedGraph,
         occurrences: &[StaticOccurrence],
+        external: &[ExternalOccurrence],
         edges_max: usize,
     ) {
-        if occurrences.is_empty() {
+        if occurrences.is_empty() && external.is_empty() {
             return;
         }
         let enclosing = UnitDefinitions::build(graph);
@@ -402,6 +403,32 @@ impl EdgeStore {
                     rift_protocol::read::EdgeDerivation::Syntax
                 } else {
                     rift_protocol::read::EdgeDerivation::Resolution
+                },
+            };
+            admitted.entry(from).or_default().push(edge);
+        }
+        for occurrence in external {
+            let Some(from) = occurrence
+                .edge_from
+                .as_ref()
+                .or_else(|| enclosing.resolve(&occurrence.binding))
+            else {
+                continue;
+            };
+            let edge = Edge {
+                from: from.clone(),
+                to: occurrence.target.clone(),
+                kind: occurrence
+                    .edge_kind
+                    .unwrap_or_else(|| role_kind(occurrence.role)),
+                occurrence: occurrence.binding.clone(),
+                static_callee: (occurrence.role == ReferenceRole::Call)
+                    .then_some(occurrence.callee_range),
+                from_graph: false,
+                derivation: if occurrence.declared {
+                    rift_protocol::read::EdgeDerivation::Resolution
+                } else {
+                    rift_protocol::read::EdgeDerivation::Syntax
                 },
             };
             admitted.entry(from).or_default().push(edge);
