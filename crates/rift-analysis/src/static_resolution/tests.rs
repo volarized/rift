@@ -1,4 +1,27 @@
 #[test]
+fn test_ecmascript_parameters_shadow_only_their_bound_names() {
+    let source = "function leaf() {}\nfunction run(value) { leaf(); }\nfunction shadow(leaf) { leaf(); }\nfunction pattern({ leaf: renamed }, [other], ...rest) { leaf(); renamed(); other(); rest(); }\nfunction duplicate() { function leaf() {} function leaf() {} leaf(); }";
+    for (language, path) in [("javascript", "main.js"), ("typescript", "main.ts")] {
+        let document = syntax(path, source);
+        assert!(
+            document
+                .facts()
+                .static_facts()
+                .expect("static facts")
+                .unsupported_bindings()
+                .is_empty()
+        );
+        let result = resolution(language, &[(path, source)], &[], WORK_MAX);
+        let resolved = calls(&result, path).collect::<Vec<_>>();
+        assert_eq!(resolved.len(), 2, "{language}: {resolved:?}");
+        for call in resolved {
+            assert!(target(call).ends_with("/leaf"));
+            assert_eq!(source_of(call, source), "leaf()");
+        }
+    }
+}
+
+#[test]
 fn test_typescript_declared_interface_calls_survive_unrelated_member_writes() {
     let source = "interface Task { run(): void; } function root(input: Task, other) { other.run = () => {}; input.run(); }";
     let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);
