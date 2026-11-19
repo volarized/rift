@@ -286,6 +286,39 @@ pub struct GraphDatasetBuilder {
 }
 
 impl GraphDatasetBuilder {
+    /// Adds the commit and release events from an acquired symbol history.
+    ///
+    /// # Errors
+    /// Returns an identity or graph admission refusal.
+    pub fn insert_history(
+        &mut self,
+        history: &rift_protocol::read::SymbolHistory,
+    ) -> Result<(), RiftError> {
+        use rift_protocol::read::HistoryEdge;
+
+        for edge in &history.edges {
+            let (event, revision) = match edge {
+                HistoryEdge::IntroducedIn { commit } => {
+                    (HistoryEvent::Introduced, &commit.revision)
+                }
+                HistoryEdge::ChangedIn { commit, .. } => (HistoryEvent::Changed, &commit.revision),
+                HistoryEdge::RemovedIn { commit } => (HistoryEvent::Removed, &commit.revision),
+                HistoryEdge::IntroducedInRelease { revision } => {
+                    (HistoryEvent::Introduced, revision)
+                }
+                HistoryEdge::ChangedInRelease { revision, .. } => (HistoryEvent::Changed, revision),
+                HistoryEdge::RemovedInRelease { revision } => (HistoryEvent::Removed, revision),
+                HistoryEdge::RenamedFrom { .. } | HistoryEdge::CoChanges { .. } => continue,
+            };
+            self.insert(GraphFact::History {
+                symbol: &history.symbol,
+                event,
+                revision: &RevisionIri::parse(&revision.to_string())?,
+            })?;
+        }
+        Ok(())
+    }
+
     /// Adds one fact's triples, all or none.
     ///
     /// A triple the dataset already holds costs nothing, so repeating a fact is free.

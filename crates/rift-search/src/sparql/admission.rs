@@ -30,6 +30,7 @@ pub(super) struct Admission {
     pub(super) retrieval: Vec<RetrievalSelection>,
     pub(super) reads_base: bool,
     pub(super) symbol_only: bool,
+    pub(super) history: super::requirements::HistoryRequirements,
     pub(super) named_local: bool,
     pub(super) embedded_patterns: usize,
     pub(super) semantics: Option<SemanticInventory>,
@@ -70,6 +71,10 @@ pub(super) fn admit(query: &mut Query, limits: &GraphLimits) -> Result<Admission
     let mut admission = Admission {
         reads_base: describes,
         symbol_only: !describes,
+        history: super::requirements::HistoryRequirements {
+            supported: !describes,
+            ..Default::default()
+        },
         semantics: (!describes).then(SemanticInventory::default),
         named_local,
         ..Admission::default()
@@ -224,12 +229,14 @@ fn admit_pattern<'a>(
                 admission.named_local = true;
             } else {
                 admission.symbol_only = false;
+                admission.history.supported = false;
                 admission.semantics = None;
             }
         }
         QueryExpression::Path { path, .. } if !pending.in_retrieval => {
             admission.reads_base = true;
             admission.symbol_only = false;
+            admission.history.supported = false;
             admission.semantics = admission.semantics.and_then(|mut requirements| {
                 requirements.include_path(path)?;
                 Some(requirements)
@@ -237,6 +244,7 @@ fn admit_pattern<'a>(
         }
         QueryExpression::Bgp { patterns } if !pending.in_retrieval && !patterns.is_empty() => {
             admission.reads_base = true;
+            admission.history.include_patterns(patterns);
             admission.semantics = admission.semantics.and_then(|mut requirements| {
                 requirements.include_patterns(patterns)?;
                 Some(requirements)

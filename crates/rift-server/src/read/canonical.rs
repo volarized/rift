@@ -26,6 +26,61 @@ pub struct LocalSymbolViewInput {
 }
 
 impl LocalSymbolViewInput {
+    /// Projects selected symbols and their complete commit timelines.
+    ///
+    /// # Errors
+    /// Refuses unavailable history, incomplete timelines, and graph admission failures.
+    pub fn project_history(
+        &self,
+        reads: &ReadService,
+        selection: rift_search::sparql::SymbolSelection<'_>,
+        dataset: &mut rift_search::sparql::GraphDatasetBuilder,
+        cancellation: &rift_search::sparql::QueryCancellation,
+        deadline: std::time::Instant,
+    ) -> Result<(), RiftError> {
+        use rift_search::sparql::SymbolAddress;
+
+        self.project_symbols(selection, dataset, cancellation, deadline)?;
+        for symbol in self.material.index.unestablished_objects() {
+            check_graph_projection(cancellation, deadline)?;
+            let selected = match selection {
+                rift_search::sparql::SymbolSelection::All => true,
+                rift_search::sparql::SymbolSelection::Named(name) => symbol?.facts().name() == name,
+                rift_search::sparql::SymbolSelection::Identified(_) => false,
+            };
+            if selected {
+                return errors::server::search_coverage_unavailable()
+                    .operation("graph history identity acquisition")
+                    .fail();
+            }
+        }
+        let mut timelines = reads.symbol_timelines()?;
+        for (identity, symbol) in self.material.index.objects() {
+            check_graph_projection(cancellation, deadline)?;
+            let id = rift_protocol::read::SymbolId(identity.as_str().to_owned());
+            if !matches_symbol(
+                selection,
+                SymbolAddress::Established(&id),
+                symbol?.facts().name(),
+            ) {
+                continue;
+            }
+            let (bindings, _) = self.material.index.symbols_by_identity_page(
+                identity,
+                0,
+                reads.index.results_max(),
+            )?;
+            let history = timelines.symbol_timeline(&reads.index, &bindings, id)?;
+            if !history.complete {
+                return errors::server::search_coverage_unavailable()
+                    .operation("graph history acquisition")
+                    .fail();
+            }
+            dataset.insert_history(&history)?;
+        }
+        check_graph_projection(cancellation, deadline)
+    }
+
     /// Attaches encoded query material to the existing view and byte bounds.
     ///
     /// The view expires no later than `expires` when supplied.

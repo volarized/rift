@@ -323,6 +323,7 @@ impl RiftMcp {
                     .acquire_semantic_inventory(resolved, required, deadline)
                     .await?))
             } else if query.symbol_selection().is_some()
+                || query.history_selection().is_some()
                 || query.syntax_element_selection().is_some()
                 || !query.reads_base()
             {
@@ -427,6 +428,24 @@ fn project_local_endpoints(
     Ok(())
 }
 
+fn project_symbol_inventory(
+    input: &rift_server::LocalSymbolViewInput,
+    reads: &rift_server::ReadService,
+    query: &GraphQuery,
+    dataset: &mut rift_search::sparql::GraphDatasetBuilder,
+    cancellation: &QueryCancellation,
+    deadline: std::time::Instant,
+) -> Result<(), RiftError> {
+    if let Some(selection) = query.history_selection() {
+        input.project_history(reads, selection, dataset, cancellation, deadline)?;
+    } else if let Some(selection) = query.syntax_element_selection() {
+        input.project_syntax_elements(reads, selection, dataset, cancellation, deadline)?;
+    } else if let Some(selection) = query.symbol_selection() {
+        input.project_symbols(selection, dataset, cancellation, deadline)?;
+    }
+    Ok(())
+}
+
 fn project_semantic_inventory(
     input: &rift_server::LocalSymbolViewInput,
     acquired: &AcquiredAdjacency,
@@ -523,17 +542,11 @@ impl AcquiredGraph {
             )?;
         } else if let Some(exact) = &exact {
             exact.project(&mut dataset)?;
-        } else if let Some(selection) = query.syntax_element_selection() {
-            input.project_syntax_elements(
+        } else {
+            project_symbol_inventory(
+                &input,
                 &reads,
-                selection,
-                &mut dataset,
-                cancellation,
-                deadline.at().into_std(),
-            )?;
-        } else if let Some(selection) = query.symbol_selection() {
-            input.project_symbols(
-                selection,
+                query,
                 &mut dataset,
                 cancellation,
                 deadline.at().into_std(),
