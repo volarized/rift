@@ -628,7 +628,13 @@ impl LocalSymbolViews {
         Ok(self.captured_view_at(&id, root, owner, SystemTime::now()))
     }
 
-    fn captured_view_at(
+    /// Returns the retained view `id` names as of `now`.
+    ///
+    /// # Errors
+    /// Returns `view_expired` for a view that expired by `now`, `view_context` for an unknown
+    /// view or another root or owner, and `index_preparing` for a view captured while the
+    /// index prepared.
+    pub fn captured_view_at(
         &self,
         id: &CapturedViewId,
         root: &Path,

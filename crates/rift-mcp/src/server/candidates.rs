@@ -337,19 +337,7 @@ impl RiftMcp {
             .get()
             .ok_or_else(|| unavailable("retained read material is unavailable"))?;
         if let Some(view) = &requested.view {
-            let response = self.saved_candidates(&requested.params, view)?;
-            let accepted = views
-                .captured_view(
-                    view.id.as_str(),
-                    std::path::Path::new(&response.root),
-                    &response.owner,
-                )
-                .map_err(read_failure)?
-                .map_err(|reason| unavailable(&format!("{reason:?}")))?;
-            if &accepted != view {
-                return Err(unavailable("captured view context does not match"));
-            }
-            return Ok(SearchCandidateResult::Captured(Box::new(response)));
+            return self.held_candidates(views, &requested.params, view, SystemTime::now());
         }
         validate_candidate_query(&requested.params)?;
         let (resolved, ranking, references, deadline) =
@@ -478,30 +466,78 @@ impl RiftMcp {
         self.candidate_responses.save_bytes(id, expires, encoded)
     }
 
+    /// Answers the candidates `view` retained as of `now`, or the typed reason a `search`
+    /// page naming that view answers: `view_expired` once the view expired, else
+    /// `view_context`.
+    fn held_candidates(
+        &self,
+        views: &rift_server::LocalSymbolViews,
+        params: &SearchParams,
+        view: &CapturedView,
+        now: SystemTime,
+    ) -> Result<SearchCandidateResult, ToolFailure> {
+        use rift_protocol::symbol_read::SymbolUnavailableReason;
+        let refused = |reason| {
+            SearchCandidateResult::Unavailable(
+                rift_protocol::search_read::SearchUnavailable::Unavailable {
+                    reason,
+                    view: Some(view.clone()),
+                    warnings: Vec::new(),
+                },
+            )
+        };
+        let response = match self.saved_candidates(params, view, now)? {
+            Ok(response) => response,
+            Err(reason) => return Ok(refused(reason)),
+        };
+        let accepted = views.captured_view_at(
+            &view.id,
+            std::path::Path::new(&response.root),
+            &response.owner,
+            now,
+        );
+        match accepted {
+            Ok(accepted) if &accepted == view => {
+                Ok(SearchCandidateResult::Captured(Box::new(response)))
+            }
+            Ok(_) => Ok(refused(SymbolUnavailableReason::ViewContext)),
+            Err(reason) => Ok(refused(reason)),
+        }
+    }
+
     fn saved_candidates(
         &self,
         params: &SearchParams,
         view: &CapturedView,
-    ) -> Result<SearchCandidateResponse, ToolFailure> {
+        now: SystemTime,
+    ) -> Result<
+        Result<SearchCandidateResponse, rift_protocol::symbol_read::SymbolUnavailableReason>,
+        ToolFailure,
+    > {
+        use rift_protocol::symbol_read::SymbolUnavailableReason;
         let saved = self
             .candidate_responses
             .bytes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let bytes = saved
-            .iter()
-            .find(|row| row.id == view.id.as_str())
-            .ok_or_else(|| unavailable("captured candidates are unavailable"))?;
-        let saved: SavedResponse =
-            serde_json::from_slice(&bytes.bytes).map_err(transport_failure)?;
+        let Some(row) = saved.iter().find(|row| row.id == view.id.as_str()) else {
+            let expired = crate::proxy::captured_expiry(view).map_err(read_failure)? <= now;
+            return Ok(Err(if expired {
+                SymbolUnavailableReason::ViewExpired
+            } else {
+                SymbolUnavailableReason::ViewContext
+            }));
+        };
+        if row.expires <= now {
+            return Ok(Err(SymbolUnavailableReason::ViewExpired));
+        }
+        let saved: SavedResponse = serde_json::from_slice(&row.bytes).map_err(transport_failure)?;
         if crate::proxy::normalized_params(&saved.params) != crate::proxy::normalized_params(params)
             || &saved.response.view != view
         {
-            return Err(unavailable(
-                "captured candidate request context does not match",
-            ));
+            return Ok(Err(SymbolUnavailableReason::ViewContext));
         }
-        Ok(saved.response)
+        Ok(Ok(saved.response))
     }
 }
 
@@ -652,13 +688,21 @@ mod captured_search_startup_tests {
             .captured_view(captured.view.id.as_str(), &server.root, &captured.owner)?
             .map_err(|reason| format!("{reason:?}"))?;
         assert_eq!(selected, captured.view);
+        let now = std::time::SystemTime::now();
         let continued = server
-            .saved_candidates(&params, &selected)
-            .map_err(|failure| format!("{failure:?}"))?;
+            .saved_candidates(&params, &selected, now)
+            .map_err(|failure| format!("{failure:?}"))?
+            .map_err(|reason| format!("{reason:?}"))?;
         assert_eq!(continued.view, selected);
         let mut changed = params;
         changed.query = Some("beacon".to_owned());
-        assert!(server.saved_candidates(&changed, &selected).is_err());
+        assert_eq!(
+            server
+                .saved_candidates(&changed, &selected, now)
+                .map_err(|failure| format!("{failure:?}"))?
+                .err(),
+            Some(rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext)
+        );
         Ok(())
     }
 
@@ -989,6 +1033,92 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .len(),
             1
+        );
+        Ok(())
+    }
+
+    /// #766: a continued candidate read names why its view is gone, as `search` pages do.
+    #[tokio::test]
+    async fn released_candidate_views_answer_typed_reasons() -> TestResult {
+        use rift_protocol::symbol_read::SymbolUnavailableReason;
+        let (_directory, assembled) = super::super::tests::starting_fixture().await?;
+        let initial = crate::validation::discover_initial_workspace(&assembled.context)
+            .await?
+            .ok_or("initial discovery was cancelled")?;
+        crate::validation::prepare_initial_workspace_from(&assembled.context, initial).await?;
+        let SearchCandidateResult::Captured(captured) = assembled
+            .server
+            .search_candidates_request(request()?)
+            .await?
+        else {
+            return Err("ready publication must capture candidates".into());
+        };
+        let views = assembled.server.local_views.get().ok_or("local views")?;
+        let params: super::SearchParams = serde_json::from_value(serde_json::json!({
+            "query": "beacon", "scope": "local", "target": "symbol"
+        }))?;
+        let reason = |answer: SearchCandidateResult| match answer {
+            SearchCandidateResult::Unavailable(
+                rift_protocol::search_read::SearchUnavailable::Unavailable { reason, view, .. },
+            ) => Ok((reason, view)),
+            SearchCandidateResult::Captured(_) => Err("a gone view must not answer candidates"),
+        };
+        let now = SystemTime::now();
+        let held = assembled
+            .server
+            .held_candidates(views, &params, &captured.view, now)
+            .map_err(|failure| format!("{failure:?}"))?;
+        assert!(matches!(held, SearchCandidateResult::Captured(_)));
+        let later = now + Duration::from_mins(16);
+        assert_eq!(
+            reason(
+                assembled
+                    .server
+                    .held_candidates(views, &params, &captured.view, later)
+                    .map_err(|failure| format!("{failure:?}"))?
+            )?,
+            (
+                SymbolUnavailableReason::ViewExpired,
+                Some(captured.view.clone())
+            )
+        );
+        let mut changed = params.clone();
+        changed.query = Some("other".to_owned());
+        assert_eq!(
+            reason(
+                assembled
+                    .server
+                    .held_candidates(views, &changed, &captured.view, now)
+                    .map_err(|failure| format!("{failure:?}"))?
+            )?
+            .0,
+            SymbolUnavailableReason::ViewContext
+        );
+        let mut unknown = captured.view.clone();
+        unknown.id = rift_protocol::symbol_read::CapturedViewId::parse("unknown.view")?;
+        let arguments = serde_json::json!({"params": params, "view": unknown});
+        let answer = assembled
+            .server
+            .search_candidates_request(
+                CallToolRequestParams::new("search_candidates")
+                    .with_arguments(serde_json::from_value(arguments)?),
+            )
+            .await
+            .map_err(|failure| format!("{failure:?}"))?;
+        let value = serde_json::to_value(&answer)?;
+        assert_eq!(value["outcome"], "unavailable", "{value}");
+        assert_eq!(value["reason"], "view_context", "{value}");
+        let mut expired = unknown;
+        expired.expires_at = "2000-01-01T00:00:00Z".to_owned();
+        assert_eq!(
+            reason(
+                assembled
+                    .server
+                    .held_candidates(views, &params, &expired, now)
+                    .map_err(|failure| format!("{failure:?}"))?
+            )?
+            .0,
+            SymbolUnavailableReason::ViewExpired
         );
         Ok(())
     }

@@ -23,6 +23,8 @@ pub(in crate::proxy) use read::dispatch_facets_request;
 pub(super) enum CandidateAnswer {
     Captured(CapturedCandidates),
     Response(CallToolResult),
+    /// A project no longer holds the view the continued search named.
+    Unavailable(SymbolUnavailableReason),
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -335,6 +337,9 @@ impl RiftProxy {
         {
             Err(error) => return Ok(Some(Err(error))),
             Ok(CandidateAnswer::Response(result)) => return Ok(Some(Ok(result.into()))),
+            Ok(CandidateAnswer::Unavailable(reason)) => {
+                return Ok(Some(unavailable_search(reason)));
+            }
             Ok(CandidateAnswer::Captured(captured)) => captured,
         };
         let view = match previous {
@@ -448,6 +453,7 @@ impl RiftProxy {
                 selected.packages.clear();
                 SearchScope::Local
             };
+            let named = view.is_some();
             let result = backend
                 .candidate_response(SearchCandidateRequest {
                     params: selected,
@@ -463,6 +469,9 @@ impl RiftProxy {
                 Ok(result) => match decode_response(&result)? {
                     SearchCandidateResult::Captured(response) => *response,
                     SearchCandidateResult::Unavailable(answer) => {
+                        if let Some(reason) = view_refusal(&answer, named) {
+                            return Ok(Ok(CandidateAnswer::Unavailable(reason)));
+                        }
                         validate_preparing_response(&answer, require_ready_ranking)?;
                         return Ok(Ok(CandidateAnswer::Response(result)));
                     }
@@ -542,6 +551,21 @@ fn decode_response(result: &CallToolResult) -> Result<SearchCandidateResult, Rif
     })?;
     serde_json::from_value(value)
         .map_err(|source| errors::mcp::forward_failed().source(source).error())
+}
+
+/// The reason a project refused the view a continued search named, as the combined
+/// search answers it.
+fn view_refusal(
+    answer: &rift_protocol::search_read::SearchUnavailable,
+    named: bool,
+) -> Option<SymbolUnavailableReason> {
+    let rift_protocol::search_read::SearchUnavailable::Unavailable { reason, .. } = answer;
+    (named
+        && matches!(
+            reason,
+            SymbolUnavailableReason::ViewExpired | SymbolUnavailableReason::ViewContext
+        ))
+    .then_some(*reason)
 }
 
 fn validate_preparing_response(
@@ -758,6 +782,27 @@ mod tests {
             ranking: rift_protocol::configuration::RankingConfiguration::default(),
             results_max: 100,
         }
+    }
+
+    /// #766: a project's typed view refusal reaches the caller of a continued search.
+    #[test]
+    fn continued_search_keeps_a_project_view_refusal() {
+        let answer = |reason| rift_protocol::search_read::SearchUnavailable::Unavailable {
+            reason,
+            view: None,
+            warnings: Vec::new(),
+        };
+        for reason in [
+            SymbolUnavailableReason::ViewExpired,
+            SymbolUnavailableReason::ViewContext,
+        ] {
+            assert_eq!(view_refusal(&answer(reason), true), Some(reason));
+            assert_eq!(view_refusal(&answer(reason), false), None);
+        }
+        assert_eq!(
+            view_refusal(&answer(SymbolUnavailableReason::IndexPreparing), true),
+            None
+        );
     }
 
     #[test]
