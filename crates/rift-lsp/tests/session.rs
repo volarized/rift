@@ -130,6 +130,160 @@ async fn join(engine_task: tokio::task::JoinHandle<()>) {
 // Exchange-level: capability negotiation, requests, and refusals.
 // ---------------------------------------------------------------------
 
+#[tokio::test]
+async fn reference_batch_sends_every_request_before_reading_reversed_answers() {
+    let (_workspace, mut session, task) = started(|mut engine| async move {
+        engine.handshake(full_capabilities()).await;
+        let first = engine.next_message().await;
+        let second = engine.next_message().await;
+        assert_eq!(first["method"], "textDocument/references");
+        assert_eq!(second["method"], "textDocument/references");
+        for request in [second, first] {
+            engine.respond(&request["id"], json!([{
+                "uri": request["params"]["textDocument"]["uri"],
+                "range": {"start": request["params"]["position"], "end": request["params"]["position"]}
+            }])).await;
+        }
+        let (id, _) = engine.expect_request("shutdown").await;
+        engine.respond(&id, Value::Null).await;
+        engine.expect_request("exit").await;
+    }).await;
+    let positions = [
+        (path("first.rs"), Position::new(1, 2)),
+        (path("second.rs"), Position::new(3, 4)),
+    ];
+    let answers = session
+        .references_batch(&positions)
+        .await
+        .expect("batch answers");
+    assert_eq!(answers.len(), 2);
+    for (answer, (_, position)) in answers.iter().zip(&positions) {
+        assert_eq!(answer[0].range.start, *position);
+    }
+    session.shutdown().await;
+    join(task).await;
+}
+
+#[tokio::test]
+async fn an_oversized_reference_batch_keeps_the_session_for_the_next_request() {
+    let (_workspace, mut session, task) = started(|mut engine| async move {
+        engine.handshake(full_capabilities()).await;
+        let (id, _) = engine.expect_request("textDocument/references").await;
+        engine.respond(&id, json!([])).await;
+        let (id, _) = engine.expect_request("shutdown").await;
+        engine.respond(&id, Value::Null).await;
+        assert_eq!(engine.next_message().await["method"], "exit");
+    })
+    .await;
+    let positions = vec![
+        (path("first.rs"), Position::new(0, 0));
+        rift_lsp::correlation::PENDING_REQUESTS_MAX + 1
+    ];
+    let error = session
+        .references_batch(&positions)
+        .await
+        .expect_err("oversized group");
+    assert_eq!(
+        error.slug(),
+        errors::lsp::correlation_pending_requests_exceeded::SLUG
+    );
+    assert!(!session.is_ended());
+    assert!(
+        session
+            .references(&path("first.rs"), Position::new(0, 0))
+            .await
+            .expect("following request")
+            .is_empty()
+    );
+    session.shutdown().await;
+    join(task).await;
+}
+
+#[tokio::test]
+async fn a_cancelled_reference_batch_discards_its_answers_before_the_next_request() {
+    let (ready, received) = tokio::sync::oneshot::channel();
+    let (_workspace, mut session, task) = started(|mut engine| async move {
+        engine.handshake(full_capabilities()).await;
+        let first = engine.next_message().await;
+        let second = engine.next_message().await;
+        ready.send(()).expect("the caller still waits");
+        let next = engine.next_message().await;
+        for request in [second, first, next] {
+            engine.respond(&request["id"], json!([])).await;
+        }
+        let (id, _) = engine.expect_request("shutdown").await;
+        engine.respond(&id, Value::Null).await;
+        assert_eq!(engine.next_message().await["method"], "exit");
+    })
+    .await;
+    let positions = [
+        (path("first.rs"), Position::new(0, 0)),
+        (path("second.rs"), Position::new(0, 0)),
+    ];
+    {
+        let batch = session.references_batch(&positions);
+        tokio::pin!(batch);
+        tokio::select! {
+            answer = &mut batch => panic!("the engine holds both responses: {answer:?}"),
+            ready = received => ready.expect("both requests reached the engine"),
+        }
+    }
+    assert!(session.is_intact());
+    assert!(
+        session
+            .references(&path("next.rs"), Position::new(0, 0))
+            .await
+            .expect("following request")
+            .is_empty()
+    );
+    session.shutdown().await;
+    join(task).await;
+}
+
+#[tokio::test]
+async fn a_cancelled_full_batch_leaves_room_for_the_next_request() {
+    let (ready, received) = tokio::sync::oneshot::channel();
+    let (resume, resumed) = tokio::sync::oneshot::channel();
+    let (_workspace, mut session, task) = started(|mut engine| async move {
+        engine.handshake(full_capabilities()).await;
+        let mut requests = Vec::new();
+        for _ in 0..rift_lsp::correlation::PENDING_REQUESTS_MAX {
+            requests.push(engine.next_message().await);
+        }
+        ready.send(()).expect("the caller still waits");
+        resumed.await.expect("the caller cancelled the full batch");
+        for request in requests {
+            engine.respond(&request["id"], json!([])).await;
+        }
+        let (id, _) = engine.expect_request("textDocument/references").await;
+        engine.respond(&id, json!([])).await;
+        let (id, _) = engine.expect_request("shutdown").await;
+        engine.respond(&id, Value::Null).await;
+        engine.expect_request("exit").await;
+    })
+    .await;
+    let positions =
+        vec![(path("first.rs"), Position::new(0, 0)); rift_lsp::correlation::PENDING_REQUESTS_MAX];
+    {
+        let batch = session.references_batch(&positions);
+        tokio::pin!(batch);
+        tokio::select! {
+            answer = &mut batch => panic!("the engine holds its responses: {answer:?}"),
+            ready = received => ready.expect("the full batch reached the engine"),
+        }
+    }
+    resume.send(()).expect("the engine still waits");
+    assert!(
+        session
+            .references(&path("next.rs"), Position::new(0, 0))
+            .await
+            .expect("following request")
+            .is_empty()
+    );
+    session.shutdown().await;
+    join(task).await;
+}
+
 /// The happy-path script: negotiates the full capability grid, publishes
 /// diagnostics for the opened document and one outside the root, answers
 /// every operation the flagship test drives, then shuts down cleanly.
