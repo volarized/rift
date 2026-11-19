@@ -2144,10 +2144,7 @@ impl RiftMcp {
         let (definitions, bindings) = startup_configuration.lsp_runtime_configuration();
         let engines = Arc::new(EngineHold::new(root.clone(), definitions, bindings));
         validation.feed_engines(Arc::clone(&engines));
-        let material_bytes_max = usize::try_from(8_u64 * 1024 * 1024 * 1024)
-            .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
         let local_views = std::sync::OnceLock::from(rift_server::LocalSymbolViews::new(
-            material_bytes_max,
             crate::http::token_entropy("captured view key")?,
         ));
         let server = Self {

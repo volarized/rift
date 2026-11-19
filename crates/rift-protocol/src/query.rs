@@ -152,29 +152,65 @@ pub enum QueryReadResult {
     Unavailable(SearchUnavailable),
 }
 
-/// Bounds on one query result page.
+/// Views one server retains when `[search.query] retained_views` is omitted.
+pub const QUERY_RETAINED_VIEWS_DEFAULT: u64 = 256;
+/// Most views `[search.query] retained_views` accepts.
+pub const QUERY_RETAINED_VIEWS_MAX: u64 = 4096;
+/// Retained view material when `[search.query] retained_size` is omitted: 8 GiB.
+pub const QUERY_RETAINED_BYTES_DEFAULT: u64 = 8 << 30;
+/// Least retained view material `[search.query] retained_size` accepts: 1 MiB.
+pub const QUERY_RETAINED_BYTES_MIN: u64 = 1 << 20;
+/// Most retained view material `[search.query] retained_size` accepts: 64 GiB.
+pub const QUERY_RETAINED_BYTES_MAX: u64 = 64 << 30;
+
+/// Bounds on one query result page and on the views retained for later pages.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[schemars(transform = crate::schema::declare_query_ranges)]
 pub struct QueryConfiguration {
     /// Most encoded bytes on one page, from 1 KiB to 4 MiB.
     pub page_limit: crate::configuration::ByteSize,
+    /// Most views the server retains for later pages, 1 to 4096. A new view past
+    /// the bound releases the least recently used one.
+    #[schemars(range(min = 1, max = QUERY_RETAINED_VIEWS_MAX))]
+    pub retained_views: u64,
+    /// Most material the retained views hold together, 1mb to 64gb. A new view past
+    /// the bound releases the least recently used ones; a view larger than the bound
+    /// alone is refused.
+    pub retained_size: crate::configuration::ByteSize,
 }
 
 impl Default for QueryConfiguration {
     fn default() -> Self {
         Self {
             page_limit: crate::configuration::ByteSize::from_bytes(4 * 1024 * 1024),
+            retained_views: QUERY_RETAINED_VIEWS_DEFAULT,
+            retained_size: crate::configuration::ByteSize::from_bytes(QUERY_RETAINED_BYTES_DEFAULT),
         }
     }
 }
 
 impl QueryConfiguration {
     pub(crate) fn violation(&self) -> Option<crate::configuration::ConfigurationViolation> {
-        crate::configuration::first_out_of_range([(
-            "search.query.page_limit",
-            self.page_limit.bytes(),
-            1024,
-            4 * 1024 * 1024,
-        )])
+        crate::configuration::first_out_of_range([
+            (
+                "search.query.page_limit",
+                self.page_limit.bytes(),
+                1024,
+                4 * 1024 * 1024,
+            ),
+            (
+                "search.query.retained_views",
+                self.retained_views,
+                1,
+                QUERY_RETAINED_VIEWS_MAX,
+            ),
+            (
+                "search.query.retained_size",
+                self.retained_size.bytes(),
+                QUERY_RETAINED_BYTES_MIN,
+                QUERY_RETAINED_BYTES_MAX,
+            ),
+        ])
     }
 }

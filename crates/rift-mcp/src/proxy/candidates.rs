@@ -33,10 +33,16 @@ pub(super) struct CapturedCandidates {
     pub(super) results_max: usize,
 }
 
+/// Captured combined searches in least-recent-use order, oldest first.
 #[derive(Debug)]
 pub(super) struct CandidateViews {
     rows: Mutex<Vec<SavedCandidateBytes>>,
+    /// Keys of rows released to admit newer ones; locked after `rows` only.
+    released: Mutex<std::collections::BTreeSet<[u8; 32]>>,
 }
+
+/// Combined searches one proxy retains at once.
+const CANDIDATE_VIEWS_MAX: usize = 256;
 
 #[derive(Debug)]
 struct SavedCandidateBytes {
@@ -68,7 +74,8 @@ enum SavedCandidateRead {
 impl Default for CandidateViews {
     fn default() -> Self {
         Self {
-            rows: Mutex::new(Vec::with_capacity(256)),
+            rows: Mutex::new(Vec::with_capacity(CANDIDATE_VIEWS_MAX)),
+            released: Mutex::default(),
         }
     }
 }
@@ -99,28 +106,54 @@ impl CandidateViews {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         rows.retain(|row| row.expires > now);
-        let retained = rows.iter().fold(
-            rows.capacity()
-                .checked_mul(std::mem::size_of::<SavedCandidateBytes>())
-                .and_then(|size| size.checked_add(bytes.capacity())),
-            |sum, row| sum.and_then(|sum| sum.checked_add(row.bytes.capacity())),
-        );
-        if rows.len() == 256 || retained.is_none_or(|size| size > CANDIDATE_BYTES_MAX) {
-            return Err(invalid(
-                "view",
-                "captured search exceeds the byte or view bound",
-            ));
+        if retained_row_bytes(&rows[..0], rows.capacity(), bytes.capacity())
+            .is_none_or(|size| size > CANDIDATE_BYTES_MAX)
+        {
+            return Err(invalid("view", "captured search exceeds the byte bound"));
         }
         let key = view_key(view.id.as_str());
         if rows.iter().any(|row| row.key == key) {
             return Err(invalid("view", "captured search view is already retained"));
+        }
+        // Each release scans the rows once; at most every retained row is released.
+        let mut released = Vec::new();
+        while !rows.is_empty()
+            && (rows.len() >= CANDIDATE_VIEWS_MAX
+                || retained_row_bytes(&rows, rows.capacity(), bytes.capacity())
+                    .is_none_or(|size| size > CANDIDATE_BYTES_MAX))
+        {
+            released.push(rows.remove(0).key);
         }
         rows.push(SavedCandidateBytes {
             key,
             expires,
             bytes,
         });
+        drop(rows);
+        self.release(released);
         Ok(view)
+    }
+
+    /// Records released keys so a later continuation names its view expired.
+    fn release(&self, released: Vec<[u8; 32]>) {
+        if released.is_empty() {
+            return;
+        }
+        let mut keys = self
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        keys.extend(released);
+        while keys.len() > CANDIDATE_VIEWS_MAX {
+            keys.pop_first();
+        }
+    }
+
+    fn is_released(&self, key: &[u8; 32]) -> bool {
+        self.released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(key)
     }
 
     pub(super) fn backend(
@@ -173,19 +206,26 @@ impl CandidateViews {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let key = view_key(id.as_str());
-        let Some(row) = rows.iter().find(|row| row.key == key) else {
-            return Ok(Err(
-                rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext,
-            ));
+        let Some(position) = rows.iter().position(|row| row.key == key) else {
+            drop(rows);
+            return Ok(Err(if self.is_released(&key) {
+                SymbolUnavailableReason::ViewExpired
+            } else {
+                SymbolUnavailableReason::ViewContext
+            }));
         };
-        if row.expires <= now {
+        if rows[position].expires <= now {
             rows.retain(|row| row.expires > now);
             return Ok(Err(
                 rift_protocol::symbol_read::SymbolUnavailableReason::ViewExpired,
             ));
         }
-        let SavedCandidateRead::Search(saved) = serde_json::from_slice(&row.bytes)
-            .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
+        let row = rows.remove(position);
+        let decoded = serde_json::from_slice(&row.bytes);
+        rows.push(row);
+        drop(rows);
+        let SavedCandidateRead::Search(saved) =
+            decoded.map_err(|source| errors::mcp::forward_failed().source(source).error())?;
         if saved.view.id != *id || saved.params != normalized_params(params) {
             return Ok(Err(
                 rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext,
@@ -193,6 +233,21 @@ impl CandidateViews {
         }
         Ok(Ok(Some(*saved)))
     }
+}
+
+/// Bytes `rows` and one incoming row of `incoming` bytes charge, with the table at
+/// `capacity` rows.
+fn retained_row_bytes(
+    rows: &[SavedCandidateBytes],
+    capacity: usize,
+    incoming: usize,
+) -> Option<usize> {
+    rows.iter().fold(
+        capacity
+            .checked_mul(std::mem::size_of::<SavedCandidateBytes>())
+            .and_then(|size| size.checked_add(incoming)),
+        |sum, row| sum.and_then(|sum| sum.checked_add(row.bytes.capacity())),
+    )
 }
 
 fn saved_backends(bytes: &[u8]) -> Result<Vec<SavedCandidateBackend>, RiftError> {
@@ -932,6 +987,59 @@ mod tests {
             store.selected(&request, captured_expiry(&view).expect("expiry")),
             Ok(Err(SymbolUnavailableReason::ViewExpired))
         ));
+    }
+
+    fn numbered(serial: usize) -> CapturedCandidates {
+        let mut captured = captured();
+        captured.pools[0].view.id =
+            CapturedViewId::parse(&format!("claims.p{serial}")).expect("captured key");
+        captured
+    }
+
+    #[test]
+    fn full_candidate_store_releases_least_recently_used_search() {
+        let store = CandidateViews::default();
+        let now = SystemTime::UNIX_EPOCH;
+        let views: Vec<_> = (0..CANDIDATE_VIEWS_MAX)
+            .map(|serial| store.save(&params(), &numbered(serial), now).expect("save"))
+            .collect();
+        let selected = |view: &CapturedView| {
+            let mut request = params();
+            request.view = Some(view.id.clone());
+            store.selected(&request, now).expect("lookup")
+        };
+        assert!(
+            matches!(selected(&views[0]), Ok(Some(_))),
+            "reading the oldest search makes it the most recently used"
+        );
+        let next = store
+            .save(&params(), &numbered(CANDIDATE_VIEWS_MAX), now)
+            .expect("a full store admits the next search");
+        assert!(matches!(selected(&next), Ok(Some(_))));
+        assert!(matches!(selected(&views[0]), Ok(Some(_))));
+        assert!(
+            matches!(
+                selected(&views[1]),
+                Err(SymbolUnavailableReason::ViewExpired)
+            ),
+            "a released search reads as expired"
+        );
+        assert_eq!(store.rows.lock().expect("rows").len(), CANDIDATE_VIEWS_MAX);
+        let mut oversized = numbered(CANDIDATE_VIEWS_MAX + 1);
+        // Encodes inside the message bound, but not beside the table's own charge.
+        oversized.pools[0].root = "x".repeat(CANDIDATE_BYTES_MAX - 8192);
+        let refused = store
+            .save(&params(), &oversized, now)
+            .expect_err("oversized search");
+        assert!(
+            refused.to_string().contains("exceeds the byte bound"),
+            "{refused}"
+        );
+        assert_eq!(
+            store.rows.lock().expect("rows").len(),
+            CANDIDATE_VIEWS_MAX,
+            "an oversized search releases nothing"
+        );
     }
 
     #[test]

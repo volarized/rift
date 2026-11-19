@@ -35,8 +35,8 @@ pub use history_fill::{
     release_version,
 };
 pub use read::{
-    LocalSymbolViewInput, LocalSymbolViews, ReadService, ReadServiceBuild, accept_page,
-    accepted_limit, accepted_max_results, wire_digest,
+    LocalSymbolViewInput, LocalSymbolViews, ReadService, ReadServiceBuild, RetainedViewLimits,
+    accept_page, accepted_limit, accepted_max_results, wire_digest,
 };
 pub use recommendations::{
     LspRecommendation, LspRecommendationBatch, LspRecommendationInputs, LspRecommendationStatus,

@@ -602,7 +602,8 @@ impl QueryRetention<'_> {
             .min();
         let input = input.with_query(self.key, bytes, expires);
         let mut response = None;
-        views.capture_with(input, |view| {
+        let limits = rift_server::RetainedViewLimits::from(self.configuration);
+        views.capture_with(input, limits, |view| {
             let mut view = view.clone();
             if !constrain_provider_expiry(&mut view, self.provider_views())? {
                 response = Some(query_unavailable(SymbolUnavailableReason::ViewExpired).into());
@@ -930,6 +931,84 @@ mod tests {
             assert_eq!(answer.pagination, Some(Pagination::new(request.page, 1, 2)));
             request.revision = answer.revision.clone();
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn distinct_queries_past_the_view_bound_release_and_evaluate_again() -> TestResult {
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let directory = tempfile::tempdir()?;
+        crate::server::hermetic_workspace(
+            directory.path(),
+            "[search.query]\nretained_views = 2\n",
+        )?;
+        std::fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let root = directory.path().canonicalize()?;
+        let server =
+            RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
+        let query = |first: u64| QueryParams {
+            query: format!(
+                "SELECT ?value {{ VALUES ?value {{ {first} {} }} }} ORDER BY ?value",
+                first + 1
+            ),
+            max_results: 1,
+            ..Default::default()
+        };
+        let read = |request: QueryParams| {
+            let server = server.clone();
+            async move {
+                let output = server
+                    .graph_query(request)
+                    .await
+                    .map_err(|error| format!("{error:?}"))?
+                    .0;
+                match output.result {
+                    QueryReadResult::Results(answer) => Ok::<_, String>(answer),
+                    QueryReadResult::Unavailable(unavailable) => Err(format!("{unavailable:?}")),
+                }
+            }
+        };
+        let mut evaluations = move || {
+            drain
+                .queued_records()
+                .iter()
+                .filter(|record| {
+                    record.message() == "worker admitted"
+                        && serde_json::from_str::<Value>(record.fields())
+                            .is_ok_and(|fields| fields["work"] == "graph query")
+                })
+                .count()
+        };
+        let first = read(query(0)).await?;
+        for distinct in 1..=5 {
+            let answer = read(query(distinct * 10)).await?;
+            assert_eq!(answer.pagination, Some(Pagination::new(1, 1, 2)));
+        }
+        assert_eq!(
+            evaluations(),
+            6,
+            "every distinct query past the bound is answered"
+        );
+        let mut released = query(0);
+        released.page = 2;
+        released.revision = first.revision.clone();
+        let answer = read(released).await?;
+        assert_eq!(answer.pagination, Some(Pagination::new(2, 1, 2)));
+        assert_eq!(
+            evaluations(),
+            1,
+            "a later page of a released view evaluates the query again"
+        );
+        let mut retained = query(50);
+        retained.page = 2;
+        retained.revision = first.revision;
+        let answer = read(retained).await?;
+        assert_eq!(answer.pagination, Some(Pagination::new(2, 1, 2)));
+        assert_eq!(
+            evaluations(),
+            0,
+            "a retained view still answers its later page"
+        );
         Ok(())
     }
 
