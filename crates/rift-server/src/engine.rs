@@ -753,6 +753,15 @@ fn restart_may_help(error: &RiftError) -> bool {
 }
 
 impl EngineSlot {
+    /// Which analysis produces this engine's edges.
+    #[must_use]
+    pub(crate) const fn edge_provider(&self) -> rift_protocol::read::EdgeProvider {
+        match self.configuration.embedded {
+            Some(_) => rift_protocol::read::EdgeProvider::Engine,
+            None => rift_protocol::read::EdgeProvider::Lsp,
+        }
+    }
+
     /// Records `changes` for the live session's next exchange.
     fn owe(&self, changes: &PathChanges) {
         self.owed

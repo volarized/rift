@@ -482,7 +482,9 @@ fn validate_python_overload(
     let Some(state) = &symbol.python_overload else {
         return Ok(());
     };
-    if language != &ShippedLanguage::Python.language() || symbol.kind != "function" {
+    if language != &ShippedLanguage::Python.language()
+        || !matches!(symbol.kind, "function" | "method")
+    {
         return Err(errors::syntax::facts_structure_invalid().error());
     }
     let crate::PythonOverload::Overload {
@@ -784,8 +786,15 @@ impl SyntaxFacts {
         validate_macro_invocations(source, limits, &parts)?;
         validate_scope(source, limits, &parts)?;
         if let Some(facts) = &parts.static_facts {
-            if parts.language != ShippedLanguage::Rust.language()
-                && parts.language != ShippedLanguage::JavaScript.language()
+            if ![
+                ShippedLanguage::Rust,
+                ShippedLanguage::JavaScript,
+                ShippedLanguage::TypeScript,
+                ShippedLanguage::TypeScriptTsx,
+                ShippedLanguage::Python,
+            ]
+            .into_iter()
+            .any(|language| parts.language == language.language())
             {
                 return errors::syntax::facts_structure_invalid().fail();
             }
@@ -826,6 +835,7 @@ fn validate_export_bindings(
         ShippedLanguage::JavaScript.language(),
         ShippedLanguage::TypeScript.language(),
         ShippedLanguage::TypeScriptTsx.language(),
+        ShippedLanguage::Python.language(),
     ]
     .contains(&parts.language)
     {

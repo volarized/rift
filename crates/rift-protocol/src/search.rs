@@ -13,7 +13,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use strum::VariantArray;
 
-/// One auditable step in a search traversal. `edge` retains its occurrence and
+/// One auditable step in a search traversal. `edge` retains its occurrence, provider, and
 /// derivation; `direction` records how the walk followed it.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]

@@ -113,7 +113,7 @@ fn declaration_bound_keeps_original_units_and_reports_incomplete_coverage() {
             ..rift_protocol::configuration::PackageConfiguration::default()
         },
     );
-    let id = "rift://symbol/pypi/pypi.org/click/python/click/core/echo";
+    let id = "rift://symbol/pypi/pypi.org/click/python/click/core";
     assert_eq!(result.objects.len(), 1);
     assert_eq!(
         result.objects[0].id.as_ref().map(SymbolId::as_str),
@@ -272,7 +272,11 @@ fn malformed_and_omitted_declarations_cannot_prove_complete_coverage() {
                 .collect::<Vec<_>>();
             assert_eq!(objects.len(), 1);
             assert!(objects[0].id.is_none());
-            assert!(result.declarations.is_empty());
+            assert_eq!(result.declarations.len(), 1);
+            assert_eq!(
+                result.declarations[0].symbol.as_str(),
+                "rift://symbol/pypi/pypi.org/click/python/click/core"
+            );
             let range = result
                 .warnings
                 .iter()

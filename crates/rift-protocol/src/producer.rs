@@ -293,6 +293,8 @@ pub struct ProducerEdge {
     /// Where the edge was read from. Required when `from` is absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub occurrence: Option<SourceUnitSpan>,
+    /// Which analysis produced this edge.
+    pub provider: crate::read::EdgeProvider,
     /// How the producer established the edge.
     pub derivation: EdgeDerivation,
     /// How likely a `heuristic` edge is to hold, from 0 to 1.

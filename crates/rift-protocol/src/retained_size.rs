@@ -585,6 +585,7 @@ mod tests {
                 unit: crate::read::SourceUnitId("rift://source/project/src/lib.rs".to_owned()),
                 range: crate::read::TextRange { start: 0, end: 12 },
             }),
+            provider: crate::read::EdgeProvider::Static,
             derivation: crate::read::EdgeDerivation::Resolution,
             confidence: None,
             producer: Some(crate::producer::FactProducer {

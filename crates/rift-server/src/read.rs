@@ -350,8 +350,8 @@ impl ReadService {
             .items
             .into_iter()
             .filter_map(|recommendation| {
-                let crate::LspRecommendationStatus::Available { command, .. } =
-                    recommendation.status
+                let (crate::LspRecommendationStatus::Available { command, .. }
+                | crate::LspRecommendationStatus::Embedded { command, .. }) = recommendation.status
                 else {
                     return None;
                 };
@@ -1905,8 +1905,15 @@ pub(crate) mod tests {
                 .iter()
                 .find(|symbol| symbol.qualified_name == name)
                 .ok_or("captured structural declaration")?;
-            assert!(
-                super::symbol_id(service.index(), crate::search::declared(file, symbol))?.is_none()
+            let identity = local_identity(
+                &file.syntax().language().identity_segment(),
+                &[path.as_str(), name],
+            );
+            assert_eq!(
+                super::symbol_id(service.index(), crate::search::declared(file, symbol))?
+                    .as_ref()
+                    .map(|id| id.0.as_str()),
+                Some(identity.as_str())
             );
             Ok(crate::history::SymbolState::Present(vec![
                 crate::history::SymbolShape::from_source(file.source(), symbol),
@@ -3003,7 +3010,7 @@ pub(crate) mod tests {
             "to": symbol.id,
             "kind": symbol.kind,
             "kinds": ["calls"],
-            "derivation": "syntax"
+            "provider": "static", "derivation": "syntax"
         });
         assert!(serde_json::from_value::<rift_protocol::read::Edge>(edge.clone()).is_ok());
         edge["to"] = json!(raw_address);
@@ -3561,9 +3568,12 @@ pub(crate) mod tests {
             symbol.get("kinds").is_none(),
             "no kinds must omit the member"
         );
-        assert!(
-            symbol.get("id").is_none(),
-            "structural facts have no established identity"
+        assert_eq!(
+            symbol["id"],
+            json!(local_identity(
+                "markdown",
+                &["src/guide.md", "Beacon Guide"]
+            ))
         );
         assert_eq!(value["hits"][0]["path"], json!("src/guide.md"));
         assert_eq!(
@@ -3574,7 +3584,7 @@ pub(crate) mod tests {
     }
 
     /// One heading introduced and then content-edited across two commits;
-    /// structural classification retains both changes without a semantic identity.
+    /// the timeline retains both changes with the document identity.
     #[test]
     fn markdown_symbol_history_lists_the_committed_timeline() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -3595,10 +3605,15 @@ pub(crate) mod tests {
         let params: GetSymbolParams = serde_json::from_value(request)?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         let hit = &value["hits"][0];
-        assert!(hit["symbol"].get("id").is_none());
-        assert!(
-            hit.get("history").is_none(),
-            "unresolved structural facts have no symbol timeline"
+        let identity = local_identity("markdown", &["docs.md", "Install"]);
+        assert_eq!(hit["symbol"]["id"], json!(identity));
+        assert_eq!(hit["history"]["symbol"], json!(identity));
+        let edges = hit["history"]["edges"]
+            .as_array()
+            .ok_or("history edges required")?;
+        assert_eq!(
+            edge_labels(edges),
+            ["changed_in body_changed", "introduced_in"]
         );
         assert_eq!(hit["path"], json!("docs.md"));
         structural_changes(directory.path(), "docs.md", "Install")?;
@@ -3629,9 +3644,12 @@ pub(crate) mod tests {
             symbol.get("kinds").is_none(),
             "no kinds must omit the member"
         );
-        assert!(
-            symbol.get("id").is_none(),
-            "structural facts have no established identity"
+        assert_eq!(
+            symbol["id"],
+            json!(local_identity(
+                "json",
+                &["settings.json", "beacon settings"]
+            ))
         );
         assert_eq!(value["hits"][0]["path"], json!("settings.json"));
         assert_eq!(
@@ -3644,7 +3662,13 @@ pub(crate) mod tests {
             "language": "json"
         }))?;
         let value = serde_json::to_value(service.get_symbol(&nested)?)?;
-        assert!(value["hits"][0]["symbol"].get("id").is_none());
+        assert_eq!(
+            value["hits"][0]["symbol"]["id"],
+            json!(local_identity(
+                "json",
+                &["settings.json", "beacon settings > port"]
+            ))
+        );
         assert_eq!(value["hits"][0]["symbol"]["name"], json!("port"));
         let file = service
             .index()
@@ -3681,9 +3705,12 @@ pub(crate) mod tests {
             symbol.get("kinds").is_none(),
             "no kinds must omit the member"
         );
-        assert!(
-            symbol.get("id").is_none(),
-            "structural facts have no established identity"
+        assert_eq!(
+            symbol["id"],
+            json!(local_identity(
+                "yaml",
+                &["pipeline.yaml", "beacon pipeline"]
+            ))
         );
         assert_eq!(value["hits"][0]["path"], json!("pipeline.yaml"));
         assert_eq!(
@@ -3695,7 +3722,7 @@ pub(crate) mod tests {
     }
 
     /// One JSON member introduced and then value-edited across two commits;
-    /// structural classification retains both changes without a semantic identity.
+    /// the timeline retains both changes with the document identity.
     #[test]
     fn json_symbol_history_lists_the_committed_timeline() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -3720,10 +3747,15 @@ pub(crate) mod tests {
         let params: GetSymbolParams = serde_json::from_value(request)?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         let hit = &value["hits"][0];
-        assert!(hit["symbol"].get("id").is_none());
-        assert!(
-            hit.get("history").is_none(),
-            "unresolved structural facts have no symbol timeline"
+        let identity = local_identity("json", &["settings.json", "server"]);
+        assert_eq!(hit["symbol"]["id"], json!(identity));
+        assert_eq!(hit["history"]["symbol"], json!(identity));
+        let edges = hit["history"]["edges"]
+            .as_array()
+            .ok_or("history edges required")?;
+        assert_eq!(
+            edge_labels(edges),
+            ["changed_in body_changed", "introduced_in"]
         );
         assert_eq!(hit["path"], json!("settings.json"));
         structural_changes(directory.path(), "settings.json", "server")?;
@@ -3741,7 +3773,7 @@ pub(crate) mod tests {
 
     /// One YAML entry introduced and then value-edited across two commits
     /// in a `.yml` file; the timeline classifies both through the YAML
-    /// provider without a semantic identity.
+    /// provider with the document identity.
     #[test]
     fn yaml_symbol_history_lists_the_committed_timeline() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -3760,10 +3792,15 @@ pub(crate) mod tests {
         let params: GetSymbolParams = serde_json::from_value(request)?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         let hit = &value["hits"][0];
-        assert!(hit["symbol"].get("id").is_none());
-        assert!(
-            hit.get("history").is_none(),
-            "unresolved structural facts have no symbol timeline"
+        let identity = local_identity("yaml", &["deploy.yml", "retries"]);
+        assert_eq!(hit["symbol"]["id"], json!(identity));
+        assert_eq!(hit["history"]["symbol"], json!(identity));
+        let edges = hit["history"]["edges"]
+            .as_array()
+            .ok_or("history edges required")?;
+        assert_eq!(
+            edge_labels(edges),
+            ["changed_in body_changed", "introduced_in"]
         );
         assert_eq!(hit["path"], json!("deploy.yml"));
         structural_changes(directory.path(), "deploy.yml", "retries")?;

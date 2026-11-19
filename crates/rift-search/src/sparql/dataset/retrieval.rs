@@ -1,4 +1,4 @@
-//! RDF projections of the existing search producer's immutable response.
+//! RDF projections of retained retrieval results and edges.
 
 use oxrdf::{BlankNode, Literal, NamedNode, NamedOrBlankNode, Term, Triple, vocab::rdf};
 use rift_error::{RiftError, errors};
@@ -9,6 +9,29 @@ use super::{GraphDatasetBuilder, content_blank_node};
 use crate::sparql::{RetrievalSelection, VOCABULARY_NAMESPACE, retrieval::RDF_JSON};
 
 impl GraphDatasetBuilder {
+    /// Adds one edge with its analysis and physical occurrence.
+    /// An original record identity keeps equal records separate; local edges carry none.
+    ///
+    /// # Errors
+    /// Refuses an edge that exceeds the dataset bounds or fails its RDF projection.
+    pub fn insert_edge(
+        &mut self,
+        edge: &rift_protocol::read::Edge,
+        record: Option<&rift_protocol::edge_read::EdgeRecordId>,
+    ) -> Result<(), RiftError> {
+        let fields = serde_json::to_value(edge).map_err(|_| projection_failure())?;
+        let encoded = fields.to_string();
+        let key = record.map_or("", rift_protocol::edge_read::EdgeRecordId::as_str);
+        let id = content_blank_node(&["edge", key, &encoded]);
+        let mut triples = vec![Triple::new(
+            id.clone(),
+            rdf::TYPE,
+            super::super::vocabulary::VocabularyClass::Edge.iri(),
+        )];
+        project_fields(id.into(), fields, &mut triples, self.limits.triples_max())?;
+        self.insert_triples(triples, oxrdf::GraphNameRef::DefaultGraph)
+    }
+
     /// Adds the original producer rows to the graph selected by this service.
     ///
     /// # Errors
@@ -204,7 +227,13 @@ fn emit(
             if value.starts_with("rift://")
                 && matches!(
                     key,
-                    "id" | "unit" | "container" | "symbol" | "syntax_element" | "evidence"
+                    "id" | "unit"
+                        | "container"
+                        | "symbol"
+                        | "syntax_element"
+                        | "evidence"
+                        | "from"
+                        | "to"
                 ) =>
         {
             named(&value)?.into()

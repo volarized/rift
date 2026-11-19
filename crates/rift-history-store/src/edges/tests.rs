@@ -104,6 +104,11 @@ fn a_move_without_its_old_path_answers_no_edge() {
         commits: 1,
     };
     assert_eq!(edge_commit(&co_change), None);
+    let release = HistoryEdge::IntroducedInRelease {
+        revision: Revision::parse("rift://revision/cargo/crates.io/demo@1.0.0")
+            .expect("release revision"),
+    };
+    assert_eq!(edge_commit(&release), None);
 }
 
 #[test]

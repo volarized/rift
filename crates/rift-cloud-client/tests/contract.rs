@@ -267,7 +267,7 @@ fn the_pattern_max_length_is_the_search_pattern_bound() -> TestResult {
     Ok(())
 }
 
-/// The contract states the source bound a facets page stops at and the cursor bound the
+/// The contract states the source bound a facets page stops at and the result count bound the
 /// client enforces, and a drift in either fails validation.
 #[test]
 fn the_facets_page_bounds_are_the_ones_the_client_enforces() -> TestResult {

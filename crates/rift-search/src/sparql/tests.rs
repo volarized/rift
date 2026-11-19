@@ -757,3 +757,26 @@ fn test_graph_query_parse_refuses_inline_rows_joining_past_solution_bound() {
     assert_eq!(error.slug(), errors::search::query_answer_limit::SLUG);
     assert!(error.to_string().contains("joined VALUES rows"), "{error}");
 }
+
+#[test]
+fn normalized_query_text_preserves_literals_and_normalizes_syntax() -> Result<(), RiftError> {
+    let limits = GraphLimits::default();
+    for text in [
+        "SELECT ?value { ?s :range [ :start ?value ] }",
+        "CONSTRUCT { [] :name ?name } { ?s :name ?name }",
+        "SELECT (COUNT(?s) AS ?count) { ?s a :Symbol }",
+        "SELECT ?value { VALUES ?value { 'a  b' } }",
+    ] {
+        let first = GraphQuery::parse(text, &limits)?;
+        let repeated = GraphQuery::parse(&format!("  {text}\n# page"), &limits)?;
+        assert_eq!(
+            first.normalized_text(),
+            repeated.normalized_text(),
+            "{text}"
+        );
+    }
+    let first = GraphQuery::parse("SELECT ?v { VALUES ?v { 'a  b' } }", &limits)?;
+    let changed = GraphQuery::parse("SELECT ?v { VALUES ?v { 'a b' } }", &limits)?;
+    assert_ne!(first.normalized_text(), changed.normalized_text());
+    Ok(())
+}

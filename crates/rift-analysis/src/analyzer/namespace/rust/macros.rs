@@ -931,17 +931,17 @@ pub(super) fn children<'a>(
         &mut std::collections::BTreeSet<ByteRange>,
         &mut Vec<Export>,
     ),
-    depth_max: usize,
+    limits: rift_syntax::SyntaxLimits,
     library: bool,
 ) -> Vec<Child> {
     let (mut scope, admitted, exports) = scope;
     let context = Context {
         inventory,
         originals,
-        depth_max,
+        depth_max: limits.syntax_depth_max(),
         library,
     };
-    let ordinary = super::module_children(file, directory, inventory);
+    let ordinary = super::module_children(file, directory, inventory, limits);
     let direct = ordinary
         .iter()
         .filter(|(_, local)| local.len() == 1)
@@ -1040,7 +1040,9 @@ impl Context<'_> {
         scope: &mut Scope,
         exports: &mut Vec<Export>,
     ) {
-        if let Some(tokens) = tokens.filter(|tokens| tokens.complete && scope.complete)
+        // Original public imports remain declarations when macro effects are unknown.
+        // Their own attributes and paths are checked before recording an alias.
+        if let Some(tokens) = tokens
             && let Some(item) = tokens.range(range)
         {
             let mut requested = Vec::new();

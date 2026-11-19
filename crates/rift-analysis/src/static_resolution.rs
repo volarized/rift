@@ -1,6 +1,7 @@
 //! Resolves captured call and import sites against admitted source declarations.
 
 mod javascript;
+mod python_edges;
 mod rust;
 #[cfg(test)]
 mod tests;
@@ -38,6 +39,8 @@ pub(crate) struct StaticOccurrence {
     pub(crate) source_digest: FileDigest,
     pub(crate) callee_range: ByteRange,
     pub(crate) role: ReferenceRole,
+    pub(crate) edge_from: Option<rift_core::SymbolId>,
+    pub(crate) edge_kind: Option<rift_protocol::read::EdgeKind>,
 }
 
 /// Observations with the coverage of the bounded pass that produced them.
@@ -48,6 +51,14 @@ pub(crate) struct StaticResolution {
     pub(crate) unavailable_sources: usize,
     pub(crate) unresolved_sites: usize,
     pub(crate) exhausted: bool,
+    pub(crate) edge_calls: BTreeMap<rift_core::SourceUnitId, EdgeCallCoverage>,
+}
+
+#[derive(Debug)]
+pub(crate) struct EdgeCallCoverage {
+    pub(crate) language: rift_protocol::read::Language,
+    pub(crate) unavailable: bool,
+    pub(crate) unresolved: Vec<ByteRange>,
 }
 
 /// Runs one static pass over a captured source selection.
@@ -57,15 +68,34 @@ pub(crate) fn resolve(
     namespace: &NamespaceInput<'_>,
     work_max: usize,
 ) -> StaticResolution {
+    let mut edge_calls: BTreeMap<_, _> = documents
+        .iter()
+        .filter(|document| supported_language(document.facts))
+        .map(|document| {
+            (
+                document.placement.unit().clone(),
+                EdgeCallCoverage {
+                    language: document.facts.language().clone(),
+                    unavailable: admitted_facts(document).is_none(),
+                    unresolved: Vec::new(),
+                },
+            )
+        })
+        .collect();
     let mut work = Work::new(work_max);
     let Some(index) = Index::new(graph, documents, namespace, &mut work) else {
+        for coverage in edge_calls.values_mut() {
+            coverage.unavailable = true;
+        }
         return StaticResolution {
             exhausted: work.exhausted,
+            edge_calls,
             ..StaticResolution::default()
         };
     };
     let mut resolution = StaticResolution {
         unavailable_sources: index.unavailable_sources,
+        edge_calls,
         ..StaticResolution::default()
     };
     for file in index.files.values() {
@@ -309,6 +339,7 @@ struct Index<'source> {
     files: BTreeMap<&'source str, File<'source>>,
     rust: rust::Namespaces<'source>,
     javascript: javascript::PackageModes,
+    edge_python: python_edges::EdgePythonModules,
     syntax_publication: rift_core::ProviderRevision,
     unavailable_sources: usize,
 }
@@ -338,6 +369,7 @@ impl<'source> Index<'source> {
                 return None;
             }
         }
+        let edge_python = python_edges::EdgePythonModules::build_edge(&files, work)?;
         let rust = rust::Namespaces::new(&files, work)?;
         let javascript = javascript::PackageModes::new(namespace, work)?;
         let provider = ProviderId::new(SYNTAX_PROVIDER_ID).ok()?;
@@ -348,12 +380,21 @@ impl<'source> Index<'source> {
             files,
             rust,
             javascript,
+            edge_python,
             syntax_publication,
             unavailable_sources,
         })
     }
 
     fn resolve_file(&self, file: &File<'source>, work: &mut Work, result: &mut StaticResolution) {
+        for range in file.facts.unsupported_bindings() {
+            if !work.charge() {
+                return;
+            }
+            if let Some(coverage) = result.edge_calls.get_mut(file.document.placement.unit()) {
+                coverage.unresolved.push(*range);
+            }
+        }
         for call in file.facts.calls() {
             if !work.charge() {
                 return;
@@ -368,6 +409,20 @@ impl<'source> Index<'source> {
                     target,
                 )
             });
+            if occurrence
+                .as_ref()
+                .is_none_or(|occurrence| !matches!(occurrence.target, NormalizedTarget::Symbol(_)))
+                && let Some(coverage) = result.edge_calls.get_mut(file.document.placement.unit())
+            {
+                coverage.unresolved.push(call.range);
+            }
+            result.record(occurrence);
+        }
+        for edge in file.facts.heritage_edges() {
+            if !work.charge() {
+                return;
+            }
+            let occurrence = self.edge_heritage_occurrence(file, edge, work);
             result.record(occurrence);
         }
         for binding in file.facts.bindings() {
@@ -386,6 +441,40 @@ impl<'source> Index<'source> {
         }
     }
 
+    fn edge_heritage_occurrence(
+        &self,
+        file: &File<'source>,
+        edge: &rift_syntax::HeritageEdge,
+        work: &mut Work,
+    ) -> Option<StaticOccurrence> {
+        let target = self.edge_type_target(file, edge.target, work)?;
+        let from = file
+            .target_at(edge.from)
+            .or_else(|| self.edge_type_target(file, edge.from, work))?;
+        let mut occurrence =
+            self.occurrence(file, edge.target, edge.target, ReferenceRole::Type, target)?;
+        let from = self.occurrence(file, edge.from, edge.from, ReferenceRole::Type, from)?;
+        if let NormalizedTarget::Symbol(from) = from.target {
+            occurrence.edge_from = Some(from);
+        }
+        occurrence.edge_kind = Some(edge.kind);
+        Some(occurrence)
+    }
+
+    fn edge_type_target(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        match file.document.facts.language().name.as_str() {
+            "javascript" | "typescript" => self.edge_javascript_target(file, range, work),
+            "python" => self.edge_python_name(file, range, work),
+            "rust" => self.rust.edge_type_target(file, range, work),
+            _ => None,
+        }
+    }
+
     fn call_target(
         &self,
         file: &File<'source>,
@@ -396,8 +485,9 @@ impl<'source> Index<'source> {
             return None;
         }
         match file.document.facts.language().name.as_str() {
-            "javascript" => self.javascript_call(file, call, work),
+            "javascript" | "typescript" => self.javascript_call(file, call, work),
             "rust" => self.rust.call(file, call, work),
+            "python" => self.edge_python_call(file, call, work),
             _ => None,
         }
     }
@@ -414,6 +504,12 @@ impl<'source> Index<'source> {
                 Some((binding.name, self.javascript_import(file, binding, work)))
             }
             StaticBindingKind::RustUse { path } => Some((path, self.rust.import(file, path, work))),
+            StaticBindingKind::PythonImport {
+                export: Some(_), ..
+            } => Some((
+                binding.name,
+                self.edge_python_binding_target(file, binding, work),
+            )),
             _ => None,
         }
     }
@@ -464,6 +560,8 @@ impl<'source> Index<'source> {
             source_digest: *file.document.facts.source_digest()?,
             callee_range,
             role,
+            edge_from: None,
+            edge_kind: None,
         })
     }
 }
@@ -490,7 +588,10 @@ fn admitted_facts<'source>(
 
 fn supported_language(facts: &SyntaxFacts) -> bool {
     let language = facts.language();
-    matches!(language.name.as_str(), "javascript" | "rust") && language.dialect.is_none()
+    matches!(
+        language.name.as_str(),
+        "javascript" | "typescript" | "rust" | "python"
+    )
 }
 
 fn source_text(source: &str, range: ByteRange) -> Option<&str> {

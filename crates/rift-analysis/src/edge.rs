@@ -4,21 +4,19 @@
 //! [`Edge`] per reference target a provider resolved to an established symbol
 //! (`NormalizedTarget::Symbol`); a target the graph could not resolve
 //! (`NormalizedTarget::Contribution`) contributes no edge. `NormalizedGraph::references`
-//! carries resolution alone, so every edge's derivation is resolution - that fact lives
-//! here rather than on a per-edge field.
+//! carries resolution. Syntax headers retain syntax derivation, and normalized edges
+//! retain the derivation their provider supplied.
 //!
 //! An edge's `from` is the enclosing definition: the definition record whose contribution
 //! range is the smallest range containing the reference occurrence in the same source unit.
 //! One [`EnclosingDefinitions`] per unit holds those ranges, built once from every
 //! `Contribution::source` binding a record's contributions carry, and resolves each
-//! occurrence against it. A reference with no enclosing definition in its unit - an import at
-//! module scope, for instance - contributes no edge.
+//! occurrence against it. A reference outside every declaration uses the source module's
+//! canonical identity, derived from the common parent of the unit's declarations.
 //!
 //! An edge's `kind` is [`role_kind`]'s mapping of the reference's [`ReferenceRole`].
 //!
-//! An edge's `occurrence` is the reference's own [`DeclarationBinding`]: unit, byte range, and
-//! an optional syntax element. Every provider that publishes a reference today constructs its
-//! binding with `syntax element: None`, so the syntax element arm is populated by no production path.
+//! An edge's `occurrence` is the reference's own [`DeclarationBinding`]: unit and byte range.
 //!
 //! Building stops at [`EDGES_MAX`] edges; [`EdgeStore::is_complete`] and
 //! [`EdgeStore::dropped_edges`] report the truncation.
@@ -50,9 +48,16 @@ pub struct Edge {
     kind: EdgeKind,
     occurrence: DeclarationBinding,
     static_callee: Option<rift_syntax::ByteRange>,
+    derivation: rift_protocol::read::EdgeDerivation,
+    from_graph: bool,
 }
 
 impl Edge {
+    /// Whether the normalized graph already carries this edge.
+    pub(crate) const fn is_graph_edge(&self) -> bool {
+        self.from_graph
+    }
+
     /// Projects this resolved reference with its physical occurrence.
     #[must_use]
     pub fn to_protocol(&self) -> rift_protocol::read::Edge {
@@ -69,7 +74,8 @@ impl Edge {
                     end: self.occurrence.range().end(),
                 },
             }),
-            derivation: rift_protocol::read::EdgeDerivation::Resolution,
+            provider: rift_protocol::read::EdgeProvider::Static,
+            derivation: self.derivation,
             confidence: None,
             extensions: rift_protocol::read::Extensions::default(),
         }
@@ -92,8 +98,7 @@ impl Edge {
         self.kind
     }
 
-    /// Where the reference occurred: unit, byte range, and syntax element when the binding
-    /// provider supplied one. No production binding supplies a syntax element (module doc).
+    /// Where the reference occurred: source unit and byte range.
     #[must_use]
     pub const fn occurrence(&self) -> &DeclarationBinding {
         &self.occurrence
@@ -116,21 +121,66 @@ impl Edge {
 /// already bounded by [`PublicationLimits`](rift_provider::PublicationLimits).
 struct UnitDefinitions {
     by_unit: BTreeMap<SourceUnitId, EnclosingDefinitions<SymbolId>>,
+    edge_modules: BTreeMap<SourceUnitId, SymbolId>,
 }
 
 impl UnitDefinitions {
     fn build(graph: &NormalizedGraph) -> Self {
+        Self::build_with(graph, None)
+    }
+
+    /// `known` carries the source modules an earlier build over the same `graph` derived;
+    /// they depend on the graph alone, so a later build reads them instead of parsing
+    /// every record identity again.
+    fn build_with(
+        graph: &NormalizedGraph,
+        known: Option<&BTreeMap<SourceUnitId, SymbolId>>,
+    ) -> Self {
         let mut by_unit: BTreeMap<SourceUnitId, Vec<(u64, u64, SymbolId)>> = BTreeMap::new();
+        let mut edge_modules = BTreeMap::<SourceUnitId, Option<SymbolId>>::new();
+        let mut declared_edge_modules = BTreeMap::<SourceUnitId, SymbolId>::new();
+        let mut common_modules = CommonModules::default();
         for record in graph.records() {
             let Some(identity) = record.identity() else {
                 continue;
             };
-            for binding in record
+            // The record's Contributions are read once: the module facts and the parent
+            // identity belong to the record, and reading them per declaring binding
+            // visited every Contribution again and parsed the identity again.
+            let contributions = record
                 .contributions()
                 .iter()
-                .filter_map(|key| graph.contribution(key)?.source())
+                .filter_map(|key| graph.contribution(key))
+                .collect::<Vec<_>>();
+            let mut declared = None;
+            for binding in contributions
+                .iter()
+                .filter_map(|contribution| contribution.source())
             {
                 let range = binding.range();
+                if known.is_none() {
+                    let (is_module, parent) = declared.get_or_insert_with(|| {
+                        let is_module = contributions
+                            .iter()
+                            .filter_map(|contribution| contribution.facts())
+                            .any(|facts| {
+                                facts.language().name == "python" && facts.kind().0 == "module"
+                            });
+                        (is_module, edge_module_parent(identity))
+                    });
+                    if *is_module {
+                        declared_edge_modules.insert(binding.unit().clone(), identity.clone());
+                    }
+                    edge_modules
+                        .entry(binding.unit().clone())
+                        .and_modify(|current| {
+                            *current = current
+                                .as_ref()
+                                .zip(parent.as_ref())
+                                .and_then(|(left, right)| common_modules.common(left, right));
+                        })
+                        .or_insert_with(|| parent.clone());
+                }
                 by_unit.entry(binding.unit().clone()).or_default().push((
                     range.start(),
                     range.end(),
@@ -142,7 +192,20 @@ impl UnitDefinitions {
             .into_iter()
             .map(|(unit, spans)| (unit, EnclosingDefinitions::new(spans)))
             .collect();
-        Self { by_unit }
+        let edge_modules = if let Some(known) = known {
+            known.clone()
+        } else {
+            let mut edge_modules = edge_modules
+                .into_iter()
+                .filter_map(|(unit, identity)| identity.map(|identity| (unit, identity)))
+                .collect::<BTreeMap<_, _>>();
+            edge_modules.extend(declared_edge_modules);
+            edge_modules
+        };
+        Self {
+            by_unit,
+            edge_modules,
+        }
     }
 
     /// The innermost definition whose range contains `occurrence`'s range in its unit,
@@ -151,9 +214,64 @@ impl UnitDefinitions {
     fn resolve(&self, occurrence: &DeclarationBinding) -> Option<&SymbolId> {
         let range = occurrence.range();
         self.by_unit
-            .get(occurrence.unit())?
-            .resolve(range.start(), range.end())
+            .get(occurrence.unit())
+            .and_then(|definitions| definitions.resolve(range.start(), range.end()))
+            .or_else(|| self.edge_modules.get(occurrence.unit()))
     }
+}
+
+fn edge_module_parent(identity: &SymbolId) -> Option<SymbolId> {
+    let identity = rift_protocol::identity::SymbolIdentity::parse(identity.as_str()).ok()?;
+    let mut path = identity.qualified_path().to_vec();
+    path.pop()?;
+    let module = rift_protocol::identity::SymbolIdentity::new(
+        identity.owner().clone(),
+        identity.language().clone(),
+        path,
+    )
+    .ok()?;
+    SymbolId::new(module.wire_identity()).ok()
+}
+
+/// Answers of [`edge_module_common`] by identity pair. The declarations of one unit share
+/// few distinct parents, and each answer parses both identities.
+#[derive(Default)]
+struct CommonModules(BTreeMap<SymbolId, BTreeMap<SymbolId, Option<SymbolId>>>);
+
+impl CommonModules {
+    fn common(&mut self, left: &SymbolId, right: &SymbolId) -> Option<SymbolId> {
+        if let Some(known) = self.0.get(left).and_then(|answers| answers.get(right)) {
+            return known.clone();
+        }
+        let common = edge_module_common(left, right);
+        self.0
+            .entry(left.clone())
+            .or_default()
+            .insert(right.clone(), common.clone());
+        common
+    }
+}
+
+fn edge_module_common(left: &SymbolId, right: &SymbolId) -> Option<SymbolId> {
+    let left = rift_protocol::identity::SymbolIdentity::parse(left.as_str()).ok()?;
+    let right = rift_protocol::identity::SymbolIdentity::parse(right.as_str()).ok()?;
+    if left.owner() != right.owner() || left.language() != right.language() {
+        return None;
+    }
+    let path = left
+        .qualified_path()
+        .iter()
+        .zip(right.qualified_path())
+        .take_while(|(left, right)| left == right)
+        .map(|(part, _)| part.clone())
+        .collect();
+    let module = rift_protocol::identity::SymbolIdentity::new(
+        left.owner().clone(),
+        left.language().clone(),
+        path,
+    )
+    .ok()?;
+    SymbolId::new(module.wire_identity()).ok()
 }
 
 /// Maps one reference's portable [`ReferenceRole`] onto the wire [`EdgeKind`] this
@@ -190,6 +308,8 @@ fn reference_edges<'graph>(
             kind,
             occurrence: reference.binding().clone(),
             static_callee: None,
+            derivation: rift_protocol::read::EdgeDerivation::Resolution,
+            from_graph: false,
         })
     })
 }
@@ -226,6 +346,7 @@ pub struct EdgeStore {
     outgoing: BTreeMap<SymbolId, Vec<Edge>>,
     incoming: BTreeMap<SymbolId, Vec<Edge>>,
     dropped_edges: u64,
+    edge_modules: BTreeMap<SourceUnitId, SymbolId>,
 }
 
 impl get_size2::GetSize for Edge {
@@ -278,7 +399,12 @@ impl get_size2::GetSize for EdgeStore {
             tracker,
             rift_protocol::retained_vector_material,
         );
-        (outgoing.saturating_add(incoming), tracker)
+        let (modules, tracker) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.edge_modules, tracker);
+        (
+            outgoing.saturating_add(incoming).saturating_add(modules),
+            tracker,
+        )
     }
 }
 
@@ -292,24 +418,42 @@ impl EdgeStore {
         if occurrences.is_empty() {
             return;
         }
-        let enclosing = UnitDefinitions::build(graph);
+        // `graph` is the graph this store was built from (`WorkspaceSemantics` builds its
+        // store from its own graph and passes that graph here), so its source modules hold.
+        let enclosing = UnitDefinitions::build_with(graph, Some(&self.edge_modules));
         let existing = self.outgoing.values().map(Vec::len).sum::<usize>();
         let mut remaining = edges_max.saturating_sub(existing);
         let mut changed = false;
         let mut admitted = BTreeMap::<&SymbolId, Vec<Edge>>::new();
         for occurrence in occurrences {
+            if occurrence.edge_kind.is_some() && occurrence.edge_from.is_none() {
+                continue;
+            }
             let NormalizedTarget::Symbol(to) = &occurrence.target else {
                 continue;
             };
-            let Some(from) = enclosing.resolve(&occurrence.binding) else {
+            let Some(from) = occurrence
+                .edge_from
+                .as_ref()
+                .or_else(|| enclosing.resolve(&occurrence.binding))
+            else {
                 continue;
             };
             let edge = Edge {
                 from: from.clone(),
                 to: to.clone(),
-                kind: role_kind(occurrence.role),
+                kind: occurrence
+                    .edge_kind
+                    .unwrap_or_else(|| role_kind(occurrence.role)),
                 occurrence: occurrence.binding.clone(),
-                static_callee: Some(occurrence.callee_range),
+                static_callee: (occurrence.role == ReferenceRole::Call)
+                    .then_some(occurrence.callee_range),
+                from_graph: false,
+                derivation: if occurrence.edge_kind.is_some() {
+                    rift_protocol::read::EdgeDerivation::Syntax
+                } else {
+                    rift_protocol::read::EdgeDerivation::Resolution
+                },
             };
             admitted.entry(from).or_default().push(edge);
         }
@@ -381,6 +525,39 @@ impl EdgeStore {
                 }
             }
         }
+        for edge in graph.edges() {
+            let Some(from) = graph.identity_for(edge.source().reference()) else {
+                continue;
+            };
+            let NormalizedTarget::Symbol(to) = edge.target() else {
+                continue;
+            };
+            let Some(occurrence) = edge.occurrence() else {
+                continue;
+            };
+            let Some(derivation) = edge
+                .derivation()
+                .filter(|derivation| *derivation != rift_protocol::read::EdgeDerivation::Heuristic)
+            else {
+                continue;
+            };
+            match budget.consume() {
+                Ok(()) => {
+                    let edge = Edge {
+                        from: from.clone(),
+                        to: to.clone(),
+                        kind: crate::analyzer::edge_kind(edge.kind()),
+                        occurrence: occurrence.clone(),
+                        static_callee: None,
+                        derivation,
+                        from_graph: true,
+                    };
+                    outgoing.entry(from.clone()).or_default().push(edge.clone());
+                    incoming.entry(to.clone()).or_default().push(edge);
+                }
+                Err(_) => dropped_edges += 1,
+            }
+        }
         for edges in outgoing.values_mut() {
             edges.sort_by(edge_order);
         }
@@ -391,7 +568,19 @@ impl EdgeStore {
             outgoing,
             incoming,
             dropped_edges,
+            edge_modules: enclosing.edge_modules,
         }
+    }
+
+    /// Canonical source module used by references outside every declaration.
+    #[must_use]
+    pub fn edge_module(&self, unit: &SourceUnitId) -> Option<&SymbolId> {
+        self.edge_modules.get(unit)
+    }
+
+    /// Every captured edge, ordered by source and target.
+    pub fn edges(&self) -> impl Iterator<Item = &Edge> {
+        self.outgoing.values().flat_map(|edges| edges.iter())
     }
 
     /// Edges starting at `from`, in deterministic order. Empty when `from` has none.
@@ -694,6 +883,31 @@ mod tests {
         let alpha = symbol("rift://symbol/rust/src/lib.rs/alpha");
         assert!(store.incoming(&alpha).is_empty());
         assert!(store.is_complete());
+    }
+
+    #[test]
+    fn test_edge_module_scope_keeps_import_and_type_occurrences() {
+        let alpha = fixture_symbol("alpha");
+        let module = symbol("rift://symbol/local/rust/fixture");
+        let store = EdgeStore::build(&graph(vec![
+            definition("alpha", alpha.as_str(), "src/lib.rs", (0, 40)),
+            reference(
+                "edge_import",
+                binding("src/lib.rs", 100, 105),
+                ReferenceRole::Import,
+                "alpha",
+            ),
+            reference(
+                "edge_header",
+                binding("src/lib.rs", 110, 115),
+                ReferenceRole::Type,
+                "alpha",
+            ),
+        ]));
+        let edges = store.incoming(&alpha);
+        assert_eq!(edges.len(), 2);
+        assert!(edges.iter().all(|edge| edge.from() == &module));
+        assert_eq!(store.edge_module(&source_unit("src/lib.rs")), Some(&module));
     }
 
     #[test]

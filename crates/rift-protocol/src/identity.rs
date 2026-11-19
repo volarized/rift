@@ -277,7 +277,7 @@ impl SymbolIdentity {
             language,
             qualified_path,
         };
-        identity.validate()?;
+        identity.validated_wire_identity()?;
         Ok(identity)
     }
 
@@ -302,8 +302,12 @@ impl SymbolIdentity {
         let qualified_path = segments
             .map(decode_component)
             .collect::<Result<Vec<_>, _>>()?;
-        let identity = Self::new(owner, language, qualified_path)?;
-        if identity.wire_identity() != value {
+        let identity = Self {
+            owner,
+            language,
+            qualified_path,
+        };
+        if identity.validated_wire_identity()? != value {
             return Err(SymbolIdentityViolation::Noncanonical.into());
         }
         Ok(identity)
@@ -341,7 +345,7 @@ impl SymbolIdentity {
         format!("{SYMBOL_URI_PREFIX}{owner}/{language}/{path}")
     }
 
-    fn validate(&self) -> Result<(), RiftError> {
+    fn validated_wire_identity(&self) -> Result<String, RiftError> {
         self.validate_input_length()?;
         self.owner.validate()?;
         Language::from_identity_segment(&self.language.identity_segment())
@@ -354,7 +358,11 @@ impl SymbolIdentity {
         {
             return Err(SymbolIdentityViolation::QualifiedPath.into());
         }
-        self.validate_length()
+        let spelling = self.wire_identity();
+        if spelling.len() > SYMBOL_ID_BYTES_MAX {
+            return Err(SymbolIdentityViolation::Length.into());
+        }
+        Ok(spelling)
     }
 
     fn validate_input_length(&self) -> Result<(), RiftError> {
@@ -374,13 +382,6 @@ impl SymbolIdentity {
             .and_then(|path| path.checked_add(owner_bytes))
             .and_then(|total| total.checked_add(language_bytes));
         if total.is_none_or(|total| total > SYMBOL_ID_BYTES_MAX) {
-            return Err(SymbolIdentityViolation::Length.into());
-        }
-        Ok(())
-    }
-
-    fn validate_length(&self) -> Result<(), RiftError> {
-        if self.wire_identity().len() > SYMBOL_ID_BYTES_MAX {
             return Err(SymbolIdentityViolation::Length.into());
         }
         Ok(())
@@ -638,8 +639,8 @@ fn decode_component(value: &str) -> Result<String, RiftError> {
         .map_err(|_| RiftError::from(SymbolIdentityViolation::Encoding))
 }
 
-fn encode_component(value: &str) -> String {
-    utf8_percent_encode(value, COMPONENT_ESCAPE_SET).to_string()
+fn encode_component(value: &str) -> std::borrow::Cow<'_, str> {
+    utf8_percent_encode(value, COMPONENT_ESCAPE_SET).into()
 }
 
 fn valid_component(value: &str) -> bool {

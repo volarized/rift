@@ -34,7 +34,7 @@ pub use election::{
 pub use failure::{McpErrorExt, McpErrorFailExt, McpFailure};
 pub use http::{
     DeferredDatabaseShutdown, HttpServer, STOP_REQUEST_TIMEOUT, StopRequestFailure, TokenCheck,
-    request_stop, serve_http, stop_stage, stop_stage_within,
+    request_stop, serve_http, stop_stage,
 };
 pub use identity::{BuildCheckout, product_identity_of};
 pub use logs::logs_configuration;

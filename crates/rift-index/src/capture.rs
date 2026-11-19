@@ -389,26 +389,17 @@ impl CapturedFile {
         after_read: impl FnOnce(),
     ) -> Result<CapturedPath, RiftError> {
         let handle = fs::File::open(path).map_err(|error| capture_io_error(path, error))?;
-        let metadata = handle.metadata().map_err(|error| {
-            errors::index::workspace_filesystem()
-                .path(path)
-                .source(error)
-                .error()
-        })?;
+        let metadata = handle
+            .metadata()
+            .map_err(|error| capture_io_error(path, error))?;
         let stat = FileStat::of(&metadata);
         #[cfg(not(unix))]
-        let held_identity = Handle::from_file(handle.try_clone().map_err(|error| {
-            errors::index::workspace_filesystem()
-                .path(path)
-                .source(error)
-                .error()
-        })?)
-        .map_err(|error| {
-            errors::index::workspace_filesystem()
-                .path(path)
-                .source(error)
-                .error()
-        })?;
+        let held_identity = Handle::from_file(
+            handle
+                .try_clone()
+                .map_err(|error| capture_io_error(path, error))?,
+        )
+        .map_err(|error| capture_io_error(path, error))?;
         let bytes = read_file_bytes(handle, path, limits)?;
         after_read();
         #[cfg(not(unix))]
@@ -458,8 +449,18 @@ impl CapturedFile {
     }
 }
 
-fn capture_io_error(path: &Path, source: std::io::Error) -> RiftError {
-    if source.kind() == std::io::ErrorKind::NotFound {
+/// Rechecks failed entries without following a symlink whose target may be absent.
+/// A delete-pending entry can refuse metadata while its removed parent reports `NotFound`.
+pub(crate) fn path_was_removed(path: &Path) -> bool {
+    let missing = |path: &Path| {
+        fs::symlink_metadata(path).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    };
+    missing(path) || path.parent().is_some_and(missing)
+}
+
+/// Preserves an I/O failure, requesting recapture when the entry was removed.
+pub(crate) fn capture_io_error(path: &Path, source: std::io::Error) -> RiftError {
+    if source.kind() == std::io::ErrorKind::NotFound || path_was_removed(path) {
         errors::index::workspace_changed_during_capture()
             .path(path)
             .source(source)
@@ -546,6 +547,69 @@ mod tests {
         assert_eq!(
             error.slug(),
             errors::index::workspace_changed_during_capture::SLUG
+        );
+    }
+
+    /// Delete-pending files can report access errors before metadata reports removal (#785).
+    #[test]
+    fn test_capture_classifies_a_permission_error_for_a_removed_path_as_changed() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let path = directory.path().join("source.rs");
+        fs::write(&path, b"pub fn source() {}\n").expect("source file");
+        let source = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        fs::remove_file(&path).expect("remove after the failure, before checking metadata");
+        let error = super::capture_io_error(&path, source);
+        assert_eq!(
+            error.slug(),
+            errors::index::workspace_changed_during_capture::SLUG
+        );
+        let source = std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<std::io::Error>())
+            .expect("original capture error");
+        assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn test_capture_refuses_a_permission_error_for_an_existing_path() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let path = directory.path().join("source.rs");
+        fs::write(&path, b"pub fn source() {}\n").expect("source file");
+        let source = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let error = super::capture_io_error(&path, source);
+        assert_eq!(error.slug(), errors::index::workspace_filesystem::SLUG);
+        let source = std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<std::io::Error>())
+            .expect("original capture error");
+        assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn test_capture_classifies_a_read_error_after_removal_as_changed() {
+        struct RemovedDuringRead(std::path::PathBuf);
+
+        impl std::io::Read for RemovedDuringRead {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                fs::remove_file(&self.0).expect("remove before returning a read error");
+                Err(std::io::Error::other("read failed during removal"))
+            }
+        }
+
+        let directory = tempfile::tempdir().expect("workspace");
+        let path = directory.path().join("source.rs");
+        fs::write(&path, b"pub fn source() {}\n").expect("source file");
+        let reader = RemovedDuringRead(path.clone());
+        let limits = WorkspaceIndexLimits::default();
+        let error = crate::workspace::read_file_bytes(reader, &path, limits)
+            .expect_err("removed entry requests recapture");
+        assert_eq!(
+            error.slug(),
+            errors::index::workspace_changed_during_capture::SLUG
+        );
+        assert_eq!(
+            std::error::Error::source(&error)
+                .expect("original read error")
+                .to_string(),
+            "read failed during removal"
         );
     }
 

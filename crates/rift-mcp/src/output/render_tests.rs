@@ -300,7 +300,7 @@ fn hop(direction: &str, derivation: &str, confidence: Option<f64>) -> GraphHop {
         "kind": "calls",
         "kinds": ["calls"],
         "to": "rift://symbol/local/rust/app/b/B",
-        "derivation": derivation
+        "provider": "static", "derivation": derivation
     });
     if let Some(confidence) = confidence {
         edge["confidence"] = json!(confidence);
@@ -951,7 +951,7 @@ fn edge(direction: &str, (from, to): (&str, &str), kinds: &[&str], derivation: &
             "kind": "edge",
             "kinds": kinds,
             "to": fixture_symbol_id(to),
-            "derivation": derivation
+            "provider": "static", "derivation": derivation
         },
         "direction": direction
     }))
@@ -1054,7 +1054,7 @@ fn a_walk_hit_is_one_symbol_under_a_root_that_writes_its_identity() {
             "1 result",
             "\tat rift://symbol/local/rust/app/config/load_config",
             "",
-            "\t\t↳ referenced",
+            "\t\t↳ referenced [static]",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:20",
             "\t\t\tat rift://symbol/local/rust/app/app/run",
@@ -1070,17 +1070,17 @@ fn paths_that_share_a_prefix_share_its_kinds_and_children_follow_answer_order() 
             "3 results",
             "\tat rift://symbol/local/rust/app/config/load_config",
             "",
-            "\t\t↳ called",
+            "\t\t↳ called [static]",
             "\t\t\tby fn reload_config()",
             "\t\t\tin src/watch.rs:41",
             "\t\t\tat rift://symbol/local/rust/app/watch/reload_config",
             "",
-            "\t\t↳ referenced",
+            "\t\t↳ referenced [static]",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:20",
             "\t\t\tat rift://symbol/local/rust/app/app/run",
             "",
-            "\t\t\t↳ referenced",
+            "\t\t\t↳ referenced [static]",
             "\t\t\t\tby async fn main()",
             "\t\t\t\tin src/main.rs:9",
             "\t\t\t\tat rift://symbol/local/rust/app/main/main",
@@ -1096,10 +1096,10 @@ fn a_middle_symbol_without_a_hit_writes_its_identity_alone() {
             "1 result",
             "\tat rift://symbol/local/rust/app/config/load_config",
             "",
-            "\t\t↳ referenced",
+            "\t\t↳ referenced [static]",
             "\t\t\tat rift://symbol/local/rust/app/app/run",
             "",
-            "\t\t\t↳ referenced",
+            "\t\t\t↳ referenced [static]",
             "\t\t\t\tby async fn main()",
             "\t\t\t\tin src/main.rs:9",
             "\t\t\t\tat rift://symbol/local/rust/app/main/main",
@@ -1126,19 +1126,19 @@ fn walk_hits_from_two_starting_symbols_make_two_trees_with_a_blank_line_between(
             "3 results",
             "\tat rift://symbol/local/rust/app/config/load_config",
             "",
-            "\t\t↳ referenced",
+            "\t\t↳ referenced [static]",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:20",
             "\t\t\tat rift://symbol/local/rust/app/app/run",
             "",
-            "\t\t↳ called",
+            "\t\t↳ called [static]",
             "\t\t\tby fn reload_config()",
             "\t\t\tin src/watch.rs:41",
             "\t\t\tat rift://symbol/local/rust/app/watch/reload_config",
             "",
             "\tat rift://symbol/local/rust/app/serve/serve",
             "",
-            "\t\t↳ calls",
+            "\t\t↳ calls [static]",
             "\t\t\tfn handle()",
             "\t\t\tin src/serve.rs:5",
             "\t\t\tat rift://symbol/local/rust/app/serve/handle",
@@ -1157,7 +1157,7 @@ fn one_hit_outside_the_walk_has_no_marker_and_a_blank_line_separates_it_from_the
             "",
             "\tat rift://symbol/local/rust/app/config/load_config",
             "",
-            "\t\t↳ referenced",
+            "\t\t↳ referenced [static]",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:20",
             "\t\t\tat rift://symbol/local/rust/app/app/run",
@@ -1180,12 +1180,12 @@ fn several_hits_outside_the_walk_have_markers_that_count_only_them() {
             "",
             "\tat rift://symbol/local/rust/app/config/load_config",
             "",
-            "\t\t↳ referenced",
+            "\t\t↳ referenced [static]",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:20",
             "\t\t\tat rift://symbol/local/rust/app/app/run",
             "",
-            "\t\t\t↳ referenced",
+            "\t\t\t↳ referenced [static]",
             "\t\t\t\tby async fn main()",
             "\t\t\t\tin src/main.rs:9",
             "\t\t\t\tat rift://symbol/local/rust/app/main/main",
@@ -1203,7 +1203,7 @@ fn a_hit_outside_the_walk_that_is_the_starting_symbol_becomes_the_root_and_is_no
             "\tin src/config.rs:10 · name",
             "\tat rift://symbol/local/rust/app/config/load_config",
             "",
-            "\t\t↳ referenced",
+            "\t\t↳ referenced [static]",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:20",
             "\t\t\tat rift://symbol/local/rust/app/app/run",
@@ -1220,7 +1220,7 @@ fn a_hit_outside_the_walk_that_is_the_starting_symbol_becomes_the_root_and_is_no
             "\tin src/config.rs:10 · name",
             "\tat rift://symbol/local/rust/app/config/load_config",
             "",
-            "\t\t↳ referenced",
+            "\t\t↳ referenced [static]",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:20",
             "\t\t\tat rift://symbol/local/rust/app/app/run",
@@ -1243,7 +1243,7 @@ fn a_root_that_is_a_hit_carries_in_and_at_and_an_item_symbol_hit_carries_neither
             "\tin src/config.rs:10 · name",
             "\tat rift://symbol/local/rust/app/config/load_config",
             "",
-            "\t\t↳ referenced",
+            "\t\t↳ referenced [static]",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:20",
             "\t\t\tat rift://symbol/local/rust/app/app/run",
@@ -1266,7 +1266,7 @@ fn a_root_that_is_a_hit_without_a_location_writes_its_facts_without_in() {
             "\tname",
             "\tat rift://symbol/local/rust/app/config/load_config",
             "",
-            "\t\t↳ referenced",
+            "\t\t↳ referenced [static]",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:20",
             "\t\t\tat rift://symbol/local/rust/app/app/run",
@@ -1282,7 +1282,7 @@ fn a_root_that_is_no_hit_is_one_line_at_its_identity() {
             "1 result",
             "\tat rift://symbol/local/rust/app/config/load_config",
             "",
-            "\t\t↳ referenced",
+            "\t\t↳ referenced [static]",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:20",
             "\t\t\tat rift://symbol/local/rust/app/app/run",
@@ -1311,12 +1311,12 @@ fn two_walk_hits_that_reach_one_symbol_under_one_parent_each_get_a_symbol() {
             "2 results",
             "\tat rift://symbol/local/rust/app/config/load_config",
             "",
-            "\t\t↳ referenced",
+            "\t\t↳ referenced [static]",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:20",
             "\t\t\tat rift://symbol/local/rust/app/app/run",
             "",
-            "\t\t↳ referenced",
+            "\t\t↳ referenced [static]",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:21",
             "\t\t\tat rift://symbol/local/rust/app/app/run",
@@ -1338,7 +1338,7 @@ fn an_outgoing_hop_writes_each_kind_as_its_wire_name_with_spaces() {
             "1 result",
             "\tat rift://symbol/local/rust/app/main/main",
             "",
-            "\t\t↳ calls, has type, depends on",
+            "\t\t↳ calls, has type, depends on [static]",
             "\t\t\tfn run()",
             "\t\t\tin src/app.rs:20",
             "\t\t\tat rift://symbol/local/rust/app/app/run",
@@ -1364,7 +1364,7 @@ fn an_incoming_hop_writes_each_kind_read_from_its_target_back_and_the_distance_i
             "1 result",
             "\tat rift://symbol/local/rust/app/config/load_config",
             "",
-            "\t\t↳ called by, referenced by, type of",
+            "\t\t↳ called by, referenced by, type of [static]",
             "\t\t\tfn run()",
             "\t\t\tin src/app.rs:20",
             "\t\t\tat rift://symbol/local/rust/app/app/run",
@@ -1388,19 +1388,19 @@ fn a_heuristic_hop_starts_with_probably_whatever_its_confidence_and_direction() 
             "3 results",
             "\tat rift://symbol/local/rust/app/main/main",
             "",
-            "\t\t↳ probably implements",
+            "\t\t↳ probably implements [static]",
             "\t\t\tfn run()",
             "\t\t\tin src/app.rs:20",
             "\t\t\tat rift://symbol/local/rust/app/app/run",
             "",
             "\tat rift://symbol/local/rust/app/config/load_config",
             "",
-            "\t\t↳ probably implemented",
+            "\t\t↳ probably implemented [static]",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:20",
             "\t\t\tat rift://symbol/local/rust/app/app/run",
             "",
-            "\t\t↳ probably implemented",
+            "\t\t↳ probably implemented [static]",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:20",
             "\t\t\tat rift://symbol/local/rust/app/app/run",
@@ -1421,7 +1421,7 @@ fn a_hop_an_external_producer_emitted_names_that_producer_after_its_edge() {
             "1 result",
             "\tat rift://symbol/local/rust/app/config/load_config",
             "",
-            "\t\t↳ called · demo-indexer 0.6.1",
+            "\t\t↳ called [static] · demo-indexer 0.6.1",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:20",
             "\t\t\tat rift://symbol/local/rust/app/app/run",
@@ -1483,22 +1483,22 @@ fn the_by_word_moves_to_the_declaration_line_only_when_every_kind_phrase_ends_in
         golden(&only_page(vec![hit]), &expected);
     };
     written(
-        "\t\t↳ called, referenced",
+        "\t\t↳ called, referenced [static]",
         "\t\t\tby fn run()",
         hit(&["calls", "references"], "resolution"),
     );
     written(
-        "\t\t↳ called by, type of",
+        "\t\t↳ called by, type of [static]",
         "\t\t\tfn run()",
         hit(&["calls", "has_type"], "resolution"),
     );
     written(
-        "\t\t↳ probably called",
+        "\t\t↳ probably called [static]",
         "\t\t\tby fn run()",
         hit(&["calls"], "heuristic"),
     );
     written(
-        "\t\t↳ annotates",
+        "\t\t↳ annotates [static]",
         "\t\t\tfn run()",
         hit(&["annotated_by"], "resolution"),
     );
@@ -1522,7 +1522,7 @@ fn an_outgoing_hop_moves_by_for_annotated_by_and_writes_calls_whole() {
         "1 result",
         "\tat rift://symbol/local/rust/app/main/main",
         "",
-        "\t\t↳ calls",
+        "\t\t↳ calls [static]",
         "\t\t\tfn run()",
     ];
     calls.extend(tail);
@@ -1531,7 +1531,7 @@ fn an_outgoing_hop_moves_by_for_annotated_by_and_writes_calls_whole() {
         "1 result",
         "\tat rift://symbol/local/rust/app/main/main",
         "",
-        "\t\t↳ annotated",
+        "\t\t↳ annotated [static]",
         "\t\t\tby fn run()",
     ];
     annotated.extend(tail);
@@ -1552,7 +1552,7 @@ fn a_symbol_without_a_location_writes_its_facts_without_in() {
             "1 result",
             "\tat rift://symbol/local/rust/app/config/load_config",
             "",
-            "\t\t↳ referenced",
+            "\t\t↳ referenced [static]",
             "\t\t\tby fn run()",
             "\t\t\tname",
             "\t\t\tat rift://symbol/local/rust/app/app/run",
@@ -1573,7 +1573,7 @@ fn copied_source_keeps_its_own_leading_spaces_and_empty_lines_after_the_indent()
             "1 result",
             "\tat rift://symbol/local/rust/app/config/load_config",
             "",
-            "\t\t↳ referenced",
+            "\t\t↳ referenced [static]",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:20",
             "\t\t\tat rift://symbol/local/rust/app/app/run",
@@ -1644,8 +1644,8 @@ fn an_incoming_hop_reads_every_kind_as_the_table_says() {
         let hit = walked_hit(RUN, "fn run()", 20, vec![against(RUN, LOAD_CONFIG, wire)]);
         // A phrase that ends in ` by` moves it to the declaration line.
         let (head, declaration) = match words.strip_suffix(" by") {
-            Some(stem) => (format!("\t\t↳ {stem}"), "\t\t\tby fn run()"),
-            None => (format!("\t\t↳ {words}"), "\t\t\tfn run()"),
+            Some(stem) => (format!("\t\t↳ {stem} [static]"), "\t\t\tby fn run()"),
+            None => (format!("\t\t↳ {words} [static]"), "\t\t\tfn run()"),
         };
         golden(
             &only_page(vec![hit]),
@@ -1704,7 +1704,7 @@ fn a_symbol_writes_every_line_of_a_symbol_hit_at_its_further_line_indent() {
             "1 result",
             "\tat rift://symbol/local/rust/app/app/run",
             "",
-            "\t\t↳ constructs",
+            "\t\t↳ constructs [static]",
             "\t\t\tstruct Config",
             "\t\t\tin rift://source/cargo/crates.io/serde/lib.rs:3 · name · score 1.5 · dependency rift://revision/cargo/crates.io/serde@1.0.0 · generated · deprecated · test · document local",
             "\t\t\tat rift://symbol/pkg/cargo/crates.io/serde@1.0.0/rust/serde/Config",
@@ -1740,16 +1740,16 @@ fn the_edge_field_is_left_out_of_a_symbol_and_every_other_field_stays() {
             "3 results",
             "\tat rift://symbol/local/rust/app/config/load_config",
             "",
-            "\t\t↳ referenced",
+            "\t\t↳ referenced [static]",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:20 · score 2",
             "\t\t\tat rift://symbol/local/rust/app/app/run",
             "",
-            "\t\t\t↳ referenced",
+            "\t\t\t↳ referenced [static]",
             "\t\t\t\tby async fn main()",
             "\t\t\t\tat rift://symbol/local/rust/app/main/main",
             "",
-            "\t\t↳ called",
+            "\t\t↳ called [static]",
             "\t\t\tby fn reload_config()",
             "\t\t\tin src/watch.rs:41 · name",
             "\t\t\tat rift://symbol/local/rust/app/watch/reload_config",
@@ -1789,7 +1789,7 @@ fn a_hit_of_another_target_with_a_traversal_path_stays_an_item() {
             "",
             "\tat rift://symbol/local/rust/app/config/load_config",
             "",
-            "\t\t↳ referenced",
+            "\t\t↳ referenced [static]",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:20",
             "\t\t\tat rift://symbol/local/rust/app/app/run",
@@ -1830,10 +1830,10 @@ fn warnings_leave_the_edge_tree_text_unchanged() {
             "",
             "\tat rift://symbol/local/rust/app/config/load_config",
             "",
-            "\t\t↳ referenced",
+            "\t\t↳ referenced [static]",
             "\t\t\tat rift://symbol/local/rust/app/app/run",
             "",
-            "\t\t\t↳ referenced",
+            "\t\t\t↳ referenced [static]",
             "\t\t\t\tby async fn main()",
             "\t\t\t\tin src/main.rs:9",
             "\t\t\t\tat rift://symbol/local/rust/app/main/main",
@@ -2873,6 +2873,44 @@ fn history_lists_edges_and_marks_an_incomplete_history() {
             "\t\trift://symbol/local/rust/app/a/A",
             "",
             "\t\thistory (incomplete):",
+        ],
+    );
+}
+
+#[test]
+fn a_release_history_lists_each_release_version_with_its_edge() {
+    let release = |version: &str| {
+        Revision::parse(&format!("rift://revision/cargo/crates.io/demo@{version}"))
+            .expect("a release revision")
+    };
+    let mut hit = symbol_hit();
+    hit.history = Some(history(
+        vec![
+            HistoryEdge::RemovedInRelease {
+                revision: release("2.0.0"),
+            },
+            HistoryEdge::ChangedInRelease {
+                revision: release("1.1.0"),
+                change: HistoryChange::SignatureChanged,
+            },
+            HistoryEdge::IntroducedInRelease {
+                revision: release("1.0.0"),
+            },
+        ],
+        false,
+    ));
+    golden(
+        &symbol_result(vec![hit], pagination(0, 1)),
+        &[
+            "1 result",
+            "\tstruct A",
+            "\ta.rs:1",
+            "\trift://symbol/local/rust/app/a/A",
+            "",
+            "\thistory (incomplete):",
+            "\t\t2.0.0 · removed in release",
+            "\t\t1.1.0 · changed in release · signature changed",
+            "\t\t1.0.0 · introduced in release",
         ],
     );
 }

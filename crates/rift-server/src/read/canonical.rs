@@ -21,19 +21,43 @@ pub struct LocalSymbolViewInput {
     pub ready: bool,
     /// Owning material charge, including retained source, facts and admitted caches.
     retained_bytes: usize,
+    query: Option<HeldQuery>,
+    expires: Option<SystemTime>,
 }
 
 impl LocalSymbolViewInput {
+    /// Attaches encoded query material to the existing view and byte bounds.
+    ///
+    /// The view expires no later than `expires` when supplied.
+    #[must_use]
+    pub fn with_query(
+        mut self,
+        key: [u8; 32],
+        bytes: Vec<u8>,
+        expires: Option<SystemTime>,
+    ) -> Self {
+        self.query = Some(HeldQuery {
+            key,
+            bytes: Arc::from(bytes),
+        });
+        self.expires = expires;
+        self
+    }
+
     /// Retains source bytes from the same request's admitted file selection.
     ///
     /// # Errors
     /// Refuses a different root, owner or captured file identity.
     pub fn with_sources(self, sources: &rift_index::WorkspaceIndex) -> Result<Self, RiftError> {
-        Ok(local_view_input(
-            Arc::new(self.material.index.with_sources(sources)?),
-            self.material.metadata.to_vec(),
-            self.ready,
-        ))
+        Ok(Self {
+            query: self.query,
+            expires: self.expires,
+            ..local_view_input(
+                Arc::new(self.material.index.with_sources(sources)?),
+                self.material.metadata.to_vec(),
+                self.ready,
+            )
+        })
     }
 
     /// Returns the warnings retained by this immutable input.
@@ -62,11 +86,11 @@ impl LocalSymbolViewInput {
         metadata.warnings.extend(warnings);
         let metadata = serde_json::to_vec(&metadata)
             .map_err(|error| material_error("capture read metadata", &error))?;
-        Ok(local_view_input(
-            Arc::clone(&self.material.index),
-            metadata,
-            self.ready,
-        ))
+        Ok(Self {
+            query: self.query,
+            expires: self.expires,
+            ..local_view_input(Arc::clone(&self.material.index), metadata, self.ready)
+        })
     }
 
     /// Reads the exact bytes of a physical occurrence in this publication.
@@ -78,7 +102,7 @@ impl LocalSymbolViewInput {
         self.material.index.file(&path)?.source().get(start..end)
     }
 
-    /// Collects the complete canonical seed inventory for a bounded local semantic read.
+    /// Collects canonical declarations with source names for a bounded engine read.
     ///
     /// # Errors
     /// Refuses incomplete source or identity coverage and a seed inventory above the bound.
@@ -101,6 +125,12 @@ impl LocalSymbolViewInput {
         let mut seeds = Vec::new();
         for (id, object) in index.objects() {
             let object = object?;
+            // A Python file module has no source name token for an engine request.
+            // Its declaration remains in the captured symbol inventory.
+            let facts = object.facts();
+            if facts.language().name == "python" && facts.kind().0 == "module" {
+                continue;
+            }
             let declarations = object.assembled().contributions().len().max(1);
             remaining = remaining
                 .checked_sub(declarations)
@@ -275,12 +305,19 @@ struct CapturedMetadata {
 }
 
 #[derive(Debug, Clone)]
+struct HeldQuery {
+    key: [u8; 32],
+    bytes: Arc<[u8]>,
+}
+
+#[derive(Debug, Clone)]
 struct HeldView {
     material: Arc<LocalSymbolMaterial>,
     ready: bool,
     retained_bytes: usize,
     view: CapturedView,
     expires: SystemTime,
+    query: Option<HeldQuery>,
 }
 
 #[derive(Debug, Default)]
@@ -333,6 +370,11 @@ impl State {
                 .saturating_add(std::mem::size_of::<HeldView>())
                 .saturating_add(held.view.id.get_heap_size())
                 .saturating_add(held.view.expires_at.capacity());
+            if let Some(query) = &held.query {
+                total = total
+                    .saturating_add(query.bytes.len())
+                    .saturating_add(2 * std::mem::size_of::<usize>());
+            }
             if charged.track(Arc::as_ptr(&held.material.index)) {
                 let bytes = if shared {
                     let (bytes, next) = held.material.index.as_ref().get_size_with_tracker(charged);
@@ -436,6 +478,9 @@ impl LocalSymbolViews {
         let expires = now
             .checked_add(VIEW_LIFETIME)
             .ok_or_else(|| invalid("view", "view expiry exceeds the clock bound"))?;
+        let expires = input
+            .expires
+            .map_or(expires, |provider| expires.min(provider));
         let view = CapturedView {
             id: CapturedViewId::parse(&id)?,
             expires_at: chrono::DateTime::<chrono::Utc>::from(expires).to_rfc3339(),
@@ -448,6 +493,7 @@ impl LocalSymbolViews {
                 retained_bytes: input.retained_bytes,
                 view: view.clone(),
                 expires,
+                query: input.query,
             },
         );
         let material_bytes = state.admitted_material_bytes(self.material_bytes_max);
@@ -478,6 +524,25 @@ impl LocalSymbolViews {
             }
         }
         Ok(Some(view))
+    }
+
+    /// Reads encoded query material while its original view remains retained.
+    #[must_use]
+    pub fn query(&self, key: &[u8; 32]) -> Option<(CapturedView, Arc<[u8]>)> {
+        self.query_at(key, SystemTime::now())
+    }
+
+    fn query_at(&self, key: &[u8; 32], now: SystemTime) -> Option<(CapturedView, Arc<[u8]>)> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.expire(now);
+        // The existing view bound caps this lookup at VIEW_SLOTS entries.
+        state.views.values().find_map(|held| {
+            let query = held.query.as_ref()?;
+            (held.ready && &query.key == key).then(|| (held.view.clone(), Arc::clone(&query.bytes)))
+        })
     }
 
     fn next_key(&self, state: &mut State) -> Result<String, RiftError> {
@@ -634,6 +699,8 @@ fn local_view_input(
         material,
         ready,
         retained_bytes,
+        query: None,
+        expires: None,
     }
 }
 

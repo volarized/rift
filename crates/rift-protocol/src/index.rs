@@ -108,7 +108,7 @@ pub struct PackagePublication {
     /// Normalized edges, preserving their source occurrences and derivation. An
     /// edge an external producer wrote names it in `producer`.
     pub edges: Vec<Edge>,
-    /// Places a unit's source names a symbol, in unit, range, and symbol order. Absent when
+    /// Places a unit's source names a symbol, in unit, range, symbol, and producer order. Absent when
     /// no producer covered occurrences.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub occurrences: Vec<PackageOccurrence>,

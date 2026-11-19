@@ -25,7 +25,7 @@ const EXTERNAL_CONFIGURATION: &str = "\
 
 #[tokio::test]
 async fn incoming_references_resolve_cross_file_callers_without_writes() -> TestResult {
-    incoming_references(CONFIGURATION).await
+    incoming_references(CONFIGURATION, "engine").await
 }
 
 #[tokio::test]
@@ -33,10 +33,10 @@ async fn live_external_ty_resolves_the_same_cross_file_callers() -> TestResult {
     if !live_engine_gate::engine_live() {
         return Ok(());
     }
-    incoming_references(EXTERNAL_CONFIGURATION).await
+    incoming_references(EXTERNAL_CONFIGURATION, "lsp").await
 }
 
-async fn incoming_references(configuration: &str) -> TestResult {
+async fn incoming_references(configuration: &str, provider: &str) -> TestResult {
     let (directory, client, server_task) = served_relative_workspace(
         &[
             ("service.py", SERVICE),
@@ -60,8 +60,9 @@ async fn incoming_references(configuration: &str) -> TestResult {
     let results = answer["results"]
         .as_array()
         .ok_or("search must return results")?;
-    assert_eq!(results.len(), 1, "{answer:#}");
-    let hit = &results[0];
+    assert_eq!(results.len(), 2, "{answer:#}");
+    assert_eq!(results[0]["hit"]["symbol"]["name"], "main", "{answer:#}");
+    let hit = &results[1];
     assert_eq!(hit["path"], json!("main.py"), "{answer:#}");
     assert_eq!(hit["hit"]["symbol"]["name"], json!("caller"), "{answer:#}");
     let path = hit["traversal_path"]
@@ -73,6 +74,7 @@ async fn incoming_references(configuration: &str) -> TestResult {
     assert_eq!(edge["from"], hit["hit"]["symbol"]["id"], "{answer:#}");
     assert_eq!(edge["to"], json!(seed), "{answer:#}");
     assert_eq!(edge["kinds"], json!(["references"]), "{answer:#}");
+    assert_eq!(edge["provider"], provider, "{answer:#}");
     assert_eq!(edge["derivation"], json!("resolution"), "{answer:#}");
     assert_eq!(
         std::fs::read_to_string(directory.path().join("service.py"))?,

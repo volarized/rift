@@ -190,7 +190,7 @@ impl<'publication> PublicationSyntax<'publication> {
 /// The added edges follow the built-in ones, sorted by `from`, `to`, `kind`,
 /// occurrence unit and range, `derivation`, `kinds`, then `confidence`, so the order the
 /// producer emitted them in does not reach the publication's bytes. Occurrences are kept in
-/// unit, range, and symbol order. The publication is checked whole with
+/// unit, range, symbol, and producer order. The publication is checked whole with
 /// [`PackagePublication::validate_facts`] before it is returned.
 ///
 /// # Errors
@@ -235,12 +235,20 @@ pub fn accept_producer_facts(
     publication.edges[built_in..].sort_by(canonical_order);
     publication.occurrences.extend(occurrences);
     publication.occurrences.sort_by(|left, right| {
-        (&left.unit, left.range.start, left.range.end, &left.symbol).cmp(&(
-            &right.unit,
-            right.range.start,
-            right.range.end,
-            &right.symbol,
-        ))
+        (
+            &left.unit,
+            left.range.start,
+            left.range.end,
+            &left.symbol,
+            &left.producer,
+        )
+            .cmp(&(
+                &right.unit,
+                right.range.start,
+                right.range.end,
+                &right.symbol,
+                &right.producer,
+            ))
     });
     publication.coverage[coverage]
         .facts
@@ -304,6 +312,7 @@ fn resolve_edge(
         kinds,
         to,
         occurrence,
+        provider,
         derivation,
         confidence,
         extensions,
@@ -332,6 +341,7 @@ fn resolve_edge(
         kinds,
         to,
         occurrence,
+        provider,
         derivation,
         confidence,
         producer: Some(producer.clone()),
@@ -370,6 +380,7 @@ fn canonical_order(left: &Edge, right: &Edge) -> Ordering {
     (&left.from, &left.to, &left.kind)
         .cmp(&(&right.from, &right.to, &right.kind))
         .then_with(|| span(left).cmp(&span(right)))
+        .then_with(|| left.provider.cmp(&right.provider))
         .then_with(|| left.derivation.cmp(&right.derivation))
         .then_with(|| left.kinds.cmp(&right.kinds))
         .then_with(|| match (left.confidence, right.confidence) {
