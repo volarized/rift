@@ -807,7 +807,7 @@ fn resolution(
     )
     .expect("fixture namespace");
     let mut namespaces = prepare_context(&input, &selected);
-    let placed = selected
+    let mut placed = selected
         .iter()
         .map(|source| PlacedFacts {
             facts: source.syntax,
@@ -828,6 +828,27 @@ fn resolution(
                 ),
         })
         .collect::<Vec<_>>();
+    if language.name == "rust" {
+        let placements = placed
+            .iter()
+            .map(|placed| &placed.placement)
+            .collect::<Vec<_>>();
+        let mut aliases = crate::analyzer::namespace::placed_aliases(
+            &input,
+            &mut namespaces,
+            &selected,
+            &placements,
+            1024,
+            || panic!("invalid fixture export"),
+        )
+        .expect("fixture aliases");
+        for placed in &mut placed {
+            placed.placement = placed
+                .placement
+                .clone()
+                .with_aliases(aliases.remove(placed.path.as_str()).unwrap_or_default());
+        }
+    }
     let semantics = WorkspaceSemantics::build_facts_placed(&placed, 1024, 7, None)
         .expect("fixture graph")
         .semantics;
@@ -1460,4 +1481,54 @@ fn test_rust_unknown_import_does_not_establish_a_receiver_type() {
         WORK_MAX,
     );
     assert_eq!(calls(&result, "src/lib.rs").count(), 0);
+}
+
+#[test]
+fn test_rust_reexport_chain_calls_keep_authored_trait_identity() {
+    let source = "pub mod inner; pub use crate::inner::Count; pub fn root<T: Count>(item: &T) { item.read(); }";
+    let result = resolution(
+        "rust",
+        &[
+            ("src/lib.rs", source),
+            (
+                "src/inner/mod.rs",
+                "mod traits; pub use self::traits::Count;",
+            ),
+            ("src/inner/traits.rs", "pub trait Count { fn read(&self); }"),
+        ],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    let found = calls(&result, "src/lib.rs").collect::<Vec<_>>();
+    assert_eq!(found.len(), 1);
+    assert_eq!(source_of(found[0], source), "item.read()");
+    assert_eq!(
+        target(found[0]),
+        "rift://symbol/local/rust/fixture/inner/traits/Count/read"
+    );
+}
+
+#[test]
+fn test_rust_public_type_reexport_keeps_public_method_access() {
+    let source = "pub mod inner; pub use crate::inner::Item; pub fn root() { Item::new(); }";
+    let result = resolution(
+        "rust",
+        &[
+            ("src/lib.rs", source),
+            ("src/inner/mod.rs", "mod types; pub use self::types::Item;"),
+            (
+                "src/inner/types.rs",
+                "pub struct Item; impl Item { pub fn new() -> Self { Self } }",
+            ),
+        ],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    let found = calls(&result, "src/lib.rs").collect::<Vec<_>>();
+    assert_eq!(found.len(), 1);
+    assert_eq!(source_of(found[0], source), "Item::new()");
+    assert_eq!(
+        target(found[0]),
+        "rift://symbol/local/rust/fixture/inner/types/Item/new"
+    );
 }

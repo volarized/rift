@@ -114,11 +114,71 @@ impl<'source> Namespaces<'source> {
         {
             namespaces.index_file(file, work)?;
         }
+        namespaces.index_aliases(files, work)?;
         namespaces.index_members(files, work)?;
         namespaces.index_methods(files, work)?;
         namespaces.index_field_types(files, work)?;
         namespaces.index_bounds(files, work)?;
         Some(namespaces)
+    }
+
+    fn index_aliases(
+        &mut self,
+        files: &BTreeMap<&'source str, File<'source>>,
+        work: &mut Work,
+    ) -> Option<()> {
+        let mut declarations = BTreeMap::new();
+        for file in files
+            .values()
+            .filter(|file| file.document.facts.language().name == "rust")
+        {
+            for symbol in file.document.facts.symbols() {
+                if !work.charge() {
+                    return None;
+                }
+                let target = Target {
+                    file: file.document,
+                    symbol,
+                };
+                if symbol.kind == "impl_item" || file.conditional(symbol.item_range, work) {
+                    continue;
+                }
+                let identity = rift_core::symbol_identity(
+                    "rust",
+                    file.document.placement.identity_path(),
+                    &symbol.qualified_name,
+                );
+                declarations
+                    .entry(identity)
+                    .and_modify(|entry| *entry = None)
+                    .or_insert(Some(target));
+            }
+        }
+        for file in files
+            .values()
+            .filter(|file| file.document.facts.language().name == "rust")
+        {
+            for alias in file.document.placement.aliases() {
+                if !work.charge() {
+                    return None;
+                }
+                let Some(target) = declarations.get(&alias.target_identity).copied().flatten()
+                else {
+                    continue;
+                };
+                let path = rift_protocol::identity::SymbolIdentity::parse(alias.identity.as_str())
+                    .ok()?
+                    .qualified_path()
+                    .to_vec();
+                if target.symbol.kinds.contains(&SymbolKind::Type) || target.symbol.kind == "module"
+                {
+                    insert(&mut self.types, path, target);
+                } else {
+                    insert(&mut self.values, path, target);
+                }
+            }
+        }
+        Some(())
     }
 
     fn index_bounds(
@@ -484,8 +544,10 @@ impl<'source> Namespaces<'source> {
             selected = Some(method.target);
         }
         let target = selected?;
-        (self.accessible(file, position, &path, target, work) || target.symbol.visibility.is_none())
-            .then_some(target)
+        (target.symbol.visibility.as_deref() == Some("pub")
+            || self.accessible(file, position, &path, target, work)
+            || target.symbol.visibility.is_none())
+        .then_some(target)
     }
 
     fn lookup(

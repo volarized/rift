@@ -666,86 +666,221 @@ fn local_exports(
         .iter()
         .map(|file| (file.path.as_str(), file))
         .collect::<BTreeMap<_, _>>();
-    for (namespace, (path, range, name, target)) in requested {
-        let Some(file) = files.get(path.as_str()) else {
-            continue;
-        };
-        let configuration = configurations.file(path.as_str());
-        if configuration.admitted(file.syntax, file.source, *range) != Some(true) {
-            continue;
-        }
-        // Captured conditional declarations do not establish export completeness.
-        prepared.unresolved_exports = true;
-        let local = requested_path(namespace, target).and_then(|target_path| {
-            local_target(
+    let refused = conflicting_requests(input, &files, requested, &configurations);
+    let mut completed = std::collections::BTreeSet::new();
+    'passes: for _ in 0..requested.len() {
+        let before = prepared.exports.len();
+        for request in requested {
+            let (namespace, (path, range, name, _)) = request;
+            let Some(next) = work.checked_add(1) else {
+                break 'passes;
+            };
+            work = next;
+            if work > work_max {
+                break 'passes;
+            }
+            let Some(identity) = export_identity(input, namespace, name) else {
+                continue;
+            };
+            if completed.contains(&identity) || refused.contains(&identity) {
+                continue;
+            }
+            let Some(file) = files.get(path.as_str()) else {
+                continue;
+            };
+            let configuration = configurations.file(path.as_str());
+            if configuration.admitted(file.syntax, file.source, *range) != Some(true) {
+                continue;
+            }
+            // Captured conditional declarations do not establish export completeness.
+            prepared.unresolved_exports = true;
+            let target = export_target(
                 input,
                 selected,
-                &prepared.anchors,
+                prepared,
                 &configurations,
-                &target_path,
+                request,
                 &mut work,
                 work_max,
-            )
-            .map(|(file, symbol, target)| {
-                (
-                    target.clone(),
-                    file.path.as_str().to_owned(),
-                    symbol.qualified_name.clone(),
-                )
-            })
-        });
-        let target = match local {
-            Some(local) => Some(local),
-            None if is_path_keyword(target) => None,
-            None => external_target(input, target, &mut work, work_max),
-        };
-        let Some((target, target_path, target_qualified_name)) = target else {
-            continue;
-        };
-        let mut alias_path = namespace.clone();
-        alias_path.push(name.clone());
-        let Some(identity) = SymbolIdentity::new(
-            input.owner().clone(),
-            ShippedLanguage::Rust.language(),
-            alias_path,
-        )
-        .ok()
-        .and_then(|identity| SymbolId::new(identity.wire_identity()).ok()) else {
-            continue;
-        };
-        if identity == target {
-            continue;
+            );
+            let Some((target, target_path, target_qualified_name)) = target else {
+                continue;
+            };
+            if identity == target {
+                continue;
+            }
+            if prepared
+                .anchors
+                .values()
+                .any(|anchors| anchors.values().any(|anchor| *anchor == identity))
+            {
+                continue;
+            }
+            completed.insert(identity.clone());
+            prepared.exports.push(export_binding(
+                request,
+                identity,
+                (target, target_path, target_qualified_name),
+            ));
         }
-        if prepared
-            .anchors
-            .values()
-            .any(|anchors| anchors.values().any(|anchor| *anchor == identity))
-        {
-            continue;
+        if prepared.exports.len() == before {
+            break;
         }
-        prepared.exports.push(super::ExportBinding {
-            path: path.as_str().to_owned(),
-            binding: rift_syntax::SyntaxExportBinding {
-                kind: rift_syntax::SyntaxExportKind::Named,
-                range: *range,
-                local: None,
-                exported: None,
-                source: None,
-                container: None,
-                type_only: false,
-            },
-            identity,
-            target,
-            target_path,
-            target_qualified_name,
-            name: name.clone(),
-            qualified_name: name.clone(),
-        });
     }
     let conflicts = super::typescript::conflicting_export_identities(&prepared.exports);
     prepared
         .exports
         .retain(|export| !conflicts.contains(export.identity.as_str()));
+}
+
+fn export_binding(
+    request: &(Vec<String>, macros::Export),
+    identity: SymbolId,
+    target: (SymbolId, String, String),
+) -> super::ExportBinding {
+    let (_, (path, range, name, _)) = request;
+    let (target, target_path, target_qualified_name) = target;
+    super::ExportBinding {
+        path: path.as_str().to_owned(),
+        binding: rift_syntax::SyntaxExportBinding {
+            kind: rift_syntax::SyntaxExportKind::Named,
+            range: *range,
+            local: None,
+            exported: None,
+            source: None,
+            container: None,
+            type_only: false,
+        },
+        identity,
+        target,
+        target_path,
+        target_qualified_name,
+        name: name.clone(),
+        qualified_name: name.clone(),
+    }
+}
+
+fn export_target(
+    input: &NamespaceInput<'_>,
+    selected: &[super::SelectedFile<'_>],
+    prepared: &super::PreparedNamespace,
+    configurations: &configuration::Configurations<'_>,
+    request: &(Vec<String>, macros::Export),
+    work: &mut usize,
+    work_max: usize,
+) -> Option<(SymbolId, String, String)> {
+    let (namespace, (_, _, _, target)) = request;
+    let local = requested_path(namespace, target).and_then(|target_path| {
+        for export in &prepared.exports {
+            *work = work.checked_add(1)?;
+            if *work > work_max {
+                return None;
+            }
+            if SymbolIdentity::parse(export.identity.as_str())
+                .ok()?
+                .qualified_path()
+                == target_path
+            {
+                return Some((
+                    export.target.clone(),
+                    export.target_path.clone(),
+                    export.target_qualified_name.clone(),
+                ));
+            }
+        }
+        local_target(
+            input,
+            selected,
+            &prepared.anchors,
+            configurations,
+            &target_path,
+            work,
+            work_max,
+        )
+        .map(|(file, symbol, target)| {
+            (
+                target.clone(),
+                file.path.as_str().to_owned(),
+                symbol.qualified_name.clone(),
+            )
+        })
+    });
+    match local {
+        Some(local) => Some(local),
+        None if is_path_keyword(target)
+            || local_export_head(input, namespace, target, prepared) =>
+        {
+            None
+        }
+        None => external_target(input, target, work, work_max),
+    }
+}
+
+fn local_export_head(
+    input: &NamespaceInput<'_>,
+    namespace: &[String],
+    target: &[String],
+    prepared: &super::PreparedNamespace,
+) -> bool {
+    let Some(identity) = target
+        .first()
+        .and_then(|name| export_identity(input, namespace, name))
+    else {
+        return true;
+    };
+    prepared
+        .anchors
+        .values()
+        .any(|anchors| anchors.values().any(|anchor| *anchor == identity))
+        || prepared
+            .exports
+            .iter()
+            .any(|export| export.identity == identity)
+}
+
+fn export_identity(
+    input: &NamespaceInput<'_>,
+    namespace: &[String],
+    name: &str,
+) -> Option<SymbolId> {
+    let mut path = namespace.to_vec();
+    path.push(name.to_owned());
+    let identity = SymbolIdentity::new(
+        input.owner().clone(),
+        ShippedLanguage::Rust.language(),
+        path,
+    )
+    .ok()?;
+    SymbolId::new(identity.wire_identity()).ok()
+}
+
+fn conflicting_requests(
+    input: &NamespaceInput<'_>,
+    files: &BTreeMap<&str, &super::SelectedFile<'_>>,
+    requested: &[(Vec<String>, macros::Export)],
+    configurations: &configuration::Configurations<'_>,
+) -> std::collections::BTreeSet<SymbolId> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut refused = std::collections::BTreeSet::new();
+    for (namespace, (path, range, name, _)) in requested {
+        let Some(identity) = export_identity(input, namespace, name) else {
+            continue;
+        };
+        let Some(file) = files.get(path.as_str()) else {
+            continue;
+        };
+        let admitted =
+            configurations
+                .file(path.as_str())
+                .admitted(file.syntax, file.source, *range);
+        if admitted == Some(false) {
+            continue;
+        }
+        if admitted.is_none() || !seen.insert(identity.clone()) {
+            refused.insert(identity);
+        }
+    }
+    refused
 }
 
 fn external_target(

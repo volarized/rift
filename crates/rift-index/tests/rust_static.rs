@@ -378,3 +378,121 @@ fn test_rust_unknown_method_alternatives_do_not_select_an_active_decoy() {
             .any(|edge| edge.kind() == EdgeKind::Calls)
     );
 }
+
+#[test]
+fn test_rust_reexport_chains_keep_terminal_trait_facts() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let root = directory.path();
+    std::fs::create_dir_all(root.join("src/inner")).expect("source directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='fixture'\nversion='0.1.0'\n",
+    )
+    .expect("manifest");
+    std::fs::write(root.join("src/lib.rs"), "pub mod inner; pub use crate::inner::Count; pub struct Item; impl Count for Item { fn read(&self) -> usize { 1 } } pub fn generic<T: Count>(item: &T) -> usize { item.read() }").expect("root source");
+    std::fs::write(
+        root.join("src/inner/mod.rs"),
+        "mod traits; pub use self::traits::Count;",
+    )
+    .expect("module source");
+    std::fs::write(
+        root.join("src/inner/traits.rs"),
+        "pub trait Count { fn read(&self) -> usize; }",
+    )
+    .expect("trait source");
+    let index = WorkspaceIndex::build(
+        root,
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &TextFileInclusion::default(),
+    )
+    .expect("index");
+    let view = index.symbol_view().expect("symbols");
+    assert!(
+        view.normalized_graph()
+            .records()
+            .iter()
+            .all(|record| record.identity().is_some())
+    );
+    for kind in [EdgeKind::Implements, EdgeKind::Imports, EdgeKind::Aliases] {
+        assert!(
+            index.edges().edges().any(|edge| edge.kind() == kind
+                && edge.to().as_str().ends_with("/fixture/inner/traits/Count")),
+            "missing {kind:?} to the authored trait: {:?}",
+            index
+                .edges()
+                .edges()
+                .map(|edge| (edge.kind(), edge.from().as_str(), edge.to().as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+    for kind in [EdgeKind::Calls, EdgeKind::Reads, EdgeKind::Overrides] {
+        assert!(
+            index.edges().edges().any(|edge| edge.kind() == kind
+                && edge
+                    .to()
+                    .as_str()
+                    .ends_with("/fixture/inner/traits/Count/read")),
+            "missing {kind:?} to the authored member"
+        );
+    }
+    assert!(
+        index
+            .edges()
+            .edges()
+            .filter(|edge| edge.kind() == EdgeKind::Aliases
+                && edge.to().as_str().ends_with("/fixture/inner/traits/Count"))
+            .count()
+            >= 2
+    );
+}
+
+#[test]
+fn test_rust_reexport_cycles_and_ambiguous_entries_stay_unresolved() {
+    for modules in [
+        [
+            ("entry.rs", "pub use crate::other::Count;"),
+            ("other.rs", "pub use crate::entry::Count;"),
+        ],
+        [
+            (
+                "entry.rs",
+                "pub use crate::one::Count; pub use crate::other::Count;",
+            ),
+            ("other.rs", "pub trait Count {}"),
+        ],
+    ] {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path();
+        std::fs::create_dir(root.join("src")).expect("source directory");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='fixture'\nversion='0.1.0'\n",
+        )
+        .expect("manifest");
+        std::fs::write(root.join("src/lib.rs"), "pub mod entry; pub mod other; pub mod one { pub trait Count {} } pub use crate::entry::Count; pub struct Item; impl Count for Item {}").expect("root source");
+        for (path, source) in modules {
+            std::fs::write(root.join("src").join(path), source).expect("module source");
+        }
+        let index = WorkspaceIndex::build(
+            root,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("index");
+        assert!(
+            !index
+                .edges()
+                .edges()
+                .any(|edge| edge.kind() == EdgeKind::Implements)
+        );
+        assert!(
+            !index
+                .edges()
+                .edges()
+                .any(|edge| edge.kind() == EdgeKind::Aliases
+                    && edge.from().as_str().ends_with("/fixture/Count"))
+        );
+    }
+}
