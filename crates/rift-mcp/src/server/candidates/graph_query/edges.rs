@@ -405,27 +405,50 @@ impl RiftMcp {
             && (required.adjacency.calls
                 || required.adjacency.references
                 || required.occurrences.is_some());
-        if (captured_only && !full_adjacency)
-            || (!required.adjacency.calls
-                && !required.adjacency.references
-                && !required.adjacency.type_uses
-                && required.occurrences.is_none())
-        {
+        let resolved_adjacency = required.adjacency.calls
+            || required.adjacency.references
+            || required.adjacency.type_uses
+            || required.adjacency.heritage.extends
+            || required.adjacency.heritage.implements
+            || required.occurrences.is_some();
+        if (captured_only && !full_adjacency) || !resolved_adjacency {
             let mut acquired = AcquiredAdjacency::default();
             acquired.capture_edge_inventory(reads, required)?;
             return Ok(acquired);
         }
-        if required.adjacency.type_uses
-            && !required.adjacency.calls
-            && !required.adjacency.references
-            && required.occurrences.is_none()
+        let mut acquired = if required.adjacency.calls
+            || required.adjacency.references
+            || required.occurrences.is_some()
         {
-            return self
-                .acquire_type_inventory(resolved, required, &engines, deadline)
-                .await;
+            self.acquire_engine_inventory(resolved, required, &engines, deadline)
+                .await?
+        } else {
+            let mut acquired = AcquiredAdjacency::default();
+            acquired.capture_edge_inventory(reads, required)?;
+            acquired
+        };
+        if required.adjacency.type_uses {
+            self.acquire_type_inventory(resolved, &engines, deadline, &mut acquired)
+                .await?;
         }
-        self.acquire_engine_inventory(resolved, required, &engines, deadline)
+        if required.adjacency.heritage.extends || required.adjacency.heritage.implements {
+            self.acquire_heritage_inventory(
+                resolved,
+                required.adjacency.heritage,
+                &engines,
+                deadline,
+                &mut acquired,
+            )
+            .await?;
+        }
+        if !self
+            .engine_tree_matches(&resolved.published)
             .await
+            .map_err(|_| coverage_failure())?
+        {
+            return Err(coverage_failure());
+        }
+        Ok(acquired)
     }
 
     async fn acquire_engine_inventory(
@@ -501,26 +524,17 @@ impl RiftMcp {
                 }
             }
         }
-        if !self
-            .engine_tree_matches(&resolved.published)
-            .await
-            .map_err(|_| coverage_failure())?
-        {
-            return Err(coverage_failure());
-        }
         Ok(acquired)
     }
 
     async fn acquire_type_inventory(
         &self,
         resolved: &ResolvedWorkspace,
-        required: rift_search::sparql::SemanticInventory,
         engines: &rift_server::EnginePool,
         deadline: RequestDeadline,
-    ) -> Result<AcquiredAdjacency, RiftError> {
+        acquired: &mut AcquiredAdjacency,
+    ) -> Result<(), RiftError> {
         let reads = &resolved.published.reads;
-        let mut acquired = AcquiredAdjacency::default();
-        acquired.capture_edge_inventory(reads, required)?;
         let report = Box::pin(rift_server::graph_type_uses(
             reads,
             engines,
@@ -539,14 +553,51 @@ impl RiftMcp {
                     .push((caller, SymbolRelation::HasType, occurrence.target));
             }
         }
-        if !self
-            .engine_tree_matches(&resolved.published)
-            .await
-            .map_err(|_| coverage_failure())?
+        Ok(())
+    }
+
+    async fn acquire_heritage_inventory(
+        &self,
+        resolved: &ResolvedWorkspace,
+        required: rift_search::sparql::SemanticHeritage,
+        engines: &rift_server::EnginePool,
+        deadline: RequestDeadline,
+        acquired: &mut AcquiredAdjacency,
+    ) -> Result<(), RiftError> {
+        let reads = &resolved.published.reads;
+        let kinds = [
+            (required.extends, EdgeKind::Extends),
+            (required.implements, EdgeKind::Implements),
+        ]
+        .into_iter()
+        .filter_map(|(selected, kind)| selected.then_some(kind))
+        .collect::<Vec<_>>();
+        let (edges, warnings) = Box::pin(rift_server::graph_heritage_inventory(
+            reads,
+            engines,
+            &kinds,
+            usize::try_from(REQUESTS_MAX).unwrap_or(usize::MAX),
+            deadline.walk_end(resolved.capture_elapsed),
+        ))
+        .await?;
+        acquired.incomplete |= warnings
+            .iter()
+            .any(|warning| matches!(warning, ReadWarning::EngineAnalysisUnavailable { .. }));
+        acquired.warnings.extend(warnings);
+        if acquired.local_edges.len().saturating_add(edges.len())
+            > usize::try_from(RECORDS_MAX).unwrap_or(usize::MAX)
         {
             return Err(coverage_failure());
         }
-        Ok(acquired)
+        for edge in edges {
+            let [kind] = edge.kinds.as_slice() else {
+                return Err(coverage_failure());
+            };
+            acquired
+                .local_edges
+                .push((edge.from, relation(*kind)?, edge.to));
+        }
+        Ok(())
     }
 
     pub(super) async fn acquire_adjacency(

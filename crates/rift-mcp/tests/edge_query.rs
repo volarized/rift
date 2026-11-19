@@ -335,6 +335,12 @@ async fn test_edge_cold_calls_wait_and_reference_answers_need_no_declaration_mar
         ),
         (
             format!("SELECT ?target {{ ?target :implements <{trait_edge}> }}"),
+            Some(worker.clone()),
+        ),
+        (
+            format!(
+                "SELECT ?target {{ ?target :implements ?trait FILTER(?trait = <{trait_edge}>) }}"
+            ),
             Some(worker),
         ),
     ] {

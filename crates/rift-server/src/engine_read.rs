@@ -992,7 +992,7 @@ mod call_evidence;
 mod heritage_edges;
 mod type_uses;
 use call_evidence::CapturedCalls;
-pub use heritage_edges::graph_heritage_edges;
+pub use heritage_edges::{graph_heritage_edges, graph_heritage_inventory};
 pub use type_uses::graph_type_uses;
 
 /// Calls established for one selected local declaration.

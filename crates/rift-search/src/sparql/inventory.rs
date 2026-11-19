@@ -24,6 +24,17 @@ pub struct SemanticAdjacency {
     pub type_uses: bool,
     /// The query can inspect caller-to-target reference edges.
     pub references: bool,
+    /// Inheritance and implementation operations selected by the query.
+    pub heritage: SemanticHeritage,
+}
+
+/// Heritage kinds whose configured engine can add to captured facts.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SemanticHeritage {
+    /// The query can inspect inheritance edges.
+    pub extends: bool,
+    /// The query can inspect implementation edges.
+    pub implements: bool,
 }
 
 /// The semantic and physical facts needed from a complete selected domain.
@@ -75,9 +86,17 @@ impl SemanticInventory {
                     self.edges = true;
                     self.adjacency.type_uses = true;
                 }
+                Some("extends") => {
+                    self.edges = true;
+                    self.adjacency.heritage.extends = true;
+                }
+                Some("implements") => {
+                    self.edges = true;
+                    self.adjacency.heritage.implements = true;
+                }
                 Some(
-                    "imports" | "aliases" | "extends" | "implements" | "declares" | "contains"
-                    | "overrides" | "reads" | "writes",
+                    "imports" | "aliases" | "declares" | "contains" | "overrides" | "reads"
+                    | "writes",
                 ) => self.edges = true,
                 Some("usages") => {
                     self.occurrences.get_or_insert_default();
@@ -122,9 +141,17 @@ impl SemanticInventory {
                             self.edges = true;
                             self.adjacency.type_uses = true;
                         }
+                        Some("extends") => {
+                            self.edges = true;
+                            self.adjacency.heritage.extends = true;
+                        }
+                        Some("implements") => {
+                            self.edges = true;
+                            self.adjacency.heritage.implements = true;
+                        }
                         Some(
-                            "imports" | "aliases" | "extends" | "implements" | "declares"
-                            | "contains" | "overrides" | "reads" | "writes",
+                            "imports" | "aliases" | "declares" | "contains" | "overrides" | "reads"
+                            | "writes",
                         ) => self.edges = true,
                         Some("usages") => {
                             self.occurrences.get_or_insert_default();
