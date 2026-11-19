@@ -4,7 +4,7 @@ use rift_core::ReferenceRole;
 use rift_protocol::read::{EdgeKind, SymbolKind};
 use rift_syntax::{ByteRange, StaticBindingKind, SyntaxSymbol};
 
-use super::{Namespaces, inherent_member, is_value_binding};
+use super::{Namespaces, inherent_member, is_type_binding, is_value_binding};
 use crate::static_resolution::{
     Binding, File, Index, StaticOccurrence, StaticResolution, Target, Work,
 };
@@ -132,15 +132,65 @@ impl<'source> Namespaces<'source> {
                 .start
                 .checked_add(u64::try_from(receiver.len()).ok()?)?,
         };
-        let owner = self.receiver_target(file, receiver, work)?;
-        let mut path = owner.admitted_path()?;
-        path.push(member.trim().to_owned());
-        self.members
-            .get(&path)
-            .copied()
-            .flatten()
-            .filter(|target| target.symbol.kind == "field_declaration")
-            .or_else(|| self.inherent_method(file, range.start, owner, member.trim(), work))
+        let field = self
+            .receiver_target(file, receiver, work)
+            .and_then(|owner| {
+                let mut path = owner.admitted_path()?;
+                path.push(member.trim().to_owned());
+                self.members
+                    .get(&path)
+                    .copied()
+                    .flatten()
+                    .filter(|target| target.symbol.kind == "field_declaration")
+            });
+        field.or_else(|| self.receiver_method(file, receiver, member.trim(), work))
+    }
+
+    pub(super) fn receiver_method(
+        &self,
+        file: &File<'source>,
+        receiver: ByteRange,
+        member: &str,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        if let Some(owner) = self.receiver_target(file, receiver, work) {
+            return self.inherent_method(file, receiver.start, owner, member, work);
+        }
+        let Binding::Found(binding) =
+            file.binding(file.text(receiver)?, receiver.start, is_value_binding, work)
+        else {
+            return None;
+        };
+        let StaticBindingKind::RustReceiver { type_path } = binding.kind else {
+            return None;
+        };
+        let name = file.text(type_path)?;
+        let Binding::Found(parameter) = file.binding(name, type_path.start, is_type_binding, work)
+        else {
+            return None;
+        };
+        if parameter.kind != StaticBindingKind::RustTypeParameter {
+            return None;
+        }
+        let mut selected: Option<Target<'source>> = None;
+        let bounds = self
+            .bounds
+            .get(&(file.document.path.as_str(), parameter.name))?;
+        for &bound in bounds {
+            if !work.charge() {
+                return None;
+            }
+            let owner = self.edge_type_target(file, bound, work)?;
+            let Some(target) = self.inherent_method(file, receiver.start, owner, member, work)
+            else {
+                continue;
+            };
+            if selected.is_some_and(|previous| previous.symbol != target.symbol) {
+                return None;
+            }
+            selected = Some(target);
+        }
+        selected
     }
 
     pub(super) fn receiver_target(

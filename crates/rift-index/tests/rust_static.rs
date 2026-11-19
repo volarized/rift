@@ -233,3 +233,54 @@ fn test_rust_associated_type_use_keeps_its_declared_member() {
         );
     }
 }
+
+#[test]
+fn test_rust_trait_defaults_and_bounded_receivers_keep_stored_targets() {
+    let source = "pub trait Count { fn remaining(&self) -> usize; fn get(&self) -> usize { self.remaining() } } pub struct Item; impl Count for Item { fn remaining(&self) -> usize { 1 } } pub fn generic<T: Count>(item: &T) -> usize { item.remaining() } pub fn bounded<T>(item: &T) -> usize where T: Count { item.remaining() } pub fn shadow<T: Count>(item: &T) { let item = 1; item.remaining(); } trait Other { fn remaining(&self); } fn ambiguous<T: Count + Other>(item: &T) { item.remaining(); }";
+    let directory = tempfile::tempdir().expect("workspace");
+    let root = directory.path();
+    std::fs::create_dir(root.join("src")).expect("source directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='fixture'\nversion='0.1.0'\n",
+    )
+    .expect("manifest");
+    std::fs::write(root.join("src/lib.rs"), source).expect("source");
+    let index = WorkspaceIndex::build(
+        root,
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &TextFileInclusion::default(),
+    )
+    .expect("index");
+    let view = index.symbol_view().expect("symbols");
+    let records = view.normalized_graph().records();
+    assert!(
+        records.iter().all(|record| record.identity().is_some()),
+        "every captured declaration has an identity"
+    );
+    for from in ["/Count/get", "/fixture/generic", "/fixture/bounded"] {
+        for kind in [EdgeKind::Calls, EdgeKind::Reads] {
+            assert!(
+                index.edges().edges().any(|edge| edge.kind() == kind
+                    && edge.from().as_str().ends_with(from)
+                    && edge.to().as_str().ends_with("/Count/remaining")),
+                "missing {kind:?} {from} -> Count.remaining"
+            );
+        }
+    }
+    assert!(
+        index
+            .edges()
+            .edges()
+            .any(|edge| edge.kind() == EdgeKind::Implements
+                && edge.from().as_str().ends_with("/fixture/Item")
+                && edge.to().as_str().ends_with("/fixture/Count"))
+    );
+    assert!(!index.edges().edges().any(|edge| {
+        edge.kind() == EdgeKind::Calls
+            && ["/fixture/shadow", "/fixture/ambiguous"]
+                .iter()
+                .any(|from| edge.from().as_str().ends_with(from))
+    }));
+}

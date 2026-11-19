@@ -115,6 +115,8 @@ pub enum StaticBindingKind {
         /// Authored type or constructor path.
         type_path: ByteRange,
     },
+    /// Rust type parameter whose declared bounds remain in its lexical scope.
+    RustTypeParameter,
 }
 
 /// One named export forwarded directly from another module.
@@ -460,7 +462,9 @@ impl StaticBinding {
             StaticBindingKind::JavaScriptInstance { constructor } => valid(constructor),
             StaticBindingKind::RustUse { path } => valid(path),
             StaticBindingKind::RustReceiver { type_path } => valid(type_path),
-            StaticBindingKind::Local | StaticBindingKind::Shadow => true,
+            StaticBindingKind::Local
+            | StaticBindingKind::Shadow
+            | StaticBindingKind::RustTypeParameter => true,
         };
         valid(self.name)
             && valid(self.scope)

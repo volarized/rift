@@ -1369,3 +1369,55 @@ fn test_typescript_qualified_annotation_names_are_not_value_accesses() {
         1
     );
 }
+
+#[test]
+fn test_rust_trait_default_and_explicit_bounds_keep_source_and_identity() {
+    let source = "pub trait Count { fn remaining(&self) -> usize; fn get(&self) -> usize { self.remaining() } } pub fn generic<T: Count>(item: &T) -> usize { item.remaining() } pub fn bounded<T>(item: &T) -> usize where T: Count { item.remaining() }";
+    let result = resolution(
+        "rust",
+        &[("src/lib.rs", source)],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    let resolved = calls(&result, "src/lib.rs")
+        .map(|edge| (source_of(edge, source), target(edge)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        resolved,
+        [
+            (
+                "self.remaining()",
+                "rift://symbol/local/rust/fixture/Count/remaining"
+            ),
+            (
+                "item.remaining()",
+                "rift://symbol/local/rust/fixture/Count/remaining"
+            ),
+            (
+                "item.remaining()",
+                "rift://symbol/local/rust/fixture/Count/remaining"
+            )
+        ]
+    );
+}
+
+#[test]
+fn test_rust_bound_lookup_refuses_unknown_and_competing_traits() {
+    let source = "trait Count { fn remaining(&self); } trait Other { fn remaining(&self); } trait Marker {} fn unique<T: Marker + Count>(item: &T) { item.remaining(); } fn competing<T: Count + Other>(item: &T) { item.remaining(); } fn unknown<T: Count + missing::Other>(item: &T) { item.remaining(); } fn higher<T: Count + for<'a> missing::Other<'a>>(item: &T) { item.remaining(); } fn shadow<T: Count>(item: &T) { let item = 1; item.remaining(); }";
+    let result = resolution(
+        "rust",
+        &[("src/lib.rs", source)],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    let resolved = calls(&result, "src/lib.rs").collect::<Vec<_>>();
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(
+        target(resolved[0]),
+        "rift://symbol/local/rust/fixture/Count/remaining"
+    );
+    assert_eq!(
+        resolved[0].binding.range().start(),
+        u64::try_from(source.find("item.remaining()").expect("unique receiver")).expect("offset")
+    );
+}

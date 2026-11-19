@@ -37,6 +37,11 @@ pub(super) struct Kinds {
     attribute: u16,
     inner_attribute: u16,
     impl_item: u16,
+    trait_item: u16,
+    type_parameter: u16,
+    where_predicate: u16,
+    non_method_bounds: [u16; 2],
+    bounds: u16,
     edge_macro: u16,
     assignment: [u16; 2],
     scopes: [u16; 3],
@@ -90,6 +95,11 @@ pub(super) fn kinds() -> &'static Kinds {
             attribute: id("attribute_item"),
             inner_attribute: id("inner_attribute_item"),
             impl_item: id("impl_item"),
+            trait_item: id("trait_item"),
+            type_parameter: id("type_parameter"),
+            where_predicate: id("where_predicate"),
+            non_method_bounds: [id("lifetime"), id("removed_trait_bound")],
+            bounds: field("bounds"),
             edge_macro: id("macro_invocation"),
             assignment: [id("assignment_expression"), id("compound_assignment_expr")],
             scopes: [id("source_file"), id("block"), id("declaration_list")],
@@ -153,6 +163,8 @@ impl Kinds {
             facts.unsupported_bindings.push(byte_range(syntax_element)?);
         } else if id == self.impl_item {
             self.record_impl(syntax_element, facts)?;
+        } else if id == self.type_parameter || id == self.where_predicate {
+            self.record_bounds(syntax_element, facts)?;
         } else if id == self.attribute || id == self.inner_attribute {
             self.record_attribute(syntax_element, source, facts)?;
         } else if self.conditional[..3].contains(&id) {
@@ -324,11 +336,15 @@ impl Kinds {
         let Some(scope) = enclosing(element, &self.functions) else {
             return Ok(());
         };
-        let Some(implementation) = enclosing(scope, &[self.impl_item]) else {
+        let Some(implementation) = enclosing(scope, &[self.impl_item, self.trait_item]) else {
             return Ok(());
         };
         let Some(value_type) = implementation
-            .child_by_field_id(self.value_type)
+            .child_by_field_id(if implementation.kind_id() == self.trait_item {
+                self.name
+            } else {
+                self.value_type
+            })
             .and_then(|value_type| self.named_type(value_type))
         else {
             return Ok(());
@@ -346,6 +362,51 @@ impl Kinds {
                     type_path: byte_range(value_type)?,
                 },
             )?);
+        }
+        Ok(())
+    }
+
+    fn record_bounds(
+        &self,
+        element: Node<'_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let parameter = element.kind_id() == self.type_parameter;
+        let Some(name) = element
+            .child_by_field_id(if parameter { self.name } else { self.left })
+            .filter(|name| name.kind_id() == self.type_identifier)
+        else {
+            return Ok(());
+        };
+        if parameter
+            && let Some(scope) = enclosing(
+                element,
+                &[
+                    self.functions[0],
+                    self.functions[1],
+                    self.impl_item,
+                    self.trait_item,
+                ],
+            )
+        {
+            facts.bindings.push(binding(
+                name,
+                scope,
+                byte_range(scope)?.start,
+                StaticBindingKind::RustTypeParameter,
+            )?);
+        }
+        if let Some(bounds) = element.child_by_field_id(self.bounds) {
+            let mut cursor = bounds.walk();
+            for bound in bounds.named_children(&mut cursor) {
+                if self.non_method_bounds.contains(&bound.kind_id()) || bound.is_extra() {
+                    continue;
+                }
+                let bound = self.named_type(bound).unwrap_or(bound);
+                facts
+                    .declared_types
+                    .push((byte_range(name)?, byte_range(bound)?));
+            }
         }
         Ok(())
     }

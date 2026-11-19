@@ -18,6 +18,7 @@ pub(super) struct Namespaces<'source> {
     methods: BTreeMap<Vec<String>, Vec<Method<'source>>>,
     members: BTreeMap<Vec<String>, Option<Target<'source>>>,
     field_types: BTreeMap<Vec<String>, Target<'source>>,
+    bounds: BTreeMap<(&'source str, ByteRange), Vec<ByteRange>>,
     conditional_modules: BTreeSet<Vec<String>>,
     modules: BTreeMap<Vec<String>, bool>,
     crate_roots: BTreeMap<String, Option<&'source str>>,
@@ -106,7 +107,37 @@ impl<'source> Namespaces<'source> {
         namespaces.index_members(files, work)?;
         namespaces.index_methods(files, work)?;
         namespaces.index_field_types(files, work)?;
+        namespaces.index_bounds(files, work)?;
         Some(namespaces)
+    }
+
+    fn index_bounds(
+        &mut self,
+        files: &BTreeMap<&'source str, File<'source>>,
+        work: &mut Work,
+    ) -> Option<()> {
+        for (&path, file) in files
+            .iter()
+            .filter(|(_, file)| file.document.facts.language().name == "rust")
+        {
+            for &(name, bound) in file.facts.declared_types() {
+                if !work.charge() {
+                    return None;
+                }
+                let Binding::Found(parameter) =
+                    file.binding(file.text(name)?, name.start, is_type_binding, work)
+                else {
+                    continue;
+                };
+                if parameter.kind == StaticBindingKind::RustTypeParameter {
+                    self.bounds
+                        .entry((path, parameter.name))
+                        .or_default()
+                        .push(bound);
+                }
+            }
+        }
+        Some(())
     }
 
     fn index_members(
@@ -290,8 +321,7 @@ impl<'source> Namespaces<'source> {
             StaticCallee::Direct => self.direct_call(file, call, work),
             StaticCallee::Qualified => self.qualified_call(file, call, work),
             StaticCallee::Member { receiver, member } => {
-                let owner = self.receiver_target(file, receiver, work)?;
-                self.inherent_method(file, call.range.start, owner, file.text(member)?, work)
+                self.receiver_method(file, receiver, file.text(member)?, work)
             }
             StaticCallee::Unsupported | StaticCallee::Constructor => None,
         }
@@ -387,6 +417,11 @@ impl<'source> Namespaces<'source> {
         member: &str,
         work: &mut Work,
     ) -> Option<Target<'source>> {
+        if owner.symbol.kind == "trait" {
+            let mut path = owner.admitted_path()?;
+            path.push(member.to_owned());
+            return self.members.get(&path).copied().flatten()?.callable();
+        }
         if !matches!(owner.symbol.kind, "struct" | "enum" | "union_item") {
             return None;
         }
@@ -758,7 +793,10 @@ fn path_segments<'text>(source: &'text str, work: &mut Work) -> Option<Vec<&'tex
 
 fn is_type_binding(kind: StaticBindingKind) -> bool {
     // Value bindings do not shadow paths in Rust's type namespace.
-    matches!(kind, StaticBindingKind::RustUse { .. })
+    matches!(
+        kind,
+        StaticBindingKind::RustUse { .. } | StaticBindingKind::RustTypeParameter
+    )
 }
 
 fn is_value_binding(kind: StaticBindingKind) -> bool {

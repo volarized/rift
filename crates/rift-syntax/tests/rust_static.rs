@@ -186,3 +186,52 @@ fn test_rust_grouped_imports_refuse_before_copying_past_the_bound() {
         .expect_err("copied paths exceed bound");
     assert_eq!(error.slug().as_str(), "rift.syntax.facts_count_exceeded");
 }
+
+#[test]
+fn test_rust_trait_default_captures_its_receiver_owner() {
+    let path = ProjectPath::new("src/lib.rs").expect("path");
+    let source =
+        "trait Count { fn remaining(&self) -> usize; fn get(&self) -> usize { self.remaining() } }";
+    let document = RustSyntaxProvider::default()
+        .analyze(
+            SyntaxSource {
+                path: &path,
+                text: source,
+            },
+            SyntaxLimits::default(),
+        )
+        .expect("syntax");
+    let facts = document.facts().static_facts().expect("static facts");
+    assert!(facts.bindings().iter().any(|binding| {
+        matches!(binding.kind, rift_syntax::StaticBindingKind::RustReceiver { type_path } if &source[usize::try_from(type_path.start).expect("offset")..usize::try_from(type_path.end).expect("offset")] == "Count")
+    }));
+}
+
+#[test]
+fn test_rust_inline_and_where_bounds_retain_authored_paths() {
+    let path = ProjectPath::new("src/lib.rs").expect("path");
+    let source =
+        "fn inline<T: Count>(item: &T) {} fn bounded<T>(item: &T) where T: crate::Count {}";
+    let document = RustSyntaxProvider::default()
+        .analyze(
+            SyntaxSource {
+                path: &path,
+                text: source,
+            },
+            SyntaxLimits::default(),
+        )
+        .expect("syntax");
+    let facts = document.facts().static_facts().expect("static facts");
+    let bounds = facts
+        .declared_types()
+        .iter()
+        .map(|&(name, bound)| {
+            let text = |range: rift_syntax::ByteRange| {
+                &source[usize::try_from(range.start).expect("offset")
+                    ..usize::try_from(range.end).expect("offset")]
+            };
+            (text(name), text(bound))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(bounds, [("T", "Count"), ("T", "crate::Count")]);
+}
