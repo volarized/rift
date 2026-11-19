@@ -54,7 +54,12 @@ struct DefinitionSites {
 impl DefinitionSites {
     fn new(calls: &GraphCalls, authored: Option<&AuthoredSites>) -> Self {
         let mut units = BTreeMap::<_, BTreeMap<_, Vec<_>>>::new();
-        for (_, ranges) in &calls.local {
+        for ranges in calls
+            .local
+            .iter()
+            .map(|(_, ranges)| ranges)
+            .chain(calls.packages.iter().map(|(_, ranges)| ranges))
+        {
             for source in ranges {
                 let key = (source.unit.0.clone(), source.range.start, source.range.end);
                 let Some(at) = authored.and_then(|authored| authored.get(&key)) else {

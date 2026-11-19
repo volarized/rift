@@ -578,7 +578,7 @@ impl EngineInventoryAnswer {
             .collect();
         let definitions = resolve_definitions(
             reads,
-            &self.workspace_root,
+            (roots, &self.workspace_root),
             self.encoding,
             self.definition_callers,
             self.definitions,
@@ -844,6 +844,7 @@ fn resolve_heritage(
 
 #[derive(Clone, Debug)]
 struct InventoryCallSite {
+    name: String,
     caller: SymbolId,
     source: rift_protocol::read::SourceUnitSpan,
     utf8: Position,
@@ -853,6 +854,7 @@ struct InventoryCallSite {
 
 #[derive(Debug)]
 struct InventoryDefinition {
+    name: String,
     at: u64,
     caller: SymbolId,
     source: rift_protocol::read::SourceUnitSpan,
@@ -889,7 +891,18 @@ fn inventory_call_sites(
             .next_back()
             .map(|(offset, _)| start + offset)
             .ok_or_else(graph_call_coverage)?;
+        let name = match call.callee {
+            rift_syntax::StaticCallee::Member { member, .. } => file
+                .source()
+                .get(
+                    usize::try_from(member.start).map_err(|_| graph_call_coverage())?
+                        ..usize::try_from(member.end).map_err(|_| graph_call_coverage())?,
+                )
+                .ok_or_else(graph_call_coverage)?,
+            _ => text.rsplit("::").next().unwrap_or(text),
+        };
         sites.push(InventoryCallSite {
+            name: name.to_owned(),
             at: offset as u64,
             caller,
             source: rift_protocol::read::SourceUnitSpan {
@@ -937,6 +950,7 @@ async fn read_definitions(
         for (site, locations) in chunk.iter().zip(answers) {
             report.charge(locations.len().saturating_add(1))?;
             report.definitions.push(InventoryDefinition {
+                name: site.name.clone(),
                 at: site.at,
                 caller: site.caller.clone(),
                 source: site.source.clone(),
@@ -949,16 +963,12 @@ async fn read_definitions(
 
 fn resolve_definitions(
     reads: &ReadService,
-    workspace_root: &std::path::Path,
+    (packages, workspace_root): (&CalleeRoots, &std::path::Path),
     encoding: PositionEncoding,
     callers: BTreeSet<SymbolId>,
     definitions: Vec<InventoryDefinition>,
     source_complete: bool,
 ) -> Result<Vec<(SymbolId, GraphCalls)>, RiftError> {
-    let roots = [
-        rift_lsp::TreeRoot::new(workspace_root)?,
-        rift_lsp::TreeRoot::new(reads.index().root())?,
-    ];
     let mut calls: BTreeMap<_, _> = callers
         .into_iter()
         .map(|caller| {
@@ -972,24 +982,39 @@ fn resolve_definitions(
         })
         .collect();
     for definition in definitions {
-        let answer = calls.entry(definition.caller).or_default();
+        let answer = calls.entry(definition.caller.clone()).or_default();
         if definition.locations.is_empty() {
             answer.complete = false;
         }
+        let caller = CoreSymbolId::new(definition.caller.as_str())?;
         for location in definition.locations {
-            let path = roots[0]
-                .project_path(&location.uri)
-                .or_else(|_| roots[1].project_path(&location.uri));
-            let target = match path {
-                Ok(path) => {
-                    super::project_definition(reads, &path, (location.range, encoding), false)?
+            let file = super::callee_file(
+                packages,
+                &[workspace_root, reads.index().root()],
+                &caller,
+                super::NamedCallee {
+                    uri: &location.uri,
+                    name: &definition.name,
+                    position: location.range.start,
+                    encoding,
+                },
+            )?;
+            match file {
+                super::CalleeFile::Project(path) => {
+                    if let Some(target) =
+                        super::project_definition(reads, &path, (location.range, encoding), false)?
+                    {
+                        answer.local.push((target, vec![definition.source.clone()]));
+                    } else {
+                        answer.complete = false;
+                    }
                 }
-                Err(_) => None,
-            };
-            if let Some(target) = target {
-                answer.local.push((target, vec![definition.source.clone()]));
-            } else {
-                answer.complete = false;
+                super::CalleeFile::Package(target) => {
+                    answer
+                        .packages
+                        .push((target, vec![definition.source.clone()]));
+                }
+                super::CalleeFile::Unaddressed => answer.complete = false,
             }
         }
     }
@@ -1067,10 +1092,11 @@ mod tests {
         let uri = rift_lsp::TreeRoot::new(directory.path())?.document_uri(&path)?;
         let calls = resolve_definitions(
             &reads,
-            directory.path(),
+            (&CalleeRoots::default(), directory.path()),
             PositionEncoding::Utf8,
             BTreeSet::from([caller.clone()]),
             vec![InventoryDefinition {
+                name: sites[0].name.clone(),
                 at: sites[0].at,
                 caller: caller.clone(),
                 source: sites[0].source.clone(),
@@ -1088,6 +1114,96 @@ mod tests {
             answer.local,
             vec![(local.clone(), vec![sites[0].source.clone()])]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn call_definitions_keep_admitted_package_targets_complete()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let installed = tempfile::tempdir()?;
+        std::fs::write(
+            directory.path().join("Cargo.toml"),
+            "[package]\nname = 'fixture'\nversion = '0.1.0'\n[lib]\npath = 'lib.rs'\n",
+        )?;
+        std::fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn caller() { alias(); }\n",
+        )?;
+        let reads = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let path = ProjectPath::new("lib.rs")?;
+        let file = reads.index().file(&path).ok_or("file")?;
+        let (seeds, _) = reads.local_search_view_input(true)?.inventory_seeds()?;
+        let caller = seeds
+            .into_iter()
+            .find(|seed| seed.as_str().ends_with("/caller"))
+            .ok_or("caller")?;
+        let sites = inventory_call_sites(&reads, file, &BTreeSet::from([caller.clone()]))?;
+        let package = rift_core::PackageIdentity {
+            manager: "cargo".to_owned(),
+            registry: "crates.io".to_owned(),
+            name: "dependency".to_owned(),
+            version: "1.0.0".to_owned(),
+        };
+        let root = rift_lsp::TreeRoot::new(installed.path())?;
+        let roots = CalleeRoots::from_packages(vec![rift_lsp::uri::PackageRoot::new(
+            root.clone(),
+            package,
+        )]);
+        let location = Location {
+            uri: root.document_uri(&ProjectPath::new("src/lib.rs")?)?,
+            range: lsp_types::Range::new(Position::new(2, 7), Position::new(2, 13)),
+        };
+        let calls = resolve_definitions(
+            &reads,
+            (&roots, directory.path()),
+            PositionEncoding::Utf8,
+            BTreeSet::from([caller.clone()]),
+            vec![InventoryDefinition {
+                name: sites[0].name.clone(),
+                at: sites[0].at,
+                caller,
+                source: sites[0].source.clone(),
+                locations: vec![location.clone()],
+            }],
+            true,
+        )?;
+        let [(_, answer)] = calls.as_slice() else {
+            panic!("one caller")
+        };
+        assert!(answer.complete);
+        assert!(answer.local.is_empty());
+        let [(target, ranges)] = answer.packages.as_slice() else {
+            panic!("one admitted target")
+        };
+        assert_eq!(target.position(), location.range.start);
+        assert_eq!(target.path().as_str(), "src/lib.rs");
+        assert_eq!(ranges, &[sites[0].source.clone()]);
+        let seed = calls[0].0.clone();
+        let merged = calls::merge_calls(
+            vec![(
+                seed.clone(),
+                GraphCalls {
+                    local: vec![(seed.clone(), vec![sites[0].source.clone()])],
+                    complete: true,
+                    ..GraphCalls::default()
+                },
+            )],
+            calls,
+            vec![(seed, sites[0].source.clone(), sites[0].at)],
+        );
+        assert!(
+            merged[0].1.local.is_empty(),
+            "the resolved dependency replaces a conflicting local target"
+        );
+        assert_eq!(merged[0].1.packages.len(), 1);
+        assert!(merged[0].1.complete);
         Ok(())
     }
 
