@@ -1024,6 +1024,8 @@ pub enum CallDestination {
 pub enum CallProvider {
     /// Configured language engine.
     Engine,
+    /// A configured engine's incoming references at the authored callee.
+    EngineReferences,
     /// Language-specific extractor.
     Extractor,
 }
@@ -1033,6 +1035,8 @@ pub enum CallProvider {
 pub struct CallCorroboration {
     /// Invocation span supplied by static resolution.
     pub authored: SourceUnitSpan,
+    /// Authored callee selection, excluding invocation arguments.
+    pub callee: TextRange,
     /// Original engine span.
     pub observed: SourceUnitSpan,
     /// Target selected by static resolution.
@@ -1104,10 +1108,18 @@ pub async fn graph_calls(
         combined.edge_warnings.extend(answer.edge_warnings);
         combined.corroboration.extend(answer.corroboration);
     }
-    if observed {
-        Ok(static_calls.combine(combined))
+    let answer = if observed {
+        static_calls.combine(combined)
     } else {
-        static_calls.answer().ok_or_else(unavailable)
+        static_calls.answer().ok_or_else(unavailable)?
+    };
+    if direction == TraversalDirection::Outgoing {
+        Ok(Box::pin(call_evidence::confirm_reference_sites(
+            reads, engines, answer, deadline,
+        ))
+        .await)
+    } else {
+        Ok(answer)
     }
 }
 
@@ -3545,6 +3557,86 @@ done
             answer.occurrences[0].enclosing,
             Some(symbol(&reads, "caller"))
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn graph_calls_restore_only_independently_confirmed_callee_sites() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn leaf() {}\npub fn other() {}\npub fn root() { leaf(); }\n",
+        )?;
+        let reads = reads(directory.path())?;
+        let uri = location(directory.path(), "lib.rs", 2, 7, 11).uri;
+        let range = json!({"start":{"line":2,"character":7},"end":{"line":2,"character":11}});
+        let prepared =
+            json!([{"name":"root","kind":12,"uri":uri,"range":range,"selectionRange":range}]);
+        let mut outgoing = item(location(directory.path(), "lib.rs", 1, 7, 12), "other");
+        outgoing
+            .from_ranges
+            .push(Range::new(Position::new(2, 16), Position::new(2, 20)));
+        let response = |value: &serde_json::Value| -> Result<String, Box<dyn std::error::Error>> {
+            let payload = serde_json::to_string(value)?.replace('"', "\\\"");
+            Ok(format!(
+                "frame \"{{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":$id,\\\"result\\\":{payload}}}\""
+            ))
+        };
+        for confirmed in [false, true] {
+            let references = if confirmed {
+                serde_json::to_value([location(directory.path(), "lib.rs", 2, 16, 20)])?
+            } else {
+                json!([])
+            };
+            let reference_step = format!(
+                "    *'\"method\":\"textDocument/references\"'*)\n      {} ;;\n    *'\"method\":\"exit\"'*)",
+                response(&references)?
+            );
+            let text = METHOD_ENGINE
+                .replace(
+                    "CAPABILITIES",
+                    r#"{\"referencesProvider\":true,\"callHierarchyProvider\":true}"#,
+                )
+                .replace("PREPARE", &response(&prepared)?)
+                .replace("OUTGOING", &response(&serde_json::to_value([&outgoing])?)?)
+                .replace("    *'\"method\":\"exit\"'*)", &reference_step);
+            let engine = tempfile::tempdir()?;
+            let script = engine.path().join("engine.sh");
+            fs::write(&script, text)?;
+            let configuration = serde_json::from_value(json!({
+                "command":["sh",script.display().to_string()], "settle_delay":"1ms",
+                "retry":{"attempts":2,"delay":"1ms","delay_limit":"1ms"}
+            }))?;
+            let engines = pool(directory.path(), "rust", configuration);
+            let result = Box::pin(super::graph_calls(
+                &reads,
+                &engines,
+                &CalleeRoots::default(),
+                &symbol(&reads, "root"),
+                rift_protocol::read::TraversalDirection::Outgoing,
+                far(),
+            ))
+            .await;
+            engines.shutdown().await;
+            let graph = result?;
+            assert!(
+                !graph.complete,
+                "the original disagreement remains incomplete"
+            );
+            assert_eq!(
+                graph
+                    .local
+                    .iter()
+                    .any(|(target, _)| target == &symbol(&reads, "leaf")),
+                confirmed
+            );
+            assert!(graph.corroboration.iter().any(|record| !record.agrees));
+            assert_eq!(
+                graph.corroboration.iter().any(|record| record.agrees),
+                confirmed
+            );
+        }
         Ok(())
     }
 
