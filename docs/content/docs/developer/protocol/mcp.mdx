@@ -322,6 +322,9 @@ Remote acquisition uses bounded batches and holds the selected publication for t
 ### Captured answers and pages
 
 A successful answer names the `revision` it read. The caller sends that `revision` for later pages.
+An answer that combines extra projects names a tree revision over the revisions those projects
+read. A later page sent with it reads the retained answer. Once any of those projects serves
+another revision, the server refuses it.
 `page` starts at 1 and defaults to 1. `max_results` defaults to 10 and accepts 1 to 1000.
 
 `pagination` carries `page`, `pages`, `max_results`, and `total`. A page past the last returns
@@ -857,15 +860,18 @@ no entries. It refuses a read whose text exceeds the byte limit, with typed `Err
 The answer carries:
 
 - `configuration_revision` - an eight-character digest of the accepted `rift.toml` bytes
+- `revision` - the indexed revision the page read
 - `languages` - effective identities in order, with enabled state, include and exclude patterns,
   syntax availability, and selected LSP process state
 - `source` - captured project paths, content digests, and matched language identities
-- `pagination` - the zero-based page and total page count
+- `pagination` - `page`, `pages`, `max_results`, and `total` of the source catalog
 
-The bare URI selects page zero. `rift://workspace?page=1` selects another page. Each page
-holds at most 50 source units and repeats the language summaries. When another page exists,
-the compact response ends with its URI. A page past the end returns an empty `source` list
-with the actual page count.
+The bare URI selects page 1. `rift://workspace?page=2&max_results=50&revision=<revision>`
+selects a later page of the catalog that `revision` names. `max_results` defaults to 10 and
+accepts 1 through 50, and each page repeats the language summaries. The server refuses a
+revision it no longer serves. When another page exists, the compact response ends with its URI,
+which carries the revision. A page past the end returns an empty `source` list with the actual
+page count.
 
 The compact text has these parts:
 
@@ -925,9 +931,12 @@ source:
     }
   ],
   "pagination": {
+    "max_results": 10,
     "page": 1,
-    "pages": 1
+    "pages": 1,
+    "total": 1
   },
+  "revision": "rift://revision/tree/9f0c4e2a7b1d3c5e8f6a0b2d4c6e8a1f3b5d7c9e0a2b4d6f8e1c3a5b7d9f0e2c",
   "source": [
     {
       "digest": "8a4d20bc",
@@ -943,7 +952,7 @@ source:
 </ExampleTabs>
 
 The source page describes one published catalog. The server **MUST** return its configuration
-revision, source digests, and pagination from that publication. During preparation, the server
+revision, revision, source digests, and pagination from that publication. During preparation, the server
 logs [`local_index_preparing`](#reads) and the page lists prepared files.
 After preparation, the catalog also includes visible files without enabled syntax.
 

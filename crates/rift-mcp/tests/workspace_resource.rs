@@ -126,6 +126,66 @@ async fn a_workspace_page_past_the_end_answers_an_empty_catalog() -> TestResult 
     Ok(())
 }
 
+/// #743: a page names the revision it read; a later page read with that revision pages
+/// the same catalog, and a revision the server does not serve is refused.
+#[tokio::test]
+async fn a_workspace_page_names_the_revision_later_pages_pin() -> TestResult {
+    let (_directory, client, server_task) = served_workspace(
+        &[
+            ("lib.rs", "pub fn beacon() {}\n"),
+            ("other.rs", "pub fn other() {}\n"),
+        ],
+        None,
+    )
+    .await?;
+
+    let first = resource_body(&client, "rift://workspace?max_results=1").await?;
+    let revision = first["revision"]
+        .as_str()
+        .ok_or("a page names its revision")?;
+    assert!(revision.starts_with("rift://revision/"), "{first:#}");
+    let pages = first["pagination"]["pages"].as_u64().ok_or("page count")?;
+    assert!(pages >= 2, "{first:#}");
+    let listed = client
+        .read_resource(ReadResourceRequestParams::new(
+            "rift://workspace?max_results=1".to_owned(),
+        ))
+        .await?;
+    let text = resource_text(&listed, "rift://workspace?max_results=1")?;
+    assert!(
+        text.contains(&format!("&revision={revision}")),
+        "the next page link pins the revision: {text}"
+    );
+
+    let second = resource_body(
+        &client,
+        &format!("rift://workspace?page=2&max_results=1&revision={revision}"),
+    )
+    .await?;
+    assert_eq!(second["revision"], first["revision"], "{second:#}");
+    assert_eq!(second["pagination"]["page"], Value::from(2));
+    assert_ne!(second["source"], first["source"], "{second:#}");
+
+    let unserved = format!("rift://revision/tree/{}", "0".repeat(64));
+    let error = client
+        .read_resource(ReadResourceRequestParams::new(format!(
+            "rift://workspace?page=2&max_results=1&revision={unserved}"
+        )))
+        .await
+        .expect_err("a revision the server does not serve is refused");
+    let rmcp::ServiceError::McpError(error) = error else {
+        return Err(format!("the refusal must be an MCP error: {error}").into());
+    };
+    assert!(
+        error.message.contains(&unserved),
+        "the refusal names the revision: {error:?}"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn workspace_pages_partition_the_complete_visible_catalog() -> TestResult {
     let page_size = rift_protocol::workspace::WORKSPACE_SOURCE_UNITS_MAX;

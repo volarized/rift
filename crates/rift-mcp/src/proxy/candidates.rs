@@ -371,6 +371,13 @@ impl RiftProxy {
             captured.results_max,
         )?;
         merged.view = Some(view);
+        merged.revision = super::query::combined_revision(
+            captured
+                .pools
+                .iter()
+                .filter(|pool| pool.backend != "global")
+                .map(|pool| pool.revision.as_ref()),
+        )?;
         Ok(Some(crate::output::Json(merged).retrieval_result()))
     }
     fn candidate_context_matches(
@@ -504,6 +511,7 @@ impl RiftProxy {
                 owner: Some(response.owner),
                 root: root.to_owned(),
                 view: response.view,
+                revision: response.revision,
                 inputs: response.inputs,
             });
             super::encode_bounded(&pools, CANDIDATE_BYTES_MAX)
@@ -758,6 +766,7 @@ mod tests {
                 id: CapturedViewId::parse(key).expect("captured key"),
                 expires_at: expiry.to_owned(),
             },
+            revision: None,
             inputs: serde_json::from_value(json!({"precise":[],"broad":[],"warnings":[]}))
                 .expect("empty captured inputs"),
         }
@@ -837,6 +846,7 @@ mod tests {
             root: pool.root.clone(),
             owner: SymbolOwner::Local,
             view: pool.view.clone(),
+            revision: None,
             inputs,
             ranking: captured.ranking,
             results_max: captured.results_max,

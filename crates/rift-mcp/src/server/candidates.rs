@@ -35,6 +35,9 @@ pub(crate) struct SearchCandidateResponse {
     pub(crate) root: String,
     pub(crate) owner: rift_protocol::identity::SymbolOwner,
     pub(crate) view: CapturedView,
+    /// The revision the captured candidates read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) revision: Option<rift_protocol::revision::Revision>,
     pub(crate) inputs: SearchCandidateInputs,
     pub(crate) ranking: rift_protocol::configuration::RankingConfiguration,
     pub(crate) results_max: usize,
@@ -206,6 +209,7 @@ impl RiftMcp {
             root: captured.root,
             owner: Some(captured.owner),
             view: captured.view.clone(),
+            revision: captured.revision,
             inputs: captured.inputs,
         }];
         pools.extend(captured.global);
@@ -381,6 +385,11 @@ impl RiftMcp {
             .ok_or_else(|| unavailable("project root is not UTF-8"))?
             .to_owned();
         let owner = material.owner().clone();
+        let revision = resolved
+            .published
+            .reads
+            .served_revision()
+            .map_err(read_failure)?;
         let mut response = None;
         views
             .capture_with(material, |view| {
@@ -388,6 +397,7 @@ impl RiftMcp {
                     root,
                     owner,
                     view: view.clone(),
+                    revision: Some(revision.clone()),
                     inputs,
                     ranking: configuration.ranking,
                     results_max,
