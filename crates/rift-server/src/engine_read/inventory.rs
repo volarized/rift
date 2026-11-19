@@ -590,10 +590,10 @@ impl EngineInventoryAnswer {
         )?;
         let calls = calls::merge_calls(calls, definitions, sites);
         let reference_definitions = std::sync::Arc::new(self.reference_definitions);
+        let mut mapping = super::ReferenceMapping::new(reads, &self.workspace_root, self.encoding)?;
         let mut references = Vec::new();
         for (seed, locations) in self.references {
-            let mut engine = super::map_inventory_references(
-                reads,
+            let mut engine = super::map_inventory_references_with_mapping(
                 &seed,
                 ReferenceReport {
                     locations: Ok(locations),
@@ -601,8 +601,8 @@ impl EngineInventoryAnswer {
                     encoding: self.encoding,
                     full: true,
                 },
-                &self.workspace_root,
                 self.selection.enclosing,
+                &mut mapping,
             )?;
             if self.selection.occurrences.is_none() {
                 let mut callers = BTreeSet::new();

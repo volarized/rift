@@ -1885,6 +1885,20 @@ fn map_inventory_references(
     workspace_root: &std::path::Path,
     require_caller: bool,
 ) -> Result<GraphReferences, RiftError> {
+    let mut mapping = ReferenceMapping::new(reads, workspace_root, report.encoding)?;
+    map_inventory_references_with_mapping(target, report, require_caller, &mut mapping)
+}
+
+fn map_inventory_references_with_mapping(
+    target: &SymbolId,
+    report: ReferenceReport,
+    require_caller: bool,
+    mapping: &mut ReferenceMapping<'_>,
+) -> Result<GraphReferences, RiftError> {
+    let reads = mapping.reads;
+    if report.encoding != mapping.encoding {
+        return Err(graph_reference_coverage());
+    }
     let identity = CoreSymbolId::new(target.as_str())?;
     let excluded: BTreeSet<_> = edge_declarations(reads, &identity)?
         .into_iter()
@@ -1895,17 +1909,12 @@ fn map_inventory_references(
                 .map(|range| (declaration.file.path().clone(), range.start, range.end))
         })
         .collect();
-    let roots = [
-        TreeRoot::new(workspace_root)?,
-        TreeRoot::new(reads.index().root())?,
-    ];
     let mut dropped = 0_u64;
-    let mut positions = BTreeMap::new();
     let mut found = BTreeMap::new();
     for location in report.locations.map_err(|_| graph_reference_coverage())? {
-        let path = roots[0]
+        let path = mapping.roots[0]
             .project_path(&location.uri)
-            .or_else(|_| roots[1].project_path(&location.uri));
+            .or_else(|_| mapping.roots[1].project_path(&location.uri));
         let path = match path {
             Ok(path) => path,
             Err(error) if error.slug() == errors::lsp::uri_outside_root::SLUG => continue,
@@ -1914,11 +1923,7 @@ fn map_inventory_references(
         let Some(file) = reads.index().file(&path) else {
             continue;
         };
-        let positions = positions
-            .entry(file.path())
-            .or_insert_with(|| LineIndex::new(file.source()));
-        let start = positions.byte_offset(report.encoding, location.range.start)?;
-        let end = positions.byte_offset(report.encoding, location.range.end)?;
+        let (start, end) = mapping.range(file, location.range)?;
         if file.source().get(start..end).is_none() {
             return Err(graph_reference_coverage());
         }
@@ -1926,13 +1931,7 @@ fn map_inventory_references(
         if excluded.contains(&key) || found.contains_key(&key) {
             continue;
         }
-        let resolved = reference_definition_targets(
-            reads,
-            &roots,
-            &report.definitions,
-            &location,
-            report.encoding,
-        )?;
+        let resolved = mapping.targets(&report.definitions, &location)?;
         if resolved.is_empty() {
             dropped += 1;
         }
@@ -1978,30 +1977,106 @@ fn map_inventory_references(
     })
 }
 
-fn reference_definition_targets(
-    reads: &ReadService,
-    roots: &[TreeRoot; 2],
-    definitions: &ReferenceDefinitions,
-    location: &Location,
+type DefinitionLocationKey = (String, u32, u32, u32, u32);
+
+/// Reuses only positions and definitions from one captured inventory.
+struct ReferenceMapping<'a> {
+    reads: &'a ReadService,
+    roots: [TreeRoot; 2],
     encoding: PositionEncoding,
-) -> Result<BTreeSet<SymbolId>, RiftError> {
-    let mut resolved = BTreeSet::new();
-    for definition in definitions
-        .get(&reference_key(location))
-        .into_iter()
-        .flatten()
-    {
-        let path = roots[0]
-            .project_path(&definition.uri)
-            .or_else(|_| roots[1].project_path(&definition.uri));
-        if let Ok(path) = path
-            && let Some(symbol) =
-                project_definition(reads, &path, (definition.range, encoding), false)?
-        {
-            resolved.insert(symbol);
-        }
+    positions: BTreeMap<ProjectPath, LineIndex<'a>>,
+    definitions: BTreeMap<DefinitionLocationKey, Option<SymbolId>>,
+    #[cfg(test)]
+    line_index_builds: usize,
+    #[cfg(test)]
+    definition_resolutions: usize,
+}
+
+impl<'a> ReferenceMapping<'a> {
+    fn new(
+        reads: &'a ReadService,
+        workspace_root: &std::path::Path,
+        encoding: PositionEncoding,
+    ) -> Result<Self, RiftError> {
+        Ok(Self {
+            reads,
+            roots: [
+                TreeRoot::new(workspace_root)?,
+                TreeRoot::new(reads.index().root())?,
+            ],
+            encoding,
+            positions: BTreeMap::new(),
+            definitions: BTreeMap::new(),
+            #[cfg(test)]
+            line_index_builds: 0,
+            #[cfg(test)]
+            definition_resolutions: 0,
+        })
     }
-    Ok(resolved)
+
+    fn range(&mut self, file: &'a IndexedFile, range: Range) -> Result<(usize, usize), RiftError> {
+        let positions = match self.positions.entry(file.path().clone()) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                #[cfg(test)]
+                {
+                    self.line_index_builds += 1;
+                }
+                entry.insert(LineIndex::new(file.source()))
+            }
+        };
+        Ok((
+            positions.byte_offset(self.encoding, range.start)?,
+            positions.byte_offset(self.encoding, range.end)?,
+        ))
+    }
+
+    fn targets(
+        &mut self,
+        definitions: &ReferenceDefinitions,
+        location: &Location,
+    ) -> Result<BTreeSet<SymbolId>, RiftError> {
+        let mut resolved = BTreeSet::new();
+        for definition in definitions
+            .get(&reference_key(location))
+            .into_iter()
+            .flatten()
+        {
+            if let Some(symbol) = self.definition(definition)? {
+                resolved.insert(symbol);
+            }
+        }
+        Ok(resolved)
+    }
+
+    fn definition(&mut self, location: &Location) -> Result<Option<SymbolId>, RiftError> {
+        let key = (
+            location.uri.as_str().to_owned(),
+            location.range.start.line,
+            location.range.start.character,
+            location.range.end.line,
+            location.range.end.character,
+        );
+        if let Some(symbol) = self.definitions.get(&key) {
+            return Ok(symbol.clone());
+        }
+        let path = self.roots[0]
+            .project_path(&location.uri)
+            .or_else(|_| self.roots[1].project_path(&location.uri));
+        let mut symbol = None;
+        if let Ok(path) = path
+            && let Some(file) = self.reads.index().file(&path)
+        {
+            let (start, end) = self.range(file, location.range)?;
+            symbol = project_definition_at(self.reads, file, (start as u64, end as u64), false)?;
+        }
+        #[cfg(test)]
+        {
+            self.definition_resolutions += 1;
+        }
+        self.definitions.insert(key, symbol.clone());
+        Ok(symbol)
+    }
 }
 
 /// Reads outgoing reference edges by resolving the bounded local target inventory.
@@ -2284,6 +2359,15 @@ fn project_definition(
     let lines = LineIndex::new(file.source());
     let start = lines.byte_offset(encoding, range.start)? as u64;
     let end = lines.byte_offset(encoding, range.end)? as u64;
+    project_definition_at(reads, file, (start, end), require_type)
+}
+
+fn project_definition_at(
+    reads: &ReadService,
+    file: &IndexedFile,
+    (start, end): (u64, u64),
+    require_type: bool,
+) -> Result<Option<SymbolId>, RiftError> {
     let Some(symbol) = file.enclosing_symbol(start, end) else {
         return Ok(None);
     };
@@ -2977,6 +3061,8 @@ mod tests {
             ),
         ]);
         // A server can return the same structural-property occurrences for both seeds.
+        let mut mapping =
+            super::ReferenceMapping::new(&reads, directory.path(), PositionEncoding::Utf8)?;
         for (target, start) in [(first, 55), (second, 64)] {
             let report = ReferenceReport {
                 definitions: definitions.clone().into(),
@@ -2985,13 +3071,21 @@ mod tests {
                 full: true,
             };
             let answer =
-                super::map_inventory_references(&reads, &target, report, directory.path(), true)?;
+                super::map_inventory_references_with_mapping(&target, report, true, &mut mapping)?;
             assert_eq!(answer.occurrences.len(), 1, "{answer:?}");
             assert_eq!(answer.occurrences[0].target, target);
             assert_eq!(answer.occurrences[0].source.range.start, start);
             assert!(!answer.complete);
             assert_eq!(answer.edge_warnings.len(), 1);
         }
+        assert_eq!(
+            mapping.line_index_builds, 1,
+            "one captured file is indexed once across seeds"
+        );
+        assert_eq!(
+            mapping.definition_resolutions, 2,
+            "each returned definition is resolved once across seeds"
+        );
         Ok(())
     }
 
