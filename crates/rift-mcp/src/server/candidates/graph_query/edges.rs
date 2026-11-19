@@ -36,6 +36,7 @@ pub(super) struct AcquiredAdjacency {
     pages: Vec<(EdgeSearchPage, SymbolRelation)>,
     local: Vec<QueryOccurrence>,
     local_edges: Vec<(SymbolId, SymbolRelation, SymbolId)>,
+    edge_facts: Vec<rift_protocol::read::Edge>,
     named_package_symbols: BTreeMap<SymbolId, (Symbol, RevisionIri)>,
     installed: BTreeMap<SymbolId, Arc<InstalledTarget>>,
     revisions: BTreeMap<SymbolOwner, RevisionIri>,
@@ -107,6 +108,7 @@ impl AcquiredAdjacency {
                     kind: edge.kind(),
                 });
             }
+            self.edge_facts.push(edge.to_protocol());
         }
         Ok(())
     }
@@ -179,6 +181,9 @@ impl AcquiredAdjacency {
         occurrences: Option<OccurrenceSelection>,
     ) -> Result<(), RiftError> {
         if edges {
+            for edge in &self.edge_facts {
+                dataset.insert_edge(edge, None)?;
+            }
             for (source, relation, target) in &self.local_edges {
                 dataset.insert(GraphFact::Relation {
                     source,
@@ -316,6 +321,7 @@ impl AcquiredAdjacency {
             }
             for group in &page.groups {
                 for record in &group.edges {
+                    dataset.insert_edge(&record.edge, Some(&record.id))?;
                     dataset.insert(GraphFact::Relation {
                         source: &record.edge.from,
                         relation: *relation,
@@ -507,6 +513,7 @@ impl RiftMcp {
                 remaining = remaining
                     .checked_sub(references.occurrences.len())
                     .ok_or_else(coverage_failure)?;
+                acquired.edge_facts.extend(references.edges);
                 acquired.admit_references(&seed, references.occurrences);
             }
             if required.adjacency.calls {
@@ -525,6 +532,7 @@ impl RiftMcp {
                 if !calls.packages.is_empty() {
                     return Err(coverage_failure());
                 }
+                acquired.edge_facts.extend(calls.edges);
                 for (target, occurrences) in calls.local {
                     remaining = remaining
                         .checked_sub(1 + occurrences.len())
@@ -554,6 +562,7 @@ impl RiftMcp {
         .await?;
         acquired.incomplete |= !report.complete;
         acquired.warnings.extend(report.edge_warnings);
+        acquired.edge_facts.extend(report.edges);
         for occurrence in report.occurrences {
             if acquired.local_edges.len() == usize::try_from(RECORDS_MAX).unwrap_or(usize::MAX) {
                 return Err(coverage_failure());
@@ -606,7 +615,8 @@ impl RiftMcp {
             };
             acquired
                 .local_edges
-                .push((edge.from, relation(*kind)?, edge.to));
+                .push((edge.from.clone(), relation(*kind)?, edge.to.clone()));
+            acquired.edge_facts.push(edge);
         }
         Ok(())
     }
@@ -788,6 +798,7 @@ impl<'request> AdjacencyWalk<'request> {
                     Err(error) => return Err(error),
                 };
                 self.acquired.incomplete |= !references.complete;
+                self.acquired.edge_facts.extend(references.edges);
                 self.acquired.warnings.extend(references.edge_warnings);
                 let occurrences = references.occurrences;
                 charge_records(&mut self.remaining, occurrences.len())?;
@@ -801,6 +812,7 @@ impl<'request> AdjacencyWalk<'request> {
                 .await?;
                 self.acquired.incomplete |= !references.complete;
                 self.acquired.warnings.extend(references.edge_warnings);
+                self.acquired.edge_facts.extend(references.edges);
                 charge_records(&mut self.remaining, references.occurrences.len())?;
                 for occurrence in references.occurrences {
                     frontier.insert(occurrence.target.clone());
@@ -830,9 +842,12 @@ impl<'request> AdjacencyWalk<'request> {
                         TraversalDirection::Incoming => edge.from.clone(),
                     };
                     frontier.insert(neighbor);
-                    self.acquired
-                        .local_edges
-                        .push((edge.from, relation(kind)?, edge.to));
+                    self.acquired.local_edges.push((
+                        edge.from.clone(),
+                        relation(kind)?,
+                        edge.to.clone(),
+                    ));
+                    self.acquired.edge_facts.push(edge);
                 }
             }
             (_, kind) => self.edge_static_step(seed, kind, frontier)?,
@@ -922,6 +937,7 @@ impl<'request> AdjacencyWalk<'request> {
                 TraversalDirection::Outgoing => to.clone(),
             });
             self.acquired.local_edges.push((from, relation, to));
+            self.acquired.edge_facts.push(edge.to_protocol());
         }
         Ok(())
     }
@@ -968,6 +984,7 @@ impl<'request> AdjacencyWalk<'request> {
                     }),
             );
         }
+        self.acquired.edge_facts.extend(calls.edges);
         charge_records(&mut self.remaining, calls.local.len())?;
         for (neighbor, ranges) in calls.local {
             charge_records(&mut self.remaining, ranges.len())?;
@@ -1076,7 +1093,7 @@ impl<'request> AdjacencyWalk<'request> {
                     (*symbol, RevisionIri::parse(&revision.to_string())?),
                 );
             }
-            calls.local.push((declaration.id, occurrences));
+            calls.name_package_call(&callee, declaration.id, occurrences);
         }
         Ok(())
     }
@@ -1137,10 +1154,8 @@ impl<'request> AdjacencyWalk<'request> {
             {
                 return Err(coverage_failure());
             }
-            self.acquired
-                .installed
-                .insert(identity.clone(), Arc::new(target));
-            calls.local.push((identity, occurrences));
+            calls.name_package_call(&target.callee, identity.clone(), occurrences);
+            self.acquired.installed.insert(identity, Arc::new(target));
         }
         Ok(())
     }
@@ -1213,6 +1228,7 @@ impl<'request> AdjacencyWalk<'request> {
                 }
             }
             charge_records(&mut self.remaining, calls.local.len())?;
+            self.acquired.edge_facts.extend(calls.edges);
             for (target, occurrences) in calls.local {
                 charge_records(&mut self.remaining, occurrences.len())?;
                 let owner = SymbolIdentity::parse(target.as_str())?;

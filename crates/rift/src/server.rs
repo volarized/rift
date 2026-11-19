@@ -55,18 +55,8 @@ const SERVER_DATABASE_STOP_RESERVE: Duration = Duration::from_millis(500);
 /// OTLP shutdown.
 const SERVER_LOG_FLUSH_RESERVE: Duration = Duration::from_millis(500);
 /// Time the stop keeps for the final OTLP flush and shutdown after every stop record.
-/// A collector that accepts and never answers costs the stop this much and no more,
-/// whatever the `OTEL_METRIC_EXPORT_TIMEOUT` and `OTEL_BSP_EXPORT_TIMEOUT` variables are set to.
+/// Earlier stages leave this reserve; export can use all remaining stop time.
 const SERVER_EXPORT_STOP_RESERVE: Duration = Duration::from_millis(500);
-/// Time the stop keeps inside the OTLP reserve to send the final export result through logs.
-const SERVER_LOG_EXPORT_STOP_RESERVE: Duration = Duration::from_millis(50);
-/// Time the stop keeps inside the OTLP reserve for the trace flush before database close.
-const SERVER_TRACE_FLUSH_RESERVE: Duration = Duration::from_millis(50);
-/// Time the stop keeps inside the OTLP reserve to shut down spans and metrics after database
-/// close and before the final log flush.
-const SERVER_TRACE_METRIC_STOP_RESERVE: Duration = SERVER_EXPORT_STOP_RESERVE
-    .saturating_sub(SERVER_LOG_EXPORT_STOP_RESERVE)
-    .saturating_sub(SERVER_TRACE_FLUSH_RESERVE);
 /// Time a workspace server's stop keeps for the stages after serving and the index and
 /// vectors close: the log drain's final flush, the metrics database's close, and the OTLP
 /// export.
@@ -81,12 +71,6 @@ const _: () = assert!(
         + SERVER_LOG_FLUSH_RESERVE.as_millis()
         + SERVER_EXPORT_STOP_RESERVE.as_millis()
         < SERVER_STOP_DEADLINE.as_millis()
-        && SERVER_LOG_EXPORT_STOP_RESERVE.as_millis() > 0
-        && SERVER_TRACE_METRIC_STOP_RESERVE.as_millis() > 0
-        && SERVER_LOG_EXPORT_STOP_RESERVE.as_millis()
-            + SERVER_TRACE_METRIC_STOP_RESERVE.as_millis()
-            + SERVER_TRACE_FLUSH_RESERVE.as_millis()
-            == SERVER_EXPORT_STOP_RESERVE.as_millis()
 );
 // Each mode's reserve is a share of the stop's deadline, and a repository server, which runs
 // the export and the log drain's final flush and closes no metrics database of its own, keeps
@@ -1119,8 +1103,8 @@ async fn serve_foreground(
     let logs = database
         .close_logs(deadline - SERVER_EXPORT_STOP_RESERVE)
         .await;
-    // Export failures do not fail a stop. The phase outcomes are recorded before the log
-    // provider closes; that provider cannot export its own shutdown result.
+    // Export failures do not fail a stop. The log provider exports the earlier phase
+    // outcomes; its own shutdown result reaches stderr after the provider closes.
     let _ = stop_export(&export, deadline).await;
     retire_before_exit(guard);
     stopped.and(search).and(logs)
@@ -1223,10 +1207,12 @@ const fn log_flush_end_reserve(repository: bool) -> Duration {
     })
 }
 
-/// Sends the OTLP export's final spans and metric points and shuts it down by `deadline`,
-/// or [`SERVER_EXPORT_STOP_RESERVE`] after the stage starts when that comes first, as the
-/// `otlp export` stop stage: a collector that is down or stalled costs the stop that
-/// reserve at most, even when the stages before left more.
+/// Sends final spans and metric points and shuts down OTLP by the stop deadline.
+///
+/// Each phase shares `deadline` and takes only what the previous phase left. The trace
+/// flush runs inside the stage span; provider shutdown sends that closed span, and log
+/// shutdown sends the phase results. Earlier stages leave `SERVER_EXPORT_STOP_RESERVE`,
+/// and export can use any additional time they left.
 ///
 /// The stage records `outcome="ok"` when the export shut down inside `deadline`,
 /// `outcome="timeout"` at `warn` when the deadline passed first, as with a collector that
@@ -1237,27 +1223,43 @@ async fn stop_export(
     export: &rift_tracing::OtlpExport,
     deadline: tokio::time::Instant,
 ) -> Result<(), rift_tracing::ExportShutdownError> {
-    let bound = deadline.min(tokio::time::Instant::now() + SERVER_EXPORT_STOP_RESERVE);
-    let provider_bound = bound - SERVER_LOG_EXPORT_STOP_RESERVE;
+    stop_export_with(
+        deadline,
+        |bound| export.flush_traces(bound),
+        |bound| export.shutdown_traces_and_metrics(bound),
+        |bound| export.shutdown_logs(bound),
+    )
+    .await
+}
+
+async fn stop_export_with<Flush, Shutdown, Logs>(
+    deadline: tokio::time::Instant,
+    flush_traces: impl FnOnce(tokio::time::Instant) -> Flush,
+    shutdown_traces_and_metrics: impl FnOnce(tokio::time::Instant) -> Shutdown,
+    shutdown_logs: impl FnOnce(tokio::time::Instant) -> Logs,
+) -> Result<(), rift_tracing::ExportShutdownError>
+where
+    Flush: std::future::Future<Output = Result<(), rift_tracing::ExportShutdownError>>,
+    Shutdown: std::future::Future<Output = Result<(), rift_tracing::ExportShutdownError>>,
+    Logs: std::future::Future<Output = Result<(), rift_tracing::ExportShutdownError>>,
+{
     let flush_started = tokio::time::Instant::now();
-    let trace_flush_bound = provider_bound.min(flush_started + SERVER_TRACE_FLUSH_RESERVE);
     let mut flush = None;
-    let stage_result =
-        rift_mcp::stop_stage_within("otlp export", deadline, trace_flush_bound, async {
-            let result = export.flush_traces(trace_flush_bound).await;
-            let stage_result = match &result {
-                Ok(()) | Err(rift_tracing::ExportShutdownError::TimedOut) => Ok(()),
-                Err(failed @ rift_tracing::ExportShutdownError::Failed(_)) => {
-                    errors::mcp::http_serve_failed()
-                        .operation("otlp export")
-                        .source(io::Error::other(failed.to_string()))
-                        .fail()
-                }
-            };
-            flush = Some(result);
-            stage_result
-        })
-        .await;
+    let stage_result = rift_mcp::stop_stage("otlp export", deadline, async {
+        let result = flush_traces(deadline).await;
+        let stage_result = match &result {
+            Ok(()) | Err(rift_tracing::ExportShutdownError::TimedOut) => Ok(()),
+            Err(failed @ rift_tracing::ExportShutdownError::Failed(_)) => {
+                errors::mcp::http_serve_failed()
+                    .operation("otlp export")
+                    .source(io::Error::other(failed.to_string()))
+                    .fail()
+            }
+        };
+        flush = Some(result);
+        stage_result
+    })
+    .await;
     let flush = flush.unwrap_or_else(|| match stage_result {
         Err(error) => Err(rift_tracing::ExportShutdownError::Failed(error.to_string())),
         Ok(()) => Err(rift_tracing::ExportShutdownError::Failed(
@@ -1268,32 +1270,35 @@ async fn stop_export(
         result: flush,
         elapsed: flush_started.elapsed(),
     };
-    record_export_result("traces", &flush_report, trace_flush_bound);
+    record_export_result("traces", &flush_report, deadline);
 
     let started = tokio::time::Instant::now();
-    let traces_and_metrics = export.shutdown_traces_and_metrics(provider_bound).await;
+    let traces_and_metrics = shutdown_traces_and_metrics(deadline).await;
     let traces_and_metrics_report = ExportPhaseReport {
         result: traces_and_metrics,
         elapsed: started.elapsed(),
     };
-    record_export_result(
-        "traces and metrics",
-        &traces_and_metrics_report,
-        provider_bound,
-    );
+    record_export_result("traces and metrics", &traces_and_metrics_report, deadline);
 
-    export.shutdown_logs(bound).await
+    let started = tokio::time::Instant::now();
+    let logs = shutdown_logs(deadline).await;
+    let logs_report = ExportPhaseReport {
+        result: logs,
+        elapsed: started.elapsed(),
+    };
+    record_export_result("logs", &logs_report, deadline);
+    logs_report.result
 }
 
 fn record_export_result(
     phase: &'static str,
     report: &ExportPhaseReport,
-    bound: tokio::time::Instant,
+    deadline: tokio::time::Instant,
 ) {
     let elapsed_ms = u64::try_from(report.elapsed.as_millis()).unwrap_or(u64::MAX);
-    let remaining = bound.saturating_duration_since(tokio::time::Instant::now());
-    match &report.result {
-        Ok(()) => rift_tracing::info!(
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    match (&report.result, remaining.is_zero()) {
+        (Ok(()), false) => rift_tracing::info!(
             component = "mcp",
             operation = "server.stop",
             stage = "otlp export",
@@ -1303,17 +1308,19 @@ fn record_export_result(
             ?remaining,
             "stop stage ended"
         ),
-        Err(rift_tracing::ExportShutdownError::TimedOut) => rift_tracing::warn!(
-            component = "mcp",
-            operation = "server.stop",
-            stage = "otlp export",
-            phase,
-            outcome = "timeout",
-            elapsed_ms,
-            ?remaining,
-            "stop stage ended"
-        ),
-        Err(failed @ rift_tracing::ExportShutdownError::Failed(_)) => rift_tracing::warn!(
+        (Ok(()), true) | (Err(rift_tracing::ExportShutdownError::TimedOut), _) => {
+            rift_tracing::warn!(
+                component = "mcp",
+                operation = "server.stop",
+                stage = "otlp export",
+                phase,
+                outcome = "timeout",
+                elapsed_ms,
+                ?remaining,
+                "stop stage ended"
+            );
+        }
+        (Err(failed @ rift_tracing::ExportShutdownError::Failed(_)), _) => rift_tracing::warn!(
             component = "mcp",
             operation = "server.stop",
             stage = "otlp export",
@@ -1785,6 +1792,157 @@ mod tests {
     use std::time::Duration;
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    #[tokio::test(start_paused = true)]
+    async fn log_export_failure_is_recorded_after_provider_shutdown() -> TestResult {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let deadline = tokio::time::Instant::now() + SERVER_STOP_DEADLINE;
+        let closed = |_| std::future::ready(Ok(()));
+        let failure = rift_tracing::ExportShutdownError::Failed("collector refused".to_owned());
+        let logs = |_| std::future::ready(Err(failure.clone()));
+        let result = super::stop_export_with(deadline, closed, closed, logs).await;
+        assert_eq!(result, Err(failure));
+        drop(recorder);
+        let records = drain.queued_records();
+        let stages = records
+            .iter()
+            .filter(|record| record.message() == "stop stage ended")
+            .map(|record| serde_json::from_str::<serde_json::Value>(record.fields()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let logs = stages
+            .iter()
+            .find(|fields| fields["phase"] == "logs")
+            .ok_or("the log shutdown result is recorded")?;
+        assert_eq!(logs["outcome"], "error", "{logs}");
+        assert!(
+            logs["failed"]
+                .as_str()
+                .is_some_and(|text| text.contains("collector refused")),
+            "{logs}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn export_without_a_collector_ends_ok() -> TestResult {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let export = rift_tracing::OtlpExport::default();
+        let deadline = tokio::time::Instant::now() + SERVER_STOP_DEADLINE;
+        super::stop_export(&export, deadline).await?;
+        assert_eq!(deadline - tokio::time::Instant::now(), SERVER_STOP_DEADLINE);
+        drop(recorder);
+        let records = drain.queued_records();
+        let stages = records
+            .iter()
+            .filter(|record| record.message() == "stop stage ended")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stages.len(),
+            4,
+            "the flush and shutdown results are recorded"
+        );
+        for stage in stages {
+            let fields: serde_json::Value = serde_json::from_str(stage.fields())?;
+            assert_eq!(fields["outcome"], "ok", "{fields}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_export_uses_one_stop_deadline_for_every_phase() -> TestResult {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let deadline = tokio::time::Instant::now() + SERVER_STOP_DEADLINE;
+        let held = |bound| async move {
+            assert_eq!(bound, deadline, "every phase shares the stop deadline");
+            tokio::time::timeout_at(bound, std::future::pending::<()>())
+                .await
+                .map_err(|_| rift_tracing::ExportShutdownError::TimedOut)
+        };
+        let closed = |bound| async move {
+            assert_eq!(bound, deadline, "later phases get no new budget");
+            Ok(())
+        };
+        super::stop_export_with(deadline, held, closed, closed).await?;
+        drop(recorder);
+        let records = drain.queued_records();
+        let stages = records
+            .iter()
+            .filter(|record| record.message() == "stop stage ended")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stages.len(),
+            4,
+            "the flush and shutdown results are recorded"
+        );
+        for stage in stages {
+            let fields: serde_json::Value = serde_json::from_str(stage.fields())?;
+            assert_eq!(fields["outcome"], "timeout", "{fields}");
+            assert_eq!(fields["remaining"], "0ns", "{fields}");
+        }
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.message() == "operations in flight")
+                .count(),
+            1,
+            "the shared deadline publishes the operations in flight once"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn trace_flush_uses_the_remaining_stop_budget() -> TestResult {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let deadline = tokio::time::Instant::now() + SERVER_STOP_DEADLINE;
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        let (release, held) = tokio::sync::oneshot::channel();
+        let flush = |bound| async move {
+            started.send(()).expect("the test observes the export");
+            tokio::time::timeout_at(bound, held)
+                .await
+                .map_err(|_| rift_tracing::ExportShutdownError::TimedOut)?
+                .expect("the test releases the export");
+            Ok(())
+        };
+        let shutdown = |bound| async move {
+            assert_eq!(
+                bound, deadline,
+                "provider shutdown shares the stop deadline"
+            );
+            Ok(())
+        };
+        let logs = |bound| async move {
+            assert_eq!(bound, deadline, "log shutdown shares the stop deadline");
+            Ok(())
+        };
+        let stop = super::stop_export_with(deadline, flush, shutdown, logs);
+        let release_export = async move {
+            waiting.await.expect("the export started");
+            tokio::time::advance(Duration::from_millis(100)).await;
+            release
+                .send(())
+                .expect("the export still has stop time left");
+        };
+        let (result, ()) = tokio::join!(stop, release_export);
+        result?;
+        drop(recorder);
+        let records = drain.queued_records();
+        let stages = records
+            .iter()
+            .filter(|record| record.message() == "stop stage ended")
+            .map(|record| serde_json::from_str::<serde_json::Value>(record.fields()))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            stages.len(),
+            4,
+            "the flush and shutdown results are recorded"
+        );
+        for stage in stages {
+            assert_eq!(stage["outcome"], "ok", "{stage}");
+            assert_eq!(stage["remaining"], "3.9s", "{stage}");
+        }
+        Ok(())
+    }
 
     fn holder() -> ServerLock {
         ServerLock {

@@ -7,7 +7,7 @@ use rift_core::{ProjectPath, SymbolId as CoreSymbolId};
 use rift_error::{RiftError, errors};
 use rift_lsp::{EngineSession, LineIndex, PositionEncoding, TreeRoot};
 use rift_protocol::read::{
-    Edge, EdgeDerivation, EdgeKind, ExactKind, Extensions, ReadWarning, SymbolId,
+    Edge, EdgeDerivation, EdgeKind, EdgeProvider, ExactKind, Extensions, ReadWarning, SymbolId,
     TraversalDirection,
 };
 use tokio::time::Instant;
@@ -197,7 +197,7 @@ fn edge_locations(
                 TraversalDirection::Outgoing => (seed.clone(), neighbor),
                 TraversalDirection::Incoming => (neighbor, seed.clone()),
             };
-            edges.push(edge_protocol(from, to, kind));
+            edges.push(edge_protocol(from, to, kind, slot.edge_provider()));
         } else if direction == TraversalDirection::Incoming {
             let before = edges.len();
             edge_impl_header(
@@ -219,7 +219,7 @@ fn edge_locations(
     Ok(edges)
 }
 
-fn edge_protocol(from: SymbolId, to: SymbolId, kind: EdgeKind) -> Edge {
+fn edge_protocol(from: SymbolId, to: SymbolId, kind: EdgeKind, provider: EdgeProvider) -> Edge {
     Edge {
         producer: None,
         from,
@@ -227,6 +227,7 @@ fn edge_protocol(from: SymbolId, to: SymbolId, kind: EdgeKind) -> Edge {
         kind: ExactKind(kind.as_ref().to_owned()),
         kinds: vec![kind],
         occurrence: None,
+        provider,
         derivation: EdgeDerivation::Resolution,
         confidence: None,
         extensions: Extensions::default(),

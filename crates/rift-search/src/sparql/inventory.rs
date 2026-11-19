@@ -80,6 +80,9 @@ impl SemanticInventory {
             let name = predicate.as_str().strip_prefix(VOCABULARY_NAMESPACE);
             match name {
                 Some("name" | "revision") => {}
+                Some("provider" | "from" | "to" | "kinds" | "derivation")
+                    if edge(patterns, subject) => {}
+                None if class(pattern) == Some("Edge") => {}
                 Some("calls") => self.adjacency.calls = true,
                 Some("references") => self.adjacency.references = true,
                 Some("hasType") => {
@@ -171,6 +174,12 @@ impl SemanticInventory {
         }
         Some(())
     }
+}
+
+fn edge(patterns: &[TriplePattern], term: &TermPattern) -> bool {
+    patterns
+        .iter()
+        .any(|pattern| pattern.subject == *term && class(pattern) == Some("Edge"))
 }
 
 fn occurrence(patterns: &[TriplePattern], term: &TermPattern) -> bool {

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use rift_error::{RiftError, errors};
 use rift_index::WorkspaceSourcePolicy;
 use rift_protocol::configuration::{
-    CONFIGURATION_FILE_BYTES_MAX, LspPackageManager, WorkspaceConfiguration,
+    CONFIGURATION_FILE_BYTES_MAX, EmbeddedEngine, LspPackageManager, WorkspaceConfiguration,
 };
 use rift_protocol::map::{
     MAP_RECOMMENDATION_COMMAND_CHARS_MAX, MAP_RECOMMENDATION_ROOT_CHARS_MAX,
@@ -44,6 +44,16 @@ pub enum LspRecommendationStatus {
     Available {
         /// Selected executable relative to its project or available on PATH.
         program: String,
+        /// Native shell command that applies the recommendation.
+        command: String,
+        /// Primary project, root-defined profile, or extra workspace selected by the command.
+        scope: SearchScope,
+    },
+    /// No installed supported executable was found, and this build links in an engine for
+    /// the language; the command selects that embedded engine.
+    Embedded {
+        /// Engine this build serves in process, without an executable.
+        engine: EmbeddedEngine,
         /// Native shell command that applies the recommendation.
         command: String,
         /// Primary project, root-defined profile, or extra workspace selected by the command.
@@ -135,6 +145,7 @@ impl LspRecommendationInputs {
             projects,
             &self.registered,
             RecommendationSelection::Complete,
+            std::env::var_os("PATH").as_deref(),
         )
         .map(|batch| batch.items)
     }
@@ -156,6 +167,7 @@ impl LspRecommendationInputs {
             projects,
             &self.registered,
             RecommendationSelection::Available,
+            std::env::var_os("PATH").as_deref(),
         )
     }
 }
@@ -328,6 +340,54 @@ struct Candidate {
     language: &'static str,
     program: &'static str,
     manifest: &'static str,
+    /// Engine this build links in for the language, selected when no executable is installed.
+    embedded: Option<EmbeddedEngine>,
+}
+
+/// How a recommendation selects a language server.
+enum Selection {
+    /// An installed executable under one package manager's layout.
+    Installed {
+        manager: LspPackageManager,
+        program: String,
+    },
+    /// An engine this build links in.
+    Embedded(EmbeddedEngine),
+}
+
+impl Selection {
+    /// The `rift config set` argument that writes this selection.
+    fn argument(&self) -> String {
+        match self {
+            Self::Installed { manager, .. } => {
+                format!("--lsp-package-manager={}", manager.as_str())
+            }
+            Self::Embedded(engine) => format!("--lsp-embedded={}", embedded_name(*engine)),
+        }
+    }
+
+    /// The recommendation status that applies this selection with `command` in `scope`.
+    fn status(self, command: String, scope: SearchScope) -> LspRecommendationStatus {
+        match self {
+            Self::Installed { program, .. } => LspRecommendationStatus::Available {
+                program,
+                command,
+                scope,
+            },
+            Self::Embedded(engine) => LspRecommendationStatus::Embedded {
+                engine,
+                command,
+                scope,
+            },
+        }
+    }
+}
+
+/// The configuration spelling of `engine`, as `embedded` names it in `rift.toml`.
+const fn embedded_name(engine: EmbeddedEngine) -> &'static str {
+    match engine {
+        EmbeddedEngine::Ty => "ty",
+    }
 }
 
 impl Candidate {
@@ -337,16 +397,19 @@ impl Candidate {
                 language: "rust",
                 program: "rust-analyzer",
                 manifest: "Cargo.toml",
+                embedded: None,
             }),
             "python" => Some(Self {
                 language: "python",
                 program: "ty",
                 manifest: "pyproject.toml",
+                embedded: Some(EmbeddedEngine::Ty),
             }),
             "typescript" | "typescript:tsx" | "javascript" => Some(Self {
                 language: "typescript",
                 program: "typescript-language-server",
                 manifest: "package.json",
+                embedded: None,
             }),
             _ => None,
         }
@@ -362,6 +425,18 @@ impl Candidate {
         crate::package_manager::recommended_command(manager, root, search, dependencies)
             .map(|command| (manager, command.program().to_owned()))
     }
+
+    /// The installed executable, else the engine this build links in for the language.
+    fn selection(
+        &self,
+        root: &Path,
+        search: Option<&OsStr>,
+        dependencies: &rift_protocol::dependencies::DependenciesConfiguration,
+    ) -> Option<Selection> {
+        self.installed(root, search, dependencies)
+            .map(|(manager, program)| Selection::Installed { manager, program })
+            .or_else(|| self.embedded.map(Selection::Embedded))
+    }
 }
 
 fn decisions(
@@ -370,8 +445,8 @@ fn decisions(
     projects: BTreeMap<(PathBuf, String), PathBuf>,
     registered: &BTreeMap<String, PathBuf>,
     selection: RecommendationSelection,
+    search: Option<&OsStr>,
 ) -> Result<LspRecommendationBatch, RiftError> {
-    let search = std::env::var_os("PATH");
     let mut registrations = registered
         .iter()
         .filter_map(|(name, project)| {
@@ -412,8 +487,8 @@ fn decisions(
             })
         {
             LspRecommendationStatus::Overlapping
-        } else if let Some((manager, program)) =
-            candidate.installed(&project, search.as_deref(), &configuration.dependencies)
+        } else if let Some(selected) =
+            candidate.selection(&project, search, &configuration.dependencies)
         {
             let extra = registered
                 .iter()
@@ -434,16 +509,12 @@ fn decisions(
                     SearchScope::ProfileLocal { name } => Some(name.as_str()),
                     _ => None,
                 },
-                manager,
+                &selected.argument(),
             );
             if extra.is_some() {
                 command = format!("cd {} && {command}", quote(&project.to_string_lossy()));
             }
-            LspRecommendationStatus::Available {
-                program,
-                command,
-                scope,
-            }
+            selected.status(command, scope)
         } else {
             LspRecommendationStatus::Unavailable {
                 program: candidate.program.to_owned(),
@@ -476,7 +547,8 @@ fn append_recommendation(
     root: &Path,
 ) -> Result<bool, RiftError> {
     let command_bytes = match &recommendation.status {
-        LspRecommendationStatus::Available { command, .. } => {
+        LspRecommendationStatus::Available { command, .. }
+        | LspRecommendationStatus::Embedded { command, .. } => {
             if selection == RecommendationSelection::Available
                 && (recommendation.root.chars().count() > MAP_RECOMMENDATION_ROOT_CHARS_MAX
                     || command.chars().count() > MAP_RECOMMENDATION_COMMAND_CHARS_MAX)
@@ -536,16 +608,8 @@ fn project_name(root: &Path, project: &Path) -> String {
         .map_or_else(|_| project.to_string_lossy().into_owned(), slash)
 }
 
-fn command(
-    language: &str,
-    root: &str,
-    profile: Option<&str>,
-    manager: LspPackageManager,
-) -> String {
-    let mut arguments = vec![
-        format!("--language={language}"),
-        format!("--lsp-package-manager={}", manager.as_str()),
-    ];
+fn command(language: &str, root: &str, profile: Option<&str>, selection: &str) -> String {
+    let mut arguments = vec![format!("--language={language}"), selection.to_owned()];
     if let Some(profile) = profile {
         arguments.push(format!("--profile={profile}"));
         arguments.push(format!("--profile-root={root}"));
@@ -997,9 +1061,51 @@ mod tests {
             projects,
             &BTreeMap::new(),
             RecommendationSelection::Complete,
+            None,
         )
         .expect_err("shared results must fit the configuration byte bound");
         assert_eq!(error.slug().as_str(), "rift.core.configuration_invalid");
+        Ok(())
+    }
+
+    /// A Python project with no installed language server is offered the engine this build
+    /// links in, not an install request for an executable it does not need. Regression for
+    /// `rift config recommend` printing "executable unavailable: ty" beside embedded ty.
+    #[test]
+    fn test_python_without_an_installed_server_recommends_the_embedded_engine()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        let projects =
+            BTreeMap::from([((root.clone(), "python".to_owned()), root.join("main.py"))]);
+        let batch = decisions(
+            &root,
+            &WorkspaceConfiguration::default(),
+            projects.clone(),
+            &BTreeMap::new(),
+            RecommendationSelection::Complete,
+            Some(OsStr::new("/missing")),
+        )?;
+        assert_eq!(
+            batch.items[0].status,
+            LspRecommendationStatus::Embedded {
+                engine: EmbeddedEngine::Ty,
+                command: "rift config set '--language=python' '--lsp-embedded=ty'".to_owned(),
+                scope: SearchScope::Local,
+            }
+        );
+        let available = decisions(
+            &root,
+            &WorkspaceConfiguration::default(),
+            projects,
+            &BTreeMap::new(),
+            RecommendationSelection::Available,
+            Some(OsStr::new("/missing")),
+        )?;
+        assert_eq!(
+            available.items, batch.items,
+            "the map lists the embedded command"
+        );
         Ok(())
     }
 
@@ -1009,7 +1115,11 @@ mod tests {
             "typescript:tsx",
             "docs",
             Some("docs"),
-            LspPackageManager::Bun,
+            &Selection::Installed {
+                manager: LspPackageManager::Bun,
+                program: "bun".to_owned(),
+            }
+            .argument(),
         );
         assert!(command.contains("'--profile=docs'"));
         assert!(command.contains("'--profile-root=docs'"));

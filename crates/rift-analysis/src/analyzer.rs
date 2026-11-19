@@ -1731,6 +1731,7 @@ impl Records {
                 kind: rift_protocol::read::ExactKind(kind.as_ref().to_owned()),
                 kinds: vec![kind],
                 occurrence,
+                provider: rift_protocol::read::EdgeProvider::Static,
                 derivation,
                 confidence: None,
                 extensions: rift_protocol::read::Extensions::default(),

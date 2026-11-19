@@ -339,7 +339,17 @@ async fn test_edge_cold_calls_wait_and_reference_answers_need_no_declaration_mar
         ),
         (
             format!(
-                "SELECT ?target {{ ?target :implements ?trait FILTER(?trait = <{trait_edge}>) }}"
+                "SELECT ?target {{ ?target :implements ?trait . \
+                 ?edge a :Edge; :from ?target; :to ?trait; :provider 'lsp' . \
+                 FILTER(?trait = <{trait_edge}>) }}"
+            ),
+            Some(worker.clone()),
+        ),
+        (
+            format!(
+                "SELECT ?target {{ ?caller :hasType ?target . \
+                     ?edge a :Edge; :from ?caller; :to ?target; :kinds :has_type; \
+                     :provider 'lsp' . FILTER(?caller = <{take}>) }}"
             ),
             Some(worker),
         ),

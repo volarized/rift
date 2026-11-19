@@ -169,7 +169,8 @@ impl GetSize for SyntaxFacts {
                 .saturating_add(macros)
                 .saturating_add(scope)
                 .saturating_add(static_facts)
-                .saturating_add(markdown),
+                .saturating_add(markdown)
+                .saturating_add(self.invalid_declarations.retained_bytes()),
             tracker,
         )
     }

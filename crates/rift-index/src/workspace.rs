@@ -51,7 +51,10 @@ use rift_syntax::{
 use sha2::{Digest as _, Sha256};
 
 use crate::LocatedSyntax;
-use crate::capture::{CaptureBoundary, CapturedPath, LastCapture, capture_path, root_identity};
+use crate::capture::{
+    CaptureBoundary, CapturedPath, LastCapture, capture_io_error, capture_path, path_was_removed,
+    root_identity,
+};
 use crate::change_set::{FileDigest, FileRecord, PathChanges, WorkspaceDigests, tree_revision_of};
 use crate::chunk::text_chunks;
 use crate::content_cache::WorkspaceContentCache;
@@ -801,7 +804,9 @@ impl WorkspaceSourcePolicy {
             GitignorePolicy::Ignore,
         ) {
             check_cancelled(cancelled)?;
-            let entry = entry.map_err(|error| walk_error(&self.root, error))?;
+            let Some(entry) = walked_entry(&self.root, entry)? else {
+                continue;
+            };
             let file_type = entry.file_type();
             if file_type.is_some_and(|file_type| file_type.is_dir()) {
                 if entry.depth() > self.limits.directory_depth_max {
@@ -2667,6 +2672,16 @@ struct SymbolDeclarations {
     addresses: BTreeMap<(ProjectPath, usize), (SymbolId, usize)>,
 }
 
+/// The assembled record one declaration belongs to, as the directory build already holds it.
+enum HeldRecordObject<'a> {
+    /// The record's identity has this readable object.
+    Assembled(&'a ReadableSymbol),
+    /// The record assembles with portable facts and has no identity.
+    Unidentified,
+    /// The held objects do not answer; the declaration is assembled on its own.
+    Unknown,
+}
+
 impl SymbolDeclarations {
     /// The symbol one declaration binds, and the declaration's ordinal among that symbol's
     /// bindings in the order a symbol read lists them.
@@ -3835,6 +3850,63 @@ impl WorkspaceIndex {
         })
     }
 
+    /// What [`Self::assembled_symbol`] answers for the declaration `provider` names, read from
+    /// the record objects the directory already assembled.
+    ///
+    /// Declarations merged into one record share its assembly. Assembling it again per
+    /// declaration cost the record's Contribution count once per declaration, quadratic in
+    /// a record's size: on Bun (511,604 declarations in 270,153 identified records) that pass
+    /// took 28 s, against 0.8 s for one assembly per record. A record with no identity is
+    /// decided from its Contributions alone. Any other case answers
+    /// [`HeldRecordObject::Unknown`], and the caller assembles it as before.
+    fn held_record_object<'a>(
+        &self,
+        objects: &BTreeMap<SymbolId, usize>,
+        assembled: &'a BTreeMap<SymbolId, Result<ReadableSymbol, RiftError>>,
+        provider: &str,
+    ) -> HeldRecordObject<'a> {
+        let graph = self.semantics.graph();
+        let Some(position) = self.semantics.record_position(provider) else {
+            return HeldRecordObject::Unknown;
+        };
+        let Some(record) = graph.records().get(position) else {
+            return HeldRecordObject::Unknown;
+        };
+        let Some(identity) = record.identity() else {
+            return if rift_provider::SymbolAssembler::assembles_facts(graph, record) {
+                HeldRecordObject::Unidentified
+            } else {
+                HeldRecordObject::Unknown
+            };
+        };
+        if objects.get(identity) != Some(&position) {
+            return HeldRecordObject::Unknown;
+        }
+        match assembled.get(identity) {
+            Some(Ok(object)) => HeldRecordObject::Assembled(object),
+            _ => HeldRecordObject::Unknown,
+        }
+    }
+
+    /// The readable symbol one declaration binds while the directory is built: the held
+    /// record object when [`Self::held_record_object`] answers, `None` for a record with no
+    /// identity, and [`Self::assembled_symbol`] otherwise.
+    fn declaration_object<'a>(
+        &self,
+        matched: SymbolMatch<'_>,
+        provider: &str,
+        objects: &BTreeMap<SymbolId, usize>,
+        assembled: &'a BTreeMap<SymbolId, Result<ReadableSymbol, RiftError>>,
+    ) -> Result<Option<Cow<'a, ReadableSymbol>>, RiftError> {
+        Ok(
+            match self.held_record_object(objects, assembled, provider) {
+                HeldRecordObject::Assembled(object) => Some(Cow::Borrowed(object)),
+                HeldRecordObject::Unidentified => None,
+                HeldRecordObject::Unknown => Some(Cow::Owned(self.assembled_symbol(matched)?)),
+            },
+        )
+    }
+
     /// Files the build left out of the index, whole or in part, in project-path order.
     ///
     /// Build and rebuild continue after invalid UTF-8, NUL bytes, a file beyond
@@ -4169,7 +4241,15 @@ impl WorkspaceIndex {
                     .entry(provider.clone())
                     .or_default()
                     .push((file.path().clone(), index));
-                let assembled = self.assembled_symbol(matched)?;
+                let Some(assembled) = self.declaration_object(
+                    matched,
+                    &provider,
+                    &declarations.objects,
+                    &declarations.assembled,
+                )?
+                else {
+                    continue;
+                };
                 if let Some(identity) = assembled.identity() {
                     let declaration =
                         self.declaration_facts(matched, &provider, &assembled, &starts)?;
@@ -4493,7 +4573,9 @@ impl WorkspaceIndex {
             GitignorePolicy::Ignore,
         );
         for entry in walker {
-            let entry = entry.map_err(|error| walk_error(&self.root, error))?;
+            let Some(entry) = walked_entry(&self.root, entry)? else {
+                continue;
+            };
             let file_type = entry.file_type();
             if file_type.is_some_and(|file_type| file_type.is_dir()) {
                 if entry.depth() > self.limits.directory_depth_max {
@@ -4569,7 +4651,9 @@ impl WorkspaceIndex {
             GitignorePolicy::Ignore,
         );
         for entry in walker {
-            let entry = entry.map_err(|error| walk_error(&self.root, error))?;
+            let Some(entry) = walked_entry(&self.root, entry)? else {
+                continue;
+            };
             let file_type = entry.file_type();
             if file_type.is_some_and(|file_type| file_type.is_dir()) {
                 if entry.depth() > self.limits.directory_depth_max {
@@ -5271,7 +5355,9 @@ fn discover_cancellable(
     let mut discovered = DiscoveredPaths::default();
     for entry in source_walk(root, limits.directory_depth_max, gitignore) {
         check_cancelled(cancelled)?;
-        let entry = entry.map_err(|error| walk_error(root, error))?;
+        let Some(entry) = walked_entry(root, entry)? else {
+            continue;
+        };
         let Some(path) = walked_file(&entry, limits.directory_depth_max)? else {
             continue;
         };
@@ -5323,7 +5409,9 @@ fn discover_forced(
         .collect();
     for entry in forced_walk(root, limits.directory_depth_max, reach) {
         check_cancelled(cancelled)?;
-        let entry = entry.map_err(|error| walk_error(root, error))?;
+        let Some(entry) = walked_entry(root, entry)? else {
+            continue;
+        };
         let Some(path) = walked_file(&entry, limits.directory_depth_max)? else {
             continue;
         };
@@ -5411,7 +5499,9 @@ impl GitignoreChain {
         let mut ignore_files = inputs.len();
         for entry in source_walk(root, limits.directory_depth_max, GitignorePolicy::Ignore) {
             check_cancelled(cancelled)?;
-            let entry = entry.map_err(|error| walk_error(root, error))?;
+            let Some(entry) = walked_entry(root, entry)? else {
+                continue;
+            };
             let path = entry.path();
             if !entry
                 .file_type()
@@ -5504,7 +5594,7 @@ fn compiled_gitignore(
 ) -> Result<(Gitignore, FileDigest), RiftError> {
     const UTF8_BYTE_ORDER_MARK: char = '\u{feff}';
 
-    let file = fs::File::open(path).map_err(|error| catalog_io_error(path, error))?;
+    let file = fs::File::open(path).map_err(|error| capture_io_error(path, error))?;
     let bytes = read_file_bytes(file, path, limits)?;
     if bytes.len() > limits.file_bytes_max() {
         return errors::index::workspace_file_too_large()
@@ -6353,6 +6443,29 @@ fn walk_source_path(error: &ignore::Error) -> Option<PathBuf> {
     }
 }
 
+/// One walk step's entry, or `None` for an entry a concurrent removal took below `root`.
+///
+/// A directory its parent listed and that is gone before the walk opens it is absent from
+/// the tree, as a walk started after the removal finds it, so the walk goes on without it.
+/// A missing root, and every other walk failure, still refuses.
+fn walked_entry(
+    root: &Path,
+    entry: Result<DirEntry, ignore::Error>,
+) -> Result<Option<DirEntry>, RiftError> {
+    match entry {
+        Ok(entry) => Ok(Some(entry)),
+        Err(error) if removed_below(root, &error) => Ok(None),
+        Err(error) => Err(walk_error(root, error)),
+    }
+}
+
+/// Whether `error` reports a path strictly below `root` that no longer exists.
+fn removed_below(root: &Path, error: &ignore::Error) -> bool {
+    error.io_error().is_some()
+        && walk_source_path(error)
+            .is_some_and(|path| path != root && path.starts_with(root) && path_was_removed(&path))
+}
+
 fn walk_error(root: &Path, error: ignore::Error) -> RiftError {
     let path = walk_source_path(&error).unwrap_or_else(|| root.to_path_buf());
     errors::index::workspace_filesystem()
@@ -6698,10 +6811,10 @@ fn catalog_file(
     path: &Path,
     limits: WorkspaceIndexLimits,
 ) -> Result<IndexRead<TextSourceFile>, RiftError> {
-    let handle = fs::File::open(path).map_err(|error| catalog_io_error(path, error))?;
+    let handle = fs::File::open(path).map_err(|error| capture_io_error(path, error))?;
     let metadata = handle
         .metadata()
-        .map_err(|error| catalog_io_error(path, error))?;
+        .map_err(|error| capture_io_error(path, error))?;
     let bytes = read_file_bytes(handle, path, limits)?;
     let project_path = project_path_below(root, path)?;
     if bytes.len() > limits.file_bytes_max() {
@@ -6740,20 +6853,6 @@ fn catalog_file(
     Ok(IndexRead::Included(file))
 }
 
-fn catalog_io_error(path: &Path, source: std::io::Error) -> RiftError {
-    if source.kind() == std::io::ErrorKind::NotFound {
-        errors::index::workspace_changed_during_capture()
-            .path(path)
-            .source(source)
-            .error()
-    } else {
-        errors::index::workspace_filesystem()
-            .path(path)
-            .source(source)
-            .error()
-    }
-}
-
 #[cfg(unix)]
 pub(crate) fn metadata_is_executable(metadata: &fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -6777,12 +6876,7 @@ pub(crate) fn read_file_bytes(
     reader
         .take(limits.file_bytes_max().saturating_add(1) as u64)
         .read_to_end(&mut bytes)
-        .map_err(|error| {
-            errors::index::workspace_filesystem()
-                .path(path)
-                .source(error)
-                .error()
-        })?;
+        .map_err(|error| capture_io_error(path, error))?;
     Ok(bytes)
 }
 
@@ -10702,7 +10796,10 @@ mod tests {
         }
 
         let limits = WorkspaceIndexLimits::new(5, 4, 100, 4, 5).expect("limits");
-        let error = super::read_file_bytes(FailedReader, Path::new("failed.rs"), limits)
+        let directory = tempfile::tempdir().expect("workspace");
+        let path = directory.path().join("failed.rs");
+        fs::write(&path, "source").expect("existing source file");
+        let error = super::read_file_bytes(FailedReader, &path, limits)
             .expect_err("a failed read must not become an omitted file");
         assert_eq!(error.slug(), errors::index::workspace_filesystem::SLUG);
         assert!(error.to_string().contains("failed.rs"), "{error}");
@@ -13575,6 +13672,69 @@ mod tests {
     }
 
     #[test]
+    fn directory_reads_each_declaration_from_its_record_assembly() {
+        let root = tempfile::tempdir().expect("workspace");
+        fs::write(
+            root.path().join("package.json"),
+            r#"{"name":"beacon","version":"1.0.0","main":"index.js","types":"index.d.ts"}"#,
+        )
+        .expect("captured package metadata");
+        fs::write(
+            root.path().join("index.js"),
+            "export function open(path) {}\nfunction local() {}\n",
+        )
+        .expect("implementation");
+        fs::write(
+            root.path().join("index.d.ts"),
+            "export declare function open(path: string): void;\nexport declare function open(path: number): void;\n",
+        )
+        .expect("overloads");
+        let index = WorkspaceIndex::build(
+            root.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("captured index");
+        let declarations = index.build_symbol_declarations().expect("directory");
+        let mut held = 0;
+        for file in index.files() {
+            for position in 0..file.syntax().symbols().len() {
+                let matched = index
+                    .declaration_match(file.path(), position)
+                    .expect("captured declaration");
+                let provider = matched.symbol.provider_address(
+                    &file.syntax().language().identity_segment(),
+                    file.path().as_str(),
+                );
+                let assembled = index.assembled_symbol(matched).expect("readable symbol");
+                match index.held_record_object(
+                    &declarations.objects,
+                    &declarations.assembled,
+                    &provider,
+                ) {
+                    HeldRecordObject::Assembled(object) => {
+                        assert_eq!(object, &assembled, "{provider}");
+                        held += 1;
+                    }
+                    HeldRecordObject::Unidentified => {
+                        assert!(assembled.identity().is_none(), "{provider}");
+                    }
+                    HeldRecordObject::Unknown => panic!("{provider} has no held record"),
+                }
+            }
+        }
+        assert_eq!(held, declarations.facts.len());
+        assert!(
+            declarations
+                .canonical
+                .values()
+                .any(|bindings| bindings.len() == 3),
+            "three declarations of open share one record assembly"
+        );
+    }
+
+    #[test]
     fn canonical_identity_directory_does_not_promote_unproved_source_or_previous_view() {
         let root = tempfile::tempdir().expect("workspace");
         fs::create_dir(root.path().join("src")).expect("source directory");
@@ -14753,6 +14913,147 @@ mod tests {
                 errors::index::workspace_cancelled::SLUG,
                 "the check after {passed} passed checks"
             );
+        }
+    }
+
+    /// A directory removed while a capture walks the tree leaves the capture, whichever
+    /// check the removal lands at: a walk that meets the listed directory gone treats it
+    /// as absent, and the capture answers the tree without it rather than refusing with
+    /// a filesystem failure. Regression for the root workspace read refused with
+    /// `storage_failure` naming a build directory deleted beside the server.
+    #[test]
+    fn test_visible_capture_drops_a_directory_removed_during_the_walk() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        fn workspace() -> tempfile::TempDir {
+            let directory = tempfile::tempdir().expect("workspace");
+            let root = directory.path();
+            for (path, text) in [
+                ("a/kept.rs", "pub fn first() {}\n"),
+                ("b/nested/gone.rs", "pub fn removed() {}\n"),
+                ("c/kept.rs", "pub fn last() {}\n"),
+            ] {
+                let path = root.join(path);
+                fs::create_dir_all(path.parent().expect("fixture parent")).expect("directory");
+                fs::write(path, text).expect("source");
+            }
+            directory
+        }
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let text = TextFileInclusion::default();
+        let languages = LanguageFileSelections::default();
+        let last = LastCapture::default();
+        let checks = AtomicUsize::new(0);
+        let counted = || {
+            checks.fetch_add(1, Ordering::SeqCst);
+            false
+        };
+        let directory = workspace();
+        capture_visible_digests_with_languages_cancellable(
+            directory.path(),
+            limits,
+            &visibility,
+            &text,
+            &languages,
+            &last,
+            &counted,
+        )
+        .expect("an undisturbed visible capture completes");
+        let made = checks.load(Ordering::SeqCst);
+        let kept = ProjectPath::new("a/kept.rs").expect("kept path");
+        for passed in 0..made {
+            let directory = workspace();
+            let removed = directory.path().join("b");
+            let checks = AtomicUsize::new(0);
+            let done = AtomicBool::new(false);
+            let removing = || {
+                if checks.fetch_add(1, Ordering::SeqCst) == passed
+                    && !done.swap(true, Ordering::SeqCst)
+                {
+                    fs::remove_dir_all(&removed).expect("remove the directory mid-walk");
+                }
+                false
+            };
+            let (indexed, visible, _) = capture_visible_digests_with_languages_cancellable(
+                directory.path(),
+                limits,
+                &visibility,
+                &text,
+                &languages,
+                &last,
+                &removing,
+            )
+            .unwrap_or_else(|error| {
+                panic!("a removal at check {passed} refused the capture: {error:?}")
+            });
+            assert!(indexed.get(&kept).is_some(), "check {passed}: {indexed:?}");
+            assert!(visible.get(&kept).is_some(), "check {passed}: {visible:?}");
+        }
+    }
+
+    /// A walk drops a removed entry even after a permission error (#785).
+    #[test]
+    fn test_walk_drops_removed_entries_after_a_permission_error() {
+        for remove_parent in [false, true] {
+            let directory = tempfile::tempdir().expect("workspace");
+            let root = directory.path();
+            let parent = root.join("nested");
+            fs::create_dir(&parent).expect("parent directory");
+            let path = parent.join("gone.rs");
+            fs::write(&path, "pub fn removed() {}\n").expect("source");
+            let error = ignore::Error::WithPath {
+                path: path.clone(),
+                err: Box::new(ignore::Error::Io(std::io::Error::from(
+                    std::io::ErrorKind::PermissionDenied,
+                ))),
+            };
+            if remove_parent {
+                fs::remove_dir_all(&parent).expect("remove parent after the failure");
+            } else {
+                fs::remove_file(&path).expect("remove entry after the failure");
+            }
+            let entry = super::walked_entry(root, Err(error)).expect("removed entry is absent");
+            assert!(entry.is_none());
+        }
+    }
+
+    #[test]
+    fn test_walk_refuses_a_permission_error_for_an_existing_entry() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path();
+        let path = root.join("kept.rs");
+        fs::write(&path, "pub fn kept() {}\n").expect("source");
+        let error = ignore::Error::WithPath {
+            path: path.clone(),
+            err: Box::new(ignore::Error::Io(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            ))),
+        };
+        let error = super::walked_entry(root, Err(error)).expect_err("existing entry refuses");
+        assert_eq!(error.slug(), errors::index::workspace_filesystem::SLUG);
+        assert_eq!(error_path(&error), Some(path));
+        let source = std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<ignore::Error>())
+            .and_then(ignore::Error::io_error)
+            .expect("original walk error");
+        assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn test_walk_refuses_a_missing_root_or_a_path_outside_the_root() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path().join("removed");
+        for path in [&root, directory.path()] {
+            let error = ignore::Error::WithPath {
+                path: path.to_path_buf(),
+                err: Box::new(ignore::Error::Io(std::io::Error::from(
+                    std::io::ErrorKind::NotFound,
+                ))),
+            };
+            let error = super::walked_entry(&root, Err(error)).expect_err("walk boundary refuses");
+            assert_eq!(error.slug(), errors::index::workspace_filesystem::SLUG);
+            assert_eq!(error_path(&error).as_deref(), Some(path));
         }
     }
 

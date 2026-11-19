@@ -350,8 +350,8 @@ impl ReadService {
             .items
             .into_iter()
             .filter_map(|recommendation| {
-                let crate::LspRecommendationStatus::Available { command, .. } =
-                    recommendation.status
+                let (crate::LspRecommendationStatus::Available { command, .. }
+                | crate::LspRecommendationStatus::Embedded { command, .. }) = recommendation.status
                 else {
                     return None;
                 };
@@ -3051,7 +3051,7 @@ pub(crate) mod tests {
             "to": symbol.id,
             "kind": symbol.kind,
             "kinds": ["calls"],
-            "derivation": "syntax"
+            "provider": "static", "derivation": "syntax"
         });
         assert!(serde_json::from_value::<rift_protocol::read::Edge>(edge.clone()).is_ok());
         edge["to"] = json!(raw_address);

@@ -755,6 +755,7 @@ struct CorpusArms {
     search_dependency_units: usize,
     literal_at_identities: usize,
     escaped_identities: usize,
+    release_history_edges: usize,
     query_forms: BTreeSet<String>,
     query_terms: BTreeSet<String>,
 }
@@ -763,6 +764,19 @@ impl CorpusArms {
     fn observe(&mut self, structured: &Value) {
         self.dependency_units += dependency_unit_count(&structured["declarations"]);
         self.search_dependency_units += dependency_unit_count(&structured["answer"]["bindings"]);
+        self.release_history_edges +=
+            structured["history"]["edges"]
+                .as_array()
+                .map_or(0, |edges| {
+                    edges
+                        .iter()
+                        .filter(|edge| {
+                            edge["edge"]
+                                .as_str()
+                                .is_some_and(|name| name.ends_with("_in_release"))
+                        })
+                        .count()
+                });
         for identity in source_units(structured) {
             if identity.contains('@') && !identity.contains("%40") {
                 self.literal_at_identities += 1;
@@ -803,6 +817,10 @@ impl CorpusArms {
         assert!(
             self.search_dependency_units > 0,
             "query bindings retain package source units"
+        );
+        assert!(
+            self.release_history_edges > 0,
+            "a package symbol's history carries release edges"
         );
         assert!(
             self.literal_at_identities > 0 && self.escaped_identities > 0,

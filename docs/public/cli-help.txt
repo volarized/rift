@@ -51,6 +51,8 @@ Options:
           Executable name or relative path, started directly without a shell
       --lsp-package-manager <LSP_PACKAGE_MANAGER>
           Installation layout selecting an installed language server without an executable path [possible values: cargo, bun, npm, uv]
+      --lsp-embedded <LSP_EMBEDDED>
+          Engine this build serves in process, selected without an executable [possible values: ty]
       --lsp-argument=<LSP_ARGUMENT>
           Literal process argument, repeated for additional arguments
       --user

@@ -2928,6 +2928,54 @@ fn rust_public_reexports_keep_rust_identity_in_a_mixed_workspace() {
 }
 
 #[test]
+fn public_reexports_resolve_only_one_public_declaration_per_target() {
+    let path = ProjectPath::new("src/lib.rs").expect("source path");
+    let text = "mod shapes { pub struct Circle; pub struct Square; struct Hidden; pub fn twice() {} pub fn twice() {} }\npub use shapes::Circle as Round;\npub use shapes::Square;\npub use shapes::Hidden;\npub use shapes::twice;\npub use shapes::Circle as Disc;\n";
+    let files = [PackageSource::new(&path, text)];
+    let manifest_path = ProjectPath::new("Cargo.toml").expect("manifest path");
+    let metadata = [PackageSource::new(&manifest_path, MANIFEST)];
+    let owner = SymbolOwner::Local;
+    let language = rift_syntax::ShippedLanguage::Rust.language();
+    let limits = rift_syntax::SyntaxLimits::default();
+    let input =
+        NamespaceInput::workspace(&owner, &language, &files, &metadata, &[], (2, 4096, limits))
+            .expect("workspace");
+    let syntax = RustSyntaxProvider::default()
+        .analyze(SyntaxSource { path: &path, text }, limits)
+        .expect("Rust syntax")
+        .into_facts();
+    let selected = [super::super::SelectedFile {
+        path: &path,
+        source: text,
+        syntax: &syntax,
+    }];
+    let prepared = super::prepare(&input, &selected);
+    let exports = prepared
+        .exports
+        .iter()
+        .map(|export| (export.identity.as_str(), export.target.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        exports,
+        [
+            (
+                "rift://symbol/local/rust/crate_root/Round",
+                "rift://symbol/local/rust/crate_root/shapes/Circle"
+            ),
+            (
+                "rift://symbol/local/rust/crate_root/Square",
+                "rift://symbol/local/rust/crate_root/shapes/Square"
+            ),
+            (
+                "rift://symbol/local/rust/crate_root/Disc",
+                "rift://symbol/local/rust/crate_root/shapes/Circle"
+            ),
+        ],
+        "a private target and a target two declarations share stay unresolved"
+    );
+}
+
+#[test]
 fn public_reexports_remain_when_an_external_crate_is_declared() {
     let target = local_alias_analysis(
         &[
@@ -2978,6 +3026,7 @@ fn package_edges_reach_dependency_and_standard_library_owners() {
             .iter()
             .filter(|edge| !edge.to.as_str().contains("/serde/rust/"))
             .map(|edge| {
+                assert_eq!(edge.provider, rift_protocol::read::EdgeProvider::Static);
                 (
                     edge.from
                         .as_str()
@@ -3213,7 +3262,7 @@ fn cargo_targets_other_than_the_library_and_their_modules_sit_outside_namespaces
 }
 
 #[test]
-fn a_target_that_failed_analysis_does_not_reach_its_modules() {
+fn a_target_with_parse_errors_reaches_its_valid_modules() {
     let origin = ContributionOrigin::new(
         Some(SourceLocation::Project { package: None }),
         SourceKind::Authored,
@@ -3222,8 +3271,9 @@ fn a_target_that_failed_analysis_does_not_reach_its_modules() {
     let prepared = prepared_for_context(
         &[("Cargo.toml", MANIFEST)],
         &[
-            ("src/main.rs", "mod cli;\nfn main( {}\n"),
-            ("src/cli.rs", "pub fn run() {}\n"),
+            ("src/main.rs", "mod a;\nfn main( {}\n"),
+            ("src/a.rs", "mod b;\npub fn run( {}\n"),
+            ("src/a/b.rs", "pub fn run() {}\n"),
         ],
         None,
         false,
@@ -3237,6 +3287,144 @@ fn a_target_that_failed_analysis_does_not_reach_its_modules() {
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>(),
+        ["src/a.rs", "src/a/b.rs", "src/main.rs"]
+    );
+}
+
+#[test]
+fn library_modules_keep_identities_beside_parse_errors() {
+    let found = selected_anchors(
+        &[("Cargo.toml", MANIFEST)],
+        &[
+            ("src/lib.rs", "pub mod a;\npub fn broken( {}\n"),
+            ("src/a.rs", "pub mod b;\npub fn broken( {}\n"),
+            ("src/a/b.rs", "pub struct Sender;\n"),
+        ],
+        None,
+        false,
+    );
+    assert_eq!(
+        found["src/lib.rs"]["a"].as_str(),
+        "rift://symbol/cargo/crates.io/crate-root/rust/crate_root/a"
+    );
+    assert_eq!(
+        found["src/a.rs"]["b"].as_str(),
+        "rift://symbol/cargo/crates.io/crate-root/rust/crate_root/a/b"
+    );
+    assert_eq!(
+        found["src/a/b.rs"]["Sender"].as_str(),
+        "rift://symbol/cargo/crates.io/crate-root/rust/crate_root/a/b/Sender"
+    );
+}
+
+#[test]
+fn modules_inside_error_subtrees_are_not_followed() {
+    let text = "pub mod a;\nfn broken() { mod hidden;\n";
+    let path = ProjectPath::new("src/lib.rs").expect("source path");
+    let source = SyntaxSource { path: &path, text };
+    let provider = RustSyntaxProvider::default();
+    let limits = rift_syntax::SyntaxLimits::default();
+    let document = provider.analyze(source, limits).expect("captured syntax");
+    let hidden = document
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.name == "hidden")
+        .expect("captured module inside error subtree");
+    assert!(hidden.container.is_none());
+    let invalid = provider
+        .invalid_declarations(source, limits, &[hidden.item_range])
+        .expect("declaration validation");
+    assert!(invalid.contains(&hidden.item_range));
+    let origin = ContributionOrigin::new(
+        Some(SourceLocation::Project { package: None }),
+        SourceKind::Authored,
+    )
+    .expect("selected project origin");
+    for root in ["src/lib.rs", "src/main.rs"] {
+        let prepared = prepared_for_context(
+            &[("Cargo.toml", MANIFEST)],
+            &[
+                (root, text),
+                ("src/a.rs", "pub struct Sender;\n"),
+                ("src/hidden.rs", "pub struct Hidden;\n"),
+            ],
+            None,
+            false,
+            &SymbolOwner::Local,
+            &origin,
+            false,
+        );
+        assert!(!prepared.anchors.contains_key("src/hidden.rs"));
+        assert!(!prepared.outside_namespaces.contains("src/hidden.rs"));
+        if root == "src/lib.rs" {
+            assert!(prepared.anchors.contains_key("src/a.rs"));
+        } else {
+            assert!(prepared.outside_namespaces.contains("src/a.rs"));
+        }
+    }
+}
+
+#[test]
+fn library_and_binary_with_parse_errors_keep_the_shared_module_library_identity() {
+    let origin = ContributionOrigin::new(
+        Some(SourceLocation::Project { package: None }),
+        SourceKind::Authored,
+    )
+    .expect("selected project origin");
+    let prepared = prepared_for_context(
+        &[("Cargo.toml", MANIFEST)],
+        &[
+            ("src/lib.rs", "pub mod shared;\npub fn broken( {}\n"),
+            ("src/main.rs", "mod shared;\nfn main( {}\n"),
+            ("src/shared.rs", "pub struct Sender;\n"),
+        ],
+        None,
+        false,
+        &SymbolOwner::Local,
+        &origin,
+        false,
+    );
+    assert_eq!(
+        prepared.anchors["src/shared.rs"]["Sender"].as_str(),
+        "rift://symbol/local/rust/crate_root/shared/Sender"
+    );
+    assert_eq!(
+        prepared.outside_namespaces.into_iter().collect::<Vec<_>>(),
         ["src/main.rs"]
     );
+}
+
+#[test]
+fn partial_library_extraction_keeps_original_source_and_incomplete_coverage() {
+    let text = "pub mod a;\n}\n";
+    let analysis = local_alias_analysis(
+        &[("src/lib.rs", text), ("src/a.rs", "pub struct Sender;\n")],
+        LOCAL_ALIAS_MANIFEST,
+    );
+    let publication = analysis.publication();
+    let sender = publication
+        .objects
+        .iter()
+        .find(|object| object.name == "Sender")
+        .expect("valid module declaration");
+    assert_eq!(
+        sender.id.as_ref().expect("library identity").as_str(),
+        "rift://symbol/cargo/crates.io/serde_core/rust/serde_core/a/Sender"
+    );
+    assert!(publication.objects.iter().all(|object| object.id.is_some()));
+    let root = publication
+        .units
+        .iter()
+        .find(|unit| unit.path.0 == "src/lib.rs")
+        .expect("original root");
+    assert_eq!(root.source, text);
+    assert!(root.source_complete);
+    let parsed_root = analysis
+        .files()
+        .iter()
+        .find(|held| held.file().path().as_str() == "src/lib.rs")
+        .expect("captured root");
+    assert!(parsed_root.file().syntax().has_errors());
+    assert!(publication.coverage[0].inventory_complete);
+    assert!(!publication.coverage[0].identity_complete);
 }

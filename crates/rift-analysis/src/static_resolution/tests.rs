@@ -215,7 +215,26 @@ fn resolution(
             placement: &placed.placement,
         })
         .collect::<Vec<_>>();
-    resolve(semantics.graph(), &documents, &input, work_max)
+    let result = resolve(semantics.graph(), &documents, &input, work_max);
+    let mut edges = crate::EdgeStore::build(semantics.graph());
+    edges.add_static(
+        semantics.graph(),
+        &result.occurrences,
+        &result.external,
+        WORK_MAX,
+    );
+    for occurrence in &result.external {
+        let edge = edges
+            .incoming(&occurrence.target)
+            .iter()
+            .find(|edge| edge.occurrence() == &occurrence.binding)
+            .expect("external occurrence reaches its target");
+        assert_eq!(
+            edge.to_protocol().provider,
+            rift_protocol::read::EdgeProvider::Static
+        );
+    }
+    result
 }
 
 fn calls<'source>(
