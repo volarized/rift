@@ -109,6 +109,64 @@ impl ReadService {
     }
 }
 
+pub(super) async fn outgoing_calls(
+    reads: &ReadService,
+    engines: &EnginePool,
+    roots: &CalleeRoots,
+    seed: &SymbolId,
+    deadline: Instant,
+) -> Result<GraphCalls, RiftError> {
+    let selection = EngineInventorySelection {
+        calls: true,
+        references: false,
+        types: rift_search::sparql::TypeSelection::default(),
+        enclosing: true,
+        occurrences: None,
+        batch_inputs: rift_lsp::correlation::PENDING_REQUESTS_MAX,
+        records_max: super::TRAVERSAL_SYMBOLS_MAX,
+    };
+    let mut answer: Option<GraphCalls> = None;
+    for file in reads.engine_inventory_files(std::slice::from_ref(seed), selection)? {
+        let raw = match file.read(engines, selection, deadline).await {
+            Ok(raw) => raw,
+            Err(error)
+                if super::graph_engine_method_missing(&error)
+                    || error.slug()
+                        == rift_error::errors::server::search_coverage_unavailable::SLUG
+                    || error.slug() == rift_error::errors::lsp::engine_analyzing::SLUG =>
+            {
+                let mut captured =
+                    super::captured_graph_calls(reads, seed, TraversalDirection::Outgoing)?;
+                captured.complete = false;
+                captured.edge_warnings.push(super::engine_analysis_warning(
+                    file.language,
+                    error.detail(),
+                ));
+                return Ok(captured);
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(raw) = raw else { continue };
+        let inventory = raw.resolve(reads, roots)?;
+        for (caller, mut calls) in inventory.calls {
+            if &caller != seed {
+                continue;
+            }
+            calls
+                .edge_warnings
+                .extend(inventory.warnings.iter().cloned());
+            match &mut answer {
+                Some(answer) => answer.merge(calls),
+                None => answer = Some(calls),
+            }
+        }
+    }
+    match answer {
+        Some(answer) => Ok(answer),
+        None => super::captured_graph_calls(reads, seed, TraversalDirection::Outgoing),
+    }
+}
+
 fn inventory_file<'group>(
     grouped: &'group mut BTreeMap<ProjectPath, EngineInventoryFile>,
     file: &rift_index::IndexedFile,
@@ -776,9 +834,7 @@ fn inventory_call_sites(
     let Some(facts) = file.syntax().static_facts() else {
         return Ok(Vec::new());
     };
-    let placement = rift_syntax::DocumentPlacement::project_path(file.path())?;
     let lines = LineIndex::new(file.source());
-    let mut resolved = BTreeMap::<SymbolId, BTreeSet<rift_syntax::ByteRange>>::new();
     let mut sites = Vec::new();
     for call in facts.calls() {
         let Some(caller) =
@@ -787,21 +843,6 @@ fn inventory_call_sites(
             continue;
         };
         if !seeds.contains(&caller) {
-            continue;
-        }
-        let identity = CoreSymbolId::new(caller.as_str())?;
-        let known = resolved.entry(caller.clone()).or_insert_with(|| {
-            reads
-                .edges()
-                .outgoing(&identity)
-                .iter()
-                .filter(|edge| {
-                    edge.kind() == EdgeKind::Calls && edge.occurrence().unit() == placement.unit()
-                })
-                .filter_map(rift_index::Edge::static_callee)
-                .collect()
-        });
-        if known.contains(&call.callee_range) {
             continue;
         }
         let start = usize::try_from(call.callee_range.start).map_err(|_| graph_call_coverage())?;
@@ -917,16 +958,7 @@ fn resolve_definitions(
             }
         }
     }
-    calls
-        .into_iter()
-        .map(|(seed, answer)| {
-            let identity = CoreSymbolId::new(seed.as_str())?;
-            Ok((
-                seed,
-                CapturedCalls::read(reads, &identity, TraversalDirection::Outgoing).combine(answer),
-            ))
-        })
-        .collect()
+    Ok(calls.into_iter().collect())
 }
 
 #[cfg(test)]
@@ -935,6 +967,93 @@ mod tests {
     use rift_core::{SourceVisibility, TextFileInclusion};
     use rift_index::WorkspaceIndexLimits;
     use rift_protocol::configuration::HistoryConfiguration;
+
+    #[test]
+    fn captured_calls_still_read_the_engine_definition() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        std::fs::write(
+            directory.path().join("graph.ts"),
+            "function helper() {}\nexport function caller() { helper(); }\n",
+        )?;
+        let reads = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let file = reads
+            .index()
+            .file(&ProjectPath::new("graph.ts")?)
+            .ok_or("file")?;
+        let (seeds, _) = reads.local_search_view_input(true)?.inventory_seeds()?;
+        let caller = seeds
+            .into_iter()
+            .find(|seed| seed.as_str().ends_with("/caller"))
+            .ok_or("caller")?;
+        assert_eq!(
+            inventory_call_sites(&reads, file, &BTreeSet::from([caller]))?.len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn call_definitions_select_the_local_binding_instead_of_its_helper()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let source =
+            "function helper() {}\nconst local = helper;\nexport function caller() { local(); }\n";
+        std::fs::write(directory.path().join("graph.ts"), source)?;
+        let reads = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let path = ProjectPath::new("graph.ts")?;
+        let file = reads.index().file(&path).ok_or("file")?;
+        let (seeds, _) = reads.local_search_view_input(true)?.inventory_seeds()?;
+        let caller = seeds
+            .iter()
+            .find(|seed| seed.as_str().ends_with("/caller"))
+            .ok_or("caller")?;
+        let local = seeds
+            .iter()
+            .find(|seed| seed.as_str().ends_with("/local"))
+            .ok_or("local")?;
+        let sites = inventory_call_sites(&reads, file, &BTreeSet::from([caller.clone()]))?;
+        assert_eq!(
+            sites.len(),
+            1,
+            "a captured call still requires engine definition resolution"
+        );
+        let uri = rift_lsp::TreeRoot::new(directory.path())?.document_uri(&path)?;
+        let calls = resolve_definitions(
+            &reads,
+            directory.path(),
+            PositionEncoding::Utf8,
+            BTreeSet::from([caller.clone()]),
+            vec![InventoryDefinition {
+                caller: caller.clone(),
+                source: sites[0].source.clone(),
+                locations: vec![Location {
+                    uri,
+                    range: lsp_types::Range::new(Position::new(1, 6), Position::new(1, 11)),
+                }],
+            }],
+            true,
+        )?;
+        let [(_, answer)] = calls.as_slice() else {
+            panic!("one caller")
+        };
+        assert_eq!(
+            answer.local,
+            vec![(local.clone(), vec![sites[0].source.clone()])]
+        );
+        Ok(())
+    }
 
     #[test]
     fn implementation_answers_keep_only_direct_implements() -> Result<(), Box<dyn std::error::Error>>

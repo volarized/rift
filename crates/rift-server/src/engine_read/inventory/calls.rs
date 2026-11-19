@@ -33,14 +33,13 @@ pub(super) fn merge_calls(
 }
 
 struct DefinitionSites {
-    targets: BTreeMap<SymbolId, BTreeMap<String, CallIntervals>>,
+    units: BTreeMap<String, CallIntervals>,
 }
 
 impl DefinitionSites {
     fn new(calls: &GraphCalls) -> Self {
-        let mut targets = BTreeMap::<_, BTreeMap<_, Vec<_>>>::new();
-        for (target, ranges) in &calls.local {
-            let units = targets.entry(target.clone()).or_default();
+        let mut units = BTreeMap::<_, Vec<_>>::new();
+        for (_, ranges) in &calls.local {
             for source in ranges {
                 units
                     .entry(source.unit.as_str().to_owned())
@@ -49,34 +48,26 @@ impl DefinitionSites {
             }
         }
         Self {
-            targets: targets
+            units: units
                 .into_iter()
-                .map(|(target, units)| {
-                    (
-                        target,
-                        units
-                            .into_iter()
-                            .map(|(unit, ranges)| (unit, CallIntervals::new(ranges)))
-                            .collect(),
-                    )
-                })
+                .map(|(unit, ranges)| (unit, CallIntervals::new(ranges)))
                 .collect(),
         }
     }
 
     fn remove_repeated(&self, calls: &mut GraphCalls) {
-        calls.local.retain_mut(|(target, ranges)| {
-            let Some(units) = self.targets.get(target) else {
-                return true;
-            };
+        let retain = |ranges: &mut Vec<SourceUnitSpan>| {
             let located = !ranges.is_empty();
             ranges.retain(|source| {
-                !units
+                !self
+                    .units
                     .get(source.unit.as_str())
                     .is_some_and(|spans| spans.contains(source))
             });
-            located && !ranges.is_empty()
-        });
+            !located || !ranges.is_empty()
+        };
+        calls.local.retain_mut(|(_, ranges)| retain(ranges));
+        calls.packages.retain_mut(|(_, ranges)| retain(ranges));
     }
 }
 
@@ -113,6 +104,28 @@ mod tests {
             unit: SourceUnitId("rift://source/project/lib.rs".to_owned()),
             range: TextRange { start, end },
         }
+    }
+
+    #[test]
+    fn definition_target_replaces_a_different_hierarchy_target_at_the_same_site() {
+        let caller = SymbolId("rift://symbol/local/typescript/test/caller".to_owned());
+        let local = SymbolId("rift://symbol/local/typescript/test/local".to_owned());
+        let helper = SymbolId("rift://symbol/local/typescript/test/helper".to_owned());
+        let definition = GraphCalls {
+            local: vec![(local.clone(), vec![span(10, 30)])],
+            complete: true,
+            ..GraphCalls::default()
+        };
+        let hierarchy = GraphCalls {
+            local: vec![(helper, vec![span(10, 15)])],
+            complete: true,
+            ..GraphCalls::default()
+        };
+        let merged = merge_calls(
+            vec![(caller.clone(), hierarchy)],
+            vec![(caller, definition)],
+        );
+        assert_eq!(merged[0].1.local, vec![(local, vec![span(10, 30)])]);
     }
 
     #[test]

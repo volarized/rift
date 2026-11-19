@@ -1077,10 +1077,18 @@ pub async fn graph_calls(
     let [declaration] = declarations.as_slice() else {
         return Err(unavailable());
     };
+    let file = declaration.file;
+    if direction == TraversalDirection::Outgoing
+        && engines.engine_for(file.syntax().language()).is_some()
+    {
+        return Box::pin(inventory::outgoing_calls(
+            reads, engines, roots, seed, deadline,
+        ))
+        .await;
+    }
     if count != 1 {
         return Err(unavailable());
     }
-    let file = declaration.file;
     let static_calls = CapturedCalls::read(reads, &identity, direction);
     let Some(slot) = engines.engine_for(file.syntax().language()) else {
         return static_calls.answer().ok_or_else(unavailable);
