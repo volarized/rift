@@ -250,7 +250,7 @@ while IFS= read -r header; do
   id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
   case "$body" in
     *'"method":"initialize"'*)
-      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true,\"callHierarchyProvider\":true,\"implementationProvider\":true,\"typeHierarchyProvider\":true}}}"
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true,\"definitionProvider\":true,\"callHierarchyProvider\":true,\"implementationProvider\":true,\"typeHierarchyProvider\":true}}}"
       frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"edge/analysis","value":{"kind":"begin","title":"analysis"}}}' ;;
     *'"method":"textDocument/didOpen"'*)
       uri=$(printf '%s' "$body" | grep -o '"uri":"[^"]*"' | head -1 | cut -d '"' -f4) ;;
@@ -267,6 +267,9 @@ while IFS= read -r header; do
       frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"to\":$(item leaf 12 1 7 11),\"fromRanges\":[$(range 2 30 38)]}]}" ;;
     *'"method":"callHierarchy/incomingCalls"'*)
       frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"from\":$(item root 12 2 7 11),\"fromRanges\":[$(range 2 30 38)]}]}" ;;
+    *'"method":"textDocument/definition"'*)
+      if printf '%s' "$body" | grep -q '"line":3'; then resolved=$(range 0 11 17); else resolved=$(range 1 7 11); fi
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"uri\":\"$uri\",\"range\":$resolved}]}" ;;
     *'"method":"textDocument/references"'*)
       if printf '%s' "$body" | grep -q '"line":0'; then result="[{\"uri\":\"$uri\",\"range\":$(range 3 20 26)}]"; else result='[]'; fi
       frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":$result}" ;;
