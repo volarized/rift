@@ -1201,6 +1201,12 @@ fn map_graph_calls(
         ..GraphCalls::default()
     };
     let mut locations = 0usize;
+    let captured = held
+        .unit
+        .project_path()
+        .map(ProjectPath::new)
+        .transpose()?
+        .and_then(|path| reads.index().file(&path));
     for call in report.calls.map_err(|_| unavailable())? {
         let item = &call.to;
         let at = NamedCallee {
@@ -1226,6 +1232,7 @@ fn map_graph_calls(
         };
         let index = LineIndex::new(source);
         let mut occurrences = Vec::new();
+        let located = !call.from_ranges.is_empty();
         for range in call.from_ranges {
             locations = locations
                 .checked_add(1)
@@ -1236,6 +1243,13 @@ fn map_graph_calls(
             if source.get(start..end).is_none() {
                 return Err(unavailable());
             }
+            if held.direction == TraversalDirection::Outgoing
+                && let Some(file) = captured
+                && edge_enclosing_symbol(reads, file, start as u64, end as u64)?
+                    .is_some_and(|caller| caller.as_str() != identity.as_str())
+            {
+                continue;
+            }
             occurrences.push(SourceUnitSpan {
                 unit: unit.clone(),
                 range: TextRange {
@@ -1243,6 +1257,9 @@ fn map_graph_calls(
                     end: end as u64,
                 },
             });
+        }
+        if located && occurrences.is_empty() {
+            continue;
         }
         match neighbor {
             CalleeFile::Project(path) => {
@@ -2307,6 +2324,71 @@ mod tests {
             source.get(usize::try_from(site.range.start)?..usize::try_from(site.range.end)?),
             Some("beacon")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn graph_calls_keep_only_sites_owned_by_the_selected_callable() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let source = "pub fn leaf() {}\npub fn root() { let nested = || { leaf(); }; leaf(); }\n";
+        fs::write(directory.path().join("lib.rs"), source)?;
+        let reads = reads(directory.path())?;
+        let line = source.lines().nth(1).ok_or("caller line")?;
+        let nested = u32::try_from(line.find("leaf()").ok_or("nested call")?)?;
+        let direct = u32::try_from(line.rfind("leaf()").ok_or("direct call")?)?;
+        let mut call = item(location(directory.path(), "lib.rs", 0, 7, 11), "leaf");
+        call.from_ranges = vec![
+            Range::new(Position::new(1, nested), Position::new(1, nested + 4)),
+            Range::new(Position::new(1, direct), Position::new(1, direct + 4)),
+        ];
+        let held = super::CallGraphSource {
+            trees: [directory.path(), directory.path()],
+            source,
+            unit: crate::read::source_unit_id(&ProjectPath::new("lib.rs")?),
+            direction: rift_protocol::read::TraversalDirection::Outgoing,
+        };
+        let expected = u64::try_from(source.rfind("leaf()").ok_or("direct call")?)?;
+        for (name, ranges, start) in [
+            ("root", call.from_ranges.clone(), Some(expected)),
+            ("root", vec![call.from_ranges[0]], None),
+            (
+                "nested",
+                call.from_ranges.clone(),
+                Some(u64::try_from(source.find("leaf();").ok_or("nested call")?)?),
+            ),
+        ] {
+            let seed = rift_core::SymbolId::new(symbol(&reads, name).0)?;
+            let mut observed = call.clone();
+            observed.from_ranges = ranges;
+            let graph = super::map_graph_calls(
+                &reads,
+                &CalleeRoots::default(),
+                &seed,
+                CalleeReport {
+                    calls: Ok(vec![observed]),
+                    encoding: PositionEncoding::Utf16,
+                },
+                &held,
+            )?;
+            if let Some(start) = start {
+                let [(_, sites)] = graph.local.as_slice() else {
+                    return Err("one callee".into());
+                };
+                assert_eq!(
+                    sites.len(),
+                    1,
+                    "a nested closure owns its own call: {sites:?}"
+                );
+                assert_eq!(sites[0].range.start, start);
+            } else {
+                assert!(
+                    graph.local.is_empty(),
+                    "a filtered site is not an unlocated neighbor"
+                );
+            }
+            assert!(graph.complete);
+        }
+
         Ok(())
     }
 
