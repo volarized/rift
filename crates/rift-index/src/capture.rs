@@ -6,64 +6,36 @@
 //! tree's bytes, so each capture records every path's stat beside the digests it
 //! captured, and the next capture reads and hashes only the paths whose stat moved.
 
+mod selection;
+pub(crate) use selection::{DiscoveryInputs, SelectionInputs};
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
-#[cfg(unix)]
+use rift_core::ProjectPath;
 use rift_core::constants::RIFT_STATE_DIRECTORY;
-#[cfg(unix)]
 use tempfile::NamedTempFile;
 
 use crate::change_set::FileDigest;
 use crate::workspace::{WorkspaceIndexLimits, metadata_is_executable, read_file_bytes};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use nix::sys::statfs::statfs;
 use rift_error::{RiftError, errors};
-#[cfg(not(unix))]
 use same_file::Handle;
 
-#[cfg(target_os = "linux")]
-fn supports_stat_reuse_type(filesystem_type: nix::sys::statfs::FsType) -> bool {
-    use nix::sys::statfs::{EXT4_SUPER_MAGIC, TMPFS_MAGIC};
+/// Root identity retained while metadata observations are reused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RootIdentity(Arc<Handle>);
 
-    matches!(filesystem_type, EXT4_SUPER_MAGIC | TMPFS_MAGIC)
-}
-
-#[cfg(target_os = "macos")]
-fn supports_stat_reuse_type(filesystem_type_name: &str) -> bool {
-    matches!(filesystem_type_name, "apfs" | "hfs")
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(test)]
 pub(crate) fn supports_stat_reuse(root: &Path) -> bool {
-    statfs(root).is_ok_and(|filesystem| {
-        #[cfg(target_os = "linux")]
-        {
-            supports_stat_reuse_type(filesystem.filesystem_type())
-        }
-        #[cfg(target_os = "macos")]
-        {
-            supports_stat_reuse_type(filesystem.filesystem_type_name())
-        }
-    })
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-pub(crate) fn supports_stat_reuse(_root: &Path) -> bool {
-    false
-}
-
-#[cfg(all(not(unix), test))]
-pub(crate) fn supports_stat_reuse(_root: &Path) -> bool {
-    false
+    CaptureBoundary::create(root).is_some()
 }
 
 /// A timestamped file on the workspace filesystem, created before capture reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CaptureBoundary {
-    #[cfg(unix)]
     modified: SystemTime,
     #[cfg(unix)]
     changed_seconds: i64,
@@ -77,95 +49,77 @@ impl CaptureBoundary {
     /// Creates a boundary under `.rift`; failure disables reuse for this capture.
     pub(crate) fn create(root: &Path) -> Option<Self> {
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::fs::MetadataExt as _;
 
-            if !supports_stat_reuse(root) {
-                return None;
-            }
-            let root_metadata = fs::metadata(root).ok()?;
-            if !root_metadata.is_dir() {
-                return None;
-            }
-            let directory = root.join(RIFT_STATE_DIRECTORY);
-            match fs::create_dir(&directory) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(_) => return None,
-            }
-            let directory_metadata = fs::symlink_metadata(&directory).ok()?;
-            if !directory_metadata.is_dir() || directory_metadata.dev() != root_metadata.dev() {
-                return None;
-            }
-            let file = NamedTempFile::new_in(&directory).ok()?;
-            let metadata = file.as_file().metadata().ok()?;
-            if metadata.dev() != root_metadata.dev() {
-                return None;
-            }
-            let modified = metadata.modified().ok()?;
-            Some(Self {
-                modified,
-                changed_seconds: metadata.ctime(),
-                changed_nanoseconds: metadata.ctime_nsec(),
-                device: metadata.dev(),
-            })
+        let root_metadata = fs::metadata(root).ok()?;
+        if !root_metadata.is_dir() {
+            return None;
         }
-        #[cfg(not(unix))]
-        {
-            let _ = root;
-            None
+        let directory = root.join(RIFT_STATE_DIRECTORY);
+        match fs::create_dir(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return None,
         }
+        let directory_metadata = fs::symlink_metadata(&directory).ok()?;
+        if !directory_metadata.is_dir() {
+            return None;
+        }
+        let file = NamedTempFile::new_in(&directory).ok()?;
+        let metadata = file.as_file().metadata().ok()?;
+        #[cfg(unix)]
+        if metadata.dev() != root_metadata.dev() {
+            return None;
+        }
+        Some(Self {
+            modified: metadata.modified().ok()?,
+            #[cfg(unix)]
+            changed_seconds: metadata.ctime(),
+            #[cfg(unix)]
+            changed_nanoseconds: metadata.ctime_nsec(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+        })
     }
 
-    #[cfg(unix)]
     fn proves_old_file(self, stat: FileStat) -> bool {
-        stat.modified
-            .is_some_and(|modified| modified < self.modified)
-            && stat.status.device == self.device
+        let old_modified = stat
+            .modified
+            .is_some_and(|modified| modified < self.modified);
+        #[cfg(unix)]
+        let old_status = stat.status.device == self.device
             && (stat.status.changed_seconds, stat.status.changed_nanoseconds)
-                < (self.changed_seconds, self.changed_nanoseconds)
+                < (self.changed_seconds, self.changed_nanoseconds);
+        #[cfg(not(unix))]
+        let old_status = true;
+        old_modified && old_status
     }
 
-    #[cfg(unix)]
     fn is_not_before(self, previous: Self) -> bool {
-        self.device == previous.device
-            && self.modified >= previous.modified
+        #[cfg(unix)]
+        let status_follows = self.device == previous.device
             && (self.changed_seconds, self.changed_nanoseconds)
-                >= (previous.changed_seconds, previous.changed_nanoseconds)
-    }
-
-    #[cfg(not(unix))]
-    fn proves_old_file(self, _stat: FileStat) -> bool {
-        false
-    }
-
-    #[cfg(not(unix))]
-    fn is_not_before(self, _previous: Self) -> bool {
-        false
+                >= (previous.changed_seconds, previous.changed_nanoseconds);
+        #[cfg(not(unix))]
+        let status_follows = true;
+        self.modified >= previous.modified && status_follows
     }
 }
 
-#[cfg(unix)]
-pub(crate) fn root_identity(root: &Path) -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    let metadata = fs::metadata(root).ok()?;
-    Some((metadata.dev(), metadata.ino()))
-}
-
-#[cfg(not(unix))]
-pub(crate) fn root_identity(_root: &Path) -> Option<(u64, u64)> {
-    None
+pub(crate) fn root_identity(root: &Path) -> Option<RootIdentity> {
+    Handle::from_path(root)
+        .ok()
+        .map(|handle| RootIdentity(Arc::new(handle)))
 }
 
 /// Each path's stat and digests from the last request-time capture, so the next capture
 /// reads and hashes only the paths whose stat moved.
 ///
-/// A stat is the file's length and modification time, and on unix also its status change
-/// time, device, inode, and mode. A capture reuses a digest only when its stat still
-/// matches and both timestamps precede the boundary that validated the bytes. Reuse keeps
-/// that original boundary; it does not renew it. Only selected filesystem types reuse
-/// digests; every other type reads every file again.
+/// A stat records length, modification and creation times, and read-only permissions.
+/// Unix metadata also records status-change time, device, inode, and mode. A capture
+/// reuses digests only when the stat matches and modification time precedes the filesystem
+/// boundary that validated the bytes; Unix status-change time must precede it too.
+/// Reuse retains that original boundary, preventing reuse within the same timestamp tick.
 ///
 /// A record holds the paths of one capture alone, so it stays within `files_max`, and it
 /// is reused only under the limits, root identity, and filesystem boundary it was captured
@@ -174,10 +128,27 @@ pub(crate) fn root_identity(_root: &Path) -> Option<(u64, u64)> {
 #[derive(Default)]
 pub struct LastCapture {
     limits: Option<WorkspaceIndexLimits>,
-    paths: HashMap<PathBuf, CapturedPath>,
+    paths: HashMap<PathBuf, RecordedPath>,
+    pub(crate) selection: Option<Arc<CaptureSelection>>,
     read: usize,
     boundary: Option<CaptureBoundary>,
-    root_identity: Option<(u64, u64)>,
+    root_identity: Option<RootIdentity>,
+}
+
+/// One path's metadata and its validated project-relative spelling, when indexed.
+struct RecordedPath {
+    capture: CapturedPath,
+    project: Option<Arc<ProjectPath>>,
+}
+
+/// Paths selected under one canonical root, including files the byte capture refused.
+#[derive(Clone, Debug)]
+pub(crate) struct CaptureSelection {
+    pub(crate) root: PathBuf,
+    pub(crate) source: Vec<PathBuf>,
+    pub(crate) other: Vec<PathBuf>,
+    pub(crate) inputs: Option<Arc<SelectionInputs>>,
+    pub(crate) boundary: Option<CaptureBoundary>,
 }
 
 impl LastCapture {
@@ -186,15 +157,25 @@ impl LastCapture {
         limits: WorkspaceIndexLimits,
         paths: usize,
         boundary: Option<CaptureBoundary>,
-        root_identity: Option<(u64, u64)>,
+        root_identity: Option<RootIdentity>,
     ) -> Self {
         Self {
             limits: Some(limits),
             paths: HashMap::with_capacity(paths),
+            selection: None,
             read: 0,
             boundary,
             root_identity,
         }
+    }
+
+    pub(crate) fn selection_for(
+        &self,
+        limits: WorkspaceIndexLimits,
+    ) -> Option<&Arc<CaptureSelection>> {
+        (self.limits == Some(limits))
+            .then_some(self.selection.as_ref())
+            .flatten()
     }
 
     /// How many paths the capture that recorded this read and hashed; every other path
@@ -211,14 +192,14 @@ impl LastCapture {
         stat: FileStat,
         limits: WorkspaceIndexLimits,
         boundary: Option<CaptureBoundary>,
-        root_identity: Option<(u64, u64)>,
+        root_identity: Option<&RootIdentity>,
     ) -> Option<CapturedPath> {
         let (Some(previous_boundary), Some(boundary)) = (self.boundary, boundary) else {
             return None;
         };
         if self.limits != Some(limits)
             || stat.modified.is_none()
-            || self.root_identity != root_identity
+            || self.root_identity.as_ref() != root_identity
             || self.root_identity.is_none()
             || !boundary.is_not_before(previous_boundary)
         {
@@ -226,6 +207,7 @@ impl LastCapture {
         }
         self.paths
             .get(path)
+            .map(|recorded| &recorded.capture)
             .filter(|captured| {
                 captured.stat == stat
                     && captured
@@ -236,20 +218,50 @@ impl LastCapture {
     }
 
     pub(crate) fn captured(&self, path: &Path) -> Option<CapturedPath> {
-        self.paths.get(path).copied()
+        self.paths.get(path).map(|recorded| recorded.capture)
+    }
+
+    pub(crate) fn project_path(&self, root: &Path, path: &Path) -> Option<&Arc<ProjectPath>> {
+        self.selection
+            .as_ref()
+            .filter(|selection| selection.root == root)?;
+        self.paths.get(path)?.project.as_ref()
+    }
+
+    /// Caches validation only for a path whose metadata this capture already recorded.
+    pub(crate) fn remember_project_path(&mut self, path: &Path, project: Arc<ProjectPath>) {
+        if let Some(recorded) = self.paths.get_mut(path) {
+            recorded.project = Some(project);
+        }
     }
 
     pub(crate) const fn boundary(&self) -> Option<CaptureBoundary> {
         self.boundary
     }
 
-    pub(crate) const fn root_identity(&self) -> Option<(u64, u64)> {
-        self.root_identity
+    pub(crate) fn root_identity(&self) -> Option<RootIdentity> {
+        self.root_identity.clone()
     }
 
     /// Records one captured path, counting it when it was read.
     pub(crate) fn record(&mut self, path: &Path, captured: CapturedPath, was_read: bool) {
-        self.paths.insert(path.to_path_buf(), captured);
+        self.record_projected(path, captured, was_read, None);
+    }
+
+    pub(crate) fn record_projected(
+        &mut self,
+        path: &Path,
+        captured: CapturedPath,
+        was_read: bool,
+        project: Option<Arc<ProjectPath>>,
+    ) {
+        self.paths.insert(
+            path.to_path_buf(),
+            RecordedPath {
+                capture: captured,
+                project,
+            },
+        );
         self.read += usize::from(was_read);
     }
 }
@@ -271,7 +283,7 @@ pub(crate) fn capture_path(
     limits: WorkspaceIndexLimits,
     last: &LastCapture,
     boundary: Option<CaptureBoundary>,
-    root_identity: Option<(u64, u64)>,
+    root_identity: Option<&RootIdentity>,
 ) -> Result<(CapturedPath, bool), RiftError> {
     capture_path_with(path, limits, last, boundary, root_identity, || {})
 }
@@ -281,10 +293,15 @@ fn capture_path_with(
     limits: WorkspaceIndexLimits,
     last: &LastCapture,
     boundary: Option<CaptureBoundary>,
-    root_identity: Option<(u64, u64)>,
+    root_identity: Option<&RootIdentity>,
     before_open: impl FnOnce(),
 ) -> Result<(CapturedPath, bool), RiftError> {
-    let metadata = fs::metadata(path).map_err(|error| capture_io_error(path, error))?;
+    let metadata = fs::symlink_metadata(path).map_err(|error| capture_io_error(path, error))?;
+    if !metadata.is_file() {
+        return errors::index::workspace_changed_during_capture()
+            .path(path)
+            .fail();
+    }
     let stat = FileStat::of(&metadata);
     if let Some(captured) = last.reusable(path, stat, limits, boundary, root_identity) {
         return Ok((captured, false));
@@ -319,6 +336,8 @@ impl CapturedPath {
 struct FileStat {
     length: u64,
     modified: Option<SystemTime>,
+    created: Option<SystemTime>,
+    readonly: bool,
     #[cfg(unix)]
     status: UnixStatus,
 }
@@ -340,6 +359,8 @@ impl FileStat {
         Self {
             length: metadata.len(),
             modified: metadata.modified().ok(),
+            created: metadata.created().ok(),
+            readonly: metadata.permissions().readonly(),
             #[cfg(unix)]
             status: UnixStatus::of(metadata),
         }
@@ -479,27 +500,6 @@ mod tests {
     use super::{LastCapture, capture_path_with};
     use crate::workspace::WorkspaceIndexLimits;
     use rift_error::errors;
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn test_stat_reuse_filesystem_allowlist_is_closed() {
-        use nix::sys::statfs::{EXT4_SUPER_MAGIC, OVERLAYFS_SUPER_MAGIC, TMPFS_MAGIC};
-
-        assert!(super::supports_stat_reuse_type(EXT4_SUPER_MAGIC));
-        assert!(super::supports_stat_reuse_type(TMPFS_MAGIC));
-        assert!(!super::supports_stat_reuse_type(OVERLAYFS_SUPER_MAGIC));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn test_stat_reuse_filesystem_allowlist_is_closed() {
-        for supported in ["apfs", "hfs"] {
-            assert!(super::supports_stat_reuse_type(supported));
-        }
-        for unsupported in ["msdos", "exfat", "nfs", "unknown"] {
-            assert!(!super::supports_stat_reuse_type(unsupported));
-        }
-    }
 
     #[test]
     fn test_capture_refuses_path_replaced_after_read() {

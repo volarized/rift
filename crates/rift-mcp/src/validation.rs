@@ -741,6 +741,8 @@ impl IndexState {
 #[derive(Debug)]
 pub(crate) struct IndexValidation {
     pub(crate) observed_epoch: Arc<AtomicU64>,
+    /// Last observation that can change the selected path set.
+    discovery_epoch: AtomicU64,
     pub(crate) watch_failed: Arc<AtomicBool>,
     pub(crate) invalidations: mpsc::Sender<()>,
     pub(crate) changed: Arc<Notify>,
@@ -1091,6 +1093,7 @@ impl IndexValidation {
         (
             Arc::new(Self {
                 observed_epoch: Arc::new(AtomicU64::new(0)),
+                discovery_epoch: AtomicU64::new(0),
                 watch_failed: Arc::new(AtomicBool::new(false)),
                 supervisor_running: Arc::new(AtomicBool::new(true)),
                 invalidations,
@@ -1149,7 +1152,18 @@ impl IndexValidation {
         paths: impl IntoIterator<Item = ProjectPath>,
     ) -> Result<u64, RiftError> {
         let mut publication = self.locked_pending();
-        publication.retain(paths, self.paths_max);
+        let current = self.current_publication();
+        let mut discovery_required = false;
+        publication.retain(
+            paths.into_iter().inspect(|path| {
+                discovery_required |= Self::path_requires_discovery(current.as_deref(), path);
+            }),
+            self.paths_max,
+        );
+        drop(current);
+        if discovery_required {
+            self.invalidate_discovery_locked();
+        }
         let result = self.observe_locked(&mut publication, WATCH_ROUTE_PATHS);
         drop(publication);
         result
@@ -1221,6 +1235,9 @@ impl IndexValidation {
         pending: &mut PendingWork,
         event: &'static str,
     ) -> Result<u64, RiftError> {
+        if pending.whole_workspace {
+            self.invalidate_discovery_locked();
+        }
         let previous = self
             .observed_epoch
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |epoch| {
@@ -1253,6 +1270,26 @@ impl IndexValidation {
             }
         }
         Ok(epoch)
+    }
+
+    /// Invalidates selection before advancing the observation, under the publication lane.
+    fn invalidate_discovery_locked(&self) {
+        self.discovery_epoch
+            .store(self.observed_epoch().saturating_add(1), Ordering::SeqCst);
+    }
+
+    fn path_requires_discovery(current: Option<&PublishedWorkspace>, path: &ProjectPath) -> bool {
+        let policy_file = path.as_str() == WORKSPACE_CONFIGURATION_FILE
+            || Path::new(path.as_str()).file_name() == Some(std::ffi::OsStr::new(VCS_IGNORE_FILE));
+        policy_file || current.is_none_or(|current| current.file_record(path).is_none())
+    }
+
+    /// Reads the selection position under observation's publication lane.
+    pub(crate) fn discovery_epoch(&self) -> u64 {
+        let publication = self.locked_pending();
+        let epoch = self.discovery_epoch.load(Ordering::SeqCst);
+        drop(publication);
+        epoch
     }
 
     /// Returns latest filesystem-event epoch.
@@ -1329,6 +1366,14 @@ impl IndexValidation {
                 self.observe_locked(&mut publication, route).map(Some)
             }
             WatchImpact::Paths(paths) => {
+                let current = self.current_publication();
+                let discovery_required = paths
+                    .iter()
+                    .any(|path| Self::path_requires_discovery(current.as_deref(), path));
+                drop(current);
+                if discovery_required {
+                    self.invalidate_discovery_locked();
+                }
                 publication.retain(paths, self.paths_max);
                 self.observe_locked(&mut publication, route).map(Some)
             }
