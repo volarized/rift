@@ -113,7 +113,8 @@ fn reference_entry(
     }
 }
 
-/// Writes the history: one entry per edge, commit edges newest first, then co-changes.
+/// Writes the history: one entry per edge, commit edges newest first, then co-changes, or
+/// release edges newest release first.
 fn history_section(
     lines: &mut Lines<'_>,
     history: &SymbolHistory,
@@ -155,7 +156,8 @@ fn history_section(
 
 /// Writes one edge. A commit edge reads date, commit, edge, the change or the path the
 /// declaration came from, author, its path when the declaration lived elsewhere, and the
-/// commit summary below; a co-change reads the other symbol and the shared commit count.
+/// commit summary below; a co-change reads the other symbol and the shared commit count; a
+/// release edge reads the release version, edge, and the change.
 fn edge_entry(
     lines: &mut Lines<'_>,
     edge: &HistoryEdge,
@@ -179,6 +181,13 @@ fn edge_entry(
             facts.push(&format!("{commits} commits"));
             return lines.line(ENTRY_INDENT, facts.as_str());
         }
+        HistoryEdge::IntroducedInRelease { revision }
+        | HistoryEdge::RemovedInRelease { revision } => {
+            return release_entry(lines, edge, revision, None);
+        }
+        HistoryEdge::ChangedInRelease { revision, change } => {
+            return release_entry(lines, edge, revision, Some(&spaced_name(change)?));
+        }
     };
     let HistoryCommit {
         revision,
@@ -197,6 +206,22 @@ fn edge_entry(
     }
     lines.line(ENTRY_INDENT, facts.as_str())?;
     lines.line(DETAIL_INDENT, summary.as_deref().unwrap_or_default())
+}
+
+/// Writes one release edge: the release version, the edge, and the change it names.
+fn release_entry(
+    lines: &mut Lines<'_>,
+    edge: &HistoryEdge,
+    revision: &Revision,
+    change: Option<&str>,
+) -> Result<(), TextError> {
+    let mut facts = Facts::default();
+    facts.push_value(revision.release_version().unwrap_or_default());
+    facts.push(&edge_name(edge)?);
+    if let Some(change) = change {
+        facts.push(change);
+    }
+    lines.line(ENTRY_INDENT, facts.as_str())
 }
 
 /// The wire tag of `edge` with underscores written as spaces, such as `introduced in`.

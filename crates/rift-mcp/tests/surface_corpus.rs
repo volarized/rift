@@ -25,6 +25,11 @@ pub(crate) fn corpus() -> Vec<(&'static str, Value)> {
             "get_symbol",
             json!({ "name": "helper_beacon", "scope": "global" }),
         ),
+        // The fixture global API answers a package symbol's history with release edges.
+        (
+            "get_symbol",
+            json!({ "name": "helper_beacon", "scope": "global", "include": {"history": true} }),
+        ),
         ("search", json!({ "query": "beacon", "scope": "all" })),
         // The fixture's committed baseline serves the timeline: one
         // `introduced` version from the walk's first commit.
@@ -353,8 +358,8 @@ fn package_argument_corpus() -> Vec<(&'static str, Value)> {
 fn traversal_search_corpus() -> Vec<(&'static str, Value)> {
     [
         format!("SELECT ?usage ?unit ?start ?end {{ <{TRAVERSAL_CALLEE}> :usages ?usage . ?usage :unit ?unit; :start ?start; :end ?end }} ORDER BY ?unit ?start"),
-        format!("SELECT DISTINCT ?caller {{ ?caller :references <{TRAVERSAL_CALLEE}> }}"),
-        format!("SELECT DISTINCT ?caller {{ ?caller :references+ <{TRAVERSAL_CALLEE}> }}"),
+        format!("SELECT DISTINCT ?caller {{ ?caller :references <{TRAVERSAL_CALLEE}> }} ORDER BY ?caller"),
+        format!("SELECT DISTINCT ?caller {{ ?caller :references+ <{TRAVERSAL_CALLEE}> }} ORDER BY ?caller"),
         format!("SELECT ?caller {{ ?caller :references <{TRAVERSAL_CALLEE}> FILTER(?caller = <{TRAVERSAL_CALLER}>) }}"),
         format!("SELECT ?callee {{ <{TRAVERSAL_CALLER}> :calls ?callee }}"),
         format!("SELECT ?callee {{ <{TRAVERSAL_CALLER}> :calls/:calls ?callee }}"),

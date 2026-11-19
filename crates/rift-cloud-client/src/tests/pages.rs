@@ -67,14 +67,13 @@ fn test_advertised_page_limit_cuts_the_caller_limit() {
     assert_eq!(advertised_page_limit(20, &capabilities), 20);
 }
 
-/// The first page stopped at the response body bound, marked `result_truncated`, and the page
-/// its cursor leads to.
+/// Returns the requested fixture page; the first carries `result_truncated` at the body bound.
 pub(super) fn body_bound_page(
     mut first: serde_json::Value,
     second: serde_json::Value,
-    cursor: Option<&str>,
+    page: Option<&str>,
 ) -> serde_json::Value {
-    if cursor.is_some() {
+    if page.is_some() {
         return second;
     }
     first["warnings"] = serde_json::json!([
@@ -94,7 +93,7 @@ async fn a_short_page_above_its_reported_total_refuses() {
 }
 
 /// Symbol page assembly refuses a page that changes revision, repeats a declaration, or
-/// repeats a cursor, and records the refusal a later request answers; it stops at the
+/// repeats a page, and records the refusal a later request answers; it stops at the
 /// advertised candidate bound.
 #[tokio::test]
 async fn test_fixture_search_page_assembly_records_refusals() {

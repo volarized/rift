@@ -40,7 +40,7 @@ fn assert_runtime_library_root(name: &str) {
     let (owner, origin) = python_runtime(name, "3.14.7");
     let language = rift_syntax::ShippedLanguage::Python.language();
     let path = ProjectPath::new("json/__init__.py").expect("original selected path");
-    let text = "def dumps(obj):\n    return str(obj)\n\ndef loads(text):\n    return text\n";
+    let text = "\"\"\"JSON module.\"\"\"\ndef dumps(obj):\n    return str(obj)\n\ndef loads(text):\n    return text\n";
     let files = [PackageSource::new(&path, text)];
     let roots = [PackageImportRoot::runtime(owner.clone(), None).expect("selected runtime layout")];
     let input = ExactPackageInput::new(
@@ -59,7 +59,18 @@ fn assert_runtime_library_root(name: &str) {
     assert_eq!(publication.units[0].path.0, path.as_str());
     assert_eq!(publication.units[0].source, text);
     assert!(publication.units[0].source_complete);
-    assert_eq!(publication.objects.len(), 2);
+    let module = publication
+        .objects
+        .iter()
+        .find(|object| object.kind.0 == "module")
+        .expect("the file declares its module");
+    assert_eq!(
+        module.id.as_ref().expect("canonical module object").0,
+        format!("rift://symbol/stdlib/{name}/python/json")
+    );
+    assert_eq!(module.name, "json");
+    assert_eq!(module.documentation[0].text, "JSON module.");
+    assert_eq!(publication.objects.len(), 3);
     for declaration_name in ["dumps", "loads"] {
         let object = publication
             .objects
@@ -201,7 +212,7 @@ fn unknown_runtime_layout_retains_original_declarations_without_identity() {
     let analysis = PackageAnalyzer::analyze(input, 1).expect("raw runtime publication");
     let publication = analysis.publication();
     assert_eq!(publication.units[0].source, text);
-    assert_eq!(publication.objects.len(), 2);
+    assert_eq!(publication.objects.len(), 3);
     assert!(publication.objects.iter().all(|object| object.id.is_none()));
     assert!(publication.declarations.is_empty());
 }
@@ -282,5 +293,115 @@ fn runtime_root_cannot_assign_same_source_bytes_to_package_or_local_owner() {
             Some(ProjectPath::new("").expect("captured root path"))
         )
         .is_err()
+    );
+}
+
+/// A package module's explicit re-export, `from .decoder import JSONDecoder
+/// as JSONDecoder`, places an alias at the package's own import path that
+/// targets the defining module's declaration, as do absolute and chained
+/// re-exports; a plain import, an unresolved module, and a name the target
+/// module does not declare place none.
+#[test]
+fn explicit_python_reexports_alias_the_defining_declaration() {
+    let (owner, origin) = runtime("3.14.7");
+    let language = rift_syntax::ShippedLanguage::Python.language();
+    let selected = [
+        (
+            "json/__init__.py",
+            "from .decoder import JSONDecoder as JSONDecoder\n\
+             from json.encoder import JSONEncoder as JSONEncoder\n\
+             from .tool import Reader as Reader\n\
+             from .decoder import helper\n\
+             from .missing import Gone as Gone\n\
+             from .decoder import Absent as Absent\n",
+        ),
+        (
+            "json/decoder.py",
+            "class JSONDecoder:\n    pass\n\ndef helper():\n    pass\n",
+        ),
+        ("json/encoder.py", "class JSONEncoder:\n    pass\n"),
+        ("json/tool.py", "from .reader import Reader as Reader\n"),
+        ("json/reader.py", "class Reader:\n    pass\n"),
+    ];
+    let paths = selected
+        .iter()
+        .map(|(path, _)| ProjectPath::new(*path).expect("original path"))
+        .collect::<Vec<_>>();
+    let files = paths
+        .iter()
+        .zip(&selected)
+        .map(|(path, (_, text))| PackageSource::new(path, text))
+        .collect::<Vec<_>>();
+    let roots = [PackageImportRoot::runtime(owner.clone(), None).expect("selected runtime layout")];
+    let input = ExactPackageInput::new(
+        &owner,
+        &language,
+        &origin,
+        &files,
+        ExactPackageLimits::new(8, 16 * 1024),
+    )
+    .expect("selected sources")
+    .with_import_roots(&roots)
+    .expect("same owner and original layout");
+    let analysis = PackageAnalyzer::analyze(input, 1).expect("runtime publication");
+    let publication = analysis.publication();
+    let prefix = "rift://symbol/stdlib/python/python/";
+    let mut aliases = publication
+        .edges
+        .iter()
+        .filter(|edge| edge.kind.0 == rift_protocol::read::EdgeKind::Aliases.as_ref())
+        .filter_map(|edge| {
+            Some((
+                edge.from.as_str().strip_prefix(prefix)?.to_owned(),
+                edge.to.as_str().strip_prefix(prefix)?.to_owned(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    aliases.sort();
+    assert_eq!(
+        aliases,
+        [
+            (
+                "json/JSONDecoder".to_owned(),
+                "json/decoder/JSONDecoder".to_owned()
+            ),
+            (
+                "json/JSONEncoder".to_owned(),
+                "json/encoder/JSONEncoder".to_owned()
+            ),
+            ("json/Reader".to_owned(), "json/reader/Reader".to_owned()),
+            (
+                "json/tool/Reader".to_owned(),
+                "json/reader/Reader".to_owned()
+            ),
+        ]
+    );
+    let alias = publication
+        .objects
+        .iter()
+        .find(|object| {
+            object
+                .id
+                .as_ref()
+                .is_some_and(|id| id.0 == format!("{prefix}json/JSONDecoder"))
+        })
+        .expect("the alias is an addressable symbol");
+    assert_eq!(alias.name, "JSONDecoder");
+}
+
+#[test]
+fn python_relative_imports_refuse_a_parent_past_the_top_level_package() {
+    let module = vec!["json".to_owned(), "tool".to_owned()];
+    assert_eq!(
+        super::python::exports::python_import_target(&module, false, "..json.reader"),
+        None
+    );
+    assert_eq!(
+        super::python::exports::python_import_target(&module, false, ".reader"),
+        Some(vec!["json".to_owned(), "reader".to_owned()])
+    );
+    assert_eq!(
+        super::python::exports::python_import_target(&["json".to_owned()], true, "..json.reader"),
+        None
     );
 }

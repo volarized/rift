@@ -99,6 +99,13 @@ a [`get_symbol`](/docs/mcp#tool-get_symbol) declaration binding, addressed by `u
 of the `path` a project declaration carries. The logical symbol identity remains separate from
 that physical source address.
 
+## Edge provider
+
+Every `Edge` carries `provider`: `static` for static analysis
+captured into the index, `engine` for a language engine embedded in Rift, or `lsp` for a
+language server reached through LSP. Its `derivation` records resolution, syntax, or heuristic
+analysis; its optional `producer` names the external producer. Package edges carry the same fields.
+
 ## History facts
 
 The `history` family is resolved from the workspace's version-control history rather than from
@@ -110,6 +117,11 @@ symbol's history as edges. Each commit edge, a
 `rift://revision/git/<commit>` revision, its author and time, and the path the declaration lived
 at in it. A `co_changes` edge names another symbol and the number of listed commits that changed
 both.
+
+A package or runtime symbol has no commits in the workspace, so its history comes from the global
+API as release edges: `introduced_in_release`, `changed_in_release`, or `removed_in_release`, each
+naming a release of the symbol's owner as a `rift://revision/cargo/crates.io/demo@1.0.0`
+revision. A release history carries no commit or `co_changes` edge.
 
 The history store keys each declaration change by the path and qualified name the commit held. A
 [`SymbolId`](/docs/developer/protocol/reference#SymbolId) depends on the module layout of the tree

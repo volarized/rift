@@ -289,19 +289,6 @@ jobs:
         timeout-minutes: 12
         env:
           NEXTEST_PROFILE: ci
-      - name: Measure retained material accounting
-        if: ${{ !cancelled() && steps.rust_tests.outcome != 'skipped' }}
-        timeout-minutes: 5
-        run: |
-          RIFT_RETAINED_MATERIAL_ROOT="$(uv run --locked --project dev rift-dev corpus sync bun)"
-          export RIFT_RETAINED_MATERIAL_ROOT
-          uv run --locked --project dev rift-dev test nextest run \
-            --workspace-remap . \
-            --cargo-metadata target/llvm-cov-target/target/nextest/cargo-metadata.json \
-            --binaries-metadata target/llvm-cov-target/target/nextest/binaries-metadata.json \
-            --target-dir-remap target/llvm-cov-target/target \
-            --profile corpus --no-tests fail --run-ignored all \
-            -E 'test(=read::canonical::tests::captured_preparation_views_measure_shared_accounting_cost)'
       - name: Preserve Rust coverage and test results
         if: ${{ !cancelled() && steps.rust_tests.outcome != 'skipped' }}
         uses: actions/upload-artifact@v7.0.2
@@ -310,7 +297,6 @@ jobs:
           path: |
             lcov.info
             target/nextest/ci/junit.xml
-            target/nextest/corpus/junit.xml
             target/nextest/ci/failure-windows/
             target/integration/nextest/
             !target/integration/nextest/**/archive/**
@@ -792,6 +778,14 @@ jobs:
             case: stop
             test: test_bun_stop
             minutes: 10
+          # #733/#730 took 273/275 s; #734 reached 292 s of test work
+          # after 11 s of sync (303 s total). Use the Bun corpus bounds:
+          # 540 - 292 = 248 s test headroom; 600 - 540 - 30 s cleanup
+          # leaves 30 s for sync and archive setup in this 10-minute step.
+          - repository: bun
+            case: retained-material
+            test: read::canonical::tests::captured_preparation_views_measure_shared_accounting_cost
+            minutes: 10
           - repository: nextjs
             case: workspace
             test: test_nextjs_corpus
@@ -831,7 +825,22 @@ jobs:
         timeout-minutes: ${{ matrix.minutes }}
         env:
           RIFT_CORPUS_REPORT: ${{ github.workspace }}/target/corpus/${{ matrix.repository }}.json
-        run: just corpus-test "${{ matrix.repository }}" "${{ matrix.test }}" target/integration.tar.zst
+          CORPUS_REPOSITORY: ${{ matrix.repository }}
+          CORPUS_CASE: ${{ matrix.case }}
+          CORPUS_TEST: ${{ matrix.test }}
+        run: |
+          if [ "$CORPUS_CASE" = retained-material ]; then
+            RIFT_RETAINED_MATERIAL_ROOT="$(just corpus-sync "$CORPUS_REPOSITORY")"
+            export RIFT_RETAINED_MATERIAL_ROOT
+            mkdir -p target/llvm-cov-target
+            uv run --locked --project dev rift-dev test nextest --coverage run \
+              --archive-file target/integration.tar.zst --extract-overwrite \
+              --workspace-remap . \
+              --profile corpus --no-tests fail --run-ignored all \
+              -E "test(=$CORPUS_TEST)"
+          else
+            just corpus-test "$CORPUS_REPOSITORY" "$CORPUS_TEST" target/integration.tar.zst
+          fi
       - name: Report corpus coverage
         if: ${{ !cancelled() && steps.corpus.outcome != 'skipped' }}
         # `generate-check` validates generated wire bytes; coverage measures maintained Rust source.

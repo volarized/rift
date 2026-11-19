@@ -3,6 +3,8 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use sha2::{Digest as _, Sha256};
+
 use rift_error::{RiftError, errors};
 use rift_protocol::query::{
     QueryAnswer, QueryConfiguration, QueryParams, QueryReadResult, QueryResult,
@@ -87,6 +89,20 @@ impl RiftMcp {
         // Every read of the query's retrieval requests comes after this line, so each
         // one meets the scope the accepted workspace selects.
         let query = query.with_default_scope(&default_scope);
+        let key = query_key(&query, params.language, &revision, resolved.published.epoch)
+            .map_err(read_failure)?;
+        let configuration = resolved
+            .published
+            .configuration
+            .search_configuration()
+            .query;
+        if params.revision.as_ref() == Some(&revision)
+            && let Some(output) = self
+                .retained_query_page(key, paging, revision.clone(), configuration, deadline)
+                .await?
+        {
+            return Ok(output);
+        }
         let graph = match Box::pin(self.prepare_graph(resolved, &query, limits, deadline)).await? {
             Ok(graph) => graph,
             Err(unavailable) => return Ok(Json(QueryReadResult::Unavailable(unavailable).into())),
@@ -97,7 +113,7 @@ impl RiftMcp {
         tokio::time::timeout_at(
             deadline.at(),
             self.blocking.run("graph query", move || {
-                graph.evaluate(&query, deadline, &cancellation, &views, paging)
+                graph.evaluate(&query, deadline, &cancellation, &views, paging, key)
             }),
         )
         .await
@@ -108,6 +124,45 @@ impl RiftMcp {
             }
             Json(output)
         })
+        .map_err(read_failure)
+    }
+
+    async fn retained_query_page(
+        &self,
+        key: [u8; 32],
+        paging: (u64, u64),
+        revision: rift_protocol::revision::Revision,
+        configuration: QueryConfiguration,
+        deadline: RequestDeadline,
+    ) -> Result<Option<Json<QueryOutput>>, ToolFailure> {
+        let views = Arc::clone(&self.local_views);
+        tokio::time::timeout_at(
+            deadline.at(),
+            self.blocking.run("retained query page", move || {
+                let Some((view, bytes)) = views.get().and_then(|views| views.query(&key)) else {
+                    return Ok(None);
+                };
+                let (answer, warnings, display): (QueryAnswer, Vec<ReadWarning>, QueryDisplay) =
+                    serde_json::from_slice(&bytes).map_err(encoding_failure)?;
+                let mut output = query_page(
+                    &view,
+                    &answer,
+                    QueryPageOptions {
+                        configuration: &configuration,
+                        page: paging.0,
+                        max_results: paging.1,
+                        warnings,
+                        display,
+                    },
+                )?;
+                if let QueryReadResult::Results(answer) = &mut output.result {
+                    answer.revision = Some(revision);
+                }
+                Ok(Some(Json(output)))
+            }),
+        )
+        .await
+        .map_err(|_| read_failure(deadline_failure(deadline.budget())))?
         .map_err(read_failure)
     }
 
@@ -389,7 +444,7 @@ fn project_semantic_inventory(
     acquired.project_local(
         dataset,
         input,
-        required.references || required.calls,
+        required.edges || required.references || required.calls,
         required.occurrences,
     )
 }
@@ -421,6 +476,7 @@ impl AcquiredGraph {
         cancellation: &QueryCancellation,
         views: &std::sync::OnceLock<rift_server::LocalSymbolViews>,
         paging: (u64, u64),
+        key: [u8; 32],
     ) -> Result<QueryOutput, RiftError> {
         let Self {
             limits,
@@ -434,7 +490,7 @@ impl AcquiredGraph {
             mut warnings,
         } = self;
         if acquired.is_incomplete() && !query.admits_partial_witness() {
-            return Ok(query_unavailable(SymbolUnavailableReason::InsufficientCoverage).into());
+            return Ok(incomplete_flows(warnings).into());
         }
         let input = reads.local_search_view_input(true)?;
         let mut dataset = GraphDataset::builder(limits);
@@ -505,6 +561,7 @@ impl AcquiredGraph {
         }
         let views = views.get().ok_or_else(retention_failure)?;
         let retention = QueryRetention {
+            key,
             answer: &answer,
             configuration: &configuration,
             paging,
@@ -518,6 +575,7 @@ impl AcquiredGraph {
 }
 
 struct QueryRetention<'answer> {
+    key: [u8; 32],
     answer: &'answer QueryAnswer,
     configuration: &'answer QueryConfiguration,
     paging: (u64, u64),
@@ -534,15 +592,19 @@ impl QueryRetention<'_> {
         input: rift_server::LocalSymbolViewInput,
         cancellation: &QueryCancellation,
     ) -> Result<QueryOutput, RiftError> {
+        let bytes = serde_json::to_vec(&(self.answer, &self.warnings, &self.display))
+            .map_err(encoding_failure)?;
+        let expires = self
+            .provider_views()
+            .map(crate::proxy::captured_expiry)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .min();
+        let input = input.with_query(self.key, bytes, expires);
         let mut response = None;
         views.capture_with(input, |view| {
             let mut view = view.clone();
-            let provider_views = self.acquired.remote_view().into_iter().chain(
-                self.retrieved
-                    .iter()
-                    .filter_map(|entry| entry.result.view.as_ref()),
-            );
-            if !constrain_provider_expiry(&mut view, provider_views)? {
+            if !constrain_provider_expiry(&mut view, self.provider_views())? {
                 response = Some(query_unavailable(SymbolUnavailableReason::ViewExpired).into());
                 return Ok(false);
             }
@@ -560,10 +622,36 @@ impl QueryRetention<'_> {
                     display: self.display,
                 },
             )?);
-            Ok(false)
+            Ok(true)
         })?;
         response.ok_or_else(retention_failure)
     }
+
+    fn provider_views(&self) -> impl Iterator<Item = &CapturedView> {
+        self.acquired.remote_view().into_iter().chain(
+            self.retrieved
+                .iter()
+                .filter_map(|entry| entry.result.view.as_ref()),
+        )
+    }
+}
+
+fn query_key(
+    query: &GraphQuery,
+    language: rift_protocol::query::QueryLanguage,
+    revision: &rift_protocol::revision::Revision,
+    epoch: u64,
+) -> Result<[u8; 32], RiftError> {
+    let selected = query
+        .retrieval_requests()
+        .iter()
+        .map(|selection| &selection.request)
+        .collect::<Vec<_>>();
+    // Publication movement invalidates dependency and configuration selections even
+    // when a git commit remains the served revision.
+    let bytes = serde_json::to_vec(&(query.normalized_text(), language, revision, epoch, selected))
+        .map_err(encoding_failure)?;
+    Ok(Sha256::digest(bytes).into())
 }
 
 fn evaluate_acquired_query(
@@ -681,8 +769,53 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
+    #[test]
+    fn query_key_names_normalized_text_revision_and_selection() -> TestResult {
+        use rift_protocol::read::SearchScope;
+        use rift_protocol::revision::Revision;
+        let limits = GraphLimits::default();
+        let revision = Revision::tree(&"a".repeat(64))?;
+        let statement = "SELECT ?hit { SERVICE :search { ?hit :query 'beacon' } }";
+        let original =
+            GraphQuery::parse(statement, &limits)?.with_default_scope(&SearchScope::Local);
+        let spaced = GraphQuery::parse(&format!("  {statement}\n# page"), &limits)?
+            .with_default_scope(&SearchScope::Local);
+        let key = query_key(&original, QueryLanguage::Sparql, &revision, 1)?;
+        assert_eq!(
+            key,
+            query_key(&spaced, QueryLanguage::Sparql, &revision, 1)?
+        );
+        let global = original.clone().with_default_scope(&SearchScope::Global);
+        assert_ne!(
+            key,
+            query_key(&global, QueryLanguage::Sparql, &revision, 1)?
+        );
+        assert_ne!(
+            key,
+            query_key(&original, QueryLanguage::Sparql, &revision, 2)?
+        );
+        let moved = Revision::tree(&"b".repeat(64))?;
+        assert_ne!(key, query_key(&original, QueryLanguage::Sparql, &moved, 1)?);
+        let package = |name| {
+            GraphQuery::parse(
+                &format!(
+                    "SELECT ?hit {{ SERVICE :search {{ ?hit :query 'beacon'; :scope 'global'; :packages '[{{\"manager\":\"cargo\",\"registry\":\"crates.io\",\"name\":\"{name}\"}}]'^^rdf:JSON }} }}"
+                ),
+                &limits,
+            )
+        };
+        let serde = package("serde")?;
+        let tokio = package("tokio")?;
+        assert_ne!(
+            query_key(&serde, QueryLanguage::Sparql, &revision, 1)?,
+            query_key(&tokio, QueryLanguage::Sparql, &revision, 1)?
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn query_pages_select_bindings_at_the_requested_revision() -> TestResult {
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let directory = tempfile::tempdir()?;
         crate::server::hermetic_workspace(directory.path(), "")?;
         std::fs::write(
@@ -716,11 +849,58 @@ mod tests {
             };
             assert_eq!(answer.pagination, Some(Pagination::new(page, 1, 2)));
             params.revision = answer.revision.clone();
+            if page == 1 {
+                params.query = format!("  {}\n# page", params.query);
+            }
             let QueryAnswer::Bindings { bindings, .. } = answer.answer else {
                 return Err("bindings".into());
             };
             assert_eq!(bindings.len(), usize::from(page <= 2));
         }
+        let evaluations = drain
+            .queued_records()
+            .iter()
+            .filter(|record| {
+                record.message() == "worker admitted"
+                    && serde_json::from_str::<Value>(record.fields())
+                        .is_ok_and(|fields| fields["work"] == "graph query")
+            })
+            .count();
+        assert_eq!(evaluations, 1, "later pages read the retained answer");
+        let previous_revision = params.revision.take();
+        std::fs::write(
+            root.join("lib.rs"),
+            "pub fn alpha() {}\npub fn beta() {}\npub fn gamma() {}\n",
+        )?;
+        server.validation.observe_whole_workspace()?;
+        params.page = 1;
+        let QueryReadResult::Results(answer) = server
+            .graph_query(params.clone())
+            .await
+            .map_err(|error| format!("{error:?}"))?
+            .0
+            .result
+        else {
+            return Err("query result".into());
+        };
+        assert_ne!(answer.revision, previous_revision);
+        assert_eq!(answer.pagination, Some(Pagination::new(1, 1, 3)));
+        params.revision = answer.revision;
+        params.page = 2;
+        server
+            .graph_query(params)
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        let evaluations = drain
+            .queued_records()
+            .iter()
+            .filter(|record| {
+                record.message() == "worker admitted"
+                    && serde_json::from_str::<Value>(record.fields())
+                        .is_ok_and(|fields| fields["work"] == "graph query")
+            })
+            .count();
+        assert_eq!(evaluations, 1, "a moved revision evaluates once");
         Ok(())
     }
 
@@ -1048,7 +1228,7 @@ mod tests {
                     let result = json!({
                         "groups": [{"seed":seed,"complete":true,"edges":[{
                             "id": format!("{number:064x}"),
-                            "edge":{"from":seed,"to":next,"kind":facet,"kinds":[facet],"derivation":"resolution"}
+                            "edge":{"from":seed,"to":next,"kind":facet,"kinds":[facet],"provider": "static", "derivation":"resolution"}
                         }]}],
                         "symbols":[seed_symbol,next_symbol],
                         "sources":sources,
@@ -1099,7 +1279,7 @@ mod tests {
                     "groups": [{"seed":seed,"complete":true,"edges":[{
                         "id": format!("{id:064x}"),
                         "edge":{"from":caller,"to":seed,"kind":"calls",
-                            "kinds":["calls"],"derivation":"resolution"}
+                            "kinds":["calls"],"provider": "static", "derivation":"resolution"}
                     }]}],
                     "symbols":[symbol(seed),symbol(caller)],
                     "analyzer_revision":"analyzer-v1","corpus_revision":"corpus-v1",
@@ -1320,9 +1500,10 @@ mod tests {
             )
             .into());
         };
+        let view = result.view.as_ref().ok_or("captured view")?;
         assert_eq!(
-            result.view.as_ref().map(|view| view.expires_at.as_str()),
-            Some(expires.as_str())
+            view.expires_at.parse::<jiff::Timestamp>()?,
+            expires.parse::<jiff::Timestamp>()?
         );
         let QueryAnswer::Bindings { bindings, .. } = result.answer else {
             return Err("expected call bindings".into());
@@ -1368,7 +1549,8 @@ mod tests {
         let server =
             RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
         let statement = format!(
-            "SELECT ?source ?unit ?start ?end {{ <{ROOT}> :calls ?target . \
+            "SELECT ?source ?unit ?start ?end ?provider {{ <{ROOT}> :calls ?target . \
+             ?edge a :Edge; :from <{ROOT}>; :to ?target; :provider ?provider . \
              ?syntax_element :of ?target; :index 0; :source ?source; :range [ :unit ?unit; :start ?start; :end ?end ] }}"
         );
         let response = server
@@ -1396,6 +1578,7 @@ mod tests {
             row["unit"]["value"],
             "rift://source/cargo/crates.io/demo/src/a.rs"
         );
+        assert_eq!(row["provider"]["value"], "static");
         assert_eq!(row["start"]["value"], "10");
         assert_eq!(row["end"]["value"], "29");
 

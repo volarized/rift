@@ -79,6 +79,7 @@ pub(crate) fn serve_global_examples(tools: &mut [rmcp::model::Tool]) {
             "get_symbol" => json!([
                 { "id": GLOBAL_EXAMPLE_SYMBOL, "include": {"documentation": true} },
                 { "id": GLOBAL_EXAMPLE_SYMBOL, "revision": GLOBAL_EXAMPLE_REVISION },
+                { "id": GLOBAL_EXAMPLE_SYMBOL, "include": {"history": true} },
             ]),
             "facets" => json!([
                 { "symbol": GLOBAL_EXAMPLE_SYMBOL },

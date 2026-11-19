@@ -2406,7 +2406,10 @@ impl Tower {
         let symbol = &results[0]["hit"]["symbol"];
         assert_eq!(symbol["language"], json!("markdown"));
         assert_eq!(symbol["kind"], json!("heading"));
-        assert!(symbol.get("id").is_none());
+        assert_eq!(
+            symbol["id"],
+            json!(local_identity("markdown", &["notes.md", "Beacon Notes"]))
+        );
         assert_eq!(results[0]["path"], json!("notes.md"));
         assert!(results[0]["range"]["end"].is_u64());
         Ok(())
@@ -2448,7 +2451,10 @@ impl Tower {
             let symbol = &results[0]["hit"]["symbol"];
             assert_eq!(symbol["language"], json!(language));
             assert_eq!(symbol["kind"], json!(kind));
-            assert!(symbol.get("id").is_none());
+            assert_eq!(
+                symbol["id"],
+                json!(local_identity(language, &[path, query]))
+            );
             assert_eq!(results[0]["path"], json!(path));
             assert!(results[0]["range"]["end"].is_u64());
         }

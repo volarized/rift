@@ -109,6 +109,7 @@ async fn rust_analyzer_supplies_a_call_on_an_inferred_receiver() -> TestResult {
         )
         .await?;
         if engine_enabled {
+            assert_edge_provider(&client, "root", "lsp").await?;
             assert_eq!(
                 composed["answer"],
                 json!({"result":"boolean", "value":true}),
@@ -231,5 +232,72 @@ async fn retrieval_projections_keep_ranked_and_regex_results_and_refuse_missing_
         );
     }
     client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn static_edge_provider_filters_captured_calls() -> TestResult {
+    let files = [(
+        "entry.mjs",
+        "export function perform() {}\nexport function root() { perform(); }\n",
+    )];
+    let (_directory, client, task) = served_workspace(&files, None).await?;
+    let seed = identity(&client, "root").await?;
+    let raw = crate::workspace_client::call_retrying_acceptance(
+        &client,
+        crate::workspace_client::tool_request(
+            "search_retrieval",
+            &json!({"traversal": {"seed": seed, "direction": "outgoing", "kinds": ["calls"]}}),
+        ),
+    )
+    .await?;
+    assert_eq!(
+        raw["results"][0]["traversal_path"][0]["edge"]["provider"], "static",
+        "{raw}"
+    );
+    let answer = statement(&client, format!("ASK {{ <{seed}> :calls ?target . ?target :name 'perform' . ?edge a :Edge; :from <{seed}>; :to ?target; :kinds :calls; :provider 'static' }}")).await?;
+    assert_eq!(
+        answer["answer"],
+        json!({"result":"boolean", "value":true}),
+        "{answer}"
+    );
+    client.cancel().await?;
+    task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn embedded_edge_provider_filters_inferred_python_calls() -> TestResult {
+    let files = [
+        ("pyproject.toml", METADATA),
+        (
+            "graph.py",
+            "class Worker:\n    def perform(self) -> int:\n        return 1\n\ndef root(worker: Worker) -> int:\n    return worker.perform()\n",
+        ),
+    ];
+    let (_directory, client, task) =
+        served_workspace(&files, Some(CONFIGURATION.to_owned())).await?;
+    assert_edge_provider(&client, "root", "engine").await?;
+    client.cancel().await?;
+    task.await?;
+    Ok(())
+}
+
+async fn assert_edge_provider(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    name: &str,
+    provider: &str,
+) -> TestResult {
+    let seed = identity(client, name).await?;
+    for selected in [provider, "absent"] {
+        let answer = statement(client, format!("SELECT DISTINCT ?provider {{ <{seed}> :calls ?target . ?target :name 'perform' . ?edge a :Edge; :from <{seed}>; :to ?target; :kinds :calls; :provider ?provider . FILTER(?provider = '{selected}') }}")).await?;
+        let rows = query::rows(&answer)?;
+        if selected == provider {
+            assert_eq!(rows.len(), 1, "{answer}");
+            assert_eq!(rows[0]["provider"]["value"], provider, "{answer}");
+        } else {
+            assert!(rows.is_empty(), "{answer}");
+        }
+    }
     Ok(())
 }

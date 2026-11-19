@@ -326,6 +326,26 @@ impl SymbolAssembler {
             disagreements,
         })
     }
+
+    /// Whether [`Self::assemble`] returns a symbol with portable facts for `record`.
+    ///
+    /// Decides the answer from the record's captured Contributions alone: it builds no
+    /// references, edges, or presentation, so its cost is the record's Contribution count
+    /// instead of the graph's reference and edge count.
+    #[must_use]
+    pub fn assembles_facts(graph: &NormalizedGraph, record: &SymbolRecord) -> bool {
+        if record.index_revision() != graph.index_revision() {
+            return false;
+        }
+        let mut facts = false;
+        for key in record.contributions() {
+            let Some(contribution) = graph.contribution(key) else {
+                return false;
+            };
+            facts |= contribution.facts().is_some();
+        }
+        facts
+    }
 }
 
 fn provider_rank(key: &ContributionKey, precedence: &[ProviderId]) -> (usize, ProviderId) {
@@ -751,6 +771,48 @@ mod tests {
                 symbol
             );
         }
+    }
+
+    #[test]
+    fn assembles_facts_answers_what_assembly_answers_without_assembling() {
+        let graph = graph();
+        for record in graph.records() {
+            let assembled = SymbolAssembler::assemble(&graph, record, &[provider("syntax")]);
+            assert_eq!(
+                SymbolAssembler::assembles_facts(&graph, record),
+                assembled
+                    .as_ref()
+                    .and_then(super::AssembledSymbol::facts)
+                    .is_some()
+            );
+        }
+        let beacon = reference("syntax", "syntax-beacon");
+        let position = graph.record_position_for(&beacon).expect("record position");
+        assert_eq!(graph.records().get(position), graph.record_for(&beacon));
+        let record = &graph.records()[position];
+        assert!(SymbolAssembler::assembles_facts(&graph, record));
+        let stale = rift_core::SymbolRecord::new(
+            IndexRevision::new(2).expect("index"),
+            record.identity().cloned(),
+            record.resolution(),
+            record.contributions().to_vec(),
+        )
+        .expect("stale record");
+        assert!(SymbolAssembler::assemble(&graph, &stale, &[]).is_none());
+        assert!(!SymbolAssembler::assembles_facts(&graph, &stale));
+        let missing = rift_core::SymbolRecord::new(
+            record.index_revision(),
+            None,
+            rift_core::SymbolResolution::Unresolved,
+            vec![ContributionKey::new(
+                provider("syntax"),
+                ProviderRevision::new(9).expect("revision"),
+                ProviderSymbolId::new("absent").expect("provider symbol"),
+            )],
+        )
+        .expect("record with an uncaptured contribution");
+        assert!(SymbolAssembler::assemble(&graph, &missing, &[]).is_none());
+        assert!(!SymbolAssembler::assembles_facts(&graph, &missing));
     }
 
     #[test]

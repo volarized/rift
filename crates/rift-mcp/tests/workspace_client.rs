@@ -491,7 +491,11 @@ pub(crate) async fn captured_seed(
     let rows = query::rows(&answer)?;
     let mut selected = rows
         .iter()
-        .filter(|row| query::literal(row, "name").ok() == Some(name));
+        .filter(|row| query::literal(row, "name").ok() == Some(name))
+        .filter(|row| {
+            query::literal(row, "language").ok() != Some("python")
+                || query::literal(row, "kind").ok() != Some("module")
+        });
     let row = selected
         .next()
         .ok_or_else(|| format!("original declaration {name} at {path}: {answer}"))?;
