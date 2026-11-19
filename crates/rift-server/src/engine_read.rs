@@ -1362,7 +1362,7 @@ async fn resolve_symbol_references(
     };
     let language = file.syntax().language().clone();
     let target = ReferenceTarget::new(slot.workspace_root(), reads.index().root(), file, symbol)?;
-    let answered = Box::pin(references_on_engine(slot, &target, deadline)).await;
+    let answered = Box::pin(references_on_engine(slot, &target, false, deadline)).await;
     let (report, unconfirmed) = match answered {
         Ok((report, unconfirmed)) => (report, unconfirmed.then(|| slot.name().to_owned())),
         Err(error) if error.slug() == errors::lsp::engine_capability_absent::SLUG => {
@@ -1513,8 +1513,54 @@ impl ReferenceTarget {
     }
 }
 
+type ReferenceDefinitions = BTreeMap<(String, u32, u32), Vec<Location>>;
+
+fn reference_key(location: &Location) -> (String, u32, u32) {
+    (
+        location.uri.as_str().to_owned(),
+        location.range.start.line,
+        location.range.start.character,
+    )
+}
+
+async fn reference_definitions(
+    session: &mut EngineSession,
+    locations: &[Location],
+    maximum: usize,
+    mut remaining: usize,
+) -> Result<ReferenceDefinitions, RiftError> {
+    let mut definitions = BTreeMap::new();
+    if !session.capabilities().definitions.definition {
+        return Ok(definitions);
+    }
+    let positions: BTreeMap<_, _> = locations
+        .iter()
+        .filter_map(|location| {
+            let path = session.root().project_path(&location.uri).ok()?;
+            Some((reference_key(location), (path, location.range.start)))
+        })
+        .collect();
+    let positions: Vec<_> = positions.into_iter().collect();
+    for chunk in positions.chunks(maximum.clamp(1, rift_lsp::correlation::PENDING_REQUESTS_MAX)) {
+        let requests: Vec<_> = chunk.iter().map(|(_, position)| position.clone()).collect();
+        let answers = session.definition_batch(&requests).await?;
+        let records = answers.iter().map(Vec::len).sum::<usize>();
+        remaining = remaining
+            .checked_sub(records)
+            .ok_or_else(graph_reference_coverage)?;
+        definitions.extend(
+            chunk
+                .iter()
+                .zip(answers)
+                .map(|((key, _), answer)| (key.clone(), answer)),
+        );
+    }
+    Ok(definitions)
+}
+
 #[derive(PartialEq)]
 struct ReferenceReport {
+    definitions: std::sync::Arc<ReferenceDefinitions>,
     locations: Result<Vec<Location>, usize>,
     encoding: PositionEncoding,
     full: bool,
@@ -1523,6 +1569,7 @@ struct ReferenceReport {
 async fn references_on_engine(
     slot: &EngineSlot,
     target: &ReferenceTarget,
+    resolve_targets: bool,
     deadline: Instant,
 ) -> Result<(ReferenceReport, bool), RiftError> {
     let request_path = target.path.clone();
@@ -1543,6 +1590,7 @@ async fn references_on_engine(
                     if locations.len() > TRAVERSAL_SYMBOLS_MAX {
                         return Ok(Some(ReferenceReport {
                             locations: Err(locations.len()),
+                            definitions: BTreeMap::new().into(),
                             encoding,
                             full: true,
                         }));
@@ -1564,7 +1612,19 @@ async fn references_on_engine(
                             ))
                     });
                     locations.dedup();
+                    let definitions = if resolve_targets {
+                        reference_definitions(
+                            session,
+                            &locations,
+                            rift_lsp::correlation::PENDING_REQUESTS_MAX,
+                            TRAVERSAL_SYMBOLS_MAX,
+                        )
+                        .await?
+                    } else {
+                        BTreeMap::new()
+                    };
                     Ok(Some(ReferenceReport {
+                        definitions: definitions.into(),
                         locations: Ok(locations),
                         encoding,
                         full: true,
@@ -1758,6 +1818,7 @@ async fn engine_graph_references(
     if declarations.is_empty() {
         return Err(unavailable());
     }
+    let mut complete = true;
     let mut found = BTreeMap::new();
     let mut edge_warnings = Vec::new();
     for declaration in declarations {
@@ -1771,7 +1832,7 @@ async fn engine_graph_references(
             file,
             declaration.symbol,
         )?;
-        let (report, unconfirmed) = Box::pin(references_on_engine(slot, &request, deadline))
+        let (report, unconfirmed) = Box::pin(references_on_engine(slot, &request, true, deadline))
             .await
             .map_err(|error| {
                 if graph_engine_method_missing(&error) {
@@ -1790,6 +1851,8 @@ async fn engine_graph_references(
         }
         let mapped =
             map_inventory_references(reads, target, report, slot.workspace_root(), require_caller)?;
+        complete &= mapped.complete;
+        edge_warnings.extend(mapped.edge_warnings);
         for occurrence in mapped.occurrences {
             let key = (
                 occurrence.source.unit.0.clone(),
@@ -1801,7 +1864,7 @@ async fn engine_graph_references(
     }
     Ok(GraphReferences {
         occurrences: found.into_values().collect(),
-        complete: true,
+        complete,
         edge_warnings,
     })
 }
@@ -1828,6 +1891,7 @@ fn map_inventory_references(
         TreeRoot::new(workspace_root)?,
         TreeRoot::new(reads.index().root())?,
     ];
+    let mut dropped = 0_u64;
     let mut positions = BTreeMap::new();
     let mut found = BTreeMap::new();
     for location in report.locations.map_err(|_| graph_reference_coverage())? {
@@ -1852,6 +1916,19 @@ fn map_inventory_references(
         }
         let key = (path, start as u64, end as u64);
         if excluded.contains(&key) || found.contains_key(&key) {
+            continue;
+        }
+        let resolved = reference_definition_targets(
+            reads,
+            &roots,
+            &report.definitions,
+            &location,
+            report.encoding,
+        )?;
+        if resolved.is_empty() {
+            dropped += 1;
+        }
+        if !resolved.contains(target) {
             continue;
         }
         if found.len() == TRAVERSAL_SYMBOLS_MAX {
@@ -1879,9 +1956,44 @@ fn map_inventory_references(
     }
     Ok(GraphReferences {
         occurrences: found.into_values().collect(),
-        complete: report.full,
-        edge_warnings: Vec::new(),
+        complete: report.full && dropped == 0,
+        edge_warnings: if dropped == 0 {
+            Vec::new()
+        } else {
+            vec![ReadWarning::EngineAnalysisUnavailable {
+                language: None,
+                detail: format!(
+                    "the language engine did not resolve a local definition for {dropped} reference locations; those locations were dropped"
+                ),
+            }]
+        },
     })
+}
+
+fn reference_definition_targets(
+    reads: &ReadService,
+    roots: &[TreeRoot; 2],
+    definitions: &ReferenceDefinitions,
+    location: &Location,
+    encoding: PositionEncoding,
+) -> Result<BTreeSet<SymbolId>, RiftError> {
+    let mut resolved = BTreeSet::new();
+    for definition in definitions
+        .get(&reference_key(location))
+        .into_iter()
+        .flatten()
+    {
+        let path = roots[0]
+            .project_path(&definition.uri)
+            .or_else(|_| roots[1].project_path(&definition.uri));
+        if let Ok(path) = path
+            && let Some(symbol) =
+                project_definition(reads, &path, (definition.range, encoding), false)?
+        {
+            resolved.insert(symbol);
+        }
+    }
+    Ok(resolved)
 }
 
 /// Reads outgoing reference edges by resolving the bounded local target inventory.
@@ -2805,6 +2917,11 @@ mod tests {
         let reads = reads(directory.path())?;
         let target = symbol(&reads, "beacon");
         let report = ReferenceReport {
+            definitions: BTreeMap::from([(
+                super::reference_key(&location(directory.path(), "lib.rs", 1, 18, 24)),
+                vec![location(directory.path(), "lib.rs", 0, 7, 13)],
+            )])
+            .into(),
             locations: Ok(vec![
                 location(outside.path(), "other.rs", 0, 0, 3),
                 location(directory.path(), "lib.rs", 0, 7, 13),
@@ -2827,6 +2944,50 @@ mod tests {
     }
 
     #[test]
+    fn inventory_references_follow_definitions_for_two_seeds_in_one_file() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn first() {}\npub fn second() {}\npub fn caller() { first(); second(); unknown(); }\n",
+        )?;
+        let reads = reads(directory.path())?;
+        let first = symbol(&reads, "first");
+        let second = symbol(&reads, "second");
+        let locations = vec![
+            location(directory.path(), "lib.rs", 2, 18, 23),
+            location(directory.path(), "lib.rs", 2, 27, 33),
+            location(directory.path(), "lib.rs", 2, 37, 44),
+        ];
+        let definitions = BTreeMap::from([
+            (
+                super::reference_key(&locations[0]),
+                vec![location(directory.path(), "lib.rs", 0, 7, 12)],
+            ),
+            (
+                super::reference_key(&locations[1]),
+                vec![location(directory.path(), "lib.rs", 1, 7, 13)],
+            ),
+        ]);
+        // A server can return the same structural-property occurrences for both seeds.
+        for (target, start) in [(first, 55), (second, 64)] {
+            let report = ReferenceReport {
+                definitions: definitions.clone().into(),
+                locations: Ok(locations.clone()),
+                encoding: PositionEncoding::Utf8,
+                full: true,
+            };
+            let answer =
+                super::map_inventory_references(&reads, &target, report, directory.path(), true)?;
+            assert_eq!(answer.occurrences.len(), 1, "{answer:?}");
+            assert_eq!(answer.occurrences[0].target, target);
+            assert_eq!(answer.occurrences[0].source.range.start, start);
+            assert!(!answer.complete);
+            assert_eq!(answer.edge_warnings.len(), 1);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn reference_mapping_retains_cross_file_callers_and_deduplicates() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(
@@ -2845,6 +3006,7 @@ mod tests {
         let other = location(directory.path(), "caller.rs", 0, 28, 34);
         let canonical = location(reads.index().root(), "caller.rs", 0, 18, 24);
         let report = ReferenceReport {
+            definitions: BTreeMap::new().into(),
             locations: Ok(vec![own, caller.clone(), other, caller, canonical]),
             encoding: PositionEncoding::Utf16,
             full: true,
@@ -2868,6 +3030,7 @@ mod tests {
         let seed = rift_core::SymbolId::new(symbol(&reads, "beacon").0)?;
         for (start, end) in [(80, 81), (10, 2)] {
             let report = ReferenceReport {
+                definitions: BTreeMap::new().into(),
                 locations: Ok(vec![location(directory.path(), "lib.rs", 0, start, end)]),
                 encoding: PositionEncoding::Utf16,
                 full: true,
@@ -2875,6 +3038,7 @@ mod tests {
             assert!(map_references(&reads, &seed, report, directory.path()).is_err());
         }
         let overflow = ReferenceReport {
+            definitions: BTreeMap::new().into(),
             locations: Err(super::TRAVERSAL_SYMBOLS_MAX + 1),
             encoding: PositionEncoding::Utf16,
             full: true,
@@ -2891,6 +3055,7 @@ mod tests {
         let reads = reads(directory.path())?;
         let target = rift_core::SymbolId::new(symbol(&reads, "beacon").0)?;
         let report = ReferenceReport {
+            definitions: BTreeMap::new().into(),
             locations: Ok(vec![
                 location(outside.path(), "lib.rs", 0, 0, 1),
                 location(directory.path(), "absent.rs", 0, 0, 1),
@@ -2902,6 +3067,7 @@ mod tests {
         let mut refused = location(directory.path(), "lib.rs", 0, 0, 1);
         refused.uri = "https://example.com/lib.rs".parse()?;
         let report = ReferenceReport {
+            definitions: BTreeMap::new().into(),
             locations: Ok(vec![refused]),
             encoding: PositionEncoding::Utf16,
             full: true,
@@ -3129,6 +3295,7 @@ done
         let target = rift_core::SymbolId::new(symbol(&reads, "beacon").0)?;
         let prior = rift_core::SymbolId::new(symbol(&reads, "caller").0)?;
         let report = ReferenceReport {
+            definitions: BTreeMap::new().into(),
             locations: Ok(vec![location(directory.path(), "main.py", 4, 11, 17)]),
             encoding: PositionEncoding::Utf16,
             full: true,

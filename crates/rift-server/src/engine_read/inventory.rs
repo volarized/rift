@@ -138,6 +138,7 @@ pub struct EngineInventoryAnswer {
     encoding: PositionEncoding,
     calls: Vec<InventoryCalls>,
     references: Vec<(SymbolId, Vec<Location>)>,
+    reference_definitions: super::ReferenceDefinitions,
     types: Vec<(SymbolId, Vec<Location>)>,
     heritage: Vec<InventoryHeritage>,
     definitions: Vec<InventoryDefinition>,
@@ -236,6 +237,7 @@ impl EngineInventoryFile {
             encoding: report.encoding,
             calls: report.calls,
             references: report.references,
+            reference_definitions: report.reference_definitions,
             types: report.types,
             heritage: report.heritage,
             definitions: report.definitions,
@@ -256,6 +258,7 @@ struct InventoryReport {
     encoding: PositionEncoding,
     calls: Vec<InventoryCalls>,
     references: Vec<(SymbolId, Vec<Location>)>,
+    reference_definitions: super::ReferenceDefinitions,
     types: Vec<(SymbolId, Vec<Location>)>,
     heritage: Vec<InventoryHeritage>,
     definitions: Vec<InventoryDefinition>,
@@ -336,6 +339,7 @@ async fn read_positions(
         encoding,
         calls: Vec::new(),
         references: Vec::new(),
+        reference_definitions: BTreeMap::new(),
         types: Vec::new(),
         heritage: Vec::new(),
         definitions: Vec::new(),
@@ -374,6 +378,14 @@ async fn read_positions(
             read_calls(session, chunk, &requests, maximum, &mut report).await?;
         }
     }
+    let locations: Vec<_> = report
+        .references
+        .iter()
+        .flat_map(|(_, locations)| locations.iter().cloned())
+        .collect();
+    report.reference_definitions =
+        super::reference_definitions(session, &locations, maximum, report.remaining).await?;
+    report.charge(report.reference_definitions.values().map(Vec::len).sum())?;
     Ok(report)
 }
 
@@ -488,6 +500,7 @@ impl EngineInventoryAnswer {
                     .is_some_and(|facts| facts.unsupported_bindings().is_empty()),
         )?;
         let calls = calls::merge_calls(calls, definitions);
+        let reference_definitions = std::sync::Arc::new(self.reference_definitions);
         let mut references = Vec::new();
         for (seed, locations) in self.references {
             let mut engine = super::map_inventory_references(
@@ -495,6 +508,7 @@ impl EngineInventoryAnswer {
                 &seed,
                 ReferenceReport {
                     locations: Ok(locations),
+                    definitions: std::sync::Arc::clone(&reference_definitions),
                     encoding: self.encoding,
                     full: true,
                 },
