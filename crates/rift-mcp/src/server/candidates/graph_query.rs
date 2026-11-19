@@ -373,19 +373,23 @@ fn project_local_endpoints(
 }
 
 fn project_semantic_inventory(
+    reads: &rift_server::ReadService,
     input: &rift_server::LocalSymbolViewInput,
     acquired: &AcquiredAdjacency,
     required: SemanticInventory,
     dataset: &mut rift_search::sparql::GraphDatasetBuilder,
     cancellation: &QueryCancellation,
-    deadline: std::time::Instant,
+    deadline: RequestDeadline,
 ) -> Result<(), RiftError> {
-    input.project_symbols(
-        rift_search::sparql::SymbolSelection::All,
-        dataset,
-        cancellation,
-        deadline,
-    )?;
+    if required.symbols {
+        input.project_symbols(
+            rift_search::sparql::SymbolSelection::All,
+            dataset,
+            cancellation,
+            deadline.at().into_std(),
+        )?;
+    }
+    acquired.project_captured_inventory(dataset, input, reads, cancellation, deadline)?;
     acquired.project_local(
         dataset,
         input,
@@ -458,12 +462,13 @@ impl AcquiredGraph {
             )?;
         } else if let Some(required) = local_semantics {
             project_semantic_inventory(
+                &reads,
                 &input,
                 &acquired,
                 required,
                 &mut dataset,
                 cancellation,
-                deadline.at().into_std(),
+                deadline,
             )?;
         } else if let Some(exact) = &exact {
             exact.project(&mut dataset)?;
@@ -680,6 +685,49 @@ mod tests {
     use serde_json::{Value, json};
 
     type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    #[tokio::test]
+    async fn occurrence_inventory_does_not_project_unrequested_symbols_and_edges() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        crate::server::hermetic_workspace(directory.path(), "")?;
+        std::fs::write(
+            directory.path().join("entry.ts"),
+            "function leaf() {}\nexport function root() { leaf(); }\nexport const unused = { first: 1, second: 2, third: 3 };\n",
+        )?;
+        let root = directory.path().canonicalize()?;
+        let server =
+            RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
+        let limits = GraphLimits::builder().triples_max(16).build()?;
+        let query = GraphQuery::parse(
+            "SELECT (COUNT(*) AS ?n) { ?target :usages ?usage }",
+            &limits,
+        )?;
+        let deadline = server.request_deadline().await;
+        let resolved = server
+            .published_workspace(super::super::super::wire::ErrorPhase::Read, deadline)
+            .await
+            .map_err(|failure| format!("{failure:?}"))?;
+        let graph = server
+            .prepare_graph(resolved, &query, limits, deadline)
+            .await
+            .map_err(|failure| format!("{failure:?}"))?
+            .map_err(|reason| format!("{reason:?}"))?;
+        let output = graph.evaluate(
+            &query,
+            deadline,
+            &QueryCancellation::new(),
+            &server.local_views,
+            (1, 10),
+        )?;
+        assert!(
+            matches!(&output.result, QueryReadResult::Results(result)
+                if matches!(&result.answer, QueryAnswer::Bindings { bindings, .. }
+                    if matches!(&bindings[0]["n"], rift_protocol::query::RdfTerm::Literal { value, .. } if value == "1"))),
+            "{:?}",
+            output.result
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn query_pages_select_bindings_at_the_requested_revision() -> TestResult {

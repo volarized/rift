@@ -36,6 +36,7 @@ pub(super) struct AcquiredAdjacency {
     pages: Vec<(EdgeSearchPage, SymbolRelation)>,
     local: Vec<QueryOccurrence>,
     local_edges: Vec<(SymbolId, SymbolRelation, SymbolId)>,
+    captured_inventory: Option<rift_search::sparql::SemanticInventory>,
     named_package_symbols: BTreeMap<SymbolId, (Symbol, RevisionIri)>,
     installed: BTreeMap<SymbolId, Arc<InstalledTarget>>,
     revisions: BTreeMap<SymbolOwner, RevisionIri>,
@@ -51,8 +52,39 @@ impl AcquiredAdjacency {
         required: rift_search::sparql::SemanticInventory,
     ) -> Result<(), RiftError> {
         self.incomplete |= !reads.static_edges_complete()?;
-        let maximum = usize::try_from(RECORDS_MAX).map_err(|_| coverage_failure())?;
+        self.captured_inventory = Some(required);
+        Ok(())
+    }
+
+    pub(super) fn project_captured_inventory(
+        &self,
+        dataset: &mut GraphDatasetBuilder,
+        input: &rift_server::LocalSymbolViewInput,
+        reads: &rift_server::ReadService,
+        cancellation: &rift_search::sparql::QueryCancellation,
+        deadline: RequestDeadline,
+    ) -> Result<(), RiftError> {
+        let Some(required) = self.captured_inventory else {
+            return Ok(());
+        };
+        // Captured edges already belong to the bounded publication. Project them
+        // directly so the dataset charges distinct triples and literal bytes.
         for edge in reads.edges().edges() {
+            if cancellation.is_cancelled() {
+                return errors::search::query_cancelled().fail();
+            }
+            if std::time::Instant::now() >= deadline.at().into_std() {
+                return Err(super::deadline_failure(deadline.budget()));
+            }
+            let source = SymbolId(edge.from().as_str().to_owned());
+            let target = SymbolId(edge.to().as_str().to_owned());
+            if required.edges || required.adjacency.calls || required.adjacency.references {
+                dataset.insert(GraphFact::Relation {
+                    source: &source,
+                    relation: relation(edge.kind())?,
+                    target: &target,
+                })?;
+            }
             let usage = (required.adjacency.references || required.occurrences.is_some())
                 && matches!(
                     edge.kind(),
@@ -64,37 +96,18 @@ impl AcquiredAdjacency {
                         | EdgeKind::Writes
                         | EdgeKind::HasType
                 );
-            let records = self
-                .local_edges
-                .len()
-                .saturating_add(self.local.len())
-                .saturating_add(if usage { 3 } else { 1 });
-            if records > maximum {
-                return Err(coverage_failure());
+            if !usage {
+                continue;
             }
-            self.local_edges.push((
-                SymbolId(edge.from().as_str().to_owned()),
-                relation(edge.kind())?,
-                SymbolId(edge.to().as_str().to_owned()),
-            ));
-            if usage {
-                let target = SymbolId(edge.to().as_str().to_owned());
-                let caller = SymbolId(edge.from().as_str().to_owned());
-                self.local_edges
-                    .push((caller.clone(), SymbolRelation::References, target.clone()));
-                let binding = edge.occurrence();
-                self.local.push(QueryOccurrence {
-                    target,
-                    enclosing: Some(caller),
-                    source: rift_protocol::read::SourceUnitSpan {
-                        unit: rift_protocol::read::SourceUnitId(binding.unit().to_string()),
-                        range: rift_protocol::read::TextRange {
-                            start: binding.range().start(),
-                            end: binding.range().end(),
-                        },
-                    },
-                    kind: edge.kind(),
-                });
+            if required.adjacency.references {
+                dataset.insert(GraphFact::Relation {
+                    source: &source,
+                    relation: SymbolRelation::References,
+                    target: &target,
+                })?;
+            }
+            if let Some(selection) = required.occurrences {
+                self.project_occurrence(dataset, input, &captured_occurrence(edge), selection)?;
             }
         }
         Ok(())
@@ -178,41 +191,55 @@ impl AcquiredAdjacency {
         }
         if let Some(required) = occurrences {
             for occurrence in &self.local {
-                let range = &occurrence.source.range;
-                let unit = &occurrence.source.unit;
-                let key = format!(
-                    "{} {} {} {}",
-                    occurrence.target.as_str(),
-                    unit.as_str(),
-                    range.start,
-                    range.end
-                );
-                let source = if required.source {
-                    let text = if let Some(installed) = occurrence
-                        .enclosing
-                        .as_ref()
-                        .and_then(|id| self.installed.get(id))
-                    {
-                        if installed.unit != *unit {
-                            return Err(coverage_failure());
-                        }
-                        source_slice(&installed.source, range)?
-                    } else {
-                        input
-                            .occurrence_source(&occurrence.source)
-                            .ok_or_else(coverage_failure)?
-                    };
-                    Some(text)
-                } else {
-                    None
-                };
-                dataset.insert(GraphFact::Occurrence {
-                    key: &key,
-                    occurrence,
-                    source,
-                })?;
+                self.project_occurrence(dataset, input, occurrence, required)?;
             }
         }
+        Ok(())
+    }
+
+    fn project_occurrence(
+        &self,
+        dataset: &mut GraphDatasetBuilder,
+        input: &rift_server::LocalSymbolViewInput,
+        occurrence: &QueryOccurrence,
+        required: OccurrenceSelection,
+    ) -> Result<(), RiftError> {
+        let range = &occurrence.source.range;
+        let unit = &occurrence.source.unit;
+        // Equal locations can carry records with different kinds or enclosing symbols.
+        let key = format!(
+            "{} {} {} {} {} {}",
+            occurrence.target.as_str(),
+            unit.as_str(),
+            range.start,
+            range.end,
+            occurrence.kind.as_ref(),
+            occurrence.enclosing.as_ref().map_or("", SymbolId::as_str)
+        );
+        let source = if required.source {
+            let text = if let Some(installed) = occurrence
+                .enclosing
+                .as_ref()
+                .and_then(|id| self.installed.get(id))
+            {
+                if installed.unit != *unit {
+                    return Err(coverage_failure());
+                }
+                source_slice(&installed.source, range)?
+            } else {
+                input
+                    .occurrence_source(&occurrence.source)
+                    .ok_or_else(coverage_failure)?
+            };
+            Some(text)
+        } else {
+            None
+        };
+        dataset.insert(GraphFact::Occurrence {
+            key: &key,
+            occurrence,
+            source,
+        })?;
         Ok(())
     }
 
@@ -1365,6 +1392,22 @@ impl<'request> AdjacencyWalk<'request> {
             }
         }
         Ok(None)
+    }
+}
+
+fn captured_occurrence(edge: &rift_index::Edge) -> QueryOccurrence {
+    let binding = edge.occurrence();
+    QueryOccurrence {
+        target: SymbolId(edge.to().as_str().to_owned()),
+        enclosing: Some(SymbolId(edge.from().as_str().to_owned())),
+        source: rift_protocol::read::SourceUnitSpan {
+            unit: rift_protocol::read::SourceUnitId(binding.unit().to_string()),
+            range: rift_protocol::read::TextRange {
+                start: binding.range().start(),
+                end: binding.range().end(),
+            },
+        },
+        kind: edge.kind(),
     }
 }
 

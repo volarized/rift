@@ -40,6 +40,8 @@ pub struct SemanticHeritage {
 /// The semantic and physical facts needed from a complete selected domain.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SemanticInventory {
+    /// The query can inspect complete captured symbol metadata.
+    pub symbols: bool,
     /// The query can inspect captured edge kinds.
     pub edges: bool,
     /// Resolved edge kinds the query can inspect.
@@ -79,7 +81,7 @@ impl SemanticInventory {
             let subject = &pattern.subject;
             let name = predicate.as_str().strip_prefix(VOCABULARY_NAMESPACE);
             match name {
-                Some("name" | "revision") => {}
+                Some("name" | "revision") => self.symbols = true,
                 Some("calls") => self.adjacency.calls = true,
                 Some("references") => self.adjacency.references = true,
                 Some("hasType") => {
@@ -104,7 +106,10 @@ impl SemanticInventory {
                 Some("kind" | "language")
                     if patterns.iter().any(|other| {
                         other.subject == *subject && class(other) == Some("Symbol")
-                    }) => {}
+                    }) =>
+                {
+                    self.symbols = true;
+                }
                 Some("source" | "of" | "kind" | "range") if occurrence(patterns, subject) => {
                     let usage = self.occurrences.get_or_insert_default();
                     usage.source |= name == Some("source");
@@ -119,7 +124,7 @@ impl SemanticInventory {
                 {
                     self.occurrences.get_or_insert_default();
                 }
-                None if class(pattern) == Some("Symbol") => {}
+                None if class(pattern) == Some("Symbol") => self.symbols = true,
                 None if class(pattern) == Some("Occurrence") => {
                     self.occurrences.get_or_insert_default();
                 }
