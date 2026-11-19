@@ -826,9 +826,11 @@ impl<'request> AdjacencyWalk<'request> {
             .selected
             .is_some_and(|selection| selection.symbol_details);
         if let Err(error) = self.name_package_calls(&mut calls, details).await {
-            if self.selected.is_some() || !super::lacks_coverage(&error) {
+            if !super::lacks_coverage(&error) {
                 return Err(error);
             }
+            // The unnamed dependency does not erase independently established
+            // local calls. Only a positive ASK witness can use incomplete adjacency.
             self.acquired.incomplete = true;
         }
         self.admit_local_calls(seed, calls, frontier)?;
