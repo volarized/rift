@@ -81,7 +81,7 @@ impl LocalSymbolViewInput {
     /// Collects canonical declarations with source names for a bounded engine read.
     ///
     /// # Errors
-    /// Refuses incomplete source or identity coverage and a seed inventory above the bound.
+    /// Refuses incomplete source coverage and a seed inventory above the bound.
     pub fn semantic_seeds(
         &self,
         mut remaining: usize,
@@ -92,10 +92,7 @@ impl LocalSymbolViewInput {
                 .error()
         };
         let index = &self.material.index;
-        if !self.ready
-            || !index.objects_complete()
-            || index.unestablished_objects().next().is_some()
-        {
+        if !self.ready || !index.objects_complete() {
             return Err(unavailable());
         }
         let mut seeds = Vec::new();
@@ -111,9 +108,6 @@ impl LocalSymbolViewInput {
             remaining = remaining
                 .checked_sub(declarations)
                 .ok_or_else(unavailable)?;
-            if !index.identity_coverage_complete(object.facts().language()) {
-                return Err(unavailable());
-            }
             seeds.push(rift_protocol::read::SymbolId(id.as_str().to_owned()));
         }
         Ok(seeds)

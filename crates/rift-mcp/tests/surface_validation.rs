@@ -79,10 +79,7 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
     let reaches_dependencies = request_reaches_dependencies(name, request)
         .expect("a validated exact request carries a canonical symbol identity");
     assert_source_unit_ids_use_served_resolvers(structured, &context, reaches_dependencies);
-    assert!(
-        structured.get("warnings").is_none(),
-        "{context}: {structured:#}"
-    );
+    assert_fixture_warnings(name, request, structured);
     assert!(
         structured["documentation"].get("warnings").is_none(),
         "{context}: {structured:#}"
@@ -135,6 +132,29 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
             }
         }
     }
+}
+
+fn assert_fixture_warnings(name: &str, request: &Value, structured: &Value) {
+    let Some(warnings) = structured.get("warnings") else {
+        return;
+    };
+    assert_eq!(name, "search", "{structured:#}");
+    let query = request["query"].as_str().expect("query statement");
+    assert!(
+        [":calls", ":references", ":usages"]
+            .iter()
+            .any(|predicate| query.contains(predicate)),
+        "only edge reads omit the fixture's unlinked declarations: {request:#}"
+    );
+    let warnings: Vec<rift_protocol::read::ReadWarning> =
+        serde_json::from_value(warnings.clone()).expect("typed read warnings");
+    // The unlinked change_witness.rs holds two declarations without identities.
+    assert!(
+        matches!(warnings.as_slice(),
+            [rift_protocol::read::ReadWarning::EdgeCoverageMissing { kinds, detail }]
+                if kinds.is_empty() && detail.contains("identities: 2;")),
+        "{warnings:?}"
+    );
 }
 
 /// Exact retrieval reaches the released owner its canonical identity names.

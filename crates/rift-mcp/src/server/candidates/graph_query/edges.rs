@@ -689,6 +689,11 @@ impl RiftMcp {
         {
             return Err(coverage_failure());
         }
+        if walk.local.is_some() || walk.local_reverse.is_some() {
+            walk.acquired
+                .warnings
+                .extend(resolved.published.reads.edge_identity_warning());
+        }
         walk.verify_installed().await?;
         Ok(Ok(walk.acquired))
     }
