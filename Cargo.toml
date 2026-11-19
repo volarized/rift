@@ -238,6 +238,14 @@ overflow-checks = true
 [profile.dev.package.sha2]
 opt-level = 3
 
+# Parsing and tree release dominate large syntax captures in unoptimized builds.
+# Keep the shared parser runtime optimized for development and tests.
+[profile.dev.package.tree-sitter]
+opt-level = 3
+
+[profile.test.package.tree-sitter]
+opt-level = 3
+
 # gemm-common's `vmulq_f16` is an `#[inline]` fp16 `asm!` without a `target_feature`
 # of its own: it assembles only once inlined into an fp16 caller. At opt-level 0 it is
 # emitted alone, and aarch64 Linux and Windows reject it ("instruction requires:
