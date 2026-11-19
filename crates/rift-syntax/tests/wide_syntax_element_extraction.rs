@@ -5,17 +5,20 @@
 //! with them is quadratic in the sibling count. Each test analyzes one such shape at two sizes
 //! [`GROWTH_FACTOR`] apart: a linear analysis takes about [`GROWTH_FACTOR`] times as long on
 //! the larger file, a quadratic one about its square, and [`ratio_max`] tells the two apart.
-//! Both sizes run on the same machine, so the ratio between them does not depend on how fast
-//! that machine is, and `.config/nextest.toml` runs this suite alone, so no other test's load
-//! lands between them.
-//! The smaller file grows until one analysis of it takes [`SMALL_RUN_MIN`], so a slowdown the
-//! machine imposes for a moment stays small beside the times it divides.
+//! Process CPU time measures the analyzer's work, including any worker threads, without
+//! charging it for another process's scheduling time. The existing nextest wall-clock
+//! deadline still bounds the whole test. Bounded batches reach [`CPU_SAMPLE_MIN`] before
+//! averaging, so a coarse CPU clock can measure short analyses too. Their documents stay
+//! alive until the clock stops, excluding result destruction from the measured work.
+//! The smaller file grows until one analysis takes [`SMALL_RUN_MIN`] of CPU time or reaches
+//! the same source, syntax element or calibration bound as before.
 //!
 //! The loops walk [`registry::providers`], so a provider registered later joins these proofs
 //! once [`wide_line`] and [`attached_run`] name its language.
 
 use std::time::Duration;
 
+use cpu_time::ProcessTime;
 use rift_core::ProjectPath;
 use rift_protocol::read::Language;
 use rift_syntax::{
@@ -47,17 +50,17 @@ fn ratio_max() -> f64 {
     (linear * quadratic).sqrt()
 }
 
-/// Runs per size. The fastest counts, so a run slowed by other work on the machine drops out.
+/// Samples per size. The fastest counts, reducing incidental work inside the test process.
 const REPEATS: usize = 3;
 
-/// The time one analysis of the smaller file takes at least, once calibrated.
-///
-/// A stall that lands on every larger run adds its length divided by the smaller run's time
-/// to the ratio. A TOML wide syntax element whose smaller file analyzed in 3.0 ms measured 11.8 on a
-/// busy machine, each 23.6 ms larger run stalled to 35.5 ms; the quiet machine measured 8.1.
-/// At twenty milliseconds the same stall adds 0.6, and only a stall past about 290 ms on
-/// every larger run reaches [`ratio_max`].
+/// Target CPU time of one smaller-file analysis, within the existing input bounds.
 const SMALL_RUN_MIN: Duration = Duration::from_millis(20);
+
+/// CPU work accumulated by one sample before normalizing by its analysis count.
+const CPU_SAMPLE_MIN: Duration = SMALL_RUN_MIN.saturating_mul(2);
+
+/// Bounds retained documents while measuring clocks with coarse accounting intervals.
+const ANALYSES_PER_SAMPLE_MAX: usize = 64;
 
 /// Doublings of a shape's starting count calibration takes at most: sixteen times the
 /// start, which the fastest shape on an Apple M-series debug build, a JSON wide syntax element at
@@ -142,21 +145,37 @@ fn attached_run(language: &Language) -> Option<(&'static str, &'static str)> {
     }
 }
 
-/// Analyzes `text` once and returns the document with the time it took.
+/// Measures a bounded batch and returns its last document and average analysis CPU time.
 fn timed_analysis(provider: &dyn SyntaxProvider, text: &str) -> (SyntaxDocument, Duration) {
     let path = ProjectPath::new("wide").expect("valid fixture path");
-    let source = SyntaxSource { path: &path, text };
-    let (analysis, measurement) = rift_tracing::measure_elapsed!("syntax.analyze", {
-        provider.analyze(source, SyntaxLimits::default())
-    })
-    .expect("the monotonic clock must not regress");
-    let document = analysis.unwrap_or_else(|error| {
-        panic!(
-            "a wide shape must analyze under the default limits: language={:?}, error={error}",
-            provider.language()
-        )
-    });
-    (document, measurement.elapsed())
+    let mut documents = Vec::with_capacity(ANALYSES_PER_SAMPLE_MAX);
+    let start = ProcessTime::try_now().expect("the process CPU clock must be available");
+    let elapsed = loop {
+        let source = SyntaxSource { path: &path, text };
+        let (analysis, _) = rift_tracing::measure_elapsed!("syntax.analyze", {
+            provider.analyze(source, SyntaxLimits::default())
+        })
+        .expect("the monotonic clock must not regress");
+        documents.push(analysis.unwrap_or_else(|error| {
+            panic!(
+                "a wide shape must analyze under the default limits: language={:?}, error={error}",
+                provider.language()
+            )
+        }));
+        let elapsed = start
+            .try_elapsed()
+            .expect("the process CPU clock must be readable");
+        if elapsed >= CPU_SAMPLE_MIN {
+            break elapsed;
+        }
+        assert!(
+            documents.len() < ANALYSES_PER_SAMPLE_MAX,
+            "the CPU sample must reach its accounting interval within the document bound"
+        );
+    };
+    let analyses = u32::try_from(documents.len()).expect("the sample count is bounded");
+    let document = documents.pop().expect("at least one measured analysis");
+    (document, elapsed / analyses)
 }
 
 /// The smaller file's line count: `lines_min`, doubled until one analysis of the smaller file
@@ -192,7 +211,7 @@ fn calibrated_lines(
 /// and refuses a time ratio at or above [`ratio_max`]; returns the larger file's document and
 /// count.
 ///
-/// The two sizes alternate so both meet the same machine load.
+/// The two sizes alternate; their CPU work is compared under the same process conditions.
 fn analyze_linearly(
     provider: &dyn SyntaxProvider,
     build: impl Fn(usize) -> String,
@@ -215,7 +234,7 @@ fn analyze_linearly(
     let ratio_max = ratio_max();
     assert!(
         ratio < ratio_max,
-        "analysis time must grow linearly with the sibling count: language={:?}, \
+        "analysis CPU time must grow linearly with the sibling count: language={:?}, \
          lines={lines}, small={small:?}, large={large:?}, ratio={ratio:.2}, \
          ratio_max={ratio_max:.2}",
         provider.language(),
