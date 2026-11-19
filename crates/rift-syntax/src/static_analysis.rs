@@ -152,6 +152,15 @@ pub struct StaticInherentImpl {
     pub type_path: ByteRange,
 }
 
+/// One Rust configuration attribute and the item whose presence it controls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticConditionalItem {
+    /// Item or enclosing body controlled by the attribute.
+    pub range: ByteRange,
+    /// Authored configuration attribute, including its delimiters.
+    pub attribute: ByteRange,
+}
+
 /// Collections retained by static syntax capture.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StaticFactsParts {
@@ -181,8 +190,8 @@ pub struct StaticFactsParts {
     pub rust_uses: Vec<StaticRustUse>,
     /// Authored Rust implementations.
     pub inherent_impls: Vec<StaticInherentImpl>,
-    /// Items whose admission depends on unresolved Rust configuration.
-    pub conditional_items: Vec<ByteRange>,
+    /// Items whose admission depends on Rust configuration.
+    pub conditional_items: Vec<StaticConditionalItem>,
 }
 
 /// Calls and binding evidence retained after the syntax tree is released.
@@ -284,7 +293,7 @@ impl StaticFacts {
 
     /// Authored Rust items requiring configuration evidence.
     #[must_use]
-    pub fn conditional_items(&self) -> &[ByteRange] {
+    pub fn conditional_items(&self) -> &[StaticConditionalItem] {
         &self.0.conditional_items
     }
 
@@ -409,7 +418,10 @@ impl StaticFacts {
                     .copied()
                     .all(|range| valid(range) && row.scope.encloses(range))
         });
-        let conditional = self.conditional_items().iter().copied().all(valid);
+        let conditional = self
+            .conditional_items()
+            .iter()
+            .all(|item| valid(item.range) && valid(item.attribute));
         if !(edges
             && references
             && declared_types

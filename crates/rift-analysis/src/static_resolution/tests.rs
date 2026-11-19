@@ -1421,3 +1421,43 @@ fn test_rust_bound_lookup_refuses_unknown_and_competing_traits() {
         u64::try_from(source.find("item.remaining()").expect("unique receiver")).expect("offset")
     );
 }
+
+#[test]
+fn test_rust_default_feature_conditions_preserve_exact_call_source_and_target() {
+    let source = "#[cfg(feature=\"std\")] fn leaf() {} #[cfg(feature=\"off\")] fn inactive() { leaf(); } fn root() { leaf(); } #[cfg(unknown)] fn mystery() {} fn uncertain() { mystery(); }";
+    let manifest =
+        "[package]\nname='fixture'\nversion='0.1.0'\n[features]\ndefault=['std']\nstd=[]\noff=[]\n";
+    let result = resolution(
+        "rust",
+        &[("src/lib.rs", source)],
+        &[("Cargo.toml", manifest)],
+        WORK_MAX,
+    );
+    let found = calls(&result, "src/lib.rs").collect::<Vec<_>>();
+    assert_eq!(found.len(), 1);
+    assert_eq!(source_of(found[0], source), "leaf()");
+    assert_eq!(target(found[0]), "rift://symbol/local/rust/fixture/leaf");
+    assert_eq!(
+        found[0].binding.range().start(),
+        u64::try_from(source.rfind("leaf()").expect("active call")).expect("offset")
+    );
+}
+
+#[test]
+fn test_rust_unknown_import_does_not_establish_a_receiver_type() {
+    let source =
+        "mod known; #[cfg(unknown)] use crate::known::Item; fn root(item: &Item) { item.read(); }";
+    let result = resolution(
+        "rust",
+        &[
+            ("src/lib.rs", source),
+            (
+                "src/known.rs",
+                "pub struct Item; impl Item { pub fn read(&self) {} }",
+            ),
+        ],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    assert_eq!(calls(&result, "src/lib.rs").count(), 0);
+}

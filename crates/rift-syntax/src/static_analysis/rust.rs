@@ -210,7 +210,10 @@ impl Kinds {
             next
         };
         if let Some(conditional) = conditional {
-            facts.conditional_items.push(byte_range(conditional)?);
+            facts.conditional_items.push(super::StaticConditionalItem {
+                range: byte_range(conditional)?,
+                attribute: byte_range(syntax_element)?,
+            });
         }
         Ok(())
     }

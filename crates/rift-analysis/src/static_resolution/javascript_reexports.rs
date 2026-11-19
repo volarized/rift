@@ -99,7 +99,10 @@ fn files<'source>(
         let Some(facts) = admitted_facts(document) else {
             continue;
         };
-        files.insert(document.path.as_str(), File::new(document, facts, work)?);
+        files.insert(
+            document.path.as_str(),
+            File::new(document, facts, None, work)?,
+        );
     }
     Some(files)
 }

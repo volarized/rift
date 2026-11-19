@@ -20,6 +20,14 @@ impl<'source> Index<'source> {
             if !work.charge() {
                 return;
             }
+            if file.conditional(reference.target, work)
+                || self
+                    .rust
+                    .module(file, reference.target.start, work)
+                    .is_none()
+            {
+                continue;
+            }
             let target = if reference.role == ReferenceRole::Type {
                 self.rust.edge_type_target(file, reference.target, work)
             } else {
@@ -59,6 +67,14 @@ impl<'source> Index<'source> {
         for symbol in file.document.facts.symbols() {
             if !work.charge() {
                 return;
+            }
+            if file.conditional(symbol.item_range, work)
+                || self
+                    .rust
+                    .module(file, symbol.item_range.start, work)
+                    .is_none()
+            {
+                continue;
             }
             let target = Target {
                 file: file.document,
@@ -137,11 +153,9 @@ impl<'source> Namespaces<'source> {
             .and_then(|owner| {
                 let mut path = owner.admitted_path()?;
                 path.push(member.trim().to_owned());
-                self.members
-                    .get(&path)
-                    .copied()
-                    .flatten()
-                    .filter(|target| target.symbol.kind == "field_declaration")
+                self.members.get(&path).copied().flatten().filter(|target| {
+                    target.symbol.kind == "field_declaration" && self.available(*target)
+                })
             });
         field.or_else(|| self.receiver_method(file, receiver, member.trim(), work))
     }

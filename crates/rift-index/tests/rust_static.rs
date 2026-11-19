@@ -284,3 +284,97 @@ fn test_rust_trait_defaults_and_bounded_receivers_keep_stored_targets() {
                 .any(|from| edge.from().as_str().ends_with(from))
     }));
 }
+
+#[test]
+fn test_rust_default_features_keep_active_facts_and_refuse_unknown_conditions() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let root = directory.path();
+    std::fs::create_dir(root.join("src")).expect("source directory");
+    std::fs::write(root.join("Cargo.toml"), "[package]\nname='fixture'\nversion='0.1.0'\n[features]\ndefault=['standard']\nstandard=['std']\nstd=[]\noff=[]\n").expect("manifest");
+    let source = "#[cfg(feature=\"std\")]\npub fn leaf() -> u8 { 1 }\n#[cfg(not(feature=\"std\"))]\npub fn leaf() -> u8 { 2 }\npub fn useit() -> u8 { leaf() }\npub use crate::leaf as selected; fn alias_call() { selected(); }\n#[cfg(feature=\"off\")] fn inactive() { leaf(); }\n#[cfg(unknown)] fn mystery() {}\nfn unknown_call() { mystery(); }\n#[cfg(feature=\"std\")] pub mod active;\nuse crate::active::child; fn module_call() { child(); } #[cfg(feature=\"off\")] mod inactive_module; #[cfg(unknown)] mod uncertain_module;";
+    std::fs::write(root.join("src/lib.rs"), source).expect("source");
+    std::fs::write(root.join("src/active.rs"), "pub fn child() {}").expect("module source");
+    for file in ["inactive_module.rs", "uncertain_module.rs"] {
+        std::fs::write(
+            root.join("src").join(file),
+            "fn leaf() {} fn root() { leaf(); }",
+        )
+        .expect("conditional module source");
+    }
+    let index = WorkspaceIndex::build(
+        root,
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &TextFileInclusion::default(),
+    )
+    .expect("index");
+    let view = index.symbol_view().expect("symbols");
+    assert!(
+        view.normalized_graph()
+            .records()
+            .iter()
+            .all(|record| record.identity().is_some())
+    );
+    for (from, to, kind) in [
+        ("/fixture/useit", "/fixture/leaf", EdgeKind::Calls),
+        ("/fixture/module_call", "/active/child", EdgeKind::Calls),
+    ] {
+        assert!(
+            index.edges().edges().any(|edge| edge.kind() == kind
+                && edge.from().as_str().ends_with(from)
+                && edge.to().as_str().ends_with(to)),
+            "missing {from} -> {to}"
+        );
+    }
+    assert!(
+        index
+            .edges()
+            .edges()
+            .any(|edge| edge.kind() == EdgeKind::Imports
+                && edge.to().as_str().ends_with("/active/child"))
+    );
+    assert!(!index.edges().edges().any(|edge| {
+        edge.kind() == EdgeKind::Calls
+            && ["/fixture/inactive", "/fixture/unknown_call"]
+                .iter()
+                .any(|from| edge.from().as_str().ends_with(from))
+    }));
+    assert!(!index.edges().edges().any(|edge| {
+        ["/inactive_module", "/uncertain_module"]
+            .iter()
+            .any(|part| edge.from().as_str().contains(part))
+    }));
+    assert!(
+        index
+            .edges()
+            .edges()
+            .any(|edge| edge.kind() == EdgeKind::Aliases
+                && edge.to().as_str().ends_with("/fixture/leaf"))
+    );
+}
+
+#[test]
+fn test_rust_unknown_method_alternatives_do_not_select_an_active_decoy() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let root = directory.path();
+    std::fs::create_dir(root.join("src")).expect("source directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='fixture'\nversion='0.1.0'\n",
+    )
+    .expect("manifest");
+    std::fs::write(root.join("src/lib.rs"), "struct Item; impl Item { fn method() {} } #[cfg(unknown)] impl Item { fn method() {} } fn root() { Item::method(); }").expect("source");
+    let index = WorkspaceIndex::build(
+        root,
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &TextFileInclusion::default(),
+    )
+    .expect("index");
+    assert!(
+        !index
+            .edges()
+            .edges()
+            .any(|edge| edge.kind() == EdgeKind::Calls)
+    );
+}

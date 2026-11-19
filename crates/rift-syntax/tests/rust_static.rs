@@ -235,3 +235,31 @@ fn test_rust_inline_and_where_bounds_retain_authored_paths() {
         .collect::<Vec<_>>();
     assert_eq!(bounds, [("T", "Count"), ("T", "crate::Count")]);
 }
+
+#[test]
+fn test_rust_conditional_items_keep_their_authored_attribute_ranges() {
+    let path = ProjectPath::new("src/lib.rs").expect("path");
+    let source = "#[cfg(feature=\"std\")]\nfn leaf() {}";
+    let document = RustSyntaxProvider::default()
+        .analyze(
+            SyntaxSource {
+                path: &path,
+                text: source,
+            },
+            SyntaxLimits::default(),
+        )
+        .expect("syntax");
+    let conditions = document
+        .facts()
+        .static_facts()
+        .expect("static facts")
+        .conditional_items();
+    assert_eq!(conditions.len(), 1);
+    let condition = conditions[0];
+    let text = |range: rift_syntax::ByteRange| {
+        &source[usize::try_from(range.start).expect("offset")
+            ..usize::try_from(range.end).expect("offset")]
+    };
+    assert_eq!(text(condition.attribute), "#[cfg(feature=\"std\")]");
+    assert_eq!(text(condition.range), "fn leaf() {}");
+}

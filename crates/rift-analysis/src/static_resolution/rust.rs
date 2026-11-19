@@ -19,7 +19,9 @@ pub(super) struct Namespaces<'source> {
     members: BTreeMap<Vec<String>, Option<Target<'source>>>,
     field_types: BTreeMap<Vec<String>, Target<'source>>,
     bounds: BTreeMap<(&'source str, ByteRange), Vec<ByteRange>>,
+    unavailable: BTreeSet<(&'source str, ByteRange)>,
     conditional_modules: BTreeSet<Vec<String>>,
+    inactive_modules: BTreeSet<Vec<String>>,
     modules: BTreeMap<Vec<String>, bool>,
     crate_roots: BTreeMap<String, Option<&'source str>>,
 }
@@ -51,20 +53,28 @@ impl<'source> Namespaces<'source> {
         if file.conditional(range, work) {
             return None;
         }
+        self.module(file, range.start, work)?;
+        self.type_target(file, range, work)
+    }
+
+    fn type_target(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
         let parts = path_segments(file.text(range)?, work)?;
         if let [name] = parts.as_slice()
             && let Some(target) = Self::local_type(file, range.start, name, work)
         {
-            return Some(target);
+            return self.available(target).then_some(target);
         }
         let path = self.resolved_path(file, range.start, &parts, work)?;
         self.lookup(file, range.start, &path, Namespace::Type, work)
             .or_else(|| {
-                self.members
-                    .get(&path)
-                    .copied()
-                    .flatten()
-                    .filter(|target| target.symbol.kinds.contains(&SymbolKind::Type))
+                self.members.get(&path).copied().flatten().filter(|target| {
+                    target.symbol.kinds.contains(&SymbolKind::Type) && self.available(*target)
+                })
             })
     }
 
@@ -153,7 +163,7 @@ impl<'source> Namespaces<'source> {
             if let Some(target) = target {
                 let file = files.get(target.file.path.as_str())?;
                 if let Some(implementation) = inherent_member(file, target.symbol, work)
-                    && let Some(owner) = self.edge_type_target(file, implementation.type_path, work)
+                    && let Some(owner) = self.type_target(file, implementation.type_path, work)
                 {
                     path = owner.admitted_path()?;
                     path.push(target.symbol.name.clone());
@@ -181,7 +191,7 @@ impl<'source> Namespaces<'source> {
                 }
                 let file = files.get(method.target.file.path.as_str())?;
                 let range = method.implementation.type_path;
-                let Some(owner) = self.edge_type_target(file, range, work) else {
+                let Some(owner) = self.type_target(file, range, work) else {
                     continue;
                 };
                 let Some(mut canonical) = owner.admitted_path() else {
@@ -205,8 +215,9 @@ impl<'source> Namespaces<'source> {
             if !work.charge() {
                 return None;
             }
-            let Some(target) = target.filter(|target| target.symbol.kind == "field_declaration")
-            else {
+            let Some(target) = target.filter(|target| {
+                target.symbol.kind == "field_declaration" && self.available(*target)
+            }) else {
                 continue;
             };
             let file = files.get(target.file.path.as_str())?;
@@ -245,6 +256,16 @@ impl<'source> Namespaces<'source> {
                 let depth = symbol.qualified_name.split("::").count();
                 namespace.base = path.get(..path.len().checked_sub(depth)?)?.to_vec();
             }
+            if file.inactive(symbol.item_range, work) {
+                if symbol.kind == "module" {
+                    self.inactive_modules.insert(path);
+                }
+                continue;
+            }
+            if file.conditional(symbol.item_range, work) {
+                self.unavailable
+                    .insert((file.document.path.as_str(), symbol.item_range));
+            }
             if symbol.kind == "impl_item" {
                 continue;
             }
@@ -282,9 +303,6 @@ impl<'source> Namespaces<'source> {
         path: Vec<String>,
         work: &mut Work,
     ) {
-        if file.conditional(symbol.item_range, work) {
-            return;
-        }
         let target = Target {
             file: file.document,
             symbol,
@@ -317,6 +335,7 @@ impl<'source> Namespaces<'source> {
         if file.conditional(call.range, work) {
             return None;
         }
+        self.module(file, call.range.start, work)?;
         match call.callee {
             StaticCallee::Direct => self.direct_call(file, call, work),
             StaticCallee::Qualified => self.qualified_call(file, call, work),
@@ -420,7 +439,13 @@ impl<'source> Namespaces<'source> {
         if owner.symbol.kind == "trait" {
             let mut path = owner.admitted_path()?;
             path.push(member.to_owned());
-            return self.members.get(&path).copied().flatten()?.callable();
+            return self
+                .members
+                .get(&path)
+                .copied()
+                .flatten()
+                .filter(|target| self.available(*target))?
+                .callable();
         }
         if !matches!(owner.symbol.kind, "struct" | "enum" | "union_item") {
             return None;
@@ -445,6 +470,9 @@ impl<'source> Namespaces<'source> {
                 .any(|edge| edge.from == range);
             if inherent && trait_impl {
                 continue;
+            }
+            if !self.available(method.target) {
+                return None;
             }
             if !trait_impl && !inherent {
                 selected = None;
@@ -472,9 +500,19 @@ impl<'source> Namespaces<'source> {
             Namespace::Type => &self.types,
             Namespace::Value => &self.values,
         };
-        let target = index.get(path).copied().flatten()?;
+        let target = index
+            .get(path)
+            .copied()
+            .flatten()
+            .filter(|target| self.available(*target))?;
         self.accessible(file, position, path, target, work)
             .then_some(target)
+    }
+
+    fn available(&self, target: Target<'source>) -> bool {
+        !self
+            .unavailable
+            .contains(&(target.file.path.as_str(), target.symbol.item_range))
     }
 
     fn accessible(
@@ -493,7 +531,7 @@ impl<'source> Namespaces<'source> {
         };
         for length in 1..=target_namespace.len() {
             let module = &target_namespace[..length];
-            if !work.charge() || self.conditional_modules.contains(module) {
+            if !work.charge() || self.module_unavailable(module) {
                 return false;
             }
             if self.modules.get(module) == Some(&false)
@@ -565,6 +603,9 @@ impl<'source> Namespaces<'source> {
         match file.binding(head, position, is_type_binding, work) {
             Binding::Found(binding) => match binding.kind {
                 StaticBindingKind::RustUse { path } => {
+                    if file.conditional(path, work) {
+                        return None;
+                    }
                     let imported = file.use_parts(path, work)?;
                     let imported = imported.iter().map(String::as_str).collect::<Vec<_>>();
                     let mut prefix = self.absolute_path(file, path.start, &imported, work)?;
@@ -675,7 +716,17 @@ impl<'source> Namespaces<'source> {
                 path = inline;
             }
         }
+        for length in 1..=path.len() {
+            if !work.charge() || self.module_unavailable(&path[..length]) {
+                return None;
+            }
+        }
         Some(path)
+    }
+
+    fn module_unavailable(&self, path: &[String]) -> bool {
+        self.conditional_modules.contains(path)
+            || self.inactive_modules.contains(path) && !self.types.contains_key(path)
     }
 }
 
@@ -713,10 +764,15 @@ impl File<'_> {
     }
 
     pub(super) fn conditional(&self, range: ByteRange, work: &mut Work) -> bool {
-        self.facts
-            .conditional_items()
-            .iter()
-            .any(|item| !work.charge() || item.contains(range.start))
+        self.conditions.iter().any(|(item, admitted)| {
+            !work.charge() || item.contains(range.start) && *admitted != Some(true)
+        })
+    }
+
+    pub(super) fn inactive(&self, range: ByteRange, work: &mut Work) -> bool {
+        self.conditions.iter().any(|(item, admitted)| {
+            !work.charge() || item.contains(range.start) && *admitted == Some(false)
+        })
     }
 
     fn in_impl_or_trait(&self, symbol: &SyntaxSymbol, work: &mut Work) -> bool {

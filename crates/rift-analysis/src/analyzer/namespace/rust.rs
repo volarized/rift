@@ -11,6 +11,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::NamespaceInput;
 
+pub(super) mod configuration;
 mod macros;
 
 /// Establishes the selected library root from captured metadata once per inventory.
@@ -660,7 +661,19 @@ fn local_exports(
         return;
     };
     let mut work = 0usize;
+    let configurations = configuration::Configurations::new(input);
+    let files = selected
+        .iter()
+        .map(|file| (file.path.as_str(), file))
+        .collect::<BTreeMap<_, _>>();
     for (namespace, (path, range, name, target)) in requested {
+        let Some(file) = files.get(path.as_str()) else {
+            continue;
+        };
+        let configuration = configurations.file(path.as_str());
+        if configuration.admitted(file.syntax, file.source, *range) != Some(true) {
+            continue;
+        }
         // Captured conditional declarations do not establish export completeness.
         prepared.unresolved_exports = true;
         let local = requested_path(namespace, target).and_then(|target_path| {
@@ -668,6 +681,7 @@ fn local_exports(
                 input,
                 selected,
                 &prepared.anchors,
+                &configurations,
                 &target_path,
                 &mut work,
                 work_max,
@@ -801,6 +815,7 @@ fn local_target<'input>(
     input: &NamespaceInput<'_>,
     selected: &'input [super::SelectedFile<'input>],
     anchors: &'input super::Anchors,
+    configurations: &configuration::Configurations<'_>,
     path: &[String],
     work: &mut usize,
     work_max: usize,
@@ -835,7 +850,16 @@ fn local_target<'input>(
             else {
                 continue;
             };
-            if symbol.visibility.as_deref() != Some("pub")
+            let admitted = configurations.file(file.path.as_str()).admitted(
+                file.syntax,
+                file.source,
+                symbol.item_range,
+            );
+            if admitted == Some(false) {
+                continue;
+            }
+            if admitted != Some(true)
+                || symbol.visibility.as_deref() != Some("pub")
                 || file
                     .source
                     .get(
