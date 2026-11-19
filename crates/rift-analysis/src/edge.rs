@@ -125,37 +125,61 @@ struct UnitDefinitions {
 
 impl UnitDefinitions {
     fn build(graph: &NormalizedGraph) -> Self {
+        Self::build_with(graph, None)
+    }
+
+    /// `known` carries the source modules an earlier build over the same `graph` derived;
+    /// they depend on the graph alone, so a later build reads them instead of parsing
+    /// every record identity again.
+    fn build_with(
+        graph: &NormalizedGraph,
+        known: Option<&BTreeMap<SourceUnitId, SymbolId>>,
+    ) -> Self {
         let mut by_unit: BTreeMap<SourceUnitId, Vec<(u64, u64, SymbolId)>> = BTreeMap::new();
         let mut edge_modules = BTreeMap::<SourceUnitId, Option<SymbolId>>::new();
         let mut declared_edge_modules = BTreeMap::<SourceUnitId, SymbolId>::new();
+        let mut common_modules = CommonModules::default();
         for record in graph.records() {
             let Some(identity) = record.identity() else {
                 continue;
             };
-            for binding in record
+            // The record's Contributions are read once: the module facts and the parent
+            // identity belong to the record, and reading them per declaring binding
+            // visited every Contribution again and parsed the identity again.
+            let contributions = record
                 .contributions()
                 .iter()
-                .filter_map(|key| graph.contribution(key)?.source())
+                .filter_map(|key| graph.contribution(key))
+                .collect::<Vec<_>>();
+            let mut declared = None;
+            for binding in contributions
+                .iter()
+                .filter_map(|contribution| contribution.source())
             {
                 let range = binding.range();
-                let is_module = record
-                    .contributions()
-                    .iter()
-                    .filter_map(|key| graph.contribution(key)?.facts())
-                    .any(|facts| facts.language().name == "python" && facts.kind().0 == "module");
-                if is_module {
-                    declared_edge_modules.insert(binding.unit().clone(), identity.clone());
+                if known.is_none() {
+                    let (is_module, parent) = declared.get_or_insert_with(|| {
+                        let is_module = contributions
+                            .iter()
+                            .filter_map(|contribution| contribution.facts())
+                            .any(|facts| {
+                                facts.language().name == "python" && facts.kind().0 == "module"
+                            });
+                        (is_module, edge_module_parent(identity))
+                    });
+                    if *is_module {
+                        declared_edge_modules.insert(binding.unit().clone(), identity.clone());
+                    }
+                    edge_modules
+                        .entry(binding.unit().clone())
+                        .and_modify(|current| {
+                            *current = current
+                                .as_ref()
+                                .zip(parent.as_ref())
+                                .and_then(|(left, right)| common_modules.common(left, right));
+                        })
+                        .or_insert_with(|| parent.clone());
                 }
-                let parent = edge_module_parent(identity);
-                edge_modules
-                    .entry(binding.unit().clone())
-                    .and_modify(|current| {
-                        *current = current
-                            .as_ref()
-                            .zip(parent.as_ref())
-                            .and_then(|(left, right)| edge_module_common(left, right));
-                    })
-                    .or_insert(parent);
                 by_unit.entry(binding.unit().clone()).or_default().push((
                     range.start(),
                     range.end(),
@@ -167,11 +191,16 @@ impl UnitDefinitions {
             .into_iter()
             .map(|(unit, spans)| (unit, EnclosingDefinitions::new(spans)))
             .collect();
-        let mut edge_modules = edge_modules
-            .into_iter()
-            .filter_map(|(unit, identity)| identity.map(|identity| (unit, identity)))
-            .collect::<BTreeMap<_, _>>();
-        edge_modules.extend(declared_edge_modules);
+        let edge_modules = if let Some(known) = known {
+            known.clone()
+        } else {
+            let mut edge_modules = edge_modules
+                .into_iter()
+                .filter_map(|(unit, identity)| identity.map(|identity| (unit, identity)))
+                .collect::<BTreeMap<_, _>>();
+            edge_modules.extend(declared_edge_modules);
+            edge_modules
+        };
         Self {
             by_unit,
             edge_modules,
@@ -201,6 +230,25 @@ fn edge_module_parent(identity: &SymbolId) -> Option<SymbolId> {
     )
     .ok()?;
     SymbolId::new(module.wire_identity()).ok()
+}
+
+/// Answers of [`edge_module_common`] by identity pair. The declarations of one unit share
+/// few distinct parents, and each answer parses both identities.
+#[derive(Default)]
+struct CommonModules(BTreeMap<SymbolId, BTreeMap<SymbolId, Option<SymbolId>>>);
+
+impl CommonModules {
+    fn common(&mut self, left: &SymbolId, right: &SymbolId) -> Option<SymbolId> {
+        if let Some(known) = self.0.get(left).and_then(|answers| answers.get(right)) {
+            return known.clone();
+        }
+        let common = edge_module_common(left, right);
+        self.0
+            .entry(left.clone())
+            .or_default()
+            .insert(right.clone(), common.clone());
+        common
+    }
 }
 
 fn edge_module_common(left: &SymbolId, right: &SymbolId) -> Option<SymbolId> {
@@ -369,7 +417,9 @@ impl EdgeStore {
         if occurrences.is_empty() {
             return;
         }
-        let enclosing = UnitDefinitions::build(graph);
+        // `graph` is the graph this store was built from (`WorkspaceSemantics` builds its
+        // store from its own graph and passes that graph here), so its source modules hold.
+        let enclosing = UnitDefinitions::build_with(graph, Some(&self.edge_modules));
         let existing = self.outgoing.values().map(Vec::len).sum::<usize>();
         let mut remaining = edges_max.saturating_sub(existing);
         let mut changed = false;
