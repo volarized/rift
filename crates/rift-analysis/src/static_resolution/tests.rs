@@ -1,4 +1,38 @@
 #[test]
+fn test_typescript_declared_interface_calls_survive_unrelated_member_writes() {
+    let source = "interface Task { run(): void; } function root(input: Task, other) { other.run = () => {}; input.run(); }";
+    let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);
+    assert_eq!(
+        calls(&result, "main.ts").map(target).collect::<Vec<_>>(),
+        ["rift://symbol/local/typescript/.%2Fmain.ts/Task/run"]
+    );
+}
+
+#[test]
+fn test_typescript_overloaded_methods_keep_one_logical_call_target() {
+    let source = "interface Task { run(value: string): void; run(value: number): void; } class Worker { run(value: string): void; run(value: number): void; run(value: string | number) {} } function root(input: Task) { input.run('a'); const worker = new Worker(); worker.run(1); }";
+    let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);
+    assert_eq!(
+        calls(&result, "main.ts").map(target).collect::<Vec<_>>(),
+        [
+            "rift://symbol/local/typescript/.%2Fmain.ts/Task/run",
+            "rift://symbol/local/typescript/.%2Fmain.ts/Worker",
+            "rift://symbol/local/typescript/.%2Fmain.ts/Worker/run"
+        ]
+    );
+}
+
+#[test]
+fn test_typescript_duplicate_method_implementations_remain_unresolved() {
+    let source = "class Task { run() {} run() {} } const input = new Task(); input.run();";
+    let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);
+    assert_eq!(
+        calls(&result, "main.ts").map(target).collect::<Vec<_>>(),
+        ["rift://symbol/local/typescript/.%2Fmain.ts/Task"]
+    );
+}
+
+#[test]
 fn test_typescript_deferred_calls_resolve_later_lexical_bindings() {
     let source = "namespace Tasks { export const root = () => leaf(); export const leaf = () => {}; } leaf(); const leaf = () => {};";
     let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);

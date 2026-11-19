@@ -187,7 +187,10 @@ impl<'source> Index<'source> {
                 continue;
             }
             let file = self.files.get(class.file.path.as_str())?;
-            if role == ReferenceRole::Call && file.assignments.may_replace_method(member) {
+            if role == ReferenceRole::Call
+                && class.symbol.kind != "interface"
+                && file.assignments.may_replace_method(member)
+            {
                 return None;
             }
             let target = file.javascript_declared_member(
@@ -281,9 +284,22 @@ impl<'source> File<'source> {
                 continue;
             }
             if let Some(previous) = found {
-                // A type member can have several signatures for one logical symbol.
-                if role != ReferenceRole::Type || symbol.kind != previous.symbol.kind {
+                if symbol.kind != previous.symbol.kind {
                     return None;
+                }
+                // Overload signatures share a member, but two bodies are ambiguous.
+                if role != ReferenceRole::Type {
+                    if symbol.kind != "method"
+                        || (symbol.body_range.is_some() && previous.symbol.body_range.is_some())
+                    {
+                        return None;
+                    }
+                    if symbol.body_range.is_some() {
+                        found = Some(Target {
+                            file: self.document,
+                            symbol,
+                        });
+                    }
                 }
             } else {
                 found = Some(Target {
