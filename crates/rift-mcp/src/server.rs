@@ -1785,6 +1785,13 @@ pub(crate) fn hermetic_workspace(root: &Path, configuration: &str) -> std::io::R
     std::fs::write(root.join("rift.toml"), contents)
 }
 
+/// One request capture's files and the watcher position that selected them.
+#[derive(Debug, Default)]
+struct RequestCapture {
+    files: Arc<LastCapture>,
+    selection: Option<(u64, ConfigurationFingerprint)>,
+}
+
 /// Workspace MCP server: reads serve an immutable snapshot rebuilt after source changes.
 ///
 /// Clones share every piece of server state. The HTTP transport clones one
@@ -1820,7 +1827,7 @@ pub struct RiftMcp {
     engines: Arc<EngineHold>,
     /// The last request-time capture's stats and digests: the next capture reads only the
     /// paths whose stat moved since.
-    last_capture: Arc<std::sync::Mutex<Arc<LastCapture>>>,
+    last_capture: Arc<std::sync::Mutex<RequestCapture>>,
     /// The authorized requests in flight, which the history task waits on before a batch
     /// and the HTTP transport counts.
     activity: Arc<IdleTracker>,
@@ -3931,6 +3938,8 @@ impl RiftMcp {
         let languages = current.configuration.language_file_selections();
         let last_capture = Arc::clone(&self.last_capture);
         let cancellation = self.validation.cancellation.clone();
+        let validation = Arc::clone(&self.validation);
+        let configuration = current.configuration.fingerprint;
         rift_tracing::debug_span!(
             "index.reconcile",
             component = "index",
@@ -3941,20 +3950,32 @@ impl RiftMcp {
             "workspace fingerprint",
             cancellation,
             move |cancellation| {
-                let last = Arc::clone(
-                    &last_capture
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner),
-                );
-                let (digests, next) = rift_index::capture_digests_with_languages_cancellable(
-                    &root,
-                    limits,
-                    &visibility,
-                    &text_inclusion,
-                    &languages,
-                    &last,
-                    &|| cancellation.is_cancelled(),
-                )?;
+                let observed_epoch = validation.discovery_epoch();
+                let recorded = last_capture
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let last = Arc::clone(&recorded.files);
+                let reuse_selection = recorded.selection == Some((observed_epoch, configuration))
+                    && !validation.watch_failed.load(Ordering::Acquire);
+                drop(recorded);
+                let cancelled = || cancellation.is_cancelled();
+                let recaptured = if reuse_selection {
+                    last.recapture_selected_cancellable(&root, limits, &cancelled)?
+                } else {
+                    None
+                };
+                let (digests, next) = match recaptured {
+                    Some(captured) => captured,
+                    None => rift_index::capture_digests_with_languages_cancellable(
+                        &root,
+                        limits,
+                        &visibility,
+                        &text_inclusion,
+                        &languages,
+                        &last,
+                        &cancelled,
+                    )?,
+                };
                 if !crate::validation::captured_build_paths_match(&root, &reads, &|| {
                     cancellation.is_cancelled()
                 })? {
@@ -3965,7 +3986,10 @@ impl RiftMcp {
                 }
                 *last_capture
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = RequestCapture {
+                    files: Arc::new(next),
+                    selection: Some((observed_epoch, configuration)),
+                };
                 let configuration = rift_tracing::traced!(
                     component = "index",
                     operation = "fingerprint.configuration",
@@ -3994,7 +4018,8 @@ impl RiftMcp {
                     let last = Arc::clone(
                         &last_capture
                             .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .files,
                     );
                     let (digests, next) =
                         capture_prepared_workspace(&root, &published, &last, &|| {
@@ -4002,7 +4027,10 @@ impl RiftMcp {
                         })?;
                     *last_capture
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = RequestCapture {
+                        files: Arc::new(next),
+                        selection: None,
+                    };
                     Ok((digests, configuration_fingerprint(&root)))
                 },
             )
@@ -8575,6 +8603,117 @@ done
                 .any(|warning| matches!(warning, ReadWarning::StaleIndex { .. })),
             "a published rebuild clears the recorded failure: {:?}",
             answer.warnings
+        );
+        Ok(())
+    }
+
+    async fn shallow_unsupervised_fixture() -> TestResult<(tempfile::TempDir, UnsupervisedServer)> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        super::hermetic_workspace(directory.path(), "[source]\ndirectory_depth = 2\n")?;
+        let assembled = unsupervised_server(directory.path()).await?;
+        let state = directory.path().join(".rift");
+        fs::create_dir_all(&state)?;
+        let modified = fs::metadata(directory.path())?.modified()?;
+        let marker = state.join("capture-clock");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            fs::write(&marker, "timestamp probe")?;
+            if fs::metadata(&marker)?.modified()? > modified {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("filesystem timestamp did not advance".into());
+            }
+            std::thread::yield_now();
+        }
+        Ok((directory, assembled))
+    }
+
+    #[tokio::test]
+    async fn unchanged_reads_do_not_walk_without_a_watcher_event() -> TestResult {
+        let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let (directory, assembled) = Box::pin(shallow_unsupervised_fixture()).await?;
+        let server = &assembled.server;
+        assert_eq!(search_symbols(server, "beacon").await?.results.len(), 1);
+        let walks = recorder
+            .metrics()
+            .find("index.directory_walks", &[])
+            .ok_or("initial capture walked")?
+            .value()
+            .clone();
+        assert_eq!(search_symbols(server, "beacon").await?.results.len(), 1);
+        assert_eq!(
+            recorder
+                .metrics()
+                .find("index.directory_walks", &[])
+                .map(|series| series.value().clone()),
+            Some(walks)
+        );
+
+        let current = Arc::clone(&server.published.read().await.current);
+        fs::create_dir_all(directory.path().join("uncaptured/empty/deep"))?;
+        let unreported = server
+            .capture_tree(&current)
+            .await
+            .expect_err("directory metadata invalidates selection without an event");
+        assert_eq!(unreported.slug(), errors::index::workspace_too_deep::SLUG);
+        server.validation.observe_whole_workspace()?;
+        let observed = server
+            .capture_tree(&current)
+            .await
+            .expect_err("directory observation invalidates selection");
+        assert_eq!(observed.slug(), errors::index::workspace_too_deep::SLUG);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn known_edits_reuse_selection_and_new_paths_or_watch_failure_walk() -> TestResult {
+        let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let (directory, assembled) = Box::pin(shallow_unsupervised_fixture()).await?;
+        let server = &assembled.server;
+        assert_eq!(search_symbols(server, "beacon").await?.results.len(), 1);
+        let current = Arc::clone(&server.published.read().await.current);
+        let walks = recorder
+            .metrics()
+            .find("index.directory_walks", &[])
+            .ok_or("first capture walked")?
+            .value()
+            .clone();
+        fs::write(directory.path().join("lib.rs"), "pub fn lantern() {}\n")?;
+        let (edited, _) = server.capture_tree(&current).await?;
+        assert_ne!(edited.fingerprint(), current.fingerprint);
+        server
+            .validation
+            .observe_paths([CoreProjectPath::new("lib.rs")?])?;
+        let (observed, _) = server.capture_tree(&current).await?;
+        assert_eq!(observed, edited);
+        assert_eq!(
+            recorder
+                .metrics()
+                .find("index.directory_walks", &[])
+                .map(|series| series.value().clone()),
+            Some(walks)
+        );
+
+        fs::write(directory.path().join("added.rs"), "pub fn added() {}\n")?;
+        server
+            .validation
+            .observe_paths([CoreProjectPath::new("added.rs")?])?;
+        let (added, _) = server.capture_tree(&current).await?;
+        assert!(added.get(&CoreProjectPath::new("added.rs")?).is_some());
+
+        server.validation.observe_watch_failure()?;
+        server.capture_tree(&current).await?;
+        fs::write(
+            directory.path().join("unreported.rs"),
+            "pub fn unreported() {}\n",
+        )?;
+        let (failed_watch, _) = server.capture_tree(&current).await?;
+        assert!(
+            failed_watch
+                .get(&CoreProjectPath::new("unreported.rs")?)
+                .is_some()
         );
         Ok(())
     }

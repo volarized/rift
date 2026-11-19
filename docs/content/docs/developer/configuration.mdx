@@ -1142,7 +1142,7 @@ of the two on its own, and writes to one wait for that database's turn alone.
 4 MiB. The request selects rows with `page` and `max_results`. A page above the byte bound
 returns a typed error; the caller can reduce `max_results`.
 
-<VersionBadge version="v0.0.83" />
+<VersionBadge version="v0.0.84" />
 
 The server retains each answer in a view for 15 minutes, so a later `page` with the same
 `revision` reads it without evaluating the query again. Two `[search.query]` keys bound the

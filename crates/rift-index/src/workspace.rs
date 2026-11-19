@@ -1,4 +1,5 @@
 mod symbol_view;
+mod walk;
 pub use symbol_view::WorkspaceSymbolView;
 
 use std::borrow::Cow;
@@ -49,11 +50,12 @@ use rift_syntax::{
     SyntaxSymbol, registry,
 };
 use sha2::{Digest as _, Sha256};
+use walk::{projected_walk, selected_walk};
 
 use crate::LocatedSyntax;
 use crate::capture::{
-    CaptureBoundary, CapturedPath, LastCapture, capture_io_error, capture_path, path_was_removed,
-    root_identity,
+    CaptureBoundary, CaptureSelection, CapturedPath, DiscoveryInputs, LastCapture, RootIdentity,
+    SelectionInputs, capture_io_error, capture_path, path_was_removed, root_identity,
 };
 use crate::change_set::{FileDigest, FileRecord, PathChanges, WorkspaceDigests, tree_revision_of};
 use crate::chunk::text_chunks;
@@ -799,50 +801,30 @@ impl WorkspaceSourcePolicy {
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<Vec<ProjectPath>, RiftError> {
         check_cancelled(cancelled)?;
-        let mut paths = Vec::new();
-        for entry in source_walk(
+        let builder = source_walk_builder(
             &self.root,
             self.limits.directory_depth_max,
             GitignorePolicy::Ignore,
             Some(Arc::clone(&self.matcher)),
-        ) {
-            check_cancelled(cancelled)?;
-            let Some(entry) = walked_entry(&self.root, entry)? else {
-                continue;
-            };
-            let file_type = entry.file_type();
-            if file_type.is_some_and(|file_type| file_type.is_dir()) {
-                if entry.depth() > self.limits.directory_depth_max {
-                    return errors::index::workspace_too_deep()
-                        .path(entry.path())
-                        .field("source.directory_depth")
-                        .observed(entry.depth() as u64)
-                        .maximum(self.limits.directory_depth_max as u64)
-                        .fail();
+        );
+        let selected = projected_walk(
+            &self.root,
+            builder,
+            self.limits.files_max,
+            0,
+            cancelled,
+            |entry| {
+                let Some(path) = walked_file(entry, self.limits.directory_depth_max)? else {
+                    return Ok(None);
+                };
+                if !self.visible_selection(path) {
+                    return Ok(None);
                 }
-                continue;
-            }
-            if !file_type.is_some_and(|file_type| file_type.is_file())
-                || !self.visible_selection(entry.path())
-            {
-                continue;
-            }
-            if paths.len() >= self.limits.files_max {
-                return errors::index::workspace_too_many_files()
-                    .path(entry.path())
-                    .field(SOURCE_FILES_FIELD)
-                    .observed(paths.len().saturating_add(1))
-                    .maximum(self.limits.files_max)
-                    .fail();
-            }
-            let relative = entry.path().strip_prefix(&self.root).map_err(|error| {
-                errors::index::workspace_invalid_path()
-                    .path(entry.path())
-                    .source(error)
-                    .error()
-            })?;
-            paths.push(relative_path(relative)?);
-        }
+                Ok(Some(()))
+            },
+            |path, ()| project_path_below(&self.root, path),
+        )?;
+        let mut paths: Vec<_> = selected.into_iter().map(|(_, path)| path).collect();
         paths.sort();
         Ok(paths)
     }
@@ -5250,6 +5232,7 @@ fn leave_out_beyond_declaration_bound(
 /// by path.
 #[derive(Debug, Default)]
 struct DiscoveredPaths {
+    inputs: Option<Arc<SelectionInputs>>,
     /// Each source path with the provider that claimed it, so the caller
     /// never asks the language table the same question twice.
     source: Vec<(PathBuf, &'static dyn SyntaxProvider)>,
@@ -5329,8 +5312,8 @@ impl DiscoveredPaths {
 /// A provider extension adds syntax facts; every other accepted file joins baseline text.
 /// Both classes use the same `.gitignore` and `[source]` policy.
 ///
-/// Directories are walked in file-name order so a bound violation is reported
-/// deterministically; both returned lists are sorted by path. Source and text paths share one
+/// Selected paths sort at the join; refusals replay file-name order for a deterministic
+/// error. Both returned lists are sorted by path. Source and text paths share one
 /// `files_max` budget, counted as they are discovered, and [`discover_forced`] spends the same
 /// budget on what the `.gitignore`-respecting walk could not reach.
 fn discover_cancellable(
@@ -5351,33 +5334,39 @@ fn discover_cancellable(
         .respect_gitignore()
         .then(|| GitignoreChain::build_cancellable(root, limits, Arc::clone(&matcher), cancelled))
         .transpose()?;
+    let directory_inputs =
+        DiscoveryInputs::new(limits.files_max.saturating_add(limits.directory_depth_max));
     let mut discovered = DiscoveredPaths::default();
-    for entry in source_walk(
+    let builder = source_walk_builder(
         root,
         limits.directory_depth_max,
         gitignore,
         Some(Arc::clone(&matcher)),
-    ) {
-        check_cancelled(cancelled)?;
-        let Some(entry) = walked_entry(root, entry)? else {
-            continue;
-        };
-        let Some(path) = walked_file(&entry, limits.directory_depth_max)? else {
-            continue;
+    );
+    let selected = selected_walk(root, builder, limits.files_max, 0, cancelled, |entry| {
+        if ignore_chain.is_none() && entry.file_type().is_some_and(|kind| kind.is_dir()) {
+            directory_inputs.directory(entry.path());
+        }
+        let Some(path) = walked_file(entry, limits.directory_depth_max)? else {
+            return Ok(None);
         };
         if !matcher.includes(path)
             || ignore_chain
                 .as_ref()
                 .is_some_and(|chain| chain.excludes(path, false))
         {
-            continue;
+            return Ok(None);
         }
-        let Some(class) = language.classifies(path)? else {
-            continue;
-        };
-        discovered.admit_classified(limits.files_max, path, class, language)?;
+        language.classifies(path)
+    })?;
+    for (path, class) in selected {
+        discovered.admit_classified(limits.files_max, &path, class, language)?;
     }
     discover_forced(root, limits, &matcher, language, &mut discovered, cancelled)?;
+    discovered.inputs = match &ignore_chain {
+        Some(chain) => chain.observations.as_ref().map(Arc::clone),
+        None => directory_inputs.finish(),
+    };
     discovered
         .source
         .sort_by(|left, right| left.0.cmp(&right.0));
@@ -5411,21 +5400,25 @@ fn discover_forced(
         .chain(discovered.text.iter().cloned())
         .chain(discovered.lockfiles.iter().cloned())
         .collect();
-    for entry in forced_walk(root, limits.directory_depth_max, reach, Arc::clone(matcher)) {
-        check_cancelled(cancelled)?;
-        let Some(entry) = walked_entry(root, entry)? else {
-            continue;
-        };
-        let Some(path) = walked_file(&entry, limits.directory_depth_max)? else {
-            continue;
-        };
-        if matcher.verdict(path) != PathVerdict::ForceIncluded || recorded.contains(path) {
-            continue;
-        }
-        let Some(class) = language.classifies(path)? else {
-            continue;
-        };
-        discovered.admit_classified(limits.files_max, path, class, language)?;
+    let held = discovered.source.len() + discovered.text.len() + discovered.lockfiles.len();
+    let selected = selected_walk(
+        root,
+        forced_walk(root, limits.directory_depth_max, reach, Arc::clone(matcher)),
+        limits.files_max,
+        held,
+        cancelled,
+        |entry| {
+            let Some(path) = walked_file(entry, limits.directory_depth_max)? else {
+                return Ok(None);
+            };
+            if matcher.verdict(path) != PathVerdict::ForceIncluded || recorded.contains(path) {
+                return Ok(None);
+            }
+            language.classifies(path)
+        },
+    )?;
+    for (path, class) in selected {
+        discovered.admit_classified(limits.files_max, &path, class, language)?;
     }
     Ok(())
 }
@@ -5471,6 +5464,7 @@ fn walked_file(entry: &DirEntry, directory_depth_max: usize) -> Result<Option<&P
 /// this policy would see no source event at all.
 #[derive(Debug)]
 pub(crate) struct GitignoreChain {
+    observations: Option<Arc<SelectionInputs>>,
     layers: BTreeMap<PathBuf, Vec<Gitignore>>,
     inputs: BTreeMap<PathBuf, FileDigest>,
     root: PathBuf,
@@ -5487,13 +5481,17 @@ impl GitignoreChain {
         matcher: Arc<PathMatcher>,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<Self, RiftError> {
+        let observations =
+            DiscoveryInputs::new(limits.files_max.saturating_add(limits.directory_depth_max));
         let mut layers: BTreeMap<PathBuf, Vec<Gitignore>> = BTreeMap::new();
         let mut inputs = BTreeMap::new();
         if let Ok(repository) = rift_history::Repository::open(root) {
             let exclude = repository.exclude_path();
+            observations.policy(&exclude);
             if exclude.is_file() {
                 let repository_root = repository.worktree_root();
                 let (layer, digest) = compiled_gitignore(&exclude, repository_root, limits)?;
+                observations.policy(&exclude);
                 inputs.insert(exclude, digest);
                 layers
                     .entry(repository_root.to_path_buf())
@@ -5501,42 +5499,43 @@ impl GitignoreChain {
                     .push(layer);
             }
         }
-        let mut ignore_files = inputs.len();
-        for entry in source_walk(
+        let builder = source_walk_builder(
             root,
             limits.directory_depth_max,
             GitignorePolicy::Ignore,
             Some(matcher),
-        ) {
+        );
+        let ignore_files = projected_walk(
+            root,
+            builder,
+            limits.files_max,
+            inputs.len(),
+            cancelled,
+            |entry| {
+                if entry.file_type().is_some_and(|kind| kind.is_dir()) {
+                    observations.ignore_directory(entry.path());
+                }
+                let is_ignore = entry.file_type().is_some_and(|kind| kind.is_file())
+                    && entry.file_name() == OsStr::new(".gitignore");
+                Ok(is_ignore.then_some(()))
+            },
+            |path, ()| {
+                observations.policy(path);
+                let compiled = compiled_gitignore(path, path.parent().unwrap_or(path), limits)?;
+                observations.policy(path);
+                Ok(compiled)
+            },
+        )?;
+        for (path, (layer, digest)) in ignore_files {
             check_cancelled(cancelled)?;
-            let Some(entry) = walked_entry(root, entry)? else {
-                continue;
-            };
-            let path = entry.path();
-            if !entry
-                .file_type()
-                .is_some_and(|file_type| file_type.is_file())
-                || path.file_name() != Some(OsStr::new(".gitignore"))
-            {
-                continue;
-            }
-            if ignore_files >= limits.files_max {
-                return errors::index::workspace_too_many_files()
-                    .path(path)
-                    .field(SOURCE_FILES_FIELD)
-                    .observed(ignore_files.saturating_add(1))
-                    .maximum(limits.files_max)
-                    .fail();
-            }
-            ignore_files += 1;
-            let (layer, digest) = compiled_gitignore(path, path.parent().unwrap_or(path), limits)?;
-            inputs.insert(path.to_path_buf(), digest);
+            inputs.insert(path, digest);
             layers
                 .entry(layer.path().to_path_buf())
                 .or_default()
                 .push(layer);
         }
         Ok(Self {
+            observations: observations.finish(),
             layers,
             inputs,
             root: root.to_path_buf(),
@@ -5676,7 +5675,7 @@ fn capture_paths_with_boundary(
     limits: WorkspaceIndexLimits,
     last: &LastCapture,
     boundary: Option<CaptureBoundary>,
-    root_identity: Option<(u64, u64)>,
+    root_identity: Option<RootIdentity>,
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<(WorkspaceDigests, LastCapture), RiftError> {
     recorded_capture_paths_with_boundary(
@@ -5697,12 +5696,12 @@ fn recorded_capture_paths_with_boundary(
     limits: WorkspaceIndexLimits,
     last: &LastCapture,
     boundary: Option<CaptureBoundary>,
-    root_identity: Option<(u64, u64)>,
+    root_identity: Option<RootIdentity>,
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<RecordedCapture, RiftError> {
     let source: Vec<PathBuf> = paths.source.iter().map(|(path, _)| path.clone()).collect();
     let other: Vec<PathBuf> = paths.text.iter().chain(&paths.lockfiles).cloned().collect();
-    recorded_capture_path_lists(
+    let mut recorded = recorded_capture_path_lists(
         root,
         limits,
         &CapturePathLists {
@@ -5713,7 +5712,13 @@ fn recorded_capture_paths_with_boundary(
             root_identity,
             cancelled,
         },
-    )
+    )?;
+    if let Some(selection) = &mut recorded.last.selection {
+        let selection = Arc::make_mut(selection);
+        selection.inputs = paths.inputs.as_ref().map(Arc::clone);
+        selection.boundary = boundary;
+    }
+    Ok(recorded)
 }
 
 struct CapturePathLists<'a> {
@@ -5721,7 +5726,7 @@ struct CapturePathLists<'a> {
     other: &'a [PathBuf],
     last: &'a LastCapture,
     boundary: Option<CaptureBoundary>,
-    root_identity: Option<(u64, u64)>,
+    root_identity: Option<RootIdentity>,
     cancelled: &'a (dyn Fn() -> bool + Sync),
 }
 
@@ -5755,7 +5760,7 @@ fn recorded_capture_path_lists(
         other,
         last,
         boundary,
-        root_identity,
+        ref root_identity,
         cancelled,
     } = *paths;
     let mut workspace_bytes = 0_usize;
@@ -5763,7 +5768,25 @@ fn recorded_capture_path_lists(
         .len()
         .checked_add(other.len())
         .ok_or_else(|| errors::index::workspace_too_many_files().path(root).error())?;
-    let mut next = LastCapture::under(limits, held, boundary, root_identity);
+    let mut next = LastCapture::under(limits, held, boundary, root_identity.clone());
+    let retained_selection = last.selection.as_ref().filter(|selection| {
+        let same_root = selection.root == root;
+        let same_source = std::ptr::eq(selection.source.as_slice(), source);
+        let same_other = std::ptr::eq(selection.other.as_slice(), other);
+        same_root && same_source && same_other
+    });
+    next.selection = Some(retained_selection.map_or_else(
+        || {
+            Arc::new(CaptureSelection {
+                root: root.to_path_buf(),
+                source: source.to_vec(),
+                other: other.to_vec(),
+                inputs: None,
+                boundary: None,
+            })
+        },
+        Arc::clone,
+    ));
     let digests = (|| {
         let mut capture = PathCapture {
             workspace_bytes: &mut workspace_bytes,
@@ -5772,7 +5795,7 @@ fn recorded_capture_path_lists(
             last,
             next: &mut next,
             boundary,
-            root_identity,
+            root_identity: root_identity.clone(),
             cancelled,
         };
         let (source, unparsed): (Vec<_>, Vec<_>) = capture
@@ -6062,9 +6085,13 @@ fn recorded_capture_visible_attempt(
                             let absolute = root.join(path.as_str());
                             let (capture, was_read) = match next.captured(&absolute) {
                                 Some(capture) => (capture, false),
-                                None => {
-                                    capture_path(&absolute, limits, last, boundary, root_identity)?
-                                }
+                                None => capture_path(
+                                    &absolute,
+                                    limits,
+                                    last,
+                                    boundary,
+                                    root_identity.as_ref(),
+                                )?,
                             };
                             Ok((absolute, capture, was_read))
                         })
@@ -6088,6 +6115,62 @@ fn recorded_capture_visible_attempt(
         digests,
         last: next,
     })
+}
+
+impl LastCapture {
+    /// Rechecks selected file metadata without walking while the caller retains its visibility policy.
+    ///
+    /// The caller must retain a healthy watch and the accepted source policy. Events for
+    /// unknown paths, policy files, directories, or rescans invalidate this selection.
+    /// Directory and ignore-file metadata also detect changes before watch delivery.
+    /// Changed inputs, missing paths, or changed entry kinds ask for discovery via `None`.
+    /// Work is linear in selected files and bounded discovery inputs, with metadata calls
+    /// across the worker pool; unchanged inputs require neither a walk nor content reads.
+    ///
+    /// # Errors
+    /// Returns root, read, configured-bound, or cancellation refusals.
+    pub fn recapture_selected_cancellable(
+        &self,
+        root: &Path,
+        limits: WorkspaceIndexLimits,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Option<(WorkspaceDigests, Self)>, RiftError> {
+        check_cancelled(cancelled)?;
+        let Some(selection) = self.selection_for(limits) else {
+            return Ok(None);
+        };
+        let root = canonical_root(root)?;
+        if root != selection.root {
+            return Ok(None);
+        }
+        let identity = root_identity(&root);
+        if identity.is_none() || identity != self.root_identity() {
+            return Ok(None);
+        }
+        let same_inputs = selection
+            .inputs
+            .as_ref()
+            .is_some_and(|inputs| inputs.unchanged(selection.boundary, cancelled));
+        check_cancelled(cancelled)?;
+        if !same_inputs {
+            return Ok(None);
+        }
+        let paths = CapturePathLists {
+            source: &selection.source,
+            other: &selection.other,
+            last: self,
+            boundary: CaptureBoundary::create(&root),
+            root_identity: identity,
+            cancelled,
+        };
+        match capture_path_lists_with_boundary(&root, limits, &paths) {
+            Ok(captured) => Ok(Some(captured)),
+            Err(error) if error.slug() == errors::index::workspace_changed_during_capture::SLUG => {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
 }
 
 /// Captures one publication's selected source and other paths without walking the workspace.
@@ -6225,7 +6308,7 @@ struct PathCapture<'capture> {
     last: &'capture LastCapture,
     next: &'capture mut LastCapture,
     boundary: Option<CaptureBoundary>,
-    root_identity: Option<(u64, u64)>,
+    root_identity: Option<RootIdentity>,
     cancelled: &'capture (dyn Fn() -> bool + Sync),
 }
 
@@ -6245,31 +6328,47 @@ impl PathCapture<'_> {
             self.limits,
             self.last,
             self.boundary,
-            self.root_identity,
+            self.root_identity.as_ref(),
             self.cancelled,
         );
-        let read: Vec<Result<(CapturedPath, bool), RiftError>> = paths
+        let root = self.root;
+        let read: Vec<_> = paths
             .par_iter()
             .map(|path| {
                 check_cancelled(cancelled)?;
-                capture_path(path, limits, last, boundary, root_identity)
+                let (capture, was_read) =
+                    capture_path(path, limits, last, boundary, root_identity)?;
+                let project = last.project_path(root, path).map(Arc::clone);
+                Ok::<_, RiftError>((capture, was_read, project))
             })
             .collect();
         let mut captured = Vec::with_capacity(paths.len());
         for (path, capture) in paths.iter().zip(&read) {
-            if let Ok((capture, was_read)) = capture {
-                self.next.record(path, *capture, *was_read);
+            if let Ok((capture, was_read, project)) = capture {
+                self.next.record_projected(
+                    path,
+                    *capture,
+                    *was_read,
+                    project.as_ref().map(Arc::clone),
+                );
             }
         }
         for (path, capture) in paths.iter().zip(read) {
             check_cancelled(cancelled)?;
-            let (capture, _) = capture?;
+            let (capture, _, project) = capture?;
             let Some(file) = capture.file() else {
                 continue;
             };
             count_workspace_bytes(self.workspace_bytes, file.length, path, limits)?;
+            let project = if let Some(project) = project {
+                project
+            } else {
+                let project = Arc::new(project_path_below(self.root, path)?);
+                self.next.remember_project_path(path, Arc::clone(&project));
+                project
+            };
             captured.push(CapturedEntry {
-                path: project_path_below(self.root, path)?,
+                path: project.as_ref().clone(),
                 state: file.state,
                 content: file.content,
                 length: file.length,
@@ -6368,6 +6467,15 @@ fn source_walk(
     gitignore: GitignorePolicy,
     matcher: Option<Arc<PathMatcher>>,
 ) -> Walk {
+    source_walk_builder(root, directory_depth_max, gitignore, matcher).build()
+}
+
+fn source_walk_builder(
+    root: &Path,
+    directory_depth_max: usize,
+    gitignore: GitignorePolicy,
+    matcher: Option<Arc<PathMatcher>>,
+) -> WalkBuilder {
     let mut builder = WalkBuilder::new(root);
     builder
         .standard_filters(false)
@@ -6378,7 +6486,7 @@ fn source_walk(
         .filter_entry(move |entry| source_walk_includes(entry, matcher.as_deref()))
         .git_ignore(gitignore == GitignorePolicy::Respect)
         .git_exclude(gitignore == GitignorePolicy::Respect);
-    builder.build()
+    builder
 }
 
 /// Applies the hard floor and prunes only directories the source policy proves excluded.
@@ -6398,7 +6506,7 @@ fn forced_walk(
     directory_depth_max: usize,
     reach: ForceIncludeReach,
     matcher: Arc<PathMatcher>,
-) -> Walk {
+) -> WalkBuilder {
     let mut builder = WalkBuilder::new(root);
     builder
         .standard_filters(false)
@@ -6410,7 +6518,7 @@ fn forced_walk(
             source_walk_includes(entry, Some(matcher.as_ref())) && reach.reaches(entry.path())
         })
         .git_ignore(false);
-    builder.build()
+    builder
 }
 
 /// The hard floor every workspace applies before `.gitignore` or `[source]` are consulted:
@@ -10789,6 +10897,7 @@ mod tests {
         })
         .expect("the shipped Rust provider");
         DiscoveredPaths {
+            inputs: None,
             source: source.into_iter().map(|path| (path, provider)).collect(),
             text: Vec::new(),
             lockfiles: Vec::new(),
@@ -10859,7 +10968,6 @@ mod tests {
         fs::write(&first, b"123456").expect("first source");
         fs::write(&oversized, b"123456789").expect("oversized source");
         let both = source_only(vec![first.clone(), oversized.clone()]);
-        #[cfg(unix)]
         if crate::capture::supports_stat_reuse(&root) {
             advance_capture_clock(&root, &[first.clone(), oversized.clone()]);
         }
@@ -10871,7 +10979,7 @@ mod tests {
         let (_, next) = capture_paths(&root, &both, limits, &last).expect("nothing moved");
         assert_eq!(
             next.read_paths(),
-            if cfg!(unix) && crate::capture::supports_stat_reuse(&root) {
+            if crate::capture::supports_stat_reuse(&root) {
                 0
             } else {
                 2
@@ -10905,7 +11013,6 @@ mod tests {
         for path in &paths {
             fs::write(path, b"//abc\n").expect("source");
         }
-        #[cfg(unix)]
         if crate::capture::supports_stat_reuse(&root) {
             advance_capture_clock(&root, &paths);
         }
@@ -10942,7 +11049,7 @@ mod tests {
         assert_eq!(repeated.to_string(), first.to_string());
         assert_eq!(
             last.read_paths(),
-            if cfg!(unix) && crate::capture::supports_stat_reuse(&root) {
+            if crate::capture::supports_stat_reuse(&root) {
                 0
             } else {
                 2
@@ -11044,6 +11151,7 @@ mod tests {
         let big_text = root.join("big.md");
         fs::write(&big_text, b"much larger than four bytes").expect("big text file");
         let paths = DiscoveredPaths {
+            inputs: None,
             source: Vec::new(),
             text: vec![big_text],
             lockfiles: Vec::new(),
@@ -11056,6 +11164,7 @@ mod tests {
         let over_workspace = root.join("over.md");
         fs::write(&over_workspace, b"still more than ten bytes total").expect("oversized text");
         let paths = DiscoveredPaths {
+            inputs: None,
             source: Vec::new(),
             text: vec![over_workspace],
             lockfiles: Vec::new(),
@@ -11073,6 +11182,7 @@ mod tests {
         let invalid = root.join("invalid.md");
         fs::write(&invalid, [0xff, 0xfe]).expect("invalid text bytes");
         let paths = DiscoveredPaths {
+            inputs: None,
             source: Vec::new(),
             text: vec![invalid],
             lockfiles: Vec::new(),
@@ -14364,6 +14474,148 @@ mod tests {
         .expect("the capture must read the tree")
     }
 
+    #[test]
+    fn selected_capture_reuses_validated_paths_and_matches_cold_after_an_edit() {
+        let (directory, _) = two_file_workspace();
+        let root = directory
+            .path()
+            .canonicalize()
+            .expect("canonical workspace");
+        let source = root.join("src/lib.rs");
+        let text = root.join("notes.txt");
+        fs::write(root.join("refused.rs"), [0xff, 0]).expect("refused source");
+        advance_capture_clock(&root, &[source.clone(), text, root.join("refused.rs")]);
+        let (first, last) = captured_after(&root, &LastCapture::default());
+        let project = last
+            .project_path(&root, &source)
+            .expect("validated source path");
+        assert!(last.project_path(&root.join("src"), &source).is_none());
+        let (same, next) = last
+            .recapture_selected_cancellable(&root, WorkspaceIndexLimits::default(), &|| false)
+            .expect("metadata capture")
+            .expect("selection retained");
+        assert_eq!(same, first);
+        assert!(Arc::ptr_eq(
+            project,
+            next.project_path(&root, &source)
+                .expect("retained validation")
+        ));
+        assert_eq!(next.read_paths(), 0);
+
+        fs::write(&source, "pub fn changed_source() {}\n").expect("source edit");
+        let (edited, next) = next
+            .recapture_selected_cancellable(&root, WorkspaceIndexLimits::default(), &|| false)
+            .expect("changed metadata")
+            .expect("same selected paths");
+        assert_eq!(next.read_paths(), 1);
+        let (cold, _) = captured_after(&root, &LastCapture::default());
+        assert_eq!(edited, cold);
+
+        fs::remove_file(&source).expect("remove selected source");
+        assert!(
+            next.recapture_selected_cancellable(&root, WorkspaceIndexLimits::default(), &|| false)
+                .expect("removed path requests discovery")
+                .is_none()
+        );
+        let smaller = WorkspaceIndexLimits::new(1, 1024, 4096, 4, 10).expect("smaller bounds");
+        assert!(
+            next.recapture_selected_cancellable(&root, smaller, &|| false)
+                .expect("new limits request discovery")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn selected_capture_requires_the_same_root_identity() {
+        let directory = tempfile::tempdir().expect("workspace parent");
+        let root = directory.path().join("workspace");
+        fs::create_dir(&root).expect("workspace root");
+        let root = root.canonicalize().expect("canonical root");
+        fs::write(root.join("lib.rs"), "pub fn original() {}\n").expect("original source");
+        advance_capture_clock(&root, std::slice::from_ref(&root));
+        let (first, last) = captured_after(&root, &LastCapture::default());
+        fs::rename(&root, directory.path().join("previous")).expect("move original root");
+        fs::create_dir(&root).expect("replacement root");
+        fs::write(root.join("lib.rs"), "pub fn replacement() {}\n").expect("replacement source");
+        assert!(
+            last.recapture_selected_cancellable(&root, WorkspaceIndexLimits::default(), &|| false)
+                .expect("new root requests discovery")
+                .is_none()
+        );
+        let (cold, _) = captured_after(&root, &last);
+        assert_ne!(first, cold);
+    }
+
+    #[test]
+    fn selected_capture_invalidates_nested_repository_excludes() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path().canonicalize().expect("canonical root");
+        let nested = root.join("nested");
+        fs::create_dir(&nested).expect("nested repository");
+        rift_history::fixture::init(&nested);
+        let source = nested.join("lib.rs");
+        let exclude = nested.join(".git/info/exclude");
+        fs::write(&source, "pub fn kept() {}\n").expect("source");
+        fs::write(&exclude, "").expect("empty excludes");
+        advance_capture_clock(&root, &[root.clone(), nested.clone(), exclude.clone()]);
+        let (first, last) = captured_after(&root, &LastCapture::default());
+        assert!(
+            first
+                .get(&ProjectPath::new("nested/lib.rs").expect("path"))
+                .is_some()
+        );
+        assert!(
+            last.recapture_selected_cancellable(&root, WorkspaceIndexLimits::default(), &|| false)
+                .expect("unchanged selection")
+                .is_some()
+        );
+        fs::write(exclude, "lib.rs\n").expect("changed nested excludes");
+        assert!(
+            last.recapture_selected_cancellable(&root, WorkspaceIndexLimits::default(), &|| false)
+                .expect("changed policy")
+                .is_none()
+        );
+        let (cold, _) = captured_after(&root, &last);
+        assert!(
+            cold.get(&ProjectPath::new("nested/lib.rs").expect("path"))
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_capture_invalidates_a_symlinked_ignore_file_target() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let policy = tempfile::NamedTempFile::new().expect("external ignore policy");
+        let root = directory.path().canonicalize().expect("canonical root");
+        fs::write(root.join("lib.rs"), "pub fn kept() {}\n").expect("source");
+        fs::write(policy.path(), "").expect("empty ignore policy");
+        std::os::unix::fs::symlink(policy.path(), root.join(".gitignore")).expect("policy link");
+        advance_capture_clock(&root, &[root.clone(), policy.path().to_path_buf()]);
+        let (first, last) = captured_after(&root, &LastCapture::default());
+        assert!(
+            first
+                .get(&ProjectPath::new("lib.rs").expect("path"))
+                .is_some()
+        );
+        assert!(
+            last.recapture_selected_cancellable(&root, WorkspaceIndexLimits::default(), &|| false)
+                .expect("unchanged selection")
+                .is_some()
+        );
+        fs::write(policy.path(), "lib.rs\n").expect("changed linked policy");
+        assert!(
+            last.recapture_selected_cancellable(&root, WorkspaceIndexLimits::default(), &|| false)
+                .expect("changed policy")
+                .is_none()
+        );
+        let (cold, _) = captured_after(&root, &last);
+        assert!(
+            cold.get(&ProjectPath::new("lib.rs").expect("path"))
+                .is_none()
+        );
+    }
+
     /// The paths the production discovery policy admits in one test workspace.
     fn discovered_files_for_test(root: &Path) -> Vec<PathBuf> {
         let languages = LanguageFileSelections::default();
@@ -14389,8 +14641,8 @@ mod tests {
 
     /// Waits until a filesystem marker has newer modification and status-change times than
     /// every path, so the next capture can prove unchanged digests safe to reuse.
-    #[cfg(unix)]
     fn advance_capture_clock(root: &Path, paths: &[PathBuf]) {
+        #[cfg(unix)]
         use std::os::unix::fs::MetadataExt as _;
 
         fs::create_dir_all(root.join(".rift")).expect("state directory");
@@ -14399,12 +14651,16 @@ mod tests {
         loop {
             fs::write(&marker, b"timestamp probe").expect("advance filesystem timestamp");
             let marker_metadata = fs::metadata(&marker).expect("marker stat");
+            #[cfg(unix)]
             let marker_changed = (marker_metadata.ctime(), marker_metadata.ctime_nsec());
             let marker_modified = marker_metadata.modified().expect("marker mtime");
             let old_files = paths.iter().all(|path| {
                 let metadata = fs::metadata(path).expect("source stat");
-                metadata.modified().expect("source mtime") < marker_modified
-                    && (metadata.ctime(), metadata.ctime_nsec()) < marker_changed
+                #[cfg(unix)]
+                let old_status = (metadata.ctime(), metadata.ctime_nsec()) < marker_changed;
+                #[cfg(not(unix))]
+                let old_status = true;
+                metadata.modified().expect("source mtime") < marker_modified && old_status
             });
             if old_files {
                 return;
@@ -14469,7 +14725,6 @@ mod tests {
             )
             .expect("bounded visible capture")
         };
-        #[cfg(unix)]
         advance_capture_clock(
             root,
             &entries
@@ -14498,7 +14753,6 @@ mod tests {
         let (again_indexed, again_visible, next) = capture(&last);
         assert_eq!(again_indexed, indexed);
         assert_eq!(again_visible, visible);
-        #[cfg(unix)]
         if crate::capture::supports_stat_reuse(root) {
             assert_eq!(
                 next.read_paths(),
