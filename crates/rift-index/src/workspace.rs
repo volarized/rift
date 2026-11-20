@@ -3795,11 +3795,10 @@ impl WorkspaceIndex {
         let Ok(unit) = rift_syntax::DocumentPlacement::project_path(path) else {
             return false;
         };
-        let Some(file) = self.file(path) else {
+        if self.file(path).is_none() {
             return false;
-        };
-        self.identity_coverage_complete(file.syntax().language())
-            .unwrap_or(false)
+        }
+        self.warnings.is_empty()
             && self
                 .semantics
                 .static_edge_calls_complete(unit.unit(), range)

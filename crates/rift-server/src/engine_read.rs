@@ -1874,9 +1874,7 @@ pub async fn graph_references(
         .clone();
     if engines.engine_for(&language).is_none() {
         return Ok(GraphReferences {
-            complete: captured.complete
-                && reads.edges().is_complete()
-                && reads.index().identity_coverage_complete(&language)?,
+            complete: captured.complete && reads.static_edges_complete()?,
             ..captured
         });
     }
@@ -2300,7 +2298,7 @@ impl<'a> ReferenceMapping<'a> {
 /// Reads outgoing reference edges by resolving the bounded local target inventory.
 ///
 /// # Errors
-/// Refuses incomplete identity coverage, an inventory above the traversal bound, or engine failure.
+/// Refuses incomplete sources, an inventory above the traversal bound, or engine failure.
 ///
 /// # Cancel safety
 /// Dropping the future cancels the current engine exchange and publishes no retained answer.
@@ -2420,26 +2418,26 @@ fn edge_reference_targets(
     reads: &ReadService,
     language: &Language,
 ) -> Result<BTreeSet<SymbolId>, RiftError> {
+    if !reads.index().symbol_view()?.objects_complete() {
+        return Err(graph_reference_coverage());
+    }
     let mut targets = BTreeSet::new();
     for file in reads
         .index()
         .files()
         .filter(|file| file.syntax().language().name == language.name)
     {
-        if !reads
-            .index()
-            .identity_coverage_complete(file.syntax().language())?
-        {
-            return Err(graph_reference_coverage());
-        }
         for declaration in file
             .syntax()
             .symbols()
             .iter()
             .filter(|declaration| declaration.name_range.is_some())
         {
-            let target = symbol_id(reads.index(), crate::search::declared(file, declaration))?
-                .ok_or_else(graph_reference_coverage)?;
+            let Some(target) =
+                symbol_id(reads.index(), crate::search::declared(file, declaration))?
+            else {
+                continue;
+            };
             targets.insert(target);
             if targets.len() > TRAVERSAL_SYMBOLS_MAX {
                 return Err(graph_reference_coverage());
@@ -2734,6 +2732,35 @@ mod tests {
             assert_eq!(hop.edge.from, id("seed"));
             assert_eq!(hop.edge.kinds, [rift_protocol::read::EdgeKind::Calls]);
         }
+    }
+
+    #[test]
+    fn reference_targets_keep_identities_beside_a_variance_parse_error() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("package.json"),
+            r#"{"name":"beacon"}"#,
+        )?;
+        fs::write(
+            directory.path().join("index.ts"),
+            "export interface Broken<out T> { value: T; }\n\
+             export function target() {}\nexport function caller() { target(); }\n",
+        )?;
+        let reads = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let language = rift_protocol::read::Language::from_identity_segment("typescript")?;
+        assert!(!reads.index().identity_coverage_complete(&language)?);
+        let targets = super::edge_reference_targets(&reads, &language)?;
+        assert!(targets.contains(&symbol(&reads, "caller")));
+        assert!(targets.contains(&symbol(&reads, "target")));
+        assert!(reads.static_edges_complete()?);
+        assert!(reads.edge_identity_warning().is_some());
+        Ok(())
     }
 
     #[test]

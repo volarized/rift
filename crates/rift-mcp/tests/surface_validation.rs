@@ -79,21 +79,7 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
     let reaches_dependencies = request_reaches_dependencies(name, request)
         .expect("a validated exact request carries a canonical symbol identity");
     assert_source_unit_ids_use_served_resolvers(structured, &context, reaches_dependencies);
-    // A whole-inventory query over a corpus that mixes languages answers from partly
-    // covered calls and names the missing coverage; no other warning reaches a clean corpus.
-    let coverage_only = name == "search"
-        && structured["warnings"].as_array().is_some_and(|warnings| {
-            warnings.iter().all(|warning| {
-                matches!(
-                    warning["code"].as_str(),
-                    Some("edge_coverage_missing" | "engine_analysis_unavailable")
-                )
-            })
-        });
-    assert!(
-        structured.get("warnings").is_none() || coverage_only,
-        "{context}: {structured:#}"
-    );
+    assert_fixture_warnings(name, request, structured);
     assert!(
         structured["documentation"].get("warnings").is_none(),
         "{context}: {structured:#}"
@@ -146,6 +132,43 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
             }
         }
     }
+}
+
+fn assert_fixture_warnings(name: &str, request: &Value, structured: &Value) {
+    use rift_protocol::read::ReadWarning;
+
+    let Some(warnings) = structured.get("warnings") else {
+        return;
+    };
+    assert_eq!(name, "search", "{structured:#}");
+    let query = request["query"].as_str().expect("query statement");
+    assert!(
+        [":calls", ":references", ":usages"]
+            .iter()
+            .any(|predicate| query.contains(predicate)),
+        "only edge reads omit the fixture's unlinked declarations: {request:#}"
+    );
+    let warnings: Vec<rift_protocol::read::ReadWarning> =
+        serde_json::from_value(warnings.clone()).expect("typed read warnings");
+    // The unlinked change_witness.rs holds two declarations without identities.
+    assert_eq!(
+        warnings
+            .iter()
+            .filter(|warning| matches!(warning,
+        ReadWarning::EdgeCoverageMissing { kinds, detail }
+            if kinds.is_empty() && detail.contains("identities: 2;")))
+            .count(),
+        1,
+        "{warnings:?}"
+    );
+    // Mixed-language reads retain their captured and engine coverage warnings too.
+    assert!(
+        warnings.iter().all(|warning| matches!(
+            warning,
+            ReadWarning::EdgeCoverageMissing { .. } | ReadWarning::EngineAnalysisUnavailable { .. }
+        )),
+        "{warnings:?}"
+    );
 }
 
 /// Exact retrieval reaches the released owner its canonical identity names.

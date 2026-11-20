@@ -243,7 +243,7 @@ impl LocalSymbolViewInput {
     /// Collects canonical declarations with source names for a bounded engine read.
     ///
     /// # Errors
-    /// Refuses incomplete source or identity coverage and a seed inventory above the bound.
+    /// Refuses incomplete source coverage and a seed inventory above the bound.
     pub fn semantic_seeds(
         &self,
         mut remaining: usize,
@@ -254,10 +254,7 @@ impl LocalSymbolViewInput {
                 .error()
         };
         let index = &self.material.index;
-        if !self.ready
-            || !index.objects_complete()
-            || index.unestablished_objects().next().is_some()
-        {
+        if !self.ready || !index.objects_complete() {
             return Err(unavailable());
         }
         let mut seeds = Vec::new();
@@ -273,9 +270,6 @@ impl LocalSymbolViewInput {
             remaining = remaining
                 .checked_sub(declarations)
                 .ok_or_else(unavailable)?;
-            if !index.identity_coverage_complete(object.facts().language()) {
-                return Err(unavailable());
-            }
             seeds.push(rift_protocol::read::SymbolId(id.as_str().to_owned()));
         }
         Ok(seeds)
@@ -284,9 +278,8 @@ impl LocalSymbolViewInput {
     /// Collects every established canonical declaration for a captured inventory read,
     /// with the coverage of the inventory they come from.
     ///
-    /// A source left out of the index, a declaration without an established identity, and a
-    /// language whose identities are incomplete each make the inventory partial; the
-    /// declarations that are established still answer.
+    /// A source left out of the index makes the inventory partial. Objects without
+    /// identities stay outside this selection; callers report their omission.
     ///
     /// # Errors
     /// Returns the captured publication failure.
@@ -294,21 +287,14 @@ impl LocalSymbolViewInput {
         &self,
     ) -> Result<(Vec<rift_protocol::read::SymbolId>, InventoryCoverage), RiftError> {
         let index = &self.material.index;
-        let mut coverage = if self.ready
-            && index.objects_complete()
-            && index.unestablished_objects().next().is_none()
-        {
+        let coverage = if self.ready && index.objects_complete() {
             InventoryCoverage::Complete
         } else {
             InventoryCoverage::Partial
         };
         let mut seeds = Vec::new();
         for (id, object) in index.objects() {
-            let object = object?;
-            let facts = object.facts();
-            if !index.identity_coverage_complete(facts.language()) {
-                coverage = InventoryCoverage::Partial;
-            }
+            object?;
             seeds.push(rift_protocol::read::SymbolId(id.as_str().to_owned()));
         }
         Ok((seeds, coverage))

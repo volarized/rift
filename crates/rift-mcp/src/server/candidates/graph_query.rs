@@ -23,6 +23,8 @@ use crate::output::{Json, QueryDisplay, QueryOutput, ToolFailure};
 mod edges;
 mod exact;
 mod installed;
+#[cfg(test)]
+mod inventory_tests;
 pub(crate) mod retrieval;
 
 use super::super::RequestDeadline;
@@ -241,6 +243,9 @@ impl RiftMcp {
             .query;
         let reads = Arc::clone(&resolved.published.reads);
         let mut warnings = acquired.take_warnings();
+        if local_semantics.is_some() {
+            warnings.extend(reads.edge_identity_warning());
+        }
         warnings.extend(resolved.stale);
         if let Some(exact) = &mut exact {
             warnings.extend(exact.take_warnings());
@@ -1669,24 +1674,38 @@ mod tests {
             root.join("invalid-directory/unestablished.py"),
             "def might_call(): pass\n",
         )?;
-        let incomplete = RiftMcp::build_settled(&root, limits).await?;
-        let response = incomplete
+        let partial = RiftMcp::build_settled(&root, limits).await?;
+        let response = partial
             .graph_query(query)
             .await
             .map_err(|failure| format!("{failure:?}"))?
             .0
             .result;
-        assert!(
-            matches!(
-                response,
-                QueryReadResult::Unavailable(SearchUnavailable::Unavailable {
-                    reason: SymbolUnavailableReason::InsufficientCoverage,
-                    ..
-                })
-            ),
-            "{response:?}"
-        );
+        assert_identified_incoming_callers(response)?;
         service.abort();
+        Ok(())
+    }
+
+    fn assert_identified_incoming_callers(response: QueryReadResult) -> TestResult {
+        let QueryReadResult::Results(answer) = response else {
+            return Err(format!("identified callers remain available: {response:?}").into());
+        };
+        let expected = ["rift://symbol/local/python/app/hello", PACKAGE_BRIDGE];
+        assert!(
+            matches!(&answer.answer, QueryAnswer::Bindings { bindings, .. }
+        if bindings.len() == expected.len() && bindings.iter().all(|row|
+            matches!(&row["caller"], rift_protocol::query::RdfTerm::Iri { value }
+                if expected.contains(&value.as_str())))),
+            "{answer:?}"
+        );
+        assert!(
+            answer.warnings.iter().any(
+                |warning| matches!(warning, ReadWarning::EdgeCoverageMissing { detail, .. }
+            if detail.contains("identities"))
+            ),
+            "{:?}",
+            answer.warnings
+        );
         Ok(())
     }
 
@@ -2087,7 +2106,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn graph_ask_refuses_rust_without_captured_identities() -> TestResult {
+    async fn graph_inventory_reports_unestablished_captures_with_empty_answers() -> TestResult {
         let directory = tempfile::tempdir()?;
         crate::server::hermetic_workspace(directory.path(), "")?;
         std::fs::write(directory.path().join("lib.rs"), "fn alpha() {}\n")?;
@@ -2108,15 +2127,23 @@ mod tests {
                 .map_err(|failure| format!("{failure:?}"))?
                 .0
                 .result;
+            let QueryReadResult::Results(answer) = result else {
+                return Err(format!("{query}: {result:?}").into());
+            };
             assert!(
-                matches!(
-                    result,
-                    QueryReadResult::Unavailable(SearchUnavailable::Unavailable {
-                        reason: SymbolUnavailableReason::InsufficientCoverage,
-                        ..
-                    })
+                matches!(&answer.answer, QueryAnswer::Boolean { value: false })
+                    || matches!(&answer.answer, QueryAnswer::Bindings { bindings, .. }
+                    if bindings.len() == 1 && matches!(&bindings[0]["n"],
+                        rift_protocol::query::RdfTerm::Literal { value, .. } if value == "0")),
+                "{query}: {answer:?}"
+            );
+            assert!(
+                answer.warnings.iter().any(
+                    |warning| matches!(warning, ReadWarning::EdgeCoverageMissing { detail, .. }
+                    if detail.contains("identities: 1;"))
                 ),
-                "{query}: {result:?}"
+                "{:?}",
+                answer.warnings
             );
         }
         Ok(())
@@ -2192,7 +2219,7 @@ mod tests {
         Ok(())
     }
 
-    async fn static_endpoint(
+    pub(super) async fn static_endpoint(
         server: &RiftMcp,
         name: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
