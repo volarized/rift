@@ -652,9 +652,29 @@ impl<'source> Namespaces<'source> {
         }
         let target = selected?;
         (target.symbol.visibility.as_deref() == Some("pub")
-            || self.accessible(file, position, &path, target, work)
+            || self.method_visible(file, position, target, work)
             || target.symbol.visibility.is_none())
         .then_some(target)
+    }
+
+    fn method_visible(
+        &self,
+        file: &File<'source>,
+        position: u64,
+        target: Target<'source>,
+        work: &mut Work,
+    ) -> bool {
+        let Some(source) = self.module(file, position, work) else {
+            return false;
+        };
+        let Some(declared) = self.module_at(
+            target.file.path.as_str(),
+            target.symbol.item_range.start,
+            work,
+        ) else {
+            return false;
+        };
+        namespace_visible(source, declared, target.symbol.visibility.as_deref())
     }
 
     fn lookup(
@@ -891,7 +911,11 @@ impl<'source> Namespaces<'source> {
     }
 
     fn module(&self, file: &File<'source>, position: u64, work: &mut Work) -> Option<&[String]> {
-        let namespace = self.files.get(file.document.path.as_str())?;
+        self.module_at(file.document.path.as_str(), position, work)
+    }
+
+    fn module_at(&self, file: &str, position: u64, work: &mut Work) -> Option<&[String]> {
+        let namespace = self.files.get(file)?;
         let mut path = namespace.base.as_slice();
         let crate_name = path.first()?;
         if self

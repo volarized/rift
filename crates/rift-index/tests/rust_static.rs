@@ -726,3 +726,53 @@ fn test_rust_macro_token_errors_keep_unaffected_stored_facts() {
         );
     }
 }
+
+#[test]
+fn test_rust_private_associated_calls_use_the_declaring_module() {
+    // #824: an imported type does not change its helper's visibility scope.
+    let directory = tempfile::tempdir().expect("workspace");
+    let root = directory.path();
+    std::fs::create_dir(root.join("src")).expect("source directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='fixture'\nversion='0.1.0'\n",
+    )
+    .expect("manifest");
+    std::fs::write(root.join("src/lib.rs"), "pub struct Item; mod methods; fn denied() { Item::hidden(1); } mod other { use crate::Item; fn denied() { Item::hidden(1); } }").expect("root source");
+    std::fs::write(root.join("src/methods.rs"), "use crate::Item; impl Item { fn hidden<T>(_: T) -> Self { Item } pub fn run() -> Self { Item::hidden(1) } } mod child { use crate::Item; fn nested() { Item::hidden(1); } }").expect("module source");
+    let index = WorkspaceIndex::build(
+        root,
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &TextFileInclusion::default(),
+    )
+    .expect("index");
+    assert!(
+        index
+            .symbol_view()
+            .expect("symbols")
+            .normalized_graph()
+            .records()
+            .iter()
+            .all(|record| record.identity().is_some())
+    );
+    for from in ["/Item/run", "/child/nested"] {
+        assert!(
+            index
+                .edges()
+                .edges()
+                .any(|edge| edge.kind() == EdgeKind::Calls
+                    && edge.from().as_str().ends_with(from)
+                    && edge.to().as_str().ends_with("/Item/hidden")),
+            "missing helper call from {from}"
+        );
+    }
+    assert!(
+        !index
+            .edges()
+            .edges()
+            .any(|edge| edge.kind() == EdgeKind::Calls
+                && edge.from().as_str().ends_with("/denied")
+                && edge.to().as_str().ends_with("/Item/hidden"))
+    );
+}
