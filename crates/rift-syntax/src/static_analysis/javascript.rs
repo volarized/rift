@@ -767,9 +767,13 @@ impl Kinds {
         if syntax_element.kind_id() != self.member {
             return Ok(StaticCallee::Unsupported);
         }
+        // A call result and a constructed value are receivers too: a declared return type
+        // or the constructed class names their members.
         let receiver = syntax_element
             .child_by_field_id(self.object)
-            .filter(|receiver| self.receiver(*receiver));
+            .filter(|receiver| {
+                self.receiver(*receiver) || [self.call, self.new].contains(&receiver.kind_id())
+            });
         let member = syntax_element
             .child_by_field_id(self.property)
             .filter(|member| {
@@ -891,11 +895,11 @@ impl Kinds {
     fn record_declared_type(
         &self,
         element: Node<'_>,
+        source: &str,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
         let name = element.child_by_field_id(self.name).or_else(|| {
             self.pattern
-        source: &str,
                 .and_then(|field| element.child_by_field_id(field))
         });
         let annotation = if self.type_alias == Some(element.kind_id()) {
@@ -918,11 +922,11 @@ impl Kinds {
             };
             annotation = inner;
         }
+        annotation = self.nullable_type(annotation, source);
         if self.generic == Some(annotation.kind_id()) {
             let Some(inner) = annotation.child_by_field_id(self.name) else {
                 return Ok(());
             };
-        annotation = self.nullable_type(annotation, source);
             annotation = inner;
         }
         if name.is_missing() || annotation.is_missing() {
@@ -1133,10 +1137,6 @@ impl Kinds {
         &self,
         pattern: Node<'_>,
         declarator: Node<'_>,
-        facts: &mut StaticFactsParts,
-    ) -> Result<(), RiftError> {
-        let Some(shapes) = &self.type_shapes else {
-            return Ok(());
     /// Binds the names an object pattern takes from `require` to the exports their keys
     /// name, as the member form `require('./lib').name` does. Answers whether it bound
     /// them: a pattern with a default, a rest or a nested entry binds no export.
@@ -1201,6 +1201,10 @@ impl Kinds {
         Ok(true)
     }
 
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let Some(shapes) = &self.type_shapes else {
+            return Ok(());
         };
         let call = declarator
             .child_by_field_id(self.value)

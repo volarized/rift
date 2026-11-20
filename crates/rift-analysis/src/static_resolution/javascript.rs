@@ -182,6 +182,10 @@ impl<'source> Index<'source> {
         if let Some(member) = file.members.get(&range) {
             let member = (*member)?;
             let name = file.text(member.member?)?;
+            if role != rift_core::ReferenceRole::Type && file.callbacks.is_call(member.receiver) {
+                let owner = self.javascript_call_result(file, member.receiver, work)?;
+                return self.javascript_class_member(owner, name, MemberMode::Instance, role, work);
+            }
             if !file.members.contains_key(&member.receiver) {
                 return self.javascript_named_member(
                     file,
@@ -263,6 +267,16 @@ impl<'source> Index<'source> {
             return self.javascript_super_constructor(file, call.range.start, work);
         }
         let target = match call.callee {
+            StaticCallee::Member { receiver, member } if file.callbacks.is_call(receiver) => {
+                let owner = self.javascript_call_result(file, receiver, work)?;
+                self.javascript_class_member(
+                    owner,
+                    file.text(member)?,
+                    MemberMode::Instance,
+                    rift_core::ReferenceRole::Call,
+                    work,
+                )?
+            }
             StaticCallee::Member { receiver, member } if !file.text(receiver)?.contains('.') => {
                 self.javascript_named_member(
                     file,
@@ -286,6 +300,7 @@ impl<'source> Index<'source> {
                     .symbol
                     .kinds
                     .contains(&rift_protocol::read::SymbolKind::Constructible)
+                || javascript_constructor_function(target)
                 || self.javascript_declared_signature(target, true, work))
             .then_some(target);
         }
@@ -306,7 +321,6 @@ impl<'source> Index<'source> {
     /// The annotation must name, through at most `DECLARED_TYPE_DEPTH_MAX` aliases, a type
     /// declaration whose own shape is the signature: a function or constructor type alias,
     /// or an interface with a call or construct signature. The call then targets the
-                || javascript_constructor_function(target)
     /// binding itself; no function body is chosen for it.
     fn javascript_declared_signature(
         &self,
@@ -324,20 +338,6 @@ impl<'source> Index<'source> {
         else {
             return false;
         };
-        for _ in 0..super::javascript_members::DECLARED_TYPE_DEPTH_MAX {
-            if !work.charge() {
-                return false;
-            }
-            let Some(named) =
-                self.javascript_target(file, annotation, rift_core::ReferenceRole::Type, work)
-            else {
-                return false;
-            };
-            let Some((owner, name)) = self
-                .files
-                .get(named.file.path.as_str())
-                .zip(named.symbol.name_range)
-            else {
         self.javascript_written_signature(file, annotation, constructs, work)
     }
 
@@ -354,6 +354,20 @@ impl<'source> Index<'source> {
         let declared = |file: &File<'source>, name: rift_syntax::ByteRange| {
             file.declared_types.get(&name).copied().flatten()
         };
+        for _ in 0..super::javascript_members::DECLARED_TYPE_DEPTH_MAX {
+            if !work.charge() {
+                return false;
+            }
+            let Some(named) =
+                self.javascript_target(file, annotation, rift_core::ReferenceRole::Type, work)
+            else {
+                return false;
+            };
+            let Some((owner, name)) = self
+                .files
+                .get(named.file.path.as_str())
+                .zip(named.symbol.name_range)
+            else {
                 return false;
             };
             if owner.type_signatures.contains(&(name, constructs)) {
@@ -437,20 +451,6 @@ impl<'source> Index<'source> {
             StaticBindingKind::JavaScriptRequire { .. } => {
                 self.javascript_require_value(file, binding, role, work)
             }
-            _ => None,
-        }
-    }
-
-    fn javascript_require_value(
-        &self,
-        file: &File<'source>,
-        binding: &StaticBinding,
-        role: rift_core::ReferenceRole,
-        work: &mut Work,
-    ) -> Option<Target<'source>> {
-        let StaticBindingKind::JavaScriptRequire {
-            module,
-            export,
             StaticBindingKind::JavaScriptTypeImport { module, export }
                 if role == rift_core::ReferenceRole::Type =>
             {
@@ -467,6 +467,20 @@ impl<'source> Index<'source> {
                     work,
                 )
             }
+            _ => None,
+        }
+    }
+
+    fn javascript_require_value(
+        &self,
+        file: &File<'source>,
+        binding: &StaticBinding,
+        role: rift_core::ReferenceRole,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let StaticBindingKind::JavaScriptRequire {
+            module,
+            export,
             require,
         } = binding.kind
         else {
@@ -697,20 +711,6 @@ impl File<'_> {
 }
 
 impl File<'_> {
-    /// Whether an assignment inside the scope of `binding` writes its name again. A
-    /// write to an inner binding of the same name counts too: the check only refuses.
-    pub(super) fn javascript_binding_reassigned(&self, binding: &StaticBinding) -> bool {
-        self.text(binding.name)
-            .and_then(|name| self.assignments.name_writes.get(name))
-            .is_some_and(|writes| writes.iter().any(|&start| binding.scope.contains(start)))
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum MemberMode {
-    Instance,
-    Static,
-impl File<'_> {
     /// Whether an assignment writes `binding`: a write of its name inside its scope that
     /// no inner binding of the same name takes. A write whose binding is ambiguous counts.
     pub(super) fn javascript_binding_written(
@@ -755,20 +755,22 @@ impl File<'_> {
     }
 }
 
+impl File<'_> {
+    /// Whether an assignment inside the scope of `binding` writes its name again. A
+    /// write to an inner binding of the same name counts too: the check only refuses.
+    pub(super) fn javascript_binding_reassigned(&self, binding: &StaticBinding) -> bool {
+        self.text(binding.name)
+            .and_then(|name| self.assignments.name_writes.get(name))
+            .is_some_and(|writes| writes.iter().any(|&start| binding.scope.contains(start)))
+    }
 }
 
-pub(super) fn js_binding<'source>(
-    file: &File<'source>,
-    modes: &PackageModes<'source>,
-    name: &str,
-    position: u64,
-    role: rift_core::ReferenceRole,
-    work: &mut Work,
-) -> Option<&'source StaticBinding> {
-    if file.blocked(position, work) {
-        return None;
-    }
-    let mut best: Option<&StaticBinding> = None;
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum MemberMode {
+    Instance,
+    Static,
+}
+
 /// Whether `name` at `position` is the `CommonJS` builtin: the file runs as `CommonJS` and
 /// no binding in scope takes the name.
 pub(super) fn builtin_commonjs_name<'source>(
@@ -788,6 +790,18 @@ pub(super) fn builtin_commonjs_name<'source>(
         && !file.javascript_reassigned(name, None)
 }
 
+pub(super) fn js_binding<'source>(
+    file: &File<'source>,
+    modes: &PackageModes<'source>,
+    name: &str,
+    position: u64,
+    role: rift_core::ReferenceRole,
+    work: &mut Work,
+) -> Option<&'source StaticBinding> {
+    if file.blocked(position, work) {
+        return None;
+    }
+    let mut best: Option<&StaticBinding> = None;
     let mut ambiguous = false;
     for &binding in file.by_name.get(name)? {
         if !work.charge() {
@@ -796,13 +810,21 @@ pub(super) fn builtin_commonjs_name<'source>(
         if !binding.scope.contains(position) {
             continue;
         }
+        let type_import = matches!(binding.kind, StaticBindingKind::JavaScriptTypeImport { .. });
+        if role != rift_core::ReferenceRole::Type && type_import {
+            continue;
+        }
         let symbol = file.target_at(binding.name).map(|target| target.symbol);
         if role != rift_core::ReferenceRole::Type
             && symbol.is_some_and(|symbol| matches!(symbol.kind, "interface" | "type_alias"))
         {
             continue;
         }
+        // A JavaScript type names a class value; a name bound by `require` can hold one.
+        let required_value = matches!(binding.kind, StaticBindingKind::JavaScriptRequire { .. })
+            && javascript_source(file.document.path.as_str());
         if role == rift_core::ReferenceRole::Type
+            && !required_value
             && symbol.is_some_and(|symbol| matches!(symbol.kind, "variable" | "function"))
         {
             continue;
@@ -810,21 +832,13 @@ pub(super) fn builtin_commonjs_name<'source>(
         match best {
             Some(current) if current.scope == binding.scope => ambiguous = true,
             Some(current) if !current.scope.encloses(binding.scope) => {}
-        let type_import = matches!(binding.kind, StaticBindingKind::JavaScriptTypeImport { .. });
-        if role != rift_core::ReferenceRole::Type && type_import {
-            continue;
-        }
             _ => {
                 best = Some(binding);
                 ambiguous = false;
             }
         }
     }
-        // A JavaScript type names a class value; a name bound by `require` can hold one.
-        let required_value = matches!(binding.kind, StaticBindingKind::JavaScriptRequire { .. })
-            && javascript_source(file.document.path.as_str());
     let binding = best?;
-            && !required_value
     let deferred = modes
         .scopes
         .get(file.document.path.as_str())

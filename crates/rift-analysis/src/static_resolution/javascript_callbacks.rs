@@ -36,6 +36,11 @@ pub(super) struct Callbacks<'source> {
 }
 
 impl<'source> Callbacks<'source> {
+    /// Whether `range` is a call.
+    pub(super) fn is_call(&self, range: ByteRange) -> bool {
+        self.calls.contains_key(&range)
+    }
+
     pub(super) fn index(facts: &'source StaticFacts, work: &mut Work) -> Option<Self> {
         let mut callbacks = Self::default();
         let mut owners = BTreeMap::<ByteRange, Option<ByteRange>>::new();
@@ -241,11 +246,6 @@ impl<'source> Index<'source> {
         })
     }
 
-    /// The function type written for the declaration `name`, inline or through its named
-    /// type.
-    fn javascript_function_type<'index>(
-        &'index self,
-        file: &'index File<'source>,
     /// Whether the binding holds a call result the resolved callee declares callable.
     ///
     /// `const handler = some()` with `some(): Handler` and `Handler` a function type: the
@@ -298,6 +298,11 @@ impl<'source> Index<'source> {
         .is_some()
     }
 
+    /// The function type written for the declaration `name`, inline or through its named
+    /// type.
+    fn javascript_function_type<'index>(
+        &'index self,
+        file: &'index File<'source>,
         name: ByteRange,
         work: &mut Work,
     ) -> Option<(&'index File<'source>, ByteRange)> {
@@ -333,5 +338,38 @@ impl<'source> Index<'source> {
             file = owner;
         }
         None
+    }
+
+    /// The class or interface the result of the call at `range` is declared as: the named
+    /// return type the resolved callee declares, or the class a `new` constructs. A callee
+    /// without a declared return type, an overloaded callee and a return type written as a
+    /// type parameter type nothing.
+    pub(super) fn javascript_call_result<'index>(
+        &'index self,
+        file: &'index File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let call = file.callbacks.calls.get(&range).copied()?;
+        work.javascript_lookup(|work| {
+            let callee = self.javascript_call(file, call, work)?;
+            if call.callee == rift_syntax::StaticCallee::Constructor {
+                // `new C()` is an instance of the class it constructs.
+                return (callee.symbol.kind == "class").then_some(callee);
+            }
+            let declared = self.files.get(callee.file.path.as_str())?;
+            let entries = declared
+                .callbacks
+                .returns
+                .get(&callee.symbol.name_range?)?
+                .as_ref()?;
+            let [(None, annotation)] = entries.as_slice() else {
+                return None;
+            };
+            if self.javascript_type_parameter(declared, *annotation, work) {
+                return None;
+            }
+            self.javascript_declared_type(declared, *annotation, work)
+        })
     }
 }

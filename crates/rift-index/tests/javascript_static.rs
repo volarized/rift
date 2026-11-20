@@ -1756,3 +1756,85 @@ export function refuse() {
         );
     }
 }
+
+#[test]
+fn test_members_of_call_results_through_declared_return_types() {
+    // A member of a call result is a member of the named type the resolved callee
+    // declares as its return type, written as an annotation or, in JavaScript, in a
+    // documentation comment.
+    let source = "export class Item {
+  value = 1
+  read() { return this.value }
+  chain(): Item { return this }
+}
+export function create(): Item { return new Item() }
+export function maybe(): Item | undefined { return undefined }
+export function loose() { return new Item() }
+export function generic<T>(value: T): T { return value }
+export function use() {
+  return [create().read(), create().value, create().chain().read(), maybe().read()]
+}
+export function refuse() { return [loose().read(), generic(new Item()).read(), missing().read()] }
+";
+    let (_directory, index) = workspace_with_manifest(&[("main.ts", source)], module_manifest());
+    for to in ["main.ts/Item/read", "main.ts/Item/chain"] {
+        assert!(has_edge(&index, EdgeKind::Calls, "main.ts/use", to), "{to}");
+    }
+    assert!(has_edge(
+        &index,
+        EdgeKind::Reads,
+        "main.ts/use",
+        "main.ts/Item/value"
+    ));
+    // No declared return type, a return type written as a type parameter and an
+    // unresolved callee.
+    assert!(!index.edges().edges().any(|edge| {
+        edge.kind() == EdgeKind::Calls
+            && edge.from().as_str().ends_with("main.ts/refuse")
+            && edge.to().as_str().ends_with("main.ts/Item/read")
+    }));
+    let script = "class Help { visible() { return [] } }
+class Command {
+  /** @returns {Help} */
+  createHelp() { return new Help() }
+  info() { return this.createHelp().visible() }
+}
+exports.Command = Command;
+";
+    let (_directory, index) = workspace(&[("command.js", script)]);
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "command.js/Command/info",
+        "command.js/Help/visible"
+    ));
+}
+
+#[test]
+fn test_members_of_a_constructed_value_belong_to_its_class() {
+    // `new Item().read()` reads a member of the class `new` constructs, as a binding
+    // initialized by that `new` does.
+    let source = "export class Item { value = 1; read() { return this.value } }
+export function make() { return 1 }
+export function use() { return [new Item().read(), new Item().value] }
+export function refuse() { return [new make().read(), new Missing().read()] }
+";
+    let (_directory, index) = workspace_with_manifest(&[("main.ts", source)], module_manifest());
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "main.ts/use",
+        "main.ts/Item/read"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Reads,
+        "main.ts/use",
+        "main.ts/Item/value"
+    ));
+    assert!(!index.edges().edges().any(|edge| {
+        edge.kind() == EdgeKind::Calls
+            && edge.from().as_str().ends_with("main.ts/refuse")
+            && edge.to().as_str().ends_with("/read")
+    }));
+}
