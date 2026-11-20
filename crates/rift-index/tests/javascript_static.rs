@@ -750,3 +750,77 @@ export function refuse() { new plain({}); new callback(); callable.extra; shape(
     ));
 }
 
+#[test]
+fn test_typescript_root_parse_error_keeps_the_declarations_outside_its_body() {
+    // The interface body cannot be parsed and turns the document root into an error.
+    let respond = "export type Before = string
+export interface Respond {
+  <T extends Before, U extends number>(
+    data: T,
+    status?: U
+  ): Wrapped<T, U, 'body'>
+  <T extends Before, U extends number>(
+    data: T,
+    init?: Init<U>
+  ): Wrapped<T, U, 'body'>
+  <T extends null, U extends number>(
+    data: T,
+    status?: U
+  ): Wrapped<null, U, 'body'>
+}
+export class Item {
+  value = 1
+  read() { return this.value }
+}
+export function later(item: Item) { return item.read() }
+";
+    let main = "import { Item, later } from './respond.js'
+import type { Respond } from './respond.js'
+export function run(item: Item, respond: Respond) { return later(item) }
+";
+    let (_directory, index) = workspace_with_manifest(
+        &[("main.ts", main), ("respond.ts", respond)],
+        module_manifest(),
+    );
+    let language =
+        rift_protocol::read::Language::from_identity_segment("typescript").expect("language");
+    assert!(
+        index
+            .identity_coverage_complete(&language)
+            .expect("identity coverage")
+    );
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "main.ts/run",
+        "respond.ts/later"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "respond.ts/later",
+        "respond.ts/Item/read"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Reads,
+        "respond.ts/Item/read",
+        "respond.ts/Item/value"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Contains,
+        "respond.ts/Item",
+        "respond.ts/Item/read"
+    ));
+    for target in ["respond.ts/Item", "respond.ts/Respond"] {
+        assert!(
+            has_edge(&index, EdgeKind::HasType, "main.ts/run", target),
+            "{target}"
+        );
+    }
+    // Nothing is declared from inside the body that was left out.
+    assert!(!index.edges().edges().any(|edge| {
+        edge.kind() == EdgeKind::Contains && edge.from().as_str().ends_with("respond.ts/Respond")
+    }));
+}

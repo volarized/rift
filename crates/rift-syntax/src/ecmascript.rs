@@ -77,6 +77,7 @@ use rift_error::errors;
 use rift_protocol::read::{Documentation, DocumentationFormat, Language, SymbolKind, SyntaxKind};
 mod commonjs;
 mod members;
+pub(crate) mod recovery;
 
 use tree_sitter::{Node, Parser};
 
@@ -1857,9 +1858,14 @@ pub(crate) fn analyze_included(
         parser.set_included_ranges(ranges).is_ok(),
         "host grammar ranges must be ordered and non-overlapping: ranges={ranges:?}",
     );
-    let tree = parser
-        .parse(source.text, None)
-        .ok_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())?;
+    // A host grammar's ranges already select what this parser reads.
+    let parsed = if ranges.is_empty() {
+        recovery::parse(&mut parser, source.text)
+    } else {
+        parser.parse(source.text, None).map(|tree| (tree, false))
+    };
+    let (tree, recovered) =
+        parsed.ok_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())?;
     let mut rules = EcmaScriptRules {
         kinds,
         exports: ModuleExports::read(tree.root_node(), source.text, kinds)?,
@@ -1910,7 +1916,8 @@ pub(crate) fn analyze_included(
         source.path.clone(),
         syntax_elements,
         symbols,
-        tree.root_node().has_error(),
+        // A recovered tree holds no error node; the source still failed to parse whole.
+        recovered || tree.root_node().has_error(),
     )
     .with_source_witness(source.text)
     .with_export_bindings(export_bindings)

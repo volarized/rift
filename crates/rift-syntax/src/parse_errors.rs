@@ -31,9 +31,20 @@ pub(crate) fn invalid_declarations(
             .runtime_abi_max(tree_sitter::LANGUAGE_VERSION)
             .error()
     })?;
-    let tree = parser
-        .parse(source.text, None)
-        .ok_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())?;
+    // Validation reads the tree extraction read: a recovered ECMAScript document.
+    let ecmascript = [
+        ShippedLanguage::JavaScript,
+        ShippedLanguage::TypeScript,
+        ShippedLanguage::TypeScriptTsx,
+    ]
+    .iter()
+    .any(|shipped| shipped.language() == *language);
+    let tree = if ecmascript {
+        crate::ecmascript::recovery::parse(&mut parser, source.text).map(|(tree, _)| tree)
+    } else {
+        parser.parse(source.text, None)
+    }
+    .ok_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())?;
     let declarations = declarations.iter().copied().collect::<BTreeSet<_>>();
     let header_terminator = [ShippedLanguage::Python, ShippedLanguage::Cython]
         .iter()
@@ -46,20 +57,6 @@ pub(crate) fn invalid_declarations(
             );
             id
         });
-    invalid_ranges(
-        tree.root_node(),
-        source,
-        limits,
-        &declarations,
-        HeaderRules {
-            terminator: header_terminator,
-            recovered: recovered_header,
-        },
-    )
-}
-
-fn invalid_ranges(
-    root: Node<'_>,
     // TypeScript variance annotations (`in`, `out`) are not in the grammar. The parser
     // confines that error to the type parameter list, which names no declaration.
     let recovered_header = [ShippedLanguage::TypeScript, ShippedLanguage::TypeScriptTsx]
@@ -74,15 +71,18 @@ fn invalid_ranges(
             id
         })
         .flatten();
-    source: SyntaxSource<'_>,
-    limits: SyntaxLimits,
-    declarations: &BTreeSet<ByteRange>,
-    rules: HeaderRules,
-) -> Result<BTreeSet<ByteRange>, RiftError> {
-    let mut invalid = BTreeSet::new();
-    let body_field = root.language().field_id_for_name("body");
-    let mut pending = vec![(root, 0_usize, false)];
-    let mut visited = 0_usize;
+    invalid_ranges(
+        tree.root_node(),
+        source,
+        limits,
+        &declarations,
+        HeaderRules {
+            terminator: header_terminator,
+            recovered: recovered_header,
+        },
+    )
+}
+
 /// Grammar facts that decide which header errors keep a declaration's name.
 #[derive(Clone, Copy)]
 struct HeaderRules {
@@ -92,6 +92,17 @@ struct HeaderRules {
     recovered: Option<NonZeroU16>,
 }
 
+fn invalid_ranges(
+    root: Node<'_>,
+    source: SyntaxSource<'_>,
+    limits: SyntaxLimits,
+    declarations: &BTreeSet<ByteRange>,
+    rules: HeaderRules,
+) -> Result<BTreeSet<ByteRange>, RiftError> {
+    let mut invalid = BTreeSet::new();
+    let body_field = root.language().field_id_for_name("body");
+    let mut pending = vec![(root, 0_usize, false)];
+    let mut visited = 0_usize;
     let mut cursor = root.walk();
     while let Some((syntax_element, depth, in_error)) = pending.pop() {
         visited += 1;
@@ -125,6 +136,9 @@ struct HeaderRules {
 }
 
 /// A declaration's body does not decide whether its header can name a symbol.
+///
+/// Neither does an error confined to the recovered header field: the name, the
+/// heritage clause and every other header part are then outside the error.
 fn header_has_error(
     syntax_element: Node<'_>,
     body_field: Option<NonZeroU16>,
@@ -139,9 +153,6 @@ fn header_has_error(
     }
     let mut cursor = syntax_element.walk();
     syntax_element
-///
-/// Neither does an error confined to the recovered header field: the name, the
-/// heritage clause and every other header part are then outside the error.
         .children(&mut cursor)
         .take_while(|child| {
             // Python can place a body error before an empty block. A missing
@@ -214,17 +225,6 @@ mod tests {
     }
 
     #[test]
-    fn facts_keep_the_validation_answer_and_copies_validate_again() {
-        let path = ProjectPath::new("main.py").expect("source path");
-        let text = "def ok():\n    pass\ndef broken(: pass\n";
-        let source = SyntaxSource { path: &path, text };
-        let provider = PythonSyntaxProvider::default();
-        let facts = provider
-            .analyze(source, SyntaxLimits::DEFAULT)
-            .expect("source facts")
-            .into_facts();
-        let ranges = facts
-    #[test]
     fn type_parameter_errors_keep_declarations_named_outside_them() {
         for (extension, text, expected) in [
             (
@@ -279,6 +279,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn facts_keep_the_validation_answer_and_copies_validate_again() {
+        let path = ProjectPath::new("main.py").expect("source path");
+        let text = "def ok():\n    pass\ndef broken(: pass\n";
+        let source = SyntaxSource { path: &path, text };
+        let provider = PythonSyntaxProvider::default();
+        let facts = provider
+            .analyze(source, SyntaxLimits::DEFAULT)
+            .expect("source facts")
+            .into_facts();
+        let ranges = facts
             .symbols()
             .iter()
             .map(|symbol| symbol.item_range)
@@ -363,5 +374,81 @@ mod tests {
             .invalid_declarations(source, limits, &declarations)
             .expect_err("declaration bound");
         assert_eq!(error.slug(), errors::syntax::too_many_syntax_elements::SLUG);
+    }
+
+    #[test]
+    fn a_root_error_keeps_declarations_outside_the_body_that_holds_it() {
+        // Three generic call signatures without separators make the document root an
+        // error. Leaving out that interface body's interior parses the rest whole.
+        let signatures = "  <T extends Before, U extends number>(\n    data: T,\n    status?: U\n  ): Wrapped<T, U, 'body'>\n  <T extends Before, U extends number>(\n    data: T,\n    init?: Init<U>\n  ): Wrapped<T, U, 'body'>\n  <T extends null, U extends number>(\n    data: T,\n    status?: U\n  ): Wrapped<null, U, 'body'>\n";
+        let tail = "export class Item {\n  value = 1\n  read() { return this.value }\n}\nexport function later(item: Item) { return item.read() }\n";
+        let recovered = format!(
+            "export type Before = string\nexport interface Respond {{\n{signatures}}}\n{tail}"
+        );
+        // The body never closes, so no interior can be left out.
+        let unclosed = format!("export interface Respond {{\n{signatures}{tail}");
+        // An error outside every braced body gives recovery nothing to leave out.
+        let outside = format!(") ) )\n{recovered}");
+        // A second body with its own error is left out as well.
+        let second = format!("{recovered}export function tail() {{ return ) ) ) }}\n");
+        let all = &["Before", "Respond", "Item", "value", "read", "later"][..];
+        for (extension, text, kept, refused) in [
+            ("ts", recovered.as_str(), all, &[][..]),
+            ("tsx", recovered.as_str(), all, &[][..]),
+            (
+                "ts",
+                second.as_str(),
+                &["Before", "Item", "later", "tail"][..],
+                &[][..],
+            ),
+            ("ts", unclosed.as_str(), &[][..], &["Item", "later"][..]),
+            (
+                "ts",
+                outside.as_str(),
+                &[][..],
+                &["Before", "Item", "later"][..],
+            ),
+        ] {
+            let path = ProjectPath::new(format!("main.{extension}")).expect("source path");
+            let source = SyntaxSource { path: &path, text };
+            let provider = crate::registry::provider_for_extension(extension).expect("provider");
+            let document = provider
+                .analyze(source, SyntaxLimits::DEFAULT)
+                .expect("source facts");
+            assert!(document.has_errors(), "{extension}: {text:?}");
+            let ranges = document
+                .symbols()
+                .iter()
+                .map(|symbol| symbol.item_range)
+                .collect::<Vec<_>>();
+            let invalid = provider
+                .invalid_declarations(source, SyntaxLimits::DEFAULT, &ranges)
+                .expect("declaration validation");
+            let valid = document
+                .symbols()
+                .iter()
+                .filter(|symbol| !invalid.contains(&symbol.item_range))
+                .map(|symbol| symbol.name.as_str())
+                .collect::<Vec<_>>();
+            for name in kept {
+                assert!(
+                    valid.contains(name),
+                    "{extension}: {name} kept in {valid:?}"
+                );
+            }
+            for name in refused {
+                assert!(
+                    !valid.contains(name),
+                    "{extension}: {name} refused in {valid:?}"
+                );
+            }
+            // Offsets are the source's own: every kept name is read at its written place.
+            for symbol in document.symbols() {
+                let range = symbol.name_range.expect("declaration name");
+                let start = usize::try_from(range.start).expect("offset");
+                let end = usize::try_from(range.end).expect("offset");
+                assert_eq!(&text[start..end], symbol.name, "{extension}");
+            }
+        }
     }
 }
