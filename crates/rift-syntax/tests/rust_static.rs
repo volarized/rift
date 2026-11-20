@@ -179,6 +179,7 @@ fn test_rust_use_paths_stay_inside_their_recorded_scope() {
             path: vec![ByteRange { start: 0, end: 1 }],
             scope: ByteRange { start: 2, end: 3 },
             glob: false,
+            visibility: None,
         }],
         ..StaticFactsParts::default()
     };
@@ -196,6 +197,7 @@ fn test_rust_use_path_components_share_the_syntax_bound() {
                 path: vec![range; 3],
                 scope: range,
                 glob: false,
+                visibility: None,
             };
             3
         ],
@@ -333,4 +335,152 @@ fn test_rust_local_return_facts_keep_authored_initializer_and_return_type() {
             .any(|&(name, result)| text(name) == "copy" && text(result) == "Self")
     );
     assert!(facts.bindings().iter().any(|binding| matches!(binding.kind, rift_syntax::StaticBindingKind::RustValue { initializer } if text(binding.name) == "copy" && text(initializer) == "self.copy()")));
+}
+
+#[test]
+fn test_rust_macro_token_errors_keep_authored_declarations_and_ranges() {
+    let path = ProjectPath::new("src/lib.rs").expect("path");
+    let source = "macro_rules! marker { (~) => {}; } fn leaf() {} fn run() { leaf(); }";
+    let document = RustSyntaxProvider::default()
+        .analyze(
+            SyntaxSource {
+                path: &path,
+                text: source,
+            },
+            SyntaxLimits::default(),
+        )
+        .expect("syntax");
+    let marker = document
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.name == "marker")
+        .expect("macro");
+    assert_eq!(
+        &source[usize::try_from(marker.item_range.start).expect("start")
+            ..usize::try_from(marker.item_range.end).expect("end")],
+        "macro_rules! marker { (~) => {}; }"
+    );
+    let invalid = RustSyntaxProvider::default()
+        .invalid_declarations(
+            SyntaxSource {
+                path: &path,
+                text: source,
+            },
+            SyntaxLimits::default(),
+            &[marker.item_range],
+        )
+        .expect("validation");
+    assert!(
+        invalid.is_empty(),
+        "opaque body errors do not invalidate the macro header"
+    );
+    let facts = document.facts().static_facts().expect("static facts");
+    assert_eq!(facts.calls().len(), 1);
+}
+
+#[test]
+fn test_rust_tuple_impls_keep_authored_structural_owner_ranges() {
+    let path = ProjectPath::new("src/lib.rs").expect("path");
+    let source = "impl Pair for (usize, u8) { fn total(&self) {} } impl Pair for (u8, usize) { fn total(&self) {} } impl Pair for (usize,) { fn total(&self) {} } impl Pair for () { fn total(&self) {} } impl<'a> Pair for (&'a Item, [u8]) { fn total(&self) {} } impl Pair for (Item) { fn total(&self) {} }";
+    let document = RustSyntaxProvider::default()
+        .analyze(
+            SyntaxSource {
+                path: &path,
+                text: source,
+            },
+            SyntaxLimits::default(),
+        )
+        .expect("syntax");
+    let facts = document.facts().static_facts().expect("static facts");
+    let owners = facts
+        .inherent_impls()
+        .iter()
+        .map(|implementation| {
+            &source[usize::try_from(implementation.type_path.start).expect("start")
+                ..usize::try_from(implementation.type_path.end).expect("end")]
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        owners,
+        [
+            "(usize, u8)",
+            "(u8, usize)",
+            "(usize,)",
+            "()",
+            "(&'a Item, [u8])",
+            "Item"
+        ]
+    );
+    let names = document
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.kind == "impl_item")
+        .map(|symbol| symbol.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        [
+            "(usize,u8)",
+            "(u8,usize)",
+            "(usize,)",
+            "()",
+            "(&Item,[u8])",
+            "Item"
+        ]
+    );
+}
+
+#[test]
+fn test_rust_reexport_imports_keep_authored_visibility_ranges() {
+    let path = ProjectPath::new("src/lib.rs").expect("path");
+    let source = "pub(crate) use crate::Item; use crate::Other;";
+    let document = RustSyntaxProvider::default()
+        .analyze(
+            SyntaxSource {
+                path: &path,
+                text: source,
+            },
+            SyntaxLimits::default(),
+        )
+        .expect("syntax");
+    let uses = document
+        .facts()
+        .static_facts()
+        .expect("static facts")
+        .rust_uses();
+    let visibility = uses[0].visibility.expect("restricted visibility");
+    assert_eq!(
+        &source[usize::try_from(visibility.start).expect("start")
+            ..usize::try_from(visibility.end).expect("end")],
+        "pub(crate)"
+    );
+    assert!(uses[1].visibility.is_none());
+}
+
+#[test]
+fn test_rust_function_pointer_results_keep_authored_types_and_receivers() {
+    let path = ProjectPath::new("src/lib.rs").expect("path");
+    let source =
+        "struct Table { make: fn() -> Item } fn run(table: &Table) { (table.make)().read(); }";
+    let document = RustSyntaxProvider::default()
+        .analyze(
+            SyntaxSource {
+                path: &path,
+                text: source,
+            },
+            SyntaxLimits::default(),
+        )
+        .expect("syntax");
+    let facts = document.facts().static_facts().expect("static facts");
+    let text = |range: rift_syntax::ByteRange| {
+        &source
+            [usize::try_from(range.start).expect("start")..usize::try_from(range.end).expect("end")]
+    };
+    assert!(
+        facts
+            .declared_types()
+            .iter()
+            .any(|&(name, result)| text(name) == "make" && text(result) == "Item")
+    );
+    assert!(facts.calls().iter().any(|call| matches!(call.callee, rift_syntax::StaticCallee::Member { receiver, member } if text(receiver) == "(table.make)()" && text(member) == "read")));
 }

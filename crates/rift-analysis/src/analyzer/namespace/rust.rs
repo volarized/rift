@@ -27,26 +27,12 @@ pub(super) fn prepare(
         return super::PreparedNamespace::default();
     }
     let originals = original_sources(input);
-    let libraries = selected_libraries(input, &inventory);
-    let mut assigned = BTreeMap::new();
-    let mut pending = VecDeque::new();
-    for (root, name) in libraries {
-        let Some((namespace, directory, library)) = library_root(input, &root, name) else {
-            continue;
-        };
-        if assigned.insert(root.clone(), namespace.clone()).is_some() {
-            return super::PreparedNamespace::default();
-        }
-        pending.push_back((
-            root,
-            namespace,
-            directory,
-            macros::Scope::default(),
-            library,
-        ));
-    }
+    let Some((mut assigned, mut pending)) = library_roots_pending(input, &inventory) else {
+        return super::PreparedNamespace::default();
+    };
     let mut anchors = BTreeMap::new();
     let mut requested = Vec::new();
+    let mut declaring = BTreeMap::<String, Vec<(String, rift_syntax::ByteRange)>>::new();
     while let Some((path, namespace, directory, scope, library)) = pending.pop_front() {
         let Some(file) = inventory.get(path.as_str()) else {
             continue;
@@ -72,6 +58,12 @@ pub(super) fn prepare(
                 .into_iter()
                 .map(|export| (namespace.clone(), export)),
         );
+        for (child, _, item) in module_children(file, &directory, &inventory, input.syntax()) {
+            declaring
+                .entry(child)
+                .or_default()
+                .push((path.clone(), item));
+        }
         let declared = file_anchors(input, file.syntax, &namespace, &admitted);
         anchors.insert(
             path.clone(),
@@ -115,8 +107,68 @@ pub(super) fn prepare(
         outside_namespaces: target_paths(input, &inventory, &originals, &assigned),
         ..Default::default()
     };
-    local_exports(input, selected, &requested, &mut prepared);
+    let admitted = module_admission(input, &inventory, &declaring, assigned.len());
+    local_exports(input, selected, &requested, &admitted, &mut prepared);
     prepared
+}
+
+/// Whether the configuration admits each module file: its declaring `mod` items and every
+/// ancestor's. A file several alternative items declare is admitted when one of them is;
+/// a file reached only through inactive items is not; anything else unknown stays unknown.
+/// Files no ordinary `mod` item declares (crate roots, macro-produced modules) keep the
+/// admission of their own items.
+fn module_admission(
+    input: &NamespaceInput<'_>,
+    inventory: &BTreeMap<&str, &super::SelectedFile<'_>>,
+    declaring: &BTreeMap<String, Vec<(String, rift_syntax::ByteRange)>>,
+    depth_max: usize,
+) -> BTreeMap<String, Option<bool>> {
+    let configurations = configuration::Configurations::new(input);
+    let mut admitted = BTreeMap::<String, Option<bool>>::new();
+    // Each pass settles at least one more module depth; module files bound the passes.
+    for _ in 0..=depth_max {
+        let mut changed = false;
+        for (child, items) in declaring {
+            let mut status = Some(false);
+            for (parent, item) in items {
+                let parent_status = if declaring.contains_key(parent) {
+                    let Some(parent_status) = admitted.get(parent) else {
+                        status = None;
+                        continue;
+                    };
+                    *parent_status
+                } else {
+                    Some(true)
+                };
+                let item_status = inventory.get(parent.as_str()).and_then(|file| {
+                    configurations
+                        .file(parent)
+                        .admitted(file.syntax, file.source, *item)
+                });
+                status = match (status, and(parent_status, item_status)) {
+                    (_, Some(true)) | (Some(true), _) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    _ => None,
+                };
+            }
+            if admitted.get(child) != Some(&status) {
+                admitted.insert(child.clone(), status);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    admitted
+}
+
+fn and(left: Option<bool>, right: Option<bool>) -> Option<bool> {
+    match (left, right) {
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        (Some(true), Some(true)) => Some(true),
+        _ => None,
+    }
 }
 
 /// Original paths of the Cargo targets other than a library, and of the modules they
@@ -153,7 +205,7 @@ fn target_paths(
         {
             continue;
         }
-        for (child, _) in module_children(file, &directory, inventory, input.syntax()) {
+        for (child, _, _) in module_children(file, &directory, inventory, input.syntax()) {
             let child_directory = child
                 .strip_suffix("/mod.rs")
                 .or_else(|| child.strip_suffix(".rs"))
@@ -241,6 +293,34 @@ fn target_roots(
     roots
 }
 
+type Pending = VecDeque<(String, Vec<String>, String, macros::Scope, bool)>;
+
+/// The selected library roots, assigned to their crate namespaces and queued for the
+/// module walk. Two roots of one path refuse the whole inventory.
+fn library_roots_pending(
+    input: &NamespaceInput<'_>,
+    inventory: &BTreeMap<&str, &super::SelectedFile<'_>>,
+) -> Option<(BTreeMap<String, Vec<String>>, Pending)> {
+    let mut assigned = BTreeMap::new();
+    let mut pending = VecDeque::new();
+    for (root, name) in selected_libraries(input, inventory) {
+        let Some((namespace, directory, library)) = library_root(input, &root, name) else {
+            continue;
+        };
+        if assigned.insert(root.clone(), namespace.clone()).is_some() {
+            return None;
+        }
+        pending.push_back((
+            root,
+            namespace,
+            directory,
+            macros::Scope::default(),
+            library,
+        ));
+    }
+    Some((assigned, pending))
+}
+
 fn library_root(
     input: &NamespaceInput<'_>,
     root: &str,
@@ -306,7 +386,7 @@ fn module_children(
     directory: &str,
     inventory: &BTreeMap<&str, &super::SelectedFile<'_>>,
     limits: SyntaxLimits,
-) -> Vec<(String, Vec<String>)> {
+) -> Vec<(String, Vec<String>, rift_syntax::ByteRange)> {
     module_paths(
         file,
         directory,
@@ -315,12 +395,16 @@ fn module_children(
     )
 }
 
+/// Child module files with their logical names and the declaring `mod` item's range.
+///
+/// Alternative declarations of one module, such as `#[cfg]`-selected `#[path]` files,
+/// each keep their own entry.
 fn module_paths(
     file: &super::SelectedFile<'_>,
     directory: &str,
     contains: &dyn Fn(&str) -> bool,
     limits: SyntaxLimits,
-) -> Vec<(String, Vec<String>)> {
+) -> Vec<(String, Vec<String>, rift_syntax::ByteRange)> {
     let Some(invalid) = super::errors::invalid_declarations(file, limits) else {
         return Vec::new();
     };
@@ -412,7 +496,7 @@ fn module_paths(
             .filter(|path| ProjectPath::new(path.as_str()).is_ok() && contains(path.as_str()))
             .collect::<Vec<_>>();
         if let [child] = admitted.as_slice() {
-            children.push(((*child).clone(), local));
+            children.push(((*child).clone(), local, symbol.item_range));
         }
     }
     children
@@ -447,7 +531,7 @@ fn file_anchors(
         if symbol.qualified_name != base {
             continue;
         }
-        let structural = symbol.kind == "impl_item" && symbol.name.starts_with(['&', '[']);
+        let structural = symbol.kind == "impl_item" && symbol.name.starts_with(['&', '[', '(']);
         let names = if structural {
             let mut names = match symbol.container.as_deref() {
                 Some(container) => owner_path(container, &owners),
@@ -696,6 +780,7 @@ fn local_exports(
     input: &NamespaceInput<'_>,
     selected: &[super::SelectedFile<'_>],
     requested: &[(Vec<String>, macros::Export)],
+    admitted: &BTreeMap<String, Option<bool>>,
     prepared: &mut super::PreparedNamespace,
 ) {
     let Some(work_max) = input
@@ -712,7 +797,11 @@ fn local_exports(
         .iter()
         .map(|file| (file.path.as_str(), file))
         .collect::<BTreeMap<_, _>>();
-    let refused = conflicting_requests(input, &files, requested, &configurations);
+    let modules = Modules {
+        configurations: &configurations,
+        admitted,
+    };
+    let refused = conflicting_requests(input, &files, requested, &modules);
     // Build declaration and identity lookups once for every later binding and pass.
     let mut declarations = None;
     let mut export_paths = ExportPaths::default();
@@ -720,7 +809,7 @@ fn local_exports(
     'passes: for _ in 0..requested.len() {
         let before = prepared.exports.len();
         for request in requested {
-            let (namespace, (path, range, name, _)) = request;
+            let (namespace, (path, range, name, _, _)) = request;
             let Some(next) = work.checked_add(1) else {
                 break 'passes;
             };
@@ -737,20 +826,13 @@ fn local_exports(
             let Some(file) = files.get(path.as_str()) else {
                 continue;
             };
-            let configuration = configurations.file(path.as_str());
-            if configuration.admitted(file.syntax, file.source, *range) != Some(true) {
+            if modules.admitted(file, *range) != Some(true) {
                 continue;
             }
             // Captured conditional declarations do not establish export completeness.
             prepared.unresolved_exports = true;
             let declarations = declarations.get_or_insert_with(|| {
-                local_declarations(
-                    selected,
-                    &prepared.anchors,
-                    &configurations,
-                    &mut work,
-                    work_max,
-                )
+                local_declarations(selected, &prepared.anchors, &modules, &mut work, work_max)
             });
             let Some(declarations) = declarations else {
                 break 'passes;
@@ -759,7 +841,7 @@ fn local_exports(
                 input,
                 declarations,
                 (prepared, &mut export_paths),
-                &configurations,
+                &modules,
                 request,
                 &mut work,
                 work_max,
@@ -772,6 +854,14 @@ fn local_exports(
             }
             if declarations.identities.contains(identity.as_str()) {
                 continue;
+            }
+            if let Some(range) = request.1.4 {
+                let Some(visibility) = macros::text_range(file.source, range) else {
+                    continue;
+                };
+                prepared
+                    .alias_visibilities
+                    .insert(identity.clone(), visibility.to_owned());
             }
             completed.insert(identity.clone());
             prepared.exports.push(export_binding(
@@ -790,12 +880,38 @@ fn local_exports(
         .retain(|export| !conflicts.contains(export.identity.as_str()));
 }
 
+/// Configuration admission of captured items, including their module file's admission.
+struct Modules<'configuration, 'input> {
+    configurations: &'configuration configuration::Configurations<'input>,
+    admitted: &'configuration BTreeMap<String, Option<bool>>,
+}
+
+impl Modules<'_, '_> {
+    fn admitted(
+        &self,
+        file: &super::SelectedFile<'_>,
+        range: rift_syntax::ByteRange,
+    ) -> Option<bool> {
+        let module = self
+            .admitted
+            .get(file.path.as_str())
+            .copied()
+            .unwrap_or(Some(true));
+        and(
+            module,
+            self.configurations
+                .file(file.path.as_str())
+                .admitted(file.syntax, file.source, range),
+        )
+    }
+}
+
 fn export_binding(
     request: &(Vec<String>, macros::Export),
     identity: SymbolId,
     target: (SymbolId, String, String),
 ) -> super::ExportBinding {
-    let (_, (path, range, name, _)) = request;
+    let (_, (path, range, name, _, _)) = request;
     let (target, target_path, target_qualified_name) = target;
     super::ExportBinding {
         path: path.as_str().to_owned(),
@@ -865,12 +981,12 @@ fn export_target(
     input: &NamespaceInput<'_>,
     declarations: &LocalDeclarations<'_>,
     (prepared, export_paths): (&super::PreparedNamespace, &mut ExportPaths),
-    configurations: &configuration::Configurations<'_>,
+    modules: &Modules<'_, '_>,
     request: &(Vec<String>, macros::Export),
     work: &mut usize,
     work_max: usize,
 ) -> Option<(SymbolId, String, String)> {
-    let (namespace, (_, _, _, target)) = request;
+    let (namespace, (_, _, _, target, _)) = request;
     let local = requested_path(namespace, target).and_then(|target_path| {
         // The charge is what reading the bindings in order costs, so the bound holds
         // the same requests as before.
@@ -889,21 +1005,15 @@ fn export_target(
         if export_paths.unparsed.is_some() {
             return None;
         }
-        local_target(
-            input,
-            declarations,
-            configurations,
-            &target_path,
-            work,
-            work_max,
+        local_target(input, declarations, modules, &target_path, work, work_max).map(
+            |(file, symbol, target)| {
+                (
+                    target.clone(),
+                    file.path.as_str().to_owned(),
+                    symbol.qualified_name.clone(),
+                )
+            },
         )
-        .map(|(file, symbol, target)| {
-            (
-                target.clone(),
-                file.path.as_str().to_owned(),
-                symbol.qualified_name.clone(),
-            )
-        })
     });
     match local {
         Some(local) => Some(local),
@@ -956,21 +1066,18 @@ fn conflicting_requests(
     input: &NamespaceInput<'_>,
     files: &BTreeMap<&str, &super::SelectedFile<'_>>,
     requested: &[(Vec<String>, macros::Export)],
-    configurations: &configuration::Configurations<'_>,
+    modules: &Modules<'_, '_>,
 ) -> std::collections::BTreeSet<SymbolId> {
     let mut seen = std::collections::BTreeSet::new();
     let mut refused = std::collections::BTreeSet::new();
-    for (namespace, (path, range, name, _)) in requested {
+    for (namespace, (path, range, name, _, _)) in requested {
         let Some(identity) = export_identity(input, namespace, name) else {
             continue;
         };
         let Some(file) = files.get(path.as_str()) else {
             continue;
         };
-        let admitted =
-            configurations
-                .file(path.as_str())
-                .admitted(file.syntax, file.source, *range);
+        let admitted = modules.admitted(file, *range);
         if admitted == Some(false) {
             continue;
         }
@@ -1061,7 +1168,7 @@ struct LocalDeclarations<'input> {
 fn local_declarations<'input>(
     selected: &'input [super::SelectedFile<'input>],
     anchors: &'input super::Anchors,
-    configurations: &configuration::Configurations<'_>,
+    modules: &Modules<'_, '_>,
     work: &mut usize,
     work_max: usize,
 ) -> Option<LocalDeclarations<'input>> {
@@ -1077,7 +1184,6 @@ fn local_declarations<'input>(
         let Some(anchors) = anchors.get(file.path.as_str()) else {
             continue;
         };
-        let configuration = configurations.file(file.path.as_str());
         for symbol in file.syntax.symbols() {
             if symbol.kind == "impl_item" {
                 continue;
@@ -1086,7 +1192,7 @@ fn local_declarations<'input>(
             if *work > work_max {
                 return None;
             }
-            if configuration.admitted(file.syntax, file.source, symbol.item_range) == Some(false) {
+            if modules.admitted(file, symbol.item_range) == Some(false) {
                 continue;
             }
             if let Some(identity) = anchors.get(&symbol.qualified_name) {
@@ -1105,7 +1211,7 @@ fn local_declarations<'input>(
 fn local_target<'input>(
     input: &NamespaceInput<'_>,
     declarations: &LocalDeclarations<'input>,
-    configurations: &configuration::Configurations<'_>,
+    modules: &Modules<'_, '_>,
     path: &[String],
     work: &mut usize,
     work_max: usize,
@@ -1125,11 +1231,7 @@ fn local_target<'input>(
     else {
         return None;
     };
-    let admitted = configurations.file(file.path.as_str()).admitted(
-        file.syntax,
-        file.source,
-        symbol.item_range,
-    );
+    let admitted = modules.admitted(file, symbol.item_range);
     let spelled = file
         .source
         .get(usize::try_from(symbol.range.start).ok()?..usize::try_from(symbol.range.end).ok()?)
@@ -1196,7 +1298,7 @@ pub(super) fn namespace_paths(
         } else {
             path.strip_suffix(".rs").unwrap_or(path)
         };
-        for (path, _) in module_paths(
+        for (path, _, _) in module_paths(
             &super::SelectedFile {
                 path: document.path(),
                 source: document.source(),

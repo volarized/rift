@@ -963,6 +963,9 @@ impl<'source> Index<'source> {
             }
             if let Some((range, target)) = self.import_target(file, binding, work) {
                 let occurrence = target.and_then(|target| {
+                    if file.document.facts.language().name == "rust" {
+                        return self.rust_import_occurrence(file, range, target, work);
+                    }
                     let mut occurrence =
                         self.occurrence(file, range, range, ReferenceRole::Import, target)?;
                     if file.document.facts.language().name == "python" {
@@ -1197,7 +1200,7 @@ fn admitted_facts<'source>(
             && (document.facts.symbols().is_empty()
                 || !matches!(
                     document.facts.language().name.as_str(),
-                    "javascript" | "typescript"
+                    "javascript" | "typescript" | "rust"
                 )))
     {
         return None;

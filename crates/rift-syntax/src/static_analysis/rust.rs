@@ -19,6 +19,8 @@ pub(super) struct Kinds {
     generic_type: u16,
     reference_type: u16,
     array_type: u16,
+    tuple_type: u16,
+    unit_type: u16,
     self_parameter: u16,
     self_value: u16,
     scoped_identifier: u16,
@@ -26,6 +28,8 @@ pub(super) struct Kinds {
     call: u16,
     generic_function: u16,
     field_expression: u16,
+    field_declaration: u16,
+    function_type: u16,
     struct_expression: u16,
     use_declaration: u16,
     use_alias: u16,
@@ -44,6 +48,7 @@ pub(super) struct Kinds {
     non_method_bounds: [u16; 2],
     bounds: u16,
     edge_macro: u16,
+    macro_definition: u16,
     assignment: [u16; 2],
     scopes: [u16; 3],
     functions: [u16; 3],
@@ -51,10 +56,13 @@ pub(super) struct Kinds {
     value: u16,
     member: u16,
     argument: u16,
+    arguments: u16,
     name: u16,
     alias: u16,
     path: u16,
     pattern: u16,
+    named_patterns: [u16; 3],
+    shorthand_field: u16,
     value_type: u16,
     return_type: u16,
     left: u16,
@@ -74,6 +82,8 @@ pub(super) fn kinds() -> &'static Kinds {
             generic_type: id("generic_type"),
             reference_type: id("reference_type"),
             array_type: id("array_type"),
+            tuple_type: id("tuple_type"),
+            unit_type: id("unit_type"),
             self_parameter: id("self_parameter"),
             self_value: id("self"),
             scoped_identifier: id("scoped_identifier"),
@@ -81,6 +91,8 @@ pub(super) fn kinds() -> &'static Kinds {
             call: id("call_expression"),
             generic_function: id("generic_function"),
             field_expression: id("field_expression"),
+            field_declaration: id("field_declaration"),
+            function_type: id("function_type"),
             struct_expression: id("struct_expression"),
             use_declaration: id("use_declaration"),
             use_alias: id("use_as_clause"),
@@ -104,6 +116,7 @@ pub(super) fn kinds() -> &'static Kinds {
             non_method_bounds: [id("lifetime"), id("removed_trait_bound")],
             bounds: field("bounds"),
             edge_macro: id("macro_invocation"),
+            macro_definition: id("macro_definition"),
             assignment: [id("assignment_expression"), id("compound_assignment_expr")],
             scopes: [id("source_file"), id("block"), id("declaration_list")],
             functions: [
@@ -115,10 +128,17 @@ pub(super) fn kinds() -> &'static Kinds {
             value: field("value"),
             member: field("field"),
             argument: field("argument"),
+            arguments: field("arguments"),
             name: field("name"),
             alias: field("alias"),
             path: field("path"),
             pattern: field("pattern"),
+            named_patterns: [
+                id("struct_pattern"),
+                id("tuple_struct_pattern"),
+                id("generic_pattern"),
+            ],
+            shorthand_field: id("shorthand_field_identifier"),
             value_type: field("type"),
             return_type: field("return_type"),
             left: field("left"),
@@ -136,6 +156,19 @@ impl Kinds {
         budget: &mut rift_core::LoopBudget,
     ) -> Result<(), RiftError> {
         let syntax_element = visited.syntax_element();
+        let mut ancestor = Some(visited);
+        // The shared walk already bounds parent depth. Opaque macro contents and
+        // parser recovery subtrees cannot establish executable facts.
+        while let Some(current) = ancestor {
+            let element = current.syntax_element();
+            if element.kind_id() == self.macro_definition
+                || element.is_error()
+                || element.is_missing()
+            {
+                return Ok(());
+            }
+            ancestor = current.parent();
+        }
         let id = syntax_element.kind_id();
         self.record_reference(visited, facts)?;
         if id == self.call {
@@ -165,6 +198,8 @@ impl Kinds {
             self.record_return(syntax_element, facts)?;
         } else if id == self.functions[1] {
             self.record_return(syntax_element, facts)?;
+        } else if id == self.field_declaration {
+            self.record_function_field(syntax_element, facts)?;
         } else if self.assignment.contains(&id) {
             self.record_mutation(syntax_element, facts)?;
         } else if id == self.edge_macro {
@@ -185,6 +220,29 @@ impl Kinds {
             self.record_pattern(syntax_element, scope, facts)?;
         } else if id == self.parameters || id == self.closure_parameters {
             self.record_patterns(visited, facts)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn record_error(
+        &self,
+        visited: Visited<'_, '_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let mut ancestor = visited.parent();
+        let mut scope = None;
+        while let Some(current) = ancestor {
+            let element = current.syntax_element();
+            if element.kind_id() == self.macro_definition {
+                return Ok(());
+            }
+            if scope.is_none() && self.scopes.contains(&element.kind_id()) {
+                scope = Some(element);
+            }
+            ancestor = current.parent();
+        }
+        if let Some(scope) = scope {
+            facts.unsupported_bindings.push(byte_range(scope)?);
         }
         Ok(())
     }
@@ -268,6 +326,20 @@ impl Kinds {
             self.member(callee)?
         };
         facts.calls.push(call(syntax_element, callee, shape)?);
+        if shape == StaticCallee::Qualified
+            && let Some(arguments) = syntax_element.child_by_field_id(self.arguments)
+        {
+            let mut cursor = arguments.walk();
+            if let Some(first) = arguments
+                .named_children(&mut cursor)
+                .find(|argument| !argument.is_extra())
+                .filter(|argument| !argument.is_missing())
+            {
+                facts
+                    .receiver_arguments
+                    .push((byte_range(syntax_element)?, byte_range(first)?));
+            }
+        }
         Ok(())
     }
 
@@ -279,8 +351,13 @@ impl Kinds {
             .child_by_field_id(self.value)
             .and_then(|syntax_element| {
                 (!syntax_element.is_missing()
-                    && [self.identifier, self.self_value, self.field_expression]
-                        .contains(&syntax_element.kind_id()))
+                    && [
+                        self.identifier,
+                        self.self_value,
+                        self.field_expression,
+                        self.call,
+                    ]
+                    .contains(&syntax_element.kind_id()))
                 .then_some(syntax_element)
             });
         let member = syntax_element
@@ -465,16 +542,24 @@ impl Kinds {
     }
 
     fn named_type<'tree>(&self, mut element: Node<'tree>) -> Option<Node<'tree>> {
+        element = crate::rust::implemented_type(element);
         // Each step follows one grammar child, bounded by the captured syntax depth.
         while [self.generic_type, self.reference_type].contains(&element.kind_id()) {
-            element = element.child_by_field_id(self.value_type)?;
+            element = crate::rust::implemented_type(element.child_by_field_id(self.value_type)?);
         }
         (!element.is_missing()
-            && [self.type_identifier, self.scoped_type_identifier].contains(&element.kind_id()))
+            && [
+                self.type_identifier,
+                self.scoped_type_identifier,
+                self.tuple_type,
+                self.unit_type,
+            ]
+            .contains(&element.kind_id()))
         .then_some(element)
     }
 
     fn implementation_type<'tree>(&self, element: Node<'tree>) -> Option<Node<'tree>> {
+        let element = crate::rust::implemented_type(element);
         if element.kind_id() == self.generic_type {
             return element.child_by_field_id(self.value_type);
         }
@@ -483,6 +568,8 @@ impl Kinds {
             self.scoped_type_identifier,
             self.reference_type,
             self.array_type,
+            self.tuple_type,
+            self.unit_type,
         ]
         .contains(&element.kind_id())
             && !element.is_missing())
@@ -524,6 +611,29 @@ impl Kinds {
             facts
                 .declared_types
                 .push((byte_range(name)?, byte_range(return_type)?));
+        }
+        Ok(())
+    }
+
+    fn record_function_field(
+        &self,
+        element: Node<'_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let Some(value) = element
+            .child_by_field_id(self.value_type)
+            .filter(|value| value.kind_id() == self.function_type)
+        else {
+            return Ok(());
+        };
+        if let Some(name) = element.child_by_field_id(self.name) {
+            let result = value
+                .child_by_field_id(self.return_type)
+                .and_then(|result| self.named_type(result))
+                .unwrap_or(value);
+            facts
+                .declared_types
+                .push((byte_range(name)?, byte_range(result)?));
         }
         Ok(())
     }
@@ -582,28 +692,55 @@ impl Kinds {
             } else {
                 byte_range(scope)?.start
             };
+        self.bind_pattern(pattern, scope, available_from, facts)
+    }
+
+    /// Binds every name a pattern introduces in `scope`: identifiers and `{ name }`
+    /// shorthand fields, never the type path of a struct or tuple struct pattern. A macro
+    /// in the pattern leaves the scope's bindings unsupported.
+    fn bind_pattern(
+        &self,
+        pattern: Node<'_>,
+        scope: Node<'_>,
+        available_from: u64,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
         let mut pending = vec![pattern];
-        let mut cursor = element.walk();
+        let mut cursor = pattern.walk();
         while let Some(element) = pending.pop() {
+            let kind = element.kind_id();
             if [
                 self.scoped_identifier,
                 self.scoped_type_identifier,
                 self.type_identifier,
             ]
-            .contains(&element.kind_id())
+            .contains(&kind)
             {
                 continue;
             }
-            if element.kind_id() == self.identifier {
+            if kind == self.edge_macro {
+                facts.unsupported_bindings.push(byte_range(scope)?);
+                return Ok(());
+            }
+            if kind == self.identifier || kind == self.shorthand_field {
                 facts.bindings.push(binding(
                     element,
                     scope,
                     available_from,
                     StaticBindingKind::Shadow,
                 )?);
-            } else {
-                pending.extend(element.named_children(&mut cursor));
+                continue;
             }
+            let path = if self.named_patterns.contains(&kind) {
+                element.child_by_field_id(self.value_type)
+            } else {
+                None
+            };
+            pending.extend(
+                element
+                    .named_children(&mut cursor)
+                    .filter(|child| Some(*child) != path),
+            );
         }
         Ok(())
     }
@@ -617,15 +754,24 @@ impl Kinds {
         let Some(scope) = enclosing(visited, &self.functions).map(Visited::syntax_element) else {
             return Ok(());
         };
+        if syntax_element.kind_id() != self.closure_parameters {
+            return Ok(());
+        }
+        // A closure's pattern parameters bind their names for the whole closure body.
         let mut cursor = syntax_element.walk();
-        let has_unparsed_pattern = syntax_element.named_children(&mut cursor).any(|child| {
-            !child.is_extra()
-                && child.kind_id() != self.parameter
-                && child.kind_id() != self.identifier
-                && !child.is_missing()
-        });
-        if syntax_element.kind_id() == self.closure_parameters && has_unparsed_pattern {
-            facts.unsupported_bindings.push(byte_range(scope)?);
+        let patterns = syntax_element
+            .named_children(&mut cursor)
+            .filter(|child| {
+                !child.is_extra()
+                    && child.kind_id() != self.parameter
+                    && child.kind_id() != self.identifier
+            })
+            .collect::<Vec<_>>();
+        for pattern in patterns {
+            if pattern.is_missing() {
+                continue;
+            }
+            self.bind_pattern(pattern, scope, byte_range(scope)?.start, facts)?;
         }
         Ok(())
     }

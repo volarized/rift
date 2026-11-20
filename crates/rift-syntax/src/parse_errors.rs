@@ -88,7 +88,8 @@ fn invalid_ranges(
         if declarations.contains(&range)
             && (in_error
                 || (syntax_element != root
-                    && header_has_error(syntax_element, body_field, header_terminator)))
+                    && header_has_error(syntax_element, body_field, header_terminator)
+                    && !opaque_macro_body(syntax_element)))
         {
             invalid.insert(range);
         }
@@ -119,6 +120,43 @@ fn header_has_error(
             *child != body && !header_ended
         })
         .any(|child| child.has_error())
+}
+
+// The Rust grammar parses macro matchers as token trees. Their contents do not
+// determine whether the macro's name and delimiters form a valid declaration.
+fn opaque_macro_body(element: Node<'_>) -> bool {
+    if element.kind() != "macro_definition" {
+        return false;
+    }
+    let Some(name) = element
+        .child_by_field_name("name")
+        .filter(|name| !name.has_error())
+    else {
+        return false;
+    };
+    let mut cursor = element.walk();
+    let mut children = element
+        .children(&mut cursor)
+        .filter(|child| !child.is_extra());
+    let Some(keyword) = children.next() else {
+        return false;
+    };
+    if keyword.kind() != "macro_rules!" || children.next() != Some(name) {
+        return false;
+    }
+    let Some(open) = children.next() else {
+        return false;
+    };
+    let close = match open.kind() {
+        "(" => ")",
+        "[" => "]",
+        "{" => "}",
+        _ => return false,
+    };
+    children
+        .filter(|child| child.kind() != ";")
+        .last()
+        .is_some_and(|last| last.kind() == close && !last.is_missing())
 }
 
 #[cfg(test)]

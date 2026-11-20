@@ -9,7 +9,7 @@ use crate::static_resolution::{
     Binding, File, Index, StaticOccurrence, StaticResolution, Target, Work,
 };
 
-enum ReceiverOwner<'source> {
+pub(super) enum ReceiverOwner<'source> {
     Target(Target<'source>),
     TypePath(ByteRange),
 }
@@ -95,29 +95,36 @@ impl<'source> Index<'source> {
                 result.record(self.rust_edge(file, range, EdgeKind::Overrides, target, base));
             }
         }
-        for imported in file
-            .facts
-            .rust_uses()
-            .iter()
-            .filter(|imported| imported.glob)
-        {
+        for imported in file.facts.rust_uses() {
             if !work.charge() {
                 return;
             }
-            let occurrence = self
-                .rust
-                .import(file, imported.range, work)
-                .and_then(|target| {
-                    self.occurrence(
-                        file,
-                        imported.range,
-                        imported.range,
-                        ReferenceRole::Import,
-                        target,
-                    )
-                });
+            let target = if imported.glob {
+                self.rust.import(file, imported.range, work)
+            } else {
+                self.rust.written_import(file, imported.range, work)
+            };
+            let occurrence = target
+                .and_then(|target| self.rust_import_occurrence(file, imported.range, target, work));
             result.record(occurrence);
         }
+    }
+
+    pub(in crate::static_resolution) fn rust_import_occurrence(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        target: Target<'source>,
+        work: &mut Work,
+    ) -> Option<StaticOccurrence> {
+        let mut occurrence = self.occurrence(file, range, range, ReferenceRole::Import, target)?;
+        if let Some(source) = self.rust.import_source(file, range, work) {
+            let source = self.occurrence(file, range, range, ReferenceRole::Import, source)?;
+            if let rift_provider::NormalizedTarget::Symbol(from) = source.target {
+                occurrence.edge_from = Some(from);
+            }
+        }
+        Some(occurrence)
     }
 
     fn rust_edge(
@@ -146,6 +153,12 @@ impl<'source> Namespaces<'source> {
         range: ByteRange,
         work: &mut Work,
     ) -> Option<Target<'source>> {
+        if let Some(call) = self.member_calls.get(&(file.document.path.as_str(), range)) {
+            let rift_syntax::StaticCallee::Member { receiver, member } = (*call)?.callee else {
+                return None;
+            };
+            return self.receiver_method(file, receiver, file.text(member)?, work);
+        }
         let (receiver, member) = file.text(range)?.rsplit_once('.')?;
         let receiver = ByteRange {
             start: range.start,
@@ -153,18 +166,14 @@ impl<'source> Namespaces<'source> {
                 .start
                 .checked_add(u64::try_from(receiver.len()).ok()?)?,
         };
-        if self
-            .member_calls
-            .contains(&(file.document.path.as_str(), range))
-        {
-            return self.receiver_method(file, receiver, member.trim(), work);
-        }
         self.receiver_target(file, receiver, work)
             .and_then(|owner| {
-                let mut path = owner.admitted_path()?;
+                let mut path = self.field_owner(owner).admitted_path()?;
                 path.push(member.trim().to_owned());
                 self.fields.get(&path).copied().flatten().filter(|target| {
-                    target.symbol.kind == "field_declaration" && self.available(*target)
+                    target.symbol.kind == "field_declaration"
+                        && self.available(*target)
+                        && self.declaration_visible(file, range.start, *target, work)
                 })
             })
     }
@@ -192,7 +201,7 @@ impl<'source> Namespaces<'source> {
         }
         let type_path = match self.receiver_owner_at_depth(file, receiver, work, depth)? {
             ReceiverOwner::Target(owner) => {
-                return self.inherent_method(file, receiver.start, owner, member, work);
+                return self.receiver_method_of(file, receiver.start, owner, member, work);
             }
             ReceiverOwner::TypePath(type_path) => type_path,
         };
@@ -239,7 +248,7 @@ impl<'source> Namespaces<'source> {
         }
     }
 
-    fn receiver_owner_at_depth(
+    pub(super) fn receiver_owner_at_depth(
         &self,
         file: &File<'source>,
         range: ByteRange,
@@ -249,37 +258,54 @@ impl<'source> Namespaces<'source> {
         if depth == 0 || !work.charge() {
             return None;
         }
-        let mut parts = file.text(range)?.split('.').map(str::trim);
-        let receiver = parts.next()?;
-        let mut owner = match file.binding(receiver, range.start, is_value_binding, work) {
-            Binding::Found(binding) => match binding.kind {
-                StaticBindingKind::RustReceiver { type_path } => self
-                    .edge_type_target(file, type_path, work)
-                    .map_or(ReceiverOwner::TypePath(type_path), ReceiverOwner::Target),
-                StaticBindingKind::RustValue { initializer } => {
-                    self.value_owner(file, initializer, work, depth - 1)?
-                }
-                _ => return None,
-            },
-            Binding::Missing if receiver == "Self" => {
-                ReceiverOwner::Target(self.edge_type_target(file, range, work).filter(|owner| {
-                    owner.symbol.kind == "struct" && owner.symbol.body_range.is_none()
-                })?)
-            }
-            _ => return None,
-        };
-        for member in parts {
-            if !work.charge() {
-                return None;
-            }
-            let ReceiverOwner::Target(target) = owner else {
+        if self
+            .initializers
+            .contains_key(&(file.document.path.as_str(), range))
+        {
+            return self.value_owner(file, range, work, depth - 1);
+        }
+        if let Some((receiver, member)) = file.text(range)?.rsplit_once('.') {
+            let receiver = ByteRange {
+                start: range.start,
+                end: range
+                    .start
+                    .checked_add(u64::try_from(receiver.len()).ok()?)?,
+            };
+            let ReceiverOwner::Target(target) =
+                self.receiver_owner_at_depth(file, receiver, work, depth - 1)?
+            else {
                 return None;
             };
-            let mut path = target.admitted_path()?;
-            path.push(member.to_owned());
-            owner = ReceiverOwner::Target(*self.field_types.get(&path)?);
+            let mut path = self.field_owner(target).admitted_path()?;
+            path.push(member.trim().to_owned());
+            self.fields.get(&path).copied().flatten().filter(|target| {
+                self.available(*target)
+                    && self.declaration_visible(file, range.start, *target, work)
+            })?;
+            return self
+                .field_types
+                .get(&path)
+                .copied()
+                .map(ReceiverOwner::Target);
         }
-        Some(owner)
+        let receiver = file.text(range)?.trim();
+        match file.binding(receiver, range.start, is_value_binding, work) {
+            Binding::Found(binding) => match binding.kind {
+                StaticBindingKind::RustReceiver { type_path } => Some(
+                    self.edge_type_target(file, type_path, work)
+                        .map_or(ReceiverOwner::TypePath(type_path), ReceiverOwner::Target),
+                ),
+                StaticBindingKind::RustValue { initializer } => {
+                    self.value_owner(file, initializer, work, depth - 1)
+                }
+                _ => None,
+            },
+            Binding::Missing if receiver == "Self" => self
+                .edge_type_target(file, range, work)
+                .filter(|owner| owner.symbol.kind == "struct" && owner.symbol.body_range.is_none())
+                .map(ReceiverOwner::Target),
+            _ => None,
+        }
     }
 
     fn value_owner(
@@ -296,7 +322,15 @@ impl<'source> Namespaces<'source> {
             .initializers
             .get(&(file.document.path.as_str(), initializer))
         {
-            let callable = self.call_at_depth(file, (*call)?, work, depth - 1)?;
+            let call = (*call)?;
+            let callable = self
+                .call_at_depth(file, call, work, depth - 1)
+                .or_else(|| {
+                    if call.callee != rift_syntax::StaticCallee::Unsupported {
+                        return None;
+                    }
+                    self.function_field(file, call.callee_range, work, depth - 1)
+                })?;
             return self
                 .return_owners
                 .get(&(callable.file.path.as_str(), callable.symbol.name_range?))
@@ -304,6 +338,57 @@ impl<'source> Namespaces<'source> {
                 .map(ReceiverOwner::Target);
         }
         self.receiver_owner_at_depth(file, initializer, work, depth - 1)
+    }
+
+    fn function_field(
+        &self,
+        file: &File<'source>,
+        mut range: ByteRange,
+        work: &mut Work,
+        depth: usize,
+    ) -> Option<Target<'source>> {
+        if depth == 0 {
+            return None;
+        }
+        // Only a captured field expression can supply a function-pointer return.
+        // Parenthesized invocation syntax keeps the field's original inner range.
+        for _ in 0..depth {
+            let text = file.text(range)?;
+            if !text.starts_with('(') || !text.ends_with(')') {
+                break;
+            }
+            range.start = range.start.checked_add(1)?;
+            range.end = range.end.checked_sub(1)?;
+            let text = file.text(range)?;
+            range.start = range
+                .start
+                .checked_add(u64::try_from(text.len() - text.trim_start().len()).ok()?)?;
+            range.end = range
+                .end
+                .checked_sub(u64::try_from(text.len() - text.trim_end().len()).ok()?)?;
+        }
+        if !file.facts.references().iter().any(|reference| {
+            work.charge() && reference.target == range && reference.role == ReferenceRole::Read
+        }) {
+            return None;
+        }
+        let (receiver, member) = file.text(range)?.rsplit_once('.')?;
+        let receiver = ByteRange {
+            start: range.start,
+            end: range
+                .start
+                .checked_add(u64::try_from(receiver.len()).ok()?)?,
+        };
+        let ReceiverOwner::Target(owner) =
+            self.receiver_owner_at_depth(file, receiver, work, depth - 1)?
+        else {
+            return None;
+        };
+        let mut path = self.field_owner(owner).admitted_path()?;
+        path.push(member.trim().to_owned());
+        self.fields.get(&path).copied().flatten().filter(|target| {
+            self.available(*target) && self.declaration_visible(file, range.start, *target, work)
+        })
     }
 
     fn container(

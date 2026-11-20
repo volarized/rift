@@ -24,6 +24,12 @@ impl Kinds {
         let Some(argument) = element.child_by_field_id(self.argument) else {
             return Ok(());
         };
+        let mut declaration_cursor = element.walk();
+        let visibility = element
+            .named_children(&mut declaration_cursor)
+            .find(|child| child.kind() == "visibility_modifier")
+            .map(byte_range)
+            .transpose()?;
         let mut pending = vec![(argument, Vec::new())];
         let mut cursor = element.walk();
         while let Some((element, mut prefix)) = pending.pop() {
@@ -47,7 +53,7 @@ impl Kinds {
                     pending.push((list, prefix));
                 }
             } else {
-                self.import_leaf(element, scope, prefix, facts, budget)?;
+                self.import_leaf(element, scope, prefix, visibility, facts, budget)?;
             }
         }
         Ok(())
@@ -58,6 +64,7 @@ impl Kinds {
         element: Node<'_>,
         scope: Node<'_>,
         mut prefix: Vec<crate::ByteRange>,
+        visibility: Option<crate::ByteRange>,
         facts: &mut StaticFactsParts,
         budget: &mut LoopBudget,
     ) -> Result<(), RiftError> {
@@ -81,6 +88,7 @@ impl Kinds {
                 path: prefix,
                 scope: byte_range(scope)?,
                 glob: true,
+                visibility,
             });
             return Ok(());
         }
@@ -106,6 +114,7 @@ impl Kinds {
             path: prefix,
             scope: byte_range(scope)?,
             glob,
+            visibility,
         });
         if !glob {
             facts.bindings.push(binding(

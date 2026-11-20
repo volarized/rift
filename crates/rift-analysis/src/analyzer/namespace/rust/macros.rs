@@ -71,7 +71,7 @@ impl Scope {
 type Inventory<'a> = BTreeMap<&'a str, &'a SelectedFile<'a>>;
 type Child = (String, Vec<String>, Scope);
 
-fn text_range(source: &str, range: ByteRange) -> Option<&str> {
+pub(super) fn text_range(source: &str, range: ByteRange) -> Option<&str> {
     source.get(usize::try_from(range.start).ok()?..usize::try_from(range.end).ok()?)
 }
 
@@ -282,33 +282,54 @@ pub(super) fn configured(
     depth: usize,
     feature: &impl Fn(&str) -> Option<bool>,
 ) -> Option<Condition> {
+    configured_with_flags(input, library, depth, feature, &|_| None)
+}
+
+pub(super) fn configured_with_flags(
+    input: &[&str],
+    library: bool,
+    depth: usize,
+    feature: &impl Fn(&str) -> Option<bool>,
+    flag: &impl Fn(&[&str]) -> Option<bool>,
+) -> Option<Condition> {
     if depth == 0 {
         return None;
     }
     match input {
-        ["test"] => Some(if library {
-            Condition::Known(false)
-        } else {
-            Condition::Unknown
-        }),
+        ["test"] => Some(flag(input).map_or_else(
+            || {
+                if library {
+                    Condition::Known(false)
+                } else {
+                    Condition::Unknown
+                }
+            },
+            Condition::Known,
+        )),
         ["true"] => Some(Condition::Known(true)),
         ["false"] => Some(Condition::Known(false)),
-        [name] if super::crate_name_is_valid(name) => Some(Condition::Unknown),
-        ["feature", "=", value] => {
-            Some(feature(value).map_or(Condition::Unknown, Condition::Known))
+        [name] if super::crate_name_is_valid(name) => {
+            Some(flag(input).map_or(Condition::Unknown, Condition::Known))
         }
+        ["feature", "=", value] if value.starts_with('"') && value.ends_with('"') => Some(
+            flag(input)
+                .or_else(|| feature(value))
+                .map_or(Condition::Unknown, Condition::Known),
+        ),
         [name, "=", value]
             if super::crate_name_is_valid(name)
                 && value.starts_with('"')
                 && value.ends_with('"') =>
         {
-            Some(Condition::Unknown)
+            Some(flag(input).map_or(Condition::Unknown, Condition::Known))
         }
         ["not", "(", rest @ .., ")"] => {
-            configured(rest, library, depth - 1, feature).map(|value| match value {
-                Condition::Known(value) => Condition::Known(!value),
-                Condition::Unknown => Condition::Unknown,
-            })
+            configured_with_flags(rest, library, depth - 1, feature, flag).map(
+                |value| match value {
+                    Condition::Known(value) => Condition::Known(!value),
+                    Condition::Unknown => Condition::Unknown,
+                },
+            )
         }
         [operation @ ("all" | "any"), "(", rest @ .., ")"] => {
             let mut rest = rest;
@@ -331,7 +352,8 @@ pub(super) fn configured(
                 if nested != 0 || split == 0 {
                     return None;
                 }
-                let value = configured(&rest[..split], library, depth - 1, feature)?;
+                let value =
+                    configured_with_flags(&rest[..split], library, depth - 1, feature, flag)?;
                 result = if *operation == "all" {
                     match (result, value) {
                         (Condition::Known(false), _) | (_, Condition::Known(false)) => {
@@ -870,7 +892,7 @@ impl Context<'_> {
                 Some(())
             },
             &mut |range, name, target| {
-                requested.push((path.clone(), range, name, target));
+                requested.push((path.clone(), range, name, target, None));
                 Some(())
             },
         )?;
@@ -933,7 +955,13 @@ fn invocation_name(source: &str, range: ByteRange) -> Option<&str> {
         .filter(|name| super::crate_name_is_valid(name))
 }
 
-pub(super) type Export = (rift_core::ProjectPath, ByteRange, String, Vec<String>);
+pub(super) type Export = (
+    rift_core::ProjectPath,
+    ByteRange,
+    String,
+    Vec<String>,
+    Option<ByteRange>,
+);
 
 pub(super) fn children<'a>(
     file: &'a SelectedFile<'a>,
@@ -956,15 +984,16 @@ pub(super) fn children<'a>(
         library,
     };
     let ordinary = super::module_children(file, directory, inventory, limits);
+    // Keyed by the declaring item: alternative `mod` items of one name each keep their file.
     let direct = ordinary
         .iter()
-        .filter(|(_, local)| local.len() == 1)
-        .map(|(path, local)| (local[0].as_str(), (path, local)))
+        .filter(|(_, local, _)| local.len() == 1)
+        .map(|(path, local, item)| (*item, (path, local)))
         .collect::<BTreeMap<_, _>>();
     let mut children = ordinary
         .iter()
-        .filter(|(_, local)| local.len() > 1)
-        .map(|(path, local)| (path.clone(), local.clone(), Scope::default()))
+        .filter(|(_, local, _)| local.len() > 1)
+        .map(|(path, local, _)| (path.clone(), local.clone(), Scope::default()))
         .collect::<Vec<_>>();
     let tokens = context.tokens(file, directory, &scope);
     if file.syntax.macro_invocations().is_none() || tokens.is_none() {
@@ -978,8 +1007,7 @@ pub(super) fn children<'a>(
                 scope.define(file, symbol, transparent, original);
             }
             Event::Symbol(symbol) => {
-                let name = super::source_identifier(&symbol.name);
-                let child = name.as_deref().and_then(|name| direct.get(name)).copied();
+                let child = direct.get(&symbol.item_range).copied();
                 if let Some((path, local)) = child {
                     children.push((path.clone(), local.clone(), scope.clone()));
                 }
@@ -1054,15 +1082,15 @@ impl Context<'_> {
         scope: &mut Scope,
         exports: &mut Vec<Export>,
     ) {
-        // Original public imports remain declarations when macro effects are unknown.
+        // Original explicit imports remain declarations when macro effects are unknown.
         // Their own attributes and paths are checked before recording an alias.
         if let Some(tokens) = tokens
             && let Some(item) = tokens.range(range)
         {
             let mut requested = Vec::new();
             if tokens
-                .public_imports(&item, &mut |range, name, target| {
-                    requested.push((file.path.clone(), range, name, target));
+                .public_imports(&item, true, &mut |range, name, target, visibility| {
+                    requested.push((file.path.clone(), range, name, target, visibility));
                     Some(())
                 })
                 .is_some()

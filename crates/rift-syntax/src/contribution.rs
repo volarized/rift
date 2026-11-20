@@ -28,6 +28,8 @@ pub struct PlacedAlias {
     pub target_identity: String,
     /// Original export statement range.
     pub range: crate::ByteRange,
+    /// Written restricted visibility; absent for an unrestricted public export.
+    pub visibility: Option<String>,
 }
 
 /// Logical identity and language supplied by an established declaration mapping.
@@ -344,17 +346,18 @@ impl SyntaxPublicationBuilder {
                 placement.unit().clone(),
                 SourceRange::new(alias.range.start, alias.range.end)?,
             );
+            let mut kinds = vec![rift_protocol::read::SymbolKind::Alias];
+            if alias.visibility.is_none() {
+                kinds.push(rift_protocol::read::SymbolKind::Public);
+            }
             let facts = PortableSymbolFacts::new(
                 syntax.language().clone(),
                 alias.name.clone(),
                 alias.qualified_name.clone(),
                 ExactKind("export".to_owned()),
             )
-            .kinds(vec![
-                rift_protocol::read::SymbolKind::Alias,
-                rift_protocol::read::SymbolKind::Public,
-            ])
-            .visibility("public");
+            .kinds(kinds)
+            .visibility(alias.visibility.as_deref().unwrap_or("public"));
             let edge = rift_core::ContributionEdge::new(rift_core::EdgeKind::Alias, target)
                 .with_derivation(rift_protocol::read::EdgeDerivation::Syntax)
                 .with_occurrence(source.clone());
