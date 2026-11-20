@@ -104,6 +104,14 @@ pub enum StaticBindingKind {
         /// Named property, or absent for the module value.
         export: Option<ByteRange>,
     },
+    /// A type a JavaScript documentation comment imports from another module; it names
+    /// that module's export where a type is written and is no value.
+    JavaScriptTypeImport {
+        /// Unquoted module specifier.
+        module: ByteRange,
+        /// Imported name.
+        export: ByteRange,
+    },
     /// A local variable initialized directly by a constructor.
     JavaScriptInstance {
         /// Constructor name.
@@ -701,6 +709,9 @@ impl StaticBinding {
             } => valid(module) && export.is_none_or(&valid) && valid(require),
             StaticBindingKind::JavaScriptEdgeNamespace { module }
             | StaticBindingKind::PythonModule { module } => valid(module),
+            StaticBindingKind::JavaScriptTypeImport { module, export } => {
+                valid(module) && valid(export)
+            }
             StaticBindingKind::JavaScriptInstance { constructor }
             | StaticBindingKind::PythonInstance { constructor } => valid(constructor),
             StaticBindingKind::PythonReceiver { class_name } => valid(class_name),
@@ -736,7 +747,7 @@ fn vector_capacity<T>(items: &Vec<T>) -> usize {
 
 enum Grammar {
     Python(&'static python_edges::EdgePythonKinds),
-    JavaScript(&'static javascript::Kinds),
+    JavaScript(&'static javascript::Kinds, javascript::Documentation),
     Rust(&'static rust::Kinds, rift_core::LoopBudget),
 }
 
@@ -750,7 +761,7 @@ pub(crate) struct Capture<'source> {
 impl<'source> Capture<'source> {
     pub(crate) fn for_javascript(source: &'source str) -> Self {
         Self {
-            grammar: Grammar::JavaScript(javascript::kinds()),
+            grammar: Grammar::JavaScript(javascript::kinds(), javascript::Documentation::default()),
             edge_heritage: heritage_edges::edge_javascript_kinds(),
             source,
             facts: StaticFacts::default(),
@@ -762,7 +773,10 @@ impl<'source> Capture<'source> {
         dialect: crate::typescript::TypeScriptDialect,
     ) -> Self {
         Self {
-            grammar: Grammar::JavaScript(javascript::edge_typescript_kinds(dialect)),
+            grammar: Grammar::JavaScript(
+                javascript::edge_typescript_kinds(dialect),
+                javascript::Documentation::default(),
+            ),
             edge_heritage: heritage_edges::edge_typescript_kinds(dialect),
             source,
             facts: StaticFacts::default(),
@@ -795,15 +809,24 @@ impl<'source> Capture<'source> {
         visited: crate::extract::Visited<'_, '_>,
     ) -> Result<(), RiftError> {
         let syntax_element = visited.syntax_element();
-        if syntax_element.is_missing() || syntax_element.is_extra() {
+        if syntax_element.is_missing() {
+            return Ok(());
+        }
+        if syntax_element.is_extra() {
+            if let Grammar::JavaScript(kinds, documentation) = &mut self.grammar {
+                kinds.record_comment(visited, self.source, documentation, &mut self.facts.0)?;
+            }
             return Ok(());
         }
         self.edge_heritage.record_edge(visited, &mut self.facts.0)?;
         match &mut self.grammar {
             Grammar::Python(kinds) => kinds.record_edge(visited, self.source, &mut self.facts.0),
-            Grammar::JavaScript(kinds) => {
-                kinds.record(syntax_element, self.source, &mut self.facts.0)
-            }
+            Grammar::JavaScript(kinds, documentation) => kinds.record(
+                syntax_element,
+                self.source,
+                documentation,
+                &mut self.facts.0,
+            ),
             Grammar::Rust(kinds, budget) => {
                 kinds.record(syntax_element, self.source, &mut self.facts.0, budget)
             }

@@ -1467,3 +1467,115 @@ exports.use = use;
             .expect("identity coverage")
     );
 }
+
+#[test]
+fn test_javascript_documentation_comment_types_type_parameters_and_returns() {
+    // In JavaScript a documentation comment written right before a function states the
+    // types of its parameters and of its result. A named type is a class in scope, or a
+    // type the comment imports from another module.
+    let option = "class Option {
+  name() { return 'o' }
+  attributeName() { return 'a' }
+}
+exports.Option = Option;
+";
+    let help = "class Help { format() { return '' } }
+exports.Help = Help;
+";
+    let command = "const { Option } = require('./option.js');
+/**
+ * @typedef { import(\"./help.js\").Help } Help
+ */
+class Command {
+  /**
+   * @param {Option} option
+   * @param {string} label
+   * @returns {Command}
+   */
+  addOption(option, label) {
+    option.name();
+    return this;
+  }
+
+  /** @return {Option} */
+  createOption() { return new Option() }
+
+  /**
+   * @param {(Option | null | undefined)} [maybe]
+   */
+
+  optional(maybe) { return maybe.attributeName() }
+
+  use() {
+    const created = this.createOption();
+    return created.attributeName();
+  }
+
+  /** @param {Help} helper */
+  help(helper) { return helper.format() }
+
+  /** @param {Option} other */
+  renamed(option) { return option.name() }
+
+  /** @param {Option[]} list */
+  many(list) { return list.name() }
+
+  /** @param {Missing} option */
+  unknown(option) { return option.name() }
+}
+/** @param {Option} option */
+const gap = 1;
+function far(option) { return option.name() }
+exports.Command = Command;
+exports.far = far;
+exports.gap = gap;
+";
+    let (_directory, index) = workspace(&[
+        ("option.js", option),
+        ("help.js", help),
+        ("command.js", command),
+    ]);
+    for (from, to) in [
+        ("command.js/Command/addOption", "option.js/Option/name"),
+        (
+            "command.js/Command/optional",
+            "option.js/Option/attributeName",
+        ),
+        ("command.js/Command/use", "option.js/Option/attributeName"),
+        ("command.js/Command/help", "help.js/Help/format"),
+    ] {
+        assert!(
+            has_edge(&index, EdgeKind::Calls, from, to),
+            "{from} -> {to}"
+        );
+    }
+    // A tag naming another parameter, a type that is not a single named type, a name with
+    // no declaration and a comment separated from the function by a statement type
+    // nothing.
+    for caller in [
+        "command.js/Command/renamed",
+        "command.js/Command/many",
+        "command.js/Command/unknown",
+        "command.js/far",
+    ] {
+        assert!(
+            !index.edges().edges().any(|edge| {
+                edge.kind() == EdgeKind::Calls && edge.from().as_str().ends_with(caller)
+            }),
+            "{caller}"
+        );
+    }
+}
+
+#[test]
+fn test_typescript_ignores_documentation_comment_types() {
+    // TypeScript reads types from annotations only; a documentation comment types nothing.
+    let source = "export class Item { run() { return 1 } }
+/** @param {Item} item */
+export function use(item) { return item.run() }
+";
+    let (_directory, index) = workspace_with_manifest(&[("main.ts", source)], module_manifest());
+    assert!(!index.edges().edges().any(|edge| {
+        edge.kind() == EdgeKind::Calls && edge.from().as_str().ends_with("main.ts/use")
+    }));
+}

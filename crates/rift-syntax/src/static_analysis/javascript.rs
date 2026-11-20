@@ -11,6 +11,10 @@ use super::{
 use crate::ByteRange;
 use crate::extract::byte_range;
 
+mod documentation;
+
+pub(super) use documentation::Documentation;
+
 pub(super) struct Kinds {
     identifier: u16,
     property_identifier: u16,
@@ -334,9 +338,11 @@ impl Kinds {
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
         let id = syntax_element.kind_id();
+        documentation: &mut Documentation,
         self.record_module_syntax(syntax_element, source, facts);
         self.record_reference(syntax_element, facts)?;
         self.record_member(syntax_element, facts)?;
+        self.record_documented_function(syntax_element, source, documentation, facts)?;
         self.record_declared_type(syntax_element, facts)?;
         self.record_type_signature(syntax_element, facts)?;
         self.record_return_type(syntax_element, facts)?;
@@ -1050,10 +1056,9 @@ impl Kinds {
             Some(value) => self.initializer(value, source)?,
             _ => StaticBindingKind::Local,
         };
-        if self.type_shapes.is_some()
-            && let Some(call) = syntax_element
-                .child_by_field_id(self.value)
-                .filter(|value| value.kind_id() == self.call)
+        if let Some(call) = syntax_element
+            .child_by_field_id(self.value)
+            .filter(|value| value.kind_id() == self.call)
         {
             // The name takes the whole result of the call.
             facts
@@ -1132,11 +1137,6 @@ impl Kinds {
 
     fn initializer(&self, value: Node<'_>, source: &str) -> Result<StaticBindingKind, RiftError> {
         if value.kind_id() == self.new
-            && let Some(constructor) = value
-                .child_by_field_id(self.constructor)
-                .filter(|constructor| self.receiver(*constructor))
-        {
-            return Ok(StaticBindingKind::JavaScriptInstance {
     /// Binds the names an object pattern takes from `require` to the exports their keys
     /// name, as the member form `require('./lib').name` does. Answers whether it bound
     /// them: a pattern with a default, a rest or a nested entry binds no export.
@@ -1201,6 +1201,11 @@ impl Kinds {
         Ok(true)
     }
 
+            && let Some(constructor) = value
+                .child_by_field_id(self.constructor)
+                .filter(|constructor| self.receiver(*constructor))
+        {
+            return Ok(StaticBindingKind::JavaScriptInstance {
                 constructor: byte_range(constructor)?,
             });
         }

@@ -107,6 +107,17 @@ impl<'source> PackageModes<'source> {
     }
 }
 
+/// Whether the file is JavaScript source, whose types documentation comments write.
+pub(super) fn javascript_source(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .is_some_and(|extension| {
+            ["js", "cjs", "mjs", "jsx"]
+                .iter()
+                .any(|known| extension.eq_ignore_ascii_case(known))
+        })
+}
+
 pub(super) fn typescript_commonjs(path: &str) -> bool {
     std::path::Path::new(path)
         .extension()
@@ -440,6 +451,22 @@ impl<'source> Index<'source> {
                 member,
                 ModuleMode::Esm,
                 role,
+            StaticBindingKind::JavaScriptTypeImport { module, export }
+                if role == rift_core::ReferenceRole::Type =>
+            {
+                let mode = match self.javascript.mode(file.document.path.as_str(), work) {
+                    ModuleMode::CommonJs => ModuleMode::CommonJs,
+                    _ => ModuleMode::Esm,
+                };
+                self.javascript_export(
+                    file,
+                    file.text(module)?,
+                    file.text(export)?,
+                    mode,
+                    role,
+                    work,
+                )
+            }
                 work,
             ),
             StaticBindingKind::JavaScriptInstance { constructor } => {
@@ -700,3 +727,12 @@ pub(super) fn builtin_commonjs_name<'source>(
         )
         && !file.javascript_reassigned(name, None)
 }
+
+        let type_import = matches!(binding.kind, StaticBindingKind::JavaScriptTypeImport { .. });
+        if role != rift_core::ReferenceRole::Type && type_import {
+            continue;
+        }
+        // A JavaScript type names a class value; a name bound by `require` can hold one.
+        let required_value = matches!(binding.kind, StaticBindingKind::JavaScriptRequire { .. })
+            && javascript_source(file.document.path.as_str());
+            && !required_value
