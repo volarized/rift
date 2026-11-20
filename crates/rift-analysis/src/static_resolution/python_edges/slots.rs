@@ -33,15 +33,13 @@ impl<'source> Index<'source> {
                 if !work.charge() {
                     return false;
                 }
-                match self.python_written_receiver(path, range, work) {
+                // A writer static lookup cannot resolve is not attributed to this module.
+                !matches!(
+                    self.python_written_receiver(path, range, work),
                     Some(Value::Symbol(target))
-                        if target.symbol.kinds.contains(&SymbolKind::Module) =>
-                    {
-                        target.file.path != file.document.path
-                    }
-                    Some(Value::Symbol(_) | Value::Instance(_)) => true,
-                    _ => false,
-                }
+                        if target.symbol.kinds.contains(&SymbolKind::Module)
+                            && target.file.path == file.document.path
+                )
             })
     }
 
@@ -61,6 +59,8 @@ impl<'source> Index<'source> {
         {
             return true;
         }
+        // An instance write goes through a property's setter and leaves its slot in place.
+        let property = declaration.symbol.kinds.contains(&SymbolKind::Property);
         self.python_writes
             .get(name)
             .into_iter()
@@ -69,18 +69,21 @@ impl<'source> Index<'source> {
                 if !work.charge() {
                     return false;
                 }
-                let (written, instance_write) =
-                    match self.python_written_receiver(path, range, work) {
-                        Some(Value::Symbol(target))
-                            if target.symbol.kinds.contains(&SymbolKind::Module) =>
-                        {
-                            return true;
-                        }
-                        Some(Value::Symbol(target)) => (target, false),
-                        Some(Value::Instance(target)) if instance => (target, true),
-                        Some(Value::Instance(_)) => return true,
-                        _ => return false,
-                    };
+                let (written, instance_write) = match self
+                    .python_written_receiver(path, range, work)
+                {
+                    Some(Value::Symbol(target))
+                        if target.symbol.kinds.contains(&SymbolKind::Module) =>
+                    {
+                        return true;
+                    }
+                    Some(Value::Symbol(target)) => (target, false),
+                    Some(Value::Instance(target)) if instance && !property => (target, true),
+                    // A writer static lookup cannot resolve is not attributed to this class.
+                    Some(Value::Instance(_) | Value::Member { .. } | Value::Module(_)) | None => {
+                        return true;
+                    }
+                };
                 self.python_slot_relation(class, written, declaration, instance_write, work)
                     == Some(false)
             })

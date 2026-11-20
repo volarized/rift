@@ -178,3 +178,19 @@ fn test_python_overloads_keep_unrelated_slots_and_class_descriptors() {
         );
     }
 }
+
+#[test]
+fn test_python_member_slots_ignore_unresolved_writers() {
+    let source = "class Owner:\n    def request(self): pass\n    def get(self): return self.request()\nclass Other:\n    def request(self): pass\ndef patch(response):\n    response.request = None\n    response.get = None\nOther.request = None\n";
+    let result = resolution("python", &[("main.py", source)], &[], WORK_MAX);
+    assert_eq!(
+        calls(&result, "main.py")
+            .map(|edge| (source_of(edge, source), target(edge)))
+            .collect::<Vec<_>>(),
+        [(
+            "self.request()",
+            "rift://symbol/local/python/main/Owner/request"
+        )],
+        "{result:?}"
+    );
+}
