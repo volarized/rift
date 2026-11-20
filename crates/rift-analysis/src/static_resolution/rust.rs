@@ -22,7 +22,7 @@ pub(super) struct Namespaces<'source> {
     methods: BTreeMap<Vec<String>, Vec<Method<'source>>>,
     members: BTreeMap<Vec<String>, Option<Target<'source>>>,
     fields: BTreeMap<Vec<String>, Option<Target<'source>>>,
-    member_calls: BTreeSet<(&'source str, ByteRange)>,
+    member_calls: BTreeMap<(&'source str, ByteRange), Option<&'source StaticCall>>,
     field_types: BTreeMap<Vec<String>, Target<'source>>,
     bounds: BTreeMap<(&'source str, ByteRange), Vec<ByteRange>>,
     unavailable: BTreeSet<(&'source str, ByteRange)>,
@@ -244,7 +244,10 @@ impl<'source> Namespaces<'source> {
                     return None;
                 }
                 if matches!(call.callee, StaticCallee::Member { .. }) {
-                    self.member_calls.insert((path, call.callee_range));
+                    self.member_calls
+                        .entry((path, call.callee_range))
+                        .and_modify(|call| *call = None)
+                        .or_insert(Some(call));
                 }
                 self.initializers
                     .entry((path, call.range))

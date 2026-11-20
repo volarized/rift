@@ -153,6 +153,12 @@ impl<'source> Namespaces<'source> {
         range: ByteRange,
         work: &mut Work,
     ) -> Option<Target<'source>> {
+        if let Some(call) = self.member_calls.get(&(file.document.path.as_str(), range)) {
+            let rift_syntax::StaticCallee::Member { receiver, member } = (*call)?.callee else {
+                return None;
+            };
+            return self.receiver_method(file, receiver, file.text(member)?, work);
+        }
         let (receiver, member) = file.text(range)?.rsplit_once('.')?;
         let receiver = ByteRange {
             start: range.start,
@@ -160,12 +166,6 @@ impl<'source> Namespaces<'source> {
                 .start
                 .checked_add(u64::try_from(receiver.len()).ok()?)?,
         };
-        if self
-            .member_calls
-            .contains(&(file.document.path.as_str(), range))
-        {
-            return self.receiver_method(file, receiver, member.trim(), work);
-        }
         self.receiver_target(file, receiver, work)
             .and_then(|owner| {
                 let mut path = owner.admitted_path()?;

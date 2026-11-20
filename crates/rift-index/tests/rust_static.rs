@@ -1056,3 +1056,85 @@ fn test_rust_tuple_impls_keep_structural_identities_and_calls() {
                 .any(|suffix| edge.from().as_str().ends_with(suffix))
     }));
 }
+
+#[test]
+fn test_rust_multiline_member_reads_keep_captured_receiver_ranges() {
+    // #832: member reads use the same authored receiver as their calls.
+    let directory = tempfile::tempdir().expect("workspace");
+    let root = directory.path();
+    std::fs::create_dir(root.join("src")).expect("source directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='fixture'\nversion='0.1.0'\n",
+    )
+    .expect("manifest");
+    let source = "pub struct Item; pub struct Next; impl Item { pub fn next(self) -> Next { Next } } impl Next { pub fn read(self) -> usize { 1 } } pub struct Table { pub make: fn() -> Item } pub fn run(table: &Table) -> usize { (table.make)() /* first */\n .next() /* second */\n .read() } pub fn denied(table: &Table) { let table = 0; (table.make)() /* shadow */\n .next() /* shadow */\n .read(); }";
+    std::fs::write(root.join("src/lib.rs"), source).expect("source");
+    let index = WorkspaceIndex::build(
+        root,
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &TextFileInclusion::default(),
+    )
+    .expect("index");
+    assert!(
+        index
+            .symbol_view()
+            .expect("symbols")
+            .normalized_graph()
+            .records()
+            .iter()
+            .all(|record| record.identity().is_some())
+    );
+    let file = index
+        .files()
+        .find(|file| file.path().as_str() == "src/lib.rs")
+        .expect("source file");
+    let facts = file.syntax().static_facts().expect("static facts");
+    let text = |range: rift_syntax::ByteRange| {
+        &source
+            [usize::try_from(range.start).expect("start")..usize::try_from(range.end).expect("end")]
+    };
+    let call = facts.calls().iter().find(|call| matches!(call.callee, rift_syntax::StaticCallee::Member { member, .. } if text(member) == "read") && text(call.range).contains("/* second */")).expect("captured member call");
+    let rift_syntax::StaticCallee::Member { receiver, .. } = call.callee else {
+        unreachable!("member call");
+    };
+    assert_eq!(text(receiver), "(table.make)() /* first */\n .next()");
+    for (target, read) in [
+        ("/Item/next", "(table.make)() /* first */\n .next"),
+        (
+            "/Next/read",
+            "(table.make)() /* first */\n .next() /* second */\n .read",
+        ),
+    ] {
+        for kind in [EdgeKind::Calls, EdgeKind::Reads] {
+            let edge = index
+                .edges()
+                .edges()
+                .find(|edge| {
+                    edge.kind() == kind
+                        && edge.from().as_str().ends_with("/fixture/run")
+                        && edge.to().as_str().ends_with(target)
+                })
+                .unwrap_or_else(|| panic!("missing {kind:?} -> {target}"));
+            let expected = if kind == EdgeKind::Calls {
+                format!("{read}()")
+            } else {
+                read.to_owned()
+            };
+            let range = edge.occurrence().range();
+            assert_eq!(
+                &source[usize::try_from(range.start()).expect("start")
+                    ..usize::try_from(range.end()).expect("end")],
+                expected
+            );
+        }
+    }
+    assert!(
+        !index
+            .edges()
+            .edges()
+            .any(|edge| edge.from().as_str().ends_with("/fixture/denied")
+                && matches!(edge.kind(), EdgeKind::Calls | EdgeKind::Reads))
+    );
+}
