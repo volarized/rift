@@ -524,6 +524,85 @@ fn distinct_generation_admission_counts_shared_allocations_and_keeps_original_so
     println!("cached_material_bytes={cached} shared_material_bytes={shared}");
 }
 
+/// Releases by measuring every remaining view again after each release: the rule the one
+/// measure in use order must equal.
+fn released_one_at_a_time(state: &mut State, kept: &str, bytes_max: usize) -> usize {
+    let mut released = 0;
+    while state.exceeds(bytes_max) && state.release_least_recent(Some(kept)) {
+        released += 1;
+    }
+    released
+}
+
+#[test]
+fn one_shared_measure_releases_what_measuring_after_each_release_does() {
+    let (_directory, indexes, _) = distinct_text_generations();
+    let now = SystemTime::now();
+    let held = |service_key| {
+        let store = BoundedViews::new(usize::MAX, service_key);
+        let views = indexes
+            .iter()
+            .map(|index| {
+                store
+                    .capture_at(text_generation_input(index), now)
+                    .expect("capture")
+                    .expect("view")
+            })
+            .collect::<Vec<_>>();
+        (store, views)
+    };
+    let (measured, views) = held([51; 32]);
+    let kept = views.last().expect("newest view").id.as_str().to_owned();
+    // The shared charge of the newest view alone, of the two newest, and of all three.
+    let mut bounds = Vec::new();
+    {
+        let mut state = measured.state.lock().expect("state");
+        bounds.push(state.material_bytes());
+        loop {
+            bounds.push(state.material_bytes_with_shared_indexes(true));
+            if !state.release_least_recent(Some(&kept)) {
+                break;
+            }
+        }
+    }
+    assert_eq!(bounds.len(), 4);
+    let mut released_some = false;
+    let mut kept_shared = false;
+    for bound in bounds {
+        // Bounds on both sides of each charge, closer than one released key's bytes.
+        for bytes_max in (bound.saturating_sub(96)..=bound.saturating_add(96)).step_by(8) {
+            let (expected, expected_views) = held([52; 32]);
+            let (actual, actual_views) = held([52; 32]);
+            assert_eq!(expected_views, actual_views);
+            let kept = actual_views.last().expect("newest view").id.as_str();
+            let mut expected = expected.state.lock().expect("state");
+            let mut actual = actual.state.lock().expect("state");
+            let expected_released = released_one_at_a_time(&mut expected, kept, bytes_max);
+            let (mut released, settled) = actual.release_measured(kept, bytes_max);
+            if !settled {
+                released += released_one_at_a_time(&mut actual, kept, bytes_max);
+            }
+            assert_eq!(released, expected_released, "bytes_max={bytes_max}");
+            assert_eq!(
+                actual.views.keys().collect::<Vec<_>>(),
+                expected.views.keys().collect::<Vec<_>>(),
+                "bytes_max={bytes_max}"
+            );
+            assert_eq!(actual.expired, expected.expired, "bytes_max={bytes_max}");
+            released_some |= released > 0;
+            kept_shared |= released == 0 && actual.material_bytes() > bytes_max;
+        }
+    }
+    assert!(
+        released_some,
+        "a bound below the shared charge releases views"
+    );
+    assert!(
+        kept_shared,
+        "a bound the shared charge fits keeps every view"
+    );
+}
+
 #[test]
 #[ignore = "retained material measurement"]
 fn captured_preparation_views_measure_shared_accounting_cost() {
