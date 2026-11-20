@@ -75,13 +75,13 @@ fn test_hono_static_collection_floors() -> Result<(), Box<dyn std::error::Error>
             .insert((edge.from(), edge.to()));
     }
     for (kind, floor) in [
-        (EdgeKind::Calls, 796),
+        (EdgeKind::Calls, 893),
         (EdgeKind::Contains, 5534),
         (EdgeKind::Extends, 73),
         (EdgeKind::HasType, 2083),
-        (EdgeKind::Imports, 945),
-        (EdgeKind::Reads, 3628),
-        (EdgeKind::Writes, 396),
+        (EdgeKind::Imports, 990),
+        (EdgeKind::Reads, 3847),
+        (EdgeKind::Writes, 401),
         (EdgeKind::Overrides, 31),
         (EdgeKind::Aliases, 214),
         (EdgeKind::Implements, 7),

@@ -64,13 +64,6 @@ slow-timeout = { period = "420s", terminate-after = 1, grace-period = "30s" }
 filter = 'binary(=mcp_proxy) & test(=live_proxied_read_resolves_incoming_references)'
 slow-timeout = { period = "180s", terminate-after = 1, grace-period = "10s" }
 
-# The Zod floor case indexes 125 TypeScript files in an unoptimized build and
-# takes more than the default minute on a loaded host. It runs only when asked for
-# with its corpus path, so the wider deadline costs an ordinary run nothing.
-[[profile.default.overrides]]
-filter = 'binary(=corpus_zod) & test(=test_zod_static_collection_floors)'
-slow-timeout = { period = "300s", terminate-after = 1, grace-period = "30s" }
-
 # These ignored cost measurements run locally through the ordinary profiles.
 # Keep their existing per-test deadline without a separate measurement profile.
 [[profile.default.overrides]]
@@ -123,6 +116,12 @@ junit.store-success-output = true
 [[profile.corpus.overrides]]
 filter = 'binary(=corpus_fastapi) & test(=test_fastapi_corpus)'
 slow-timeout = { period = "240s", terminate-after = 1, grace-period = "30s" }
+
+# The Zod floor case indexes 125 TypeScript files in an unoptimized build: 55 to 80 s
+# measured on a loaded host.
+[[profile.corpus.overrides]]
+filter = 'binary(=corpus_zod) & test(=test_zod_static_collection_floors)'
+slow-timeout = { period = "300s", terminate-after = 1, grace-period = "30s" }
 
 [[profile.corpus.overrides]]
 filter = 'binary(=corpus_bun) & test(=test_bun_workspace)'

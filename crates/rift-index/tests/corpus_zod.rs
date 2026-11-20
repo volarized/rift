@@ -64,13 +64,13 @@ fn test_zod_static_collection_floors() -> Result<(), Box<dyn std::error::Error>>
             .insert((edge.from(), edge.to()));
     }
     for (kind, floor) in [
-        (EdgeKind::Calls, 2455),
+        (EdgeKind::Calls, 2472),
         (EdgeKind::Contains, 16237),
         (EdgeKind::Extends, 669),
         (EdgeKind::HasType, 6345),
-        (EdgeKind::Imports, 562),
-        (EdgeKind::Reads, 7669),
-        (EdgeKind::Writes, 263),
+        (EdgeKind::Imports, 564),
+        (EdgeKind::Reads, 7953),
+        (EdgeKind::Writes, 285),
         (EdgeKind::Overrides, 606),
         (EdgeKind::Aliases, 3830),
         (EdgeKind::Implements, 1),
