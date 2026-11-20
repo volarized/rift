@@ -11,6 +11,8 @@ use rift_syntax::DocumentPlacement;
 
 const WORK_MAX: usize = 10_000;
 
+mod python_overloads;
+
 #[test]
 fn test_python_property_returns_resolve_instance_members_and_aliases() {
     let source = "class Item:\n    def read(self): pass\nclass Owner:\n    @property\n    def item(self) -> Item: return Item()\n    def use(self): return self.item.read()\nclass Child(Owner):\n    def use(self): return self.item.read()\ndef typed(owner: Owner):\n    owner.item.read()\n    alias = owner.item\n    alias.read()\ndef constructed(): return Owner().item.read()\n";

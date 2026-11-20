@@ -132,7 +132,7 @@ impl<'source> Index<'source> {
             return self.export_value(file, name, work);
         }
         let member = self
-            .python_own_member(class, name)
+            .python_own_member(class, name, work)
             .or_else(|| self.python_base_member(class, name, work));
         let assigned = member.is_some_and(|target| self.python_assigned_member(target));
         if member.is_some() && !assigned {
@@ -193,7 +193,7 @@ impl<'source> Index<'source> {
                 return None;
             }
             let base = self.files.get(path)?.qualified_target(qualified)?;
-            if let Some(target) = self.python_own_member(base, name)
+            if let Some(target) = self.python_own_member(base, name, work)
                 && !self.python_assigned_member(target)
             {
                 return Some(target);
@@ -313,9 +313,21 @@ impl<'source> Index<'source> {
         &self,
         class: Target<'source>,
         name: &str,
+        work: &mut Work,
     ) -> Option<Target<'source>> {
         let file = self.files.get(class.file.path.as_str())?;
-        file.qualified_target(&format!("{}.{name}", class.symbol.qualified_name))
+        let target = file.qualified_target(&format!("{}.{name}", class.symbol.qualified_name))?;
+        if !target.symbol.kinds.contains(&SymbolKind::Callable) {
+            return Some(target);
+        }
+        let bindings = file
+            .by_name
+            .get(name)?
+            .iter()
+            .copied()
+            .filter(|binding| binding.scope == class.symbol.item_range);
+        let binding = self.python_binding_group(file, bindings, work)?;
+        file.target_at(binding.name)
     }
 
     pub(super) fn python_base_member(
@@ -330,7 +342,7 @@ impl<'source> Index<'source> {
                 return None;
             }
             let base = self.files.get(path)?.qualified_target(qualified)?;
-            if let Some(target) = self.python_own_member(base, name) {
+            if let Some(target) = self.python_own_member(base, name, work) {
                 return Some(target);
             }
         }

@@ -2,6 +2,7 @@
 
 mod annotations;
 mod classes;
+mod overloads;
 mod references;
 
 pub(super) use classes::ClassOrders;
@@ -109,8 +110,13 @@ impl<'source> Index<'source> {
                 continue;
             }
             if let StaticBindingKind::PythonReceiver { class_name } = binding.kind {
-                let selected =
-                    edge_python_binding(file, file.text(binding.name)?, call.range.start, work)?;
+                let selected = edge_python_binding(
+                    self,
+                    file,
+                    file.text(binding.name)?,
+                    call.range.start,
+                    work,
+                )?;
                 if selected != binding {
                     return None;
                 }
@@ -192,7 +198,7 @@ impl<'source> Index<'source> {
         }
         let mut names = file.text(range)?.splitn(2, '.').map(str::trim);
         let name = names.next()?;
-        let binding = edge_python_binding(file, name, range.start, work)?;
+        let binding = edge_python_binding(self, file, name, range.start, work)?;
         let value = self.binding_value(file, binding, work)?;
         Some((value, names.next().unwrap_or("")))
     }
@@ -325,13 +331,10 @@ impl<'source> Index<'source> {
             let Some(bindings) = file.by_name.get(name) else {
                 return self.module_value(&format!("{module}.{name}"));
             };
-            let mut root = bindings.iter().filter(|binding| {
+            let root = bindings.iter().copied().filter(|binding| {
                 binding.scope.start == 0 && binding.scope.end == file.document.source.len() as u64
             });
-            let binding = root.next()?;
-            if root.next().is_some() {
-                return None;
-            }
+            let binding = self.python_binding_group(file, root, work)?;
             match binding.kind {
                 StaticBindingKind::Local
                 | StaticBindingKind::Shadow
@@ -369,6 +372,7 @@ fn is_super(text: &str) -> bool {
 }
 
 fn edge_python_binding<'source>(
+    index: &Index<'source>,
     file: &File<'source>,
     name: &str,
     position: u64,
@@ -417,8 +421,7 @@ fn edge_python_binding<'source>(
         }
         let scope = best?;
         let mut declaration = None;
-        let mut selected = None;
-        let mut ambiguous = false;
+        let mut selected = false;
         for &binding in bindings {
             if !work.charge() {
                 return None;
@@ -430,21 +433,26 @@ fn edge_python_binding<'source>(
                 StaticBindingKind::PythonGlobal => declaration = Some(true),
                 StaticBindingKind::PythonNonlocal => declaration = Some(false),
                 _ => {
-                    ambiguous |= selected.is_some();
-                    selected = Some(binding);
+                    selected = true;
                 }
             }
         }
         if let Some(is_global) = declaration {
-            if selected.is_some() || global || (nonlocal && is_global) {
+            if selected || global || (nonlocal && is_global) {
                 return None;
             }
             excluded.insert(scope);
             global = is_global;
             nonlocal = !is_global;
         } else {
-            let selected =
-                selected.filter(|binding| !ambiguous && binding.available_from <= position)?;
+            let candidates = bindings
+                .iter()
+                .copied()
+                .filter(|binding| binding.scope == scope);
+            let selected = index.python_binding_group(file, candidates, work)?;
+            if selected.available_from > position {
+                return None;
+            }
             return file
                 .python_guard_available(selected, position, work)
                 .then_some(selected);

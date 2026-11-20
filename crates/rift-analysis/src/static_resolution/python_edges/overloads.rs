@@ -1,0 +1,88 @@
+//! Selects one runtime implementation after validated overload signatures.
+
+use rift_syntax::{PythonOverload, StaticBinding, StaticBindingKind};
+
+use super::super::{Binding, File, Index, Work};
+
+impl<'source> Index<'source> {
+    pub(super) fn python_binding_group(
+        &self,
+        file: &File<'source>,
+        mut bindings: impl Iterator<Item = &'source StaticBinding>,
+        work: &mut Work,
+    ) -> Option<&'source StaticBinding> {
+        let first = bindings.next()?;
+        let Some(second) = bindings.next() else {
+            let signature = file.target_at(first.name).is_some_and(|target| {
+                matches!(
+                    target.symbol.python_overload,
+                    Some(PythonOverload::Overload { .. })
+                )
+            });
+            return (!signature).then_some(first);
+        };
+        let qualified = &file.target_at(first.name)?.symbol.qualified_name;
+        let mut implementation = None;
+        let mut signatures_end = 0;
+        for binding in [first, second].into_iter().chain(bindings) {
+            if !work.charge() {
+                return None;
+            }
+            let target = file.target_at(binding.name)?.callable()?;
+            if &target.symbol.qualified_name != qualified {
+                return None;
+            }
+            match target.symbol.python_overload.as_ref()? {
+                state @ PythonOverload::Overload { .. } => {
+                    if !self.python_overload_import(file, state, work) {
+                        return None;
+                    }
+                    signatures_end = signatures_end.max(target.symbol.item_range.end);
+                }
+                PythonOverload::Ordinary if implementation.is_none() => {
+                    implementation = Some(binding);
+                }
+                PythonOverload::Ordinary | PythonOverload::Unknown => return None,
+            }
+        }
+        let implementation = implementation?;
+        (signatures_end <= file.target_at(implementation.name)?.symbol.item_range.start)
+            .then_some(implementation)
+    }
+
+    fn python_overload_import(
+        &self,
+        file: &File<'source>,
+        state: &PythonOverload,
+        work: &mut Work,
+    ) -> bool {
+        let PythonOverload::Overload {
+            module,
+            imported,
+            binding,
+            decorator,
+            ..
+        } = state
+        else {
+            return false;
+        };
+        let Some(module_name) = file.text(*module) else {
+            return false;
+        };
+        if self.edge_python.0.contains_key(module_name) {
+            return false;
+        }
+        let Some(name) = file.text(*binding) else {
+            return false;
+        };
+        let Binding::Found(selected) = file.binding(name, decorator.start, |_| true, work) else {
+            return false;
+        };
+        selected.name == *binding
+            && selected.kind
+                == StaticBindingKind::PythonImport {
+                    module: *module,
+                    export: *imported,
+                }
+    }
+}

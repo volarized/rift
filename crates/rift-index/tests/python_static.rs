@@ -26,6 +26,30 @@ fn build(files: &[(&str, &str)]) -> (tempfile::TempDir, WorkspaceIndex) {
 }
 
 #[test]
+fn test_python_overloads_store_implementation_calls_and_returned_receivers() {
+    let source = "from typing import overload\nclass Item:\n    def leaf(self): pass\n@overload\ndef build(value: int) -> Item: ...\n@overload\ndef build(value: str) -> Item: ...\ndef build(value) -> Item: return Item()\ndef use():\n    item = build(1)\n    item.leaf()\n";
+    let (_directory, index) = build(&[("main.py", source)]);
+    for (target, spelling) in [("build", "build(1)"), ("Item/leaf", "item.leaf()")] {
+        let edge = index
+            .edges()
+            .edges()
+            .find(|edge| {
+                edge.kind().as_ref() == "calls"
+                    && edge.from().as_str() == "rift://symbol/local/python/main/use"
+                    && edge.to().as_str() == format!("rift://symbol/local/python/main/{target}")
+            })
+            .expect("stored resolved call");
+        let range = edge.occurrence().range();
+        let start = usize::try_from(range.start()).expect("call start");
+        let end = usize::try_from(range.end()).expect("call end");
+        assert_eq!(&source[start..end], spelling);
+        assert_eq!(edge.occurrence().unit().key().as_str(), "main.py");
+    }
+    assert!(index.edges().is_complete());
+    assert_eq!(index.edges().dropped_edges(), 0);
+}
+
+#[test]
 fn test_python_property_returns_store_calls_and_property_reads() {
     let source = "class Item:\n    def read(self): pass\nclass Owner:\n    @property\n    def item(self) -> Item: return Item()\n    def use(self): return self.item.read()\ndef use(owner: Owner): return owner.item.read()\ndef invalid(): return Owner.item.read()\n";
     let (_directory, index) = build(&[("main.py", source)]);
