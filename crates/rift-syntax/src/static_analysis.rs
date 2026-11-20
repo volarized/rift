@@ -123,6 +123,11 @@ pub enum StaticBindingKind {
         /// Authored value path.
         value: ByteRange,
     },
+    /// A write to a Python member slot, separate from lexical bindings.
+    PythonMemberWrite {
+        /// Authored receiver of the assignment target.
+        receiver: ByteRange,
+    },
     /// A Python name checked by an `isinstance` condition.
     PythonGuard {
         /// Authored class argument.
@@ -398,6 +403,7 @@ impl StaticBinding {
                 decorator,
             } => valid(annotation) && decorator.is_none_or(&valid),
             StaticBindingKind::PythonAlias { value } => valid(value),
+            StaticBindingKind::PythonMemberWrite { receiver } => valid(receiver),
             StaticBindingKind::RustUse { path } => valid(path),
             StaticBindingKind::RustReceiver { type_path } => valid(type_path),
             StaticBindingKind::Local

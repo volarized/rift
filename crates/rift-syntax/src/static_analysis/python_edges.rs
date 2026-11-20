@@ -513,6 +513,19 @@ impl EdgePythonKinds {
                     .push(binding(target, scope, available, kind)?);
             } else if target.kind_id() == self.attribute {
                 facts.assignments.push(byte_range(target)?);
+                if let Some((receiver, member)) = target
+                    .child_by_field_id(self.object)
+                    .zip(target.child_by_field_id(self.member))
+                {
+                    facts.bindings.push(binding(
+                        member,
+                        scope,
+                        byte_range(visited.syntax_element())?.end,
+                        StaticBindingKind::PythonMemberWrite {
+                            receiver: byte_range(receiver)?,
+                        },
+                    )?);
+                }
                 let kind = self.edge_assignment_kind(visited, target)?;
                 if kind != StaticBindingKind::Shadow {
                     facts

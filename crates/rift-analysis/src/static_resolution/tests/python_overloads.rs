@@ -99,3 +99,82 @@ fn test_python_overloads_refuse_a_local_typing_module() {
         "{result:?}"
     );
 }
+
+#[test]
+fn test_python_overloads_refuse_replaced_member_slots() {
+    for write in [
+        "Owner.build = unknown",
+        "alias = Owner\nalias.build = unknown",
+        "def replace(self: Owner): self.build = unknown",
+    ] {
+        let source = format!(
+            "from typing import overload\nclass Owner:\n    @overload\n    def build(self, value: int): ...\n    def build(self, value): pass\n{write}\ndef use(owner: Owner): owner.build(1)\n"
+        );
+        let result = resolution("python", &[("main.py", &source)], &[], WORK_MAX);
+        assert!(
+            calls(&result, "main.py").all(|edge| source_of(edge, &source) != "owner.build(1)"),
+            "{source}\n{result:?}"
+        );
+    }
+}
+
+#[test]
+fn test_python_overloads_refuse_replaced_module_exports_and_decorators() {
+    let source = "from typing import overload\n@overload\ndef leaf(value: int): ...\ndef leaf(value): pass\n";
+    for imported in [
+        "import main\nmain.leaf = unknown\ndef use(): main.leaf(1)\n",
+        "import main as alias\nalias.leaf = unknown\nfrom main import leaf\ndef use(): leaf(1)\n",
+    ] {
+        let result = resolution(
+            "python",
+            &[("main.py", source), ("use.py", imported)],
+            &[],
+            WORK_MAX,
+        );
+        assert!(
+            calls(&result, "use.py")
+                .all(|edge| target(edge) != "rift://symbol/local/python/main/leaf"),
+            "{result:?}"
+        );
+    }
+    for prefix in ["from unknown import *\n", "classmethod = unknown\n"] {
+        let source = format!(
+            "from typing import overload\n{prefix}class Owner:\n    @classmethod\n    @overload\n    def build(cls, value: int): ...\n    @classmethod\n    def build(cls, value): pass\n"
+        );
+        let result = resolution(
+            "python",
+            &[
+                ("main.py", &source),
+                (
+                    "use.py",
+                    "from main import Owner\ndef use(): Owner.build(1)\n",
+                ),
+            ],
+            &[],
+            WORK_MAX,
+        );
+        assert!(
+            calls(&result, "use.py")
+                .all(|edge| target(edge) != "rift://symbol/local/python/main/Owner/build"),
+            "{result:?}"
+        );
+    }
+}
+
+#[test]
+fn test_python_overloads_keep_unrelated_slots_and_class_descriptors() {
+    for write in [
+        "class Other:\n    def build(self, value): pass\nOther.build = unknown",
+        "def replace(owner: Owner): owner.build = unknown",
+    ] {
+        let source = format!(
+            "from typing import overload\nclass Owner:\n    @classmethod\n    @overload\n    def build(cls, value: int): ...\n    @classmethod\n    def build(cls, value): pass\n{write}\ndef use(): Owner.build(1)\n"
+        );
+        let result = resolution("python", &[("main.py", &source)], &[], WORK_MAX);
+        assert!(
+            calls(&result, "main.py").any(|edge| source_of(edge, &source) == "Owner.build(1)"
+                && target(edge) == "rift://symbol/local/python/main/Owner/build"),
+            "{result:?}"
+        );
+    }
+}

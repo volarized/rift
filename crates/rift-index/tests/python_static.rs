@@ -183,3 +183,16 @@ fn test_python_wildcard_import_stores_the_module_and_explicit_alias() {
     assert!(index.edges().is_complete());
     assert_eq!(index.edges().dropped_edges(), 0);
 }
+
+#[test]
+fn test_python_overloads_do_not_store_replaced_slots() {
+    let source = "from typing import overload\nclass Owner:\n    @overload\n    def build(self, value: int): ...\n    def build(self, value): pass\nOwner.build = unknown\ndef use(owner: Owner): owner.build(1)\n";
+    let (_directory, index) = build(&[("main.py", source)]);
+    assert!(
+        index
+            .edges()
+            .edges()
+            .all(|edge| edge.kind().as_ref() != "calls"
+                || edge.to().as_str() != "rift://symbol/local/python/main/Owner/build")
+    );
+}

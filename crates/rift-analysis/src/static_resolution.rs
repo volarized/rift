@@ -251,6 +251,9 @@ impl<'source> File<'source> {
                 return None;
             }
             let name = self.text(binding.name)?;
+            if matches!(binding.kind, StaticBindingKind::PythonMemberWrite { .. }) {
+                continue;
+            }
             self.by_name.entry(name).or_default().push(binding);
             match binding.kind {
                 StaticBindingKind::PythonAnnotation { .. }
@@ -407,6 +410,7 @@ struct Index<'source> {
     javascript: javascript::PackageModes,
     edge_python: python_edges::EdgePythonModules,
     edge_python_classes: python_edges::ClassOrders<'source>,
+    python_writes: BTreeMap<&'source str, Vec<(&'source str, ByteRange)>>,
     syntax_publication: rift_core::ProviderRevision,
     unavailable_sources: usize,
 }
@@ -437,6 +441,23 @@ impl<'source> Index<'source> {
             }
         }
         let edge_python = python_edges::EdgePythonModules::build_edge(&files, work)?;
+        let mut python_writes = BTreeMap::<_, Vec<_>>::new();
+        for file in files
+            .values()
+            .filter(|file| file.document.facts.language().name == "python")
+        {
+            for binding in file.facts.bindings() {
+                if !work.charge() {
+                    return None;
+                }
+                if let StaticBindingKind::PythonMemberWrite { receiver } = binding.kind {
+                    python_writes
+                        .entry(file.text(binding.name)?)
+                        .or_default()
+                        .push((file.document.path.as_str(), receiver));
+                }
+            }
+        }
         let rust = rust::Namespaces::new(&files, work)?;
         let javascript = javascript::PackageModes::new(namespace, work)?;
         let provider = ProviderId::new(SYNTAX_PROVIDER_ID).ok()?;
@@ -449,6 +470,7 @@ impl<'source> Index<'source> {
             javascript,
             edge_python,
             edge_python_classes: python_edges::ClassOrders::default(),
+            python_writes,
             syntax_publication,
             unavailable_sources,
         };

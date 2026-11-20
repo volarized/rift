@@ -197,6 +197,9 @@ impl<'source> Index<'source> {
             .or_else(|| self.python_base_member(class, name, work));
         let assigned = member.is_some_and(|target| self.python_assigned_member(target));
         if member.is_some() && !assigned {
+            if !self.python_member_slot_available(class, instance, name, member?, work) {
+                return None;
+            }
             if instance
                 && let Some(declaration) = member
                 && let Some(assigned) = self.python_property_result(declaration, work)
@@ -211,6 +214,9 @@ impl<'source> Index<'source> {
         let declaration = self
             .python_declared_base_member(class, name, work)
             .or(member)?;
+        if !self.python_member_slot_available(class, instance, name, declaration, work) {
+            return None;
+        }
         match member.filter(|own| key(*own) != key(declaration)) {
             Some(assigned) => Some(Value::Member {
                 declaration,
@@ -240,6 +246,31 @@ impl<'source> Index<'source> {
         };
         file.enclosing_callable(range)
             .is_some_and(|caller| class.symbol.item_range.encloses(caller.symbol.item_range))
+    }
+
+    pub(super) fn python_slot_relation(
+        &self,
+        class: Target<'source>,
+        written: Target<'source>,
+        declaration: Target<'source>,
+        instance: bool,
+        work: &mut Work,
+    ) -> Option<bool> {
+        let order = self.edge_python_classes.0.get(&key(class))?;
+        let owner = declaration.symbol.container.as_deref()?;
+        for &ancestor in &order.classes {
+            if !work.charge() {
+                return None;
+            }
+            if ancestor == key(written) {
+                return Some(true);
+            }
+            if !instance && ancestor == ClassKey::Declaration(declaration.file.path.as_str(), owner)
+            {
+                return Some(false);
+            }
+        }
+        order.complete.then_some(false)
     }
 
     fn python_declared_base_member(

@@ -84,7 +84,7 @@ impl OverloadContext {
 
     fn shadow(&mut self, syntax_element: Node<'_>, source: &str) {
         if let Some(name) = source.get(syntax_element.byte_range())
-            && self.imports.contains_key(name)
+            && (self.imports.contains_key(name) || matches!(name, "classmethod" | "staticmethod"))
         {
             self.shadowed.insert(name.to_owned());
         }
@@ -195,6 +195,9 @@ impl OverloadContext {
                 return Ok(PythonOverload::Unknown);
             };
             if matches!(text, "classmethod" | "staticmethod") {
+                if self.shadowed.contains(text) {
+                    return Ok(PythonOverload::Unknown);
+                }
                 continue;
             }
             let (binding, qualified) = match expression.kind() {

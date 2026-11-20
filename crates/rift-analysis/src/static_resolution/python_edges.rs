@@ -4,6 +4,7 @@ mod annotations;
 mod classes;
 mod overloads;
 mod references;
+mod slots;
 
 pub(super) use classes::ClassOrders;
 
@@ -335,6 +336,19 @@ impl<'source> Index<'source> {
                 binding.scope.start == 0 && binding.scope.end == file.document.source.len() as u64
             });
             let binding = self.python_binding_group(file, root, work)?;
+            let callable = file.target_at(binding.name).is_some_and(|target| {
+                target.symbol.kinds.contains(&SymbolKind::Callable)
+                    || target.symbol.kinds.contains(&SymbolKind::Constructible)
+            });
+            if (callable
+                || matches!(
+                    binding.kind,
+                    StaticBindingKind::PythonImport { .. } | StaticBindingKind::PythonModule { .. }
+                ))
+                && !self.python_module_slot_available(file, name, work)
+            {
+                return None;
+            }
             match binding.kind {
                 StaticBindingKind::Local
                 | StaticBindingKind::Shadow

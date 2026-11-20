@@ -69,6 +69,9 @@ impl<'source> Index<'source> {
         let Some(module_name) = file.text(*module) else {
             return false;
         };
+        if file.blocked(decorator.start, work) {
+            return false;
+        }
         if self.edge_python.0.contains_key(module_name) {
             return false;
         }
