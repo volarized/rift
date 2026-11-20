@@ -194,3 +194,46 @@ fn test_python_member_slots_ignore_unresolved_writers() {
         "{result:?}"
     );
 }
+
+#[test]
+fn test_python_property_setters_keep_their_member_slot() {
+    let source = "class Response:\n    @property\n    def elapsed(self): return 1\n    @elapsed.setter\n    def elapsed(self, value): pass\nclass Bound:\n    def __init__(self, response: Response):\n        self._response = response\n    def close(self):\n        self._response.elapsed = 1\ndef direct(response: Response):\n    response.elapsed = 2\n    return response.elapsed\n";
+    let result = resolution("python", &[("main.py", source)], &[], WORK_MAX);
+    let accesses = result
+        .occurrences
+        .iter()
+        .filter(|edge| {
+            matches!(
+                edge.role,
+                super::ReferenceRole::Read | super::ReferenceRole::Write
+            )
+        })
+        .filter(|edge| target(edge) == "rift://symbol/local/python/main/Response/elapsed")
+        .map(|edge| {
+            (
+                edge.role,
+                edge.edge_from.as_ref().map(rift_core::SymbolId::as_str),
+                source_of(edge, source),
+            )
+        })
+        .collect::<Vec<_>>();
+    for expected in [
+        (
+            super::ReferenceRole::Write,
+            Some("rift://symbol/local/python/main/Bound/close"),
+            "self._response.elapsed",
+        ),
+        (
+            super::ReferenceRole::Write,
+            Some("rift://symbol/local/python/main/direct"),
+            "response.elapsed",
+        ),
+        (
+            super::ReferenceRole::Read,
+            Some("rift://symbol/local/python/main/direct"),
+            "response.elapsed",
+        ),
+    ] {
+        assert!(accesses.contains(&expected), "{expected:?}\n{accesses:?}");
+    }
+}

@@ -424,6 +424,20 @@ impl<'source> Index<'source> {
             .iter()
             .copied()
             .filter(|binding| binding.scope == class.symbol.item_range);
+        // Getter, setter and deleter facets of one property are one member slot.
+        let mut property = true;
+        for binding in bindings.clone() {
+            if !work.charge() {
+                return None;
+            }
+            property &= file.target_at(binding.name).is_some_and(|facet| {
+                facet.symbol.kinds.contains(&SymbolKind::Property)
+                    && facet.symbol.qualified_name == target.symbol.qualified_name
+            });
+        }
+        if property {
+            return Some(target);
+        }
         let binding = self.python_binding_group(file, bindings, work)?;
         file.target_at(binding.name)
     }
