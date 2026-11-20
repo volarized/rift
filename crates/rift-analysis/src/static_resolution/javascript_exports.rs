@@ -599,7 +599,7 @@ impl<'source> File<'source> {
                 || shorthand
                 || self.blocked(local.start, work)
                 || role == rift_core::ReferenceRole::Call
-                    && self.javascript_reassigned(local_name, None)) =>
+                    && self.javascript_local_written(local, local_name, work)) =>
             {
                 Some(Export::Declaration(local))
             }
@@ -607,6 +607,26 @@ impl<'source> File<'source> {
                 name: local_name,
                 position: local.start,
             }),
+        }
+    }
+}
+
+impl File<'_> {
+    /// Whether the exported local declaration `local` is written with a value that may not
+    /// be callable. A name without its own binding falls back to any write of the name.
+    fn javascript_local_written(
+        &self,
+        local: rift_syntax::ByteRange,
+        name: &str,
+        work: &mut Work,
+    ) -> bool {
+        match self
+            .by_name
+            .get(name)
+            .and_then(|bindings| bindings.iter().find(|binding| binding.name == local))
+        {
+            Some(binding) => self.javascript_binding_written(binding, work),
+            None => self.javascript_reassigned(name, None),
         }
     }
 }

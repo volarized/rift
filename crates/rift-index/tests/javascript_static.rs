@@ -1583,9 +1583,10 @@ export function use(item) { return item.run() }
 #[test]
 fn test_commonjs_module_exports_of_a_declared_name_exports_that_declaration() {
     // `module.exports = name` makes the declaration `name` binds the module's value, as
-    // `export default name` does for a module. A module that assigns its value twice, and
-    // a name assigned again, export nothing a call can trust. `new` constructs a function
-    // written with the `function` keyword, never an arrow function.
+    // `export default name` does for a module. A module that assigns its value twice
+    // exports nothing a call can trust; a name given only functions stays callable (D35).
+    // `new` constructs a function written with the `function` keyword, never an arrow
+    // function.
     let error = "function AxiosError(message) { this.message = message }
 AxiosError.prototype.toJSON = function toJSON() { return {} };
 module.exports = AxiosError;
@@ -1609,11 +1610,13 @@ const replaced = require('./replaced.js');
 const moved = require('./moved.js');
 function use() { sanitize(1); return new AxiosError('x') }
 const arrow = () => 1;
-function refuse() { return [replaced(), moved(), new arrow()] }
+function refuse() { return [replaced(), new arrow()] }
+function given() { return moved() }
 function shadowed(require) { const local = require('./value'); return local(1) }
 exports.use = use;
 exports.refuse = refuse;
 exports.shadowed = shadowed;
+exports.given = given;
 ";
     let (_directory, index) = workspace(&[
         ("error.js", error),
@@ -1633,6 +1636,12 @@ exports.shadowed = shadowed;
         EdgeKind::Calls,
         "main.js/use",
         "error.js/AxiosError"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "main.js/given",
+        "moved.js/moved"
     ));
     for caller in ["main.js/refuse", "main.js/shadowed"] {
         assert!(
@@ -1876,6 +1885,45 @@ export function refuse() { return [new make().read(), new Missing().read()] }
         edge.kind() == EdgeKind::Calls
             && edge.from().as_str().ends_with("main.ts/refuse")
             && edge.to().as_str().ends_with("/read")
+    }));
+}
+
+#[test]
+fn test_calls_through_bindings_given_only_functions_target_the_binding() {
+    // A binding assigned again keeps its calls when every value it is given is a function
+    // written in place; the call targets the binding declaration. A value that may not be
+    // callable keeps the refusal.
+    let utils = "export let isOld = (): boolean => {
+  const result = true
+  isOld = () => result
+  return result
+}
+export function make() { return 1 }
+export let mixed = () => 1
+mixed = make
+export let later = function () { return 1 }
+later = function () { return 2 }
+";
+    let main = "import { isOld, mixed, later } from './utils'
+export function use() { return [isOld(), later()] }
+export function refuse() { return mixed() }
+";
+    let (_directory, index) =
+        workspace_with_manifest(&[("utils.ts", utils), ("main.ts", main)], module_manifest());
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "main.ts/use",
+        "utils.ts/isOld"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "main.ts/use",
+        "utils.ts/later"
+    ));
+    assert!(!index.edges().edges().any(|edge| {
+        edge.kind() == EdgeKind::Calls && edge.from().as_str().ends_with("main.ts/refuse")
     }));
 }
 

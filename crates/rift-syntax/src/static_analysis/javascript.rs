@@ -78,6 +78,7 @@ pub(super) struct Kinds {
     left: u16,
     argument: u16,
     parameter: u16,
+    right: u16,
 }
 
 struct ModuleSyntaxKinds {
@@ -126,9 +127,9 @@ struct TypeShapeKinds {
     union: u16,
 }
 
-impl TypeShapeKinds {
     /// An array type, a `readonly` type operator and a generic's type argument list.
     array: [u16; 3],
+impl TypeShapeKinds {
     fn resolve(grammar: &tree_sitter::Language) -> Self {
         let id = |name| kind(grammar, name);
         Self {
@@ -162,8 +163,8 @@ impl TypeShapeKinds {
             union: id("union_type"),
         }
     }
-}
             array: [id("array_type"), id("readonly_type"), id("type_arguments")],
+}
 
 pub(super) fn kinds() -> &'static Kinds {
     static KINDS: OnceLock<Kinds> = OnceLock::new();
@@ -216,7 +217,6 @@ fn named_expression_kinds(grammar: &tree_sitter::Language) -> [u16; 3] {
 
 fn excluded_value_kinds(grammar: &tree_sitter::Language) -> Vec<u16> {
     [
-        "import_statement",
 fn scope_kinds(grammar: &tree_sitter::Language, program: u16) -> [u16; 8] {
     let id = |name| kind(grammar, name);
     [
@@ -231,6 +231,7 @@ fn scope_kinds(grammar: &tree_sitter::Language, program: u16) -> [u16; 8] {
     ]
 }
 
+        "import_statement",
         "export_clause",
         "namespace_export",
         "type_query",
@@ -315,8 +316,8 @@ impl Kinds {
             arrow,
             import: id("import_statement"),
             import_clause: id("import_clause"),
-            import_specifier: id("import_specifier"),
             argument_list: id("arguments"),
+            import_specifier: id("import_specifier"),
             namespace_import: id("namespace_import"),
             export_specifier: id("export_specifier"),
             export: id("export_statement"),
@@ -338,6 +339,7 @@ impl Kinds {
             argument: field("argument"),
             parameter: field("parameter"),
         }
+            right: field("right"),
     }
 }
 
@@ -718,8 +720,6 @@ impl Kinds {
         while let Some(sibling) = after.filter(|sibling| sibling.is_error() || !sibling.is_named())
         {
             trailing.extend(sibling.is_error().then_some(sibling));
-            after = sibling.next_sibling();
-        }
         let Some(shapes) = &self.type_shapes else {
             return Ok(None);
         };
@@ -727,6 +727,8 @@ impl Kinds {
             && let Some(name) = parent.child_by_field_id(self.name)
         {
             return Ok(Some(StaticFunctionContext::Initializer(byte_range(name)?)));
+        }
+            after = sibling.next_sibling();
         }
         if after.is_none() {
             errors.append(&mut trailing);
@@ -773,12 +775,12 @@ impl Kinds {
             self.member(callee)?
         };
         facts.calls.push(call(syntax_element, callee, shape)?);
-        Ok(())
-    }
         if let Some((name, written)) = owner.zip(self.element_type(annotation, source)) {
             facts.element_returns.push((name, byte_range(written)?));
             return Ok(());
         }
+        Ok(())
+    }
 
     fn member(&self, syntax_element: Node<'_>) -> Result<StaticCallee, RiftError> {
         if syntax_element.kind_id() != self.member {
@@ -893,8 +895,6 @@ impl Kinds {
     fn pattern_parent(&self, child: Node<'_>, parent: Node<'_>) -> bool {
         let id = parent.kind_id();
         self.patterns.contains(&id)
-            || (id == self.pair_pattern && parent.child_by_field_id(self.value) == Some(child))
-            || (self.default_patterns.contains(&id)
     /// The named element type an array type writes: `T[]`, `readonly T[]`, `Array<T>` and
     /// `ReadonlyArray<T>`, with `T` a type name or a generic type's name.
     fn element_type<'tree>(&self, written: Node<'tree>, source: &str) -> Option<Node<'tree>> {
@@ -933,6 +933,8 @@ impl Kinds {
         self.named_type(element)
     }
 
+            || (id == self.pair_pattern && parent.child_by_field_id(self.value) == Some(child))
+            || (self.default_patterns.contains(&id)
                 && parent.child_by_field_id(self.left) == Some(child))
     }
 
@@ -1182,14 +1184,14 @@ impl Kinds {
             .child_by_field_id(self.value)
             .and_then(|value| self.function_value(value))
         {
-            facts.bindings.push(binding(
-                name,
         if let Some(element) = self.element_type(annotation, source) {
             facts
                 .element_types
                 .push((byte_range(name)?, byte_range(element)?));
             return Ok(());
         }
+            facts.bindings.push(binding(
+                name,
                 scope,
                 byte_range(scope)?.start,
                 StaticBindingKind::Local,
@@ -1709,3 +1711,15 @@ impl Kinds {
 fn text<'a>(syntax_element: Node<'_>, source: &'a str) -> Option<&'a str> {
     source.get(syntax_element.byte_range())
 }
+            // A plain name given a function written in place stays callable.
+            if id == self.assignment[0]
+                && let Some(left) = syntax_element
+                    .child_by_field_id(self.left)
+                    .filter(|left| left.kind_id() == self.identifier)
+                && syntax_element
+                    .child_by_field_id(self.right)
+                    .and_then(|value| self.function_value(value))
+                    .is_some()
+            {
+                facts.function_writes.push(byte_range(left)?);
+            }

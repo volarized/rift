@@ -711,8 +711,9 @@ impl File<'_> {
 }
 
 impl File<'_> {
-    /// Whether an assignment writes `binding`: a write of its name inside its scope that
-    /// no inner binding of the same name takes. A write whose binding is ambiguous counts.
+    /// Whether an assignment writes `binding` with a value that may not be callable: a write
+    /// of its name inside its scope that no inner binding of the same name takes, whose
+    /// value is not a function written in place. A write whose binding is ambiguous counts.
     pub(super) fn javascript_binding_written(
         &self,
         binding: &StaticBinding,
@@ -726,7 +727,8 @@ impl File<'_> {
         };
         let bindings = self.by_name.get(name).map_or(&[][..], Vec::as_slice);
         writes.iter().any(|&start| {
-            if !binding.scope.contains(start) {
+            // A function written in place keeps the binding callable (D35).
+            if !binding.scope.contains(start) || self.function_writes.contains(&start) {
                 return false;
             }
             // The innermost scope holding the write decides which binding it writes.
