@@ -18,11 +18,39 @@ impl<'source> Index<'source> {
     ) -> Option<SymbolId> {
         let scopes = self.javascript.scopes.get(file.document.path.as_str())?;
         let callable = scopes.callables.resolve(range.start, range.end).copied();
-        if let Some(symbol) = callable {
-            return self.javascript_identity(Target {
+        let value = scopes.function_values.resolve(range.start, range.end);
+        let holder = match (value, callable) {
+            // A callable declared inside the function value is the nearer caller.
+            (Some(value), Some(symbol))
+                if value.encloses(symbol.range) && *value != symbol.range =>
+            {
+                None
+            }
+            // The call runs when the function value does. The innermost declaration
+            // holding that value is the caller: the callable it defines, or the
+            // variable, field or object member whose initializer builds it.
+            (Some(value), _) => scopes.definitions.resolve(value.start, value.end).copied(),
+            // Outside every function, an instance field initializer runs with its field.
+            (None, None) => scopes
+                .definitions
+                .resolve(range.start, range.end)
+                .copied()
+                .filter(|symbol| {
+                    matches!(
+                        symbol.syntax_element_kind,
+                        Some("field_definition" | "public_field_definition")
+                    )
+                }),
+            (None, Some(_)) => None,
+        };
+        for symbol in [holder, callable].into_iter().flatten() {
+            let identity = self.javascript_identity(Target {
                 file: file.document,
                 symbol,
             });
+            if identity.is_some() {
+                return identity;
+            }
         }
         self.javascript_module_identity(file, work)
     }

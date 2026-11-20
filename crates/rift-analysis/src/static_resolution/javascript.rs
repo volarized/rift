@@ -28,6 +28,8 @@ pub(super) struct Scopes<'source> {
     pub(super) classes: crate::EnclosingDefinitions<&'source rift_syntax::SyntaxSymbol>,
     pub(super) definitions: crate::EnclosingDefinitions<&'source rift_syntax::SyntaxSymbol>,
     pub(super) callables: crate::EnclosingDefinitions<&'source rift_syntax::SyntaxSymbol>,
+    /// Every arrow function and function expression, named or not.
+    pub(super) function_values: crate::EnclosingDefinitions<rift_syntax::ByteRange>,
     pub(super) functions: crate::EnclosingDefinitions<rift_syntax::ByteRange>,
     pub(super) blocks: crate::EnclosingDefinitions<rift_syntax::ByteRange>,
     pub(super) deferred: crate::EnclosingDefinitions<rift_syntax::ByteRange>,

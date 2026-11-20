@@ -19,6 +19,13 @@ impl<'source> Scopes<'source> {
                 .map(|(_, range)| (range.start, range.end, *range))
                 .collect::<Vec<_>>(),
         );
+        let function_values = crate::EnclosingDefinitions::new(
+            captured
+                .values
+                .values()
+                .map(|range| (range.start, range.end, *range))
+                .collect::<BTreeSet<_>>(),
+        );
         let deferred = deferred_scopes(file, work)?;
         let mut classes = Vec::new();
         let mut definitions = Vec::new();
@@ -60,6 +67,7 @@ impl<'source> Scopes<'source> {
             classes: crate::EnclosingDefinitions::new(classes),
             deferred,
             definitions: crate::EnclosingDefinitions::new(definitions),
+            function_values,
             callables: crate::EnclosingDefinitions::new(callables),
             functions: crate::EnclosingDefinitions::new(functions),
             blocks: crate::EnclosingDefinitions::new(

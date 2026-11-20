@@ -481,3 +481,108 @@ export interface Plain { plain: T; second: O }
     assert!(has_edge(&index, EdgeKind::HasType, "/Plain/second", "/O"));
 }
 
+fn calls(index: &WorkspaceIndex) -> Vec<(String, String)> {
+    let mut calls = index
+        .edges()
+        .edges()
+        .filter(|edge| edge.kind() == EdgeKind::Calls)
+        .map(|edge| {
+            let tail = |identity: &str| {
+                identity
+                    .split_once(".%2Fmain.")
+                    .and_then(|(_, rest)| rest.split_once('/'))
+                    .map_or_else(|| "<module>".to_owned(), |(_, name)| name.to_owned())
+            };
+            (tail(edge.from().as_str()), tail(edge.to().as_str()))
+        })
+        .collect::<Vec<_>>();
+    calls.sort();
+    calls.dedup();
+    calls
+}
+
+#[test]
+fn test_calls_in_deferred_initializers_belong_to_the_declaration_holding_them() {
+    // `wrap(() => leaf())` defers the call: the declaration whose initializer holds that
+    // function value is the caller, never the module or an enclosing callable.
+    let source = "function leaf() { return 1 }
+function wrap(run) { return run }
+export const use = () => leaf();
+export const built = wrap(() => { const inner = wrap(() => leaf()); return inner });
+export const direct = leaf();
+export function outer() { const local = wrap(() => leaf()); wrap(function () { leaf() }); return local }
+export class Item { value = leaf(); held = wrap(() => leaf()); static made = wrap(() => leaf()); run() { return wrap(() => leaf()) } }
+export const api = { member: wrap(() => leaf()), method() { return leaf() } };
+";
+    for path in ["main.mjs", "main.ts"] {
+        let (_directory, index) = workspace_with_manifest(&[(path, source)], module_manifest());
+        let found = calls(&index);
+        let expect = |from: &str, to: &str| {
+            assert!(
+                found.contains(&(from.to_owned(), to.to_owned())),
+                "{path}: missing {from} -> {to} in {found:?}"
+            );
+        };
+        expect("use", "leaf");
+        expect("built", "wrap");
+        expect("built/inner", "leaf");
+        // Module execution calls the direct initializers.
+        expect("<module>", "leaf");
+        expect("<module>", "wrap");
+        expect("outer/local", "leaf");
+        expect("outer", "leaf");
+        expect("outer", "wrap");
+        expect("Item/value", "leaf");
+        expect("Item/held", "leaf");
+        expect("Item/made", "leaf");
+        expect("Item/run", "leaf");
+        expect("api/member", "leaf");
+        expect("api/method", "leaf");
+        // Only the direct initializer of `direct` and the calls to `wrap` run with the module.
+        assert_eq!(
+            found
+                .iter()
+                .filter(|(from, to)| from == "<module>" && to == "leaf")
+                .count(),
+            1,
+            "{path}: {found:?}"
+        );
+        assert!(
+            !found.contains(&("built".to_owned(), "leaf".to_owned())),
+            "{path}: {found:?}"
+        );
+    }
+}
+
+#[test]
+fn test_deferred_initializer_calls_keep_lexical_shadows_and_unknown_receivers_unresolved() {
+    let source = "function leaf() { return 1 }
+function wrap(run) { return run }
+export const shadowed = wrap((leaf) => leaf());
+export const local = wrap(() => { const leaf = () => 2; return leaf() });
+export const unknown = wrap((value) => value.leaf());
+";
+    for path in ["main.mjs", "main.ts"] {
+        let (_directory, index) = workspace_with_manifest(&[(path, source)], module_manifest());
+        let found = calls(&index);
+        // A parameter named like the function and an unknown receiver name no declaration.
+        assert!(
+            !found.contains(&("shadowed".to_owned(), "leaf".to_owned())),
+            "{path}: {found:?}"
+        );
+        assert!(
+            !found.contains(&("unknown".to_owned(), "leaf".to_owned())),
+            "{path}: {found:?}"
+        );
+        // The local arrow is its own declaration; the module function is not called.
+        assert!(
+            found.contains(&("local".to_owned(), "local/leaf".to_owned())),
+            "{path}: {found:?}"
+        );
+        assert!(
+            !found.contains(&("local".to_owned(), "leaf".to_owned())),
+            "{path}: {found:?}"
+        );
+    }
+}
+
