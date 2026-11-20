@@ -42,6 +42,34 @@ impl PreparedProjectSemantics<'_> {
         edges_max: usize,
         previous: Option<&NormalizedGraph>,
     ) -> Result<BuiltSemantics, RiftError> {
+        self.build_with(edges_max, previous, true)
+    }
+
+    /// Builds semantic adjacency for a source inventory that is still growing, leaving
+    /// the static pass to the publication that holds every source.
+    ///
+    /// Static calls, references, and containment resolve across files, so a pass over a
+    /// part of the sources answers for that part alone and is run again from nothing when
+    /// the next sources arrive. The result holds no static occurrence and reports
+    /// unavailable static call coverage for every unit.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when graph validation fails.
+    pub fn build_deferring_static(
+        self,
+        edges_max: usize,
+        previous: Option<&NormalizedGraph>,
+    ) -> Result<BuiltSemantics, RiftError> {
+        self.build_with(edges_max, previous, false)
+    }
+
+    fn build_with(
+        self,
+        edges_max: usize,
+        previous: Option<&NormalizedGraph>,
+        resolve_static: bool,
+    ) -> Result<BuiltSemantics, RiftError> {
         let mut built = self.prepared.build(edges_max, previous)?;
         built.semantics.outside_namespaces = self.outside_namespaces;
         if built.beyond_declaration_bound.is_empty() && built.refused_contributions.is_empty() {
@@ -56,9 +84,13 @@ impl PreparedProjectSemantics<'_> {
                     placement: &placed.placement,
                 })
                 .collect::<Vec<_>>();
-            built
-                .semantics
-                .add_static_resolution(&sources, &self.input, edges_max);
+            if resolve_static {
+                built
+                    .semantics
+                    .add_static_resolution(&sources, &self.input, edges_max);
+            } else {
+                built.semantics.defer_static_resolution(&sources);
+            }
         }
         Ok(built)
     }
