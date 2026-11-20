@@ -2058,3 +2058,32 @@ exports.refuse = refuse;
             && edge.to().as_str().ends_with("/adapter")
     }));
 }
+
+#[test]
+fn test_calls_through_shorthand_members_of_an_exported_object() {
+    // `api.leaf()` with `export const api = { leaf }` calls the member `leaf`, which holds
+    // the imported function; a member holding a value that is not callable stays uncalled.
+    let leaf = "export function leaf() { return 1 }
+export const value = 1
+";
+    let api = "import { leaf, value } from './leaf'
+export const api = { leaf, value }
+";
+    let probe = "import { api } from './api'
+export function use() { return api.leaf() }
+export function refuse() { return api.value() }
+";
+    let (_directory, index) = workspace_with_manifest(
+        &[("leaf.ts", leaf), ("api.ts", api), ("probe.ts", probe)],
+        module_manifest(),
+    );
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "probe.ts/use",
+        "api.ts/api/leaf"
+    ));
+    assert!(!index.edges().edges().any(|edge| {
+        edge.kind() == EdgeKind::Calls && edge.from().as_str().ends_with("probe.ts/refuse")
+    }));
+}

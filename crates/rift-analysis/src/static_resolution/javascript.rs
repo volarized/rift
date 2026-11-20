@@ -314,6 +314,44 @@ impl<'source> Index<'source> {
                 self.javascript_callable_result(target, work)
                     .then_some(target)
             })
+            .or_else(|| {
+                self.javascript_shorthand_callable(target, work)
+                    .then_some(target)
+            })
+    }
+
+    /// Whether a shorthand object member (`{ verify }`) holds a callable value: the name it
+    /// is written with resolves, in the member's own file, to a callable declaration. The
+    /// call targets the member itself.
+    fn javascript_shorthand_callable(&self, target: Target<'source>, work: &mut Work) -> bool {
+        if target.symbol.syntax_element_kind != Some("shorthand_property_identifier") {
+            return false;
+        }
+        let Some((file, name)) = self
+            .files
+            .get(target.file.path.as_str())
+            .zip(target.symbol.name_range)
+        else {
+            return false;
+        };
+        work.javascript_lookup(|work| {
+            let binding = js_binding(
+                file,
+                &self.javascript,
+                file.text(name)?,
+                name.start,
+                rift_core::ReferenceRole::Call,
+                work,
+            )?;
+            let value = self.javascript_binding_target(
+                file,
+                binding,
+                rift_core::ReferenceRole::Call,
+                work,
+            )?;
+            value.callable().map(|_| ())
+        })
+        .is_some()
     }
 
     /// Whether the binding's declared type states that its value can be called or constructed.
