@@ -218,6 +218,7 @@ struct File<'source> {
     python_values: BTreeMap<u64, StaticBindingKind>,
     python_calls: BTreeMap<u64, Vec<&'source StaticCall>>,
     declared_types: BTreeMap<ByteRange, Option<ByteRange>>,
+    type_signatures: BTreeSet<(ByteRange, bool)>,
     members: BTreeMap<ByteRange, Option<&'source rift_syntax::StaticMember>>,
     export_writes: BTreeMap<javascript_exports::ExportSlot<'source>, Option<u64>>,
     member_writes: BTreeMap<(ByteRange, Option<&'source str>), Option<u64>>,
@@ -240,10 +241,10 @@ impl<'source> AssignmentTargets<'source> {
         if target.starts_with('(') || target.contains(['[', ']', '\\', '/']) {
             self.unknown = true;
         }
-        let Some((receiver, path)) = target.split_once('.') else {
         if target.contains(['.', '[']) {
             self.member_writes.push((start, target));
         }
+        let Some((receiver, path)) = target.split_once('.') else {
             self.names.insert(target);
             return;
         };
@@ -288,7 +289,6 @@ fn written_member(target: &str) -> Option<(&str, Option<&str>)> {
         });
         return Some((receiver, literal));
     }
-
     let (receiver, property) = target.rsplit_once('.')?;
     let receiver = receiver.trim().trim_end_matches('?').trim();
     let property = property.trim();
@@ -298,6 +298,7 @@ fn written_member(target: &str) -> Option<(&str, Option<&str>)> {
             .all(|character| character.is_alphanumeric() || matches!(character, '_' | '$' | '#'));
     named.then_some((receiver, Some(property)))
 }
+
 /// Whether the assignment after `target` stores the member itself, bound to its receiver.
 ///
 /// `this.run = this.run.bind(this)` keeps the declared member: the value is that member
@@ -336,6 +337,7 @@ impl<'source> File<'source> {
             python_values: BTreeMap::new(),
             python_calls: BTreeMap::new(),
             declared_types: BTreeMap::new(),
+            type_signatures: BTreeSet::new(),
             members: BTreeMap::new(),
             export_writes: BTreeMap::new(),
             member_writes: BTreeMap::new(),
@@ -397,6 +399,12 @@ impl<'source> File<'source> {
                 .entry(name)
                 .and_modify(|entry| *entry = None)
                 .or_insert(Some(annotation));
+        }
+        for &signature in self.facts.type_signatures() {
+            if !work.charge() {
+                return None;
+            }
+            self.type_signatures.insert(signature);
         }
         for range in self.facts.assignments() {
             if !work.charge() {

@@ -526,7 +526,8 @@ impl<'source> File<'source> {
         let declaration = binding.local.and_then(|local| self.target_at(local));
         match declaration.map(|target| target.symbol.kind) {
             Some("interface" | "type_alias") => role == rift_core::ReferenceRole::Type,
-            Some("variable") => role != rift_core::ReferenceRole::Type,
+            // A value declaration is never a type; an interface of the same name is.
+            Some("variable" | "function") => role != rift_core::ReferenceRole::Type,
             _ => true,
         }
     }

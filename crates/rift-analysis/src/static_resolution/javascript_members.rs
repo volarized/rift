@@ -12,7 +12,7 @@ use super::{File, Index, Target, Work};
 const RECEIVER_WRAPPERS_MAX: u32 = 8;
 
 /// Maximum aliases followed while resolving an explicit receiver type.
-const DECLARED_TYPE_DEPTH_MAX: u32 = 32;
+pub(super) const DECLARED_TYPE_DEPTH_MAX: u32 = 32;
 
 impl<'source> Index<'source> {
     pub(super) fn javascript_object_member(

@@ -20,6 +20,7 @@ pub(super) struct Kinds {
     type_identifier: Option<u16>,
     nested_type: Option<u16>,
     type_parameter: Option<u16>,
+    type_shapes: Option<TypeShapeKinds>,
     annotation: Option<u16>,
     generic: Option<u16>,
     type_alias: Option<u16>,
@@ -90,6 +91,35 @@ impl ModuleSyntaxKinds {
             meta_property: kind(grammar, "meta_property"),
             await_expression: kind(grammar, "await_expression"),
             await_token,
+        }
+    }
+}
+
+/// Grammar kinds read from TypeScript type declarations only.
+struct TypeShapeKinds {
+    interface: u16,
+    /// Call and construct signatures, then function and constructor types.
+    signatures: [u16; 4],
+    /// Bodies that can hold a signature member, then the parenthesized type wrapper.
+    signature_holders: [u16; 3],
+}
+
+impl TypeShapeKinds {
+    fn resolve(grammar: &tree_sitter::Language) -> Self {
+        let id = |name| kind(grammar, name);
+        Self {
+            interface: id("interface_declaration"),
+            signatures: [
+                id("call_signature"),
+                id("construct_signature"),
+                id("function_type"),
+                id("constructor_type"),
+            ],
+            signature_holders: [
+                id("interface_body"),
+                id("object_type"),
+                id("parenthesized_type"),
+            ],
         }
     }
 }
@@ -188,6 +218,7 @@ impl Kinds {
             type_identifier: typescript.then(|| id("type_identifier")),
             nested_type: typescript.then(|| id("nested_type_identifier")),
             type_parameter: typescript.then(|| id("type_parameter")),
+            type_shapes: typescript.then(|| TypeShapeKinds::resolve(grammar)),
             annotation: typescript.then(|| id("type_annotation")),
             generic: typescript.then(|| id("generic_type")),
             type_alias: typescript.then(|| id("type_alias_declaration")),
@@ -275,6 +306,7 @@ impl Kinds {
         self.record_reference(syntax_element, facts)?;
         self.record_member(syntax_element, facts)?;
         self.record_declared_type(syntax_element, facts)?;
+        self.record_type_signature(syntax_element, facts)?;
         self.record_function(syntax_element, facts)?;
         if id == self.call {
             self.record_call(syntax_element, source, facts)?;
@@ -419,38 +451,6 @@ impl Kinds {
                 StaticBindingKind::Shadow,
             )?);
         }
-        Ok(())
-    }
-
-    fn record_call(
-        &self,
-        syntax_element: Node<'_>,
-        source: &str,
-        facts: &mut StaticFactsParts,
-    ) -> Result<(), RiftError> {
-        let Some(callee) = syntax_element
-            .child_by_field_id(self.callee)
-            .filter(|syntax_element| !syntax_element.is_missing())
-        else {
-            return Ok(());
-        };
-        let shape = if callee.kind_id() == self.identifier {
-            if text(callee, source) == Some("eval") {
-                let root = enclosing(syntax_element, &self.scopes[..1]).unwrap_or(syntax_element);
-                facts.unsupported_bindings.push(byte_range(root)?);
-            }
-            StaticCallee::Direct
-        } else if callee.kind_id() == self.receivers[1] {
-            StaticCallee::Constructor
-        } else {
-            self.member(callee)?
-        };
-        facts.calls.push(call(syntax_element, callee, shape)?);
-        Ok(())
-    }
-
-    fn member(&self, syntax_element: Node<'_>) -> Result<StaticCallee, RiftError> {
-        if syntax_element.kind_id() != self.member {
         if let Some(scope) = scope {
             self.record_type_parameter_errors(parameter, scope, facts)?;
         }
@@ -505,6 +505,38 @@ impl Kinds {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn record_call(
+        &self,
+        syntax_element: Node<'_>,
+        source: &str,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let Some(callee) = syntax_element
+            .child_by_field_id(self.callee)
+            .filter(|syntax_element| !syntax_element.is_missing())
+        else {
+            return Ok(());
+        };
+        let shape = if callee.kind_id() == self.identifier {
+            if text(callee, source) == Some("eval") {
+                let root = enclosing(syntax_element, &self.scopes[..1]).unwrap_or(syntax_element);
+                facts.unsupported_bindings.push(byte_range(root)?);
+            }
+            StaticCallee::Direct
+        } else if callee.kind_id() == self.receivers[1] {
+            StaticCallee::Constructor
+        } else {
+            self.member(callee)?
+        };
+        facts.calls.push(call(syntax_element, callee, shape)?);
+        Ok(())
+    }
+
+    fn member(&self, syntax_element: Node<'_>) -> Result<StaticCallee, RiftError> {
+        if syntax_element.kind_id() != self.member {
             return Ok(StaticCallee::Unsupported);
         }
         let receiver = syntax_element
@@ -673,6 +705,57 @@ impl Kinds {
             facts
                 .declared_types
                 .push((byte_range(name)?, byte_range(annotation)?));
+        }
+        Ok(())
+    }
+
+    /// Records the type declaration whose own shape is this signature.
+    ///
+    /// `interface I { (): void }`, `type F = () => void` and `type C = new () => T` state
+    /// that a value of the named type can be called or constructed. A signature nested
+    /// deeper, such as a member's type, says nothing about the declaration itself.
+    fn record_type_signature(
+        &self,
+        element: Node<'_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let Some(shapes) = &self.type_shapes else {
+            return Ok(());
+        };
+        let (signatures, holders) = (shapes.signatures, shapes.signature_holders);
+        let Some(position) = signatures
+            .iter()
+            .position(|kind| *kind == element.kind_id())
+        else {
+            return Ok(());
+        };
+        let constructs = position % 2 == 1;
+        let member = position < 2;
+        let mut holder = element.parent();
+        if member {
+            // A signature member belongs to an interface body or an aliased object type.
+            let Some(body) = holder.filter(|body| holders[..2].contains(&body.kind_id())) else {
+                return Ok(());
+            };
+            holder = body.parent();
+        }
+        // The syntax walk has admitted every enclosing type's depth.
+        while let Some(wrapper) = holder.filter(|wrapper| wrapper.kind_id() == holders[2]) {
+            holder = wrapper.parent();
+        }
+        let Some(declaration) = holder else {
+            return Ok(());
+        };
+        let declares = self.type_alias == Some(declaration.kind_id())
+            || (member && shapes.interface == declaration.kind_id());
+        if !declares {
+            return Ok(());
+        }
+        if let Some(name) = declaration
+            .child_by_field_id(self.name)
+            .filter(|name| !name.is_missing())
+        {
+            facts.type_signatures.push((byte_range(name)?, constructs));
         }
         Ok(())
     }

@@ -227,6 +227,9 @@ pub struct StaticFactsParts {
     pub members: Vec<StaticMember>,
     /// Declaration names and their explicit named type annotations.
     pub declared_types: Vec<(ByteRange, ByteRange)>,
+    /// Type declaration names whose own shape is a signature: a call signature or
+    /// function type (`false`), or a construct signature or constructor type (`true`).
+    pub type_signatures: Vec<(ByteRange, bool)>,
     /// Runtime function expressions and their enclosing value ranges.
     pub function_values: Vec<(ByteRange, ByteRange)>,
     /// Function expressions that establish their own receiver.
@@ -279,6 +282,12 @@ impl StaticFacts {
     #[must_use]
     pub fn declared_types(&self) -> &[(ByteRange, ByteRange)] {
         &self.0.declared_types
+    }
+
+    /// Type declarations whose own shape is a call (`false`) or construct (`true`) signature.
+    #[must_use]
+    pub fn type_signatures(&self) -> &[(ByteRange, bool)] {
+        &self.0.type_signatures
     }
 
     /// Runtime function expressions and their enclosing value ranges.
@@ -373,6 +382,7 @@ impl StaticFacts {
             vector_capacity(&self.0.references),
             vector_capacity(&self.0.members),
             vector_capacity(&self.0.declared_types),
+            vector_capacity(&self.0.type_signatures),
             vector_capacity(&self.0.function_values),
             vector_capacity(&self.0.function_scopes),
             vector_capacity(&self.0.static_blocks),
@@ -402,6 +412,7 @@ impl StaticFacts {
             self.references().len(),
             self.members().len(),
             self.declared_types().len(),
+            self.type_signatures().len(),
             self.function_values().len(),
             self.function_scopes().len(),
             self.static_blocks().len(),
@@ -473,7 +484,8 @@ impl StaticFacts {
         let declared_types = self
             .declared_types()
             .iter()
-            .all(|(name, annotation)| valid(*name) && valid(*annotation));
+            .all(|(name, annotation)| valid(*name) && valid(*annotation))
+            && self.type_signatures().iter().all(|(name, _)| valid(*name));
         let assignments = self.assignments().iter().copied().all(valid);
         let members = self.members().iter().all(|member| {
             valid(member.range)

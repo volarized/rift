@@ -699,3 +699,54 @@ export function patch(item: Typed, bag: Record<string, unknown>, key: string) { 
     );
 }
 
+#[test]
+fn test_typescript_calls_through_declared_callable_and_constructible_bindings() {
+    // A binding whose declared type is a function type alias, or an interface with a call
+    // or construct signature, is the target of a call or `new` on it. The type and the
+    // value named `$constructor` are separate declarations.
+    let core = "export interface $constructor<T, D = unknown> { new (def: D): T; init(inst: T, def: D): void }
+export function $constructor<T>(name: string): $constructor<T> { return null as never }
+export type Callback = (value: string) => number;
+export type Renamed = Callback;
+export interface Callable { (value: string): number; extra: string }
+export interface Shape { extra: string }
+";
+    let source = "import * as core from './core.js';
+import type { Callback, Callable, Renamed, Shape } from './core.js';
+export interface Made { kind: 'made' }
+export const Made: core.$constructor<Made> = core.$constructor('Made');
+export const plain = core.$constructor('Plain');
+declare const callback: Callback;
+declare const renamed: Renamed;
+declare const callable: Callable;
+declare const shape: Shape;
+declare const unknown: unknown;
+export function make() { return new Made({}) }
+export function run() { callback('a'); renamed('b'); return callable('c') }
+export function refuse() { new plain({}); new callback(); callable.extra; shape('d'); new shape(); return unknown('e') }
+";
+    let (_directory, index) =
+        workspace_with_manifest(&[("main.ts", source), ("core.ts", core)], module_manifest());
+    let found = calls(&index);
+    for (from, to) in [
+        ("make", "Made"),
+        ("run", "callback"),
+        ("run", "renamed"),
+        ("run", "callable"),
+    ] {
+        assert!(
+            found.contains(&(from.to_owned(), to.to_owned())),
+            "missing {from} -> {to} in {found:?}"
+        );
+    }
+    // An inferred value, a callable used with `new`, a shape without a signature and an
+    // unknown value name no call target.
+    assert!(!found.iter().any(|(from, _)| from == "refuse"), "{found:?}");
+    assert!(has_edge(
+        &index,
+        EdgeKind::HasType,
+        "/Made",
+        "core.ts/$constructor"
+    ));
+}
+

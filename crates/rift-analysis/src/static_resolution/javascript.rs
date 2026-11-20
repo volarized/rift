@@ -239,10 +239,70 @@ impl<'source> Index<'source> {
                 || target
                     .symbol
                     .kinds
-                    .contains(&rift_protocol::read::SymbolKind::Constructible))
+                    .contains(&rift_protocol::read::SymbolKind::Constructible)
+                || self.javascript_declared_signature(target, true, work))
             .then_some(target);
         }
-        target.callable()
+        target.callable().or_else(|| {
+            self.javascript_declared_signature(target, false, work)
+                .then_some(target)
+        })
+    }
+
+    /// Whether the binding's declared type states that its value can be called or constructed.
+    ///
+    /// The annotation must name, through at most `DECLARED_TYPE_DEPTH_MAX` aliases, a type
+    /// declaration whose own shape is the signature: a function or constructor type alias,
+    /// or an interface with a call or construct signature. The call then targets the
+    /// binding itself; no function body is chosen for it.
+    fn javascript_declared_signature(
+        &self,
+        target: Target<'source>,
+        constructs: bool,
+        work: &mut Work,
+    ) -> bool {
+        let declared = |file: &File<'source>, name: rift_syntax::ByteRange| {
+            file.declared_types.get(&name).copied().flatten()
+        };
+        let Some(mut file) = self.files.get(target.file.path.as_str()) else {
+            return false;
+        };
+        let Some(mut annotation) = target
+            .symbol
+            .name_range
+            .and_then(|name| declared(file, name))
+        else {
+            return false;
+        };
+        for _ in 0..super::javascript_members::DECLARED_TYPE_DEPTH_MAX {
+            if !work.charge() {
+                return false;
+            }
+            let Some(named) =
+                self.javascript_target(file, annotation, rift_core::ReferenceRole::Type, work)
+            else {
+                return false;
+            };
+            let Some((owner, name)) = self
+                .files
+                .get(named.file.path.as_str())
+                .zip(named.symbol.name_range)
+            else {
+                return false;
+            };
+            if owner.type_signatures.contains(&(name, constructs)) {
+                return true;
+            }
+            if named.symbol.kind != "type_alias" {
+                return false;
+            }
+            let Some(next) = declared(owner, name) else {
+                return false;
+            };
+            file = owner;
+            annotation = next;
+        }
+        false
     }
 
     pub(super) fn javascript_import(
@@ -582,7 +642,7 @@ pub(super) fn js_binding<'source>(
             continue;
         }
         if role == rift_core::ReferenceRole::Type
-            && symbol.is_some_and(|symbol| symbol.kind == "variable")
+            && symbol.is_some_and(|symbol| matches!(symbol.kind, "variable" | "function"))
         {
             continue;
         }
