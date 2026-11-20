@@ -1280,6 +1280,46 @@ fn test_rust_reference_receivers_reach_the_referent_members() {
 }
 
 #[test]
+fn test_rust_associated_types_stay_outside_lexical_scope() {
+    // `Error` in a method signature names the module item; only `Self::Error` names the
+    // implementation's associated type.
+    let source = "pub struct Error;\npub trait Source { type Error; fn read(&self) -> Result<u8, Self::Error>; fn other(&self) -> Self::Error; }\npub struct Item;\nimpl Source for Item {\n    type Error = Error;\n    fn read(&self) -> Result<u8, Error> { Err(Error) }\n    fn other(&self) -> Self::Error { Error }\n}\npub fn local() { struct Error; let _value: Error = Error; }\n";
+    let (_directory, index) = fixture_index(PLAIN_MANIFEST, &[("src/lib.rs", source)]);
+    let types = index
+        .edges()
+        .edges()
+        .filter(|edge| edge.kind() == EdgeKind::HasType)
+        .map(|edge| {
+            (
+                edge.from().as_str().to_owned(),
+                edge.to().as_str().to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let read = types
+        .iter()
+        .filter(|(from, _)| from.ends_with("/read") && !from.contains("/Source/"))
+        .map(|(_, to)| to.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        read.iter().any(|to| to.ends_with("/fixture/Error")),
+        "{types:?}"
+    );
+    assert!(
+        !read
+            .iter()
+            .any(|to| to.ends_with("/Error") && !to.ends_with("/fixture/Error")),
+        "{types:?}"
+    );
+    assert!(
+        types
+            .iter()
+            .any(|(from, to)| from.ends_with("/local") && to.ends_with("/local/Error")),
+        "{types:?}"
+    );
+}
+
+#[test]
 fn test_rust_inactive_alternative_modules_are_never_endpoints() {
     // `pub use self::imp::Write` names `std::io` under the default feature; the inactive
     // `#[path]` alternative is not a local endpoint for implementations or type uses.
@@ -1320,6 +1360,30 @@ fn test_rust_inactive_alternative_modules_are_never_endpoints() {
             "inactive alternative endpoint: {edge:?}"
         );
     }
+}
+
+#[test]
+fn test_rust_struct_expressions_name_body_local_structs_first() {
+    let source = "pub struct Adapter { pub value: u8 }\npub fn collect() -> u8 { struct Adapter { value: u8 } let adapter = Adapter { value: 1 }; adapter.value }\npub fn module_level() -> u8 { Adapter { value: 2 }.value }\n";
+    let (_directory, index) = fixture_index(PLAIN_MANIFEST, &[("src/lib.rs", source)]);
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "/fixture/collect",
+        "/collect/Adapter"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "/fixture/module_level",
+        "/fixture/Adapter"
+    ));
+    assert!(!has_edge(
+        &index,
+        EdgeKind::Calls,
+        "/fixture/collect",
+        "/fixture/Adapter"
+    ));
 }
 
 #[test]

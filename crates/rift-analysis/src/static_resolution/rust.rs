@@ -138,6 +138,10 @@ impl<'source> Namespaces<'source> {
                 return Some(target);
             }
             container = container.rsplit_once("::")?.0;
+            // Items declared in a body are in scope there; an implementation's or trait's
+            // associated items are reachable only through a path such as `Self::Name`.
+            file.qualified_target(container)
+                .filter(|target| target.symbol.kinds.contains(&SymbolKind::Callable))?;
         }
     }
 
@@ -975,6 +979,12 @@ impl<'source> Namespaces<'source> {
     ) -> Option<Target<'source>> {
         let parts = path_segments(file.text(call.callee_range)?, work)?;
         let position = call.range.start;
+        // A struct declared in an enclosing body shadows module items of its name.
+        if let [name] = parts.as_slice()
+            && let Some(target) = Self::local_type(file, position, name, work)
+        {
+            return (target.symbol.kind == "struct" && self.available(target)).then_some(target);
+        }
         if let ["Self", member] = parts.as_slice()
             && let Some(owner) = self.structural_self(file, position, work)
         {
