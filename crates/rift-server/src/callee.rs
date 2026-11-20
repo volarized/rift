@@ -104,9 +104,10 @@ impl CalleeRoots {
         packages.dedup();
         Self {
             packages: packages.into(),
-            registry_unresolved: context
-                .install_folders()
-                .any(|folder| matches!(folder.location, InstallLocation::CargoRegistry(_))),
+            registry_unresolved: context.install_folders().any(|folder| {
+                matches!(folder.location, InstallLocation::CargoRegistry(_))
+                    && folder_roots(folder, &registries, spellings).is_empty()
+            }),
         }
     }
 
@@ -254,7 +255,7 @@ impl RootSpellings<'_> {
 /// The package roots an accepted install folder names, one per spelling.
 fn folder_roots(
     folder: &InstallFolder,
-    _registries: &[PathBuf],
+    registries: &[PathBuf],
     spellings: RootSpellings<'_>,
 ) -> Vec<PackageRoot> {
     let origin = &folder.origin;
@@ -279,9 +280,44 @@ fn folder_roots(
                 .map(|base| PackageRoot::within_origin(&base, within.clone(), origin.clone()))
                 .collect()
         }
-        // Cache folder presence does not establish its defining registry endpoint.
-        InstallLocation::CargoRegistry(_) => Vec::new(),
+        InstallLocation::CargoRegistry(directory) => {
+            let rift_core::SourceLocation::Dependency { package } = origin else {
+                return Vec::new();
+            };
+            // The dependency context accepts this owner from the lockfile's registry
+            // endpoint. The cache spelling must independently name that same endpoint.
+            if package.manager != "cargo"
+                || package.registry != "crates.io"
+                || directory != &format!("{}-{}", package.name, package.version)
+            {
+                return Vec::new();
+            }
+            registries
+                .iter()
+                .filter(|root| crates_io_source(root))
+                .flat_map(|root| spellings.of(&root.join(directory)))
+                .filter_map(|root| TreeRoot::new(&root).ok())
+                .map(|root| PackageRoot::with_origin(root, origin.clone()))
+                .collect()
+        }
     }
+}
+
+/// Cargo's crates.io source directory, directly below `registry/src`.
+fn crates_io_source(root: &Path) -> bool {
+    root.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new("src"))
+        && root
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            == Some(std::ffi::OsStr::new("registry"))
+        && root
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .and_then(|name| name.strip_prefix("index.crates.io-"))
+            .is_some_and(|hash| {
+                hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
 }
 
 /// `$CARGO_HOME`, or `.cargo` below the home folder when it is unset, as Cargo reads it.
@@ -796,10 +832,29 @@ mod tests {
             identity("cargo", "serde", "1.0.228"),
             InstallLocation::CargoRegistry("serde-1.0.228".to_owned()),
         );
-        assert!(
-            folder_roots(&serde, &registries, spellings).is_empty(),
-            "cache folders do not establish registry ownership"
+        assert_eq!(
+            spelled(&folder_roots(&serde, &registries, spellings)),
+            [(
+                "file:///cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228"
+                    .to_owned(),
+                "cargo/serde@1.0.228".to_owned()
+            )],
+            "the accepted owner and cache endpoint agree"
         );
+        for root in [
+            "/cargo/registry/src/index.crates.io-lookalike",
+            "/cargo/registry/src/index.crates.io-1949cf8c6b5b557f.evil",
+            "/cargo/other/src/index.crates.io-1949cf8c6b5b557f",
+            "/cargo/registry/src/mirror-1949cf8c6b5b557f",
+        ] {
+            assert!(
+                folder_roots(&serde, &[PathBuf::from(root)], spellings).is_empty(),
+                "{root}"
+            );
+        }
+        let mut wrong_directory = serde.clone();
+        wrong_directory.location = InstallLocation::CargoRegistry("../serde-1.0.228".to_owned());
+        assert!(folder_roots(&wrong_directory, &registries, spellings).is_empty());
         let mut private = serde.clone();
         private.origin = rift_core::SourceLocation::Dependency {
             package: PackageIdentity {
