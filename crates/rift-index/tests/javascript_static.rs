@@ -896,3 +896,303 @@ export function refuse(c: Context, either: Either) { return [c.loose.raw, either
                 .any(|name| edge.to().as_str().ends_with(name))
     }));
 }
+
+fn call_count(index: &WorkspaceIndex, from: &str, to: &str) -> usize {
+    index
+        .edges()
+        .edges()
+        .filter(|edge| {
+            edge.kind() == EdgeKind::Calls
+                && edge.from().as_str().ends_with(from)
+                && edge.to().as_str().ends_with(to)
+        })
+        .count()
+}
+
+const CALLBACK_LIBRARY: &str = "export class Request { raw = 1 }
+export class Context { req: Request = new Request(); text(body: string) { return body } }
+export class Doc {
+  text = ''
+  write(text: string) { this.text = text }
+  indented(run: (doc: Doc) => void) { run(this) }
+  both(first: number, run: (count: number, doc: Doc) => void) { run(first, this) }
+  over(run: (doc: Doc) => void): void
+  over(run: (text: string) => void, extra: number): void
+  over(run: unknown) {}
+}
+export type Next = () => Promise<void>
+export type Handler = (c: Context, next: Next) => unknown
+export type Renamed = Handler
+export interface Shape { value: number }
+export function create(handler: Handler) { return handler }
+export function plain(handler) { return handler }
+export function generic<T extends Context>(run: (value: T) => void) { return run }
+";
+
+#[test]
+fn test_typescript_callback_parameters_take_the_written_type_at_their_position() {
+    // An unannotated callback parameter is typed by the function type written for it: the
+    // declared type of the binding the function initializes, the declared parameter of the
+    // resolved callee, or the declared return type of the function that returns it.
+    let main = "import { Doc, create } from './lib.js'
+import type { Handler, Renamed } from './lib.js'
+export function emit(doc: Doc) {
+  doc.indented((d) => { d.write('a'); d.indented((inner) => inner.write('b')) })
+  doc.both(1, (count, second) => second.write('c'))
+}
+export const handle: Handler = async (c, next) => { c.text('a'); return c.req.raw }
+export const renamed: Renamed = (c) => c.text('b')
+export const made = create(async (c) => c.text('c'))
+export const factory = (): Handler => { return async function inner(ctx) { return ctx.text('d') } }
+export const concise = (): Handler => (ctx) => ctx.text('e')
+";
+    let (_directory, index) = workspace_with_manifest(
+        &[("main.ts", main), ("lib.ts", CALLBACK_LIBRARY)],
+        module_manifest(),
+    );
+    assert_eq!(call_count(&index, "main.ts/emit", "lib.ts/Doc/write"), 3);
+    assert_eq!(call_count(&index, "main.ts/emit", "lib.ts/Doc/indented"), 2);
+    // A function expression returned by `factory` is no declaration: `factory` holds it.
+    for from in ["handle", "renamed", "made", "factory", "concise"] {
+        assert_eq!(
+            call_count(&index, &format!("main.ts/{from}"), "lib.ts/Context/text"),
+            1,
+            "{from} in {:?}",
+            calls(&index)
+        );
+    }
+    assert!(has_edge(
+        &index,
+        EdgeKind::Reads,
+        "main.ts/handle",
+        "lib.ts/Context/req"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Reads,
+        "main.ts/handle",
+        "lib.ts/Request/raw"
+    ));
+}
+
+#[test]
+fn test_callback_parameters_without_a_written_type_stay_unresolved() {
+    let main = "import { Doc, generic, plain } from './lib.js'
+import type { Context, Shape } from './lib.js'
+export function refuse(doc: Doc) {
+  plain((c) => c.text('callee parameter has no type'))
+  doc.over((d) => d.write('callee is overloaded'))
+  missing((c) => c.text('callee is not resolved'))
+  const loose = (c) => c.text('binding has no type')
+  const shaped: Shape = (c) => c.text('type is no function type')
+  doc.both(1, (count) => count.write('parameter type is no declaration'))
+  doc.indented((first, second) => second.write('no parameter at that position'))
+  generic((c) => c.text('the call decides a type parameter'))
+  doc.indented((d: Context) => d.text('its own annotation decides'))
+  return [loose, shaped]
+}
+";
+    let (_directory, index) = workspace_with_manifest(
+        &[("main.ts", main), ("lib.ts", CALLBACK_LIBRARY)],
+        module_manifest(),
+    );
+    assert_eq!(call_count(&index, "main.ts/refuse", "lib.ts/Doc/write"), 0);
+    assert_eq!(
+        call_count(&index, "main.ts/refuse/loose", "lib.ts/Context/text"),
+        0
+    );
+    assert_eq!(
+        call_count(&index, "main.ts/refuse/shaped", "lib.ts/Context/text"),
+        0
+    );
+    // Only the callback with its own annotation names the member.
+    assert_eq!(
+        index
+            .edges()
+            .edges()
+            .filter(|edge| edge.kind() == EdgeKind::Calls
+                && edge.to().as_str().ends_with("lib.ts/Context/text"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        call_count(&index, "main.ts/refuse", "lib.ts/Context/text"),
+        1
+    );
+    // JavaScript writes no types, so the same shapes name nothing there.
+    let library = "export class Doc { write(text) {} indented(run) { run(this) } }";
+    let script = "import { Doc } from './lib.mjs'
+export function emit() { const doc = new Doc(); doc.indented((d) => d.write('a')) }
+";
+    let (_directory, index) = workspace_with_manifest(
+        &[("main.mjs", script), ("lib.mjs", library)],
+        module_manifest(),
+    );
+    assert_eq!(
+        call_count(&index, "main.mjs/emit", "lib.mjs/Doc/indented"),
+        1
+    );
+    assert_eq!(call_count(&index, "main.mjs/emit", "lib.mjs/Doc/write"), 0);
+}
+
+#[test]
+fn test_typescript_members_through_type_parameter_constraints() {
+    // A value typed by a type parameter has at least the members its declared constraint
+    // names. An unconstrained parameter and a constraint that is no declaration name none,
+    // and the parameter still shadows a module declaration of its own name.
+    let source = "export interface Def { errorMap?: string; describe(): string }
+export interface D { other: number }
+export class Base<Output = unknown, D extends Def = Def> {
+  readonly _def!: D
+  read() { return [this._def.errorMap, this._def.describe()] }
+  wrong() { return this._def.other }
+}
+export function pick<T extends Def>(value: T) { return value.errorMap }
+export function loose<T>(value: T) { return value.errorMap }
+export function shaped<T extends { errorMap: string }>(value: T) { return value.errorMap }
+";
+    let (_directory, index) = workspace_with_manifest(&[("main.ts", source)], module_manifest());
+    assert!(has_edge(
+        &index,
+        EdgeKind::Reads,
+        "/Base/read",
+        "/Def/errorMap"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "/Base/read",
+        "/Def/describe"
+    ));
+    assert!(has_edge(&index, EdgeKind::Reads, "/pick", "/Def/errorMap"));
+    for from in ["/loose", "/shaped", "/Base/wrong"] {
+        assert!(
+            !index.edges().edges().any(|edge| {
+                edge.kind() == EdgeKind::Reads
+                    && edge.from().as_str().ends_with(from)
+                    && (edge.to().as_str().ends_with("/errorMap")
+                        || edge.to().as_str().ends_with("/other"))
+            }),
+            "{from}"
+        );
+    }
+}
+
+#[test]
+fn test_typescript_members_of_values_destructured_from_declared_returns() {
+    // A name destructured from a call takes the type its key has in the callee's declared
+    // return type: an inline object type, or a named type that declares the member.
+    let source = "export class Status { value = 'ok'; dirty() { this.value = 'dirty' } }
+export interface Context { parsedType: string; data: unknown }
+export interface Parts { status: Status; ctx: Context }
+export class Base {
+  process(input: string): { status: Status; ctx: Context } { return { status: new Status(), ctx: { parsedType: input, data: 1 } } }
+  named(input: string): Parts { return this.process(input) }
+  loose(input: string) { return this.process(input) }
+  run(input: string) {
+    const { status, ctx } = this.process(input)
+    status.dirty()
+    return ctx.parsedType
+  }
+  renamed(input: string) {
+    const { ctx: inner, status } = this.named(input)
+    status.dirty()
+    return inner.data
+  }
+  refuse(input: string, other: { ctx: Context }) {
+    const { ctx } = this.loose(input)
+    const { ctx: unknown } = missing(input)
+    const { absent } = this.process(input)
+    return [ctx.parsedType, unknown.parsedType, absent.parsedType, other]
+  }
+}
+export function free(base: Base) { const { ctx } = base.process('a'); return ctx.data }
+";
+    let (_directory, index) = workspace_with_manifest(&[("main.ts", source)], module_manifest());
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "/Base/run",
+        "/Status/dirty"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Reads,
+        "/Base/run",
+        "/Context/parsedType"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "/Base/renamed",
+        "/Status/dirty"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Reads,
+        "/Base/renamed",
+        "/Context/data"
+    ));
+    assert!(has_edge(&index, EdgeKind::Reads, "/free", "/Context/data"));
+    // No declared return type, an unresolved callee and a key the type does not declare.
+    assert!(!index.edges().edges().any(|edge| {
+        edge.kind() == EdgeKind::Reads
+            && edge.from().as_str().ends_with("/Base/refuse")
+            && edge.to().as_str().ends_with("/parsedType")
+    }));
+}
+
+#[test]
+fn test_typescript_members_of_values_bound_to_declared_call_results() {
+    // A name bound to a call takes the named type the resolved callee declares as its
+    // return type.
+    let source = "export interface Context { parsedType: string; data: unknown }
+export class Status { dirty() { return 1 } }
+export function make(input: string): Context { return { parsedType: input, data: 1 } }
+export function pick(input: string): Context
+export function pick(input: number): Status
+export function pick(input: unknown): unknown { return input }
+export class Base {
+  context(input: string): Context { return make(input) }
+  loose(input: string) { return make(input) }
+  status(): Status { return new Status() }
+  run(input: string) {
+    const ctx = this.context(input)
+    const status = this.status()
+    status.dirty()
+    return ctx.parsedType
+  }
+  refuse(input: string, other: Context) {
+    const loose = this.loose(input)
+    const unknown = missing(input)
+    const picked = pick(input)
+    let moved = this.context(input)
+    moved = other
+    return [loose.parsedType, unknown.parsedType, picked.parsedType, moved.parsedType]
+  }
+}
+export function free() { const ctx = make('a'); return ctx.data }
+";
+    let (_directory, index) = workspace_with_manifest(&[("main.ts", source)], module_manifest());
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "/Base/run",
+        "/Status/dirty"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Reads,
+        "/Base/run",
+        "/Context/parsedType"
+    ));
+    assert!(has_edge(&index, EdgeKind::Reads, "/free", "/Context/data"));
+    // No declared return type, an unresolved callee, an overloaded callee and a name
+    // assigned again.
+    assert!(!index.edges().edges().any(|edge| {
+        edge.kind() == EdgeKind::Reads
+            && edge.from().as_str().ends_with("/Base/refuse")
+            && edge.to().as_str().ends_with("/parsedType")
+    }));
+}
+

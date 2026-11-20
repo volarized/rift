@@ -4,8 +4,9 @@ use rift_error::RiftError;
 use tree_sitter::Node;
 
 use super::{
-    StaticBindingKind, StaticCallee, StaticFactsParts, StaticMember, StaticReexport,
-    StaticReference, binding, call, enclosing, field, identifier, kind,
+    StaticBindingKind, StaticCallee, StaticDeclaredReturn, StaticFactsParts, StaticFunctionContext,
+    StaticMember, StaticParameter, StaticReexport, StaticReference, binding, call, enclosing,
+    field, identifier, kind,
 };
 use crate::ByteRange;
 use crate::extract::byte_range;
@@ -106,6 +107,17 @@ struct TypeShapeKinds {
     getter: u16,
     /// Field holding a callable's declared return type.
     return_type: u16,
+    /// A method with a body, a `return` statement and a call's argument list.
+    method: u16,
+    return_statement: u16,
+    argument_list: u16,
+    /// Field holding an arrow function's or a function's body.
+    body: u16,
+    /// Fields holding a type parameter's constraint and a pattern pair's key.
+    constraint: u16,
+    key: u16,
+    /// A member of an object type with a name and a type.
+    property_signature: u16,
 }
 
 impl TypeShapeKinds {
@@ -133,6 +145,13 @@ impl TypeShapeKinds {
                 id
             },
             return_type: field(grammar, "return_type"),
+            method: id("method_definition"),
+            return_statement: id("return_statement"),
+            argument_list: id("arguments"),
+            body: field(grammar, "body"),
+            constraint: field(grammar, "constraint"),
+            key: field(grammar, "key"),
+            property_signature: id("property_signature"),
         }
     }
 }
@@ -320,6 +339,7 @@ impl Kinds {
         self.record_member(syntax_element, facts)?;
         self.record_declared_type(syntax_element, facts)?;
         self.record_type_signature(syntax_element, facts)?;
+        self.record_return_type(syntax_element, facts)?;
         self.record_function(syntax_element, facts)?;
         if id == self.call {
             self.record_call(syntax_element, source, facts)?;
@@ -444,6 +464,126 @@ impl Kinds {
             }
             value = parent;
         }
+        if let Some(context) = self.function_context(value)? {
+            facts.function_contexts.push((range, context));
+        }
+        Ok(())
+    }
+
+    /// The written place that can type the function value `value`: the declaration it
+    /// initializes, the call it is an argument of, or the function that returns it.
+    fn function_context(
+        &self,
+        value: Node<'_>,
+    ) -> Result<Option<StaticFunctionContext>, RiftError> {
+        let Some((shapes, parent)) = self.type_shapes.as_ref().zip(value.parent()) else {
+            return Ok(None);
+        };
+        if parent.child_by_field_id(self.value) == Some(value)
+            && let Some(name) = parent.child_by_field_id(self.name)
+        {
+            return Ok(Some(StaticFunctionContext::Initializer(byte_range(name)?)));
+        }
+        if parent.kind_id() == shapes.argument_list
+            && let Some(call) = parent.parent()
+        {
+            let mut cursor = parent.walk();
+            let index = parent
+                .named_children(&mut cursor)
+                .filter(|argument| !argument.is_extra())
+                .position(|argument| argument == value);
+            return Ok(match index.and_then(|index| u32::try_from(index).ok()) {
+                Some(index) => Some(StaticFunctionContext::Argument {
+                    call: byte_range(call)?,
+                    index,
+                }),
+                None => None,
+            });
+        }
+        if parent.kind_id() == self.arrow && parent.child_by_field_id(shapes.body) == Some(value) {
+            return Ok(Some(StaticFunctionContext::Returned(byte_range(parent)?)));
+        }
+        if parent.kind_id() != shapes.return_statement {
+            return Ok(None);
+        }
+        // The syntax walk has admitted every enclosing statement's depth.
+        let mut enclosing = parent.parent();
+        while let Some(function) = enclosing {
+            let id = function.kind_id();
+            if id == self.arrow
+                || id == shapes.method
+                || self.function.contains(&id)
+                || self.named_expression[..2].contains(&id)
+            {
+                return Ok(Some(StaticFunctionContext::Returned(byte_range(function)?)));
+            }
+            enclosing = function.parent();
+        }
+        Ok(None)
+    }
+
+    /// Records the named type a function's return annotation writes.
+    fn record_return_type(
+        &self,
+        element: Node<'_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let Some(shapes) = &self.type_shapes else {
+            return Ok(());
+        };
+        let Some(mut annotation) = element.child_by_field_id(shapes.return_type) else {
+            return Ok(());
+        };
+        if self.annotation == Some(annotation.kind_id()) {
+            let mut cursor = annotation.walk();
+            let Some(inner) = annotation
+                .named_children(&mut cursor)
+                .find(|child| !child.is_extra() && !child.is_missing())
+            else {
+                return Ok(());
+            };
+            annotation = inner;
+        }
+        let owner = self.function_owner(element)?;
+        if annotation.kind_id() == shapes.signature_holders[1] {
+            // An inline object type: each named member types the value under that key.
+            let Some(owner) = owner else {
+                return Ok(());
+            };
+            let mut cursor = annotation.walk();
+            for member in annotation.named_children(&mut cursor) {
+                if member.kind_id() != shapes.property_signature {
+                    continue;
+                }
+                let written = self
+                    .type_field
+                    .and_then(|field| member.child_by_field_id(field))
+                    .and_then(|annotation| annotation.named_child(0))
+                    .and_then(|written| self.named_type(written));
+                if let Some((name, written)) = member.child_by_field_id(self.name).zip(written) {
+                    facts.declared_returns.push(StaticDeclaredReturn {
+                        owner,
+                        function: byte_range(element)?,
+                        member: Some(byte_range(name)?),
+                        annotation: byte_range(written)?,
+                    });
+                }
+            }
+            return Ok(());
+        }
+        if let Some(annotation) = self.named_type(annotation) {
+            facts
+                .return_types
+                .push((byte_range(element)?, byte_range(annotation)?));
+            if let Some(owner) = owner {
+                facts.declared_returns.push(StaticDeclaredReturn {
+                    owner,
+                    function: byte_range(element)?,
+                    member: None,
+                    annotation: byte_range(annotation)?,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -467,7 +607,32 @@ impl Kinds {
         if let Some(scope) = scope {
             self.record_type_parameter_errors(parameter, scope, facts)?;
         }
+        // A value typed by the parameter has at least the members its constraint names.
+        let constraint = self
+            .type_shapes
+            .as_ref()
+            .and_then(|shapes| parameter.child_by_field_id(shapes.constraint))
+            .and_then(|constraint| constraint.named_child(0))
+            .and_then(|written| self.named_type(written));
+        if let Some((name, constraint)) = name.zip(constraint) {
+            facts
+                .declared_types
+                .push((byte_range(name)?, byte_range(constraint)?));
+        }
         Ok(())
+    }
+
+    /// The name a written type refers to: a type name, or the name of a generic type.
+    fn named_type<'tree>(&self, written: Node<'tree>) -> Option<Node<'tree>> {
+        let written = if self.generic == Some(written.kind_id()) {
+            written.child_by_field_id(self.name)?
+        } else {
+            written
+        };
+        (!written.is_missing()
+            && (self.type_identifier == Some(written.kind_id())
+                || self.nested_type == Some(written.kind_id())))
+        .then_some(written)
     }
 
     /// Names the parser left inside an error of a type parameter list.
@@ -711,6 +876,22 @@ impl Kinds {
         if name.is_missing() || annotation.is_missing() {
             return Ok(());
         }
+        if let Some(shapes) = &self.type_shapes {
+            // The syntax walk has admitted every enclosing type's depth.
+            let mut written = annotation;
+            while written.kind_id() == shapes.signature_holders[2] {
+                let Some(inner) = written.named_child(0) else {
+                    break;
+                };
+                written = inner;
+            }
+            if written.kind_id() == shapes.signatures[2] {
+                facts
+                    .function_types
+                    .push((byte_range(name)?, byte_range(written)?));
+                return Ok(());
+            }
+        }
         if (self.type_identifier == Some(annotation.kind_id())
             || self.nested_type == Some(annotation.kind_id()))
             && ([self.identifier, self.property_identifier].contains(&name.kind_id())
@@ -781,6 +962,12 @@ impl Kinds {
             .filter(|name| !name.is_missing())
         {
             facts.type_signatures.push((byte_range(name)?, constructs));
+            if position == 0 {
+                // A call signature states the parameters a value of the type is called with.
+                facts
+                    .function_types
+                    .push((byte_range(name)?, byte_range(element)?));
+            }
         }
         Ok(())
     }
@@ -839,6 +1026,7 @@ impl Kinds {
         };
         if name.kind_id() != self.identifier {
             let start = facts.bindings.len();
+            self.record_destructured(name, syntax_element, facts)?;
             self.record_parameter(name, scope, facts)?;
             if !is_var && scope.kind_id() == self.scopes[0] {
                 facts.javascript_module_syntax |= facts.bindings[start..].iter().any(|binding| {
@@ -860,6 +1048,16 @@ impl Kinds {
             Some(value) => self.initializer(value, source)?,
             _ => StaticBindingKind::Local,
         };
+        if self.type_shapes.is_some()
+            && let Some(call) = syntax_element
+                .child_by_field_id(self.value)
+                .filter(|value| value.kind_id() == self.call)
+        {
+            // The name takes the whole result of the call.
+            facts
+                .destructured
+                .push((byte_range(name)?, None, byte_range(call)?));
+        }
         facts
             .bindings
             .push(binding(name, scope, byte_range(syntax_element)?.end, kind)?);
@@ -873,6 +1071,50 @@ impl Kinds {
                 byte_range(scope)?.start,
                 StaticBindingKind::Local,
             )?);
+        }
+        Ok(())
+    }
+
+    /// Records the names an object pattern takes from a call, each with its key.
+    fn record_destructured(
+        &self,
+        pattern: Node<'_>,
+        declarator: Node<'_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let Some(shapes) = &self.type_shapes else {
+            return Ok(());
+        };
+        let call = declarator
+            .child_by_field_id(self.value)
+            .filter(|value| value.kind_id() == self.call);
+        let Some(call) = call.filter(|_| pattern.kind_id() == self.patterns[0]) else {
+            return Ok(());
+        };
+        let mut cursor = pattern.walk();
+        for entry in pattern.named_children(&mut cursor) {
+            let (name, key) = if entry.kind_id() == self.shorthand_pattern {
+                (Some(entry), Some(entry))
+            } else if entry.kind_id() == self.pair_pattern {
+                (
+                    entry.child_by_field_id(self.value),
+                    entry.child_by_field_id(shapes.key),
+                )
+            } else {
+                (None, None)
+            };
+            if let Some((name, key)) = name
+                .filter(|name| name.kind_id() == self.identifier || name == &entry)
+                .zip(key.filter(|key| {
+                    [self.property_identifier, self.shorthand_pattern].contains(&key.kind_id())
+                }))
+            {
+                facts.destructured.push((
+                    byte_range(name)?,
+                    Some(byte_range(key)?),
+                    byte_range(call)?,
+                ));
+            }
         }
         Ok(())
     }
@@ -1104,6 +1346,14 @@ impl Kinds {
             && let Some(parameter) = syntax_element.child_by_field_id(self.parameter)
         {
             self.record_parameter(parameter, syntax_element, facts)?;
+            if parameter.kind_id() == self.identifier {
+                facts.parameters.push(StaticParameter {
+                    function: byte_range(syntax_element)?,
+                    owner: self.function_owner(syntax_element)?,
+                    index: 0,
+                    name: byte_range(parameter)?,
+                });
+            }
         }
         Ok(())
     }
@@ -1157,14 +1407,52 @@ impl Kinds {
         let Some(scope) = syntax_element.parent() else {
             return Ok(());
         };
+        let owner = self.function_owner(scope)?;
         let mut cursor = syntax_element.walk();
-        for parameter in syntax_element
+        for (index, parameter) in syntax_element
             .named_children(&mut cursor)
             .filter(|syntax_element| !syntax_element.is_extra())
+            .enumerate()
         {
             self.record_parameter(parameter, scope, facts)?;
+            let name = if self.parameter_wrappers.contains(&parameter.kind_id()) {
+                self.pattern
+                    .and_then(|field| parameter.child_by_field_id(field))
+            } else {
+                Some(parameter)
+            };
+            if let Some((name, index)) = name
+                .filter(|name| name.kind_id() == self.identifier)
+                .zip(u32::try_from(index).ok())
+            {
+                facts.parameters.push(StaticParameter {
+                    function: byte_range(scope)?,
+                    owner,
+                    index,
+                    name: byte_range(name)?,
+                });
+            }
         }
         Ok(())
+    }
+
+    /// Name of the declaration a function belongs to: its own name, or the name of the
+    /// declaration a function value initializes.
+    fn function_owner(&self, function: Node<'_>) -> Result<Option<ByteRange>, RiftError> {
+        let value = function.kind_id() == self.arrow
+            || self.named_expression[..2].contains(&function.kind_id());
+        if !value {
+            return function
+                .child_by_field_id(self.name)
+                .map(byte_range)
+                .transpose();
+        }
+        function
+            .parent()
+            .filter(|parent| parent.child_by_field_id(self.value) == Some(function))
+            .and_then(|parent| parent.child_by_field_id(self.name))
+            .map(byte_range)
+            .transpose()
     }
 
     fn record_parameter(

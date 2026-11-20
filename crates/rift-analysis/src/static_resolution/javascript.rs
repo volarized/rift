@@ -425,6 +425,14 @@ impl<'source> Index<'source> {
             let owner = self.javascript_declared_type(file, annotation, work)?;
             return self.javascript_class_member(owner, member, MemberMode::Instance, role, work);
         }
+        if role != rift_core::ReferenceRole::Type
+            && binding.kind == StaticBindingKind::Shadow
+            && let Some(owner) = self
+                .javascript_callback_parameter(file, binding, work)
+                .or_else(|| self.javascript_destructured_name(file, binding, work))
+        {
+            return self.javascript_class_member(owner, member, MemberMode::Instance, role, work);
+        }
         match binding.kind {
             StaticBindingKind::JavaScriptEdgeNamespace { module } => self.javascript_export(
                 file,
@@ -446,10 +454,16 @@ impl<'source> Index<'source> {
             StaticBindingKind::JavaScriptImport { .. } => {
                 self.javascript_imported_member(file, binding, member, role, work)
             }
-            StaticBindingKind::Local => {
-                let target = self.javascript_binding_target(file, binding, role, work)?;
-                self.javascript_object_member(target, member, role, work)
-            }
+            StaticBindingKind::Local => self
+                .javascript_binding_target(file, binding, role, work)
+                .and_then(|target| self.javascript_object_member(target, member, role, work))
+                .or_else(|| {
+                    if role == rift_core::ReferenceRole::Type {
+                        return None;
+                    }
+                    let owner = self.javascript_destructured_name(file, binding, work)?;
+                    self.javascript_class_member(owner, member, MemberMode::Instance, role, work)
+                }),
             StaticBindingKind::JavaScriptRequire {
                 module,
                 export: None,
@@ -604,6 +618,16 @@ impl File<'_> {
             || member.is_some_and(|member| {
                 self.assignments.unknown || self.assignments.members.contains(&(name, member))
             })
+    }
+}
+
+impl File<'_> {
+    /// Whether an assignment inside the scope of `binding` writes its name again. A
+    /// write to an inner binding of the same name counts too: the check only refuses.
+    pub(super) fn javascript_binding_reassigned(&self, binding: &StaticBinding) -> bool {
+        self.text(binding.name)
+            .and_then(|name| self.assignments.name_writes.get(name))
+            .is_some_and(|writes| writes.iter().any(|&start| binding.scope.contains(start)))
     }
 }
 

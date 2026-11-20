@@ -1,6 +1,7 @@
 //! Resolves captured call and import sites against admitted source declarations.
 
 mod javascript;
+mod javascript_callbacks;
 mod javascript_edges;
 mod javascript_exports;
 mod javascript_members;
@@ -151,6 +152,7 @@ struct Work {
     budget: LoopBudget,
     exhausted: bool,
     python_depth: u8,
+    javascript_depth: u8,
 }
 
 impl Work {
@@ -159,7 +161,20 @@ impl Work {
             budget: LoopBudget::new(maximum),
             exhausted: false,
             python_depth: 0,
+            javascript_depth: 0,
         }
+    }
+
+    /// Runs one nested callback parameter lookup, refusing past a fixed nesting depth.
+    fn javascript_lookup<T>(&mut self, lookup: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
+        const DEPTH_MAX: u8 = 16;
+        if self.javascript_depth >= DEPTH_MAX {
+            return None;
+        }
+        self.javascript_depth += 1;
+        let result = lookup(self);
+        self.javascript_depth -= 1;
+        result
     }
 
     fn python_lookup<T>(&mut self, lookup: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
@@ -219,6 +234,7 @@ struct File<'source> {
     python_calls: BTreeMap<u64, Vec<&'source StaticCall>>,
     declared_types: BTreeMap<ByteRange, Option<ByteRange>>,
     type_signatures: BTreeSet<(ByteRange, bool)>,
+    callbacks: javascript_callbacks::Callbacks<'source>,
     members: BTreeMap<ByteRange, Option<&'source rift_syntax::StaticMember>>,
     export_writes: BTreeMap<javascript_exports::ExportSlot<'source>, Option<u64>>,
     member_writes: BTreeMap<(ByteRange, Option<&'source str>), Option<u64>>,
@@ -229,6 +245,8 @@ struct File<'source> {
 #[derive(Default)]
 struct AssignmentTargets<'source> {
     names: BTreeSet<&'source str>,
+    /// Start offsets of the writes to each plain name.
+    name_writes: BTreeMap<&'source str, Vec<u64>>,
     members: BTreeSet<(&'source str, &'source str)>,
     /// Every member or subscript target, with its start offset.
     member_writes: Vec<(u64, &'source str)>,
@@ -246,6 +264,7 @@ impl<'source> AssignmentTargets<'source> {
         }
         let Some((receiver, path)) = target.split_once('.') else {
             self.names.insert(target);
+            self.name_writes.entry(target).or_default().push(start);
             return;
         };
         if let Some(first) = path.split('.').map(str::trim).next() {
@@ -338,6 +357,7 @@ impl<'source> File<'source> {
             python_calls: BTreeMap::new(),
             declared_types: BTreeMap::new(),
             type_signatures: BTreeSet::new(),
+            callbacks: javascript_callbacks::Callbacks::default(),
             members: BTreeMap::new(),
             export_writes: BTreeMap::new(),
             member_writes: BTreeMap::new(),
@@ -357,6 +377,7 @@ impl<'source> File<'source> {
         file.index_bindings(work)?;
         file.index_symbols(work)?;
         file.index_javascript_members(work)?;
+        file.callbacks = javascript_callbacks::Callbacks::index(facts, work)?;
         Some(file)
     }
 

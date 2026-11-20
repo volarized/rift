@@ -216,6 +216,48 @@ pub struct StaticConditionalItem {
     pub attribute: ByteRange,
 }
 
+/// One simple parameter of function-like syntax, by position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticParameter {
+    /// The function, method, signature or function type that declares the parameter.
+    pub function: ByteRange,
+    /// Name of the declaration that function belongs to, when it has one.
+    pub owner: Option<ByteRange>,
+    /// Zero-based position in the parameter list.
+    pub index: u32,
+    /// The parameter's name.
+    pub name: ByteRange,
+}
+
+/// One named type a function's declared return type writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticDeclaredReturn {
+    /// Name of the declaration the function belongs to.
+    pub owner: ByteRange,
+    /// The function or signature that writes the return type.
+    pub function: ByteRange,
+    /// The member of an inline object type this entry types; absent for the whole type.
+    pub member: Option<ByteRange>,
+    /// The named type written for the return value or for that member.
+    pub annotation: ByteRange,
+}
+
+/// The written place that types a function value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaticFunctionContext {
+    /// The function initializes the declaration with this name.
+    Initializer(ByteRange),
+    /// The function is an argument of a call.
+    Argument {
+        /// Complete invocation range.
+        call: ByteRange,
+        /// Zero-based argument position.
+        index: u32,
+    },
+    /// The function is returned by this enclosing function.
+    Returned(ByteRange),
+}
+
 /// Collections retained by static syntax capture.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StaticFactsParts {
@@ -230,6 +272,19 @@ pub struct StaticFactsParts {
     /// Type declaration names whose own shape is a signature: a call signature or
     /// function type (`false`), or a construct signature or constructor type (`true`).
     pub type_signatures: Vec<(ByteRange, bool)>,
+    /// Simple parameters of functions, signatures and function types.
+    pub parameters: Vec<StaticParameter>,
+    /// Declaration names whose written type is a function type, with that type.
+    pub function_types: Vec<(ByteRange, ByteRange)>,
+    /// Function-like syntax and the named type its return annotation writes.
+    pub return_types: Vec<(ByteRange, ByteRange)>,
+    /// Function values and the written place that types them.
+    pub function_contexts: Vec<(ByteRange, StaticFunctionContext)>,
+    /// Declared return types by the name of the declaration the function belongs to.
+    pub declared_returns: Vec<StaticDeclaredReturn>,
+    /// Names bound from a call: the bound name, the key it is destructured by (absent when
+    /// the name takes the whole result) and the call.
+    pub destructured: Vec<(ByteRange, Option<ByteRange>, ByteRange)>,
     /// Runtime function expressions and their enclosing value ranges.
     pub function_values: Vec<(ByteRange, ByteRange)>,
     /// Function expressions that establish their own receiver.
@@ -288,6 +343,43 @@ impl StaticFacts {
     #[must_use]
     pub fn type_signatures(&self) -> &[(ByteRange, bool)] {
         &self.0.type_signatures
+    }
+
+    /// Simple parameters of functions, signatures and function types, by position.
+    #[must_use]
+    pub fn parameters(&self) -> &[StaticParameter] {
+        &self.0.parameters
+    }
+
+    /// Declaration names whose written type is a function type, with that type.
+    #[must_use]
+    pub fn function_types(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.function_types
+    }
+
+    /// Function-like syntax and the named type its return annotation writes.
+    #[must_use]
+    pub fn return_types(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.return_types
+    }
+
+    /// Function values and the written place that types them.
+    #[must_use]
+    pub fn function_contexts(&self) -> &[(ByteRange, StaticFunctionContext)] {
+        &self.0.function_contexts
+    }
+
+    /// Declared return types by the name of the declaration the function belongs to.
+    #[must_use]
+    pub fn declared_returns(&self) -> &[StaticDeclaredReturn] {
+        &self.0.declared_returns
+    }
+
+    /// Names bound from a call: the bound name, the key it is destructured by (absent when
+    /// the name takes the whole result) and the call.
+    #[must_use]
+    pub fn destructured(&self) -> &[(ByteRange, Option<ByteRange>, ByteRange)] {
+        &self.0.destructured
     }
 
     /// Runtime function expressions and their enclosing value ranges.
@@ -383,6 +475,12 @@ impl StaticFacts {
             vector_capacity(&self.0.members),
             vector_capacity(&self.0.declared_types),
             vector_capacity(&self.0.type_signatures),
+            vector_capacity(&self.0.parameters),
+            vector_capacity(&self.0.function_types),
+            vector_capacity(&self.0.return_types),
+            vector_capacity(&self.0.function_contexts),
+            vector_capacity(&self.0.declared_returns),
+            vector_capacity(&self.0.destructured),
             vector_capacity(&self.0.function_values),
             vector_capacity(&self.0.function_scopes),
             vector_capacity(&self.0.static_blocks),
@@ -413,6 +511,12 @@ impl StaticFacts {
             self.members().len(),
             self.declared_types().len(),
             self.type_signatures().len(),
+            self.parameters().len(),
+            self.function_types().len(),
+            self.return_types().len(),
+            self.function_contexts().len(),
+            self.declared_returns().len(),
+            self.destructured().len(),
             self.function_values().len(),
             self.function_scopes().len(),
             self.static_blocks().len(),
@@ -440,6 +544,36 @@ impl StaticFacts {
             return errors::syntax::facts_count_exceeded().fail();
         }
         Ok(())
+    }
+
+    /// Whether the facts that connect function values and bound names to written types
+    /// hold source ranges.
+    fn typed_values_valid(&self, valid: impl Fn(ByteRange) -> bool + Copy) -> bool {
+        self.parameters().iter().all(|parameter| {
+            valid(parameter.function) && valid(parameter.name) && parameter.owner.is_none_or(valid)
+        }) && self
+            .function_types()
+            .iter()
+            .chain(self.return_types())
+            .all(|(name, written)| valid(*name) && valid(*written))
+            && self.declared_returns().iter().all(|declared| {
+                valid(declared.owner)
+                    && valid(declared.function)
+                    && valid(declared.annotation)
+                    && declared.member.is_none_or(valid)
+            })
+            && self
+                .destructured()
+                .iter()
+                .all(|(name, key, call)| valid(*name) && key.is_none_or(valid) && valid(*call))
+            && self.function_contexts().iter().all(|(function, context)| {
+                valid(*function)
+                    && match context {
+                        StaticFunctionContext::Initializer(range)
+                        | StaticFunctionContext::Returned(range)
+                        | StaticFunctionContext::Argument { call: range, .. } => valid(*range),
+                    }
+            })
     }
 
     pub(crate) fn validate(&self, source: &str, limits: SyntaxLimits) -> Result<(), RiftError> {
@@ -485,7 +619,8 @@ impl StaticFacts {
             .declared_types()
             .iter()
             .all(|(name, annotation)| valid(*name) && valid(*annotation))
-            && self.type_signatures().iter().all(|(name, _)| valid(*name));
+            && self.type_signatures().iter().all(|(name, _)| valid(*name))
+            && self.typed_values_valid(valid);
         let assignments = self.assignments().iter().copied().all(valid);
         let members = self.members().iter().all(|member| {
             valid(member.range)

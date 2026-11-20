@@ -98,7 +98,7 @@ impl<'source> Index<'source> {
         annotation: rift_syntax::ByteRange,
         work: &mut Work,
     ) -> Option<Target<'source>> {
-        let mut current = self.javascript_target(file, annotation, ReferenceRole::Type, work)?;
+        let mut current = self.javascript_named_type(file, annotation, work)?;
         let mut visited = BTreeSet::new();
         // Alias traversal shares the work budget and has a separate depth bound.
         for _ in 0..DECLARED_TYPE_DEPTH_MAX {
@@ -116,7 +116,66 @@ impl<'source> Index<'source> {
                 return (current.symbol.kind == "type_alias").then_some(current);
             };
             let annotation = annotation.as_ref()?;
-            current = self.javascript_target(source, *annotation, ReferenceRole::Type, work)?;
+            current = self.javascript_named_type(source, *annotation, work)?;
+        }
+        None
+    }
+
+    /// Whether a written type name is a type parameter in scope at its position.
+    pub(super) fn javascript_type_parameter(
+        &self,
+        file: &File<'source>,
+        annotation: rift_syntax::ByteRange,
+        work: &mut Work,
+    ) -> bool {
+        file.text(annotation)
+            .map(str::trim)
+            .filter(|name| !name.contains('.'))
+            .and_then(|name| {
+                super::javascript::js_binding(
+                    file,
+                    &self.javascript,
+                    name,
+                    annotation.start,
+                    ReferenceRole::Type,
+                    work,
+                )
+            })
+            .is_some_and(|binding| binding.kind == rift_syntax::StaticBindingKind::Shadow)
+    }
+
+    /// The declaration a written type name refers to, read through type parameters.
+    ///
+    /// A type parameter stands for its declared constraint: a value of that type has at
+    /// least the constraint's members. A parameter without a constraint names nothing.
+    fn javascript_named_type(
+        &self,
+        file: &File<'source>,
+        mut annotation: rift_syntax::ByteRange,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        for _ in 0..DECLARED_TYPE_DEPTH_MAX {
+            let name = file.text(annotation)?.trim();
+            let constraint = (!name.contains('.'))
+                .then(|| {
+                    super::javascript::js_binding(
+                        file,
+                        &self.javascript,
+                        name,
+                        annotation.start,
+                        ReferenceRole::Type,
+                        work,
+                    )
+                })
+                .flatten()
+                .filter(|binding| binding.kind == rift_syntax::StaticBindingKind::Shadow)
+                .and_then(|binding| file.declared_types.get(&binding.name).copied().flatten());
+            match constraint {
+                Some(written) => annotation = written,
+                None => {
+                    return self.javascript_target(file, annotation, ReferenceRole::Type, work);
+                }
+            }
         }
         None
     }
