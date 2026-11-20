@@ -58,7 +58,7 @@ impl EdgePythonModules {
 enum Value<'source> {
     Symbol(Target<'source>),
     Instance(Target<'source>),
-    // An inherited declaration retains the subclass assignment for later receiver lookup.
+    // A member retains its declaration separately from its receiver value.
     Member {
         declaration: Target<'source>,
         assigned: Target<'source>,
@@ -156,11 +156,7 @@ impl<'source> Index<'source> {
                     Some(file) => self.export_value(file, member, work)?,
                     None => self.module_value(&format!("{name}.{member}"))?,
                 },
-                Value::Symbol(target)
-                | Value::Instance(target)
-                | Value::Member {
-                    assigned: target, ..
-                } => self.python_member_value(target, member, work)?,
+                value => self.python_member_value(value, member, work)?,
             };
         }
         Some(value)
@@ -240,16 +236,6 @@ impl<'source> Index<'source> {
         }
     }
 
-    fn python_value_receiver(&self, value: Value<'source>) -> Option<Target<'source>> {
-        match value {
-            Value::Instance(class)
-            | Value::Member {
-                assigned: class, ..
-            } => Some(class),
-            value => self.value_target(value),
-        }
-    }
-
     fn binding_value(
         &self,
         file: &File<'source>,
@@ -282,7 +268,13 @@ impl<'source> Index<'source> {
                 file.target_at(binding.name).map(Value::Symbol)
             }
             StaticBindingKind::PythonReceiver { class_name } => {
-                file.target_at(class_name).map(Value::Symbol)
+                let class = file.target_at(class_name)?;
+                let method = file.enclosing_callable(binding.name)?;
+                Some(if method.symbol.kinds.contains(&SymbolKind::Static) {
+                    Value::Symbol(class)
+                } else {
+                    Value::Instance(class)
+                })
             }
             StaticBindingKind::PythonImport { module, export } => {
                 let name = EdgePythonModules::name(file, file.text(module)?)?;

@@ -132,6 +132,8 @@ pub enum StaticBindingKind {
     PythonFunction {
         /// Authored return annotation.
         annotation: ByteRange,
+        /// Single identifier decorator, absent for other decorator forms.
+        decorator: Option<ByteRange>,
     },
     /// Dotted Python module import without a local alias.
     PythonModule {
@@ -390,8 +392,11 @@ impl StaticBinding {
             | StaticBindingKind::PythonInstance { constructor } => valid(constructor),
             StaticBindingKind::PythonReceiver { class_name } => valid(class_name),
             StaticBindingKind::PythonAnnotation { annotation }
-            | StaticBindingKind::PythonFunction { annotation }
             | StaticBindingKind::PythonGuard { annotation } => valid(annotation),
+            StaticBindingKind::PythonFunction {
+                annotation,
+                decorator,
+            } => valid(annotation) && decorator.is_none_or(&valid),
             StaticBindingKind::PythonAlias { value } => valid(value),
             StaticBindingKind::RustUse { path } => valid(path),
             StaticBindingKind::RustReceiver { type_path } => valid(type_path),

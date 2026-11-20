@@ -50,6 +50,39 @@ fn spelled(text: &str, range: crate::ByteRange) -> &str {
 }
 
 #[test]
+fn test_property_returns_keep_annotation_and_member_source() {
+    let text = "class Item: pass\nclass Owner:\n    @property\n    def item(self) -> Item: pass\n    def use(self): return self.item.read()\n";
+    let document = analyze(text);
+    let getter = symbol(&document, "Owner.item");
+    assert_eq!(getter.container.as_deref(), Some("Owner"));
+    assert!(getter.kinds.contains(&SymbolKind::Property));
+    let facts = document.facts().static_facts().expect("static facts");
+    let binding = facts
+        .bindings()
+        .iter()
+        .find(|binding| Some(binding.name) == getter.name_range)
+        .expect("getter evidence");
+    let crate::StaticBindingKind::PythonFunction {
+        annotation,
+        decorator,
+    } = binding.kind
+    else {
+        panic!("return annotation: {binding:?}");
+    };
+    assert_eq!(spelled(text, annotation), "Item");
+    assert_eq!(
+        spelled(text, decorator.expect("property decorator")),
+        "property"
+    );
+    assert!(
+        facts
+            .calls()
+            .iter()
+            .any(|call| spelled(text, call.callee_range) == "self.item.read")
+    );
+}
+
+#[test]
 fn test_wildcard_import_keeps_module_evidence_and_unknown_bindings() {
     let text = "from .models import *\n";
     let document = analyze(text);

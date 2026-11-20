@@ -117,11 +117,16 @@ impl<'source> Index<'source> {
 
     pub(super) fn python_member_value(
         &self,
-        class: Target<'source>,
+        receiver: Value<'source>,
         name: &str,
         work: &mut Work,
     ) -> Option<Value<'source>> {
-        let class = self.python_receiver(class, work)?;
+        let receiver = self.python_receiver(receiver, work)?;
+        let instance = matches!(receiver, Value::Instance(_));
+        let class = match receiver {
+            Value::Symbol(class) | Value::Instance(class) => class,
+            Value::Member { .. } | Value::Module(_) => return None,
+        };
         if class.symbol.kinds.contains(&SymbolKind::Module) {
             let file = self.files.get(class.file.path.as_str())?;
             return self.export_value(file, name, work);
@@ -131,6 +136,15 @@ impl<'source> Index<'source> {
             .or_else(|| self.python_base_member(class, name, work));
         let assigned = member.is_some_and(|target| self.python_assigned_member(target));
         if member.is_some() && !assigned {
+            if instance
+                && let Some(declaration) = member
+                && let Some(assigned) = self.python_property_result(declaration, work)
+            {
+                return Some(Value::Member {
+                    declaration,
+                    assigned,
+                });
+            }
             return member.map(Value::Symbol);
         }
         let declaration = self
@@ -190,35 +204,89 @@ impl<'source> Index<'source> {
 
     pub(super) fn python_receiver(
         &self,
-        mut target: Target<'source>,
+        mut value: Value<'source>,
         work: &mut Work,
-    ) -> Option<Target<'source>> {
+    ) -> Option<Value<'source>> {
         let mut visited = BTreeSet::new();
         loop {
-            if !work.charge() || !visited.insert(key(target)) {
+            if !work.charge() {
+                return None;
+            }
+            let target = match value {
+                Value::Instance(_) => return Some(value),
+                Value::Member { assigned, .. }
+                    if assigned.symbol.kinds.contains(&SymbolKind::Constructible) =>
+                {
+                    return Some(Value::Instance(assigned));
+                }
+                Value::Symbol(target)
+                | Value::Member {
+                    assigned: target, ..
+                } => target,
+                Value::Module(_) => return self.value_target(value).map(Value::Symbol),
+            };
+            if !visited.insert(key(target)) {
                 return None;
             }
             if target.symbol.kinds.contains(&SymbolKind::Constructible)
                 || target.symbol.kinds.contains(&SymbolKind::Module)
             {
-                return Some(target);
+                return Some(Value::Symbol(target));
             }
             let file = self.files.get(target.file.path.as_str())?;
-            target = match file.python_values.get(&target.symbol.name_range?.end)? {
+            value = match file.python_values.get(&target.symbol.name_range?.end)? {
                 StaticBindingKind::PythonAnnotation { annotation } => {
-                    self.python_annotation(file, *annotation, work)?
+                    Value::Instance(self.python_annotation(file, *annotation, work)?)
                 }
                 StaticBindingKind::PythonInstance { constructor } => {
                     let callable = self.edge_python_name(file, *constructor, work)?;
-                    self.python_call_result(callable, work)?
+                    Value::Instance(self.python_call_result(callable, work)?)
                 }
                 StaticBindingKind::PythonAlias { value } => {
-                    let value = work.python_lookup(|work| self.python_name(file, *value, work))?;
-                    self.python_value_receiver(value)?
+                    work.python_lookup(|work| self.python_name(file, *value, work))?
                 }
                 _ => return None,
             };
         }
+    }
+
+    fn python_property_result(
+        &self,
+        getter: Target<'source>,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let file = self.files.get(getter.file.path.as_str())?;
+        let range = getter.symbol.name_range?;
+        let StaticBindingKind::PythonFunction {
+            annotation,
+            decorator: Some(decorator),
+        } = file.python_values.get(&range.end)?
+        else {
+            return None;
+        };
+        if file.text(*decorator)? != "property" || file.blocked(decorator.start, work) {
+            return None;
+        }
+        for binding in file.by_name.get("property").into_iter().flatten() {
+            if !work.charge() || binding.scope.contains(decorator.start) {
+                return None;
+            }
+        }
+        let class = file.qualified_target(getter.symbol.container.as_deref()?)?;
+        for binding in file
+            .by_name
+            .get(getter.symbol.name.as_str())
+            .into_iter()
+            .flatten()
+        {
+            if !work.charge() {
+                return None;
+            }
+            if binding.scope == class.symbol.item_range && binding.name != range {
+                return None;
+            }
+        }
+        self.python_annotation(file, *annotation, work)
     }
 
     pub(super) fn python_call_result(
@@ -233,7 +301,7 @@ impl<'source> Index<'source> {
             return None;
         }
         let file = self.files.get(callable.file.path.as_str())?;
-        let StaticBindingKind::PythonFunction { annotation } =
+        let StaticBindingKind::PythonFunction { annotation, .. } =
             file.python_values.get(&callable.symbol.name_range?.end)?
         else {
             return None;

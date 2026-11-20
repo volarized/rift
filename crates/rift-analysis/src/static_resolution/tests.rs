@@ -12,6 +12,121 @@ use rift_syntax::DocumentPlacement;
 const WORK_MAX: usize = 10_000;
 
 #[test]
+fn test_python_property_returns_resolve_instance_members_and_aliases() {
+    let source = "class Item:\n    def read(self): pass\nclass Owner:\n    @property\n    def item(self) -> Item: return Item()\n    def use(self): return self.item.read()\nclass Child(Owner):\n    def use(self): return self.item.read()\ndef typed(owner: Owner):\n    owner.item.read()\n    alias = owner.item\n    alias.read()\ndef constructed(): return Owner().item.read()\n";
+    let result = resolution("python", &[("main.py", source)], &[], WORK_MAX);
+    let reads = calls(&result, "main.py")
+        .filter(|edge| target(edge) == "rift://symbol/local/python/main/Item/read")
+        .map(|edge| {
+            (
+                source_of(edge, source),
+                edge.edge_from.as_ref().expect("caller").as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reads,
+        [
+            (
+                "self.item.read()",
+                "rift://symbol/local/python/main/Owner/use"
+            ),
+            (
+                "self.item.read()",
+                "rift://symbol/local/python/main/Child/use"
+            ),
+            ("owner.item.read()", "rift://symbol/local/python/main/typed"),
+            ("alias.read()", "rift://symbol/local/python/main/typed"),
+            (
+                "Owner().item.read()",
+                "rift://symbol/local/python/main/constructed"
+            ),
+        ],
+        "{result:?}"
+    );
+    assert!(
+        result.occurrences.iter().any(|edge| {
+            edge.role == ReferenceRole::Read
+                && edge.edge_kind.is_none()
+                && source_of(edge, source) == "self.item"
+                && target(edge) == "rift://symbol/local/python/main/Owner/item"
+        }),
+        "{result:?}"
+    );
+    assert!(
+        result.occurrences.iter().any(|edge| {
+            edge.role == ReferenceRole::Type
+                && source_of(edge, source) == "Item"
+                && target(edge) == "rift://symbol/local/python/main/Item"
+        }),
+        "{result:?}"
+    );
+    assert!(!result.exhausted);
+}
+
+#[test]
+fn test_python_property_returns_refuse_shadowing_in_decorated_classes() {
+    let source = "class Item:\n    def read(self): pass\n@decorate\nclass Owner:\n    @property\n    def item(self) -> Item: pass\n    from missing import item\ndef use(owner: Owner): return owner.item.read()\n";
+    let result = resolution("python", &[("main.py", source)], &[], WORK_MAX);
+    assert!(
+        calls(&result, "main.py")
+            .all(|edge| target(edge) != "rift://symbol/local/python/main/Item/read"),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn test_python_property_returns_follow_imported_receiver_annotations() {
+    let result = resolution(
+        "python",
+        &[
+            (
+                "models.py",
+                "class Item:\n    def read(self): pass\nclass Owner:\n    @property\n    def item(self) -> Item: pass\n",
+            ),
+            (
+                "main.py",
+                "from models import Owner\ndef use(owner: Owner): return owner.item.read()\n",
+            ),
+        ],
+        &[],
+        WORK_MAX,
+    );
+    assert_eq!(
+        calls(&result, "main.py").map(target).collect::<Vec<_>>(),
+        ["rift://symbol/local/python/models/Item/read"],
+        "{result:?}"
+    );
+}
+
+#[test]
+fn test_python_property_returns_refuse_descriptors_shadowing_and_ambiguity() {
+    let prefix = "class Item:\n    def read(self): pass\nclass Other: pass\n";
+    let cases = [
+        "class Owner:\n    @property\n    def item(self) -> Item: pass\n    @classmethod\n    def use(cls): return cls.item.read()\ndef use():\n    Owner.item.read()\n    alias = Owner\n    alias.item.read()\n",
+        "property = unknown\nclass Owner:\n    @property\n    def item(self) -> Item: pass\ndef use(owner: Owner): return owner.item.read()\n",
+        "class Owner:\n    @other.property\n    def item(self) -> Item: pass\ndef use(owner: Owner): return owner.item.read()\n",
+        "class Owner:\n    @property\n    @decorate\n    def item(self) -> Item: pass\ndef use(owner: Owner): return owner.item.read()\n",
+        "class Owner:\n    @property\n    def item(self) -> Item | Other: pass\ndef use(owner: Owner): return owner.item.read()\n",
+        "class Owner:\n    @property\n    def item(self) -> Item: pass\n    @property\n    def item(self) -> Other: pass\ndef use(owner: Owner): return owner.item.read()\n",
+        "class Owner:\n    def item(self) -> Item: pass\ndef use(owner: Owner): return owner.item.read()\n",
+        "class Owner:\n    @property\n    def item(self) -> Item: pass\ndef use(owner: Owner):\n    owner = unknown\n    return owner.item.read()\n",
+        "def outer(property):\n    class Owner:\n        @property\n        def item(self) -> Item: pass\n    def use(owner: Owner): return owner.item.read()\n",
+        "class Owner:\n    @property\n    def item(self) -> Item: pass\n    item = unknown\ndef use(owner: Owner): return owner.item.read()\n",
+    ];
+    for case in cases {
+        let source = format!("{prefix}{case}");
+        let result = resolution("python", &[("main.py", &source)], &[], WORK_MAX);
+        assert!(
+            calls(&result, "main.py")
+                .all(|edge| { target(edge) != "rift://symbol/local/python/main/Item/read" }),
+            "{source}\n{result:?}"
+        );
+        assert!(!result.exhausted);
+    }
+}
+
+#[test]
 fn test_python_wildcard_imports_keep_modules_without_resolving_exports() {
     let source = "from .leaf import *\ndef use(): return leaf()\n";
     let result = resolution(

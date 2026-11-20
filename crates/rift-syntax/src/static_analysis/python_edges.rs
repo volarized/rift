@@ -221,6 +221,10 @@ impl EdgePythonKinds {
                 Some(annotation) if syntax_element.kind_id() == self.definitions[0] => {
                     StaticBindingKind::PythonFunction {
                         annotation: byte_range(annotation)?,
+                        decorator: self
+                            .edge_function_decorator(visited)
+                            .map(byte_range)
+                            .transpose()?,
                     }
                 }
                 _ => StaticBindingKind::Local,
@@ -230,6 +234,20 @@ impl EdgePythonKinds {
                 .push(binding(name, scope, byte_range(scope)?.start, kind)?);
         }
         Ok(())
+    }
+
+    fn edge_function_decorator<'tree>(&self, visited: Visited<'_, 'tree>) -> Option<Node<'tree>> {
+        let decorated = visited.parent()?.syntax_element();
+        if decorated.kind_id() != self.decorated {
+            return None;
+        }
+        let mut cursor = decorated.walk();
+        let mut decorators = decorated
+            .named_children(&mut cursor)
+            .filter(|element| element.kind_id() == self.decorator);
+        let expression = decorators.next()?.named_child(0)?;
+        (decorators.next().is_none() && expression.kind_id() == self.identifier)
+            .then_some(expression)
     }
 
     fn edge_import(

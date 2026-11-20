@@ -26,6 +26,44 @@ fn build(files: &[(&str, &str)]) -> (tempfile::TempDir, WorkspaceIndex) {
 }
 
 #[test]
+fn test_python_property_returns_store_calls_and_property_reads() {
+    let source = "class Item:\n    def read(self): pass\nclass Owner:\n    @property\n    def item(self) -> Item: return Item()\n    def use(self): return self.item.read()\ndef use(owner: Owner): return owner.item.read()\ndef invalid(): return Owner.item.read()\n";
+    let (_directory, index) = build(&[("main.py", source)]);
+    let calls = index
+        .edges()
+        .edges()
+        .filter(|edge| {
+            edge.kind().as_ref() == "calls"
+                && edge.to().as_str() == "rift://symbol/local/python/main/Item/read"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 2, "{:?}", index.edges());
+    for edge in calls {
+        assert!(
+            [
+                "rift://symbol/local/python/main/Owner/use",
+                "rift://symbol/local/python/main/use"
+            ]
+            .contains(&edge.from().as_str())
+        );
+        let binding = edge.occurrence();
+        assert_eq!(binding.unit().key().as_str(), "main.py");
+        let start = usize::try_from(binding.range().start()).expect("source start");
+        let end = usize::try_from(binding.range().end()).expect("source end");
+        assert!(["self.item.read()", "owner.item.read()"].contains(&&source[start..end]));
+    }
+    assert!(
+        index
+            .edges()
+            .edges()
+            .any(|edge| edge.kind().as_ref() == "reads"
+                && edge.to().as_str() == "rift://symbol/local/python/main/Owner/item")
+    );
+    assert!(index.edges().is_complete());
+    assert_eq!(index.edges().dropped_edges(), 0);
+}
+
+#[test]
 fn test_python_wildcard_import_stores_the_module_and_explicit_alias() {
     let source = "from .leaf import *\ndef use(): return leaf()\n";
     let (_directory, index) = build(&[
