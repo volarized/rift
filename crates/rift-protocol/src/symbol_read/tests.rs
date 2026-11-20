@@ -308,3 +308,129 @@ fn exact_request_schema_advertises_codec_owners_and_declaration_bounds() {
     assert!(!view_validator.is_valid(&json!(VIEW[..8].to_owned())));
     assert!(!view_validator.is_valid(&json!(VIEW.to_uppercase())));
 }
+
+const PACKAGE_ID: &str = "rift://symbol/cargo/crates.io/demo/rust/demo/run";
+
+/// A found package symbol whose history lists three release edges, newest release first.
+fn released_symbol() -> Value {
+    let mut symbol = symbol();
+    symbol["id"] = json!(PACKAGE_ID);
+    symbol["name"] = json!("run");
+    json!({
+        "outcome": "found",
+        "symbol": symbol,
+        "revision": "rift://revision/cargo/crates.io/demo@1.1.0",
+        "declarations": [],
+        "pagination": {"page": 1, "pages": 0, "max_results": 10, "total": 0},
+        "history": {
+            "symbol": PACKAGE_ID,
+            "edges": [
+                {"edge": "removed_in_release", "revision": "rift://revision/cargo/crates.io/demo@2.0.0"},
+                {
+                    "edge": "changed_in_release",
+                    "revision": "rift://revision/cargo/crates.io/demo@1.1.0",
+                    "change": "signature_changed"
+                },
+                {"edge": "introduced_in_release", "revision": "rift://revision/cargo/crates.io/demo@1.0.0"}
+            ],
+            "complete": true
+        }
+    })
+}
+
+#[test]
+fn release_history_round_trips_in_the_served_schema() {
+    let requested = SymbolId::parse(PACKAGE_ID).expect("valid fixture");
+    let found = released_symbol();
+    let schema = serde_json::to_value(schemars::schema_for!(GetSymbolResult)).expect("schema");
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    assert!(validator.is_valid(&found), "{found}");
+    let result: GetSymbolResult = serde_json::from_value(found.clone()).expect("valid fixture");
+    assert!(result.is_valid_for(&requested));
+    assert_eq!(serde_json::to_value(&result).expect("valid fixture"), found);
+    let GetSymbolResult::Found {
+        history: Some(read),
+        ..
+    } = &result
+    else {
+        panic!("found answer carries its history");
+    };
+    let versions: Vec<_> = read
+        .edges
+        .iter()
+        .filter_map(|edge| edge.release()?.release_version())
+        .collect();
+    assert_eq!(versions, ["2.0.0", "1.1.0", "1.0.0"]);
+}
+
+#[test]
+fn release_history_answers_only_for_its_package_owner() {
+    let requested = SymbolId::parse(PACKAGE_ID).expect("valid fixture");
+    let altered = |member: &str, value: Value| {
+        let mut altered = released_symbol();
+        altered["history"][member] = value;
+        serde_json::from_value::<GetSymbolResult>(altered)
+            .map(|result| result.is_valid_for(&requested))
+    };
+    let other_owner = json!([{"edge": "introduced_in_release", "revision": "rift://revision/cargo/crates.io/other@1.0.0"}]);
+    assert!(
+        !altered("edges", other_owner).expect("valid fixture"),
+        "a release of another owner"
+    );
+    let commit = json!([{"edge": "introduced_in", "commit": {
+        "revision": COMMIT_REVISION,
+        "path": "src/lib.rs",
+        "timestamp": "2026-08-17T09:41:05+00:00",
+        "author": {"name": "Alice", "email": "alice@example.com"}
+    }}]);
+    assert!(
+        !altered("edges", commit).expect("valid fixture"),
+        "a commit edge for a package"
+    );
+    assert!(
+        !altered(
+            "symbol",
+            json!("rift://symbol/cargo/crates.io/demo/rust/demo/stop")
+        )
+        .expect("valid fixture"),
+        "a history of another symbol"
+    );
+    assert!(
+        !altered(
+            "co_changes_truncated",
+            json!({"commits_past_bound": 1, "symbols_past_bound": 0})
+        )
+        .expect("valid fixture"),
+        "a package history counts no co-changes"
+    );
+    let commit_form = json!([{"edge": "introduced_in_release", "revision": COMMIT_REVISION}]);
+    assert!(
+        !altered("edges", commit_form).expect("valid fixture"),
+        "a release edge naming a commit"
+    );
+    let commit_field = json!([{"edge": "introduced_in_release", "commit": COMMIT_REVISION}]);
+    assert!(
+        altered("edges", commit_field).is_err(),
+        "a release edge carries `revision`"
+    );
+}
+
+#[test]
+fn a_project_history_carries_no_release_edge() {
+    let project = SymbolId::parse(ID).expect("valid fixture");
+    let mut local = released_symbol();
+    local["symbol"]["id"] = json!(ID);
+    local["revision"] = json!(COMMIT_REVISION);
+    local["history"]["symbol"] = json!(ID);
+    assert!(
+        !serde_json::from_value::<GetSymbolResult>(local.clone())
+            .expect("valid fixture")
+            .is_valid_for(&project)
+    );
+    local["history"]["edges"] = json!([]);
+    assert!(
+        serde_json::from_value::<GetSymbolResult>(local)
+            .expect("valid fixture")
+            .is_valid_for(&project)
+    );
+}

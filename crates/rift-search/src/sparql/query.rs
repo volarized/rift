@@ -30,6 +30,12 @@ pub struct GraphQuery {
 }
 
 impl GraphQuery {
+    /// Renders the admitted algebra with normalized SPARQL syntax.
+    #[must_use]
+    pub fn normalized_text(&self) -> String {
+        self.query.to_string()
+    }
+
     /// Parses `text` and refuses what the graph does not serve.
     ///
     /// Parsing runs on the query thread, after a count of every opening bracket and operator
@@ -91,19 +97,30 @@ impl GraphQuery {
         self
     }
 
-    /// Whether an incomplete flow producer can contribute positive solution rows.
+    /// Whether each row this SELECT returns from partially covered facts still holds.
+    ///
+    /// Joins, projections, ordering, distinct, slicing, and filters or bindings over one
+    /// row's values only keep or combine rows the covered facts support, so every returned
+    /// row stands. Anything else - an `OPTIONAL`, a negation, an `EXISTS`, an aggregate - can
+    /// answer differently once the missing facts join, so such a query needs complete coverage.
     #[must_use]
-    pub fn projects_flow_rows(&self) -> bool {
+    pub fn admits_partial_rows(&self) -> bool {
         use spargebra::algebra::QueryExpression;
 
         let Query::Select(query) = self.query() else {
             return false;
         };
+        let row_expressions_only = self.admission().embedded_patterns == 0;
         let mut pending = vec![&query.expression];
         // Admission bounds the number and depth of patterns inspected here.
         while let Some(expression) = pending.pop() {
             match expression {
                 QueryExpression::Bgp { .. } => {}
+                QueryExpression::Filter { inner, .. } | QueryExpression::Extend { inner, .. }
+                    if row_expressions_only =>
+                {
+                    pending.push(inner);
+                }
                 QueryExpression::Join { left, right } => {
                     pending.extend([left.as_ref(), right.as_ref()]);
                 }
@@ -311,6 +328,41 @@ mod tests {
         for (text, expected) in cases {
             let query = GraphQuery::parse(text, &limits).expect("valid query");
             assert_eq!(query.admits_partial_witness(), expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_select_that_only_joins_projects_orders_or_slices_admits_partial_rows() {
+        let limits = GraphLimits::default();
+        let cases = [
+            ("SELECT ?s WHERE { ?s a :Symbol }", true),
+            ("SELECT ?s ?t WHERE { ?s :calls ?t }", true),
+            (
+                "SELECT DISTINCT ?name WHERE { ?s :calls ?t . ?t :name ?name } ORDER BY ?name LIMIT 2",
+                true,
+            ),
+            (
+                "SELECT ?s WHERE { ?s a :Symbol; :name ?name FILTER(STRSTARTS(?name, 'a')) }",
+                true,
+            ),
+            ("SELECT (COUNT(?t) AS ?n) WHERE { ?s :calls ?t }", false),
+            (
+                "SELECT ?s WHERE { ?s a :Symbol FILTER EXISTS { ?s :calls ?t } }",
+                false,
+            ),
+            (
+                "SELECT ?s WHERE { ?s a :Symbol FILTER NOT EXISTS { ?caller :calls ?s } }",
+                false,
+            ),
+            (
+                "SELECT ?s ?t WHERE { ?s a :Symbol OPTIONAL { ?s :calls ?t } }",
+                false,
+            ),
+            ("ASK { ?s :calls ?t }", false),
+        ];
+        for (text, expected) in cases {
+            let query = GraphQuery::parse(text, &limits).expect("valid query");
+            assert_eq!(query.admits_partial_rows(), expected, "{text}");
         }
     }
 

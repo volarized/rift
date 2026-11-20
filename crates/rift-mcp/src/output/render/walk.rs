@@ -302,6 +302,7 @@ fn lead_of(hop: &GraphHop) -> Result<Lead, TextError> {
         kinds,
         to: _,
         occurrence: _,
+        provider,
         derivation,
         confidence: _,
         producer,
@@ -334,7 +335,7 @@ fn lead_of(hop: &GraphHop) -> Result<Lead, TextError> {
         )
     });
     Ok(Lead {
-        text: format!("{BRANCH} {guess}{words}{produced}")
+        text: format!("{BRANCH} {guess}{words} [{}]{produced}", provider.as_ref())
             .trim_end()
             .to_owned(),
         by,

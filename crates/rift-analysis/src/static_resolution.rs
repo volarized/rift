@@ -150,6 +150,7 @@ pub(crate) fn resolve(
 struct Work {
     budget: LoopBudget,
     exhausted: bool,
+    python_depth: u8,
 }
 
 impl Work {
@@ -157,7 +158,19 @@ impl Work {
         Self {
             budget: LoopBudget::new(maximum),
             exhausted: false,
+            python_depth: 0,
         }
+    }
+
+    fn python_lookup<T>(&mut self, lookup: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
+        const DEPTH_MAX: u8 = 32;
+        if self.python_depth >= DEPTH_MAX {
+            return None;
+        }
+        self.python_depth += 1;
+        let result = lookup(self);
+        self.python_depth -= 1;
+        result
     }
 
     fn charge(&mut self) -> bool {
@@ -199,12 +212,17 @@ struct File<'source> {
     by_range: BTreeMap<ByteRange, Option<&'source SyntaxSymbol>>,
     by_qualified_name: BTreeMap<&'source str, Vec<&'source SyntaxSymbol>>,
     callables: EnclosingDefinitions<&'source SyntaxSymbol>,
+    classes: EnclosingDefinitions<&'source SyntaxSymbol>,
+    class_scopes: BTreeSet<ByteRange>,
     assignments: AssignmentTargets<'source>,
+    python_values: BTreeMap<u64, StaticBindingKind>,
+    python_calls: BTreeMap<u64, Vec<&'source StaticCall>>,
     declared_types: BTreeMap<ByteRange, Option<ByteRange>>,
     members: BTreeMap<ByteRange, Option<&'source rift_syntax::StaticMember>>,
     export_writes: BTreeMap<javascript_exports::ExportSlot<'source>, Option<u64>>,
     member_writes: BTreeMap<(ByteRange, Option<&'source str>), Option<u64>>,
     unknown_member_writes: BTreeSet<Option<&'source str>>,
+    conditions: Vec<(ByteRange, Option<bool>)>,
 }
 
 #[derive(Default)]
@@ -251,6 +269,7 @@ impl<'source> File<'source> {
     fn new(
         document: &'source StaticSource<'source>,
         facts: &'source StaticFacts,
+        configuration: Option<&crate::analyzer::namespace::RustConfiguration<'_>>,
         work: &mut Work,
     ) -> Option<Self> {
         let mut file = Self {
@@ -260,13 +279,28 @@ impl<'source> File<'source> {
             by_range: BTreeMap::new(),
             by_qualified_name: BTreeMap::new(),
             callables: EnclosingDefinitions::new([]),
+            classes: EnclosingDefinitions::new([]),
+            class_scopes: BTreeSet::new(),
             assignments: AssignmentTargets::default(),
+            python_values: BTreeMap::new(),
+            python_calls: BTreeMap::new(),
             declared_types: BTreeMap::new(),
             members: BTreeMap::new(),
             export_writes: BTreeMap::new(),
             member_writes: BTreeMap::new(),
             unknown_member_writes: BTreeSet::new(),
+            conditions: Vec::new(),
         };
+        for item in facts.conditional_items() {
+            if !work.charge() {
+                return None;
+            }
+            file.conditions.push((
+                item.range,
+                file.text(item.attribute)
+                    .and_then(|text| configuration?.attribute(text)),
+            ));
+        }
         file.index_bindings(work)?;
         file.index_symbols(work)?;
         file.index_javascript_members(work)?;
@@ -278,8 +312,31 @@ impl<'source> File<'source> {
             if !work.charge() {
                 return None;
             }
+            if self.inactive(binding.name, work) {
+                continue;
+            }
             let name = self.text(binding.name)?;
             self.by_name.entry(name).or_default().push(binding);
+            match binding.kind {
+                StaticBindingKind::PythonAnnotation { .. }
+                | StaticBindingKind::PythonFunction { .. }
+                | StaticBindingKind::PythonAlias { .. }
+                | StaticBindingKind::PythonInstance { .. } => {
+                    self.python_values.insert(binding.name.end, binding.kind);
+                }
+                _ => {}
+            }
+        }
+        if self.document.facts.language().name == "python" {
+            for call in self.facts.calls() {
+                if !work.charge() {
+                    return None;
+                }
+                self.python_calls
+                    .entry(call.range.start)
+                    .or_default()
+                    .push(call);
+            }
         }
         for &(name, annotation) in self.facts.declared_types() {
             if !work.charge() {
@@ -301,7 +358,12 @@ impl<'source> File<'source> {
 
     fn index_symbols(&mut self, work: &mut Work) -> Option<()> {
         let mut callables = Vec::new();
+        let mut classes = Vec::new();
+        let python = self.document.facts.language().name == "python";
         for symbol in self.document.facts.symbols() {
+            if self.inactive(symbol.item_range, work) {
+                continue;
+            }
             if !work.charge() {
                 return None;
             }
@@ -327,6 +389,10 @@ impl<'source> File<'source> {
                     .and_modify(|entry| *entry = None)
                     .or_insert(Some(symbol));
             }
+            if python && symbol.kinds.contains(&SymbolKind::Constructible) {
+                self.class_scopes.insert(symbol.item_range);
+                classes.push((symbol.range.start, symbol.range.end, symbol));
+            }
             if symbol.kinds.contains(&SymbolKind::Callable) {
                 callables.push((symbol.range.start, symbol.range.end, symbol));
             }
@@ -338,6 +404,7 @@ impl<'source> File<'source> {
             }
         }
         self.callables = EnclosingDefinitions::new(callables);
+        self.classes = EnclosingDefinitions::new(classes);
         Some(())
     }
 
@@ -369,12 +436,25 @@ impl<'source> File<'source> {
 
     fn qualified_target(&self, name: &str) -> Option<Target<'source>> {
         let candidates = self.by_qualified_name.get(name)?;
-        if candidates.len() != 1 {
-            return None;
-        }
+        let language = self.document.facts.language().name.as_str();
+        let symbol = if language == "rust" {
+            let mut declarations = candidates
+                .iter()
+                .filter(|symbol| symbol.kind != "impl_item");
+            let selected = declarations.next().or_else(|| candidates.first())?;
+            if declarations.next().is_some() {
+                return None;
+            }
+            *selected
+        } else {
+            if language != "python" && candidates.len() != 1 {
+                return None;
+            }
+            *candidates.first()?
+        };
         Some(Target {
             file: self.document,
-            symbol: candidates[0],
+            symbol,
         })
     }
 
@@ -437,12 +517,6 @@ impl<'source> File<'source> {
             Some(_) => Binding::Blocked,
         }
     }
-
-    fn reassigned(&self, name: &str, member: Option<&str>) -> bool {
-        self.assignments.unknown
-            || self.assignments.names.contains(name)
-            || member.is_some_and(|member| self.assignments.members.contains(&(name, member)))
-    }
 }
 
 enum Binding<'source> {
@@ -458,6 +532,7 @@ struct Index<'source> {
     rust: rust::Namespaces<'source>,
     javascript: javascript::PackageModes<'source>,
     edge_python: python_edges::EdgePythonModules,
+    edge_python_classes: python_edges::ClassOrders<'source>,
     syntax_publication: rift_core::ProviderRevision,
     unavailable_sources: usize,
 }
@@ -470,6 +545,7 @@ impl<'source> Index<'source> {
         work: &mut Work,
     ) -> Option<Self> {
         let mut files = BTreeMap::new();
+        let configurations = crate::analyzer::namespace::RustConfigurations::new(namespace);
         let mut unavailable_sources = 0;
         for document in documents {
             if !work.charge() {
@@ -489,7 +565,12 @@ impl<'source> Index<'source> {
                 }
                 EMPTY_STATIC_FACTS.get_or_init(StaticFacts::default)
             };
-            let file = File::new(document, facts, work)?;
+            let file = File::new(
+                document,
+                facts,
+                Some(&configurations.file(document.path.as_str())),
+                work,
+            )?;
             if files.insert(document.path.as_str(), file).is_some() {
                 return None;
             }
@@ -499,20 +580,26 @@ impl<'source> Index<'source> {
         let javascript = javascript::PackageModes::new(namespace, &files, work)?;
         let provider = ProviderId::new(SYNTAX_PROVIDER_ID).ok()?;
         let syntax_publication = graph.publications().provider(&provider)?.revision();
-        Some(Self {
+        let mut index = Self {
             graph,
             provider,
             files,
             rust,
             javascript,
             edge_python,
+            edge_python_classes: python_edges::ClassOrders::default(),
             syntax_publication,
             unavailable_sources,
-        })
+        };
+        index.edge_python_classes = index.python_class_orders(work)?;
+        Some(index)
     }
 
     fn resolve_file(&self, file: &File<'source>, work: &mut Work, result: &mut StaticResolution) {
         for range in file.facts.unsupported_bindings() {
+            if file.inactive(*range, work) {
+                continue;
+            }
             if !work.charge() {
                 return;
             }
@@ -521,19 +608,13 @@ impl<'source> Index<'source> {
             }
         }
         for call in file.facts.calls() {
+            if file.inactive(call.range, work) {
+                continue;
+            }
             if !work.charge() {
                 return;
             }
-            let target = self.call_target(file, call, work);
-            let mut occurrence = target.and_then(|target| {
-                self.occurrence(
-                    file,
-                    call.range,
-                    call.callee_range,
-                    ReferenceRole::Call,
-                    target,
-                )
-            });
+            let mut occurrence = self.call_occurrence(file, call, work);
             if matches!(
                 file.document.facts.language().name.as_str(),
                 "javascript" | "typescript"
@@ -551,6 +632,9 @@ impl<'source> Index<'source> {
             result.record(occurrence);
         }
         for edge in file.facts.heritage_edges() {
+            if file.inactive(edge.from, work) {
+                continue;
+            }
             if !work.charge() {
                 return;
             }
@@ -558,12 +642,21 @@ impl<'source> Index<'source> {
             result.record(occurrence);
         }
         for binding in file.facts.bindings() {
+            if file.inactive(binding.name, work) {
+                continue;
+            }
             if !work.charge() {
                 return;
             }
             if let Some((range, target)) = self.import_target(file, binding, work) {
                 let occurrence = target.and_then(|target| {
-                    self.occurrence(file, range, range, ReferenceRole::Import, target)
+                    let mut occurrence =
+                        self.occurrence(file, range, range, ReferenceRole::Import, target)?;
+                    if file.document.facts.language().name == "python" {
+                        occurrence.edge_from =
+                            Some(self.python_identity(file, range, file.qualified_target(".")?)?);
+                    }
+                    Some(occurrence)
                 });
                 result.record(occurrence);
             }
@@ -574,12 +667,55 @@ impl<'source> Index<'source> {
         ) {
             self.javascript_edges(file, work, result);
         }
+        if file.document.facts.language().name == "python" {
+            self.python_references(file, work, result);
+        }
         if file.document.facts.language().name == "rust" {
             self.rust_references(file, work, result);
         }
         if !work.exhausted {
             result.analyzed_sources += 1;
         }
+    }
+
+    fn call_occurrence(
+        &self,
+        file: &File<'source>,
+        call: &StaticCall,
+        work: &mut Work,
+    ) -> Option<StaticOccurrence> {
+        let target = self.call_target(file, call, work)?;
+        let mut occurrence = self.occurrence(
+            file,
+            call.range,
+            call.callee_range,
+            ReferenceRole::Call,
+            target,
+        )?;
+        if file.document.facts.language().name == "python"
+            && let Some(caller) = file.enclosing_callable(call.range).or_else(|| {
+                file.classes
+                    .resolve(call.range.start, call.range.end)
+                    .map(|symbol| Target {
+                        file: file.document,
+                        symbol,
+                    })
+                    .or_else(|| file.qualified_target("."))
+            })
+        {
+            let caller = self.occurrence(
+                file,
+                call.range,
+                call.callee_range,
+                ReferenceRole::Call,
+                caller,
+            )?;
+            let NormalizedTarget::Symbol(caller) = caller.target else {
+                return None;
+            };
+            occurrence.edge_from = Some(caller);
+        }
+        Some(occurrence)
     }
 
     fn edge_heritage_occurrence(
@@ -648,12 +784,12 @@ impl<'source> Index<'source> {
                 export: Some(_), ..
             } => Some((binding.name, self.javascript_import(file, binding, work))),
             StaticBindingKind::RustUse { path } => Some((path, self.rust.import(file, path, work))),
-            StaticBindingKind::PythonImport {
-                export: Some(_), ..
-            } => Some((
-                binding.name,
-                self.edge_python_binding_target(file, binding, work),
-            )),
+            StaticBindingKind::PythonImport { .. } | StaticBindingKind::PythonModule { .. } => {
+                Some((
+                    binding.name,
+                    self.edge_python_binding_target(file, binding, work),
+                ))
+            }
             _ => None,
         }
     }

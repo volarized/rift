@@ -5,8 +5,8 @@ use rift_protocol::read::{Language, SourceUnitId, SymbolId, TextRange};
 
 use super::{
     GraphAnswer, GraphDataset, GraphDatasetBuilder, GraphFact, GraphLimits, GraphQuery, GraphTerm,
-    HistoryEvent, QueryCancellation, RevisionIri, SymbolRelation, SyntaxAddress, SyntaxFact,
-    SyntaxLocation,
+    HistoryEvent, QueryCancellation, RevisionIri, SymbolRelation, SymbolSelection, SyntaxAddress,
+    SyntaxFact, SyntaxLocation,
 };
 
 const MAIN: &str = "rift://symbol/local/rust/app/main";
@@ -756,4 +756,157 @@ fn test_graph_query_parse_refuses_inline_rows_joining_past_solution_bound() {
     let error = GraphQuery::parse(&joined, &limits).expect_err("121 joined inline rows pass 100");
     assert_eq!(error.slug(), errors::search::query_answer_limit::SLUG);
     assert!(error.to_string().contains("joined VALUES rows"), "{error}");
+}
+
+#[test]
+fn normalized_query_text_preserves_literals_and_normalizes_syntax() -> Result<(), RiftError> {
+    let limits = GraphLimits::default();
+    for text in [
+        "SELECT ?value { ?s :range [ :start ?value ] }",
+        "CONSTRUCT { [] :name ?name } { ?s :name ?name }",
+        "SELECT (COUNT(?s) AS ?count) { ?s a :Symbol }",
+        "SELECT ?value { VALUES ?value { 'a  b' } }",
+    ] {
+        let first = GraphQuery::parse(text, &limits)?;
+        let repeated = GraphQuery::parse(&format!("  {text}\n# page"), &limits)?;
+        assert_eq!(
+            first.normalized_text(),
+            repeated.normalized_text(),
+            "{text}"
+        );
+    }
+    let first = GraphQuery::parse("SELECT ?v { VALUES ?v { 'a  b' } }", &limits)?;
+    let changed = GraphQuery::parse("SELECT ?v { VALUES ?v { 'a b' } }", &limits)?;
+    assert_ne!(first.normalized_text(), changed.normalized_text());
+    Ok(())
+}
+
+#[test]
+fn semantic_inventory_requests_engine_types_and_heritage() {
+    let limits = GraphLimits::default();
+    for (predicate, selected) in [
+        ("hasType", "types"),
+        ("extends", "extends"),
+        ("implements", "implements"),
+    ] {
+        for query in [
+            format!("SELECT ?s ?t {{ ?s :{predicate} ?t }}"),
+            format!("SELECT ?s ?t {{ ?s :{predicate}+ ?t }}"),
+        ] {
+            let parsed = GraphQuery::parse(&query, &limits).expect("query");
+            let required = parsed.semantic_inventory().expect("inventory");
+            let enabled = match selected {
+                "types" => required.adjacency.type_uses,
+                "extends" => required.adjacency.heritage.extends,
+                _ => required.adjacency.heritage.implements,
+            };
+            assert!(enabled, "{query}: {required:?}");
+        }
+    }
+}
+
+#[test]
+fn history_queries_select_their_symbols_and_revision_facts() {
+    let limits = GraphLimits::default();
+    let id = "rift://symbol/local/rust/app/beacon";
+    for predicate in ["introducedIn", "changedIn", "removedIn"] {
+        let text =
+            format!("SELECT ?revision {{ <{id}> :{predicate} ?revision . ?revision a :Revision }}");
+        let query = GraphQuery::parse(&text, &limits).expect("history query parses");
+        assert_eq!(
+            query.history_selection(),
+            Some(SymbolSelection::Identified(id))
+        );
+        let text =
+            format!("SELECT ?revision {{ ?symbol :{predicate} ?revision . ?revision a :Commit }}");
+        let query = GraphQuery::parse(&text, &limits).expect("history inventory parses");
+        assert_eq!(query.history_selection(), Some(SymbolSelection::All));
+    }
+    let query = GraphQuery::parse(
+        "SELECT ?symbol { ?symbol a :Symbol; :name 'beacon'; :kind 'function'; :language 'rust'; :introducedIn ?revision }",
+        &limits,
+    )
+    .expect("named history parses");
+    assert_eq!(
+        query.history_selection(),
+        Some(SymbolSelection::Named("beacon"))
+    );
+    let query = GraphQuery::parse(
+        "ASK { ?symbol :name 'beacon' FILTER NOT EXISTS { ?symbol :removedIn ?revision } }",
+        &limits,
+    )
+    .expect("history absence parses");
+    assert_eq!(query.history_selection(), Some(SymbolSelection::All));
+    let query = GraphQuery::parse(
+        "SELECT ?symbol { ?symbol :introducedIn ?revision; :calls ?callee }",
+        &limits,
+    )
+    .expect("mixed facts parse");
+    assert_eq!(query.history_selection(), None);
+}
+
+#[test]
+fn history_projection_preserves_commit_and_release_events() {
+    use rift_protocol::read::{
+        CommitAuthor, HistoryChange, HistoryCommit, HistoryEdge, ProjectPath, SymbolHistory,
+    };
+    use rift_protocol::revision::Revision;
+
+    let commit = HistoryCommit {
+        revision: Revision::parse(COMMIT).expect("commit revision"),
+        path: ProjectPath("lib.rs".to_owned()),
+        timestamp: "2026-01-01T00:00:00Z".to_owned(),
+        summary: None,
+        author: CommitAuthor {
+            name: "Fixture".to_owned(),
+            email: "fixture@example.com".to_owned(),
+        },
+    };
+    let release = Revision::parse(RELEASE).expect("release revision");
+    let history = SymbolHistory {
+        symbol: symbol(MAIN),
+        edges: vec![
+            HistoryEdge::IntroducedIn {
+                commit: commit.clone(),
+            },
+            HistoryEdge::ChangedIn {
+                commit: commit.clone(),
+                change: HistoryChange::BodyChanged,
+            },
+            HistoryEdge::RemovedIn { commit },
+        ],
+        complete: true,
+        co_changes_truncated: None,
+    };
+    let released = SymbolHistory {
+        symbol: symbol("rift://symbol/cargo/crates.io/demo/rust/demo/main"),
+        edges: vec![
+            HistoryEdge::IntroducedInRelease {
+                revision: release.clone(),
+            },
+            HistoryEdge::ChangedInRelease {
+                revision: release.clone(),
+                change: HistoryChange::BodyChanged,
+            },
+            HistoryEdge::RemovedInRelease { revision: release },
+        ],
+        complete: true,
+        co_changes_truncated: None,
+    };
+    let mut dataset = GraphDataset::builder(GraphLimits::default());
+    dataset.insert_history(&history).expect("history projects");
+    dataset
+        .insert_history(&released)
+        .expect("release history projects");
+    let dataset = dataset.build();
+    for predicate in ["introducedIn", "changedIn", "removedIn"] {
+        let text = format!(
+            "SELECT ?revision {{ ?symbol :{predicate} ?revision . ?revision a :Revision }}"
+        );
+        assert_eq!(rows(&dataset, &text), vec![vec![RELEASE], vec![COMMIT]]);
+    }
+    assert_eq!(
+        rows(&dataset, "SELECT ?revision { ?revision a :Commit }"),
+        vec![vec![COMMIT]]
+    );
 }

@@ -224,6 +224,38 @@ pub struct SyntaxFacts {
     markdown_facts: Option<MarkdownFacts>,
     source_digest: Option<FileDigest>,
     syntax_limits: Option<crate::SyntaxLimits>,
+    invalid_declarations: InvalidDeclarations,
+}
+
+/// Parse-error validation of one facts value's declarations, answered once and kept.
+///
+/// A clone starts empty: a caller that copies facts through [`Arc::make_mut`] may change the
+/// declarations the copy holds, so the copy validates its own.
+#[derive(Debug, Default)]
+struct InvalidDeclarations(
+    std::sync::OnceLock<(
+        crate::SyntaxLimits,
+        Option<std::collections::BTreeSet<ByteRange>>,
+    )>,
+);
+
+impl Clone for InvalidDeclarations {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl InvalidDeclarations {
+    fn retained_bytes(&self) -> usize {
+        self.0
+            .get()
+            .and_then(|(_, invalid)| invalid.as_ref())
+            .map_or(0, |invalid| {
+                invalid
+                    .len()
+                    .saturating_mul(std::mem::size_of::<ByteRange>())
+            })
+    }
 }
 
 impl PartialEq for SyntaxFacts {
@@ -243,6 +275,7 @@ impl PartialEq for SyntaxFacts {
             markdown_facts,
             source_digest,
             syntax_limits,
+            invalid_declarations: _,
         } = self;
         *origin == other.origin
             && *language == other.language
@@ -454,6 +487,7 @@ impl SyntaxDocument {
                 markdown_facts: None,
                 source_digest: None,
                 syntax_limits: None,
+                invalid_declarations: InvalidDeclarations::default(),
             }),
         }
     }
@@ -678,6 +712,40 @@ impl SyntaxFacts {
         self.has_errors
     }
 
+    /// Item ranges of these facts' declarations that contain a parser error or sit inside an
+    /// error subtree, as [`crate::SyntaxProvider::invalid_declarations`] answers them.
+    ///
+    /// `source` must be the bytes these facts were parsed from. The first call under `limits`
+    /// parses `source` again; later calls under the same limits reuse that answer, so a pass
+    /// that runs on every index build validates a held file once. `None` is a refusal: no
+    /// provider for the language or a crossed syntax bound.
+    #[must_use]
+    pub fn invalid_declarations(
+        &self,
+        source: crate::SyntaxSource<'_>,
+        limits: crate::SyntaxLimits,
+    ) -> Option<std::collections::BTreeSet<ByteRange>> {
+        let validate = || {
+            let ranges = self
+                .symbols
+                .iter()
+                .map(|symbol| symbol.item_range)
+                .collect::<Vec<_>>();
+            crate::registry::provider_for_language(&self.language)?
+                .invalid_declarations(source, limits, &ranges)
+                .ok()
+        };
+        let (validated, invalid) = self
+            .invalid_declarations
+            .0
+            .get_or_init(|| (limits, validate()));
+        if *validated == limits {
+            invalid.clone()
+        } else {
+            validate()
+        }
+    }
+
     /// Returns Markdown block and inline facts when the Markdown provider produced them.
     #[must_use]
     pub const fn markdown_facts(&self) -> Option<&MarkdownFacts> {
@@ -747,6 +815,7 @@ impl SyntaxFacts {
             markdown_facts: parts.markdown_facts,
             source_digest: Some(parts.source_digest),
             syntax_limits: Some(limits),
+            invalid_declarations: InvalidDeclarations::default(),
         }
     }
 }

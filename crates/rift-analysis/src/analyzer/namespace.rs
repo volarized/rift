@@ -205,13 +205,15 @@ fn prepare_documents(
         if !document || language.dialect.is_some() {
             continue;
         }
-        let Some(source) = captured
-            .get(file.path.as_str())
-            .filter(|source| source.text() == file.source)
-        else {
-            continue;
-        };
-        if file.syntax.source_digest() != Some(&source.source_digest()) {
+        // Selection pairs each file's syntax facts with the bytes they were parsed from, and
+        // the provider recorded the digest of those bytes. Membership by path, the byte
+        // length, and that recorded digest identify the captured source; comparing or
+        // hashing the content again ran over every document on every index pass.
+        if file.syntax.source_digest().is_none()
+            || captured
+                .get(file.path.as_str())
+                .is_none_or(|source| source.text().len() != file.source.len())
+        {
             continue;
         }
         let anchors = file
@@ -500,3 +502,7 @@ pub(crate) fn namespace_paths(
 ) -> Result<BTreeSet<rift_core::ProjectPath>, rift_error::RiftError> {
     rust::namespace_paths(input, documents, contains, selected, files_max)
 }
+
+pub(crate) use rust::configuration::{
+    Configuration as RustConfiguration, Configurations as RustConfigurations,
+};

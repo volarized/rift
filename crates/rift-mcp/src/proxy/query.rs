@@ -1,16 +1,21 @@
 //! Routes graph queries and combines the existing project retrieval producers.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use rift_error::{RiftError, errors};
 use rift_protocol::identity::SymbolIdentity;
 use rift_protocol::query::{QueryAnswer, QueryParams, QueryReadResult, RdfTerm};
-use rift_protocol::read::{SearchParams, SearchParamsTarget, SearchResult, SearchScope, SymbolId};
+use rift_protocol::read::{
+    ReadWarning, SearchParams, SearchParamsTarget, SearchResult, SearchScope, SymbolId,
+};
+use rift_protocol::revision::Revision;
 use rift_protocol::search_read::{SearchReadResult, SearchUnavailable};
 use rift_protocol::symbol_read::{CapturedView, CapturedViewId, SymbolUnavailableReason};
 use rift_search::sparql::{GraphDataset, GraphLimits, GraphQuery, QueryCancellation};
+use rift_server::RetainedViewLimits;
 use rmcp::handler::server::tool::IntoCallToolResult as _;
 use rmcp::model::{CallToolRequestParams, CallToolResponse};
 
@@ -27,17 +32,68 @@ type Response = Result<CallToolResponse, rmcp::ErrorData>;
 #[derive(Debug)]
 pub(super) struct QueryRoutes {
     blocking: Arc<tokio::sync::Semaphore>,
+    /// Evaluated combined answers in least-recent-use order, oldest first.
+    retained: Mutex<Vec<RetainedAnswer>>,
+}
+
+/// One evaluated combined answer, keyed by its statement, selections, and revision.
+#[derive(Debug)]
+struct RetainedAnswer {
+    key: [u8; 32],
+    view: CapturedView,
+    expires: SystemTime,
+    bytes: Arc<[u8]>,
 }
 
 impl Default for QueryRoutes {
     fn default() -> Self {
         Self {
             blocking: Arc::new(tokio::sync::Semaphore::new(QUERY_WORKERS)),
+            retained: Mutex::new(Vec::new()),
         }
     }
 }
 
 impl QueryRoutes {
+    /// The unexpired answer `key` names, made the most recently used.
+    fn retained(&self, key: &[u8; 32], now: SystemTime) -> Option<(CapturedView, Arc<[u8]>)> {
+        let mut rows = self
+            .retained
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        rows.retain(|row| row.expires > now);
+        let position = rows.iter().position(|row| &row.key == key)?;
+        let row = rows.remove(position);
+        let found = (row.view.clone(), Arc::clone(&row.bytes));
+        rows.push(row);
+        Some(found)
+    }
+
+    /// Retains one answer, releasing the least recently used ones past the count or byte
+    /// bound. An answer larger than the byte bound alone is not retained.
+    fn retain(&self, answer: RetainedAnswer, limits: RetainedViewLimits, now: SystemTime) {
+        let bytes_max = limits.bytes_max();
+        if answer.bytes.len() > bytes_max {
+            return;
+        }
+        let mut rows = self
+            .retained
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        rows.retain(|row| row.expires > now && row.key != answer.key);
+        // Each retained row holds at most `bytes_max` bytes, so the sum stays bounded.
+        let mut retained: usize = rows.iter().map(|row| row.bytes.len()).sum();
+        while !rows.is_empty()
+            && (rows.len() >= limits.views_max()
+                || retained
+                    .checked_add(answer.bytes.len())
+                    .is_none_or(|size| size > bytes_max))
+        {
+            retained -= rows.remove(0).bytes.len();
+        }
+        rows.push(answer);
+    }
+
     async fn work<T: Send + 'static>(
         &self,
         work: impl FnOnce() -> Result<T, RiftError> + Send + 'static,
@@ -68,6 +124,20 @@ impl From<RiftError> for ProducerFailure {
 }
 
 impl RiftProxy {
+    /// Reads the primary project's accepted bounds on the existing query worker.
+    pub(super) async fn retention_limits(&self) -> Result<RetainedViewLimits, RiftError> {
+        let root = Arc::clone(&self.root);
+        self.query_routes
+            .work(move || {
+                Ok(RetainedViewLimits::from(
+                    &ConfigurationState::accept(&root)
+                        .search_configuration()
+                        .query,
+                ))
+            })
+            .await
+    }
+
     /// Uses the primary backend for ordinary queries. Explicit registered owners route
     /// to their project. The proxy evaluates retrieval spanning accepted projects.
     pub(super) async fn query_forward(
@@ -198,33 +268,40 @@ impl RiftProxy {
             params.max_results,
             rift_protocol::query::QUERY_MAX_RESULTS,
         )?;
-        let mut selected = Vec::new();
-        let mut bytes_left = limits.literal_bytes_max();
-        for service in query.retrieval_requests() {
-            let request = &service.request;
-            let producer = if request.pattern.is_some() && request.scope == SearchScope::All {
-                self.combined_pattern(request, limits).await
-            } else {
-                collect_retrieval(request.clone(), limits, ProducerFailure::from, |request| {
-                    self.query_producer(request)
-                })
-                .await
-            };
-            let result = match producer {
-                Ok(Ok(result)) => result,
-                Ok(Err(reason)) => return Ok(render(QueryReadResult::Unavailable(reason))),
-                Err(ProducerFailure::Forwarded(response)) => return Ok(*response),
-                Err(ProducerFailure::Internal(error)) => return Err(error),
-            };
-            let bytes = super::encode_bounded(&result, bytes_left)
-                .map_err(|_| query_failure("combined retrieval exceeds its byte bound"))?;
-            bytes_left -= bytes.len();
-            selected.push(result);
+        let paging = (params.page, params.max_results);
+        if let Some(requested) = &params.revision {
+            let key = answer_key(&query, params.language, requested)?;
+            if let Some((view, bytes)) = self.query_routes.retained(&key, SystemTime::now()) {
+                return self
+                    .retained_page(view, bytes, paging, requested.clone())
+                    .await;
+            }
         }
+        let selected = match self.collect_producers(&query, limits).await? {
+            Ok(selected) => selected,
+            Err(response) => return Ok(*response),
+        };
+        let revision = combined_revision(selected.iter().map(|result| result.revision.as_ref()))?;
+        if let Some(requested) = &params.revision
+            && revision.as_ref() != Some(requested)
+        {
+            return errors::server::read_revision_unserved()
+                .revision(requested.to_string())
+                .served(
+                    revision
+                        .as_ref()
+                        .map_or_else(|| "no revision".to_owned(), ToString::to_string),
+                )
+                .fail();
+        }
+        let key = revision
+            .as_ref()
+            .map(|revision| answer_key(&query, params.language, revision))
+            .transpose()?;
         let cancellation = QueryCancellation::new();
         let _guard = CancelQuery(cancellation.clone());
         let root = Arc::clone(&self.root);
-        let answer = self
+        let (mut answer, retained, retention) = self
             .query_routes
             .work(move || {
                 let configuration = ConfigurationState::accept(&root)
@@ -240,12 +317,25 @@ impl RiftProxy {
                         }
                     }
                 }
-                let answer = dataset.build().evaluate(&query, &cancellation)?.into();
+                let answer: QueryAnswer = dataset.build().evaluate(&query, &cancellation)?.into();
                 let view = proxy_view(selected.iter().filter_map(|result| result.view.as_ref()))?;
                 if cancellation.is_cancelled() {
                     return errors::search::query_cancelled().fail();
                 }
-                query_page(
+                let display = QueryDisplay::selected(&answer, query.presentation());
+                let retained = key
+                    .map(|key| {
+                        let bytes = serde_json::to_vec(&(&answer, &warnings, &display))
+                            .map_err(encoding_failure)?;
+                        Ok::<_, RiftError>(RetainedAnswer {
+                            key,
+                            expires: super::captured_expiry(&view)?,
+                            view: view.clone(),
+                            bytes: bytes.into(),
+                        })
+                    })
+                    .transpose()?;
+                let page = query_page(
                     &view,
                     &answer,
                     QueryPageOptions {
@@ -253,11 +343,90 @@ impl RiftProxy {
                         page: params.page,
                         max_results: params.max_results,
                         warnings,
-                        display: QueryDisplay::selected(&answer, query.presentation()),
+                        display,
+                    },
+                )?;
+                Ok((page, retained, RetainedViewLimits::from(&configuration)))
+            })
+            .await?;
+        if let Some(retained) = retained {
+            self.query_routes
+                .retain(retained, retention, SystemTime::now());
+        }
+        if let QueryReadResult::Results(result) = &mut answer.result {
+            result.revision = revision;
+        }
+        Ok(render(answer))
+    }
+
+    /// Reads every retrieval request of `query` from its producers, or the response that
+    /// ends the query early.
+    async fn collect_producers(
+        &self,
+        query: &GraphQuery,
+        limits: GraphLimits,
+    ) -> Result<Result<Vec<Box<SearchResult>>, Box<Response>>, RiftError> {
+        let mut selected = Vec::new();
+        let mut bytes_left = limits.literal_bytes_max();
+        for service in query.retrieval_requests() {
+            let request = &service.request;
+            let producer = if request.pattern.is_some() && request.scope == SearchScope::All {
+                self.combined_pattern(request, limits).await
+            } else {
+                collect_retrieval(request.clone(), limits, ProducerFailure::from, |request| {
+                    self.query_producer(request)
+                })
+                .await
+            };
+            let result = match producer {
+                Ok(Ok(result)) => result,
+                Ok(Err(reason)) => {
+                    return Ok(Err(Box::new(render(QueryReadResult::Unavailable(reason)))));
+                }
+                Err(ProducerFailure::Forwarded(response)) => return Ok(Err(response)),
+                Err(ProducerFailure::Internal(error)) => return Err(error),
+            };
+            let bytes = super::encode_bounded(&result, bytes_left)
+                .map_err(|_| query_failure("combined retrieval exceeds its byte bound"))?;
+            bytes_left -= bytes.len();
+            selected.push(result);
+        }
+        Ok(Ok(selected))
+    }
+
+    /// Pages a retained combined answer at the revision it was evaluated at.
+    async fn retained_page(
+        &self,
+        view: CapturedView,
+        bytes: Arc<[u8]>,
+        paging: (u64, u64),
+        revision: Revision,
+    ) -> Result<Response, RiftError> {
+        let root = Arc::clone(&self.root);
+        let mut answer = self
+            .query_routes
+            .work(move || {
+                let configuration = ConfigurationState::accept(&root)
+                    .search_configuration()
+                    .query;
+                let (answer, warnings, display): (QueryAnswer, Vec<ReadWarning>, QueryDisplay) =
+                    serde_json::from_slice(&bytes).map_err(encoding_failure)?;
+                query_page(
+                    &view,
+                    &answer,
+                    QueryPageOptions {
+                        configuration: &configuration,
+                        page: paging.0,
+                        max_results: paging.1,
+                        warnings,
+                        display,
                     },
                 )
             })
             .await?;
+        if let QueryReadResult::Results(result) = &mut answer.result {
+            result.revision = Some(revision);
+        }
         Ok(render(answer))
     }
 
@@ -272,6 +441,7 @@ impl RiftProxy {
         let mut results = Vec::new();
         let mut warnings = Vec::new();
         let mut views = Vec::new();
+        let mut revisions = Vec::new();
         let mut bytes_left = limits.literal_bytes_max();
         for (name, backend) in self.candidate_backends(request)? {
             let mut dispatched = request.clone();
@@ -304,6 +474,7 @@ impl RiftProxy {
                 }
             }
             views.extend(result.view);
+            revisions.push(result.revision);
         }
         crate::global::order_search_hits(&mut results, request.order);
         let limit = if request.max_results.is_some() || request.page != 1 {
@@ -314,7 +485,7 @@ impl RiftProxy {
         let (results, pagination) = crate::global::page_window(results, request.page, limit);
         Ok(Ok(Box::new(SearchResult {
             view: Some(proxy_view(views.iter())?),
-            revision: None,
+            revision: combined_revision(revisions.iter().map(Option::as_ref))?,
             results,
             pagination,
             warnings,
@@ -410,6 +581,52 @@ fn decode<T: serde::de::DeserializeOwned>(
     super::encode_bounded(value, crate::global::candidates::CANDIDATE_BYTES_MAX)
         .map_err(encoding_failure)?;
     serde_json::from_value(value.clone()).map_err(encoding_failure)
+}
+
+/// The revision one combined answer read: the revision every accepted project named when
+/// they share one, else a `tree` revision over the distinct revisions they named, which
+/// changes whenever one project's revision changes. Absent when a project named none.
+pub(super) fn combined_revision<'a>(
+    revisions: impl IntoIterator<Item = Option<&'a Revision>>,
+) -> Result<Option<Revision>, RiftError> {
+    use sha2::Digest as _;
+    let mut distinct = BTreeSet::new();
+    for revision in revisions {
+        let Some(revision) = revision else {
+            return Ok(None);
+        };
+        distinct.insert(revision.to_string());
+    }
+    if distinct.len() <= 1 {
+        return distinct
+            .first()
+            .map(|revision| Revision::parse(revision))
+            .transpose();
+    }
+    let mut digest = sha2::Sha256::new();
+    for revision in &distinct {
+        digest.update(revision.as_bytes());
+        digest.update(b"\n");
+    }
+    Revision::tree(&data_encoding::HEXLOWER.encode(&digest.finalize())).map(Some)
+}
+
+/// Names one combined answer by its normalized statement, language, retrieval selections,
+/// and revision.
+fn answer_key(
+    query: &GraphQuery,
+    language: rift_protocol::query::QueryLanguage,
+    revision: &Revision,
+) -> Result<[u8; 32], RiftError> {
+    use sha2::Digest as _;
+    let selected = query
+        .retrieval_requests()
+        .iter()
+        .map(|selection| &selection.request)
+        .collect::<Vec<_>>();
+    let bytes = serde_json::to_vec(&(query.normalized_text(), language, revision, selected))
+        .map_err(encoding_failure)?;
+    Ok(sha2::Sha256::digest(bytes).into())
 }
 
 fn proxy_view<'a>(

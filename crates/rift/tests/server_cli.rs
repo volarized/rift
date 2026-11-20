@@ -1262,8 +1262,9 @@ fn sigterm_flushes_the_otlp_export_before_the_process_exits() -> TestResult {
     Ok(())
 }
 
-/// A collector that accepts the connection and never answers costs the stop the export's
-/// reserve: the `otlp export` stage ends `timeout` at `warn`, and the process exits cleanly
+/// A stalled collector uses only the remaining stop budget.
+///
+/// The `otlp export` stage ends `timeout` at `warn`, and the process exits cleanly
 /// inside the stop bound.
 #[cfg(unix)]
 #[test]
@@ -1289,16 +1290,16 @@ fn a_stalled_collector_ends_the_export_stage_timeout_inside_the_stop_bound() -> 
     );
     assert!(
         elapsed <= STOP_EXIT_BOUND,
-        "the export stage holds the stop for its reserve alone: elapsed={elapsed:?}, bound={STOP_EXIT_BOUND:?}"
+        "the export stage uses only the remaining stop budget: elapsed={elapsed:?}, bound={STOP_EXIT_BOUND:?}"
     );
     assert_export_stage_outcome(&stderr, &["timeout"]);
     failure_window.passed();
     Ok(())
 }
 
-/// A collector that refuses the connection costs the stop at most the export's reserve: the
+/// A collector that refuses the connection costs at most the remaining stop budget. The
 /// exporter retries a refused export three times, 100 ms apart and doubling, so the stage
-/// ends `error` when the retries end inside the reserve and `timeout` when they do not,
+/// ends `error` when the retries end inside the budget and `timeout` when they do not,
 /// both at `warn`, and the process exits cleanly.
 #[cfg(unix)]
 #[test]

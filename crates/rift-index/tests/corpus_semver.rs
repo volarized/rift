@@ -61,15 +61,23 @@ fn test_semver_static_collection_floors() -> Result<(), Box<dyn std::error::Erro
     }
     for (kind, floor) in [
         (EdgeKind::Calls, 140),
-        (EdgeKind::Contains, 179),
-        (EdgeKind::Imports, 30),
-        (EdgeKind::HasType, 140),
+        (EdgeKind::Contains, 158),
+        (EdgeKind::Imports, 27),
+        (EdgeKind::HasType, 128),
         (EdgeKind::Reads, 125),
         (EdgeKind::Aliases, 1),
     ] {
         let count = pairs.get(&kind).map_or(0, BTreeSet::len);
         assert!(count >= floor, "{kind:?}: {count} < {floor}");
     }
+    assert!(
+        !index.edges().edges().any(|edge| edge
+            .occurrence()
+            .unit()
+            .to_string()
+            .ends_with("/src/serde.rs")),
+        "the default-disabled module must not contribute stored edges"
+    );
     assert!(index.edges().is_complete());
     assert_eq!(index.edges().dropped_edges(), 0);
     Ok(())

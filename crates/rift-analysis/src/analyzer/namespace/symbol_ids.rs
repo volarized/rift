@@ -181,6 +181,36 @@ fn valid_declarations_keep_ids_beside_parse_errors() {
 }
 
 #[test]
+fn python_module_keeps_id_with_broken_function() {
+    let path = "pkg/bad.py";
+    for text in ["def broken(: pass\n", "def broken(: pass"] {
+        let found = prepared(&[(path, text)], &[]);
+        assert_eq!(identity(&found, path, ".").qualified_path(), ["pkg", "bad"]);
+        assert!(!found.anchors[path].contains_key("broken"));
+    }
+}
+
+#[test]
+fn python_class_keeps_id_and_valid_methods_with_broken_method() {
+    let path = "pkg/bad.py";
+    let text = "class Container:\n    def ok(self):\n        pass\n    def broken(self,: pass\n    def fine(self):\n        pass\n";
+    let found = prepared(&[(path, text)], &[]);
+    for name in [".", "Container", "Container.ok", "Container.fine"] {
+        identity(&found, path, name);
+    }
+    assert!(!found.anchors[path].contains_key("Container.broken"));
+}
+
+#[test]
+fn python_declaration_inside_error_subtree_loses_id() {
+    let path = "pkg/bad.py";
+    let text = "else:\n    def broken():\n        pass\n";
+    let found = prepared(&[(path, text)], &[]);
+    identity(&found, path, ".");
+    assert!(!found.anchors[path].contains_key("broken"));
+}
+
+#[test]
 fn missing_container_token_keeps_valid_member_identity() {
     let found = prepared(&[("main.ts", "class Container { method() {}\n")], &[]);
     assert_eq!(
@@ -252,5 +282,20 @@ fn python_local_package_fallback_keeps_captured_roots_for_other_packages() {
     assert_eq!(
         identity(&found, "other/src/pkg/main.py", "beacon").qualified_path(),
         ["pkg", "main", "beacon"]
+    );
+}
+
+#[test]
+fn python_project_files_outside_distribution_keep_local_identity() {
+    let found = prepared(
+        &[("docs_src/tutorial.py", "class Item:\n    pass\n")],
+        &[(
+            "pyproject.toml",
+            "[build-system]\nrequires=['pdm-backend']\nbuild-backend='pdm.backend'\n[tool.pdm.build]\nsource-includes=['docs_src/']\n",
+        )],
+    );
+    assert_eq!(
+        identity(&found, "docs_src/tutorial.py", "Item").qualified_path(),
+        ["docs_src", "tutorial", "Item"]
     );
 }

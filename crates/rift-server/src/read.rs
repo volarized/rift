@@ -33,7 +33,9 @@ use crate::history::{StoredHistory, SymbolTimelines};
 mod canonical;
 mod facets;
 mod symbol;
-pub use canonical::{LocalSymbolViewInput, LocalSymbolViews};
+pub use canonical::{
+    InventoryCoverage, LocalSymbolViewInput, LocalSymbolViews, RetainedViewLimits,
+};
 
 /// Inputs for one cancellable current-tree read-service build.
 pub struct ReadServiceBuild<'a> {
@@ -350,8 +352,8 @@ impl ReadService {
             .items
             .into_iter()
             .filter_map(|recommendation| {
-                let crate::LspRecommendationStatus::Available { command, .. } =
-                    recommendation.status
+                let (crate::LspRecommendationStatus::Available { command, .. }
+                | crate::LspRecommendationStatus::Embedded { command, .. }) = recommendation.status
                 else {
                     return None;
                 };
@@ -380,27 +382,30 @@ impl ReadService {
         crate::map::build_preparation_map(source, text, self.revisions.wire_index_tree_revision())
     }
 
-    /// Whether static edge producers have complete captured identities and bounds.
+    /// Whether static edge producers completed captured sources within their bounds.
     ///
     /// # Errors
     /// Returns the captured identity directory failure.
     pub fn static_edges_complete(&self) -> Result<bool, RiftError> {
-        if !self.index.edges().is_complete() {
-            return Ok(false);
-        }
-        for file in self
+        Ok(self.index.edges().is_complete() && self.index.symbol_view()?.objects_complete())
+    }
+
+    /// Reports captured objects omitted from edges because their identities are unestablished.
+    #[must_use]
+    pub fn edge_identity_warning(&self) -> Option<ReadWarning> {
+        let omitted = self
             .index
-            .files()
-            .filter(|file| file.syntax().static_facts().is_some())
-        {
-            if !self
-                .index
-                .identity_coverage_complete(file.syntax().language())?
-            {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+            .normalized_graph()
+            .records()
+            .iter()
+            .filter(|object| object.identity().is_none())
+            .count();
+        (omitted > 0).then(|| ReadWarning::EdgeCoverageMissing {
+            kinds: Vec::new(),
+            detail: format!(
+                "captured objects without established identities: {omitted}; edge inventories omit these objects and retain edges between identified endpoints"
+            ),
+        })
     }
 
     /// Whether a configured engine serves a captured source language.
@@ -3044,7 +3049,7 @@ pub(crate) mod tests {
             "to": symbol.id,
             "kind": symbol.kind,
             "kinds": ["calls"],
-            "derivation": "syntax"
+            "provider": "static", "derivation": "syntax"
         });
         assert!(serde_json::from_value::<rift_protocol::read::Edge>(edge.clone()).is_ok());
         edge["to"] = json!(raw_address);

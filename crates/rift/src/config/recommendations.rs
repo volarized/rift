@@ -6,7 +6,10 @@ use std::path::Path;
 use rift_core::{LanguageFileSelections, SourceVisibility, TextFileInclusion};
 use rift_error::RiftError;
 use rift_index::{WorkspaceIndexLimits, WorkspaceSourcePolicy};
-use rift_protocol::configuration::{CONFIGURATION_FILE_BYTES_MAX, WorkspaceConfiguration};
+use rift_protocol::configuration::{
+    CONFIGURATION_FILE_BYTES_MAX, EmbeddedEngine, WorkspaceConfiguration,
+};
+use rift_protocol::read::SearchScope;
 use rift_server::{LspRecommendation, LspRecommendationInputs, LspRecommendationStatus};
 
 pub(super) fn recommend(root: &Path) -> Result<String, RiftError> {
@@ -87,18 +90,18 @@ fn render(root: &Path, recommendations: Vec<LspRecommendation>) -> Result<String
                 scope,
             } => {
                 let _ = writeln!(output, "  executable: {program}\n  {command}");
-                match scope {
-                    rift_protocol::read::SearchScope::ProfileLocal { name } => {
-                        let _ = writeln!(
-                            output,
-                            "  scope: local:{name}\n  primary source excludes this project folder"
-                        );
-                    }
-                    rift_protocol::read::SearchScope::NamedLocal { name } => {
-                        let _ = writeln!(output, "  scope: local@{name}");
-                    }
-                    _ => {}
-                }
+                write_scope(&mut output, &scope);
+            }
+            LspRecommendationStatus::Embedded {
+                engine,
+                command,
+                scope,
+            } => {
+                let engine = match engine {
+                    EmbeddedEngine::Ty => "ty",
+                };
+                let _ = writeln!(output, "  embedded engine: {engine}\n  {command}");
+                write_scope(&mut output, &scope);
             }
         }
         if output.len() as u64 > CONFIGURATION_FILE_BYTES_MAX {
@@ -112,6 +115,21 @@ fn render(root: &Path, recommendations: Vec<LspRecommendation>) -> Result<String
         output.push_str("no supported language server recommendations for visible project files");
     }
     Ok(output)
+}
+
+fn write_scope(output: &mut String, scope: &SearchScope) {
+    match scope {
+        SearchScope::ProfileLocal { name } => {
+            let _ = writeln!(
+                output,
+                "  scope: local:{name}\n  primary source excludes this project folder"
+            );
+        }
+        SearchScope::NamedLocal { name } => {
+            let _ = writeln!(output, "  scope: local@{name}");
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -326,6 +344,72 @@ mod tests {
         )?;
         let output = recommend(root.path())?;
         assert!(!output.contains("typescript in docs"), "{output}");
+        Ok(())
+    }
+
+    /// The embedded engine recommendation prints the engine, not an executable to install,
+    /// and its command writes `embedded` through `rift config set`. Regression for
+    /// "executable unavailable: ty; install it" beside the engine this build embeds.
+    #[test]
+    fn test_embedded_engine_recommendation_applies_without_an_executable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use clap::Parser as _;
+        let root = tempfile::tempdir()?;
+        std::fs::write(root.path().join("main.py"), "answer = 1\n")?;
+        let command = "rift config set '--language=python' '--lsp-embedded=ty'";
+        let output = render(
+            root.path(),
+            vec![rift_server::LspRecommendation {
+                language: "python".to_owned(),
+                root: ".".to_owned(),
+                origin: "main.py".to_owned(),
+                status: LspRecommendationStatus::Embedded {
+                    engine: EmbeddedEngine::Ty,
+                    command: command.to_owned(),
+                    scope: SearchScope::Local,
+                },
+            }],
+        )?;
+        assert_eq!(
+            output,
+            format!("python in .\n  origin: main.py\n  embedded engine: ty\n  {command}\n")
+        );
+        assert!(!output.contains("unavailable"), "{output}");
+        let cli = crate::Cli::try_parse_from([
+            "rift",
+            "config",
+            "set",
+            "--language=python",
+            "--lsp-embedded=ty",
+        ])?;
+        let Some(crate::CliCommand::Config { command }) = cli.command else {
+            panic!("config set command expected");
+        };
+        super::super::run(&command, root.path(), None)?;
+        let configured = rift_server::load_configuration(root.path())?;
+        let Some(rift_protocol::configuration::LanguageLspConfiguration::Inline(lsp)) =
+            &configured.languages["python"].lsp
+        else {
+            panic!("the command writes an inline lsp table");
+        };
+        assert_eq!(lsp.embedded, Some(EmbeddedEngine::Ty));
+        let configured = recommend(root.path())?;
+        assert!(
+            configured.contains("language server already configured"),
+            "{configured}"
+        );
+        assert!(
+            crate::Cli::try_parse_from([
+                "rift",
+                "config",
+                "set",
+                "--language=python",
+                "--lsp-embedded=ty",
+                "--lsp-package-manager=uv",
+            ])
+            .is_err(),
+            "one selection per language"
+        );
         Ok(())
     }
 

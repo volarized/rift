@@ -11,7 +11,63 @@ use sha2::{Digest as _, Sha256};
 use super::ReadService;
 
 const VIEW_LIFETIME: Duration = Duration::from_mins(15);
-const VIEW_SLOTS: usize = 256;
+// Released and expired keys stay recognizable up to the largest accepted view count,
+// `QUERY_RETAINED_VIEWS_MAX`, so a later read of one answers `view_expired` rather than
+// `view_context`. A test pins the two.
+const RELEASED_KEYS_MAX: usize = 4096;
+
+/// Count and material bounds on the views one store retains.
+///
+/// A capture past either bound releases the least recently used views first; only a view
+/// whose own material exceeds `bytes_max` is refused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetainedViewLimits {
+    views_max: usize,
+    bytes_max: usize,
+}
+
+impl RetainedViewLimits {
+    /// Bounds a store to `views_max` views holding at most `bytes_max` material together.
+    ///
+    /// # Panics
+    /// Panics when `views_max` is zero: a store that retains no view cannot answer a capture.
+    #[must_use]
+    #[track_caller]
+    pub fn new(views_max: usize, bytes_max: usize) -> Self {
+        assert!(
+            views_max > 0,
+            "a retained view store must admit at least one view: views_max={views_max}"
+        );
+        Self {
+            views_max,
+            bytes_max,
+        }
+    }
+
+    /// Most views the store retains at once.
+    #[must_use]
+    pub fn views_max(&self) -> usize {
+        self.views_max
+    }
+
+    /// Most material the retained views hold together.
+    #[must_use]
+    pub fn bytes_max(&self) -> usize {
+        self.bytes_max
+    }
+}
+
+impl From<&rift_protocol::query::QueryConfiguration> for RetainedViewLimits {
+    /// Reads the accepted `[search.query]` bounds; a bound past this platform's address
+    /// space saturates, since no allocation can reach it.
+    fn from(configuration: &rift_protocol::query::QueryConfiguration) -> Self {
+        let views_max = usize::try_from(configuration.retained_views)
+            .unwrap_or(usize::MAX)
+            .max(1);
+        let bytes_max = usize::try_from(configuration.retained_size.bytes()).unwrap_or(usize::MAX);
+        Self::new(views_max, bytes_max)
+    }
+}
 
 /// One immutable publication and its measured retained material.
 #[derive(Debug)]
@@ -21,19 +77,125 @@ pub struct LocalSymbolViewInput {
     pub ready: bool,
     /// Owning material charge, including retained source, facts and admitted caches.
     retained_bytes: usize,
+    query: Option<HeldQuery>,
+    expires: Option<SystemTime>,
+}
+
+/// How much of the selected captured symbol inventory one projection holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InventoryCoverage {
+    /// Every source selected for indexing contributed its declarations.
+    Complete,
+    /// Some selected sources are left out of the index or hold declarations without an
+    /// established identity; the captured warnings name them. Every projected fact stands.
+    Partial,
+}
+
+impl InventoryCoverage {
+    /// The coverage of two projections read together.
+    #[must_use]
+    pub const fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Complete, Self::Complete) => Self::Complete,
+            _ => Self::Partial,
+        }
+    }
 }
 
 impl LocalSymbolViewInput {
+    /// Projects selected symbols and their complete commit timelines.
+    ///
+    /// # Errors
+    /// Refuses unavailable history, incomplete timelines, and graph admission failures.
+    pub fn project_history(
+        &self,
+        reads: &ReadService,
+        selection: rift_search::sparql::SymbolSelection<'_>,
+        dataset: &mut rift_search::sparql::GraphDatasetBuilder,
+        cancellation: &rift_search::sparql::QueryCancellation,
+        deadline: std::time::Instant,
+    ) -> Result<(), RiftError> {
+        use rift_search::sparql::SymbolAddress;
+
+        if self.project_symbols(selection, dataset, cancellation, deadline)?
+            == InventoryCoverage::Partial
+        {
+            return errors::server::search_coverage_unavailable()
+                .operation("graph history acquisition")
+                .fail();
+        }
+        for symbol in self.material.index.unestablished_objects() {
+            check_graph_projection(cancellation, deadline)?;
+            let selected = match selection {
+                rift_search::sparql::SymbolSelection::All => true,
+                rift_search::sparql::SymbolSelection::Named(name) => symbol?.facts().name() == name,
+                rift_search::sparql::SymbolSelection::Identified(_) => false,
+            };
+            if selected {
+                return errors::server::search_coverage_unavailable()
+                    .operation("graph history identity acquisition")
+                    .fail();
+            }
+        }
+        let mut timelines = reads.symbol_timelines()?;
+        for (identity, symbol) in self.material.index.objects() {
+            check_graph_projection(cancellation, deadline)?;
+            let id = rift_protocol::read::SymbolId(identity.as_str().to_owned());
+            if !matches_symbol(
+                selection,
+                SymbolAddress::Established(&id),
+                symbol?.facts().name(),
+            ) {
+                continue;
+            }
+            let (bindings, _) = self.material.index.symbols_by_identity_page(
+                identity,
+                0,
+                reads.index.results_max(),
+            )?;
+            let history = timelines.symbol_timeline(&reads.index, &bindings, id)?;
+            if !history.complete {
+                return errors::server::search_coverage_unavailable()
+                    .operation("graph history acquisition")
+                    .fail();
+            }
+            dataset.insert_history(&history)?;
+        }
+        check_graph_projection(cancellation, deadline)
+    }
+
+    /// Attaches encoded query material to the existing view and byte bounds.
+    ///
+    /// The view expires no later than `expires` when supplied.
+    #[must_use]
+    pub fn with_query(
+        mut self,
+        key: [u8; 32],
+        bytes: Vec<u8>,
+        expires: Option<SystemTime>,
+    ) -> Self {
+        self.query = Some(HeldQuery {
+            key,
+            bytes: Arc::from(bytes),
+        });
+        self.expires = expires;
+        self
+    }
+
     /// Retains source bytes from the same request's admitted file selection.
     ///
     /// # Errors
     /// Refuses a different root, owner or captured file identity.
     pub fn with_sources(self, sources: &rift_index::WorkspaceIndex) -> Result<Self, RiftError> {
-        Ok(local_view_input(
-            Arc::new(self.material.index.with_sources(sources)?),
-            self.material.metadata.to_vec(),
-            self.ready,
-        ))
+        Ok(Self {
+            query: self.query,
+            expires: self.expires,
+            ..local_view_input(
+                Arc::new(self.material.index.with_sources(sources)?),
+                self.material.metadata.to_vec(),
+                self.ready,
+            )
+        })
     }
 
     /// Returns the warnings retained by this immutable input.
@@ -62,11 +224,11 @@ impl LocalSymbolViewInput {
         metadata.warnings.extend(warnings);
         let metadata = serde_json::to_vec(&metadata)
             .map_err(|error| material_error("capture read metadata", &error))?;
-        Ok(local_view_input(
-            Arc::clone(&self.material.index),
-            metadata,
-            self.ready,
-        ))
+        Ok(Self {
+            query: self.query,
+            expires: self.expires,
+            ..local_view_input(Arc::clone(&self.material.index), metadata, self.ready)
+        })
     }
 
     /// Reads the exact bytes of a physical occurrence in this publication.
@@ -81,7 +243,7 @@ impl LocalSymbolViewInput {
     /// Collects canonical declarations with source names for a bounded engine read.
     ///
     /// # Errors
-    /// Refuses incomplete source or identity coverage and a seed inventory above the bound.
+    /// Refuses incomplete source coverage and a seed inventory above the bound.
     pub fn semantic_seeds(
         &self,
         mut remaining: usize,
@@ -92,10 +254,7 @@ impl LocalSymbolViewInput {
                 .error()
         };
         let index = &self.material.index;
-        if !self.ready
-            || !index.objects_complete()
-            || index.unestablished_objects().next().is_some()
-        {
+        if !self.ready || !index.objects_complete() {
             return Err(unavailable());
         }
         let mut seeds = Vec::new();
@@ -111,15 +270,42 @@ impl LocalSymbolViewInput {
             remaining = remaining
                 .checked_sub(declarations)
                 .ok_or_else(unavailable)?;
-            if !index.identity_coverage_complete(object.facts().language()) {
-                return Err(unavailable());
-            }
             seeds.push(rift_protocol::read::SymbolId(id.as_str().to_owned()));
         }
         Ok(seeds)
     }
 
+    /// Collects every established canonical declaration for a captured inventory read,
+    /// with the coverage of the inventory they come from.
+    ///
+    /// A source left out of the index makes the inventory partial. Objects without
+    /// identities stay outside this selection; callers report their omission.
+    ///
+    /// # Errors
+    /// Returns the captured publication failure.
+    pub fn inventory_seeds(
+        &self,
+    ) -> Result<(Vec<rift_protocol::read::SymbolId>, InventoryCoverage), RiftError> {
+        let index = &self.material.index;
+        let coverage = if self.ready && index.objects_complete() {
+            InventoryCoverage::Complete
+        } else {
+            InventoryCoverage::Partial
+        };
+        let mut seeds = Vec::new();
+        for (id, object) in index.objects() {
+            object?;
+            seeds.push(rift_protocol::read::SymbolId(id.as_str().to_owned()));
+        }
+        Ok((seeds, coverage))
+    }
+
     /// Projects captured symbol facts for a query whose algebra requires only symbols.
+    ///
+    /// An identified symbol answers exactly or refuses: its absence is a claim only complete
+    /// coverage of its language makes. A named or whole inventory projects every captured
+    /// object and reports [`InventoryCoverage::Partial`] when some selected source is left
+    /// out of the index.
     ///
     /// # Errors
     /// Returns the captured publication failure or a graph admission refusal.
@@ -129,7 +315,7 @@ impl LocalSymbolViewInput {
         dataset: &mut rift_search::sparql::GraphDatasetBuilder,
         cancellation: &rift_search::sparql::QueryCancellation,
         deadline: std::time::Instant,
-    ) -> Result<(), RiftError> {
+    ) -> Result<InventoryCoverage, RiftError> {
         use rift_search::sparql::{GraphFact, RevisionIri, SymbolAddress, SymbolSelection};
 
         if !self.ready {
@@ -176,13 +362,14 @@ impl LocalSymbolViewInput {
                     .operation("graph symbol acquisition")
                     .fail();
             }
-            return check();
+            check()?;
+            return Ok(InventoryCoverage::Complete);
         }
-        if !index.objects_complete() {
-            return errors::server::search_coverage_unavailable()
-                .operation("graph symbol acquisition")
-                .fail();
-        }
+        let coverage = if index.objects_complete() {
+            InventoryCoverage::Complete
+        } else {
+            InventoryCoverage::Partial
+        };
         for (identity, symbol) in index.objects() {
             check()?;
             let identity = rift_protocol::read::SymbolId(identity.as_str().to_owned());
@@ -201,10 +388,12 @@ impl LocalSymbolViewInput {
                 SymbolAddress::Unestablished(contribution.reference()),
             )?;
         }
-        check()
+        check()?;
+        Ok(coverage)
     }
 
-    /// Projects the revision-pinned syntax read of each selected canonical declaration.
+    /// Projects the revision-pinned syntax read of each selected canonical declaration,
+    /// with the coverage [`Self::project_symbols`] reports for the selected symbols.
     ///
     /// # Errors
     /// Returns a syntax read or graph admission refusal before completing the projection.
@@ -215,11 +404,11 @@ impl LocalSymbolViewInput {
         dataset: &mut rift_search::sparql::GraphDatasetBuilder,
         cancellation: &rift_search::sparql::QueryCancellation,
         deadline: std::time::Instant,
-    ) -> Result<(), RiftError> {
+    ) -> Result<InventoryCoverage, RiftError> {
         use rift_protocol::read::{FacetsParams, SymbolId};
         use rift_search::sparql::SymbolAddress;
 
-        self.project_symbols(selection.symbols, dataset, cancellation, deadline)?;
+        let coverage = self.project_symbols(selection.symbols, dataset, cancellation, deadline)?;
         for (identity, symbol) in self.material.index.objects() {
             check_graph_projection(cancellation, deadline)?;
             let id = SymbolId(identity.as_str().to_owned());
@@ -252,7 +441,7 @@ impl LocalSymbolViewInput {
                 request.page += 1;
             }
         }
-        Ok(())
+        Ok(coverage)
     }
 
     /// Root of the immutable publication admitted by this input.
@@ -281,12 +470,21 @@ struct CapturedMetadata {
 }
 
 #[derive(Debug, Clone)]
+struct HeldQuery {
+    key: [u8; 32],
+    bytes: Arc<[u8]>,
+}
+
+#[derive(Debug, Clone)]
 struct HeldView {
     material: Arc<LocalSymbolMaterial>,
     ready: bool,
     retained_bytes: usize,
     view: CapturedView,
     expires: SystemTime,
+    query: Option<HeldQuery>,
+    /// Position of the last capture or read of this view in the store's use order.
+    used: u64,
 }
 
 #[derive(Debug, Default)]
@@ -294,6 +492,7 @@ struct State {
     views: BTreeMap<String, HeldView>,
     expired: BTreeSet<String>,
     serial: u64,
+    uses: u64,
 }
 
 impl State {
@@ -308,9 +507,50 @@ impl State {
             self.views.remove(&key);
             self.expired.insert(key);
         }
-        while self.expired.len() > VIEW_SLOTS {
+        self.bound_released_keys();
+    }
+
+    fn bound_released_keys(&mut self) {
+        while self.expired.len() > RELEASED_KEYS_MAX {
             self.expired.pop_first();
         }
+    }
+
+    /// Advances the use order; the counter saturates, which only ties the newest uses.
+    fn next_use(&mut self) -> u64 {
+        self.uses = self.uses.saturating_add(1);
+        self.uses
+    }
+
+    /// Releases the least recently used view other than `kept`, answering whether one was.
+    ///
+    /// One call scans every retained view once, at most `views_max` entries.
+    fn release_least_recent(&mut self, kept: Option<&str>) -> bool {
+        let Some(key) = self
+            .views
+            .iter()
+            .filter(|(key, _)| Some(key.as_str()) != kept)
+            .min_by_key(|(_, held)| held.used)
+            .map(|(key, _)| key.clone())
+        else {
+            return false;
+        };
+        self.views.remove(&key);
+        self.expired.insert(key);
+        self.bound_released_keys();
+        true
+    }
+
+    /// Material one view charges when it is the only one retained.
+    fn single_view_bytes(key: &str, held: &HeldView, bytes_max: usize) -> usize {
+        let mut alone = Self::default();
+        alone.views.insert(key.to_owned(), held.clone());
+        alone.admitted_material_bytes(bytes_max)
+    }
+
+    fn exceeds(&self, bytes_max: usize) -> bool {
+        let bytes = self.admitted_material_bytes(bytes_max);
+        bytes == usize::MAX || bytes > bytes_max
     }
 
     fn material_bytes(&self) -> usize {
@@ -339,6 +579,11 @@ impl State {
                 .saturating_add(std::mem::size_of::<HeldView>())
                 .saturating_add(held.view.id.get_heap_size())
                 .saturating_add(held.view.expires_at.capacity());
+            if let Some(query) = &held.query {
+                total = total
+                    .saturating_add(query.bytes.len())
+                    .saturating_add(2 * std::mem::size_of::<usize>());
+            }
             if charged.track(Arc::as_ptr(&held.material.index)) {
                 let bytes = if shared {
                     let (bytes, next) = held.material.index.as_ref().get_size_with_tracker(charged);
@@ -362,58 +607,70 @@ impl State {
 }
 
 /// Retains exact local read authority and continuations under count, byte and expiry bounds.
+///
+/// A capture past the count or byte bound releases the least recently used views; a later
+/// read of a released view answers `view_expired`, and a later query page evaluates again.
 #[derive(Debug)]
 pub struct LocalSymbolViews {
-    material_bytes_max: usize,
     service_key: [u8; 32],
     state: Mutex<State>,
 }
 
 impl LocalSymbolViews {
-    /// Creates a service-local authority store with a caller-owned material budget.
+    /// Creates a service-local authority store; each capture states its own bounds.
     #[must_use]
-    pub fn new(material_bytes_max: usize, service_key: [u8; 32]) -> Self {
+    pub fn new(service_key: [u8; 32]) -> Self {
         Self {
-            material_bytes_max,
             service_key,
             state: Mutex::new(State::default()),
         }
     }
 
-    /// Captures one exact publication, or refuses admission without discarding active views.
+    /// Captures one exact publication under `limits`, releasing least recently used views.
+    ///
+    /// Refuses admission, keeping every retained view, only when the publication's own
+    /// material exceeds the byte bound.
     ///
     /// # Errors
     /// Returns a registered read failure if the service-issued key cannot be constructed.
-    pub fn capture(&self, input: LocalSymbolViewInput) -> Result<Option<CapturedView>, RiftError> {
-        self.capture_at(input, SystemTime::now())
+    pub fn capture(
+        &self,
+        input: LocalSymbolViewInput,
+        limits: RetainedViewLimits,
+    ) -> Result<Option<CapturedView>, RiftError> {
+        self.capture_at(input, limits, SystemTime::now())
     }
 
     /// Captures a view only when the caller also admits its bounded response.
     ///
     /// The callback runs after material admission while the store is locked. It
-    /// must not call this store. Refusal removes only the newly captured view.
+    /// must not call this store. Refusal removes only the newly captured view; views
+    /// released to admit it stay released.
     ///
     /// # Errors
     /// Returns a registered read failure or the callback's registered error.
     pub fn capture_with(
         &self,
         input: LocalSymbolViewInput,
+        limits: RetainedViewLimits,
         admit: impl FnOnce(&CapturedView) -> Result<bool, RiftError>,
     ) -> Result<Option<CapturedView>, RiftError> {
-        self.capture_with_at(input, SystemTime::now(), admit)
+        self.capture_with_at(input, limits, SystemTime::now(), admit)
     }
 
     fn capture_at(
         &self,
         input: LocalSymbolViewInput,
+        limits: RetainedViewLimits,
         now: SystemTime,
     ) -> Result<Option<CapturedView>, RiftError> {
-        self.capture_with_at(input, now, |_| Ok(true))
+        self.capture_with_at(input, limits, now, |_| Ok(true))
     }
 
     fn capture_with_at(
         &self,
         input: LocalSymbolViewInput,
+        limits: RetainedViewLimits,
         now: SystemTime,
         admit: impl FnOnce(&CapturedView) -> Result<bool, RiftError>,
     ) -> Result<Option<CapturedView>, RiftError> {
@@ -422,55 +679,54 @@ impl LocalSymbolViews {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.expire(now);
-        if input.retained_bytes == 0 || state.views.len() == VIEW_SLOTS {
-            rift_tracing::warn!(
-                component = "server",
-                rows = state.views.len(),
-                views_max = VIEW_SLOTS,
-                incoming_bytes = input.retained_bytes,
-                index_bytes = input.material.index.retained_material_bytes(),
-                ready = input.ready,
-                bytes_max = self.material_bytes_max,
-                "retained read material exceeds the byte or view bound"
-            );
-            return Ok(None);
-        }
         let retained_bytes = input.retained_bytes;
         let index_bytes = input.material.index.retained_material_bytes();
         let ready = input.ready;
+        if retained_bytes == 0 {
+            refuse_material(&state, limits, retained_bytes, index_bytes, ready, 0);
+            return Ok(None);
+        }
         let id = self.next_key(&mut state)?;
         let expires = now
             .checked_add(VIEW_LIFETIME)
             .ok_or_else(|| invalid("view", "view expiry exceeds the clock bound"))?;
+        let expires = input
+            .expires
+            .map_or(expires, |provider| expires.min(provider));
         let view = CapturedView {
             id: CapturedViewId::parse(&id)?,
             expires_at: chrono::DateTime::<chrono::Utc>::from(expires).to_rfc3339(),
         };
-        state.views.insert(
-            id.clone(),
-            HeldView {
-                material: input.material,
-                ready: input.ready,
-                retained_bytes: input.retained_bytes,
-                view: view.clone(),
-                expires,
-            },
-        );
-        let material_bytes = state.admitted_material_bytes(self.material_bytes_max);
-        if material_bytes == usize::MAX || material_bytes > self.material_bytes_max {
-            rift_tracing::warn!(
-                component = "server",
-                rows = state.views.len(),
-                views_max = VIEW_SLOTS,
-                material_bytes,
-                incoming_bytes = retained_bytes,
-                index_bytes,
-                ready,
-                bytes_max = self.material_bytes_max,
-                "retained read material exceeds the byte or view bound"
-            );
-            state.views.remove(&id);
+        let held = HeldView {
+            material: input.material,
+            ready,
+            retained_bytes,
+            view: view.clone(),
+            expires,
+            query: input.query,
+            used: state.next_use(),
+        };
+        let alone = State::single_view_bytes(&id, &held, limits.bytes_max);
+        if alone == usize::MAX || alone > limits.bytes_max {
+            refuse_material(&state, limits, retained_bytes, index_bytes, ready, alone);
             return Ok(None);
+        }
+        let released = Self::admit_material(&mut state, &id, held, limits);
+        if state.exceeds(limits.bytes_max) {
+            // Every other view is released; the released keys alone push past the bound.
+            state.views.remove(&id);
+            refuse_material(&state, limits, retained_bytes, index_bytes, ready, alone);
+            return Ok(None);
+        }
+        if released > 0 {
+            rift_tracing::debug!(
+                component = "server",
+                released,
+                rows = state.views.len(),
+                views_max = limits.views_max,
+                bytes_max = limits.bytes_max,
+                "retained views released to admit a new view"
+            );
         }
         match admit(&view) {
             Ok(true) => {}
@@ -484,6 +740,51 @@ impl LocalSymbolViews {
             }
         }
         Ok(Some(view))
+    }
+
+    /// Reads encoded query material while its original view remains retained.
+    #[must_use]
+    pub fn query(&self, key: &[u8; 32]) -> Option<(CapturedView, Arc<[u8]>)> {
+        self.query_at(key, SystemTime::now())
+    }
+
+    fn query_at(&self, key: &[u8; 32], now: SystemTime) -> Option<(CapturedView, Arc<[u8]>)> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.expire(now);
+        let used = state.next_use();
+        // The configured view bound caps this lookup at `retained_views` entries.
+        state.views.values_mut().find_map(|held| {
+            let query = held.query.as_ref()?;
+            let selected = held.ready && &query.key == key;
+            selected.then(|| {
+                held.used = used;
+                (held.view.clone(), Arc::clone(&query.bytes))
+            })
+        })
+    }
+
+    /// Inserts `held` under `id`, releasing least recently used views past either bound.
+    ///
+    /// Returns the released count. At most every previously retained view is released, so
+    /// the loops run at most `views_max` times; each byte check costs one walk of the views.
+    fn admit_material(
+        state: &mut State,
+        id: &str,
+        held: HeldView,
+        limits: RetainedViewLimits,
+    ) -> usize {
+        let mut released = 0;
+        while state.views.len() >= limits.views_max && state.release_least_recent(None) {
+            released += 1;
+        }
+        state.views.insert(id.to_owned(), held);
+        while state.exceeds(limits.bytes_max) && state.release_least_recent(Some(id)) {
+            released += 1;
+        }
+        released
     }
 
     fn next_key(&self, state: &mut State) -> Result<String, RiftError> {
@@ -514,7 +815,13 @@ impl LocalSymbolViews {
         Ok(self.captured_view_at(&id, root, owner, SystemTime::now()))
     }
 
-    fn captured_view_at(
+    /// Returns the retained view `id` names as of `now`.
+    ///
+    /// # Errors
+    /// Returns `view_expired` for a view that expired by `now`, `view_context` for an unknown
+    /// view or another root or owner, and `index_preparing` for a view captured while the
+    /// index prepared.
+    pub fn captured_view_at(
         &self,
         id: &CapturedViewId,
         root: &Path,
@@ -537,7 +844,8 @@ impl LocalSymbolViews {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.expire(now);
-        let Some(held) = state.views.get(id.as_str()) else {
+        let used = state.next_use();
+        let Some(held) = state.views.get_mut(id.as_str()) else {
             return Err(if state.expired.contains(id.as_str()) {
                 SymbolUnavailableReason::ViewExpired
             } else {
@@ -550,8 +858,30 @@ impl LocalSymbolViews {
         if !held.ready {
             return Err(SymbolUnavailableReason::IndexPreparing);
         }
+        held.used = used;
         Ok(held.clone())
     }
+}
+
+fn refuse_material(
+    state: &State,
+    limits: RetainedViewLimits,
+    incoming_bytes: usize,
+    index_bytes: usize,
+    ready: bool,
+    view_bytes: usize,
+) {
+    rift_tracing::warn!(
+        component = "server",
+        rows = state.views.len(),
+        views_max = limits.views_max,
+        view_bytes,
+        incoming_bytes,
+        index_bytes,
+        ready,
+        bytes_max = limits.bytes_max,
+        "retained read material exceeds the byte bound"
+    );
 }
 
 fn invalid(field: &'static str, violation: &'static str) -> RiftError {
@@ -640,6 +970,8 @@ fn local_view_input(
         material,
         ready,
         retained_bytes,
+        query: None,
+        expires: None,
     }
 }
 

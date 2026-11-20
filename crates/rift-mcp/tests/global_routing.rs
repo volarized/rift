@@ -817,6 +817,90 @@ async fn a_package_symbol_read_names_the_release_the_workspace_pins() -> TestRes
     Ok(())
 }
 
+/// A package `get_symbol` read with `include.history` asks the global API for the history
+/// and answers the release edges it names, newest release first; a read without it carries
+/// no history.
+#[tokio::test]
+async fn a_package_symbol_history_names_the_releases_the_global_api_answers() -> TestResult {
+    let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n{DEMO_PACKAGE}",
+        fixture.endpoint
+    );
+    let workspace = served_dependent_workspace(Some(&configuration)).await?;
+    let (directory, client, server_task) = workspace.served;
+    let id = global_api::collected_identity(SymbolFixture::Valid, "beacon");
+    let read = call_tool(
+        &client,
+        "get_symbol",
+        json!({"id": id, "include": {"history": true}}),
+    )
+    .await?;
+    assert_eq!(read["outcome"], "found", "{read:#}");
+    assert_eq!(read["history"]["symbol"], id, "{read:#}");
+    assert_eq!(
+        read["history"]["edges"],
+        json!([
+            {
+                "edge": "changed_in_release",
+                "revision": "rift://revision/cargo/crates.io/demo@1.0.0",
+                "change": "body_changed"
+            },
+            {"edge": "introduced_in_release", "revision": global_api::INTRODUCING_RELEASE}
+        ]),
+        "{read:#}"
+    );
+    let asked = fixture
+        .requests()
+        .await
+        .into_iter()
+        .filter(|request| request.uri.ends_with("/v1/symbols"))
+        .filter_map(|request| request.body)
+        .map(|body| body["include"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(asked, [json!({"history": true})]);
+    let without = call_tool(&client, "get_symbol", json!({"id": id})).await?;
+    assert!(without.get("history").is_none(), "{without:#}");
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// #751: package history predicates name the collected releases.
+#[tokio::test]
+async fn a_package_history_query_reads_release_edges() -> TestResult {
+    let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n{DEMO_PACKAGE}",
+        fixture.endpoint
+    );
+    let workspace = served_dependent_workspace(Some(&configuration)).await?;
+    let (_directory, client, server_task) = workspace.served;
+    let id = global_api::collected_identity(SymbolFixture::Valid, "beacon");
+    for (predicate, revision) in [
+        ("introducedIn", global_api::INTRODUCING_RELEASE),
+        ("changedIn", "rift://revision/cargo/crates.io/demo@1.0.0"),
+    ] {
+        let text = format!("SELECT ?release {{ <{id}> :{predicate} ?release }}");
+        let request = tool_request("search", &json!({"query": text}));
+        let answer = call_retrying_acceptance(&client, request).await?;
+        assert_eq!(answer["answer"]["result"], "bindings", "{answer}");
+        assert_eq!(
+            answer["answer"]["bindings"],
+            json!([
+                {"release": {"type": "iri", "value": revision}}
+            ]),
+            "{answer}"
+        );
+    }
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
 /// Package and project facets use the same shape. Their syntax elements share declaration
 /// ordinals, indexes, kinds, and source, and differ in the unit and offsets that locate them.
 #[tokio::test]

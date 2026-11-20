@@ -19,6 +19,23 @@ pub enum SymbolSelection<'query> {
     Identified(&'query str),
 }
 
+#[derive(Clone, Debug, Default)]
+pub(super) struct HistoryRequirements {
+    pub(super) required: bool,
+    pub(super) supported: bool,
+}
+
+impl HistoryRequirements {
+    pub(super) fn include_patterns(&mut self, patterns: &[TriplePattern]) {
+        self.required |= patterns.iter().any(history_property);
+        self.supported &= history_patterns(patterns).is_some_and(|selection| match selection {
+            SymbolSelection::Identified(id) => rift_protocol::identity::SymbolIdentity::parse(id)
+                .is_ok_and(|id| id.owner().is_local()),
+            _ => true,
+        });
+    }
+}
+
 /// Captured syntax elements for the selected physical declarations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SyntaxSelection<'query> {
@@ -88,6 +105,21 @@ impl AdjacencySelection {
 }
 
 impl GraphQuery {
+    /// Selects symbols whose commit or release history the query requires.
+    #[must_use]
+    pub fn history_selection(&self) -> Option<SymbolSelection<'_>> {
+        if !self.admission().history.required {
+            return None;
+        }
+        if let QueryExpression::Bgp { patterns } = query_pattern(self) {
+            return history_patterns(patterns);
+        }
+        self.admission()
+            .history
+            .supported
+            .then_some(SymbolSelection::All)
+    }
+
     /// Whether a positive witness alone establishes this ASK answer.
     #[must_use]
     pub fn admits_partial_witness(&self) -> bool {
@@ -248,6 +280,7 @@ impl GraphQuery {
         let (edges, details): (Vec<_>, Vec<_>) = triples
             .into_iter()
             .partition(|edge| property(edge).and_then(kind).is_some());
+        let details = edge_details(&edges, &details)?;
         let (symbol_details, syntax_elements) = endpoint_details(&edges, &details)?;
         let mut selected = adjacency_patterns(&edges).or_else(|| layered_patterns(&edges))?;
         selected.symbol_details = symbol_details;
@@ -285,6 +318,38 @@ fn query_pattern(query: &GraphQuery) -> &QueryExpression {
             _ => return expression,
         };
     }
+}
+
+fn edge_details<'query>(
+    edges: &[&TriplePattern],
+    details: &[&'query TriplePattern],
+) -> Option<Vec<&'query TriplePattern>> {
+    let mut remaining = Vec::new();
+    for &detail in details {
+        let describes_edge = details.iter().any(|from| {
+            property(from) == Some("from")
+                && from.subject == detail.subject
+                && details.iter().any(|to| {
+                    property(to) == Some("to")
+                        && to.subject == from.subject
+                        && edges
+                            .iter()
+                            .any(|edge| edge.subject == from.object && edge.object == to.object)
+                })
+        });
+        if describes_edge {
+            if !matches!(
+                property(detail),
+                Some("from" | "to" | "provider" | "kinds" | "derivation" | "kind")
+            ) && !is_class(detail, "Edge")
+            {
+                return None;
+            }
+        } else {
+            remaining.push(detail);
+        }
+    }
+    Some(remaining)
 }
 
 fn endpoint_details(
@@ -737,6 +802,66 @@ pub(super) fn symbol_patterns(patterns: &[TriplePattern]) -> Option<SymbolSelect
 
 fn is_symbol_class(pattern: &TriplePattern) -> bool {
     is_class(pattern, "Symbol")
+}
+
+pub(super) fn history_property(pattern: &TriplePattern) -> bool {
+    matches!(
+        property(pattern),
+        Some("introducedIn" | "changedIn" | "removedIn")
+    )
+}
+
+pub(super) fn history_patterns(patterns: &[TriplePattern]) -> Option<SymbolSelection<'_>> {
+    if !patterns.iter().any(|pattern| {
+        history_property(pattern) || is_class(pattern, "Revision") || is_class(pattern, "Commit")
+    }) {
+        return symbol_patterns(patterns);
+    }
+    let symbols: Vec<_> = patterns
+        .iter()
+        .filter(|pattern| {
+            !history_property(pattern)
+                && !is_class(pattern, "Revision")
+                && !is_class(pattern, "Commit")
+        })
+        .cloned()
+        .collect();
+    symbol_patterns(&symbols)?;
+    let mut subjects = Vec::new();
+    let mut name = None;
+    for pattern in patterns {
+        if is_class(pattern, "Revision") || is_class(pattern, "Commit") {
+            continue;
+        }
+        subjects.push(&pattern.subject);
+        if property(pattern) == Some("name")
+            && let TermPattern::Literal(value) = &pattern.object
+        {
+            name = Some(value.value());
+        }
+    }
+    let single_subject = subjects
+        .first()
+        .is_some_and(|first| subjects.iter().all(|subject| subject == first));
+    let mut identity = None;
+    for subject in subjects {
+        let TermPattern::NamedNode(subject) = subject else {
+            continue;
+        };
+        let parsed = rift_protocol::identity::SymbolIdentity::parse(subject.as_str()).ok()?;
+        if !single_subject && !parsed.owner().is_local() {
+            return None;
+        }
+        identity = Some(subject.as_str());
+    }
+    Some(if single_subject {
+        identity.map_or_else(
+            || name.map_or(SymbolSelection::All, SymbolSelection::Named),
+            SymbolSelection::Identified,
+        )
+    } else {
+        SymbolSelection::All
+    })
 }
 
 fn is_class(pattern: &TriplePattern, name: &str) -> bool {

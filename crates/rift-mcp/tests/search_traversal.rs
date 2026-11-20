@@ -84,7 +84,7 @@ async fn search_traversal_neighbors_depth_one_reaches_the_direct_callers() -> Te
         &client,
         tool_request(
             "search_retrieval",
-            &json!({ "traversal": { "seed": captured_seed(&client, "leaf", "graph.py").await? } }),
+            &json!({ "traversal": { "seed": captured_seed(&client, "leaf", "graph.py").await?, "kinds": ["calls"] } }),
         ),
     )
     .await?;
@@ -127,6 +127,7 @@ async fn search_traversal_impact_incoming_depth_two_reaches_every_caller() -> Te
                 "traversal": {
                     "seed": captured_seed(&client, "leaf", "graph.py").await?,
                     "direction": "incoming",
+                    "kinds": ["calls"],
                     "depth": 2
                 }
             }),
@@ -732,6 +733,26 @@ async fn live_walk(
     Err(format!("{label} never answered {expected:?}").into())
 }
 
+/// Incoming neighbors retain one caller-to-target edge, followed against its direction.
+fn assert_direct_incoming(answer: &Value, seed: &str) -> TestResult {
+    for hit in results(answer) {
+        assert_eq!(hit["distance"], json!(1), "{hit}");
+        let path = hit["traversal_path"]
+            .as_array()
+            .ok_or("an incoming neighbor carries its path")?;
+        assert_eq!(path.len(), 1, "{hit}");
+        let hop = &path[0];
+        assert_eq!(hop["direction"], "incoming", "{hit}");
+        assert_eq!(
+            hop["edge"]["from"], hit["hit"]["symbol"]["id"],
+            "the reached declaration holds the reference: {hit}"
+        );
+        assert_eq!(hop["edge"]["to"], seed, "{hit}");
+        eprintln!("live incoming edge: {hop}");
+    }
+    Ok(())
+}
+
 /// Reads the established seed from the captured fixture before the first engine walk.
 async fn live_seed(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
@@ -774,6 +795,7 @@ const LIVE_WALK_ATTEMPTS_MAX: usize = 10;
 /// opens only through the server's feed. `beacon` becomes `beacon2` in hub.rs, below a
 /// new `helper`, and caller.rs gains `again`. The outgoing walk from `larger` opens only
 /// walk.rs, and the incoming read of `beacon2` opens only hub.rs.
+/// Incoming walks also reach `caller` and `walk` through their module-scope imports.
 #[tokio::test]
 async fn live_rust_analyzer_walks_answer_a_rename_in_an_unopened_file() -> TestResult {
     if !live_engine_gate::engine_live() {
@@ -809,14 +831,15 @@ async fn live_rust_analyzer_walks_answer_a_rename_in_an_unopened_file() -> TestR
         json!(2),
         "`max` and `len` sit in the standard library: {answer}"
     );
-    live_walk(
+    let (_, incoming) = live_walk(
         &client,
         "incoming before",
         &beacon,
         "incoming",
-        &["larger", "total"],
+        &["caller", "larger", "total", "walk"],
     )
     .await?;
+    assert_direct_incoming(&incoming, &beacon)?;
     eprintln!("live: warm after {:?}", started.elapsed());
 
     std::fs::write(
@@ -841,14 +864,15 @@ async fn live_rust_analyzer_walks_answer_a_rename_in_an_unopened_file() -> TestR
         live_walk(&client, "outgoing after", &larger, "outgoing", &["beacon2"]).await?;
     eprintln!("live: outgoing fresh after {:?}", edited.elapsed());
     let beacon2 = live_seed(&client, "beacon2", "rust").await?;
-    let (incoming, _) = live_walk(
+    let (incoming, answer) = live_walk(
         &client,
         "incoming after",
         &beacon2,
         "incoming",
-        &["again", "larger", "total"],
+        &["again", "caller", "larger", "total", "walk"],
     )
     .await?;
+    assert_direct_incoming(&answer, &beacon2)?;
     eprintln!("live: incoming fresh after {:?}", edited.elapsed());
     assert_eq!(
         (outgoing, incoming),
@@ -1241,7 +1265,7 @@ async fn search_traversal_outgoing_drops_a_standard_library_callee_and_walks_a_c
             "search_retrieval",
             &json!({
                 "traversal": {
-                    "seed": captured_seed(&client, "Holder", "extra.py").await?, "direction": "outgoing"
+                    "seed": captured_seed(&client, "Holder", "extra.py").await?, "direction": "outgoing", "kinds": ["calls"]
                 }
             }),
         ),
@@ -2127,7 +2151,7 @@ async fn search_traversal_outgoing_over_an_unavailable_global_api_drops_package_
 }
 
 /// An unnamed runtime target does not invalidate a separately established local call.
-/// Complete lists and negative answers still require the missing provider coverage.
+/// Partial rows name missing provider coverage; negative answers still require it.
 #[tokio::test]
 async fn search_calls_prove_local_witness_when_a_runtime_target_has_no_collection() -> TestResult {
     let configuration = format!("[global]\nenabled = false\n{OUTGOING_ENGINE}");
@@ -2152,8 +2176,26 @@ async fn search_calls_prove_local_witness_when_a_runtime_target_has_no_collectio
             "{answer}"
         );
     }
+    let rows = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "search",
+            &json!({"query":format!("SELECT ?t {{ <{caller}> :calls ?t }}")}),
+        ),
+    )
+    .await?;
+    assert_eq!(
+        rows["answer"]["bindings"],
+        json!([{"t":{"type":"iri","value":leaf}}]),
+        "{rows}"
+    );
+    assert!(
+        rows["warnings"].as_array().is_some_and(|warnings| warnings
+            .iter()
+            .any(|warning| warning["code"] == "edge_coverage_missing")),
+        "{rows}"
+    );
     for query in [
-        format!("SELECT ?t {{ <{caller}> :calls ?t }}"),
         format!("ASK {{ <{caller}> :calls <rift://symbol/local/python/absent> }}"),
         format!("ASK {{ <{caller}> :calls ?t FILTER NOT EXISTS {{ ?t :calls ?other }} }}"),
     ] {

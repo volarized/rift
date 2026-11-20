@@ -126,6 +126,35 @@ fn exact_answer_enforces_projection_and_declaration_bounds() {
 }
 
 #[test]
+fn requested_history_names_releases_of_the_symbol_owner() {
+    let mut request = request();
+    request.include.history = true;
+    let with_history = |edges: Value| {
+        let mut value = serde_json::to_value(found(Vec::new())).expect("found");
+        value["history"] = json!({"symbol": ID, "edges": edges, "complete": false});
+        serde_json::from_value::<GetSymbolResult>(value).expect("found with history")
+    };
+    let releases = json!([
+        {"edge": "changed_in_release", "revision": RELEASE, "change": "body_changed"},
+        {"edge": "introduced_in_release", "revision": "rift://revision/cargo/crates.io/tokio@1.49.0"}
+    ]);
+    assert!(valid_result(&request, &with_history(releases.clone()), 100));
+    assert!(
+        !valid_result(&request, &found(Vec::new()), 100),
+        "a found answer to a history request carries the history"
+    );
+    let foreign = json!([
+        {"edge": "introduced_in_release", "revision": "rift://revision/cargo/crates.io/other@1.0.0"}
+    ]);
+    assert!(!valid_result(&request, &with_history(foreign), 100));
+    request.include.history = false;
+    assert!(
+        !valid_result(&request, &with_history(releases), 100),
+        "history rides only a request that asks for it"
+    );
+}
+
+#[test]
 fn request_rejects_local_owners_revision_and_malformed_continuation() {
     let local: GetSymbolParams = serde_json::from_value(json!({
         "id": "rift://symbol/local/rust/Beacon"

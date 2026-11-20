@@ -1306,7 +1306,7 @@ fn resolution(
     )
     .expect("fixture namespace");
     let mut namespaces = prepare_context(&input, &selected);
-    let placed = selected
+    let mut placed = selected
         .iter()
         .map(|source| PlacedFacts {
             facts: source.syntax,
@@ -1327,6 +1327,27 @@ fn resolution(
                 ),
         })
         .collect::<Vec<_>>();
+    if language.name == "rust" {
+        let placements = placed
+            .iter()
+            .map(|placed| &placed.placement)
+            .collect::<Vec<_>>();
+        let mut aliases = crate::analyzer::namespace::placed_aliases(
+            &input,
+            &mut namespaces,
+            &selected,
+            &placements,
+            1024,
+            || panic!("invalid fixture export"),
+        )
+        .expect("fixture aliases");
+        for placed in &mut placed {
+            placed.placement = placed
+                .placement
+                .clone()
+                .with_aliases(aliases.remove(placed.path.as_str()).unwrap_or_default());
+        }
+    }
     let semantics = WorkspaceSemantics::build_facts_placed(&placed, 1024, 7, None)
         .expect("fixture graph")
         .semantics;
@@ -1653,6 +1674,502 @@ fn rust_shadowed_value_and_conditional_module_do_not_reach_decoys() {
 }
 
 #[test]
+fn test_python_static_receiver_depth_declines_without_blocking_later_reads() {
+    let deep = ".again()".repeat(40);
+    let source = format!(
+        "class Value:\n    count: int\n    def again(self) -> 'Value': return self\ndef deep(value: Value): return value{deep}.count\ndef short(value: Value): return value.again().count\n"
+    );
+    let result = resolution("python", &[("main.py", &source)], &[], WORK_MAX * 100);
+    let reads = result
+        .occurrences
+        .iter()
+        .filter(|edge| {
+            edge.role == ReferenceRole::Read
+                && edge.edge_kind.is_none()
+                && target(edge) == "rift://symbol/local/python/main/Value/count"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(reads.len(), 1, "{result:?}");
+    assert_eq!(
+        reads[0].edge_from.as_ref().map(rift_core::SymbolId::as_str),
+        Some("rift://symbol/local/python/main/short")
+    );
+    assert!(!result.exhausted, "{result:?}");
+}
+
+#[test]
+fn test_python_static_inherited_fields_keep_assigned_receiver_types() {
+    let source = "class Value:\n    count: int\nclass Base:\n    value: object\nclass Middle(Base):\n    def __init__(self): self.value = Value()\nclass Child(Middle):\n    def __init__(self): self.value = Value()\n    def read(self):\n        alias = self.value\n        return self.value.count + alias.count\nclass GrandChild(Child):\n    def read(self): return self.value.count\n";
+    let result = resolution("python", &[("main.py", source)], &[], WORK_MAX);
+    let reads = result
+        .occurrences
+        .iter()
+        .filter(|edge| edge.role == ReferenceRole::Read && edge.edge_kind.is_none())
+        .map(target)
+        .collect::<Vec<_>>();
+    assert!(
+        reads.contains(&"rift://symbol/local/python/main/Base/value"),
+        "{result:?}"
+    );
+    assert_eq!(
+        reads
+            .iter()
+            .filter(|target| **target == "rift://symbol/local/python/main/Value/count")
+            .count(),
+        3,
+        "{result:?}"
+    );
+}
+
+#[test]
+fn test_python_static_checked_receivers_reject_shadowing_and_rebinding() {
+    let source = "class Value:\n    count: int\ndef valid(value):\n    if not isinstance(value, Value) or disabled:\n        return\n    value.count = 1\ndef changed(value):\n    if not isinstance(value, Value): return\n    value = unknown()\n    value.count = 1\ndef shadowed(value, isinstance):\n    if not isinstance(value, Value): return\n    value.count = 1\ndef nested(value):\n    if not isinstance(value, Value): return\n    def write(): value.count = 1\n";
+    let result = resolution("python", &[("main.py", source)], &[], WORK_MAX);
+    let writes = result
+        .occurrences
+        .iter()
+        .filter(|edge| edge.role == ReferenceRole::Write)
+        .map(target)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        writes,
+        ["rift://symbol/local/python/main/Value/count"],
+        "{result:?}"
+    );
+}
+
+#[test]
+fn test_python_static_alias_cycles_and_function_objects_remain_unresolved() {
+    let source = "class Value:\n    count: int\ndef build() -> Value: return Value()\ndef root(value: Value):\n    alias = value\n    alias.count = 1\n    build.count = 2\n    cyclic = cyclic.item\n    cyclic.count = 3\n    first = second\n    second = first\n    first.count = 4\n";
+    let result = resolution("python", &[("main.py", source)], &[], WORK_MAX);
+    let writes = result
+        .occurrences
+        .iter()
+        .filter(|edge| edge.role == ReferenceRole::Write)
+        .map(target)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        writes,
+        ["rift://symbol/local/python/main/Value/count"],
+        "{result:?}"
+    );
+    assert!(!result.exhausted, "{result:?}");
+}
+
+#[test]
+fn test_python_static_inherited_fields_keep_the_declared_base_target() {
+    let source = "class Base:\n    value: int\nclass Child(Base):\n    def __init__(self): self.value = 1\n    def read(self): return self.value\n";
+    let result = resolution("python", &[("main.py", source)], &[], WORK_MAX);
+    let accesses = result
+        .occurrences
+        .iter()
+        .filter(|edge| {
+            edge.edge_kind.is_none()
+                && matches!(edge.role, ReferenceRole::Read | ReferenceRole::Write)
+        })
+        .map(target)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        accesses, ["rift://symbol/local/python/main/Base/value"; 2],
+        "{result:?}"
+    );
+}
+
+#[test]
+fn test_python_static_aliases_and_return_annotations_resolve_members() {
+    let source = "class Value:\n    count: int\n    def run(self): pass\ndef build() -> Value | None: return None\ndef root():\n    first = build()\n    second = first\n    second.count = 1\n    second.run()\n    build().count = 2\n    return build().count\n";
+    let result = resolution("python", &[("main.py", source)], &[], WORK_MAX);
+    let writes = result
+        .occurrences
+        .iter()
+        .filter(|edge| edge.role == ReferenceRole::Write)
+        .map(target)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        writes, ["rift://symbol/local/python/main/Value/count"; 2],
+        "{result:?}"
+    );
+    assert!(
+        calls(&result, "main.py")
+            .any(|edge| target(edge) == "rift://symbol/local/python/main/Value/run"),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn test_python_static_module_aliases_and_instance_class_attributes() {
+    let result = resolution(
+        "python",
+        &[
+            (
+                "pkg/__init__.py",
+                "count = 0\nclass Value:\n    count = 0\n",
+            ),
+            (
+                "main.py",
+                "import pkg\nmodule = pkg\ndef root():\n    module.count = 1\n    value = pkg.Value()\n    alias = value\n    return alias.count\ndef nested():\n    class Base:\n        count = 0\n    class Child(Base):\n        count = 1\n    value = Child()\n    return value.count\n",
+            ),
+        ],
+        &[],
+        WORK_MAX,
+    );
+    assert!(
+        result
+            .occurrences
+            .iter()
+            .any(|edge| edge.role == ReferenceRole::Write
+                && target(edge) == "rift://symbol/local/python/pkg/count"),
+        "{result:?}"
+    );
+    assert!(
+        result
+            .occurrences
+            .iter()
+            .any(|edge| edge.role == ReferenceRole::Read
+                && edge.edge_kind.is_none()
+                && target(edge) == "rift://symbol/local/python/pkg/Value/count"),
+        "{result:?}"
+    );
+    assert!(
+        result
+            .occurrences
+            .iter()
+            .any(|edge| edge.role == ReferenceRole::Read
+                && edge.edge_kind.is_none()
+                && target(edge) == "rift://symbol/local/python/main/nested/Child/count"),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn test_python_static_imports_keep_submodules_and_captured_external_exports() {
+    let result = resolution(
+        "python",
+        &[
+            (
+                "main.py",
+                "from pkg import models\nfrom pkg.bridge import External\n",
+            ),
+            ("pkg/__init__.py", ""),
+            ("pkg/models.py", "class Value: pass\n"),
+            (
+                "pkg/bridge.py",
+                "from external import External as External\n",
+            ),
+        ],
+        &[],
+        WORK_MAX,
+    );
+    let imported = result
+        .occurrences
+        .iter()
+        .filter(|edge| {
+            edge.role == ReferenceRole::Import && edge.binding.unit().key().as_str() == "main.py"
+        })
+        .map(target)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        imported,
+        [
+            "rift://symbol/local/python/pkg/models",
+            "rift://symbol/local/python/pkg/bridge"
+        ],
+        "{result:?}"
+    );
+}
+
+#[test]
+fn test_python_static_reexports_keep_module_import_owners() {
+    let result = resolution(
+        "python",
+        &[
+            ("pkg/__init__.py", "from .models import Value as Value\n"),
+            ("pkg/models.py", "class Value: pass\n"),
+            ("main.py", "from pkg import Value\n"),
+        ],
+        &[],
+        WORK_MAX,
+    );
+    let imports = result
+        .occurrences
+        .iter()
+        .filter(|edge| edge.role == ReferenceRole::Import)
+        .collect::<Vec<_>>();
+    assert_eq!(imports.len(), 2, "{result:?}");
+    assert_eq!(
+        imports[1]
+            .edge_from
+            .as_ref()
+            .map(rift_core::SymbolId::as_str),
+        Some("rift://symbol/local/python/pkg")
+    );
+}
+
+#[test]
+fn test_python_static_super_calls_and_typed_parameters() {
+    let source = "class Base:\n    def __init__(self): pass\n    def run(self): pass\nclass Child(Base):\n    def __init__(self): super().__init__()\n    @classmethod\n    def build(cls): return cls()\n    @staticmethod\n    def invoke(value: Base): value.run()\ndef root(value: 'Base'):\n    value.run()\n";
+    let result = resolution("python", &[("main.py", source)], &[], WORK_MAX);
+    assert_eq!(
+        calls(&result, "main.py").map(target).collect::<Vec<_>>(),
+        [
+            "rift://symbol/local/python/main/Base/__init__",
+            "rift://symbol/local/python/main/Child",
+            "rift://symbol/local/python/main/Base/run",
+            "rift://symbol/local/python/main/Base/run",
+        ],
+        "{result:?}"
+    );
+}
+
+#[test]
+fn test_python_static_annotations_keep_values_and_reject_ambiguous_receivers() {
+    let source = "class Value:\n    count: int = 0\n    def run(self): pass\nclass Owner:\n    def __init__(self):\n        self.value: Value | None = None\n    def run(self):\n        self.value.run()\n        self.value.count += 1\ncurrent: Value\ndef root(value: Value | Owner, cyclic: cyclic):\n    value.run()\n    cyclic.run()\n    return current.count\n";
+    let result = resolution("python", &[("main.py", source)], &[], WORK_MAX);
+    assert_eq!(
+        calls(&result, "main.py").map(target).collect::<Vec<_>>(),
+        ["rift://symbol/local/python/main/Value/run"],
+        "{result:?}"
+    );
+    let reads = result
+        .occurrences
+        .iter()
+        .filter(|edge| edge.role == ReferenceRole::Read && edge.edge_kind.is_none())
+        .map(target)
+        .collect::<Vec<_>>();
+    assert!(
+        reads.contains(&"rift://symbol/local/python/main/Owner/value"),
+        "{reads:?}"
+    );
+    assert_eq!(
+        reads
+            .iter()
+            .filter(|target| **target == "rift://symbol/local/python/main/Value/count")
+            .count(),
+        2,
+        "{reads:?}"
+    );
+}
+
+#[test]
+fn test_python_static_super_rejects_shadowed_and_static_calls() {
+    let source = "class Base:\n    def run(self): pass\nclass Child(Base):\n    @staticmethod\n    def invalid(): super().run()\n    def shadowed(self, super): super().run()\n    def explicit(self): super(Child, self).run()\n    def rebound(self): self = None; super().run()\n    def valid(self): super( ).run()\n";
+    let result = resolution("python", &[("main.py", source)], &[], WORK_MAX);
+    assert_eq!(
+        calls(&result, "main.py").map(target).collect::<Vec<_>>(),
+        ["rift://symbol/local/python/main/Base/run"],
+        "{result:?}"
+    );
+}
+
+#[test]
+fn test_python_static_module_chains_and_decorated_calls_keep_their_owners() {
+    let source = "import pkg.handlers\nfrom pkg import leaf\nfirst = leaf()\nsecond = pkg.handlers.leaf()\nclass Owner:\n    value = leaf()\n";
+    let result = resolution(
+        "python",
+        &[
+            ("main.py", source),
+            ("pkg/__init__.py", "from .handlers import leaf as leaf\n"),
+            ("pkg/handlers.py", "@decorator\ndef leaf(): pass\n"),
+        ],
+        &[],
+        WORK_MAX,
+    );
+    let calls = calls(&result, "main.py").collect::<Vec<_>>();
+    assert_eq!(calls.len(), 3, "{result:?}");
+    for (call, owner) in calls.into_iter().zip(["main", "main", "main/Owner"]) {
+        assert_eq!(target(call), "rift://symbol/local/python/pkg/handlers/leaf");
+        assert_eq!(
+            call.edge_from.as_ref().map(rift_core::SymbolId::as_str),
+            Some(format!("rift://symbol/local/python/{owner}").as_str())
+        );
+    }
+}
+
+#[test]
+fn test_python_static_constructor_bindings_follow_named_members_only() {
+    let source = "class Value:\n    def run(self): pass\nclass Owner:\n    def __init__(self): self.value = Value()\n    def run(self): self.value.run()\ndef factory(): return Value()\ndef root():\n    value.run()\n    value = Value()\n    value.run()\n    unknown = factory()\n    unknown.run()\n    first, second = Value()\n    first.run()\n    second.run()\n";
+    let result = resolution("python", &[("main.py", source)], &[], WORK_MAX);
+    let methods = calls(&result, "main.py")
+        .filter(|call| target(call).ends_with("/run"))
+        .map(target)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        methods,
+        [
+            "rift://symbol/local/python/main/Value/run",
+            "rift://symbol/local/python/main/Value/run"
+        ],
+        "{result:?}"
+    );
+}
+
+#[test]
+fn test_python_calls_in_local_initializers_keep_the_enclosing_callable() {
+    let source = "def leaf(): return 1\ndef root():\n    value: int = leaf()\n    def nested():\n        other = leaf()\n    return leaf()\n";
+    let result = resolution("python", &[("main.py", source)], &[], WORK_MAX);
+    let callers = calls(&result, "main.py")
+        .map(|call| call.edge_from.as_ref().map(rift_core::SymbolId::as_str))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        callers,
+        [
+            Some("rift://symbol/local/python/main/root"),
+            Some("rift://symbol/local/python/main/root/nested"),
+            Some("rift://symbol/local/python/main/root"),
+        ]
+    );
+}
+
+#[test]
+fn test_python_static_calls_resolve_receivers_constructors_and_reexports() {
+    let source = "from pkg import Derived\nimport pkg.models as models\ndef root():\n    Derived()\n    models.Derived()\n    Derived.create()\nclass Child(Derived):\n    def run(self):\n        self.base()\n        self.run()\n";
+    let result = resolution(
+        "python",
+        &[
+            ("main.py", source),
+            (
+                "pkg/__init__.py",
+                "from .models import Derived as Derived\n",
+            ),
+            (
+                "pkg/models.py",
+                "class Base(External):\n    def base(self): pass\nclass Derived(Base):\n    @staticmethod\n    def create(): pass\n",
+            ),
+        ],
+        &[],
+        WORK_MAX,
+    );
+    assert_eq!(calls(&result, "main.py").count(), 5, "{result:?}");
+}
+
+#[test]
+fn test_python_static_contains_accesses_overrides_and_type_usage() {
+    use rift_protocol::read::EdgeKind;
+    let source = "import models\nclass Base:\n    value: int = 0\n    def run(self): pass\nclass Child(Base):\n    def run(self, value: models.Value) -> models.Value:\n        self.value = value\n        self.value += 1\n        return models.current\n";
+    let result = resolution(
+        "python",
+        &[
+            ("main.py", source),
+            ("models.py", "class Value: pass\ncurrent: Value\n"),
+        ],
+        &[],
+        WORK_MAX,
+    );
+    for (kind, minimum) in [
+        (EdgeKind::Contains, 7),
+        (EdgeKind::Reads, 2),
+        (EdgeKind::Writes, 2),
+        (EdgeKind::Overrides, 1),
+        (EdgeKind::HasType, 3),
+        (EdgeKind::Imports, 1),
+    ] {
+        let count = result
+            .occurrences
+            .iter()
+            .filter(|occurrence| {
+                occurrence.edge_kind.unwrap_or(match occurrence.role {
+                    ReferenceRole::Read => EdgeKind::Reads,
+                    ReferenceRole::Write => EdgeKind::Writes,
+                    ReferenceRole::Type => EdgeKind::HasType,
+                    ReferenceRole::Import => EdgeKind::Imports,
+                    _ => EdgeKind::References,
+                }) == kind
+            })
+            .count();
+        assert!(count >= minimum, "{kind:?}: {count}; {result:?}");
+    }
+}
+
+#[test]
+fn test_python_static_bindings_keep_lexical_scopes_and_class_order() {
+    let source = "def leaf(): pass\ndef run():\n    first, second = (1, 2)\n    values = [leaf() for item in []]\n    leaf()\nclass Root:\n    def run(self): pass\nclass Left(Root): pass\nclass Right(Root):\n    def run(self): pass\nclass Child(Left, Right):\n    def run(  # type: ignore\n        self): self.run(); self.other()\n    def other(self): leaf()\n    @staticmethod\n    def static(self): self.run()\n";
+    let result = resolution("python", &[("main.py", source)], &[], WORK_MAX);
+    let targets = calls(&result, "main.py").map(target).collect::<Vec<_>>();
+    assert_eq!(
+        targets,
+        [
+            "rift://symbol/local/python/main/leaf",
+            "rift://symbol/local/python/main/leaf",
+            "rift://symbol/local/python/main/Child/run",
+            "rift://symbol/local/python/main/Child/other",
+            "rift://symbol/local/python/main/leaf",
+        ],
+        "{result:?}"
+    );
+    let overridden = result
+        .occurrences
+        .iter()
+        .filter(|edge| edge.edge_kind == Some(rift_protocol::read::EdgeKind::Overrides))
+        .map(target)
+        .collect::<Vec<_>>();
+    assert!(
+        overridden.contains(&"rift://symbol/local/python/main/Right/run"),
+        "{overridden:?}"
+    );
+}
+
+#[test]
+fn test_python_static_namespace_packages_and_forward_type_arguments() {
+    let source = "import pkg.models\nfrom pkg import models\nclass Child(pkg.models.Base[models.Value]):\n    def run(self, value: list['pkg.models.Value']) -> 'models.Value': pass\n";
+    let result = resolution(
+        "python",
+        &[
+            ("main.py", source),
+            ("pkg/models.py", "class Base: pass\nclass Value: pass\n"),
+        ],
+        &[],
+        WORK_MAX,
+    );
+    let types = result
+        .occurrences
+        .iter()
+        .filter(|edge| edge.role == ReferenceRole::Type && edge.edge_kind.is_none())
+        .map(target)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        types
+            .iter()
+            .filter(|id| **id == "rift://symbol/local/python/pkg/models/Value")
+            .count(),
+        3,
+        "{result:?}"
+    );
+    assert!(
+        result
+            .occurrences
+            .iter()
+            .any(|edge| edge.edge_kind == Some(rift_protocol::read::EdgeKind::Extends)),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn test_python_global_and_nonlocal_names_do_not_block_other_bindings() {
+    let source = "from jobs import leaf\ndef root():\n    active = False\n    def finish():\n        nonlocal active\n        active = True\n        leaf()\n    def send():\n        nonlocal active\n        finish()\n    def global_call():\n        global leaf\n        leaf()\n";
+    let result = resolution(
+        "python",
+        &[("main.py", source), ("jobs.py", "def leaf(): pass\n")],
+        &[],
+        WORK_MAX,
+    );
+    assert_eq!(calls(&result, "main.py").count(), 3, "{result:?}");
+}
+
+#[test]
+fn test_python_static_incomplete_bases_keep_only_the_first_base_member() {
+    let source = "class Root:\n    def inherited(self): pass\nclass Left(Root):\n    def own(self): pass\nclass Right(External): pass\nclass Child(Left, Right):\n    def run(self):\n        self.own()\n        self.inherited()\n";
+    let result = resolution("python", &[("main.py", source)], &[], WORK_MAX);
+    assert_eq!(
+        calls(&result, "main.py").map(target).collect::<Vec<_>>(),
+        ["rift://symbol/local/python/main/Left/own"]
+    );
+    assert!(!result.exhausted);
+    let exhausted = resolution("python", &[("main.py", source)], &[], 1);
+    assert!(exhausted.exhausted);
+    assert!(exhausted.occurrences.is_empty());
+}
+
+#[test]
 fn test_rust_grouped_imports_and_known_receivers_resolve_calls() {
     let source = "mod jobs; use crate::jobs::{Task, leaf as run}; fn root(task: &Task) { run(); Task::new(); task.execute(); }";
     let result = resolution(
@@ -1866,5 +2383,338 @@ fn test_typescript_qualified_annotation_names_are_not_value_accesses() {
             )
             .count(),
         1
+    );
+}
+
+#[test]
+fn test_rust_trait_default_and_explicit_bounds_keep_source_and_identity() {
+    let source = "pub trait Count { fn remaining(&self) -> usize; fn get(&self) -> usize { self.remaining() } } pub fn generic<T: Count>(item: &T) -> usize { item.remaining() } pub fn bounded<T>(item: &T) -> usize where T: Count { item.remaining() }";
+    let result = resolution(
+        "rust",
+        &[("src/lib.rs", source)],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    let resolved = calls(&result, "src/lib.rs")
+        .map(|edge| (source_of(edge, source), target(edge)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        resolved,
+        [
+            (
+                "self.remaining()",
+                "rift://symbol/local/rust/fixture/Count/remaining"
+            ),
+            (
+                "item.remaining()",
+                "rift://symbol/local/rust/fixture/Count/remaining"
+            ),
+            (
+                "item.remaining()",
+                "rift://symbol/local/rust/fixture/Count/remaining"
+            )
+        ]
+    );
+}
+
+#[test]
+fn test_rust_bound_lookup_refuses_unknown_and_competing_traits() {
+    let source = "trait Count { fn remaining(&self); } trait Other { fn remaining(&self); } trait Marker {} fn unique<T: Marker + Count>(item: &T) { item.remaining(); } fn competing<T: Count + Other>(item: &T) { item.remaining(); } fn unknown<T: Count + missing::Other>(item: &T) { item.remaining(); } fn higher<T: Count + for<'a> missing::Other<'a>>(item: &T) { item.remaining(); } fn shadow<T: Count>(item: &T) { let item = 1; item.remaining(); }";
+    let result = resolution(
+        "rust",
+        &[("src/lib.rs", source)],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    let resolved = calls(&result, "src/lib.rs").collect::<Vec<_>>();
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(
+        target(resolved[0]),
+        "rift://symbol/local/rust/fixture/Count/remaining"
+    );
+    assert_eq!(
+        resolved[0].binding.range().start(),
+        u64::try_from(source.find("item.remaining()").expect("unique receiver")).expect("offset")
+    );
+}
+
+#[test]
+fn test_rust_default_feature_conditions_preserve_exact_call_source_and_target() {
+    let source = "#[cfg(feature=\"std\")] fn leaf() {} #[cfg(feature=\"off\")] fn inactive() { leaf(); } fn root() { leaf(); } #[cfg(unknown)] fn mystery() {} fn uncertain() { mystery(); }";
+    let manifest =
+        "[package]\nname='fixture'\nversion='0.1.0'\n[features]\ndefault=['std']\nstd=[]\noff=[]\n";
+    let result = resolution(
+        "rust",
+        &[("src/lib.rs", source)],
+        &[("Cargo.toml", manifest)],
+        WORK_MAX,
+    );
+    let found = calls(&result, "src/lib.rs").collect::<Vec<_>>();
+    assert_eq!(found.len(), 1);
+    assert_eq!(source_of(found[0], source), "leaf()");
+    assert_eq!(target(found[0]), "rift://symbol/local/rust/fixture/leaf");
+    assert_eq!(
+        found[0].binding.range().start(),
+        u64::try_from(source.rfind("leaf()").expect("active call")).expect("offset")
+    );
+}
+
+#[test]
+fn test_rust_unknown_import_does_not_establish_a_receiver_type() {
+    let source =
+        "mod known; #[cfg(unknown)] use crate::known::Item; fn root(item: &Item) { item.read(); }";
+    let result = resolution(
+        "rust",
+        &[
+            ("src/lib.rs", source),
+            (
+                "src/known.rs",
+                "pub struct Item; impl Item { pub fn read(&self) {} }",
+            ),
+        ],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    assert_eq!(calls(&result, "src/lib.rs").count(), 0);
+}
+
+#[test]
+fn test_rust_reexport_chain_calls_keep_authored_trait_identity() {
+    let source = "pub mod inner; pub use crate::inner::Count; pub fn root<T: Count>(item: &T) { item.read(); }";
+    let result = resolution(
+        "rust",
+        &[
+            ("src/lib.rs", source),
+            (
+                "src/inner/mod.rs",
+                "mod traits; pub use self::traits::Count;",
+            ),
+            ("src/inner/traits.rs", "pub trait Count { fn read(&self); }"),
+        ],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    let found = calls(&result, "src/lib.rs").collect::<Vec<_>>();
+    assert_eq!(found.len(), 1);
+    assert_eq!(source_of(found[0], source), "item.read()");
+    assert_eq!(
+        target(found[0]),
+        "rift://symbol/local/rust/fixture/inner/traits/Count/read"
+    );
+}
+
+#[test]
+fn test_rust_public_type_reexport_keeps_public_method_access() {
+    let source = "pub mod inner; pub use crate::inner::Item; pub fn root() { Item::new(); }";
+    let result = resolution(
+        "rust",
+        &[
+            ("src/lib.rs", source),
+            ("src/inner/mod.rs", "mod types; pub use self::types::Item;"),
+            (
+                "src/inner/types.rs",
+                "pub struct Item; impl Item { pub fn new() -> Self { Self } }",
+            ),
+        ],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    let found = calls(&result, "src/lib.rs").collect::<Vec<_>>();
+    assert_eq!(found.len(), 1);
+    assert_eq!(source_of(found[0], source), "Item::new()");
+    assert_eq!(
+        target(found[0]),
+        "rift://symbol/local/rust/fixture/inner/types/Item/new"
+    );
+}
+
+#[test]
+fn test_rust_inactive_generic_bounds_do_not_change_outer_receivers() {
+    let source = "trait Count { fn read(&self); } trait Other { fn read(&self); } fn root<T: Count>(item: &T) { #[cfg(any())] fn inactive<T: Other>(item: &T) {} fn T() -> OtherItem { loop {} } item.read(); } struct OtherItem; impl OtherItem { fn read(&self) {} }";
+    let result = resolution(
+        "rust",
+        &[("src/lib.rs", source)],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    assert_eq!(
+        calls(&result, "src/lib.rs").map(target).collect::<Vec<_>>(),
+        ["rift://symbol/local/rust/fixture/Count/read"]
+    );
+}
+
+#[test]
+fn test_rust_local_return_receiver_uses_the_factory_declaration_scope() {
+    let source = "mod items; use crate::items::make; fn root() { let item = make(); item.read(); }";
+    let result = resolution(
+        "rust",
+        &[
+            ("src/lib.rs", source),
+            (
+                "src/items.rs",
+                "pub struct Item; impl Item { pub fn read(&self) {} } pub fn make() -> Item { Item }",
+            ),
+        ],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    let found = calls(&result, "src/lib.rs")
+        .map(|edge| (source_of(edge, source), target(edge)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        found,
+        [
+            ("make()", "rift://symbol/local/rust/fixture/items/make"),
+            (
+                "item.read()",
+                "rift://symbol/local/rust/fixture/items/Item/read"
+            )
+        ]
+    );
+}
+
+#[test]
+fn test_rust_local_receiver_depth_refuses_without_exhausting_the_pass() {
+    use std::fmt::Write as _;
+    let mut source =
+        "struct Item; impl Item { fn read(&self) {} } fn root(item: &Item) {".to_owned();
+    for index in 0..80 {
+        let previous = if index == 0 {
+            "item".to_owned()
+        } else {
+            format!("value{}", index - 1)
+        };
+        write!(source, "let value{index} = {previous};").expect("fixture source");
+    }
+    source.push_str("value79.read(); }");
+    let result = resolution(
+        "rust",
+        &[("src/lib.rs", &source)],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    assert_eq!(calls(&result, "src/lib.rs").count(), 0);
+    assert!(result.unresolved_sites > 0);
+    assert!(!result.exhausted);
+}
+
+#[test]
+fn test_rust_alias_of_a_bounded_receiver_keeps_its_type_parameter_scope() {
+    let source = "trait Count { fn read(&self); } fn root<T: Count>(item: &T) { let alias = item; alias.read(); }";
+    let result = resolution(
+        "rust",
+        &[("src/lib.rs", source)],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    let found = calls(&result, "src/lib.rs").collect::<Vec<_>>();
+    assert_eq!(found.len(), 1);
+    assert_eq!(source_of(found[0], source), "alias.read()");
+    assert_eq!(
+        target(found[0]),
+        "rift://symbol/local/rust/fixture/Count/read"
+    );
+}
+
+#[test]
+fn test_rust_unit_self_constructor_keeps_its_authored_owner() {
+    let source =
+        "struct Item; impl Item { fn read(&self) {} fn root() { let item = Self; item.read(); } }";
+    let result = resolution(
+        "rust",
+        &[("src/lib.rs", source)],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    let found = calls(&result, "src/lib.rs").collect::<Vec<_>>();
+    assert_eq!(found.len(), 1);
+    assert_eq!(source_of(found[0], source), "item.read()");
+    assert_eq!(
+        target(found[0]),
+        "rift://symbol/local/rust/fixture/Item/read"
+    );
+}
+
+#[test]
+fn test_rust_non_trait_bound_does_not_supply_a_same_named_method() {
+    let source =
+        "struct Item; impl Item { fn read(&self) {} } fn root<T: Item>(item: &T) { item.read(); }";
+    let result = resolution(
+        "rust",
+        &[("src/lib.rs", source)],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    assert_eq!(calls(&result, "src/lib.rs").count(), 0);
+}
+
+#[test]
+fn test_rust_crate_visible_nested_modules_keep_import_targets() {
+    let source = "mod provider; mod consumer;";
+    let consumer =
+        "use crate::provider::nested::Count; fn root<T: Count>(item: &T) { item.read(); }";
+    let result = resolution(
+        "rust",
+        &[
+            ("src/lib.rs", source),
+            (
+                "src/provider.rs",
+                "pub(crate) mod nested { pub(crate) trait Count { fn read(&self); } }",
+            ),
+            ("src/consumer.rs", consumer),
+        ],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    let found = calls(&result, "src/consumer.rs").collect::<Vec<_>>();
+    assert_eq!(found.len(), 1);
+    assert_eq!(source_of(found[0], consumer), "item.read()");
+    assert_eq!(
+        target(found[0]),
+        "rift://symbol/local/rust/fixture/provider/nested/Count/read"
+    );
+}
+
+#[test]
+fn test_rust_field_and_method_names_keep_exact_access_targets() {
+    let source = "struct Item { value: usize } impl Item { fn value(&self) -> usize { self.value } fn call(&self) { self.value(); } fn invalid(&self) { self.missing; } fn missing(&self) {} }";
+    let result = resolution(
+        "rust",
+        &[("src/lib.rs", source)],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    let reads = result
+        .occurrences
+        .iter()
+        .filter(|edge| edge.role == ReferenceRole::Read && edge.edge_kind.is_none())
+        .collect::<Vec<_>>();
+    assert_eq!(reads.len(), 2);
+    let field = reads
+        .iter()
+        .find(|edge| {
+            source_of(edge, source) == "self.value"
+                && edge.binding.range().start()
+                    == u64::try_from(source.find("self.value }").expect("field access"))
+                        .expect("offset")
+        })
+        .expect("field read");
+    let target = field
+        .target_binding
+        .as_ref()
+        .expect("target binding")
+        .range();
+    assert!(
+        target.start()
+            < u64::try_from(source.find("impl Item").expect("implementation")).expect("offset"),
+        "field access must target the field declaration: {target:?}"
+    );
+    assert!(
+        reads
+            .iter()
+            .any(|edge| source_of(edge, source) == "self.value"
+                && edge.binding.range().start()
+                    == u64::try_from(source.find("self.value();").expect("method call"))
+                        .expect("offset"))
     );
 }

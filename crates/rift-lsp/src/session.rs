@@ -49,8 +49,9 @@ use tokio::time::Instant;
 
 use crate::capabilities::{Capabilities, glob_matches, offered};
 
+mod batch;
 mod edges;
-use crate::correlation::{self, Correlation, METHOD_NOT_FOUND_CODE, RequestId};
+use crate::correlation::{self, Correlation, METHOD_NOT_FOUND_CODE};
 use crate::framing::Framing;
 use crate::uri::TreeRoot;
 
@@ -130,6 +131,35 @@ pub struct EngineLaunch {
     pub settle_delay: Duration,
     /// Bytes of standard error kept as the captured prefix.
     pub stderr_capture_bytes: usize,
+}
+
+/// Decodes one correlated response using the shared refusal classification.
+fn response_result<R: Request>(
+    method: &str,
+    incoming: correlation::Incoming,
+) -> Result<R::Result, RiftError> {
+    if let Some(refusal) = incoming.error {
+        let code = refusal.code;
+        let message = refusal.message;
+        if RETRYABLE_REFUSAL_CODES.contains(&code) {
+            return errors::lsp::engine_refused_retryable()
+                .method(method)
+                .code(code)
+                .message(message)
+                .fail();
+        }
+        return errors::lsp::engine_refused_terminal()
+            .method(method)
+            .code(code)
+            .message(message)
+            .fail();
+    }
+    serde_json::from_value(incoming.result.unwrap_or(Value::Null)).map_err(|source| {
+        errors::lsp::engine_result_invalid()
+            .method(method)
+            .source(source)
+            .error()
+    })
 }
 
 /// Whether an error means session cannot serve another exchange.
@@ -1333,15 +1363,13 @@ impl EngineSession {
     ) -> Result<R::Result, RiftError> {
         self.refuse_ended()?;
         self.empty_answers.forget();
-        let id = self.correlation.begin(R::METHOD)?;
         let value = serde_json::to_value(params).map_err(|source| {
             errors::lsp::engine_result_invalid()
                 .method(R::METHOD)
                 .source(source)
                 .error()
         })?;
-        let payload = correlation::request(id, R::METHOD, &value);
-        match tokio::time::timeout(timeout, self.exchange::<R>(id, payload)).await {
+        match tokio::time::timeout(timeout, self.exchange::<R>(value)).await {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(error)) => {
                 if ends_session(&error) {
@@ -1366,11 +1394,10 @@ impl EngineSession {
     /// and discarded. Every pump iteration consumes one engine message, so
     /// the loop is bounded by what the engine sends within the caller's
     /// timeout and by the framing bounds.
-    async fn exchange<R: Request>(
-        &mut self,
-        id: RequestId,
-        payload: Vec<u8>,
-    ) -> Result<R::Result, RiftError> {
+    async fn exchange<R: Request>(&mut self, value: Value) -> Result<R::Result, RiftError> {
+        self.make_room(1, R::METHOD).await?;
+        let id = self.correlation.begin(R::METHOD)?;
+        let payload = correlation::request(id, R::METHOD, &value);
         self.write_payload(payload, R::METHOD).await?;
         loop {
             let payload = self.next_payload(R::METHOD).await?;
@@ -1382,36 +1409,13 @@ impl EngineSession {
                     .await?;
                 continue;
             }
-            let response_id = incoming.id.unwrap_or(Value::Null);
+            let response_id = incoming.id.clone().unwrap_or(Value::Null);
             let method = self.correlation.conclude(&response_id)?;
             if response_id.as_u64() != Some(id.value()) {
                 // The settled response answers a cancelled call; discard it.
                 continue;
             }
-            if let Some(refusal) = incoming.error {
-                let code = refusal.code;
-                let method = method.to_owned();
-                let message = refusal.message;
-                if RETRYABLE_REFUSAL_CODES.contains(&code) {
-                    return errors::lsp::engine_refused_retryable()
-                        .method(method)
-                        .code(code)
-                        .message(message)
-                        .fail();
-                }
-                return errors::lsp::engine_refused_terminal()
-                    .method(method)
-                    .code(code)
-                    .message(message)
-                    .fail();
-            }
-            let result = incoming.result.unwrap_or(Value::Null);
-            return serde_json::from_value(result).map_err(|source| {
-                errors::lsp::engine_result_invalid()
-                    .method(method)
-                    .source(source)
-                    .error()
-            });
+            return response_result::<R>(method, incoming);
         }
     }
 

@@ -15,6 +15,17 @@ pub struct OccurrenceSelection {
     pub enclosing: bool,
 }
 
+/// Required type definitions and inheritance from semantic providers.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TypeSelection {
+    /// The query can inspect inferred type definitions.
+    pub definitions: bool,
+    /// The query can inspect class inheritance.
+    pub extends: bool,
+    /// The query can inspect interface implementations.
+    pub implements: bool,
+}
+
 /// Resolved adjacency needed by a query over the selected domain.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SemanticAdjacency {
@@ -37,13 +48,22 @@ pub struct SemanticHeritage {
     pub implements: bool,
 }
 
+/// Edge facts selected by a query.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SemanticEdges {
+    /// The query can inspect direct edges between symbols.
+    pub relations: bool,
+    /// The query can inspect original edge records and their analysis.
+    pub metadata: bool,
+}
+
 /// The semantic and physical facts needed from a complete selected domain.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SemanticInventory {
     /// The query can inspect complete captured symbol metadata.
     pub symbols: bool,
-    /// The query can inspect captured edge kinds.
-    pub edges: bool,
+    /// Edge facts the query can inspect.
+    pub edges: SemanticEdges,
     /// Resolved edge kinds the query can inspect.
     pub adjacency: SemanticAdjacency,
     /// Embedded graph patterns require complete provider adjacency.
@@ -64,7 +84,7 @@ impl GraphQuery {
                 requirements
             })
             .filter(|requirements| {
-                requirements.edges
+                requirements.edges.relations
                     || requirements.adjacency.calls
                     || requirements.adjacency.references
                     || requirements.occurrences.is_some()
@@ -82,24 +102,30 @@ impl SemanticInventory {
             let name = predicate.as_str().strip_prefix(VOCABULARY_NAMESPACE);
             match name {
                 Some("name" | "revision") => self.symbols = true,
+                Some("provider" | "from" | "to" | "kinds" | "derivation")
+                    if edge(patterns, subject) =>
+                {
+                    self.edges.metadata = true;
+                }
+                None if class(pattern) == Some("Edge") => self.edges.metadata = true,
                 Some("calls") => self.adjacency.calls = true,
                 Some("references") => self.adjacency.references = true,
                 Some("hasType") => {
-                    self.edges = true;
+                    self.edges.relations = true;
                     self.adjacency.type_uses = true;
                 }
                 Some("extends") => {
-                    self.edges = true;
+                    self.edges.relations = true;
                     self.adjacency.heritage.extends = true;
                 }
                 Some("implements") => {
-                    self.edges = true;
+                    self.edges.relations = true;
                     self.adjacency.heritage.implements = true;
                 }
                 Some(
                     "imports" | "aliases" | "declares" | "contains" | "overrides" | "reads"
                     | "writes",
-                ) => self.edges = true,
+                ) => self.edges.relations = true,
                 Some("usages") => {
                     self.occurrences.get_or_insert_default();
                 }
@@ -143,21 +169,21 @@ impl SemanticInventory {
                         Some("calls") => self.adjacency.calls = true,
                         Some("references") => self.adjacency.references = true,
                         Some("hasType") => {
-                            self.edges = true;
+                            self.edges.relations = true;
                             self.adjacency.type_uses = true;
                         }
                         Some("extends") => {
-                            self.edges = true;
+                            self.edges.relations = true;
                             self.adjacency.heritage.extends = true;
                         }
                         Some("implements") => {
-                            self.edges = true;
+                            self.edges.relations = true;
                             self.adjacency.heritage.implements = true;
                         }
                         Some(
                             "imports" | "aliases" | "declares" | "contains" | "overrides" | "reads"
                             | "writes",
-                        ) => self.edges = true,
+                        ) => self.edges.relations = true,
                         Some("usages") => {
                             self.occurrences.get_or_insert_default();
                         }
@@ -176,6 +202,12 @@ impl SemanticInventory {
         }
         Some(())
     }
+}
+
+fn edge(patterns: &[TriplePattern], term: &TermPattern) -> bool {
+    patterns
+        .iter()
+        .any(|pattern| pattern.subject == *term && class(pattern) == Some("Edge"))
 }
 
 fn occurrence(patterns: &[TriplePattern], term: &TermPattern) -> bool {

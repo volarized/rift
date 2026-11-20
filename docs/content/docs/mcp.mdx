@@ -189,6 +189,23 @@ is `global` reads this service with no `:scope`.
 
 Global edge queries read facts already collected for the selected package or runtime.
 
+### Edge provider
+
+Every edge carries a [`provider`](/docs/developer/protocol/core#edge-provider) that names
+which analysis produced it: `static`, `engine`, or `lsp`. The edge's `derivation` records how it
+was established, and its optional `producer` names an external producer.
+
+A query can check for edges from static analysis with `:provider`:
+
+```sparql
+ASK {
+  <symbol-id> :calls ?target .
+  ?edge a :Edge; :from <symbol-id>; :to ?target; :kinds :calls; :provider "static" .
+}
+```
+
+The same pattern checks for embedded engine edges with `"engine"` or LSP edges with `"lsp"`.
+
 ### References and calls [#search-traversal]
 
 A canonical symbol identity anchors a graph question. These requests use a returned
@@ -220,8 +237,8 @@ Local reference and call questions use the configured
 [language engine](/docs/developer/configuration#languages-and-lsp) when required facts
 are absent from the captured publication. Acquisition preserves physical locations and
 continues through admitted dependency sources. These facts belong to the request and do
-not enter global collection. Missing coverage refuses the query; it cannot produce a false
-`ASK`, zero count, or empty graph.
+not enter global collection. Captured static calls and references answer first, and an
+`engine_analysis_unavailable` warning names a language whose engine analysis is missing.
 
 ### Changes and commits [#search-change]
 
@@ -269,7 +286,7 @@ Use the `include` object to select optional projections, such as
 | Member | Adds when `true` |
 | --- | --- |
 | `documentation` | Bounded documentation referring to the exact declaration |
-| `history` | The logical symbol's history edges: the commits that touched it and the symbols changed beside it |
+| `history` | The logical symbol's history edges: the commits that touched a project symbol and the symbols changed beside it, or the releases that changed a package or runtime symbol |
 
 The members combine; an omitted member is `false`, and an omitted `include` adds neither. A
 declaration's source comes from [`facets`](#tool-facets) with the symbol's `id`.
@@ -291,6 +308,21 @@ at most 32 of them; `co_changes_truncated` counts what either bound left out.
 
 The local server fills its history store in the background; an incomplete history answers
 `complete: false` until the store holds the selected revision.
+
+A package or runtime symbol has no commits in your project, so its `history` names releases
+instead. Rift reads it from the global API: the collected releases of the symbol's owner that
+introduced, changed, or removed its declaration, newest release first. Each edge names its
+release as a revision such as `rift://revision/cargo/crates.io/demo@1.0.0`:
+
+- `introduced_in_release` - the oldest collected release that declares the symbol
+- `changed_in_release` - the release changed the declaration from the collected release before
+  it; `change` names the part, as it does for `changed_in`
+- `removed_in_release` - the release no longer declares the symbol the release before it declared
+
+A release history carries no `co_changes` edges. `complete: false` means the history stopped
+before the oldest collected release of the owner.
+
+<ReadExample name="global-symbol-history" />
 
 `max_results` bounds returned declarations. Send `page` and the reported `revision` for
 later declarations. The server refuses a tree revision once the index serves another tree.
@@ -394,9 +426,11 @@ the local index. See [Index](/docs/developer/architecture#index) for local updat
 RDF triples for a graph query. `page` and `max_results` select answer rows. Exact `get_symbol`
 and `facets` reads select declarations with the same pair at the reported revision.
 
-A query that requires missing facts returns `outcome: "unavailable"`. A completed query can
-return an empty result when its required facts are available. Run `rift server logs` to
-inspect missing facts or preparation still in progress.
+A query over the captured inventory answers from partly covered facts, and its `warnings` name
+the files, languages, or engines left out. A query whose answer needs every fact returns
+`outcome: "unavailable"` with `insufficient_coverage`: an empty result, a false `ASK`, a count,
+a negation, or an `OPTIONAL`. Run `rift server logs` to inspect missing facts or preparation
+still in progress.
 
 The proxy returns compact text by default. Start `rift mcp --output=all` for structured
 results and output schemas. The map and workspace resources then carry both compact text

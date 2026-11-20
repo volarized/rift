@@ -578,6 +578,26 @@ fn test_length_bound_applies_before_decode_and_after_encoding() {
 }
 
 #[test]
+fn test_parsing_checks_encoded_length_before_canonical_spelling() {
+    let prefix = "rift://symbol/local/rust/";
+    let raw = format!("{prefix}é");
+    assert_eq!(
+        SymbolIdentity::parse(&raw)
+            .err()
+            .map(|error| error_violation(&error)),
+        Some("Noncanonical".to_owned())
+    );
+    let expanded = format!("{prefix}{}", "é".repeat(SYMBOL_ID_BYTES_MAX / 3));
+    assert!(expanded.len() < SYMBOL_ID_BYTES_MAX);
+    assert_eq!(
+        SymbolIdentity::parse(&expanded)
+            .err()
+            .map(|error| error_violation(&error)),
+        Some("Length".to_owned())
+    );
+}
+
+#[test]
 fn test_construction_and_registration_use_same_acceptance() {
     for name in ["service", "app_2", "my-app"] {
         assert!(super::valid_registration_name(name));

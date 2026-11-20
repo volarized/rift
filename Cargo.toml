@@ -10,7 +10,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.0.82"
+version = "0.0.84"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
@@ -52,6 +52,7 @@ candle-core = { version = "0.11.1", default-features = false }
 candle-nn = { version = "0.11.1", default-features = false }
 candle-transformers = { version = "0.11.1", default-features = false }
 clap = { version = "4.6.5", features = ["derive"] }
+cpu-time = "=1.0.0"
 data-encoding = "2.6.0"
 digest-io = "=0.1.0"
 getrandom = { version = "0.4.3", features = ["std"] }

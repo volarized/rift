@@ -18,6 +18,7 @@ pub(super) struct Kinds {
     type_identifier: u16,
     generic_type: u16,
     reference_type: u16,
+    array_type: u16,
     self_parameter: u16,
     self_value: u16,
     scoped_identifier: u16,
@@ -37,6 +38,11 @@ pub(super) struct Kinds {
     attribute: u16,
     inner_attribute: u16,
     impl_item: u16,
+    trait_item: u16,
+    type_parameter: u16,
+    where_predicate: u16,
+    non_method_bounds: [u16; 2],
+    bounds: u16,
     edge_macro: u16,
     assignment: [u16; 2],
     scopes: [u16; 3],
@@ -50,6 +56,7 @@ pub(super) struct Kinds {
     path: u16,
     pattern: u16,
     value_type: u16,
+    return_type: u16,
     left: u16,
     body: u16,
 }
@@ -66,6 +73,7 @@ pub(super) fn kinds() -> &'static Kinds {
             type_identifier: id("type_identifier"),
             generic_type: id("generic_type"),
             reference_type: id("reference_type"),
+            array_type: id("array_type"),
             self_parameter: id("self_parameter"),
             self_value: id("self"),
             scoped_identifier: id("scoped_identifier"),
@@ -90,6 +98,11 @@ pub(super) fn kinds() -> &'static Kinds {
             attribute: id("attribute_item"),
             inner_attribute: id("inner_attribute_item"),
             impl_item: id("impl_item"),
+            trait_item: id("trait_item"),
+            type_parameter: id("type_parameter"),
+            where_predicate: id("where_predicate"),
+            non_method_bounds: [id("lifetime"), id("removed_trait_bound")],
+            bounds: field("bounds"),
             edge_macro: id("macro_invocation"),
             assignment: [id("assignment_expression"), id("compound_assignment_expr")],
             scopes: [id("source_file"), id("block"), id("declaration_list")],
@@ -107,6 +120,7 @@ pub(super) fn kinds() -> &'static Kinds {
             path: field("path"),
             pattern: field("pattern"),
             value_type: field("type"),
+            return_type: field("return_type"),
             left: field("left"),
             body: field("body"),
         }
@@ -147,12 +161,17 @@ impl Kinds {
             self.record_closure_argument(syntax_element, facts)?;
         } else if id == self.functions[0] {
             self.record_function(syntax_element, facts)?;
+            self.record_return(syntax_element, facts)?;
+        } else if id == self.functions[1] {
+            self.record_return(syntax_element, facts)?;
         } else if self.assignment.contains(&id) {
             self.record_mutation(syntax_element, facts)?;
         } else if id == self.edge_macro {
             facts.unsupported_bindings.push(byte_range(syntax_element)?);
         } else if id == self.impl_item {
             self.record_impl(syntax_element, facts)?;
+        } else if id == self.type_parameter || id == self.where_predicate {
+            self.record_bounds(syntax_element, facts)?;
         } else if id == self.attribute || id == self.inner_attribute {
             self.record_attribute(syntax_element, source, facts)?;
         } else if self.conditional[..3].contains(&id) {
@@ -198,7 +217,10 @@ impl Kinds {
             next
         };
         if let Some(conditional) = conditional {
-            facts.conditional_items.push(byte_range(conditional)?);
+            facts.conditional_items.push(super::StaticConditionalItem {
+                range: byte_range(conditional)?,
+                attribute: byte_range(syntax_element)?,
+            });
         }
         Ok(())
     }
@@ -298,12 +320,28 @@ impl Kinds {
         let closure = syntax_element
             .child_by_field_id(self.value)
             .is_some_and(|value| value.kind_id() == self.functions[2]);
-        let kind = match value_type {
-            Some(value_type) => StaticBindingKind::RustReceiver {
+        let initializer = syntax_element
+            .child_by_field_id(self.value)
+            .filter(|value| {
+                [
+                    self.call,
+                    self.identifier,
+                    self.scoped_identifier,
+                    self.self_value,
+                    self.type_identifier,
+                    self.field_expression,
+                ]
+                .contains(&value.kind_id())
+            });
+        let kind = match (value_type, closure, initializer) {
+            (Some(value_type), _, _) => StaticBindingKind::RustReceiver {
                 type_path: byte_range(value_type)?,
             },
-            None if closure => StaticBindingKind::Local,
-            None => StaticBindingKind::Shadow,
+            (_, true, _) => StaticBindingKind::Local,
+            (_, _, Some(initializer)) => StaticBindingKind::RustValue {
+                initializer: byte_range(initializer)?,
+            },
+            _ => StaticBindingKind::Shadow,
         };
         let available_from = if is_let {
             byte_range(syntax_element)?.end
@@ -324,12 +362,16 @@ impl Kinds {
         let Some(scope) = enclosing(element, &self.functions) else {
             return Ok(());
         };
-        let Some(implementation) = enclosing(scope, &[self.impl_item]) else {
+        let Some(implementation) = enclosing(scope, &[self.impl_item, self.trait_item]) else {
             return Ok(());
         };
         let Some(value_type) = implementation
-            .child_by_field_id(self.value_type)
-            .and_then(|value_type| self.named_type(value_type))
+            .child_by_field_id(if implementation.kind_id() == self.trait_item {
+                self.name
+            } else {
+                self.value_type
+            })
+            .and_then(|value_type| self.implementation_type(value_type))
         else {
             return Ok(());
         };
@@ -350,6 +392,51 @@ impl Kinds {
         Ok(())
     }
 
+    fn record_bounds(
+        &self,
+        element: Node<'_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let parameter = element.kind_id() == self.type_parameter;
+        let Some(name) = element
+            .child_by_field_id(if parameter { self.name } else { self.left })
+            .filter(|name| name.kind_id() == self.type_identifier)
+        else {
+            return Ok(());
+        };
+        if parameter
+            && let Some(scope) = enclosing(
+                element,
+                &[
+                    self.functions[0],
+                    self.functions[1],
+                    self.impl_item,
+                    self.trait_item,
+                ],
+            )
+        {
+            facts.bindings.push(binding(
+                name,
+                scope,
+                byte_range(scope)?.start,
+                StaticBindingKind::RustTypeParameter,
+            )?);
+        }
+        if let Some(bounds) = element.child_by_field_id(self.bounds) {
+            let mut cursor = bounds.walk();
+            for bound in bounds.named_children(&mut cursor) {
+                if self.non_method_bounds.contains(&bound.kind_id()) || bound.is_extra() {
+                    continue;
+                }
+                let bound = self.named_type(bound).unwrap_or(bound);
+                facts
+                    .declared_types
+                    .push((byte_range(name)?, byte_range(bound)?));
+            }
+        }
+        Ok(())
+    }
+
     fn record_impl(
         &self,
         syntax_element: Node<'_>,
@@ -357,7 +444,7 @@ impl Kinds {
     ) -> Result<(), RiftError> {
         if let Some(value_type) = syntax_element
             .child_by_field_id(self.value_type)
-            .and_then(|value_type| self.named_type(value_type))
+            .and_then(|value_type| self.implementation_type(value_type))
         {
             facts.inherent_impls.push(StaticInherentImpl {
                 range: byte_range(syntax_element)?,
@@ -374,6 +461,21 @@ impl Kinds {
         }
         (!element.is_missing()
             && [self.type_identifier, self.scoped_type_identifier].contains(&element.kind_id()))
+        .then_some(element)
+    }
+
+    fn implementation_type<'tree>(&self, element: Node<'tree>) -> Option<Node<'tree>> {
+        if element.kind_id() == self.generic_type {
+            return element.child_by_field_id(self.value_type);
+        }
+        ([
+            self.type_identifier,
+            self.scoped_type_identifier,
+            self.reference_type,
+            self.array_type,
+        ]
+        .contains(&element.kind_id())
+            && !element.is_missing())
         .then_some(element)
     }
 
@@ -395,6 +497,23 @@ impl Kinds {
                 byte_range(scope)?.start,
                 StaticBindingKind::Shadow,
             )?);
+        }
+        Ok(())
+    }
+
+    fn record_return(
+        &self,
+        element: Node<'_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let name = element.child_by_field_id(self.name);
+        let return_type = element
+            .child_by_field_id(self.return_type)
+            .and_then(|value| self.named_type(value));
+        if let Some((name, return_type)) = name.zip(return_type) {
+            facts
+                .declared_types
+                .push((byte_range(name)?, byte_range(return_type)?));
         }
         Ok(())
     }

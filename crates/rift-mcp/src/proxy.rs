@@ -3401,6 +3401,7 @@ mod tests {
                                 .expect("a captured fixture view"),
                             expires_at: "2099-01-01T00:00:00Z".to_owned(),
                         },
+                        revision: None,
                         inputs: rift_server::SearchCandidateInputs::default(),
                         ranking: rift_protocol::configuration::RankingConfiguration::default(),
                         results_max: 100,

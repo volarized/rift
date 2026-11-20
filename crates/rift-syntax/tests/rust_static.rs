@@ -4,6 +4,50 @@ use rift_core::ProjectPath;
 use rift_syntax::{RustSyntaxProvider, SyntaxLimits, SyntaxProvider, SyntaxSource};
 
 #[test]
+fn test_rust_reference_and_slice_impls_keep_authored_owner_ranges() {
+    let path = ProjectPath::new("src/lib.rs").expect("path");
+    let source = "impl<'a> Count for &'a Item { fn read(&self) {} } impl Count for &mut Item { fn read(&self) {} } impl Count for [u8] { fn read(&self) {} } impl Count for &[u8] { fn read(&self) {} }";
+    let document = RustSyntaxProvider::default()
+        .analyze(
+            SyntaxSource {
+                path: &path,
+                text: source,
+            },
+            SyntaxLimits::default(),
+        )
+        .expect("syntax");
+    let implementations = document
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.kind == "impl_item")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        implementations
+            .iter()
+            .map(|symbol| symbol.name.as_str())
+            .collect::<Vec<_>>(),
+        ["&Item", "&mut Item", "[u8]", "&[u8]"]
+    );
+    let facts = document.facts().static_facts().expect("static facts");
+    assert_eq!(
+        facts
+            .inherent_impls()
+            .iter()
+            .map(
+                |implementation| &source[usize::try_from(implementation.type_path.start)
+                    .expect("start")
+                    ..usize::try_from(implementation.type_path.end).expect("end")]
+            )
+            .collect::<Vec<_>>(),
+        ["&'a Item", "&mut Item", "[u8]", "&[u8]"]
+    );
+    for implementation in implementations {
+        assert!(document.symbols().iter().any(|member| member.name == "read"
+            && member.container.as_deref() == Some(implementation.name.as_str())));
+    }
+}
+
+#[test]
 fn test_rust_grouped_imports_keep_each_binding() {
     let path = ProjectPath::new("src/lib.rs").expect("path");
     let source = "use crate::jobs::{Task, leaf as run};";
@@ -185,4 +229,108 @@ fn test_rust_grouped_imports_refuse_before_copying_past_the_bound() {
         .analyze(source, limits)
         .expect_err("copied paths exceed bound");
     assert_eq!(error.slug().as_str(), "rift.syntax.facts_count_exceeded");
+}
+
+#[test]
+fn test_rust_trait_default_captures_its_receiver_owner() {
+    let path = ProjectPath::new("src/lib.rs").expect("path");
+    let source =
+        "trait Count { fn remaining(&self) -> usize; fn get(&self) -> usize { self.remaining() } }";
+    let document = RustSyntaxProvider::default()
+        .analyze(
+            SyntaxSource {
+                path: &path,
+                text: source,
+            },
+            SyntaxLimits::default(),
+        )
+        .expect("syntax");
+    let facts = document.facts().static_facts().expect("static facts");
+    assert!(facts.bindings().iter().any(|binding| {
+        matches!(binding.kind, rift_syntax::StaticBindingKind::RustReceiver { type_path } if &source[usize::try_from(type_path.start).expect("offset")..usize::try_from(type_path.end).expect("offset")] == "Count")
+    }));
+}
+
+#[test]
+fn test_rust_inline_and_where_bounds_retain_authored_paths() {
+    let path = ProjectPath::new("src/lib.rs").expect("path");
+    let source =
+        "fn inline<T: Count>(item: &T) {} fn bounded<T>(item: &T) where T: crate::Count {}";
+    let document = RustSyntaxProvider::default()
+        .analyze(
+            SyntaxSource {
+                path: &path,
+                text: source,
+            },
+            SyntaxLimits::default(),
+        )
+        .expect("syntax");
+    let facts = document.facts().static_facts().expect("static facts");
+    let bounds = facts
+        .declared_types()
+        .iter()
+        .map(|&(name, bound)| {
+            let text = |range: rift_syntax::ByteRange| {
+                &source[usize::try_from(range.start).expect("offset")
+                    ..usize::try_from(range.end).expect("offset")]
+            };
+            (text(name), text(bound))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(bounds, [("T", "Count"), ("T", "crate::Count")]);
+}
+
+#[test]
+fn test_rust_conditional_items_keep_their_authored_attribute_ranges() {
+    let path = ProjectPath::new("src/lib.rs").expect("path");
+    let source = "#[cfg(feature=\"std\")]\nfn leaf() {}";
+    let document = RustSyntaxProvider::default()
+        .analyze(
+            SyntaxSource {
+                path: &path,
+                text: source,
+            },
+            SyntaxLimits::default(),
+        )
+        .expect("syntax");
+    let conditions = document
+        .facts()
+        .static_facts()
+        .expect("static facts")
+        .conditional_items();
+    assert_eq!(conditions.len(), 1);
+    let condition = conditions[0];
+    let text = |range: rift_syntax::ByteRange| {
+        &source[usize::try_from(range.start).expect("offset")
+            ..usize::try_from(range.end).expect("offset")]
+    };
+    assert_eq!(text(condition.attribute), "#[cfg(feature=\"std\")]");
+    assert_eq!(text(condition.range), "fn leaf() {}");
+}
+
+#[test]
+fn test_rust_local_return_facts_keep_authored_initializer_and_return_type() {
+    let path = ProjectPath::new("src/lib.rs").expect("path");
+    let source = "struct Item; impl Item { fn copy(&self) -> Self { Self } fn run(&self) { let copy = self.copy(); } }";
+    let document = RustSyntaxProvider::default()
+        .analyze(
+            SyntaxSource {
+                path: &path,
+                text: source,
+            },
+            SyntaxLimits::default(),
+        )
+        .expect("syntax");
+    let facts = document.facts().static_facts().expect("static facts");
+    let text = |range: rift_syntax::ByteRange| {
+        &source[usize::try_from(range.start).expect("offset")
+            ..usize::try_from(range.end).expect("offset")]
+    };
+    assert!(
+        facts
+            .declared_types()
+            .iter()
+            .any(|&(name, result)| text(name) == "copy" && text(result) == "Self")
+    );
+    assert!(facts.bindings().iter().any(|binding| matches!(binding.kind, rift_syntax::StaticBindingKind::RustValue { initializer } if text(binding.name) == "copy" && text(initializer) == "self.copy()")));
 }

@@ -322,6 +322,9 @@ Remote acquisition uses bounded batches and holds the selected publication for t
 ### Captured answers and pages
 
 A successful answer names the `revision` it read. The caller sends that `revision` for later pages.
+An answer that combines extra projects names a tree revision over the revisions those projects
+read. A later page sent with it reads the retained answer. Once any of those projects serves
+another revision, the server refuses it.
 `page` starts at 1 and defaults to 1. `max_results` defaults to 10 and accepts 1 to 1000.
 
 `pagination` carries `page`, `pages`, `max_results`, and `total`. A page past the last returns
@@ -333,9 +336,26 @@ without pagination. SPARQL `LIMIT` and `OFFSET` bound the result set before pagi
 The server bounds statement size, algebra, fact acquisition, and the evaluated answer.
 `[search.query] page_limit` sets the maximum encoded bytes per page, from 1 KiB to 4 MiB.
 
-A query requiring missing facts returns typed unavailability before evaluation.
-This applies to `ASK`, counts, negation, bindings, and graphs. Available-empty facts differ
-from unavailable facts. A query needing only published symbol names does not require
+A query over the captured inventory - every symbol, call, reference, or usage it holds - answers
+from partly covered facts. This holds for a `SELECT` that joins, projects, filters, binds, orders,
+or slices, and for an `ASK` that finds a witness; every row such an answer returns stands.
+
+The answer's warnings name what is missing:
+
+- `source_unavailable` or `large_file_unparsed` - a file left out of the index
+- `framework_context_unresolved` - a framework whose context is unresolved; the file's ordinary
+  declarations still answer
+- `engine_analysis_unavailable` - a language whose engine analysis is missing; the captured static
+  facts still answer
+
+Any other query needs complete coverage and returns `insufficient_coverage` with the same warnings:
+
+- an empty result or a false `ASK`, which claims an absence
+- an aggregate such as a count
+- a negation, `EXISTS`, `MINUS`, or `OPTIONAL`
+- a graph result
+
+Available-empty facts differ from unavailable facts. A query needing only published symbol names does not require
 unavailable syntax elements, history, or engine facts. Supplied syntax facts are preserved; query evaluation
 does not reparse source to manufacture a complete syntax family.
 
@@ -424,6 +444,20 @@ left out nothing.
 still filling ended the history before the repository's first commit. When the store did not
 open, the server walks Git per request instead, and that history carries no `co_changes` edge.
 
+A package or runtime symbol's `history` comes from the global API and names releases in place
+of commits. Its edges come newest release first: `introduced_in_release` for the oldest
+collected release that declares the symbol, `changed_in_release` with a `change` for a release
+that changed the declaration from the collected release before it, and `removed_in_release` for
+a release that no longer declares it. Each names its release as a
+`rift://revision/<manager>/<registry>/<name>@<version>` or
+`rift://revision/stdlib/<runtime>@<version>` revision of the symbol's owner.
+
+A release history carries no commit edge, no `co_changes` edge, and no `co_changes_truncated`.
+The server **MUST** treat a global API answer that breaks this, or a `found` answer that omits
+the requested history, as invalid and fail the read. `complete: false` means the history ended
+before the oldest collected release of the owner, and a project symbol's history carries no
+release edge.
+
 ### Symbol ownership [#get_symbol-scope]
 
 A `local:name` owner in a symbol identity selects a profile defined in the root configuration.
@@ -446,6 +480,8 @@ its `revision`. The declaration's `unit` keeps the physical defining owner even 
 owner differs.
 
 <ReadExample name="global-symbol-documentation" />
+
+<ReadExample name="global-symbol-history" />
 
 `revision` selects the [revision](#revision-reads) to read, and the answer carries the revision
 it was read at. For a package or runtime identity it names a release of that identity's owner.
@@ -841,15 +877,18 @@ no entries. It refuses a read whose text exceeds the byte limit, with typed `Err
 The answer carries:
 
 - `configuration_revision` - an eight-character digest of the accepted `rift.toml` bytes
+- `revision` - the indexed revision the page read
 - `languages` - effective identities in order, with enabled state, include and exclude patterns,
   syntax availability, and selected LSP process state
 - `source` - captured project paths, content digests, and matched language identities
-- `pagination` - the zero-based page and total page count
+- `pagination` - `page`, `pages`, `max_results`, and `total` of the source catalog
 
-The bare URI selects page zero. `rift://workspace?page=1` selects another page. Each page
-holds at most 50 source units and repeats the language summaries. When another page exists,
-the compact response ends with its URI. A page past the end returns an empty `source` list
-with the actual page count.
+The bare URI selects page 1. `rift://workspace?page=2&max_results=50&revision=<revision>`
+selects a later page of the catalog that `revision` names. `max_results` defaults to 10 and
+accepts 1 through 50, and each page repeats the language summaries. The server refuses a
+revision it no longer serves. When another page exists, the compact response ends with its URI,
+which carries the revision. A page past the end returns an empty `source` list with the actual
+page count.
 
 The compact text has these parts:
 
@@ -909,9 +948,12 @@ source:
     }
   ],
   "pagination": {
+    "max_results": 10,
     "page": 1,
-    "pages": 1
+    "pages": 1,
+    "total": 1
   },
+  "revision": "rift://revision/tree/9f0c4e2a7b1d3c5e8f6a0b2d4c6e8a1f3b5d7c9e0a2b4d6f8e1c3a5b7d9f0e2c",
   "source": [
     {
       "digest": "8a4d20bc",
@@ -927,7 +969,7 @@ source:
 </ExampleTabs>
 
 The source page describes one published catalog. The server **MUST** return its configuration
-revision, source digests, and pagination from that publication. During preparation, the server
+revision, revision, source digests, and pagination from that publication. During preparation, the server
 logs [`local_index_preparing`](#reads) and the page lists prepared files.
 After preparation, the catalog also includes visible files without enabled syntax.
 

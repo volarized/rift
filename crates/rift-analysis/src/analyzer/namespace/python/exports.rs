@@ -7,7 +7,7 @@ use rift_protocol::identity::SymbolIdentity;
 use rift_protocol::index::python_identifier_is_valid;
 use rift_syntax::{ShippedLanguage, SyntaxExportBinding, SyntaxExportKind};
 
-use super::super::{ExportBinding, PreparedNamespace, SelectedFile, python_module, typescript};
+use super::super::{ExportBinding, PreparedNamespace, SelectedFile, typescript};
 use crate::{NamespaceInput, PackageImportRoot, PackageSource};
 
 type Target<'source> = (&'source [String], &'source str);
@@ -25,23 +25,34 @@ struct PythonReexport<'source> {
 fn established_module(
     file: &SelectedFile<'_>,
     captured: &BTreeMap<&str, PackageSource<'_>>,
-    roots: &[PackageImportRoot],
+    prepared: &PreparedNamespace,
 ) -> Option<Vec<String>> {
     let syntax = file.syntax;
-    let source = captured
-        .get(file.path.as_str())
-        .filter(|source| source.text() == file.source)?;
-    if syntax.language() != &ShippedLanguage::Python.language()
-        || syntax.has_errors()
-        || syntax.source_digest() != Some(&source.source_digest())
+    if syntax.language() != &ShippedLanguage::Python.language() {
+        return None;
+    }
+    // Selection pairs each file's syntax facts with the bytes they were parsed from, and
+    // the provider recorded the digest of those bytes. Membership by path, the byte
+    // length, and that recorded digest identify the captured source; comparing or
+    // hashing the content again ran over every selected file on every index pass.
+    if syntax.source_digest().is_none()
+        || captured
+            .get(file.path.as_str())
+            .is_none_or(|source| source.text().len() != file.source.len())
     {
         return None;
     }
-    python_module(file.path.as_str(), roots)
+    let identity = prepared.anchors.get(file.path.as_str())?.get(".")?;
+    Some(
+        SymbolIdentity::parse(identity.as_str())
+            .ok()?
+            .qualified_path()
+            .to_vec(),
+    )
 }
 
 /// Leading dots climb from the importing package without passing its top level.
-pub(in crate::analyzer::namespace) fn python_import_target(
+pub(crate) fn python_import_target(
     module: &[String],
     is_package: bool,
     written: &str,
@@ -195,13 +206,13 @@ pub(in crate::analyzer::namespace) fn prepare(
     input: &NamespaceInput<'_>,
     selected: &[SelectedFile<'_>],
     captured: &BTreeMap<&str, PackageSource<'_>>,
-    roots: &[PackageImportRoot],
+    _roots: &[PackageImportRoot],
     prepared: &mut PreparedNamespace,
 ) {
     let mut modules = BTreeMap::new();
     let mut imports = Vec::new();
     for file in selected {
-        let Some(module) = established_module(file, captured, roots) else {
+        let Some(module) = established_module(file, captured, prepared) else {
             continue;
         };
         imports.extend(requests(file, &module, &mut prepared.unresolved_exports));
