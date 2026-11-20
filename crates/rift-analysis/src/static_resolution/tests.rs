@@ -1,4 +1,79 @@
 #[test]
+fn test_typescript_export_overloads_keep_one_checked_callable() {
+    let source = "function leaf() {} export function run(value: string): void; export function run(value: number): void; export function run(value: unknown) { leaf(); }";
+    let document = syntax("jobs.ts", source);
+    assert_eq!(
+        document
+            .facts()
+            .symbols()
+            .iter()
+            .filter(|symbol| symbol.name == "run")
+            .count(),
+        3
+    );
+    let result = resolution(
+        "typescript",
+        &[
+            (
+                "main.ts",
+                "import { run } from './jobs.js'; export function root() { run(1); }",
+            ),
+            ("jobs.ts", source),
+        ],
+        &[],
+        WORK_MAX,
+    );
+    let imported = calls(&result, "main.ts").collect::<Vec<_>>();
+    assert_eq!(imported.len(), 1, "{result:?}");
+    assert!(target(imported[0]).ends_with(".%2Fjobs.ts/run"));
+    assert!(
+        imported[0]
+            .edge_from
+            .as_ref()
+            .expect("caller")
+            .as_str()
+            .ends_with(".%2Fmain.ts/root")
+    );
+    assert_eq!(calls(&result, "jobs.ts").count(), 1);
+}
+
+#[test]
+fn test_ecmascript_exported_duplicate_bodies_stay_ambiguous() {
+    for (language, main, jobs) in [
+        ("javascript", "main.mjs", "jobs.mjs"),
+        ("typescript", "main.ts", "jobs.ts"),
+    ] {
+        let source =
+            format!("import {{ run }} from './{jobs}'; export function root() {{ run(); }}");
+        let result = resolution(
+            language,
+            &[
+                (main, &source),
+                (jobs, "export function run() {} export function run() {}"),
+            ],
+            &[],
+            WORK_MAX,
+        );
+        assert_eq!(calls(&result, main).count(), 0, "{language}: {result:?}");
+        if language == "typescript" {
+            let result = resolution(
+                language,
+                &[
+                    (main, &source),
+                    (
+                        jobs,
+                        "export function run() {} export function run(value: string): void; export function run() {}",
+                    ),
+                ],
+                &[],
+                WORK_MAX,
+            );
+            assert_eq!(calls(&result, main).count(), 0, "{result:?}");
+        }
+    }
+}
+
+#[test]
 fn test_commonjs_local_object_members_resolve_only_stable_callables() {
     for (change, expected) in [
         ("", 2),

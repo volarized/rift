@@ -31,6 +31,43 @@ fn workspace_with_manifest(
 }
 
 #[test]
+fn test_typescript_export_overloads_store_one_identity_and_call() {
+    let (_directory, index) = workspace_with_manifest(
+        &[
+            (
+                "main.ts",
+                "import { run } from './jobs.js'; export function root() { run(1); }",
+            ),
+            (
+                "jobs.ts",
+                "export function run(value: string): void; export function run(value: number): void; export function run(value: unknown) {}",
+            ),
+        ],
+        r#"{"name":"fixture","version":"1.0.0","type":"module"}"#,
+    );
+    let calls = index
+        .edges()
+        .edges()
+        .filter(|edge| edge.kind() == EdgeKind::Calls)
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].from().as_str().ends_with(".%2Fmain.ts/root"));
+    assert!(calls[0].to().as_str().ends_with(".%2Fjobs.ts/run"));
+    let view = index.symbol_view().expect("view");
+    let record = view
+        .normalized_graph()
+        .records()
+        .iter()
+        .find(|record| {
+            record
+                .identity()
+                .is_some_and(|identity| identity.as_str().ends_with(".%2Fjobs.ts/run"))
+        })
+        .expect("overload identity");
+    assert_eq!(record.contributions().len(), 3);
+}
+
+#[test]
 fn test_commonjs_local_object_members_store_distinct_lexical_identities() {
     let source = "var res = {}; res.clear = function clear() { const opts = { expires: 1 }; return opts.expires; }; res.set = function() { const opts = {}; opts.expires = 2; return opts; }; module.exports = res;";
     for path in ["main.cjs", "main.cts"] {

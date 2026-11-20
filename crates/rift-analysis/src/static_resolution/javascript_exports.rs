@@ -358,18 +358,41 @@ fn export_candidates<'source>(
             return None;
         }
         let target = file.javascript_export_candidate(binding, role, work)?;
-        if found
-            .as_ref()
-            .is_some_and(|previous| previous.key(file) != target.key(file))
-        {
-            return None;
-        }
-        found = Some(target);
+        found = Some(match found {
+            Some(previous) => previous.merge(target, file)?,
+            None => target,
+        });
     }
     Some((found, stars))
 }
 
 impl<'source> Export<'source> {
+    fn merge(self, incoming: Self, file: &File<'source>) -> Option<Self> {
+        if self.key(file)? == incoming.key(file)? {
+            return Some(incoming);
+        }
+        let (Self::Declaration(previous), Self::Declaration(next)) = (&self, &incoming) else {
+            return None;
+        };
+        let previous = file.target_at(*previous)?.symbol;
+        let next = file.target_at(*next)?.symbol;
+        if previous.qualified_name != next.qualified_name
+            || [previous, next].iter().any(|symbol| {
+                symbol.kind != "function"
+                    || symbol.syntax_element_kind == Some("assignment_expression")
+            })
+            || (previous.body_range.is_some() && next.body_range.is_some())
+        {
+            return None;
+        }
+        // Retain the implementation so any later second body remains ambiguous.
+        Some(if previous.body_range.is_some() {
+            self
+        } else {
+            incoming
+        })
+    }
+
     fn key(
         &self,
         file: &File<'source>,
