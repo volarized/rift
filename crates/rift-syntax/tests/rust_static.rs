@@ -404,3 +404,31 @@ fn test_rust_reexport_imports_keep_authored_visibility_ranges() {
     );
     assert!(uses[1].visibility.is_none());
 }
+
+#[test]
+fn test_rust_function_pointer_results_keep_authored_types_and_receivers() {
+    let path = ProjectPath::new("src/lib.rs").expect("path");
+    let source =
+        "struct Table { make: fn() -> Item } fn run(table: &Table) { (table.make)().read(); }";
+    let document = RustSyntaxProvider::default()
+        .analyze(
+            SyntaxSource {
+                path: &path,
+                text: source,
+            },
+            SyntaxLimits::default(),
+        )
+        .expect("syntax");
+    let facts = document.facts().static_facts().expect("static facts");
+    let text = |range: rift_syntax::ByteRange| {
+        &source
+            [usize::try_from(range.start).expect("start")..usize::try_from(range.end).expect("end")]
+    };
+    assert!(
+        facts
+            .declared_types()
+            .iter()
+            .any(|&(name, result)| text(name) == "make" && text(result) == "Item")
+    );
+    assert!(facts.calls().iter().any(|call| matches!(call.callee, rift_syntax::StaticCallee::Member { receiver, member } if text(receiver) == "(table.make)()" && text(member) == "read")));
+}

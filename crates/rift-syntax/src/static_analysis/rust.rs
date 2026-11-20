@@ -26,6 +26,8 @@ pub(super) struct Kinds {
     call: u16,
     generic_function: u16,
     field_expression: u16,
+    field_declaration: u16,
+    function_type: u16,
     struct_expression: u16,
     use_declaration: u16,
     use_alias: u16,
@@ -82,6 +84,8 @@ pub(super) fn kinds() -> &'static Kinds {
             call: id("call_expression"),
             generic_function: id("generic_function"),
             field_expression: id("field_expression"),
+            field_declaration: id("field_declaration"),
+            function_type: id("function_type"),
             struct_expression: id("struct_expression"),
             use_declaration: id("use_declaration"),
             use_alias: id("use_as_clause"),
@@ -178,6 +182,8 @@ impl Kinds {
             self.record_return(syntax_element, facts)?;
         } else if id == self.functions[1] {
             self.record_return(syntax_element, facts)?;
+        } else if id == self.field_declaration {
+            self.record_function_field(syntax_element, facts)?;
         } else if self.assignment.contains(&id) {
             self.record_mutation(syntax_element, facts)?;
         } else if id == self.edge_macro {
@@ -303,8 +309,13 @@ impl Kinds {
             .child_by_field_id(self.value)
             .and_then(|syntax_element| {
                 (!syntax_element.is_missing()
-                    && [self.identifier, self.self_value, self.field_expression]
-                        .contains(&syntax_element.kind_id()))
+                    && [
+                        self.identifier,
+                        self.self_value,
+                        self.field_expression,
+                        self.call,
+                    ]
+                    .contains(&syntax_element.kind_id()))
                 .then_some(syntax_element)
             });
         let member = syntax_element
@@ -541,6 +552,29 @@ impl Kinds {
             facts
                 .declared_types
                 .push((byte_range(name)?, byte_range(return_type)?));
+        }
+        Ok(())
+    }
+
+    fn record_function_field(
+        &self,
+        element: Node<'_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let Some(value) = element
+            .child_by_field_id(self.value_type)
+            .filter(|value| value.kind_id() == self.function_type)
+        else {
+            return Ok(());
+        };
+        if let Some(name) = element.child_by_field_id(self.name) {
+            let result = value
+                .child_by_field_id(self.return_type)
+                .and_then(|result| self.named_type(result))
+                .unwrap_or(value);
+            facts
+                .declared_types
+                .push((byte_range(name)?, byte_range(result)?));
         }
         Ok(())
     }

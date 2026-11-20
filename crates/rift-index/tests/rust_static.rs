@@ -844,3 +844,74 @@ fn test_rust_reexport_imports_keep_the_written_module() {
     );
 }
 
+#[test]
+fn test_rust_function_pointer_results_keep_declared_member_owners() {
+    // #832: use declared field returns and subsequent method returns.
+    let directory = tempfile::tempdir().expect("workspace");
+    let root = directory.path();
+    std::fs::create_dir(root.join("src")).expect("source directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='fixture'\nversion='0.1.0'\n",
+    )
+    .expect("manifest");
+    let source = "pub struct Item { pub value: usize } impl Item { pub fn read(self) -> usize { self.value } pub fn copy(self) -> Item { self } } pub struct Table { pub make: fn() -> Item } pub struct Opaque { pub make: fn() -> Unknown } pub struct Other; impl Other { pub fn read(self) -> usize { 0 } } pub struct OtherTable { pub make: fn() -> Other } mod secrets { use crate::Item; pub struct SecretTable { make: fn() -> Item } } pub fn private(table: &secrets::SecretTable) -> usize { (table.make)().read() } pub fn run(table: &Table) -> usize { (table.make)().read() } pub fn chain(table: &Table) -> usize { (table.make)().copy().read() } pub fn local(table: &Table) -> usize { let item = (table.make)(); item.read() } pub fn unknown(table: &Opaque) { (table.make)().read(); } pub fn method_value(table: &Table) { table.make.read(); } pub fn other(table: &OtherTable) -> usize { (table.make)().read() } pub fn shadow(table: &Table) { let table = 0; (table.make)().read(); }";
+    std::fs::write(root.join("src/lib.rs"), source).expect("source");
+    let index = WorkspaceIndex::build(
+        root,
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &TextFileInclusion::default(),
+    )
+    .expect("index");
+    assert!(
+        index
+            .symbol_view()
+            .expect("symbols")
+            .normalized_graph()
+            .records()
+            .iter()
+            .all(|record| record.identity().is_some())
+    );
+    for from in ["/fixture/run", "/fixture/chain", "/fixture/local"] {
+        for kind in [EdgeKind::Calls, EdgeKind::Reads] {
+            assert!(
+                index.edges().edges().any(|edge| edge.kind() == kind
+                    && edge.from().as_str().ends_with(from)
+                    && edge.to().as_str().ends_with("/Item/read")),
+                "missing {kind:?} {from} -> Item.read"
+            );
+        }
+    }
+    assert!(!index.edges().edges().any(|edge| {
+        edge.kind() == EdgeKind::Calls
+            && [
+                "/fixture/unknown",
+                "/fixture/shadow",
+                "/fixture/method_value",
+                "/fixture/private",
+                "/fixture/other",
+            ]
+            .iter()
+            .any(|from| edge.from().as_str().ends_with(from))
+            && edge.to().as_str().ends_with("/Item/read")
+    }));
+    assert!(
+        index
+            .edges()
+            .edges()
+            .any(|edge| edge.kind() == EdgeKind::Calls
+                && edge.from().as_str().ends_with("/fixture/other")
+                && edge.to().as_str().ends_with("/Other/read")),
+        "other field keeps its own return owner"
+    );
+    assert!(
+        !index
+            .edges()
+            .edges()
+            .any(|edge| edge.kind() == EdgeKind::Reads
+                && edge.from().as_str().ends_with("/fixture/private")),
+        "private fields stay refused outside their declaration module"
+    );
+}
+

@@ -250,7 +250,10 @@ impl<'source> Namespaces<'source> {
                 if file.conditional(result, work) {
                     continue;
                 }
-                let Some(callable) = file.target_at(name).and_then(Target::callable) else {
+                let Some(callable) = file.target_at(name).filter(|target| {
+                    target.symbol.kinds.contains(&SymbolKind::Callable)
+                        || target.symbol.kind == "field_declaration"
+                }) else {
                     continue;
                 };
                 let owner = self.edge_type_target(file, result, work).or_else(|| {
@@ -436,6 +439,15 @@ impl<'source> Namespaces<'source> {
                 continue;
             };
             let file = files.get(target.file.path.as_str())?;
+            // Function-pointer annotations describe an invocation's return owner,
+            // not a nominal value stored in the field itself.
+            if target
+                .symbol
+                .name_range
+                .is_some_and(|name| file.declared_types.contains_key(&name))
+            {
+                continue;
+            }
             let reference = file.facts.references().iter().find(|reference| {
                 work.charge()
                     && reference.role == rift_core::ReferenceRole::Type
@@ -825,12 +837,12 @@ impl<'source> Namespaces<'source> {
         }
         let target = selected?;
         (target.symbol.visibility.as_deref() == Some("pub")
-            || self.method_visible(file, position, target, work)
+            || self.declaration_visible(file, position, target, work)
             || target.symbol.visibility.is_none())
         .then_some(target)
     }
 
-    fn method_visible(
+    fn declaration_visible(
         &self,
         file: &File<'source>,
         position: u64,
