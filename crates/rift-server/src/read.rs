@@ -839,6 +839,21 @@ impl ReadService {
         &self.index
     }
 
+    /// Builds what the first read of this snapshot builds: the declaration inventory,
+    /// the symbol view, and the documentation layer of its index.
+    ///
+    /// The publication that completes preparation calls this before it is published.
+    pub fn prepare_reads(&self) {
+        self.index.prepare_reads();
+    }
+
+    /// Whether the declaration inventory, the symbol view, and the documentation layer of
+    /// this snapshot's index are built.
+    #[must_use]
+    pub fn reads_prepared(&self) -> bool {
+        self.index.reads_prepared()
+    }
+
     pub(crate) fn engine_revision(&self) -> &str {
         &self.revisions.tree_revision
     }
