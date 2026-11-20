@@ -12,6 +12,57 @@ use rift_syntax::DocumentPlacement;
 const WORK_MAX: usize = 10_000;
 
 #[test]
+fn test_python_wildcard_imports_keep_modules_without_resolving_exports() {
+    let source = "from .leaf import *\ndef use(): return leaf()\n";
+    let result = resolution(
+        "python",
+        &[
+            ("pkg/__init__.py", source),
+            ("pkg/leaf.py", "value = 1\ndef leaf(): pass\n"),
+        ],
+        &[],
+        WORK_MAX,
+    );
+    let imports = result
+        .occurrences
+        .iter()
+        .filter(|edge| edge.role == ReferenceRole::Import)
+        .collect::<Vec<_>>();
+    assert_eq!(imports.len(), 1, "{result:?}");
+    assert_eq!(source_of(imports[0], source), "*");
+    assert_eq!(target(imports[0]), "rift://symbol/local/python/pkg/leaf");
+    assert_eq!(
+        imports[0]
+            .edge_from
+            .as_ref()
+            .map(rift_core::SymbolId::as_str),
+        Some("rift://symbol/local/python/pkg")
+    );
+    assert_eq!(calls(&result, "pkg/__init__.py").count(), 0);
+}
+
+#[test]
+fn test_python_wildcard_imports_refuse_unknown_and_ambiguous_modules() {
+    let result = resolution(
+        "python",
+        &[
+            ("main.py", "from missing import *\nfrom pkg.leaf import *\n"),
+            ("pkg/leaf.py", "value = 1\n"),
+            ("pkg/leaf/__init__.py", "value = 2\n"),
+        ],
+        &[],
+        WORK_MAX,
+    );
+    assert!(
+        result
+            .occurrences
+            .iter()
+            .all(|edge| edge.role != ReferenceRole::Import),
+        "{result:?}"
+    );
+}
+
+#[test]
 fn test_python_static_receiver_depth_declines_without_blocking_later_reads() {
     let deep = ".again()".repeat(40);
     let source = format!(

@@ -166,6 +166,20 @@ impl EdgePythonKinds {
             && let Some(scope) = edge_enclosing(visited, &self.scopes)
         {
             facts.unsupported_bindings.push(byte_range(scope)?);
+            if let Some(module) = visited
+                .parent()
+                .and_then(|parent| parent.syntax_element().child_by_field_id(self.module))
+            {
+                facts.bindings.push(binding(
+                    syntax_element,
+                    scope,
+                    byte_range(scope)?.start,
+                    StaticBindingKind::PythonImport {
+                        module: byte_range(module)?,
+                        export: None,
+                    },
+                )?);
+            }
         }
         self.guards.record(visited, source, facts)?;
         self.edge_reference(visited, source, facts)?;

@@ -50,6 +50,26 @@ fn spelled(text: &str, range: crate::ByteRange) -> &str {
 }
 
 #[test]
+fn test_wildcard_import_keeps_module_evidence_and_unknown_bindings() {
+    let text = "from .models import *\n";
+    let document = analyze(text);
+    let facts = document.facts().static_facts().expect("static facts");
+    let import = facts
+        .bindings()
+        .iter()
+        .find(|binding| spelled(text, binding.name) == "*")
+        .expect("wildcard import evidence");
+    let crate::StaticBindingKind::PythonImport { module, export } = import.kind else {
+        panic!("module import: {import:?}");
+    };
+    assert_eq!(spelled(text, module), ".models");
+    assert!(export.is_none());
+    assert_eq!(facts.unsupported_bindings(), [import.scope]);
+    assert_eq!(spelled(text, import.scope), text);
+    assert_eq!(declared(&document), []);
+}
+
+#[test]
 fn test_annotated_locals_keep_the_enclosing_callable_and_source_range() {
     let text = "def build():\n    visited: list[str] = []\n    if True:\n        pending: int\n    def nested():\n        result: str = ''\n";
     let document = analyze(text);
