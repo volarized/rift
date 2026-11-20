@@ -76,7 +76,7 @@ fn text_range(source: &str, range: ByteRange) -> Option<&str> {
 }
 
 // Every token borrows the admitted source. Unsupported literal forms refuse proof.
-fn tokens(source: &str) -> Option<Vec<&str>> {
+pub(super) fn tokens(source: &str) -> Option<Vec<&str>> {
     let mut output = Vec::new();
     let mut offset = 0;
     let bytes = source.as_bytes();
@@ -267,12 +267,21 @@ fn transparent_definition(source: &str, symbol: &SyntaxSymbol, scope: &Scope) ->
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Condition {
+pub(super) enum Condition {
     Known(bool),
     Unknown,
 }
 
 fn cfg(input: &[&str], library: bool, depth: usize) -> Option<Condition> {
+    configured(input, library, depth, &|_| None)
+}
+
+pub(super) fn configured(
+    input: &[&str],
+    library: bool,
+    depth: usize,
+    feature: &impl Fn(&str) -> Option<bool>,
+) -> Option<Condition> {
     if depth == 0 {
         return None;
     }
@@ -285,6 +294,9 @@ fn cfg(input: &[&str], library: bool, depth: usize) -> Option<Condition> {
         ["true"] => Some(Condition::Known(true)),
         ["false"] => Some(Condition::Known(false)),
         [name] if super::crate_name_is_valid(name) => Some(Condition::Unknown),
+        ["feature", "=", value] => {
+            Some(feature(value).map_or(Condition::Unknown, Condition::Known))
+        }
         [name, "=", value]
             if super::crate_name_is_valid(name)
                 && value.starts_with('"')
@@ -292,10 +304,12 @@ fn cfg(input: &[&str], library: bool, depth: usize) -> Option<Condition> {
         {
             Some(Condition::Unknown)
         }
-        ["not", "(", rest @ .., ")"] => cfg(rest, library, depth - 1).map(|value| match value {
-            Condition::Known(value) => Condition::Known(!value),
-            Condition::Unknown => Condition::Unknown,
-        }),
+        ["not", "(", rest @ .., ")"] => {
+            configured(rest, library, depth - 1, feature).map(|value| match value {
+                Condition::Known(value) => Condition::Known(!value),
+                Condition::Unknown => Condition::Unknown,
+            })
+        }
         [operation @ ("all" | "any"), "(", rest @ .., ")"] => {
             let mut rest = rest;
             let mut result = Condition::Known(*operation == "all");
@@ -317,7 +331,7 @@ fn cfg(input: &[&str], library: bool, depth: usize) -> Option<Condition> {
                 if nested != 0 || split == 0 {
                     return None;
                 }
-                let value = cfg(&rest[..split], library, depth - 1)?;
+                let value = configured(&rest[..split], library, depth - 1, feature)?;
                 result = if *operation == "all" {
                     match (result, value) {
                         (Condition::Known(false), _) | (_, Condition::Known(false)) => {

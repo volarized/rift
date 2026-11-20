@@ -11,6 +11,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::NamespaceInput;
 
+pub(super) mod configuration;
 mod macros;
 
 /// Establishes the selected library root from captured metadata once per inventory.
@@ -437,6 +438,7 @@ fn file_anchors(
             })
     };
     let mut anchors = BTreeMap::new();
+    let mut owners = BTreeMap::<String, Vec<String>>::new();
     for symbol in syntax.symbols().iter().filter(|symbol| supported(symbol)) {
         let base = match symbol.container.as_deref() {
             Some(container) => format!("{container}::{}", symbol.name),
@@ -445,13 +447,25 @@ fn file_anchors(
         if symbol.qualified_name != base {
             continue;
         }
-        let Some(names) = base
-            .split("::")
-            .map(source_identifier)
-            .collect::<Option<Vec<_>>>()
-        else {
+        let structural = symbol.kind == "impl_item" && symbol.name.starts_with(['&', '[']);
+        let names = if structural {
+            let mut names = match symbol.container.as_deref() {
+                Some(container) => owner_path(container, &owners),
+                None => Some(Vec::new()),
+            };
+            if let Some(names) = &mut names {
+                names.push(symbol.name.nfc().collect());
+            }
+            names
+        } else {
+            owner_path(&base, &owners)
+        };
+        let Some(names) = names else {
             continue;
         };
+        if structural {
+            owners.insert(base, names.clone());
+        }
         let mut qualified_path = namespace.to_vec();
         qualified_path.extend(names);
         let Ok(identity) = SymbolIdentity::new(
@@ -466,6 +480,29 @@ fn file_anchors(
         }
     }
     anchors
+}
+
+fn owner_path(base: &str, owners: &BTreeMap<String, Vec<String>>) -> Option<Vec<String>> {
+    let mut prefix = base;
+    // Each step removes a path component; structural owners stay one component.
+    loop {
+        if let Some(owner) = owners.get(prefix) {
+            let mut names = owner.clone();
+            if let Some(suffix) = base.get(prefix.len()..)?.strip_prefix("::") {
+                names.extend(
+                    suffix
+                        .split("::")
+                        .map(source_identifier)
+                        .collect::<Option<Vec<_>>>()?,
+                );
+            }
+            return Some(names);
+        }
+        let Some((parent, _)) = prefix.rsplit_once("::") else {
+            return base.split("::").map(source_identifier).collect();
+        };
+        prefix = parent;
+    }
 }
 
 pub(super) fn library(input: &NamespaceInput<'_>) -> Option<(String, String)> {
@@ -670,91 +707,278 @@ fn local_exports(
         return;
     };
     let mut work = 0usize;
-    // Both are built on first use and read by every later binding: visiting every
-    // declaration and every identity again per binding made this pass quadratic in
-    // the crate's public imports.
+    let configurations = configuration::Configurations::new(input);
+    let files = selected
+        .iter()
+        .map(|file| (file.path.as_str(), file))
+        .collect::<BTreeMap<_, _>>();
+    let refused = conflicting_requests(input, &files, requested, &configurations);
+    // Build declaration and identity lookups once for every later binding and pass.
     let mut declarations = None;
-    let mut anchored = None;
-    for (namespace, (path, range, name, target)) in requested {
-        // Captured conditional declarations do not establish export completeness.
-        prepared.unresolved_exports = true;
-        let local = requested_path(namespace, target).and_then(|target_path| {
+    let mut export_paths = ExportPaths::default();
+    let mut completed = std::collections::BTreeSet::new();
+    'passes: for _ in 0..requested.len() {
+        let before = prepared.exports.len();
+        for request in requested {
+            let (namespace, (path, range, name, _)) = request;
+            let Some(next) = work.checked_add(1) else {
+                break 'passes;
+            };
+            work = next;
+            if work > work_max {
+                break 'passes;
+            }
+            let Some(identity) = export_identity(input, namespace, name) else {
+                continue;
+            };
+            if completed.contains(&identity) || refused.contains(&identity) {
+                continue;
+            }
+            let Some(file) = files.get(path.as_str()) else {
+                continue;
+            };
+            let configuration = configurations.file(path.as_str());
+            if configuration.admitted(file.syntax, file.source, *range) != Some(true) {
+                continue;
+            }
+            // Captured conditional declarations do not establish export completeness.
+            prepared.unresolved_exports = true;
             let declarations = declarations.get_or_insert_with(|| {
-                local_declarations(selected, &prepared.anchors, &mut work, work_max)
+                local_declarations(
+                    selected,
+                    &prepared.anchors,
+                    &configurations,
+                    &mut work,
+                    work_max,
+                )
             });
-            local_target(
+            let Some(declarations) = declarations else {
+                break 'passes;
+            };
+            let target = export_target(
                 input,
-                declarations.as_ref()?,
-                &target_path,
+                declarations,
+                (prepared, &mut export_paths),
+                &configurations,
+                request,
                 &mut work,
                 work_max,
-            )
-            .map(|(file, symbol, target)| {
-                (
-                    target.clone(),
-                    file.path.as_str().to_owned(),
-                    symbol.qualified_name.clone(),
-                )
-            })
-        });
-        let target = match local {
-            Some(local) => Some(local),
-            None if is_path_keyword(target) => None,
-            None => external_target(input, target, &mut work, work_max),
-        };
-        let Some((target, target_path, target_qualified_name)) = target else {
-            continue;
-        };
-        let mut alias_path = namespace.clone();
-        alias_path.push(name.clone());
-        let Some(identity) = SymbolIdentity::new(
-            input.owner().clone(),
-            ShippedLanguage::Rust.language(),
-            alias_path,
-        )
-        .ok()
-        .and_then(|identity| SymbolId::new(identity.wire_identity()).ok()) else {
-            continue;
-        };
-        if identity == target {
-            continue;
+            );
+            let Some((target, target_path, target_qualified_name)) = target else {
+                continue;
+            };
+            if identity == target {
+                continue;
+            }
+            if declarations.identities.contains(identity.as_str()) {
+                continue;
+            }
+            completed.insert(identity.clone());
+            prepared.exports.push(export_binding(
+                request,
+                identity,
+                (target, target_path, target_qualified_name),
+            ));
         }
-        if anchored
-            .get_or_insert_with(|| {
-                prepared
-                    .anchors
-                    .values()
-                    .flat_map(BTreeMap::values)
-                    .map(SymbolId::as_str)
-                    .collect::<std::collections::BTreeSet<_>>()
-            })
-            .contains(identity.as_str())
-        {
-            continue;
+        if prepared.exports.len() == before {
+            break;
         }
-        prepared.exports.push(super::ExportBinding {
-            path: path.as_str().to_owned(),
-            binding: rift_syntax::SyntaxExportBinding {
-                kind: rift_syntax::SyntaxExportKind::Named,
-                range: *range,
-                local: None,
-                exported: None,
-                source: None,
-                container: None,
-                type_only: false,
-            },
-            identity,
-            target,
-            target_path,
-            target_qualified_name,
-            name: name.clone(),
-            qualified_name: name.clone(),
-        });
     }
     let conflicts = super::typescript::conflicting_export_identities(&prepared.exports);
     prepared
         .exports
         .retain(|export| !conflicts.contains(export.identity.as_str()));
+}
+
+fn export_binding(
+    request: &(Vec<String>, macros::Export),
+    identity: SymbolId,
+    target: (SymbolId, String, String),
+) -> super::ExportBinding {
+    let (_, (path, range, name, _)) = request;
+    let (target, target_path, target_qualified_name) = target;
+    super::ExportBinding {
+        path: path.as_str().to_owned(),
+        binding: rift_syntax::SyntaxExportBinding {
+            kind: rift_syntax::SyntaxExportKind::Named,
+            range: *range,
+            local: None,
+            exported: None,
+            source: None,
+            container: None,
+            type_only: false,
+        },
+        identity,
+        target,
+        target_path,
+        target_qualified_name,
+        name: name.clone(),
+        qualified_name: name.clone(),
+    }
+}
+
+/// The first export binding at each qualified path, in the order the bindings were added.
+///
+/// Every request of every pass asks which earlier binding its target path names. Reading
+/// each binding's identity again for each question made one pass cost the requests times
+/// the bindings; the bindings only grow, so each identity is parsed once, when it joins.
+#[derive(Default)]
+struct ExportPaths {
+    first: BTreeMap<Vec<String>, usize>,
+    /// The first binding whose identity does not parse; a scan stops there.
+    unparsed: Option<usize>,
+    indexed: usize,
+}
+
+impl ExportPaths {
+    /// The first binding at `path` and the bindings a scan in order reads to answer:
+    /// up to and including the match or the first unparsed identity, else all of them.
+    fn first(
+        &mut self,
+        exports: &[super::ExportBinding],
+        path: &[String],
+    ) -> (Option<usize>, usize) {
+        for (index, export) in exports.iter().enumerate().skip(self.indexed) {
+            match SymbolIdentity::parse(export.identity.as_str()) {
+                Ok(identity) => {
+                    self.first
+                        .entry(identity.qualified_path().to_vec())
+                        .or_insert(index);
+                }
+                Err(_) => {
+                    self.unparsed.get_or_insert(index);
+                }
+            }
+        }
+        self.indexed = exports.len();
+        let found = self.first.get(path).copied();
+        let last = match (found, self.unparsed) {
+            (Some(found), Some(unparsed)) => found.min(unparsed),
+            (Some(last), None) | (None, Some(last)) => last,
+            (None, None) => return (None, exports.len()),
+        };
+        (found.filter(|found| *found == last), last.saturating_add(1))
+    }
+}
+
+fn export_target(
+    input: &NamespaceInput<'_>,
+    declarations: &LocalDeclarations<'_>,
+    (prepared, export_paths): (&super::PreparedNamespace, &mut ExportPaths),
+    configurations: &configuration::Configurations<'_>,
+    request: &(Vec<String>, macros::Export),
+    work: &mut usize,
+    work_max: usize,
+) -> Option<(SymbolId, String, String)> {
+    let (namespace, (_, _, _, target)) = request;
+    let local = requested_path(namespace, target).and_then(|target_path| {
+        // The charge is what reading the bindings in order costs, so the bound holds
+        // the same requests as before.
+        let (found, read) = export_paths.first(&prepared.exports, &target_path);
+        *work = work.checked_add(read)?;
+        if *work > work_max {
+            return None;
+        }
+        if let Some(export) = found.and_then(|found| prepared.exports.get(found)) {
+            return Some((
+                export.target.clone(),
+                export.target_path.clone(),
+                export.target_qualified_name.clone(),
+            ));
+        }
+        if export_paths.unparsed.is_some() {
+            return None;
+        }
+        local_target(
+            input,
+            declarations,
+            configurations,
+            &target_path,
+            work,
+            work_max,
+        )
+        .map(|(file, symbol, target)| {
+            (
+                target.clone(),
+                file.path.as_str().to_owned(),
+                symbol.qualified_name.clone(),
+            )
+        })
+    });
+    match local {
+        Some(local) => Some(local),
+        None if is_path_keyword(target)
+            || local_export_head(input, namespace, target, prepared, declarations) =>
+        {
+            None
+        }
+        None => external_target(input, target, work, work_max),
+    }
+}
+
+fn local_export_head(
+    input: &NamespaceInput<'_>,
+    namespace: &[String],
+    target: &[String],
+    prepared: &super::PreparedNamespace,
+    declarations: &LocalDeclarations<'_>,
+) -> bool {
+    let Some(identity) = target
+        .first()
+        .and_then(|name| export_identity(input, namespace, name))
+    else {
+        return true;
+    };
+    declarations.identities.contains(identity.as_str())
+        || prepared
+            .exports
+            .iter()
+            .any(|export| export.identity == identity)
+}
+
+fn export_identity(
+    input: &NamespaceInput<'_>,
+    namespace: &[String],
+    name: &str,
+) -> Option<SymbolId> {
+    let mut path = namespace.to_vec();
+    path.push(name.to_owned());
+    let identity = SymbolIdentity::new(
+        input.owner().clone(),
+        ShippedLanguage::Rust.language(),
+        path,
+    )
+    .ok()?;
+    SymbolId::new(identity.wire_identity()).ok()
+}
+
+fn conflicting_requests(
+    input: &NamespaceInput<'_>,
+    files: &BTreeMap<&str, &super::SelectedFile<'_>>,
+    requested: &[(Vec<String>, macros::Export)],
+    configurations: &configuration::Configurations<'_>,
+) -> std::collections::BTreeSet<SymbolId> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut refused = std::collections::BTreeSet::new();
+    for (namespace, (path, range, name, _)) in requested {
+        let Some(identity) = export_identity(input, namespace, name) else {
+            continue;
+        };
+        let Some(file) = files.get(path.as_str()) else {
+            continue;
+        };
+        let admitted =
+            configurations
+                .file(path.as_str())
+                .admitted(file.syntax, file.source, *range);
+        if admitted == Some(false) {
+            continue;
+        }
+        if admitted.is_none() || !seen.insert(identity.clone()) {
+            refused.insert(identity);
+        }
+    }
+    refused
 }
 
 fn external_target(
@@ -827,27 +1051,47 @@ type LocalDeclaration<'input> = (
     &'input SymbolId,
 );
 
-/// Every admitted declaration of the inventory by identity, in selection order. Each
-/// declaration is visited once and counts one unit of `work`; `None` once `work`
-/// passes `work_max`.
+/// Cached declarations by identity, plus every established anchor for local-name checks.
+struct LocalDeclarations<'input> {
+    by_identity: BTreeMap<&'input str, Vec<LocalDeclaration<'input>>>,
+    identities: std::collections::BTreeSet<&'input str>,
+}
+
+/// Visits each declaration once under `work_max`; known inactive declarations stay out.
 fn local_declarations<'input>(
     selected: &'input [super::SelectedFile<'input>],
     anchors: &'input super::Anchors,
+    configurations: &configuration::Configurations<'_>,
     work: &mut usize,
     work_max: usize,
-) -> Option<BTreeMap<&'input str, Vec<LocalDeclaration<'input>>>> {
-    let mut declarations = BTreeMap::<&str, Vec<_>>::new();
+) -> Option<LocalDeclarations<'input>> {
+    let mut declarations = LocalDeclarations {
+        by_identity: BTreeMap::new(),
+        identities: anchors
+            .values()
+            .flat_map(BTreeMap::values)
+            .map(SymbolId::as_str)
+            .collect(),
+    };
     for file in selected {
         let Some(anchors) = anchors.get(file.path.as_str()) else {
             continue;
         };
+        let configuration = configurations.file(file.path.as_str());
         for symbol in file.syntax.symbols() {
+            if symbol.kind == "impl_item" {
+                continue;
+            }
             *work = work.checked_add(1)?;
             if *work > work_max {
                 return None;
             }
+            if configuration.admitted(file.syntax, file.source, symbol.item_range) == Some(false) {
+                continue;
+            }
             if let Some(identity) = anchors.get(&symbol.qualified_name) {
                 declarations
+                    .by_identity
                     .entry(identity.as_str())
                     .or_default()
                     .push((file, symbol, identity));
@@ -857,12 +1101,11 @@ fn local_declarations<'input>(
     Some(declarations)
 }
 
-/// The one public declaration `path` names among the admitted declarations; `None`
-/// when no declaration or more than one carries that identity, or when it is not
-/// `pub` or its range lies outside its source.
+/// The one public, active declaration `path` names with a source range in its file.
 fn local_target<'input>(
     input: &NamespaceInput<'_>,
-    declarations: &BTreeMap<&'input str, Vec<LocalDeclaration<'input>>>,
+    declarations: &LocalDeclarations<'input>,
+    configurations: &configuration::Configurations<'_>,
     path: &[String],
     work: &mut usize,
     work_max: usize,
@@ -878,14 +1121,21 @@ fn local_target<'input>(
     if *work > work_max {
         return None;
     }
-    let [(file, symbol, identity)] = declarations.get(requested.as_str())?.as_slice() else {
+    let [(file, symbol, identity)] = declarations.by_identity.get(requested.as_str())?.as_slice()
+    else {
         return None;
     };
+    let admitted = configurations.file(file.path.as_str()).admitted(
+        file.syntax,
+        file.source,
+        symbol.item_range,
+    );
     let spelled = file
         .source
         .get(usize::try_from(symbol.range.start).ok()?..usize::try_from(symbol.range.end).ok()?)
         .is_some();
-    (symbol.visibility.as_deref() == Some("pub") && spelled).then_some((*file, *symbol, *identity))
+    (admitted == Some(true) && symbol.visibility.as_deref() == Some("pub") && spelled)
+        .then_some((*file, *symbol, *identity))
 }
 
 #[cfg(test)]

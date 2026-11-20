@@ -32,6 +32,9 @@ pub const WORKSPACE_LSP_PROCESS_KEY_BYTES_MAX: usize = 129;
 pub struct WorkspaceResourcePage {
     /// Digest of the accepted `rift.toml` bytes this page describes.
     pub configuration_revision: Digest,
+    /// The indexed revision this page read. A later page read with this `revision` pages
+    /// the same source catalog.
+    pub revision: crate::revision::Revision,
     /// Effective exact-language entries, sorted by language identity.
     #[schemars(length(max = 128))]
     pub languages: Vec<WorkspaceLanguageSummary>,
@@ -159,6 +162,7 @@ mod tests {
     fn page() -> WorkspaceResourcePage {
         WorkspaceResourcePage {
             configuration_revision: Digest("3f9a1c2e".to_owned()),
+            revision: crate::revision::Revision::tree(&"a".repeat(64)).expect("tree revision"),
             languages: vec![language()],
             source: vec![WorkspaceSourceUnit {
                 path: ProjectPath("src/view.tsx".to_owned()),

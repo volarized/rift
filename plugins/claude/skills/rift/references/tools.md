@@ -50,6 +50,10 @@ Parameters:
 
 Performs search across the index using a query language. `language` names the query
 language and defaults to `sparql`.
+A query over the captured inventory answers from partly covered facts, and `warnings`
+name the files, languages, or engines left out. A query whose answer needs every fact - an empty
+result, a false `ASK`, a count, a negation, an `OPTIONAL` - answers `unavailable` with
+`insufficient_coverage` instead.
 
 Parameters:
 

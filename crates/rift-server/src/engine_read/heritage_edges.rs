@@ -26,6 +26,67 @@ struct EdgeEngineReport {
     encoding: PositionEncoding,
 }
 
+/// Reads engine heritage facts targeting the bounded captured type inventory.
+///
+/// # Errors
+/// Refuses incomplete identities, unsupported kinds, exceeded bounds or engine failures.
+///
+/// # Cancel safety
+/// Dropping the future cancels the current exchange and retains no inventory.
+pub async fn graph_heritage_inventory(
+    reads: &ReadService,
+    engines: &EnginePool,
+    kinds: &[EdgeKind],
+    requests_max: usize,
+    deadline: Instant,
+) -> Result<(Vec<Edge>, Vec<ReadWarning>), RiftError> {
+    if kinds
+        .iter()
+        .any(|kind| !matches!(kind, EdgeKind::Extends | EdgeKind::Implements))
+    {
+        return Err(graph_reference_coverage());
+    }
+    let maximum = requests_max / kinds.len().max(1);
+    let view = reads.index().symbol_view()?;
+    if !view.objects_complete() {
+        return Err(graph_reference_coverage());
+    }
+    let mut targets = Vec::new();
+    for (identity, object) in view.objects() {
+        if object?
+            .facts()
+            .symbol_kinds()
+            .contains(&rift_protocol::read::SymbolKind::Type)
+        {
+            if targets.len() == maximum {
+                return Err(graph_reference_coverage());
+            }
+            targets.push(SymbolId(identity.as_str().to_owned()));
+        }
+    }
+    let mut edges = Vec::new();
+    let mut warnings = Vec::new();
+    for target in targets {
+        for &kind in kinds {
+            let (found, reported) = Box::pin(graph_heritage_edges(
+                reads,
+                engines,
+                &target,
+                kind,
+                TraversalDirection::Incoming,
+                deadline,
+            ))
+            .await?;
+            if edges.len().saturating_add(found.len()) > TRAVERSAL_SYMBOLS_MAX {
+                return Err(graph_reference_coverage());
+            }
+            edges.extend(found);
+            warnings.extend(reported);
+        }
+    }
+    Ok((edges, warnings))
+}
+
 /// Reads inheritance edges from the capabilities the selected engine advertises.
 ///
 /// # Errors
@@ -57,17 +118,7 @@ pub async fn graph_heritage_edges(
         declaration.file,
         declaration.symbol,
     )?;
-    let implementation_kind = match declaration.symbol.kind {
-        "trait_item" | "interface_declaration" | "interface" | "trait" => {
-            Some(EdgeKind::Implements)
-        }
-        "class_declaration"
-        | "class_definition"
-        | "abstract_class_declaration"
-        | "class"
-        | "abstract_class" => Some(EdgeKind::Extends),
-        _ => None,
-    };
+    let implementation_kind = implementation_kind(declaration.symbol);
     let report = match Box::pin(edge_engine_report(
         slot,
         &target,
@@ -107,6 +158,20 @@ pub async fn graph_heritage_edges(
     Ok((edges, warnings))
 }
 
+pub(super) fn implementation_kind(symbol: &rift_syntax::SyntaxSymbol) -> Option<EdgeKind> {
+    match symbol.kind {
+        "trait_item" | "interface_declaration" | "interface" | "trait" => {
+            Some(EdgeKind::Implements)
+        }
+        "class_declaration"
+        | "class_definition"
+        | "abstract_class_declaration"
+        | "class"
+        | "abstract_class" => Some(EdgeKind::Extends),
+        _ => None,
+    }
+}
+
 fn edge_locations(
     reads: &ReadService,
     slot: &EngineSlot,
@@ -131,6 +196,18 @@ fn edge_locations(
             (location.range, report.encoding),
             "engine edges",
         )?;
+        if kind == EdgeKind::Implements && direction == TraversalDirection::Incoming {
+            edge_implementation(
+                reads,
+                &identity,
+                &path,
+                (location.range, report.encoding),
+                neighbor,
+                slot.edge_provider(),
+                &mut edges,
+            )?;
+            continue;
+        }
         if let Some(neighbor) = neighbor {
             let (from, to) = match direction {
                 TraversalDirection::Outgoing => (seed.clone(), neighbor),
@@ -143,9 +220,9 @@ fn edge_locations(
                 reads,
                 &identity,
                 &path,
-                location.range,
-                report.encoding,
+                (location.range, report.encoding),
                 kind,
+                slot.edge_provider(),
                 &mut edges,
             )?;
             if edges.len() == before {
@@ -158,7 +235,12 @@ fn edge_locations(
     Ok(edges)
 }
 
-fn edge_protocol(from: SymbolId, to: SymbolId, kind: EdgeKind, provider: EdgeProvider) -> Edge {
+pub(super) fn edge_protocol(
+    from: SymbolId,
+    to: SymbolId,
+    kind: EdgeKind,
+    provider: EdgeProvider,
+) -> Edge {
     Edge {
         producer: None,
         from,
@@ -173,13 +255,54 @@ fn edge_protocol(from: SymbolId, to: SymbolId, kind: EdgeKind, provider: EdgePro
     }
 }
 
-fn edge_impl_header(
+/// Keeps implementation replies only where the captured header establishes a direct edge.
+pub(super) fn edge_implementation(
     reads: &ReadService,
     target: &CoreSymbolId,
     path: &ProjectPath,
-    range: Range,
-    encoding: PositionEncoding,
+    (range, encoding): (Range, PositionEncoding),
+    neighbor: Option<SymbolId>,
+    provider: EdgeProvider,
+    edges: &mut Vec<Edge>,
+) -> Result<(), RiftError> {
+    let before = edges.len();
+    edge_impl_header(
+        reads,
+        target,
+        path,
+        (range, encoding),
+        EdgeKind::Implements,
+        provider,
+        edges,
+    )?;
+    if edges.len() != before {
+        return Ok(());
+    }
+    let Some(from) = neighbor else { return Ok(()) };
+    let identity = CoreSymbolId::new(from.as_str())?;
+    let direct = reads
+        .edges()
+        .outgoing(&identity)
+        .iter()
+        .any(|edge| edge.kind() == EdgeKind::Implements && edge.to() == target);
+    if direct {
+        edges.push(edge_protocol(
+            from,
+            SymbolId(target.as_str().to_owned()),
+            EdgeKind::Implements,
+            provider,
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn edge_impl_header(
+    reads: &ReadService,
+    target: &CoreSymbolId,
+    path: &ProjectPath,
+    (range, encoding): (Range, PositionEncoding),
     kind: EdgeKind,
+    provider: EdgeProvider,
     edges: &mut Vec<Edge>,
 ) -> Result<(), RiftError> {
     let Some(file) = reads.index().file(path) else {
@@ -197,7 +320,10 @@ fn edge_impl_header(
     {
         let occurrence = edge.occurrence().range();
         if start <= occurrence.start() && occurrence.end() <= end {
-            edges.push(edge.to_protocol());
+            let mut edge = edge.to_protocol();
+            edge.provider = provider;
+            edge.derivation = EdgeDerivation::Resolution;
+            edges.push(edge);
         }
     }
     Ok(())
@@ -220,6 +346,7 @@ async fn edge_engine_report(
             Box::pin(async move {
                 let capability = session.capabilities();
                 let implementation = direction == TraversalDirection::Incoming
+                    && kind == EdgeKind::Implements
                     && Some(kind) == implementation_kind
                     && capability.edges.implementation;
                 if !capability.edges.type_hierarchy && !implementation {
@@ -234,6 +361,7 @@ async fn edge_engine_report(
                 };
                 let mut locations = Vec::new();
                 if direction == TraversalDirection::Incoming
+                    && kind == EdgeKind::Implements
                     && Some(kind) == implementation_kind
                     && session.capabilities().edges.implementation
                 {
@@ -245,6 +373,12 @@ async fn edge_engine_report(
                         return Err(graph_reference_coverage());
                     }
                     for item in prepared {
+                        if item.uri != session.root().document_uri(&path)?
+                            || !(item.selection_range.start <= position
+                                && position < item.selection_range.end)
+                        {
+                            continue;
+                        }
                         edge_hierarchy_locations(session, item, direction, kind, &mut locations)
                             .await?;
                     }

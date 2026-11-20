@@ -84,7 +84,7 @@ async fn search_traversal_neighbors_depth_one_reaches_the_direct_callers() -> Te
         &client,
         tool_request(
             "search_retrieval",
-            &json!({ "traversal": { "seed": captured_seed(&client, "leaf", "graph.py").await? } }),
+            &json!({ "traversal": { "seed": captured_seed(&client, "leaf", "graph.py").await?, "kinds": ["calls"] } }),
         ),
     )
     .await?;
@@ -127,6 +127,7 @@ async fn search_traversal_impact_incoming_depth_two_reaches_every_caller() -> Te
                 "traversal": {
                     "seed": captured_seed(&client, "leaf", "graph.py").await?,
                     "direction": "incoming",
+                    "kinds": ["calls"],
                     "depth": 2
                 }
             }),
@@ -699,14 +700,21 @@ const LIVE_RUST_FILES: &[(&str, &str)] = &[
 const LIVE_RUST_ENGINE: &str =
     "[languages.rust.lsp]\ncommand = [\"rustup\", \"run\", \"1.98\", \"rust-analyzer\"]\n";
 
-/// Walks from `seed` in `direction` until the reached names equal `expected`, at most
-/// [`LIVE_WALK_ATTEMPTS_MAX`] times, printing each answer with its wall time. Returns
-/// the attempt that matched and its answer.
+/// The kinds a live incoming walk follows: the references the language server resolves.
+/// Static analysis captures the fixture's calls, imports, and containment too, and a walk
+/// over every kind reaches a caller through the first edge the index holds, so only this
+/// kind proves the language server answered.
+const LIVE_INCOMING_KINDS: &[&str] = &["references"];
+
+/// Walks from `seed` in `direction` under `kinds` until the reached names equal
+/// `expected`, at most [`LIVE_WALK_ATTEMPTS_MAX`] times, printing each answer with its wall
+/// time. Returns the attempt that matched and its answer.
 async fn live_walk(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     label: &str,
     seed: &str,
     direction: &str,
+    kinds: &[&str],
     expected: &[&str],
 ) -> TestResult<(usize, Value)> {
     for attempt in 1..=LIVE_WALK_ATTEMPTS_MAX {
@@ -715,7 +723,7 @@ async fn live_walk(
             client,
             tool_request(
                 "search_retrieval",
-                &json!({"traversal": {"seed": seed, "direction": direction}}),
+                &json!({"traversal": {"seed": seed, "direction": direction, "kinds": kinds}}),
             ),
         )
         .await?;
@@ -732,23 +740,100 @@ async fn live_walk(
     Err(format!("{label} never answered {expected:?}").into())
 }
 
-/// Incoming neighbors retain one caller-to-target edge, followed against its direction.
+/// Incoming neighbors retain one caller-to-target edge, followed against its direction,
+/// and return that edge.
+fn direct_incoming(hit: &Value, seed: &str) -> TestResult<Value> {
+    assert_eq!(hit["distance"], json!(1), "{hit}");
+    let path = hit["traversal_path"]
+        .as_array()
+        .ok_or("an incoming neighbor carries its path")?;
+    assert_eq!(path.len(), 1, "{hit}");
+    let hop = &path[0];
+    assert_eq!(hop["direction"], "incoming", "{hit}");
+    assert_eq!(
+        hop["edge"]["from"], hit["hit"]["symbol"]["id"],
+        "the reached declaration holds the reference: {hit}"
+    );
+    assert_eq!(hop["edge"]["to"], seed, "{hit}");
+    Ok(hop["edge"].clone())
+}
+
+/// Each incoming neighbor is a reference the language server resolved.
 fn assert_direct_incoming(answer: &Value, seed: &str) -> TestResult {
     for hit in results(answer) {
-        assert_eq!(hit["distance"], json!(1), "{hit}");
-        let path = hit["traversal_path"]
-            .as_array()
-            .ok_or("an incoming neighbor carries its path")?;
-        assert_eq!(path.len(), 1, "{hit}");
-        let hop = &path[0];
-        assert_eq!(hop["direction"], "incoming", "{hit}");
-        assert_eq!(
-            hop["edge"]["from"], hit["hit"]["symbol"]["id"],
-            "the reached declaration holds the reference: {hit}"
-        );
-        assert_eq!(hop["edge"]["to"], seed, "{hit}");
-        eprintln!("live incoming edge: {hop}");
+        let edge = direct_incoming(&hit, seed)?;
+        assert_eq!(edge["kinds"], json!(["references"]), "{hit}");
+        assert_eq!(edge["provider"], json!("lsp"), "{hit}");
+        eprintln!("live incoming edge: {edge}");
     }
+    Ok(())
+}
+
+/// A walk over every kind reaches exactly `expected`, each neighbor through the static edge
+/// of the paired kind the index holds for it. Returns the answer.
+async fn assert_static_incoming(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    seed: &str,
+    expected: &[(&str, &str)],
+) -> TestResult<Value> {
+    let answer = call_retrying_acceptance(
+        client,
+        tool_request(
+            "search_retrieval",
+            &json!({"traversal": {"seed": seed, "direction": "incoming"}}),
+        ),
+    )
+    .await?;
+    let mut reached = Vec::new();
+    for hit in results(&answer) {
+        let edge = direct_incoming(&hit, seed)?;
+        assert_eq!(edge["provider"], json!("static"), "{hit}");
+        let name = hit["hit"]["symbol"]["name"].as_str().unwrap_or_default();
+        let kind = edge["kind"].as_str().unwrap_or_default();
+        assert_eq!(edge["kinds"], json!([kind]), "{hit}");
+        reached.push((name.to_owned(), kind.to_owned()));
+    }
+    reached.sort();
+    let expected: Vec<(String, String)> = expected
+        .iter()
+        .map(|(name, kind)| ((*name).to_owned(), (*kind).to_owned()))
+        .collect();
+    assert_eq!(reached, expected, "{answer}");
+    Ok(answer)
+}
+
+/// The static edges arriving at the Rust fixture's `beacon`: the module-scope imports in
+/// caller.rs and walk.rs, the calls in `total` and `larger`, and `hub` containing it.
+const RUST_STATIC_INCOMING: &[(&str, &str)] = &[
+    ("caller", "imports"),
+    ("hub", "contains"),
+    ("larger", "calls"),
+    ("total", "calls"),
+    ("walk", "imports"),
+];
+
+/// The static calls arriving at the TypeScript fixture's `beacon`.
+#[cfg(unix)]
+const TYPESCRIPT_STATIC_INCOMING: &[(&str, &str)] =
+    &[("Banner", "calls"), ("larger", "calls"), ("total", "calls")];
+
+/// rust-analyzer answered the outgoing walk from `larger`: static analysis names `beacon`
+/// too, but only the language server names `max` and `len`, which sit in the standard
+/// library, so the walk drops them and counts them.
+fn assert_standard_callees_dropped(answer: &Value) -> TestResult {
+    let dropped = answer["warnings"]
+        .as_array()
+        .and_then(|warnings| {
+            warnings
+                .iter()
+                .find(|warning| warning["code"] == json!("callees_dropped"))
+        })
+        .ok_or("the walk counts the callees it dropped")?;
+    assert_eq!(
+        dropped["callees"],
+        json!(2),
+        "`max` and `len` sit in the standard library: {answer}"
+    );
     Ok(())
 }
 
@@ -794,7 +879,10 @@ const LIVE_WALK_ATTEMPTS_MAX: usize = 10;
 /// opens only through the server's feed. `beacon` becomes `beacon2` in hub.rs, below a
 /// new `helper`, and caller.rs gains `again`. The outgoing walk from `larger` opens only
 /// walk.rs, and the incoming read of `beacon2` opens only hub.rs.
-/// Incoming walks also reach `caller` and `walk` through their module-scope imports.
+/// Incoming walks read rust-analyzer's references alone: the calls in `total` and
+/// `larger`, and in `again` after the edit. A walk over every kind reaches the static edges
+/// instead, before the edit and after it: those calls, the module-scope imports in `caller`
+/// and `walk`, and `hub` containing the seed.
 #[tokio::test]
 async fn live_rust_analyzer_walks_answer_a_rename_in_an_unopened_file() -> TestResult {
     if !live_engine_gate::engine_live() {
@@ -810,35 +898,32 @@ async fn live_rust_analyzer_walks_answer_a_rename_in_an_unopened_file() -> TestR
     .await?;
     let larger = live_seed(&client, "larger", "rust").await?;
     let beacon = live_seed(&client, "beacon", "rust").await?;
-    let (cold, answer) =
-        live_walk(&client, "outgoing before", &larger, "outgoing", &["beacon"]).await?;
+    let (cold, answer) = live_walk(
+        &client,
+        "outgoing before",
+        &larger,
+        "outgoing",
+        &[],
+        &["beacon"],
+    )
+    .await?;
     assert_eq!(
         cold, 1,
         "the first walk waits out rust-analyzer's load instead of taking the empty prepare \
          it answers while loading as final"
     );
-    let dropped = answer["warnings"]
-        .as_array()
-        .and_then(|warnings| {
-            warnings
-                .iter()
-                .find(|warning| warning["code"] == json!("callees_dropped"))
-        })
-        .ok_or("the walk counts the callees it dropped")?;
-    assert_eq!(
-        dropped["callees"],
-        json!(2),
-        "`max` and `len` sit in the standard library: {answer}"
-    );
+    assert_standard_callees_dropped(&answer)?;
     let (_, incoming) = live_walk(
         &client,
         "incoming before",
         &beacon,
         "incoming",
-        &["caller", "larger", "total", "walk"],
+        LIVE_INCOMING_KINDS,
+        &["larger", "total"],
     )
     .await?;
     assert_direct_incoming(&incoming, &beacon)?;
+    assert_static_incoming(&client, &beacon, RUST_STATIC_INCOMING).await?;
     eprintln!("live: warm after {:?}", started.elapsed());
 
     std::fs::write(
@@ -859,8 +944,16 @@ async fn live_rust_analyzer_walks_answer_a_rename_in_an_unopened_file() -> TestR
         published_holds(&client, name, present, edited).await?;
     }
     eprintln!("live: published after {:?}", edited.elapsed());
-    let (outgoing, _) =
-        live_walk(&client, "outgoing after", &larger, "outgoing", &["beacon2"]).await?;
+    let (outgoing, answer) = live_walk(
+        &client,
+        "outgoing after",
+        &larger,
+        "outgoing",
+        &[],
+        &["beacon2"],
+    )
+    .await?;
+    assert_standard_callees_dropped(&answer)?;
     eprintln!("live: outgoing fresh after {:?}", edited.elapsed());
     let beacon2 = live_seed(&client, "beacon2", "rust").await?;
     let (incoming, answer) = live_walk(
@@ -868,10 +961,14 @@ async fn live_rust_analyzer_walks_answer_a_rename_in_an_unopened_file() -> TestR
         "incoming after",
         &beacon2,
         "incoming",
-        &["again", "caller", "larger", "total", "walk"],
+        LIVE_INCOMING_KINDS,
+        &["again", "larger", "total"],
     )
     .await?;
     assert_direct_incoming(&answer, &beacon2)?;
+    let mut fresh = vec![("again", "calls")];
+    fresh.extend_from_slice(RUST_STATIC_INCOMING);
+    assert_static_incoming(&client, &beacon2, &fresh).await?;
     eprintln!("live: incoming fresh after {:?}", edited.elapsed());
     assert_eq!(
         (outgoing, incoming),
@@ -948,7 +1045,9 @@ fn install_captured_typescript_engine(root: &std::path::Path) {
 /// first walk, since the walk waits out the project load. The outgoing walk from `larger`
 /// reaches `beacon`, and addresses `Math.max` in the `typescript` package the workspace
 /// installs, whose lib declares it: with the global API off it drops, and the answer names
-/// why. The incoming walk to `beacon` reaches `larger`, `total`, and the TSX `Banner`.
+/// why. The incoming walk to `beacon` reads the language server's references alone and
+/// reaches `larger`, `total`, and the TSX `Banner`; a walk over every kind reaches them
+/// through the calls static analysis captured.
 #[cfg(unix)]
 #[tokio::test]
 async fn live_typescript_language_server_walks_both_directions() -> TestResult {
@@ -976,6 +1075,7 @@ async fn live_typescript_language_server_walks_both_directions() -> TestResult {
         "typescript outgoing",
         &larger,
         "outgoing",
+        &[],
         &["beacon"],
     )
     .await?;
@@ -1003,22 +1103,47 @@ async fn live_typescript_language_server_walks_both_directions() -> TestResult {
         "typescript incoming",
         &beacon,
         "incoming",
+        LIVE_INCOMING_KINDS,
         &["Banner", "larger", "total"],
     )
     .await?;
     eprintln!("live typescript: incoming after {:?}", started.elapsed());
-    for hit in results(&answer) {
-        let hop = &hit["traversal_path"][0];
-        assert_eq!(hop["direction"], json!("incoming"), "{hit}");
-        assert_eq!(hop["edge"]["kinds"], json!(["references"]), "{hit}");
-    }
+    assert_direct_incoming(&answer, &beacon)?;
     assert!(answer["warnings"].is_null(), "{answer}");
+    assert_static_incoming(&client, &beacon, TYPESCRIPT_STATIC_INCOMING).await?;
     assert_eq!(
         (outgoing, incoming),
         (1, 1),
         "both walks answer on the first request"
     );
 
+    client.cancel().await?;
+    Ok(())
+}
+
+/// With no language engine configured, static analysis alone answers an incoming walk over
+/// every kind: the imports, calls, and containment the Rust fixture holds for `beacon`.
+#[tokio::test]
+async fn search_traversal_incoming_reaches_every_static_rust_edge_kind() -> TestResult {
+    let (_directory, client, _server_task) = served_workspace(LIVE_RUST_FILES, None).await?;
+    let beacon = captured_seed(&client, "beacon", "hub.rs").await?;
+    let answer = assert_static_incoming(&client, &beacon, RUST_STATIC_INCOMING).await?;
+    assert!(answer["warnings"].is_null(), "{answer}");
+    client.cancel().await?;
+    Ok(())
+}
+
+/// With no language engine configured, static analysis alone answers an incoming walk over
+/// every kind: the calls to `beacon` in both TypeScript dialects.
+#[cfg(unix)]
+#[tokio::test]
+async fn search_traversal_incoming_reaches_static_typescript_calls() -> TestResult {
+    let mut files = typescript_install::typescript_package_files().to_vec();
+    files.extend_from_slice(LIVE_TYPESCRIPT_FILES);
+    let (_directory, client, _server_task) = served_workspace(&files, None).await?;
+    let beacon = captured_seed(&client, "beacon", "hub.ts").await?;
+    let answer = assert_static_incoming(&client, &beacon, TYPESCRIPT_STATIC_INCOMING).await?;
+    assert!(answer["warnings"].is_null(), "{answer}");
     client.cancel().await?;
     Ok(())
 }
@@ -1264,7 +1389,7 @@ async fn search_traversal_outgoing_drops_a_standard_library_callee_and_walks_a_c
             "search_retrieval",
             &json!({
                 "traversal": {
-                    "seed": captured_seed(&client, "Holder", "extra.py").await?, "direction": "outgoing"
+                    "seed": captured_seed(&client, "Holder", "extra.py").await?, "direction": "outgoing", "kinds": ["calls"]
                 }
             }),
         ),
@@ -2145,6 +2270,64 @@ async fn search_traversal_outgoing_over_an_unavailable_global_api_drops_package_
         "{counted}"
     );
 
+    client.cancel().await?;
+    Ok(())
+}
+
+/// An unnamed runtime target does not invalidate a separately established local call.
+/// Partial rows name missing provider coverage; negative answers still require it.
+#[tokio::test]
+async fn search_calls_prove_local_witness_when_a_runtime_target_has_no_collection() -> TestResult {
+    let configuration = format!("[global]\nenabled = false\n{OUTGOING_ENGINE}");
+    let (_directory, client, _server_task) = workspace_client::served_prepared_workspace(
+        OUTGOING_FILES,
+        Some(configuration),
+        python_runtime_environment::prepare,
+    )
+    .await?;
+    let caller = captured_seed(&client, "counted", "extra.py").await?;
+    let leaf = captured_seed(&client, "leaf", "graph.py").await?;
+    for query in [
+        format!("ASK {{ <{caller}> :calls <{leaf}> }}"),
+        format!("ASK {{ <{caller}> :calls ?t FILTER(?t IN (<{leaf}>)) }}"),
+    ] {
+        let answer =
+            call_retrying_acceptance(&client, tool_request("search", &json!({"query":query})))
+                .await?;
+        assert_eq!(
+            answer["answer"],
+            json!({"result":"boolean","value":true}),
+            "{answer}"
+        );
+    }
+    let rows = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "search",
+            &json!({"query":format!("SELECT ?t {{ <{caller}> :calls ?t }}")}),
+        ),
+    )
+    .await?;
+    assert_eq!(
+        rows["answer"]["bindings"],
+        json!([{"t":{"type":"iri","value":leaf}}]),
+        "{rows}"
+    );
+    assert!(
+        rows["warnings"].as_array().is_some_and(|warnings| warnings
+            .iter()
+            .any(|warning| warning["code"] == "edge_coverage_missing")),
+        "{rows}"
+    );
+    for query in [
+        format!("ASK {{ <{caller}> :calls <rift://symbol/local/python/absent> }}"),
+        format!("ASK {{ <{caller}> :calls ?t FILTER NOT EXISTS {{ ?t :calls ?other }} }}"),
+    ] {
+        let answer =
+            call_retrying_acceptance(&client, tool_request("search", &json!({"query":query})))
+                .await?;
+        assert_eq!(answer["reason"], "insufficient_coverage", "{answer}");
+    }
     client.cancel().await?;
     Ok(())
 }

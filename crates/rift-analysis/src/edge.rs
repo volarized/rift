@@ -466,22 +466,27 @@ impl EdgeStore {
                     .binary_search_by(|other| edge_order(other, edge))
                     .is_err()
             });
-            let (fits, omitted) = edges.split_at(edges.len().min(remaining));
+            let fits = edges.len().min(remaining);
             self.dropped_edges = self
                 .dropped_edges
-                .saturating_add(u64::try_from(omitted.len()).unwrap_or(u64::MAX));
-            remaining -= fits.len();
-            for edge in fits {
-                self.outgoing
-                    .entry(from.clone())
-                    .or_default()
-                    .push(edge.clone());
+                .saturating_add(u64::try_from(edges.len() - fits).unwrap_or(u64::MAX));
+            remaining -= fits;
+            changed |= fits > 0;
+            edges.truncate(fits);
+            if edges.is_empty() {
+                continue;
+            }
+            // The admitted list becomes the outgoing list's tail: one copy per direction.
+            for edge in &edges {
                 self.incoming
                     .entry(edge.to.clone())
                     .or_default()
                     .push(edge.clone());
             }
-            changed |= !fits.is_empty();
+            self.outgoing
+                .entry(from.clone())
+                .or_default()
+                .append(&mut edges);
         }
         if changed {
             for edges in self.outgoing.values_mut().chain(self.incoming.values_mut()) {

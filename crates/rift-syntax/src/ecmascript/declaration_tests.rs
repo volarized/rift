@@ -30,6 +30,58 @@ fn javascript(text: &str) -> SyntaxDocument {
     analyze(&JavaScriptSyntaxProvider::default(), "src/main.js", text)
 }
 
+#[test]
+fn test_typescript_loop_bindings_keep_each_declaration() {
+    let document =
+        typescript("for (const [leftName, left] of entries) { for (const key in value) { key; } }");
+    let names = document
+        .symbols()
+        .iter()
+        .map(|symbol| symbol.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["leftName", "left", "key"]);
+}
+
+#[test]
+fn test_type_literal_members_and_catch_names_keep_their_declarations() {
+    let document = typescript(
+        "type Result = { value: string; run(): void }; function root() { try {} catch (error) { const value = error; } }",
+    );
+    for name in ["Result.value", "Result.run", "root.error"] {
+        assert!(!symbol(&document, name).name.is_empty());
+    }
+}
+
+#[test]
+fn test_object_members_keep_names_callable_values_and_nested_containers() {
+    // #753: object members retain the declaration holding their source.
+    let source = "const dictionary = { url: 'URL', validate: (value: string) => value, nested: { value: 1 }, short };";
+    let document = typescript(source);
+    for name in [
+        "dictionary.url",
+        "dictionary.validate",
+        "dictionary.nested",
+        "dictionary.nested.value",
+        "dictionary.short",
+    ] {
+        assert_eq!(symbol(&document, name).kind, "property");
+    }
+    assert!(
+        symbol(&document, "dictionary.validate")
+            .kinds
+            .contains(&SymbolKind::Callable)
+    );
+    assert_eq!(
+        spelled(
+            source,
+            symbol(&document, "dictionary.url")
+                .name_range
+                .expect("member name")
+        ),
+        "url"
+    );
+}
+
 /// Each declaration's qualified name, container, and kind word.
 fn declared(document: &SyntaxDocument) -> Vec<(&str, Option<&str>, &str)> {
     document
@@ -238,6 +290,7 @@ fn test_nested_declarations_qualify_under_their_enclosing_declaration() {
             ("Widget.go.step", Some("Widget.go"), "variable"),
             ("obj", None, "variable"),
             ("obj.method", Some("obj"), "method"),
+            ("obj.prop", Some("obj"), "property"),
             ("picked", None, "variable"),
         ]
     );

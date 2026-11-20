@@ -33,7 +33,9 @@ use crate::history::{StoredHistory, SymbolTimelines};
 mod canonical;
 mod facets;
 mod symbol;
-pub use canonical::{LocalSymbolViewInput, LocalSymbolViews};
+pub use canonical::{
+    InventoryCoverage, LocalSymbolViewInput, LocalSymbolViews, RetainedViewLimits,
+};
 
 /// Inputs for one cancellable current-tree read-service build.
 pub struct ReadServiceBuild<'a> {
@@ -378,6 +380,53 @@ impl ReadService {
         text: &[CoreProjectPath],
     ) -> WorkspaceMap {
         crate::map::build_preparation_map(source, text, self.revisions.wire_index_tree_revision())
+    }
+
+    /// Whether static edge producers completed captured sources within their bounds.
+    ///
+    /// # Errors
+    /// Returns the captured identity directory failure.
+    pub fn static_edges_complete(&self) -> Result<bool, RiftError> {
+        Ok(self.index.edges().is_complete() && self.index.symbol_view()?.objects_complete())
+    }
+
+    /// Captured objects whose identities are unestablished, which edge inventories omit.
+    fn edge_identity_omissions(&self) -> usize {
+        self.index
+            .normalized_graph()
+            .records()
+            .iter()
+            .filter(|object| object.identity().is_none())
+            .count()
+    }
+
+    /// Whether edge inventories omit no captured object for an unestablished identity.
+    ///
+    /// An inventory that omits one still answers its edges between identified endpoints, but
+    /// cannot establish an absence or an aggregate.
+    #[must_use]
+    pub fn edge_identities_complete(&self) -> bool {
+        self.edge_identity_omissions() == 0
+    }
+
+    /// Reports captured objects omitted from edges because their identities are unestablished.
+    #[must_use]
+    pub fn edge_identity_warning(&self) -> Option<ReadWarning> {
+        let omitted = self.edge_identity_omissions();
+        (omitted > 0).then(|| ReadWarning::EdgeCoverageMissing {
+            kinds: Vec::new(),
+            detail: format!(
+                "captured objects without established identities: {omitted}; edge inventories omit these objects and retain edges between identified endpoints"
+            ),
+        })
+    }
+
+    /// Whether a configured engine serves a captured source language.
+    #[must_use]
+    pub fn uses_edge_engines(&self, engines: &crate::EnginePool) -> bool {
+        self.index
+            .files()
+            .any(|file| engines.engine_for(file.syntax().language()).is_some())
     }
 
     /// The symbol reference adjacency built from this snapshot's normalized graph: which
@@ -788,6 +837,21 @@ impl ReadService {
     /// Returns the immutable workspace index this snapshot serves.
     pub(crate) const fn index(&self) -> &WorkspaceIndex {
         &self.index
+    }
+
+    /// Builds what the first read of this snapshot builds: the declaration inventory,
+    /// the symbol view, and the documentation layer of its index.
+    ///
+    /// The publication that completes preparation calls this before it is published.
+    pub fn prepare_reads(&self) {
+        self.index.prepare_reads();
+    }
+
+    /// Whether the declaration inventory, the symbol view, and the documentation layer of
+    /// this snapshot's index are built.
+    #[must_use]
+    pub fn reads_prepared(&self) -> bool {
+        self.index.reads_prepared()
     }
 
     pub(crate) fn engine_revision(&self) -> &str {
@@ -2481,7 +2545,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             value["pagination"],
-            json!({"page": 1, "pages": 1, "max_results": 10, "total": 2})
+            json!({"page": 1, "pages": 1, "max_results": 10, "total": 3})
         );
         Ok(())
     }
@@ -2546,7 +2610,10 @@ pub(crate) mod tests {
         let top_value = serde_json::to_value(service.get_symbol(&top_level)?)?;
         let beacon = &top_value["hits"][0]["symbol"];
         assert_eq!(beacon["kind"], json!("struct"));
-        assert_eq!(beacon["kinds"], json!(["type", "public"]));
+        assert_eq!(
+            beacon["kinds"],
+            json!(["type", "public", "member_container"])
+        );
         assert!(
             beacon.get("container").is_none(),
             "a top-level declaration serves no container"
@@ -4190,20 +4257,28 @@ pub(crate) mod tests {
         let first_value = serde_json::to_value(service.get_symbol(&first)?)?;
         assert_eq!(
             first_value["pagination"],
-            json!({"page": 1, "pages": 2, "max_results": 1, "total": 2})
+            json!({"page": 1, "pages": 3, "max_results": 1, "total": 3})
         );
         let second: GetSymbolParams =
             serde_json::from_value(json!({"name": "Beacon", "max_results": 1, "page": 2}))?;
         let second_value = serde_json::to_value(service.get_symbol(&second)?)?;
         assert_eq!(
             second_value["pagination"],
-            json!({"page": 2, "pages": 2, "max_results": 1, "total": 2})
+            json!({"page": 2, "pages": 3, "max_results": 1, "total": 3})
         );
         assert_eq!(second_value["hits"].as_array().map(Vec::len), Some(1));
         assert_ne!(
-            first_value["hits"][0]["symbol"]["id"], second_value["hits"][0]["symbol"]["id"],
+            first_value["hits"][0]["range"], second_value["hits"][0]["range"],
             "consecutive pages must serve distinct declarations"
         );
+        assert_eq!(
+            first_value["hits"][0]["symbol"]["id"], second_value["hits"][0]["symbol"]["id"],
+            "the type declaration and its implementation are facets of one symbol"
+        );
+        let third: GetSymbolParams =
+            serde_json::from_value(json!({"name": "Beacon", "max_results": 1, "page": 3}))?;
+        let third_value = serde_json::to_value(service.get_symbol(&third)?)?;
+        assert_eq!(third_value["hits"][0]["symbol"]["name"], "signal");
         Ok(())
     }
 
@@ -4216,7 +4291,7 @@ pub(crate) mod tests {
         assert_eq!(value["hits"], json!([]));
         assert_eq!(
             value["pagination"],
-            json!({"page": 40, "pages": 2, "max_results": 1, "total": 2})
+            json!({"page": 40, "pages": 3, "max_results": 1, "total": 3})
         );
         Ok(())
     }

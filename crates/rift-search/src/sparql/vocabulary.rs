@@ -78,6 +78,10 @@ pub enum VocabularyProperty {
     Extends,
     /// The source fulfils the target's interface.
     Implements,
+    /// The source contains the target within its scope.
+    Contains,
+    /// The source replaces the target inherited from a supertype.
+    Overrides,
     /// The source declares the target.
     Declares,
     /// The source reads the target's value.
@@ -293,6 +297,16 @@ impl VocabularyProperty {
                 &[SYMBOL],
                 Resource(SYMBOL),
                 "The source fulfils the target's interface.",
+            ),
+            Self::Contains => (
+                &[SYMBOL],
+                Resource(SYMBOL),
+                "The source contains the target within its scope.",
+            ),
+            Self::Overrides => (
+                &[SYMBOL],
+                Resource(SYMBOL),
+                "The source replaces the target inherited from a supertype.",
             ),
             Self::Declares => (
                 &[SYMBOL],

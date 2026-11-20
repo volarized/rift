@@ -22,6 +22,8 @@ pub struct HeritageEdge {
 
 pub(super) struct EdgeHeritageKinds {
     header: u16,
+    interface_header: Option<u16>,
+    type_arguments: Option<u16>,
     extends: Option<u16>,
     implements: Option<u16>,
     generic: Option<u16>,
@@ -56,6 +58,8 @@ pub(super) fn edge_python_kinds() -> &'static EdgeHeritageKinds {
         let grammar = tree_sitter_python::LANGUAGE.into();
         EdgeHeritageKinds {
             header: kind(&grammar, "class_definition"),
+            interface_header: None,
+            type_arguments: None,
             name: field(&grammar, "name"),
             bases: Some(field(&grammar, "superclasses")),
             extends: None,
@@ -73,6 +77,8 @@ pub(super) fn edge_rust_kinds() -> &'static EdgeHeritageKinds {
         let grammar = crate::rust::rust_grammar();
         EdgeHeritageKinds {
             header: kind(&grammar, "impl_item"),
+            interface_header: None,
+            type_arguments: None,
             name: field(&grammar, "name"),
             value_type: Some(field(&grammar, "type")),
             trait_field: Some(field(&grammar, "trait")),
@@ -91,6 +97,8 @@ impl EdgeHeritageKinds {
     ) -> Self {
         Self {
             header: kind(grammar, "class_heritage"),
+            interface_header: dialect.map(|_| kind(grammar, "extends_type_clause")),
+            type_arguments: dialect.map(|_| kind(grammar, "type_arguments")),
             name: field(grammar, "name"),
             extends: dialect.map(|_| kind(grammar, "extends_clause")),
             implements: dialect.map(|_| kind(grammar, "implements_clause")),
@@ -107,7 +115,9 @@ impl EdgeHeritageKinds {
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
         let syntax_element = visited.syntax_element();
-        if syntax_element.kind_id() != self.header {
+        if syntax_element.kind_id() != self.header
+            && self.interface_header != Some(syntax_element.kind_id())
+        {
             return Ok(());
         }
         if let Some(trait_field) = self.trait_field {
@@ -158,7 +168,9 @@ impl EdgeHeritageKinds {
         };
         let mut cursor = clause.walk();
         for target in clause.named_children(&mut cursor) {
-            self.edge_push(from, target, kind, facts)?;
+            if self.type_arguments != Some(target.kind_id()) {
+                self.edge_push(from, target, kind, facts)?;
+            }
         }
         Ok(())
     }

@@ -1,12 +1,18 @@
 //! Resolves captured call and import sites against admitted source declarations.
 
 mod javascript;
+mod javascript_edges;
+mod javascript_exports;
+mod javascript_members;
+mod javascript_reexports;
+mod javascript_scopes;
 mod python_edges;
 mod rust;
 #[cfg(test)]
 mod tests;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 
 use rift_core::{
     ContributionReference, DeclarationBinding, FileDigest, LoopBudget, ProjectPath, ProviderId,
@@ -19,7 +25,10 @@ use rift_syntax::{
     StaticFacts, SyntaxFacts, SyntaxSymbol,
 };
 
-use crate::NamespaceInput;
+use crate::{EnclosingDefinitions, NamespaceInput};
+
+// Containment can use retained declarations without captured call facts.
+static EMPTY_STATIC_FACTS: OnceLock<StaticFacts> = OnceLock::new();
 
 /// One file from the same selection as the normalized graph.
 #[derive(Debug)]
@@ -35,7 +44,7 @@ pub(crate) struct StaticSource<'source> {
 pub(crate) struct StaticOccurrence {
     pub(crate) binding: DeclarationBinding,
     pub(crate) target: NormalizedTarget,
-    pub(crate) target_binding: DeclarationBinding,
+    pub(crate) target_binding: Option<DeclarationBinding>,
     pub(crate) source_digest: FileDigest,
     pub(crate) callee_range: ByteRange,
     pub(crate) role: ReferenceRole,
@@ -61,6 +70,58 @@ pub(crate) struct EdgeCallCoverage {
     pub(crate) unresolved: Vec<ByteRange>,
 }
 
+impl EdgeCallCoverage {
+    fn captured(document: &StaticSource<'_>) -> Self {
+        let mut coverage = Self {
+            language: document.facts.language().clone(),
+            unavailable: admitted_facts(document).is_none(),
+            unresolved: Vec::new(),
+        };
+        if document.facts.has_errors()
+            && matches!(
+                document.facts.language().name.as_str(),
+                "javascript" | "typescript"
+            )
+        {
+            if let Ok(end) = u64::try_from(document.source.len()) {
+                coverage.unresolved.push(ByteRange { start: 0, end });
+            } else {
+                coverage.unavailable = true;
+            }
+        }
+        coverage
+    }
+}
+
+pub(crate) fn prepare_javascript_reexports(
+    input: &NamespaceInput<'_>,
+    prepared: &mut crate::analyzer::namespace::PreparedNamespace,
+    selected: &[crate::analyzer::namespace::SelectedFile<'_>],
+    placements: &[&DocumentPlacement],
+    aliases_max: usize,
+) {
+    javascript_reexports::prepare(input, prepared, selected, placements, aliases_max);
+}
+
+/// The coverage of a selection whose static pass has not run: no occurrence, and every
+/// supported unit reports unavailable call coverage.
+pub(crate) fn deferred(documents: &[StaticSource<'_>]) -> StaticResolution {
+    let edge_calls: BTreeMap<_, _> = documents
+        .iter()
+        .filter(|document| supported_language(document.facts))
+        .map(|document| {
+            let mut coverage = EdgeCallCoverage::captured(document);
+            coverage.unavailable = true;
+            (document.placement.unit().clone(), coverage)
+        })
+        .collect();
+    StaticResolution {
+        unavailable_sources: edge_calls.len(),
+        edge_calls,
+        ..StaticResolution::default()
+    }
+}
+
 /// Runs one static pass over a captured source selection.
 pub(crate) fn resolve(
     graph: &NormalizedGraph,
@@ -68,17 +129,30 @@ pub(crate) fn resolve(
     namespace: &NamespaceInput<'_>,
     work_max: usize,
 ) -> StaticResolution {
+    resolve_by(
+        graph,
+        documents,
+        namespace,
+        work_max,
+        |index, work, resolution| index.resolve_files(FileWork::CAPTURED, work, resolution),
+    )
+}
+
+/// Runs one static pass whose files `files` resolves against the built index.
+fn resolve_by<'source>(
+    graph: &'source NormalizedGraph,
+    documents: &'source [StaticSource<'source>],
+    namespace: &NamespaceInput<'_>,
+    work_max: usize,
+    files: impl FnOnce(&Index<'source>, &mut Work, &mut StaticResolution),
+) -> StaticResolution {
     let mut edge_calls: BTreeMap<_, _> = documents
         .iter()
         .filter(|document| supported_language(document.facts))
         .map(|document| {
             (
                 document.placement.unit().clone(),
-                EdgeCallCoverage {
-                    language: document.facts.language().clone(),
-                    unavailable: admitted_facts(document).is_none(),
-                    unresolved: Vec::new(),
-                },
+                EdgeCallCoverage::captured(document),
             )
         })
         .collect();
@@ -98,20 +172,78 @@ pub(crate) fn resolve(
         edge_calls,
         ..StaticResolution::default()
     };
-    for file in index.files.values() {
-        if !work.charge() {
-            break;
-        }
-        index.resolve_file(file, &mut work, &mut resolution);
-    }
+    files(&index, &mut work, &mut resolution);
     resolution.exhausted = work.exhausted;
     resolution
 }
+
+/// What one file's pass adds, held apart until the files join in path order.
+struct FileResolution {
+    resolution: StaticResolution,
+    /// Budget the pass consumed.
+    used: usize,
+    /// Whether the pass ended on its budget.
+    exhausted: bool,
+}
+
+/// Budget one file's pass may spend: a floor and an amount for each captured element.
+///
+/// The pass budget bounds the whole selection. Without a bound of its own, one file whose
+/// lookups run long spends what every later file needs, and the selection loses its
+/// static facts from that file on. With it that file alone ends early: its unit reports
+/// unavailable call coverage, and the files after it keep their facts.
+#[derive(Debug, Clone, Copy)]
+struct FileWork {
+    floor: usize,
+    per_element: usize,
+}
+
+impl FileWork {
+    /// The share of a captured source.
+    const CAPTURED: Self = Self {
+        floor: FILE_WORK_FLOOR,
+        per_element: FILE_WORK_PER_ELEMENT,
+    };
+
+    fn max(self, file: &File<'_>) -> usize {
+        self.floor
+            .saturating_add(file.elements().saturating_mul(self.per_element))
+    }
+
+    /// How many of `files`, from the first, may run apart with `left` of the pass budget:
+    /// the longest run whose shares, with the one charge each file costs the pass, fit.
+    fn run(self, files: &[&File<'_>], left: usize) -> usize {
+        let mut reserved = 0_usize;
+        files
+            .iter()
+            .take_while(|file| {
+                reserved = reserved.saturating_add(self.max(file)).saturating_add(1);
+                reserved <= left
+            })
+            .count()
+    }
+}
+
+/// Budget every file's pass may spend whatever it holds.
+///
+/// A module that only re-exports holds none of the counted elements and still follows
+/// every export chain: the heaviest one measured spent 51,937 charges for 27 re-exports.
+/// The floor stands five times above it.
+const FILE_WORK_FLOOR: usize = 262_144;
+
+/// Budget a file's pass may spend for each call, reference, binding, heritage edge, and
+/// declaration it holds.
+///
+/// Over two large workspaces of 12,646 and 10,024 analyzed files the heaviest file spent
+/// 144 charges per element, and a minified bundle 6. The share stands seven times above
+/// the heaviest: it ends a pass whose lookups run away, not one that is merely large.
+const FILE_WORK_PER_ELEMENT: usize = 1_024;
 
 #[derive(Debug)]
 struct Work {
     budget: LoopBudget,
     exhausted: bool,
+    python_depth: u8,
 }
 
 impl Work {
@@ -119,7 +251,19 @@ impl Work {
         Self {
             budget: LoopBudget::new(maximum),
             exhausted: false,
+            python_depth: 0,
         }
+    }
+
+    fn python_lookup<T>(&mut self, lookup: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
+        const DEPTH_MAX: u8 = 32;
+        if self.python_depth >= DEPTH_MAX {
+            return None;
+        }
+        self.python_depth += 1;
+        let result = lookup(self);
+        self.python_depth -= 1;
+        result
     }
 
     fn charge(&mut self) -> bool {
@@ -154,13 +298,64 @@ impl Target<'_> {
 
 type Bindings<'source> = BTreeMap<&'source str, Vec<&'source StaticBinding>>;
 
+/// Bindings of one name by scope, each scope's bindings in declaration order.
+type ScopedBindings<'source> = EnclosingDefinitions<Vec<&'source StaticBinding>>;
+
+/// Bindings of one name a lookup still reads in declaration order. A longer list is read
+/// through its scopes, so a lookup costs the scopes around the position.
+const SCANNED_BINDINGS_MAX: usize = 16;
+
+/// Conditional items of one file with what the configuration admits for each.
+#[derive(Default)]
+struct Conditions {
+    items: Vec<(ByteRange, Option<bool>)>,
+    /// The items by range when they nest, so a lookup reads the items around a position.
+    nested: Option<EnclosingDefinitions<Option<bool>>>,
+}
+
+impl Conditions {
+    fn new(items: Vec<(ByteRange, Option<bool>)>) -> Self {
+        let nested = (items.len() > SCANNED_BINDINGS_MAX).then(|| {
+            EnclosingDefinitions::new(
+                items
+                    .iter()
+                    .map(|(item, admitted)| (item.start, item.end, *admitted)),
+            )
+        });
+        Self { items, nested }
+    }
+
+    /// Whether an item containing `position` satisfies `holds`, or the budget ended.
+    fn any(&self, position: u64, work: &mut Work, holds: impl Fn(Option<bool>) -> bool) -> bool {
+        let containing = self
+            .nested
+            .as_ref()
+            .and_then(|nested| nested.containing(position, position.checked_add(1)?));
+        match containing {
+            Some(mut containing) => containing.any(|admitted| !work.charge() || holds(*admitted)),
+            None => self.items.iter().any(|(item, admitted)| {
+                !work.charge() || item.contains(position) && holds(*admitted)
+            }),
+        }
+    }
+}
+
 struct File<'source> {
     document: &'source StaticSource<'source>,
     facts: &'source StaticFacts,
     by_name: Bindings<'source>,
+    /// The names with more than [`SCANNED_BINDINGS_MAX`] bindings whose scopes nest.
+    by_scope: BTreeMap<&'source str, ScopedBindings<'source>>,
     by_range: BTreeMap<ByteRange, Option<&'source SyntaxSymbol>>,
-    by_qualified_name: BTreeMap<&'source str, Option<&'source SyntaxSymbol>>,
+    by_qualified_name: BTreeMap<&'source str, Vec<&'source SyntaxSymbol>>,
+    callables: EnclosingDefinitions<&'source SyntaxSymbol>,
+    classes: EnclosingDefinitions<&'source SyntaxSymbol>,
+    class_scopes: BTreeSet<ByteRange>,
     assignments: AssignmentTargets<'source>,
+    python_values: BTreeMap<u64, StaticBindingKind>,
+    python_calls: BTreeMap<u64, Vec<&'source StaticCall>>,
+    declared_types: BTreeMap<ByteRange, Option<ByteRange>>,
+    conditions: Conditions,
 }
 
 #[derive(Default)]
@@ -207,16 +402,37 @@ impl<'source> File<'source> {
     fn new(
         document: &'source StaticSource<'source>,
         facts: &'source StaticFacts,
+        configuration: Option<&crate::analyzer::namespace::RustConfiguration<'_>>,
         work: &mut Work,
     ) -> Option<Self> {
         let mut file = Self {
             document,
             facts,
             by_name: BTreeMap::new(),
+            by_scope: BTreeMap::new(),
             by_range: BTreeMap::new(),
             by_qualified_name: BTreeMap::new(),
+            callables: EnclosingDefinitions::new([]),
+            classes: EnclosingDefinitions::new([]),
+            class_scopes: BTreeSet::new(),
             assignments: AssignmentTargets::default(),
+            python_values: BTreeMap::new(),
+            python_calls: BTreeMap::new(),
+            declared_types: BTreeMap::new(),
+            conditions: Conditions::default(),
         };
+        let mut conditions = Vec::new();
+        for item in facts.conditional_items() {
+            if !work.charge() {
+                return None;
+            }
+            conditions.push((
+                item.range,
+                file.text(item.attribute)
+                    .and_then(|text| configuration?.attribute(text)),
+            ));
+        }
+        file.conditions = Conditions::new(conditions);
         file.index_bindings(work)?;
         file.index_symbols(work)?;
         Some(file)
@@ -227,8 +443,60 @@ impl<'source> File<'source> {
             if !work.charge() {
                 return None;
             }
+            if self.inactive(binding.name, work) {
+                continue;
+            }
             let name = self.text(binding.name)?;
             self.by_name.entry(name).or_default().push(binding);
+            match binding.kind {
+                StaticBindingKind::PythonAnnotation { .. }
+                | StaticBindingKind::PythonFunction { .. }
+                | StaticBindingKind::PythonAlias { .. }
+                | StaticBindingKind::PythonInstance { .. } => {
+                    self.python_values.insert(binding.name.end, binding.kind);
+                }
+                _ => {}
+            }
+        }
+        for (name, bindings) in &self.by_name {
+            if bindings.len() <= SCANNED_BINDINGS_MAX {
+                continue;
+            }
+            let mut scopes = BTreeMap::<ByteRange, Vec<&StaticBinding>>::new();
+            for &binding in bindings {
+                if !work.charge() {
+                    return None;
+                }
+                scopes.entry(binding.scope).or_default().push(binding);
+            }
+            self.by_scope.insert(
+                name,
+                EnclosingDefinitions::new(
+                    scopes
+                        .into_iter()
+                        .map(|(scope, bindings)| (scope.start, scope.end, bindings)),
+                ),
+            );
+        }
+        if self.document.facts.language().name == "python" {
+            for call in self.facts.calls() {
+                if !work.charge() {
+                    return None;
+                }
+                self.python_calls
+                    .entry(call.range.start)
+                    .or_default()
+                    .push(call);
+            }
+        }
+        for &(name, annotation) in self.facts.declared_types() {
+            if !work.charge() {
+                return None;
+            }
+            self.declared_types
+                .entry(name)
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(annotation));
         }
         for range in self.facts.assignments() {
             if !work.charge() {
@@ -240,14 +508,45 @@ impl<'source> File<'source> {
     }
 
     fn index_symbols(&mut self, work: &mut Work) -> Option<()> {
+        let mut callables = Vec::new();
+        let mut classes = Vec::new();
+        let python = self.document.facts.language().name == "python";
         for symbol in self.document.facts.symbols() {
+            if self.inactive(symbol.item_range, work) {
+                continue;
+            }
             if !work.charge() {
                 return None;
             }
-            self.by_qualified_name
+            let candidates = self
+                .by_qualified_name
                 .entry(&symbol.qualified_name)
-                .and_modify(|entry| *entry = None)
-                .or_insert(Some(symbol));
+                .or_default();
+            match (self.document.facts.language().name.as_str(), symbol.kind) {
+                ("rust", "impl_item") if !candidates.is_empty() => {}
+                ("rust", _)
+                    if candidates
+                        .first()
+                        .is_some_and(|candidate| candidate.kind == "impl_item") =>
+                {
+                    candidates.clear();
+                    candidates.push(symbol);
+                }
+                _ => candidates.push(symbol),
+            }
+            if symbol.name == "default" && symbol.name_range != Some(symbol.item_range) {
+                self.by_range
+                    .entry(symbol.item_range)
+                    .and_modify(|entry| *entry = None)
+                    .or_insert(Some(symbol));
+            }
+            if python && symbol.kinds.contains(&SymbolKind::Constructible) {
+                self.class_scopes.insert(symbol.item_range);
+                classes.push((symbol.range.start, symbol.range.end, symbol));
+            }
+            if symbol.kinds.contains(&SymbolKind::Callable) {
+                callables.push((symbol.range.start, symbol.range.end, symbol));
+            }
             if let Some(range) = symbol.name_range {
                 self.by_range
                     .entry(range)
@@ -255,7 +554,37 @@ impl<'source> File<'source> {
                     .or_insert(Some(symbol));
             }
         }
+        self.callables = EnclosingDefinitions::new(callables);
+        self.classes = EnclosingDefinitions::new(classes);
         Some(())
+    }
+
+    /// Captured calls, references, bindings, heritage edges, and declarations.
+    fn elements(&self) -> usize {
+        [
+            self.facts.calls().len(),
+            self.facts.references().len(),
+            self.facts.bindings().len(),
+            self.facts.heritage_edges().len(),
+            self.document.facts.symbols().len(),
+        ]
+        .into_iter()
+        .fold(0, usize::saturating_add)
+    }
+
+    fn enclosing_callable(&self, range: ByteRange) -> Option<Target<'source>> {
+        Some(Target {
+            file: self.document,
+            symbol: *self.callables.resolve(range.start, range.end)?,
+        })
+    }
+
+    fn parent_callable(&self, symbol: &SyntaxSymbol) -> Option<Target<'source>> {
+        self.enclosing_callable(ByteRange {
+            start: symbol.range.start.checked_sub(1)?,
+            end: symbol.range.end,
+        })
+        .filter(|parent| Some(parent.symbol.qualified_name.as_str()) == symbol.container.as_deref())
     }
 
     fn text(&self, range: ByteRange) -> Option<&'source str> {
@@ -270,9 +599,26 @@ impl<'source> File<'source> {
     }
 
     fn qualified_target(&self, name: &str) -> Option<Target<'source>> {
+        let candidates = self.by_qualified_name.get(name)?;
+        let language = self.document.facts.language().name.as_str();
+        let symbol = if language == "rust" {
+            let mut declarations = candidates
+                .iter()
+                .filter(|symbol| symbol.kind != "impl_item");
+            let selected = declarations.next().or_else(|| candidates.first())?;
+            if declarations.next().is_some() {
+                return None;
+            }
+            *selected
+        } else {
+            if language != "python" && candidates.len() != 1 {
+                return None;
+            }
+            *candidates.first()?
+        };
         Some(Target {
             file: self.document,
-            symbol: self.by_qualified_name.get(name).copied().flatten()?,
+            symbol,
         })
     }
 
@@ -283,6 +629,67 @@ impl<'source> File<'source> {
             .any(|scope| !work.charge() || scope.contains(position))
     }
 
+    /// Reads the bindings of `name` in the smallest scope that holds `position` and a
+    /// binding `admits`, in declaration order. `read` receives each with whether it is the
+    /// first of its scope; a scope read before a smaller one is found starts over there.
+    ///
+    /// A name with few bindings is read in declaration order. A name with many is read
+    /// through its scopes, the smallest first, so a file that binds one short name in
+    /// thousands of functions pays the scopes around the position for each lookup.
+    /// `None` when the budget ended; `Some(false)` when the file binds no such name.
+    fn innermost_bindings(
+        &self,
+        name: &str,
+        position: u64,
+        work: &mut Work,
+        admits: impl Fn(&'source StaticBinding) -> bool,
+        mut read: impl FnMut(&'source StaticBinding, bool),
+    ) -> Option<bool> {
+        let Some(bindings) = self.by_name.get(name) else {
+            return Some(false);
+        };
+        let scopes = self
+            .by_scope
+            .get(name)
+            .and_then(|scopes| scopes.containing(position, position.checked_add(1)?));
+        if let Some(scopes) = scopes {
+            for scope in scopes {
+                let mut first = true;
+                for &binding in scope {
+                    if !work.charge() {
+                        return None;
+                    }
+                    if admits(binding) {
+                        read(binding, first);
+                        first = false;
+                    }
+                }
+                if !first {
+                    break;
+                }
+            }
+            return Some(true);
+        }
+        let mut innermost: Option<ByteRange> = None;
+        for &binding in bindings {
+            if !work.charge() {
+                return None;
+            }
+            if !binding.scope.contains(position) || !admits(binding) {
+                continue;
+            }
+            match innermost {
+                Some(scope) if scope == binding.scope => read(binding, false),
+                Some(scope) if !scope.encloses(binding.scope) => {}
+                _ => {
+                    innermost = Some(binding.scope);
+                    read(binding, true);
+                }
+            }
+        }
+        Some(true)
+    }
+
     fn binding(
         &self,
         name: &str,
@@ -290,26 +697,34 @@ impl<'source> File<'source> {
         accepts: impl Fn(StaticBindingKind) -> bool,
         work: &mut Work,
     ) -> Binding<'source> {
-        let Some(bindings) = self.by_name.get(name) else {
-            return Binding::Missing;
-        };
+        let rust = self.document.facts.language().name == "rust";
         let mut best: Option<&StaticBinding> = None;
         let mut ambiguous = false;
-        for &binding in bindings {
-            if !work.charge() {
-                return Binding::Blocked;
-            }
-            if !binding.scope.contains(position) || !accepts(binding.kind) {
-                continue;
-            }
-            match best {
-                Some(current) if current.scope == binding.scope => ambiguous = true,
-                Some(current) if !current.scope.encloses(binding.scope) => {}
+        let found = self.innermost_bindings(
+            name,
+            position,
+            work,
+            |binding| accepts(binding.kind) && !(rust && binding.available_from > position),
+            |binding, first| match best {
+                Some(current)
+                    if !first && rust && binding.available_from > current.available_from =>
+                {
+                    best = Some(binding);
+                    ambiguous = false;
+                }
+                Some(current)
+                    if !first && rust && binding.available_from < current.available_from => {}
+                Some(_) if !first => ambiguous = true,
                 _ => {
                     best = Some(binding);
                     ambiguous = false;
                 }
-            }
+            },
+        );
+        match found {
+            None => return Binding::Blocked,
+            Some(false) => return Binding::Missing,
+            Some(true) => {}
         }
         match best {
             None => Binding::Missing,
@@ -318,12 +733,6 @@ impl<'source> File<'source> {
             }
             Some(_) => Binding::Blocked,
         }
-    }
-
-    fn reassigned(&self, name: &str, member: Option<&str>) -> bool {
-        self.assignments.unknown
-            || self.assignments.names.contains(name)
-            || member.is_some_and(|member| self.assignments.members.contains(&(name, member)))
     }
 }
 
@@ -338,10 +747,14 @@ struct Index<'source> {
     provider: ProviderId,
     files: BTreeMap<&'source str, File<'source>>,
     rust: rust::Namespaces<'source>,
-    javascript: javascript::PackageModes,
+    javascript: javascript::PackageModes<'source>,
     edge_python: python_edges::EdgePythonModules,
+    edge_python_classes: python_edges::ClassOrders<'source>,
     syntax_publication: rift_core::ProviderRevision,
     unavailable_sources: usize,
+    /// Budget every file pass consumed, joined or not.
+    #[cfg(test)]
+    performed: std::sync::atomic::AtomicUsize,
 }
 
 impl<'source> Index<'source> {
@@ -352,6 +765,7 @@ impl<'source> Index<'source> {
         work: &mut Work,
     ) -> Option<Self> {
         let mut files = BTreeMap::new();
+        let configurations = crate::analyzer::namespace::RustConfigurations::new(namespace);
         let mut unavailable_sources = 0;
         for document in documents {
             if !work.charge() {
@@ -360,34 +774,145 @@ impl<'source> Index<'source> {
             if !supported_language(document.facts) {
                 continue;
             }
-            let Some(facts) = admitted_facts(document) else {
+            let facts = if let Some(facts) = admitted_facts(document) {
+                facts
+            } else {
                 unavailable_sources += 1;
-                continue;
+                if document.facts.language().name != "rust"
+                    || document.facts.source_digest().is_none()
+                {
+                    continue;
+                }
+                EMPTY_STATIC_FACTS.get_or_init(StaticFacts::default)
             };
-            let file = File::new(document, facts, work)?;
+            let file = File::new(
+                document,
+                facts,
+                Some(&configurations.file(document.path.as_str())),
+                work,
+            )?;
             if files.insert(document.path.as_str(), file).is_some() {
                 return None;
             }
         }
         let edge_python = python_edges::EdgePythonModules::build_edge(&files, work)?;
         let rust = rust::Namespaces::new(&files, work)?;
-        let javascript = javascript::PackageModes::new(namespace, work)?;
+        let javascript = javascript::PackageModes::new(namespace, &files, work)?;
         let provider = ProviderId::new(SYNTAX_PROVIDER_ID).ok()?;
         let syntax_publication = graph.publications().provider(&provider)?.revision();
-        Some(Self {
+        let mut index = Self {
             graph,
             provider,
             files,
             rust,
             javascript,
             edge_python,
+            edge_python_classes: python_edges::ClassOrders::default(),
             syntax_publication,
             unavailable_sources,
-        })
+            #[cfg(test)]
+            performed: std::sync::atomic::AtomicUsize::new(0),
+        };
+        index.edge_python_classes = index.python_class_orders(work)?;
+        Some(index)
+    }
+
+    /// Resolves every file and joins the results in path order.
+    ///
+    /// One file's pass reads the index and that file alone, so passes run across the
+    /// worker pool with the `parallel` feature. A pass spends at most its file's share,
+    /// so the files start in runs: the longest run, in path order, whose shares together
+    /// fit what is left of the pass budget. Every pass of a run then has its whole share
+    /// whatever the files before it spend, and its result is the one a pass over the
+    /// files in order gives. When not even the next file's share fits, that file runs
+    /// alone with exactly what is left. The work done is therefore the work joined: no
+    /// pass starts on budget another file may still claim, and none is thrown away.
+    fn resolve_files(
+        &self,
+        file_work: FileWork,
+        work: &mut Work,
+        resolution: &mut StaticResolution,
+    ) {
+        let files = self.files.values().collect::<Vec<_>>();
+        let mut pending = files.as_slice();
+        while !pending.is_empty() && !work.exhausted {
+            let run = file_work.run(pending, work.budget.remaining());
+            let (run, rest) = pending.split_at(run.max(1));
+            pending = rest;
+            let alone = run.len() == 1;
+            let left = work.budget.remaining().saturating_sub(1);
+            let resolve = |file: &&File<'source>| {
+                let share = file_work.max(file);
+                let budget = if alone { share.min(left) } else { share };
+                self.resolve_file_apart(file, budget, &resolution.edge_calls)
+            };
+            #[cfg(feature = "parallel")]
+            let resolved = {
+                use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+                run.par_iter().map(resolve).collect::<Vec<_>>()
+            };
+            #[cfg(not(feature = "parallel"))]
+            let resolved = run.iter().map(resolve).collect::<Vec<_>>();
+            // One allocation holds the run's occurrences: growing by doubling while the
+            // files join would hold the list up to twice at its largest.
+            resolution.occurrences.reserve(
+                resolved
+                    .iter()
+                    .map(|apart| apart.resolution.occurrences.len())
+                    .fold(0, usize::saturating_add),
+            );
+            for (file, apart) in run.iter().zip(resolved) {
+                if !work.charge() {
+                    return;
+                }
+                let left = work.budget.remaining();
+                // Only a file running alone can end on the pass budget: a run reserves
+                // every share before it starts.
+                work.exhausted = apart.exhausted && left < file_work.max(file);
+                let over_share = apart.exhausted && !work.exhausted;
+                work.budget = LoopBudget::new(left.saturating_sub(apart.used));
+                resolution.join(file, apart.resolution, over_share);
+            }
+        }
+    }
+
+    /// One file's pass under its own budget, with a result of its own.
+    fn resolve_file_apart(
+        &self,
+        file: &File<'source>,
+        budget: usize,
+        edge_calls: &BTreeMap<rift_core::SourceUnitId, EdgeCallCoverage>,
+    ) -> FileResolution {
+        let mut work = Work::new(budget);
+        let mut resolution = StaticResolution::default();
+        let unit = file.document.placement.unit();
+        if let Some(coverage) = edge_calls.get(unit) {
+            resolution.edge_calls.insert(
+                unit.clone(),
+                EdgeCallCoverage {
+                    language: coverage.language.clone(),
+                    unavailable: coverage.unavailable,
+                    unresolved: Vec::new(),
+                },
+            );
+        }
+        self.resolve_file(file, &mut work, &mut resolution);
+        let used = budget.saturating_sub(work.budget.remaining());
+        #[cfg(test)]
+        self.performed
+            .fetch_add(used, std::sync::atomic::Ordering::Relaxed);
+        FileResolution {
+            resolution,
+            used,
+            exhausted: work.exhausted,
+        }
     }
 
     fn resolve_file(&self, file: &File<'source>, work: &mut Work, result: &mut StaticResolution) {
         for range in file.facts.unsupported_bindings() {
+            if file.inactive(*range, work) {
+                continue;
+            }
             if !work.charge() {
                 return;
             }
@@ -396,19 +921,20 @@ impl<'source> Index<'source> {
             }
         }
         for call in file.facts.calls() {
+            if file.inactive(call.range, work) {
+                continue;
+            }
             if !work.charge() {
                 return;
             }
-            let target = self.call_target(file, call, work);
-            let occurrence = target.and_then(|target| {
-                self.occurrence(
-                    file,
-                    call.range,
-                    call.callee_range,
-                    ReferenceRole::Call,
-                    target,
-                )
-            });
+            let mut occurrence = self.call_occurrence(file, call, work);
+            if matches!(
+                file.document.facts.language().name.as_str(),
+                "javascript" | "typescript"
+            ) && let Some(occurrence) = &mut occurrence
+            {
+                occurrence.edge_from = self.javascript_call_from(file, call.range, work);
+            }
             if occurrence
                 .as_ref()
                 .is_none_or(|occurrence| !matches!(occurrence.target, NormalizedTarget::Symbol(_)))
@@ -419,6 +945,9 @@ impl<'source> Index<'source> {
             result.record(occurrence);
         }
         for edge in file.facts.heritage_edges() {
+            if file.inactive(edge.from, work) {
+                continue;
+            }
             if !work.charge() {
                 return;
             }
@@ -426,19 +955,80 @@ impl<'source> Index<'source> {
             result.record(occurrence);
         }
         for binding in file.facts.bindings() {
+            if file.inactive(binding.name, work) {
+                continue;
+            }
             if !work.charge() {
                 return;
             }
             if let Some((range, target)) = self.import_target(file, binding, work) {
                 let occurrence = target.and_then(|target| {
-                    self.occurrence(file, range, range, ReferenceRole::Import, target)
+                    let mut occurrence =
+                        self.occurrence(file, range, range, ReferenceRole::Import, target)?;
+                    if file.document.facts.language().name == "python" {
+                        occurrence.edge_from =
+                            Some(self.python_identity(file, range, file.qualified_target(".")?)?);
+                    }
+                    Some(occurrence)
                 });
                 result.record(occurrence);
             }
         }
+        if matches!(
+            file.document.facts.language().name.as_str(),
+            "javascript" | "typescript"
+        ) {
+            self.javascript_edges(file, work, result);
+        }
+        if file.document.facts.language().name == "python" {
+            self.python_references(file, work, result);
+        }
+        if file.document.facts.language().name == "rust" {
+            self.rust_references(file, work, result);
+        }
         if !work.exhausted {
             result.analyzed_sources += 1;
         }
+    }
+
+    fn call_occurrence(
+        &self,
+        file: &File<'source>,
+        call: &StaticCall,
+        work: &mut Work,
+    ) -> Option<StaticOccurrence> {
+        let target = self.call_target(file, call, work)?;
+        let mut occurrence = self.occurrence(
+            file,
+            call.range,
+            call.callee_range,
+            ReferenceRole::Call,
+            target,
+        )?;
+        if file.document.facts.language().name == "python"
+            && let Some(caller) = file.enclosing_callable(call.range).or_else(|| {
+                file.classes
+                    .resolve(call.range.start, call.range.end)
+                    .map(|symbol| Target {
+                        file: file.document,
+                        symbol,
+                    })
+                    .or_else(|| file.qualified_target("."))
+            })
+        {
+            let caller = self.occurrence(
+                file,
+                call.range,
+                call.callee_range,
+                ReferenceRole::Call,
+                caller,
+            )?;
+            let NormalizedTarget::Symbol(caller) = caller.target else {
+                return None;
+            };
+            occurrence.edge_from = Some(caller);
+        }
+        Some(occurrence)
     }
 
     fn edge_heritage_occurrence(
@@ -448,9 +1038,12 @@ impl<'source> Index<'source> {
         work: &mut Work,
     ) -> Option<StaticOccurrence> {
         let target = self.edge_type_target(file, edge.target, work)?;
-        let from = file
-            .target_at(edge.from)
-            .or_else(|| self.edge_type_target(file, edge.from, work))?;
+        let from = if file.document.facts.language().name == "rust" {
+            self.edge_type_target(file, edge.from, work)?
+        } else {
+            file.target_at(edge.from)
+                .or_else(|| self.edge_type_target(file, edge.from, work))?
+        };
         let mut occurrence =
             self.occurrence(file, edge.target, edge.target, ReferenceRole::Type, target)?;
         let from = self.occurrence(file, edge.from, edge.from, ReferenceRole::Type, from)?;
@@ -504,12 +1097,12 @@ impl<'source> Index<'source> {
                 Some((binding.name, self.javascript_import(file, binding, work)))
             }
             StaticBindingKind::RustUse { path } => Some((path, self.rust.import(file, path, work))),
-            StaticBindingKind::PythonImport {
-                export: Some(_), ..
-            } => Some((
-                binding.name,
-                self.edge_python_binding_target(file, binding, work),
-            )),
+            StaticBindingKind::PythonImport { .. } | StaticBindingKind::PythonModule { .. } => {
+                Some((
+                    binding.name,
+                    self.edge_python_binding_target(file, binding, work),
+                ))
+            }
             _ => None,
         }
     }
@@ -556,7 +1149,7 @@ impl<'source> Index<'source> {
         Some(StaticOccurrence {
             binding: DeclarationBinding::new(file.document.placement.unit().clone(), range),
             target: normalized,
-            target_binding: target_binding.clone(),
+            target_binding: Some(target_binding.clone()),
             source_digest: *file.document.facts.source_digest()?,
             callee_range,
             role,
@@ -567,6 +1160,27 @@ impl<'source> Index<'source> {
 }
 
 impl StaticResolution {
+    /// Adds one file's result after the results of the files before it. A file whose
+    /// pass ended on its own share keeps what it resolved and reports unavailable call
+    /// coverage for its unit.
+    fn join(&mut self, file: &File<'_>, mut apart: Self, over_share: bool) {
+        self.occurrences.append(&mut apart.occurrences);
+        self.analyzed_sources += apart.analyzed_sources;
+        self.unresolved_sites += apart.unresolved_sites;
+        if over_share {
+            self.unavailable_sources += 1;
+        }
+        let unit = file.document.placement.unit();
+        if let Some((coverage, apart)) = self
+            .edge_calls
+            .get_mut(unit)
+            .zip(apart.edge_calls.get_mut(unit))
+        {
+            coverage.unresolved.append(&mut apart.unresolved);
+            coverage.unavailable |= over_share;
+        }
+    }
+
     fn record(&mut self, occurrence: Option<StaticOccurrence>) {
         match occurrence {
             Some(occurrence) => self.occurrences.push(occurrence),
@@ -578,8 +1192,13 @@ impl StaticResolution {
 fn admitted_facts<'source>(
     document: &'source StaticSource<'source>,
 ) -> Option<&'source StaticFacts> {
-    if document.facts.has_errors()
-        || document.facts.source_digest() != Some(&FileDigest::of(document.source.as_bytes()))
+    if document.facts.source_digest().is_none()
+        || (document.facts.has_errors()
+            && (document.facts.symbols().is_empty()
+                || !matches!(
+                    document.facts.language().name.as_str(),
+                    "javascript" | "typescript"
+                )))
     {
         return None;
     }
