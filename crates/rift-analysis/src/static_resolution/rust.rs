@@ -1001,8 +1001,83 @@ impl<'source> Namespaces<'source> {
             return Some(target);
         }
         let (member, receiver) = path.split_last()?;
-        let owner = self.lookup(file, position, receiver, Namespace::Type, work)?;
-        self.inherent_method(file, position, owner, member, work)
+        if let Some(owner) = self.lookup(file, position, receiver, Namespace::Type, work) {
+            return self.inherent_method(file, position, owner, member, work);
+        }
+        self.trait_path_call(file, call, &parts, work)
+    }
+
+    /// `Trait::method(value, ..)` where `Trait` is not a package-local declaration: the
+    /// first argument's known owner selects the one implementation of a trait spelled
+    /// `Trait` that declares `method` with a `self` receiver. Any other candidate count,
+    /// or an unknown argument, leaves the call unresolved.
+    fn trait_path_call(
+        &self,
+        file: &File<'source>,
+        call: &StaticCall,
+        parts: &[&str],
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let [.., written_trait, member] = parts else {
+            return None;
+        };
+        let (_, argument) = file
+            .facts
+            .receiver_arguments()
+            .iter()
+            .find(|(range, _)| work.charge() && *range == call.range)?;
+        let argument = reference_operand(file, *argument)?;
+        let references::ReceiverOwner::Target(owner) =
+            self.receiver_owner_at_depth(file, argument, work, RECEIVER_DEPTH_MAX)?
+        else {
+            return None;
+        };
+        let mut owners = vec![owner];
+        owners.extend(self.referent(owner));
+        owners.extend(
+            self.referents
+                .values()
+                .filter(|(_, referent)| {
+                    referent.file.path == owner.file.path
+                        && referent.symbol.item_range == owner.symbol.item_range
+                })
+                .map(|(reference, _)| *reference),
+        );
+        let mut selected = None;
+        for candidate in owners {
+            let Some(mut path) = candidate.admitted_path() else {
+                continue;
+            };
+            path.push((*member).to_owned());
+            for method in self.methods.get(&path).into_iter().flatten() {
+                if !work.charge() {
+                    return None;
+                }
+                let facts = method.target.file.facts.static_facts()?;
+                let implemented = facts
+                    .heritage_edges()
+                    .iter()
+                    .filter(|edge| edge.from == method.implementation.type_path)
+                    .filter_map(|edge| {
+                        method.target.file.source.get(
+                            usize::try_from(edge.target.start).ok()?
+                                ..usize::try_from(edge.target.end).ok()?,
+                        )
+                    })
+                    .any(|name| trait_name(name) == Some(*written_trait));
+                let receiver = matches!(
+                    self_kind(method.target),
+                    Some(SelfKind::Value | SelfKind::Shared | SelfKind::Unique)
+                );
+                if !implemented || !receiver {
+                    continue;
+                }
+                if !self.available(method.target) || selected.replace(method.target).is_some() {
+                    return None;
+                }
+            }
+        }
+        selected
     }
 
     fn inherent_method(
@@ -1599,6 +1674,45 @@ fn unadmitted_alternatives<'source>(
         }
     }
     Some(unadmitted)
+}
+
+/// The final segment of a written trait path, without generic arguments.
+fn trait_name(written: &str) -> Option<&str> {
+    let path = written.split('<').next()?.trim();
+    Some(path.rsplit("::").next()?.trim())
+}
+
+/// The operand of `&value`, `&mut value` or a parenthesized value, else the range itself.
+fn reference_operand(file: &File<'_>, mut range: ByteRange) -> Option<ByteRange> {
+    // Each step removes at least one byte of the bounded argument text.
+    loop {
+        let text = file.text(range)?;
+        let (start, end) = if let Some(rest) = text.strip_prefix('&') {
+            let rest = rest.trim_start();
+            let rest = rest
+                .strip_prefix("mut")
+                .filter(|after| after.starts_with(char::is_whitespace))
+                .unwrap_or(rest)
+                .trim_start();
+            (text.len() - rest.len(), text.len())
+        } else if let Some(inner) = text
+            .strip_prefix('(')
+            .and_then(|text| text.strip_suffix(')'))
+        {
+            let leading = inner.len() - inner.trim_start().len();
+            let trailing = inner.len() - inner.trim_end().len();
+            (1 + leading, text.len() - 1 - trailing)
+        } else {
+            return Some(range);
+        };
+        if start >= end {
+            return None;
+        }
+        range = ByteRange {
+            start: range.start.checked_add(u64::try_from(start).ok()?)?,
+            end: range.start.checked_add(u64::try_from(end).ok()?)?,
+        };
+    }
 }
 
 /// Whether a method belongs to a trait implementation rather than an inherent one.

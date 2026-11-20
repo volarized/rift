@@ -56,6 +56,7 @@ pub(super) struct Kinds {
     value: u16,
     member: u16,
     argument: u16,
+    arguments: u16,
     name: u16,
     alias: u16,
     path: u16,
@@ -125,6 +126,7 @@ pub(super) fn kinds() -> &'static Kinds {
             value: field("value"),
             member: field("field"),
             argument: field("argument"),
+            arguments: field("arguments"),
             name: field("name"),
             alias: field("alias"),
             path: field("path"),
@@ -314,6 +316,20 @@ impl Kinds {
             self.member(callee)?
         };
         facts.calls.push(call(syntax_element, callee, shape)?);
+        if shape == StaticCallee::Qualified
+            && let Some(arguments) = syntax_element.child_by_field_id(self.arguments)
+        {
+            let mut cursor = arguments.walk();
+            if let Some(first) = arguments
+                .named_children(&mut cursor)
+                .find(|argument| !argument.is_extra())
+                .filter(|argument| !argument.is_missing())
+            {
+                facts
+                    .receiver_arguments
+                    .push((byte_range(syntax_element)?, byte_range(first)?));
+            }
+        }
         Ok(())
     }
 

@@ -9,7 +9,7 @@ use crate::static_resolution::{
     Binding, File, Index, StaticOccurrence, StaticResolution, Target, Work,
 };
 
-enum ReceiverOwner<'source> {
+pub(super) enum ReceiverOwner<'source> {
     Target(Target<'source>),
     TypePath(ByteRange),
 }
@@ -248,7 +248,7 @@ impl<'source> Namespaces<'source> {
         }
     }
 
-    fn receiver_owner_at_depth(
+    pub(super) fn receiver_owner_at_depth(
         &self,
         file: &File<'source>,
         range: ByteRange,

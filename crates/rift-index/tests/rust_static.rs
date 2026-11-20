@@ -1406,6 +1406,36 @@ fn test_rust_struct_expressions_name_body_local_structs_first() {
 }
 
 #[test]
+fn test_rust_trait_path_calls_select_the_argument_implementation() {
+    // `fmt::Display::fmt(&self.inner, f)` names the Display implementation of the first
+    // argument's type; a trait the argument type does not implement, or an unknown
+    // argument, stays unresolved.
+    let source = "use std::fmt;\npub struct Inner;\npub struct Reader { pub inner: Inner }\nimpl fmt::Display for Inner { fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result { Ok(()) } }\nimpl fmt::Debug for Inner { fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result { Ok(()) } }\nimpl fmt::Display for Reader { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Display::fmt(&self.inner, f) } }\nimpl Reader {\n    pub fn debug(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Debug::fmt(&(self.inner), f) }\n    pub fn pointer(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Pointer::fmt(&self.inner, f) }\n    pub fn unknown(&self, value: u8, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Display::fmt(&value, f) }\n}\n";
+    let (_directory, index) = fixture_index(PLAIN_MANIFEST, &[("src/lib.rs", source)]);
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "/Reader/fmt",
+        "/Inner/fmt"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "/Reader/debug",
+        "/Inner/fmt"
+    ));
+    for from in ["/Reader/pointer", "/Reader/unknown"] {
+        assert!(
+            !index
+                .edges()
+                .edges()
+                .any(|edge| edge.kind() == EdgeKind::Calls && edge.from().as_str().ends_with(from)),
+            "{from}"
+        );
+    }
+}
+
+#[test]
 fn test_rust_reference_receivers_follow_the_probing_order() {
     // In `impl Source for &Value`, `self.read()` (self: &Value) selects the reference
     // implementation's by-value `read` before `Value`'s by-value `read`; `self.peek()` finds

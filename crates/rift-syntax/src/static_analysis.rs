@@ -199,6 +199,9 @@ pub struct StaticFactsParts {
     pub inherent_impls: Vec<StaticInherentImpl>,
     /// Items whose admission depends on Rust configuration.
     pub conditional_items: Vec<StaticConditionalItem>,
+    /// Rust path calls and the range of their first argument, which selects the
+    /// implementation of a `Trait::method(value, ..)` call.
+    pub receiver_arguments: Vec<(ByteRange, ByteRange)>,
 }
 
 /// Calls and binding evidence retained after the syntax tree is released.
@@ -286,6 +289,12 @@ impl StaticFacts {
         &self.0.unsupported_bindings
     }
 
+    /// Rust path calls with the range of their first argument.
+    #[must_use]
+    pub fn receiver_arguments(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.receiver_arguments
+    }
+
     /// Rust use paths with their captured group components.
     #[must_use]
     pub fn rust_uses(&self) -> &[StaticRustUse] {
@@ -320,6 +329,7 @@ impl StaticFacts {
             vector_capacity(&self.0.inherent_impls),
             vector_capacity(&self.0.rust_uses),
             vector_capacity(&self.0.conditional_items),
+            vector_capacity(&self.0.receiver_arguments),
         ]
         .into_iter()
         .fold(0, usize::saturating_add)
@@ -348,6 +358,7 @@ impl StaticFacts {
             self.inherent_impls().len(),
             self.rust_uses().len(),
             self.conditional_items().len(),
+            self.receiver_arguments().len(),
         ];
         if lengths
             .into_iter()
@@ -429,7 +440,10 @@ impl StaticFacts {
         let conditional = self
             .conditional_items()
             .iter()
-            .all(|item| valid(item.range) && valid(item.attribute));
+            .all(|item| valid(item.range) && valid(item.attribute))
+            && self.receiver_arguments().iter().all(|(call, argument)| {
+                valid(*call) && valid(*argument) && contains(*call, *argument)
+            });
         if !(edges
             && references
             && declared_types
