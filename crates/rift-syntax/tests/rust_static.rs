@@ -379,6 +379,58 @@ fn test_rust_macro_token_errors_keep_authored_declarations_and_ranges() {
 }
 
 #[test]
+fn test_rust_tuple_impls_keep_authored_structural_owner_ranges() {
+    let path = ProjectPath::new("src/lib.rs").expect("path");
+    let source = "impl Pair for (usize, u8) { fn total(&self) {} } impl Pair for (u8, usize) { fn total(&self) {} } impl Pair for (usize,) { fn total(&self) {} } impl Pair for () { fn total(&self) {} } impl<'a> Pair for (&'a Item, [u8]) { fn total(&self) {} } impl Pair for (Item) { fn total(&self) {} }";
+    let document = RustSyntaxProvider::default()
+        .analyze(
+            SyntaxSource {
+                path: &path,
+                text: source,
+            },
+            SyntaxLimits::default(),
+        )
+        .expect("syntax");
+    let facts = document.facts().static_facts().expect("static facts");
+    let owners = facts
+        .inherent_impls()
+        .iter()
+        .map(|implementation| {
+            &source[usize::try_from(implementation.type_path.start).expect("start")
+                ..usize::try_from(implementation.type_path.end).expect("end")]
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        owners,
+        [
+            "(usize, u8)",
+            "(u8, usize)",
+            "(usize,)",
+            "()",
+            "(&'a Item, [u8])",
+            "Item"
+        ]
+    );
+    let names = document
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.kind == "impl_item")
+        .map(|symbol| symbol.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        [
+            "(usize,u8)",
+            "(u8,usize)",
+            "(usize,)",
+            "()",
+            "(&Item,[u8])",
+            "Item"
+        ]
+    );
+}
+
+#[test]
 fn test_rust_reexport_imports_keep_authored_visibility_ranges() {
     let path = ProjectPath::new("src/lib.rs").expect("path");
     let source = "pub(crate) use crate::Item; use crate::Other;";

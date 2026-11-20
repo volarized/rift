@@ -437,7 +437,7 @@ fn file_anchors(
         if symbol.qualified_name != base {
             continue;
         }
-        let structural = symbol.kind == "impl_item" && symbol.name.starts_with(['&', '[']);
+        let structural = symbol.kind == "impl_item" && symbol.name.starts_with(['&', '[', '(']);
         let names = if structural {
             let mut names = match symbol.container.as_deref() {
                 Some(container) => owner_path(container, &owners),

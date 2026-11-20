@@ -981,3 +981,78 @@ fn test_rust_local_traits_take_precedence_over_glob_imports() {
     );
 }
 
+#[test]
+fn test_rust_tuple_impls_keep_structural_identities_and_calls() {
+    // #835: tuple owners preserve order and do not become element impls.
+    let directory = tempfile::tempdir().expect("workspace");
+    let root = directory.path();
+    std::fs::create_dir(root.join("src")).expect("source directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='fixture'\nversion='0.1.0'\n",
+    )
+    .expect("manifest");
+    std::fs::write(root.join("src/lib.rs"), "pub trait Pair { fn total(&self) -> usize; } impl Pair for (usize, u8) { fn total(&self) -> usize { 1 } } impl Pair for (u8, usize) { fn total(&self) -> usize { 2 } } impl Pair for (usize,) { fn total(&self) -> usize { 3 } } impl Pair for () { fn total(&self) -> usize { 4 } } pub fn one(value: &(usize,)) -> usize { value.total() } pub fn unit(value: &()) -> usize { value.total() } pub fn use_pair(value: &(usize, u8)) -> usize { value.total() } pub fn reverse(value: &(u8, usize)) -> usize { value.total() } pub fn denied(value: usize) { value.total(); }").expect("source");
+    let index = WorkspaceIndex::build(
+        root,
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &TextFileInclusion::default(),
+    )
+    .expect("index");
+    for record in index
+        .symbol_view()
+        .expect("symbols")
+        .normalized_graph()
+        .records()
+    {
+        assert!(record.identity().is_some(), "missing identity: {record:?}");
+    }
+    assert_eq!(
+        index
+            .edges()
+            .edges()
+            .filter(|edge| edge.kind() == EdgeKind::Implements
+                && edge.to().as_str().ends_with("/fixture/Pair"))
+            .count(),
+        4
+    );
+    assert_eq!(
+        index
+            .edges()
+            .edges()
+            .filter(|edge| edge.kind() == EdgeKind::Overrides
+                && edge.to().as_str().ends_with("/Pair/total"))
+            .count(),
+        4
+    );
+    for from in [
+        "/fixture/use_pair",
+        "/fixture/reverse",
+        "/fixture/one",
+        "/fixture/unit",
+    ] {
+        assert!(
+            index
+                .edges()
+                .edges()
+                .any(|edge| edge.kind() == EdgeKind::Calls
+                    && edge.from().as_str().ends_with(from)
+                    && edge.to().as_str().ends_with("/total")),
+            "missing tuple call from {from}"
+        );
+    }
+    assert!(
+        !index
+            .edges()
+            .edges()
+            .any(|edge| edge.kind() == EdgeKind::Calls
+                && edge.from().as_str().ends_with("/fixture/denied"))
+    );
+    assert!(!index.edges().edges().any(|edge| {
+        edge.kind() == EdgeKind::Implements
+            && ["/fixture/usize", "/fixture/u8"]
+                .iter()
+                .any(|suffix| edge.from().as_str().ends_with(suffix))
+    }));
+}

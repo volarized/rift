@@ -19,6 +19,8 @@ pub(super) struct Kinds {
     generic_type: u16,
     reference_type: u16,
     array_type: u16,
+    tuple_type: u16,
+    unit_type: u16,
     self_parameter: u16,
     self_value: u16,
     scoped_identifier: u16,
@@ -77,6 +79,8 @@ pub(super) fn kinds() -> &'static Kinds {
             generic_type: id("generic_type"),
             reference_type: id("reference_type"),
             array_type: id("array_type"),
+            tuple_type: id("tuple_type"),
+            unit_type: id("unit_type"),
             self_parameter: id("self_parameter"),
             self_value: id("self"),
             scoped_identifier: id("scoped_identifier"),
@@ -493,16 +497,24 @@ impl Kinds {
     }
 
     fn named_type<'tree>(&self, mut element: Node<'tree>) -> Option<Node<'tree>> {
+        element = crate::rust::implemented_type(element);
         // Each step follows one grammar child, bounded by the captured syntax depth.
         while [self.generic_type, self.reference_type].contains(&element.kind_id()) {
-            element = element.child_by_field_id(self.value_type)?;
+            element = crate::rust::implemented_type(element.child_by_field_id(self.value_type)?);
         }
         (!element.is_missing()
-            && [self.type_identifier, self.scoped_type_identifier].contains(&element.kind_id()))
+            && [
+                self.type_identifier,
+                self.scoped_type_identifier,
+                self.tuple_type,
+                self.unit_type,
+            ]
+            .contains(&element.kind_id()))
         .then_some(element)
     }
 
     fn implementation_type<'tree>(&self, element: Node<'tree>) -> Option<Node<'tree>> {
+        let element = crate::rust::implemented_type(element);
         if element.kind_id() == self.generic_type {
             return element.child_by_field_id(self.value_type);
         }
@@ -511,6 +523,8 @@ impl Kinds {
             self.scoped_type_identifier,
             self.reference_type,
             self.array_type,
+            self.tuple_type,
+            self.unit_type,
         ]
         .contains(&element.kind_id())
             && !element.is_missing())

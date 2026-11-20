@@ -18,6 +18,7 @@ pub(super) struct Namespaces<'source> {
     files: BTreeMap<&'source str, FileNamespace<'source>>,
     values: BTreeMap<Vec<String>, Option<Target<'source>>>,
     types: BTreeMap<Vec<String>, Option<Target<'source>>>,
+    structural_types: BTreeMap<(String, String), Option<Target<'source>>>,
     methods: BTreeMap<Vec<String>, Vec<Method<'source>>>,
     members: BTreeMap<Vec<String>, Option<Target<'source>>>,
     fields: BTreeMap<Vec<String>, Option<Target<'source>>>,
@@ -86,6 +87,16 @@ impl<'source> Namespaces<'source> {
             && let Some(owner) = self.structural_self(file, range.start, work)
         {
             return Some(owner);
+        }
+        if file.text(range)?.starts_with('(') {
+            let crate_name = self.module(file, range.start, work)?.first()?.clone();
+            let name = file.text(range)?.split_whitespace().collect::<String>();
+            return self
+                .structural_types
+                .get(&(crate_name, name))
+                .copied()
+                .flatten()
+                .filter(|target| self.available(*target));
         }
         let parts = path_segments(file.text(range)?, work)?;
         if let [name] = parts.as_slice()
@@ -502,6 +513,19 @@ impl<'source> Namespaces<'source> {
                     .insert((file.document.path.as_str(), symbol.item_range));
             }
             if symbol.kind == "impl_item" {
+                if structural_owner(target) && self.available(target) {
+                    let key = (path.first()?.clone(), symbol.name.clone());
+                    self.structural_types
+                        .entry(key)
+                        .and_modify(|previous| {
+                            if previous.is_some_and(|previous| {
+                                previous.admitted_path().as_deref() != Some(path.as_slice())
+                            }) {
+                                *previous = None;
+                            }
+                        })
+                        .or_insert(Some(target));
+                }
                 continue;
             }
             if symbol.kind == "module" {
@@ -1263,7 +1287,7 @@ fn inherent_member<'source>(
 }
 
 fn structural_owner(target: Target<'_>) -> bool {
-    target.symbol.kind == "impl_item" && target.symbol.name.starts_with(['&', '['])
+    target.symbol.kind == "impl_item" && target.symbol.name.starts_with(['&', '[', '('])
 }
 
 fn insert<T>(index: &mut BTreeMap<Vec<String>, Option<T>>, path: Vec<String>, target: T) {
