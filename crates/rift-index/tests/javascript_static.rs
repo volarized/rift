@@ -1643,3 +1643,60 @@ exports.shadowed = shadowed;
         );
     }
 }
+
+#[test]
+fn test_typescript_nullable_declared_types_type_their_values() {
+    // A written type that is one named type in a union with `null` or `undefined` declares
+    // that named type, for a parameter, a variable and a declared return type.
+    let source = "export interface StateStorage {
+  getItem: (name: string) => string | null
+  setItem(name: string, value: string): void
+}
+export class Holder { value = 1 }
+export function union(storage: StateStorage | undefined, holder?: (Holder | null)) {
+  storage.getItem('a')
+  storage.setItem('a', 'b')
+  return holder.value
+}
+export function create(): StateStorage | null | undefined { return undefined }
+export function result() { const s = create(); return s.getItem('b') }
+let kept: undefined | StateStorage
+export function later() { return kept.getItem('c') }
+export class Other { getItem() { return 1 } }
+export function reassigned(storage: StateStorage | undefined, other: StateStorage) {
+  storage = other
+  return storage.getItem('d')
+}
+export function refuse(either: StateStorage | Other, list: StateStorage[] | null) {
+  let built = new Other()
+  built = either as Other
+  return [either.getItem('x'), list.getItem('y'), built.getItem('z')]
+}
+";
+    let (_directory, index) = workspace_with_manifest(&[("main.ts", source)], module_manifest());
+    for (from, to) in [
+        ("main.ts/union", "main.ts/StateStorage/getItem"),
+        ("main.ts/union", "main.ts/StateStorage/setItem"),
+        ("main.ts/result", "main.ts/StateStorage/getItem"),
+        ("main.ts/later", "main.ts/StateStorage/getItem"),
+        ("main.ts/reassigned", "main.ts/StateStorage/getItem"),
+    ] {
+        assert!(
+            has_edge(&index, EdgeKind::Calls, from, to),
+            "{from} -> {to}"
+        );
+    }
+    assert!(has_edge(
+        &index,
+        EdgeKind::Reads,
+        "main.ts/union",
+        "main.ts/Holder/value"
+    ));
+    // Two named types and an array in a union type nothing, and a binding typed only by
+    // its initializer loses that type when it is assigned again.
+    assert!(!index.edges().edges().any(|edge| {
+        edge.kind() == EdgeKind::Calls
+            && edge.from().as_str().ends_with("main.ts/refuse")
+            && edge.to().as_str().ends_with("/getItem")
+    }));
+}

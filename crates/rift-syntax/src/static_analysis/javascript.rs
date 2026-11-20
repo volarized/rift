@@ -122,6 +122,8 @@ struct TypeShapeKinds {
     key: u16,
     /// A member of an object type with a name and a type.
     property_signature: u16,
+    /// A union of written types.
+    union: u16,
 }
 
 impl TypeShapeKinds {
@@ -156,6 +158,7 @@ impl TypeShapeKinds {
             constraint: field(grammar, "constraint"),
             key: field(grammar, "key"),
             property_signature: id("property_signature"),
+            union: id("union_type"),
         }
     }
 }
@@ -335,17 +338,17 @@ impl Kinds {
         &self,
         syntax_element: Node<'_>,
         source: &str,
+        documentation: &mut Documentation,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
         let id = syntax_element.kind_id();
-        documentation: &mut Documentation,
+        self.record_documented_function(syntax_element, source, documentation, facts)?;
         self.record_module_syntax(syntax_element, source, facts);
         self.record_reference(syntax_element, facts)?;
         self.record_member(syntax_element, facts)?;
-        self.record_documented_function(syntax_element, source, documentation, facts)?;
-        self.record_declared_type(syntax_element, facts)?;
+        self.record_declared_type(syntax_element, source, facts)?;
         self.record_type_signature(syntax_element, facts)?;
-        self.record_return_type(syntax_element, facts)?;
+        self.record_return_type(syntax_element, source, facts)?;
         self.record_function(syntax_element, facts)?;
         if id == self.call {
             self.record_call(syntax_element, source, facts)?;
@@ -532,6 +535,7 @@ impl Kinds {
     fn record_return_type(
         &self,
         element: Node<'_>,
+        source: &str,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
         let Some(shapes) = &self.type_shapes else {
@@ -550,6 +554,7 @@ impl Kinds {
             };
             annotation = inner;
         }
+        let annotation = self.nullable_type(annotation, source);
         let owner = self.function_owner(element)?;
         if annotation.kind_id() == shapes.signature_holders[1] {
             // An inline object type: each named member types the value under that key.
@@ -626,6 +631,45 @@ impl Kinds {
                 .push((byte_range(name)?, byte_range(constraint)?));
         }
         Ok(())
+    }
+
+    /// The one type a union writes besides `null` and `undefined`, or the written type
+    /// itself: `T | undefined` and `(T | null)` are written as `T`.
+    fn nullable_type<'tree>(&self, mut written: Node<'tree>, source: &str) -> Node<'tree> {
+        let Some(shapes) = &self.type_shapes else {
+            return written;
+        };
+        // The syntax walk has admitted every enclosing type's depth.
+        while written.kind_id() == shapes.signature_holders[2] {
+            let Some(inner) = written.named_child(0) else {
+                return written;
+            };
+            written = inner;
+        }
+        if written.kind_id() != shapes.union {
+            return written;
+        }
+        let mut named = None;
+        let mut pending = vec![written];
+        // Each member lies inside the written type the syntax walk has admitted.
+        while let Some(member) = pending.pop() {
+            if member.kind_id() == shapes.union || member.kind_id() == shapes.signature_holders[2] {
+                let mut cursor = member.walk();
+                pending.extend(
+                    member
+                        .named_children(&mut cursor)
+                        .filter(|child| !child.is_extra()),
+                );
+                continue;
+            }
+            if matches!(text(member, source), Some("null" | "undefined")) {
+                continue;
+            }
+            if named.replace(member).is_some() {
+                return written;
+            }
+        }
+        named.unwrap_or(written)
     }
 
     /// The name a written type refers to: a type name, or the name of a generic type.
@@ -851,6 +895,7 @@ impl Kinds {
     ) -> Result<(), RiftError> {
         let name = element.child_by_field_id(self.name).or_else(|| {
             self.pattern
+        source: &str,
                 .and_then(|field| element.child_by_field_id(field))
         });
         let annotation = if self.type_alias == Some(element.kind_id()) {
@@ -877,6 +922,7 @@ impl Kinds {
             let Some(inner) = annotation.child_by_field_id(self.name) else {
                 return Ok(());
             };
+        annotation = self.nullable_type(annotation, source);
             annotation = inner;
         }
         if name.is_missing() || annotation.is_missing() {
@@ -1091,52 +1137,6 @@ impl Kinds {
     ) -> Result<(), RiftError> {
         let Some(shapes) = &self.type_shapes else {
             return Ok(());
-        };
-        let call = declarator
-            .child_by_field_id(self.value)
-            .filter(|value| value.kind_id() == self.call);
-        let Some(call) = call.filter(|_| pattern.kind_id() == self.patterns[0]) else {
-            return Ok(());
-        };
-        let mut cursor = pattern.walk();
-        for entry in pattern.named_children(&mut cursor) {
-            let (name, key) = if entry.kind_id() == self.shorthand_pattern {
-                (Some(entry), Some(entry))
-            } else if entry.kind_id() == self.pair_pattern {
-                (
-                    entry.child_by_field_id(self.value),
-                    entry.child_by_field_id(shapes.key),
-                )
-            } else {
-                (None, None)
-            };
-            if let Some((name, key)) = name
-                .filter(|name| name.kind_id() == self.identifier || name == &entry)
-                .zip(key.filter(|key| {
-                    [self.property_identifier, self.shorthand_pattern].contains(&key.kind_id())
-                }))
-            {
-                facts.destructured.push((
-                    byte_range(name)?,
-                    Some(byte_range(key)?),
-                    byte_range(call)?,
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn function_value<'tree>(&self, mut value: Node<'tree>) -> Option<Node<'tree>> {
-        // Each step descends within the admitted syntax depth.
-        while value.kind_id() == self.parenthesized {
-            value = value.named_child(0)?;
-        }
-        (value.kind_id() == self.arrow || self.named_expression[..2].contains(&value.kind_id()))
-            .then_some(value)
-    }
-
-    fn initializer(&self, value: Node<'_>, source: &str) -> Result<StaticBindingKind, RiftError> {
-        if value.kind_id() == self.new
     /// Binds the names an object pattern takes from `require` to the exports their keys
     /// name, as the member form `require('./lib').name` does. Answers whether it bound
     /// them: a pattern with a default, a rest or a nested entry binds no export.
@@ -1201,6 +1201,52 @@ impl Kinds {
         Ok(true)
     }
 
+        };
+        let call = declarator
+            .child_by_field_id(self.value)
+            .filter(|value| value.kind_id() == self.call);
+        let Some(call) = call.filter(|_| pattern.kind_id() == self.patterns[0]) else {
+            return Ok(());
+        };
+        let mut cursor = pattern.walk();
+        for entry in pattern.named_children(&mut cursor) {
+            let (name, key) = if entry.kind_id() == self.shorthand_pattern {
+                (Some(entry), Some(entry))
+            } else if entry.kind_id() == self.pair_pattern {
+                (
+                    entry.child_by_field_id(self.value),
+                    entry.child_by_field_id(shapes.key),
+                )
+            } else {
+                (None, None)
+            };
+            if let Some((name, key)) = name
+                .filter(|name| name.kind_id() == self.identifier || name == &entry)
+                .zip(key.filter(|key| {
+                    [self.property_identifier, self.shorthand_pattern].contains(&key.kind_id())
+                }))
+            {
+                facts.destructured.push((
+                    byte_range(name)?,
+                    Some(byte_range(key)?),
+                    byte_range(call)?,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn function_value<'tree>(&self, mut value: Node<'tree>) -> Option<Node<'tree>> {
+        // Each step descends within the admitted syntax depth.
+        while value.kind_id() == self.parenthesized {
+            value = value.named_child(0)?;
+        }
+        (value.kind_id() == self.arrow || self.named_expression[..2].contains(&value.kind_id()))
+            .then_some(value)
+    }
+
+    fn initializer(&self, value: Node<'_>, source: &str) -> Result<StaticBindingKind, RiftError> {
+        if value.kind_id() == self.new
             && let Some(constructor) = value
                 .child_by_field_id(self.constructor)
                 .filter(|constructor| self.receiver(*constructor))

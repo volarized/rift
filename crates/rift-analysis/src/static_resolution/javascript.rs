@@ -220,7 +220,31 @@ impl<'source> Index<'source> {
         if matches!(receiver, "this" | "super") {
             return self.javascript_receiver_member(file, position, receiver, member, role, work);
         }
-        match js_binding(file, &self.javascript, receiver, position, role, work) {
+        // A receiver with a declared type keeps it when the binding is assigned again: the
+        // call is refused only for a callee named by the binding itself.
+        let binding =
+            js_binding(file, &self.javascript, receiver, position, role, work).or_else(|| {
+                (role == rift_core::ReferenceRole::Call)
+                    .then(|| {
+                        js_binding(
+                            file,
+                            &self.javascript,
+                            receiver,
+                            position,
+                            rift_core::ReferenceRole::Read,
+                            work,
+                        )
+                    })
+                    .flatten()
+                    .filter(|binding| {
+                        file.declared_types
+                            .get(&binding.name)
+                            .copied()
+                            .flatten()
+                            .is_some()
+                    })
+            });
+        match binding {
             Some(binding) => self.javascript_member(file, binding, member, role, work),
             None => self.javascript_commonjs_member(file, receiver, member, position, role, work),
         }
@@ -276,6 +300,7 @@ impl<'source> Index<'source> {
     /// The annotation must name, through at most `DECLARED_TYPE_DEPTH_MAX` aliases, a type
     /// declaration whose own shape is the signature: a function or constructor type alias,
     /// or an interface with a call or construct signature. The call then targets the
+                || javascript_constructor_function(target)
     /// binding itself; no function body is chosen for it.
     fn javascript_declared_signature(
         &self,
@@ -300,7 +325,6 @@ impl<'source> Index<'source> {
             if !work.charge() {
                 return false;
             }
-                || javascript_constructor_function(target)
             let Some(named) =
                 self.javascript_target(file, annotation, rift_core::ReferenceRole::Type, work)
             else {
@@ -427,6 +451,22 @@ impl<'source> Index<'source> {
             );
         }
         let value = super::javascript_exports::Exports {
+            StaticBindingKind::JavaScriptTypeImport { module, export }
+                if role == rift_core::ReferenceRole::Type =>
+            {
+                let mode = match self.javascript.mode(file.document.path.as_str(), work) {
+                    ModuleMode::CommonJs => ModuleMode::CommonJs,
+                    _ => ModuleMode::Esm,
+                };
+                self.javascript_export(
+                    file,
+                    file.text(module)?,
+                    file.text(export)?,
+                    mode,
+                    role,
+                    work,
+                )
+            }
             files: &self.files,
             modes: &self.javascript,
         }
@@ -451,22 +491,6 @@ impl<'source> Index<'source> {
         if role != rift_core::ReferenceRole::Type
             && binding.kind == StaticBindingKind::Shadow
             && let Some(owner) = self
-            StaticBindingKind::JavaScriptTypeImport { module, export }
-                if role == rift_core::ReferenceRole::Type =>
-            {
-                let mode = match self.javascript.mode(file.document.path.as_str(), work) {
-                    ModuleMode::CommonJs => ModuleMode::CommonJs,
-                    _ => ModuleMode::Esm,
-                };
-                self.javascript_export(
-                    file,
-                    file.text(module)?,
-                    file.text(export)?,
-                    mode,
-                    role,
-                    work,
-                )
-            }
                 .javascript_callback_parameter(file, binding, work)
                 .or_else(|| self.javascript_destructured_name(file, binding, work))
         {
