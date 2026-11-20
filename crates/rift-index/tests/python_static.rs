@@ -26,6 +26,57 @@ fn build(files: &[(&str, &str)]) -> (tempfile::TempDir, WorkspaceIndex) {
 }
 
 #[test]
+fn test_python_generic_mro_stores_the_ordered_local_target() {
+    let source = "from typing import Generic, TypeVar\nT = TypeVar('T')\nclass Root:\n    def leaf(self): return 1\nclass Left(Generic[T], Root): pass\nclass Right(Generic[T]):\n    def leaf(self): return 2\nclass Child(Left[T], Right[T]):\n    def use(self): return self.leaf()\n";
+    let (_directory, index) = build(&[("main.py", source)]);
+    let calls = index
+        .edges()
+        .edges()
+        .filter(|edge| {
+            edge.kind().as_ref() == "calls"
+                && edge.from().as_str() == "rift://symbol/local/python/main/Child/use"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].to().as_str(),
+        "rift://symbol/local/python/main/Right/leaf"
+    );
+    let binding = calls[0].occurrence();
+    let start = usize::try_from(binding.range().start()).expect("start");
+    let end = usize::try_from(binding.range().end()).expect("end");
+    assert_eq!(&source[start..end], "self.leaf()");
+}
+
+#[test]
+fn test_python_generic_ancestry_stores_inherited_calls_and_overrides() {
+    let source = "import typing as t\nT = t.TypeVar('T')\nclass Base(t.Generic[T]):\n    def leaf(self): pass\n    def report(self): pass\nclass Middle(Base[T], t.Generic[T]): pass\nclass Child(Middle[T], t.Generic[T]):\n    def report(self): return super().report()\n    def use(self): return self.leaf()\n";
+    let (_directory, index) = build(&[("main.py", source)]);
+    for (kind, from, to, spelling) in [
+        ("calls", "Child/report", "Base/report", "super().report()"),
+        ("calls", "Child/use", "Base/leaf", "self.leaf()"),
+        ("overrides", "Child/report", "Base/report", "report"),
+    ] {
+        let edge = index
+            .edges()
+            .edges()
+            .find(|edge| {
+                edge.kind().as_ref() == kind
+                    && edge.from().as_str() == format!("rift://symbol/local/python/main/{from}")
+                    && edge.to().as_str() == format!("rift://symbol/local/python/main/{to}")
+            })
+            .expect("stored inherited member");
+        let binding = edge.occurrence();
+        let start = usize::try_from(binding.range().start()).expect("start");
+        let end = usize::try_from(binding.range().end()).expect("end");
+        assert_eq!(&source[start..end], spelling);
+        assert_eq!(binding.unit().key().as_str(), "main.py");
+    }
+    assert!(index.edges().is_complete());
+    assert_eq!(index.edges().dropped_edges(), 0);
+}
+
+#[test]
 fn test_python_overloads_store_implementation_calls_and_returned_receivers() {
     let source = "from typing import overload\nclass Item:\n    def leaf(self): pass\n@overload\ndef build(value: int) -> Item: ...\n@overload\ndef build(value: str) -> Item: ...\ndef build(value) -> Item: return Item()\ndef use():\n    item = build(1)\n    item.leaf()\n";
     let (_directory, index) = build(&[("main.py", source)]);

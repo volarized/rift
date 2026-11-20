@@ -4,24 +4,35 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rift_protocol::read::SymbolKind;
 
-use super::super::{Index, Target, Work};
-use super::Value;
-use rift_syntax::StaticBindingKind;
+use super::super::{File, Index, Target, Work};
+use super::{Value, edge_python_binding};
+use rift_syntax::{ByteRange, StaticBindingKind};
 
-type Key<'source> = (&'source str, &'source str);
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ClassKey<'source> {
+    Declaration(&'source str, &'source str),
+    Generic,
+}
+
+impl ClassKey<'_> {
+    fn blocks_member(self, name: &str) -> bool {
+        // Generic's private and special members have no declaration in the selected sources.
+        self == Self::Generic && name.starts_with('_')
+    }
+}
 
 #[derive(Default)]
 pub(in crate::static_resolution) struct ClassOrders<'source>(
-    BTreeMap<Key<'source>, ClassOrder<'source>>,
+    BTreeMap<ClassKey<'source>, ClassOrder<'source>>,
 );
 
 struct ClassOrder<'source> {
-    classes: Vec<Key<'source>>,
+    classes: Vec<ClassKey<'source>>,
     complete: bool,
 }
 
 impl<'source> ClassOrder<'source> {
-    fn partial(class: Key<'source>) -> Self {
+    fn partial(class: ClassKey<'source>) -> Self {
         Self {
             classes: vec![class],
             complete: false,
@@ -29,8 +40,8 @@ impl<'source> ClassOrder<'source> {
     }
 }
 
-fn key(target: Target<'_>) -> Key<'_> {
-    (
+fn key(target: Target<'_>) -> ClassKey<'_> {
+    ClassKey::Declaration(
         target.file.path.as_str(),
         target.symbol.qualified_name.as_str(),
     )
@@ -58,25 +69,17 @@ impl<'source> Index<'source> {
                     file: file.document,
                     symbol,
                 };
-                let mut bases = Vec::new();
-                for edge in file.facts.heritage_edges() {
-                    if !work.charge() {
-                        return None;
-                    }
-                    if Some(edge.from) == symbol.name_range {
-                        bases.push(
-                            self.edge_python_name(file, edge.target, work)
-                                .filter(|target| {
-                                    target.symbol.kinds.contains(&SymbolKind::Constructible)
-                                })
-                                .map(key),
-                        );
-                    }
-                }
+                let bases = self.python_class_bases(file, target, work)?;
                 pending.insert(key(target), bases);
             }
         }
-        let mut orders = BTreeMap::new();
+        let mut orders = BTreeMap::from([(
+            ClassKey::Generic,
+            ClassOrder {
+                classes: vec![ClassKey::Generic],
+                complete: true,
+            },
+        )]);
         while !pending.is_empty() {
             let mut ready = Vec::new();
             for (class, bases) in &pending {
@@ -113,6 +116,64 @@ impl<'source> Index<'source> {
             orders.insert(class, ClassOrder::partial(class));
         }
         Some(ClassOrders(orders))
+    }
+
+    fn python_class_bases(
+        &self,
+        file: &File<'source>,
+        class: Target<'source>,
+        work: &mut Work,
+    ) -> Option<Vec<Option<ClassKey<'source>>>> {
+        let mut bases = Vec::new();
+        for edge in file.facts.heritage_edges() {
+            if !work.charge() {
+                return None;
+            }
+            if Some(edge.from) != class.symbol.name_range {
+                continue;
+            }
+            let base = if self.python_generic_marker(file, edge.target, work) {
+                Some(ClassKey::Generic)
+            } else {
+                self.edge_python_name(file, edge.target, work)
+                    .filter(|target| target.symbol.kinds.contains(&SymbolKind::Constructible))
+                    .map(key)
+            };
+            bases.push(base);
+        }
+        Some(bases)
+    }
+
+    fn python_generic_marker(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+    ) -> bool {
+        let Some(text) = file.text(range) else {
+            return false;
+        };
+        let mut names = text.split('.').map(str::trim);
+        let Some(name) = names.next() else {
+            return false;
+        };
+        let Some(binding) = edge_python_binding(self, file, name, range.start, work) else {
+            return false;
+        };
+        let StaticBindingKind::PythonImport { module, export } = binding.kind else {
+            return false;
+        };
+        let Some(module) = file.text(module) else {
+            return false;
+        };
+        let typing = ["typing", "typing_extensions"].contains(&module);
+        if !typing || self.edge_python.0.contains_key(module) {
+            return false;
+        }
+        match export {
+            Some(export) => file.text(export) == Some("Generic") && names.next().is_none(),
+            None => names.next() == Some("Generic") && names.next().is_none(),
+        }
     }
 
     pub(super) fn python_member_value(
@@ -188,10 +249,16 @@ impl<'source> Index<'source> {
         work: &mut Work,
     ) -> Option<Target<'source>> {
         let order = self.edge_python_classes.0.get(&key(class))?;
-        for &(path, qualified) in order.classes.iter().skip(1) {
+        for &ancestor in order.classes.iter().skip(1) {
             if !work.charge() {
                 return None;
             }
+            if ancestor.blocks_member(name) {
+                return None;
+            }
+            let ClassKey::Declaration(path, qualified) = ancestor else {
+                continue;
+            };
             let base = self.files.get(path)?.qualified_target(qualified)?;
             if let Some(target) = self.python_own_member(base, name, work)
                 && !self.python_assigned_member(target)
@@ -337,10 +404,16 @@ impl<'source> Index<'source> {
         work: &mut Work,
     ) -> Option<Target<'source>> {
         let order = self.edge_python_classes.0.get(&key(class))?;
-        for &(path, qualified) in order.classes.iter().skip(1) {
+        for &ancestor in order.classes.iter().skip(1) {
             if !work.charge() {
                 return None;
             }
+            if ancestor.blocks_member(name) {
+                return None;
+            }
+            let ClassKey::Declaration(path, qualified) = ancestor else {
+                continue;
+            };
             let base = self.files.get(path)?.qualified_target(qualified)?;
             if let Some(target) = self.python_own_member(base, name, work) {
                 return Some(target);
@@ -351,9 +424,9 @@ impl<'source> Index<'source> {
 }
 
 fn merge_order<'source>(
-    class: Key<'source>,
-    bases: &[Option<Key<'source>>],
-    orders: &BTreeMap<Key<'source>, ClassOrder<'source>>,
+    class: ClassKey<'source>,
+    bases: &[Option<ClassKey<'source>>],
+    orders: &BTreeMap<ClassKey<'source>, ClassOrder<'source>>,
     work: &mut Work,
 ) -> Option<ClassOrder<'source>> {
     let mut partial = ClassOrder::partial(class);
