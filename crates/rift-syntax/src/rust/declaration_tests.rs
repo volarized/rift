@@ -115,6 +115,7 @@ fn test_trait_associated_items_declare_under_the_trait() {
             ("Shape::SIDES", Some("Shape"), "constant"),
             ("Shape::area", Some("Shape"), "function"),
             ("Point", None, "struct"),
+            ("Point", None, "impl_item"),
             ("Point::Unit", Some("Point"), "type_alias"),
             ("Point::SIDES", Some("Point"), "constant"),
             ("Point::area", Some("Point"), "function"),

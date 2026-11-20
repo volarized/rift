@@ -381,6 +381,12 @@ async fn test_edge_cold_calls_wait_and_reference_answers_need_no_declaration_mar
         ),
         (
             format!("SELECT ?target {{ ?target :implements <{trait_edge}> }}"),
+            Some(worker.clone()),
+        ),
+        (
+            format!(
+                "SELECT ?target {{ ?target :implements ?trait FILTER(?trait = <{trait_edge}>) }}"
+            ),
             Some(worker),
         ),
     ] {
@@ -667,6 +673,81 @@ async fn test_python_local_initializer_calls_start_at_the_enclosing_callable() -
     };
     let answer = query_after_population(&client, &params).await?;
     assert_eq!(answer["answer"], json!({"result":"boolean", "value":true}));
+    client.cancel().await?;
+    task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_edge_rust_static_inventory_and_multiple_facets_are_queryable() -> TestResult {
+    let mut source = String::from(
+        "mod jobs; use crate::jobs::{Task, leaf}; trait Run { fn execute(&self); } \
+         pub fn root(task: &Task) { leaf(); Task::new(); task.execute(); }\n",
+    );
+    for index in 0..70 {
+        writeln!(source, "pub fn extra_{index}() {{ leaf(); }}")?;
+    }
+    let files = [
+        ("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n"),
+        ("src/lib.rs", source.as_str()),
+        (
+            "src/jobs.rs",
+            "use crate::Run; pub struct Value; impl Value { fn open(&self) {} } \
+             pub struct Task { value: Value } pub fn leaf() {} \
+             impl Task { pub fn new() -> Self { Self { value: Value } } \
+             fn read(&mut self, value: Value) { self.value = value; \
+             let value = &self.value; self.value.open(); } } \
+             impl Run for Task { fn execute(&self) {} }",
+        ),
+    ];
+    let (_directory, client, task) = served_workspace(&files, None).await?;
+    let seed = captured_seed(&client, "Task", "src/jobs.rs").await?;
+    for predicate in [
+        "calls",
+        "contains",
+        "imports",
+        "implements",
+        "overrides",
+        "reads",
+        "writes",
+        "hasType",
+    ] {
+        let answer = query_after_population(
+            &client,
+            &QueryParams {
+                query: format!("ASK {{ ?source :{predicate} ?target }}"),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(
+            answer["answer"],
+            json!({"result":"boolean", "value":true}),
+            "{predicate}: {answer}"
+        );
+    }
+    let answer = query_after_population(
+        &client,
+        &QueryParams {
+            query: format!("SELECT ?target {{ <{seed}> :calls ?target }}"),
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert!(answer.get("answer").is_some(), "{answer}");
+    let absence = query_after_population(
+        &client,
+        &QueryParams {
+            query: "ASK { FILTER NOT EXISTS { ?source :calls ?target } }".to_owned(),
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert_eq!(
+        absence["reason"],
+        json!("insufficient_coverage"),
+        "{absence}"
+    );
     client.cancel().await?;
     task.await?;
     Ok(())

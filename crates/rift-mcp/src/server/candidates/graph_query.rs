@@ -444,7 +444,7 @@ fn project_semantic_inventory(
     acquired.project_local(
         dataset,
         input,
-        required.edges || required.references || required.calls,
+        required.edges || required.adjacency.references || required.adjacency.calls,
         required.occurrences,
     )
 }
@@ -1923,7 +1923,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn graph_ask_reads_captured_edges_and_refuses_uncovered_usages() -> TestResult {
+    async fn graph_ask_refuses_rust_without_captured_identities() -> TestResult {
         let directory = tempfile::tempdir()?;
         crate::server::hermetic_workspace(directory.path(), "")?;
         std::fs::write(directory.path().join("lib.rs"), "fn alpha() {}\n")?;
@@ -1944,13 +1944,6 @@ mod tests {
                 .map_err(|failure| format!("{failure:?}"))?
                 .0
                 .result;
-            if query == "ASK { ?a :calls ?b }" {
-                assert!(
-                    matches!(&result, QueryReadResult::Results(result) if matches!(&result.answer, QueryAnswer::Boolean { value: false })),
-                    "{result:?}"
-                );
-                continue;
-            }
             assert!(
                 matches!(
                     result,
@@ -2021,13 +2014,6 @@ mod tests {
                 .map_err(|failure| format!("{failure:?}"))?
                 .0
                 .result;
-            if query.contains("FILTER NOT EXISTS") {
-                assert!(
-                    matches!(&result, QueryReadResult::Results(result) if matches!(&result.answer, QueryAnswer::Boolean { value: true })),
-                    "{result:?}"
-                );
-                continue;
-            }
             assert!(
                 matches!(
                     result,

@@ -298,6 +298,10 @@ mod tests {
             ),
             ("ASK { <urn:caller> :calls+ ?callee }", true),
             (
+                "ASK { <urn:caller> :calls ?callee FILTER(?callee IN (<urn:leaf>, <urn:other>)) }",
+                true,
+            ),
+            (
                 "ASK { <urn:caller> :name 'caller' FILTER NOT EXISTS { <urn:caller> :calls ?callee } }",
                 false,
             ),

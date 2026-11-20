@@ -100,6 +100,13 @@ impl GraphQuery {
             match expression {
                 QueryExpression::Bgp { .. } | QueryExpression::Path { .. } => {}
                 QueryExpression::Project { inner, .. } => pending.push(inner),
+                QueryExpression::Filter { inner, .. }
+                    if self.admission().embedded_patterns == 0 =>
+                {
+                    // A scalar predicate on a witnessed binding cannot depend on
+                    // missing graph facts. EXISTS and NOT EXISTS are excluded.
+                    pending.push(inner);
+                }
                 QueryExpression::Join { left, right } => {
                     pending.push(left);
                     pending.push(right);

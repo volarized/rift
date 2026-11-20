@@ -417,6 +417,16 @@ fn presentation_disagreements(
 ) -> Vec<PresentationDisagreement> {
     let mut disagreements = BTreeSet::new();
     for (key, contribution) in contributions {
+        // One provider can describe distinct declarations of the same symbol.
+        // Their declaration kinds and visibility need not agree.
+        let same_provider = key.reference().provider() == primary.key().reference().provider();
+        let different_declarations = contribution
+            .source()
+            .zip(primary.source())
+            .is_some_and(|(left, right)| left != right);
+        if same_provider && different_declarations {
+            continue;
+        }
         if let Some(facts) = contribution.facts() {
             retain_difference(
                 &mut disagreements,
@@ -813,6 +823,44 @@ mod tests {
         .expect("record with an uncaptured contribution");
         assert!(SymbolAssembler::assemble(&graph, &missing, &[]).is_none());
         assert!(!SymbolAssembler::assembles_facts(&graph, &missing));
+    }
+
+    #[test]
+    fn distinct_facets_allow_different_declaration_fields_but_one_facet_does_not() {
+        let identity = "rift://symbol/local/rust/app/Beacon";
+        let primary = contribution("syntax", 1, "declaration", "Beacon", Some(identity), None);
+        let selected = primary.facts().expect("primary facts");
+        let unit = primary.source().expect("source binding").unit().clone();
+        for (start, separate) in [(0, false), (20, true)] {
+            let facts = PortableSymbolFacts::new(
+                selected.language().clone(),
+                selected.name(),
+                selected.qualified_name(),
+                ExactKind("impl_item".to_owned()),
+            )
+            .visibility("pub");
+            let alternate = Contribution::builder(
+                ContributionKey::new(
+                    provider("syntax"),
+                    ProviderRevision::new(1).expect("revision"),
+                    ProviderSymbolId::new("implementation").expect("provider symbol"),
+                ),
+                primary.applicability(),
+                facts,
+                primary.origin().clone(),
+            )
+            .source(rift_core::DeclarationBinding::new(
+                unit.clone(),
+                SourceRange::new(start, start + 8).expect("declaration range"),
+            ))
+            .identity_anchor(SymbolId::new(identity).expect("identity"))
+            .build()
+            .expect("alternate contribution");
+            let contributions = [(alternate.key().clone(), &alternate)];
+            let differences =
+                super::presentation_disagreements(&contributions, &primary, selected, None, None);
+            assert_eq!(differences.is_empty(), separate, "{differences:?}");
+        }
     }
 
     #[test]

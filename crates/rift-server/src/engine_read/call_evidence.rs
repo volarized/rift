@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rift_core::SymbolId as CoreSymbolId;
+use rift_protocol::identity::SymbolIdentity;
 use rift_protocol::read::{
     EdgeKind, SourceUnitId, SourceUnitSpan, SymbolId, TextRange, TraversalDirection,
 };
@@ -11,6 +12,105 @@ use crate::ReadService;
 use crate::traversal::TRAVERSAL_SYMBOLS_MAX;
 
 use super::{CallCorroboration, CallDestination, CallProvider, GraphCalls};
+
+/// Retains a concrete call when a separate engine operation confirms its callee token.
+/// Original disagreements and incomplete provider coverage remain in the answer.
+pub(super) async fn confirm_reference_sites(
+    reads: &ReadService,
+    engines: &crate::EnginePool,
+    seed: &SymbolId,
+    mut calls: GraphCalls,
+    deadline: tokio::time::Instant,
+) -> GraphCalls {
+    let mut pending = BTreeMap::<SymbolId, Vec<usize>>::new();
+    for (position, record) in calls.corroboration.iter().enumerate() {
+        if !record.agrees && record.provider == CallProvider::Engine {
+            pending
+                .entry(record.static_target.clone())
+                .or_default()
+                .push(position);
+        }
+    }
+    if pending.is_empty() {
+        return calls;
+    }
+    'targets: for (target, records) in pending {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        let Ok(identity) = SymbolIdentity::parse(target.as_str()) else {
+            continue;
+        };
+        let Some(slot) = engines.engine_for(identity.language()) else {
+            continue;
+        };
+        let provider = slot.edge_provider();
+        // This read contains only engine observations, never captured references.
+        let Ok(report) = Box::pin(super::engine_graph_references(
+            reads, engines, &target, false, deadline,
+        ))
+        .await
+        else {
+            continue;
+        };
+        for warning in report.edge_warnings {
+            if !calls.edge_warnings.contains(&warning) {
+                calls.edge_warnings.push(warning);
+            }
+        }
+        let positions = report
+            .occurrences
+            .into_iter()
+            .filter(|occurrence| occurrence.target == target)
+            .map(|occurrence| (call_key(&occurrence.source), occurrence.source))
+            .collect::<BTreeMap<_, _>>();
+        for position in records {
+            if calls.corroboration.len() == TRAVERSAL_SYMBOLS_MAX {
+                break 'targets;
+            }
+            let record = &calls.corroboration[position];
+            let Some(observed) = reference_witness(&positions, record) else {
+                continue;
+            };
+            let confirmed = CallCorroboration {
+                authored: record.authored.clone(),
+                callee: TextRange {
+                    start: record.callee.start,
+                    end: record.callee.end,
+                },
+                observed: observed.clone(),
+                static_target: target.clone(),
+                engine_target: CallDestination::Local(target.clone()),
+                provider: CallProvider::EngineReferences,
+                agrees: true,
+            };
+            calls.push_local(
+                seed,
+                target.clone(),
+                vec![confirmed.authored.clone()],
+                TraversalDirection::Outgoing,
+                provider,
+            );
+            calls.corroboration.push(confirmed);
+        }
+    }
+    merge_call_neighbors(&mut calls.local);
+    calls
+}
+
+fn reference_witness<'a>(
+    positions: &'a BTreeMap<CallKey, SourceUnitSpan>,
+    record: &CallCorroboration,
+) -> Option<&'a SourceUnitSpan> {
+    let start = (record.authored.unit.0.clone(), record.callee.start, 0);
+    let end = (record.authored.unit.0.clone(), record.callee.end, u64::MAX);
+    positions
+        .range(start..=end)
+        .map(|(_, source)| source)
+        .find(|source| {
+            source.range.start < source.range.end && source.range.end <= record.callee.end
+        })
+}
 
 /// The calls one captured static pass established for a selected declaration.
 pub(super) struct CapturedCalls<'read> {
@@ -36,23 +136,20 @@ impl<'read> CapturedCalls<'read> {
             .iter()
             .filter(|edge| edge.kind() == EdgeKind::Calls && edge.static_callee().is_some());
         let edges = calls.by_ref().take(TRAVERSAL_SYMBOLS_MAX).collect();
-        let edge_complete = reads
-            .index()
-            .symbols_by_identity_page(seed, 0, 1)
-            .is_ok_and(|(declarations, count)| {
-                count == 1
-                    && declarations.first().is_some_and(|declaration| {
-                        let range = (direction == TraversalDirection::Outgoing).then_some(
-                            rift_syntax::ByteRange {
-                                start: declaration.symbol.item_range.start,
-                                end: declaration.symbol.item_range.end,
-                            },
-                        );
-                        reads
-                            .index()
-                            .static_edge_calls_complete(declaration.file.path(), range)
-                    })
-            });
+        let edge_complete = super::edge_declarations(reads, seed).is_ok_and(|declarations| {
+            !declarations.is_empty()
+                && declarations.iter().all(|declaration| {
+                    let range = (direction == TraversalDirection::Outgoing).then_some(
+                        rift_syntax::ByteRange {
+                            start: declaration.symbol.item_range.start,
+                            end: declaration.symbol.item_range.end,
+                        },
+                    );
+                    reads
+                        .index()
+                        .static_edge_calls_complete(declaration.file.path(), range)
+                })
+        });
         Self {
             reads,
             direction,
@@ -62,9 +159,13 @@ impl<'read> CapturedCalls<'read> {
         }
     }
 
+    pub(super) const fn is_complete(&self) -> bool {
+        self.edge_complete && !self.truncated
+    }
+
     pub(super) fn answer(self) -> Option<GraphCalls> {
         (self.edge_complete || !self.edges.is_empty()).then(|| {
-            let complete = self.edge_complete && !self.truncated;
+            let complete = self.is_complete();
             self.combine(GraphCalls {
                 complete,
                 ..GraphCalls::default()
@@ -247,6 +348,10 @@ impl CallEvidence {
                 }
                 records.push(CallCorroboration {
                     authored: span.clone(),
+                    callee: TextRange {
+                        start: callee.start,
+                        end: callee.end,
+                    },
                     observed: SourceUnitSpan {
                         unit: span.unit.clone(),
                         range: TextRange {
@@ -280,6 +385,46 @@ fn merge_call_neighbors(neighbors: &mut Vec<(SymbolId, Vec<SourceUnitSpan>)>) {
 #[cfg(test)]
 mod tests {
     use rift_protocol::read::SymbolId;
+
+    #[test]
+    fn reference_witness_excludes_arguments_and_other_source_units() {
+        let text = "leaf(argument)";
+        let unit = super::SourceUnitId("rift://source/project/lib.rs".to_owned());
+        let span = |unit: super::SourceUnitId, start, end| super::SourceUnitSpan {
+            unit,
+            range: super::TextRange { start, end },
+        };
+        let target = SymbolId("rift://symbol/local/rust/app/leaf".to_owned());
+        let record = super::CallCorroboration {
+            authored: span(unit.clone(), 0, text.len() as u64),
+            callee: super::TextRange { start: 0, end: 4 },
+            observed: span(unit.clone(), 0, 4),
+            static_target: target.clone(),
+            engine_target: super::CallDestination::Local(target),
+            provider: super::CallProvider::Engine,
+            agrees: false,
+        };
+        for (source, expected) in [
+            (span(unit.clone(), 0, 4), true),
+            (span(unit.clone(), 5, text.len() as u64 - 1), false),
+            (span(unit.clone(), 0, 5), false),
+            (span(unit, 4, 4), false),
+            (
+                span(
+                    super::SourceUnitId("rift://source/project/other.rs".to_owned()),
+                    0,
+                    4,
+                ),
+                false,
+            ),
+        ] {
+            let positions = std::collections::BTreeMap::from([(super::call_key(&source), source)]);
+            assert_eq!(
+                super::reference_witness(&positions, &record).is_some(),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn test_edge_static_calls_answer_complete_and_empty_adjacency() {
