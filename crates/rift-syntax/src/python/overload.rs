@@ -66,7 +66,7 @@ impl OverloadContext {
                         .parent()
                         .is_none_or(|parent| parent.id() != root.id()) =>
                 {
-                    context.unknown = true;
+                    context.shadow_import(syntax_element, source);
                 }
                 _ => {}
             }
@@ -84,9 +84,24 @@ impl OverloadContext {
 
     fn shadow(&mut self, syntax_element: Node<'_>, source: &str) {
         if let Some(name) = source.get(syntax_element.byte_range())
-            && self.imports.contains_key(name)
+            && (self.imports.contains_key(name) || matches!(name, "classmethod" | "staticmethod"))
         {
             self.shadowed.insert(name.to_owned());
+        }
+    }
+
+    fn shadow_import(&mut self, statement: Node<'_>, source: &str) {
+        let module = statement.child_by_field_name("module_name");
+        let mut cursor = statement.walk();
+        for imported in statement.named_children(&mut cursor) {
+            if Some(imported) == module {
+                continue;
+            }
+            let bound = imported
+                .child_by_field_name("alias")
+                .or_else(|| imported.child_by_field_name("name"))
+                .unwrap_or(imported);
+            self.shadow(bound.named_child(0).unwrap_or(bound), source);
         }
     }
 
@@ -150,12 +165,10 @@ impl OverloadContext {
         syntax_element: Node<'_>,
         source: &str,
     ) -> Result<PythonOverload, RiftError> {
-        let Some(parent) = syntax_element
+        let parent = syntax_element
             .parent()
             .filter(|parent| parent.kind() == "decorated_definition")
-        else {
-            return Ok(PythonOverload::Ordinary);
-        };
+            .unwrap_or(syntax_element);
         let allowed_scope = parent.parent().is_some_and(|scope| {
             scope.kind() == "module"
                 || (scope.kind() == "block"
@@ -165,6 +178,9 @@ impl OverloadContext {
         });
         if !allowed_scope || self.unknown {
             return Ok(PythonOverload::Unknown);
+        }
+        if parent.id() == syntax_element.id() {
+            return Ok(PythonOverload::Ordinary);
         }
         let mut found = None;
         let mut cursor = parent.walk();
@@ -179,6 +195,9 @@ impl OverloadContext {
                 return Ok(PythonOverload::Unknown);
             };
             if matches!(text, "classmethod" | "staticmethod") {
+                if self.shadowed.contains(text) {
+                    return Ok(PythonOverload::Unknown);
+                }
                 continue;
             }
             let (binding, qualified) = match expression.kind() {

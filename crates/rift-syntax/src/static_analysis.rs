@@ -125,6 +125,11 @@ pub enum StaticBindingKind {
         /// Authored value path.
         value: ByteRange,
     },
+    /// A write to a Python member slot, separate from lexical bindings.
+    PythonMemberWrite {
+        /// Authored receiver of the assignment target.
+        receiver: ByteRange,
+    },
     /// A Python name checked by an `isinstance` condition.
     PythonGuard {
         /// Authored class argument.
@@ -134,6 +139,8 @@ pub enum StaticBindingKind {
     PythonFunction {
         /// Authored return annotation.
         annotation: ByteRange,
+        /// Single identifier decorator, absent for other decorator forms.
+        decorator: Option<ByteRange>,
     },
     /// Dotted Python module import without a local alias.
     PythonModule {
@@ -241,6 +248,11 @@ pub struct StaticFactsParts {
     /// Rust path calls and the range of their first argument, which selects the
     /// implementation of a `Trait::method(value, ..)` call.
     pub receiver_arguments: Vec<(ByteRange, ByteRange)>,
+    /// Python loop statements, whose bodies run again after their later statements.
+    pub loops: Vec<ByteRange>,
+    /// Python lambda, comprehension and generator expression scopes, whose bodies can run
+    /// after later statements of the enclosing scope.
+    pub expression_scopes: Vec<ByteRange>,
 }
 
 /// Calls and binding evidence retained after the syntax tree is released.
@@ -352,6 +364,18 @@ impl StaticFacts {
         &self.0.conditional_items
     }
 
+    /// Python loop statements.
+    #[must_use]
+    pub fn loops(&self) -> &[ByteRange] {
+        &self.0.loops
+    }
+
+    /// Python lambda, comprehension and generator expression scopes.
+    #[must_use]
+    pub fn expression_scopes(&self) -> &[ByteRange] {
+        &self.0.expression_scopes
+    }
+
     pub(crate) fn retained_bytes(&self) -> usize {
         [
             vector_capacity(&self.0.references),
@@ -369,6 +393,8 @@ impl StaticFacts {
             vector_capacity(&self.0.rust_uses),
             vector_capacity(&self.0.conditional_items),
             vector_capacity(&self.0.receiver_arguments),
+            vector_capacity(&self.0.loops),
+            vector_capacity(&self.0.expression_scopes),
         ]
         .into_iter()
         .fold(0, usize::saturating_add)
@@ -398,6 +424,8 @@ impl StaticFacts {
             self.rust_uses().len(),
             self.conditional_items().len(),
             self.receiver_arguments().len(),
+            self.loops().len(),
+            self.expression_scopes().len(),
         ];
         if lengths
             .into_iter()
@@ -483,6 +511,12 @@ impl StaticFacts {
             && self.receiver_arguments().iter().all(|(call, argument)| {
                 valid(*call) && valid(*argument) && contains(*call, *argument)
             });
+        let flow = self
+            .loops()
+            .iter()
+            .chain(self.expression_scopes())
+            .copied()
+            .all(valid);
         if !(edges
             && references
             && declared_types
@@ -494,7 +528,8 @@ impl StaticFacts {
             && unsupported
             && implementations
             && imports
-            && conditional)
+            && conditional
+            && flow)
         {
             return errors::syntax::facts_range_invalid().fail();
         }
@@ -537,9 +572,13 @@ impl StaticBinding {
             | StaticBindingKind::PythonInstance { constructor } => valid(constructor),
             StaticBindingKind::PythonReceiver { class_name } => valid(class_name),
             StaticBindingKind::PythonAnnotation { annotation }
-            | StaticBindingKind::PythonFunction { annotation }
             | StaticBindingKind::PythonGuard { annotation } => valid(annotation),
+            StaticBindingKind::PythonFunction {
+                annotation,
+                decorator,
+            } => valid(annotation) && decorator.is_none_or(&valid),
             StaticBindingKind::PythonAlias { value } => valid(value),
+            StaticBindingKind::PythonMemberWrite { receiver } => valid(receiver),
             StaticBindingKind::RustUse { path } => valid(path),
             StaticBindingKind::RustReceiver { type_path } => valid(type_path),
             StaticBindingKind::RustValue { initializer } => valid(initializer),

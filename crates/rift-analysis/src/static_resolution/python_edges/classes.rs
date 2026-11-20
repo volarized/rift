@@ -4,24 +4,143 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rift_protocol::read::SymbolKind;
 
-use super::super::{Index, Target, Work};
-use super::Value;
-use rift_syntax::StaticBindingKind;
+use super::super::{File, Index, Target, Work};
+use super::{Value, edge_python_binding};
+use rift_syntax::{ByteRange, StaticBindingKind};
 
-type Key<'source> = (&'source str, &'source str);
+/// Classes the Python `builtins` module provides, which a module may name without binding.
+const BUILTIN_CLASSES: [&str; 96] = [
+    "ArithmeticError",
+    "AssertionError",
+    "AttributeError",
+    "BaseException",
+    "BaseExceptionGroup",
+    "BlockingIOError",
+    "BrokenPipeError",
+    "BufferError",
+    "BytesWarning",
+    "ChildProcessError",
+    "ConnectionAbortedError",
+    "ConnectionError",
+    "ConnectionRefusedError",
+    "ConnectionResetError",
+    "DeprecationWarning",
+    "EOFError",
+    "EncodingWarning",
+    "EnvironmentError",
+    "Exception",
+    "ExceptionGroup",
+    "FileExistsError",
+    "FileNotFoundError",
+    "FloatingPointError",
+    "FutureWarning",
+    "GeneratorExit",
+    "IOError",
+    "ImportError",
+    "ImportWarning",
+    "IndentationError",
+    "IndexError",
+    "InterruptedError",
+    "IsADirectoryError",
+    "KeyError",
+    "KeyboardInterrupt",
+    "LookupError",
+    "MemoryError",
+    "ModuleNotFoundError",
+    "NameError",
+    "NotADirectoryError",
+    "NotImplementedError",
+    "OSError",
+    "OverflowError",
+    "PendingDeprecationWarning",
+    "PermissionError",
+    "ProcessLookupError",
+    "PythonFinalizationError",
+    "RecursionError",
+    "ReferenceError",
+    "ResourceWarning",
+    "RuntimeError",
+    "RuntimeWarning",
+    "StopAsyncIteration",
+    "StopIteration",
+    "SyntaxError",
+    "SyntaxWarning",
+    "SystemError",
+    "SystemExit",
+    "TabError",
+    "TimeoutError",
+    "TypeError",
+    "UnboundLocalError",
+    "UnicodeDecodeError",
+    "UnicodeEncodeError",
+    "UnicodeError",
+    "UnicodeTranslateError",
+    "UnicodeWarning",
+    "UserWarning",
+    "ValueError",
+    "Warning",
+    "ZeroDivisionError",
+    "bool",
+    "bytearray",
+    "bytes",
+    "classmethod",
+    "complex",
+    "dict",
+    "enumerate",
+    "filter",
+    "float",
+    "frozenset",
+    "int",
+    "list",
+    "map",
+    "memoryview",
+    "object",
+    "property",
+    "range",
+    "reversed",
+    "set",
+    "slice",
+    "staticmethod",
+    "str",
+    "super",
+    "tuple",
+    "type",
+    "zip",
+];
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ClassKey<'source> {
+    Declaration(&'source str, &'source str),
+    Generic,
+    /// A base declared outside the selected sources, named by its written base expression.
+    /// Its own ancestors are outside the selected sources too.
+    External(&'source str, u64),
+}
+
+impl ClassKey<'_> {
+    fn blocks_member(self, name: &str) -> bool {
+        match self {
+            // Generic's private and special members have no declaration in the selected sources.
+            Self::Generic => name.starts_with('_'),
+            // Any member may be declared by a class outside the selected sources.
+            Self::External(..) => true,
+            Self::Declaration(..) => false,
+        }
+    }
+}
 
 #[derive(Default)]
 pub(in crate::static_resolution) struct ClassOrders<'source>(
-    BTreeMap<Key<'source>, ClassOrder<'source>>,
+    BTreeMap<ClassKey<'source>, ClassOrder<'source>>,
 );
 
 struct ClassOrder<'source> {
-    classes: Vec<Key<'source>>,
+    classes: Vec<ClassKey<'source>>,
     complete: bool,
 }
 
 impl<'source> ClassOrder<'source> {
-    fn partial(class: Key<'source>) -> Self {
+    fn partial(class: ClassKey<'source>) -> Self {
         Self {
             classes: vec![class],
             complete: false,
@@ -29,8 +148,8 @@ impl<'source> ClassOrder<'source> {
     }
 }
 
-fn key(target: Target<'_>) -> Key<'_> {
-    (
+fn key(target: Target<'_>) -> ClassKey<'_> {
+    ClassKey::Declaration(
         target.file.path.as_str(),
         target.symbol.qualified_name.as_str(),
     )
@@ -58,25 +177,28 @@ impl<'source> Index<'source> {
                     file: file.document,
                     symbol,
                 };
-                let mut bases = Vec::new();
-                for edge in file.facts.heritage_edges() {
-                    if !work.charge() {
-                        return None;
-                    }
-                    if Some(edge.from) == symbol.name_range {
-                        bases.push(
-                            self.edge_python_name(file, edge.target, work)
-                                .filter(|target| {
-                                    target.symbol.kinds.contains(&SymbolKind::Constructible)
-                                })
-                                .map(key),
-                        );
-                    }
-                }
+                let bases = self.python_class_bases(file, target, work)?;
                 pending.insert(key(target), bases);
             }
         }
-        let mut orders = BTreeMap::new();
+        let mut orders = BTreeMap::from([(
+            ClassKey::Generic,
+            ClassOrder {
+                classes: vec![ClassKey::Generic],
+                complete: true,
+            },
+        )]);
+        for base in pending.values().flatten().flatten() {
+            if let ClassKey::External(..) = base {
+                orders.insert(
+                    *base,
+                    ClassOrder {
+                        classes: vec![*base],
+                        complete: true,
+                    },
+                );
+            }
+        }
         while !pending.is_empty() {
             let mut ready = Vec::new();
             for (class, bases) in &pending {
@@ -115,27 +237,193 @@ impl<'source> Index<'source> {
         Some(ClassOrders(orders))
     }
 
+    fn python_class_bases(
+        &self,
+        file: &File<'source>,
+        class: Target<'source>,
+        work: &mut Work,
+    ) -> Option<Vec<Option<ClassKey<'source>>>> {
+        let mut bases = Vec::new();
+        for edge in file.facts.heritage_edges() {
+            if !work.charge() {
+                return None;
+            }
+            if Some(edge.from) != class.symbol.name_range {
+                continue;
+            }
+            let base = if self.python_generic_marker(file, edge.target, work) {
+                Some(ClassKey::Generic)
+            } else if let Some(base) = self.edge_python_base(file, edge.target, work) {
+                Some(key(base))
+            } else {
+                self.python_external_class(file, edge.target, work)
+                    .then_some(ClassKey::External(
+                        file.document.path.as_str(),
+                        edge.target.start,
+                    ))
+            };
+            bases.push(base);
+        }
+        Some(bases)
+    }
+
+    /// A base expression names a class outside the selected sources: an unbound name (a
+    /// builtin class), or a name every binding of which imports it from a module outside them,
+    /// directly or through modules of the selected sources.
+    fn python_external_class(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+    ) -> bool {
+        let Some(text) = file.text(range) else {
+            return false;
+        };
+        // A subscripted or called base can supply other bases through `__mro_entries__`; the
+        // captured base range holds only the name before its subscript or arguments.
+        let applied = usize::try_from(range.end)
+            .ok()
+            .and_then(|end| file.document.source.get(end..))
+            .is_none_or(|rest| rest.trim_start().starts_with(['[', '(']));
+        let named = !applied
+            && text.split('.').map(str::trim).all(|part| {
+                !part.is_empty() && part.chars().all(|c| c == '_' || c.is_alphanumeric())
+            });
+        let mut parts = text.split('.').map(str::trim);
+        let Some(name) = parts.next().filter(|_| named) else {
+            return false;
+        };
+        let dotted = parts.next().is_some();
+        let mut visited = BTreeSet::new();
+        self.python_external_name(file, name, range.start, dotted, &mut visited, work)
+    }
+
+    fn python_external_name<'index>(
+        &'index self,
+        file: &'index File<'source>,
+        name: &'index str,
+        position: u64,
+        dotted: bool,
+        visited: &mut BTreeSet<(&'index str, &'index str)>,
+        work: &mut Work,
+    ) -> bool {
+        if !work.charge() || !visited.insert((file.document.path.as_str(), name)) {
+            return false;
+        }
+        if file.blocked(position, work) {
+            return false;
+        }
+        let Some(bindings) = file.by_name.get(name) else {
+            // Python resolves a name no scope binds among the builtins.
+            return !dotted && BUILTIN_CLASSES.contains(&name);
+        };
+        !bindings.is_empty()
+            && bindings.iter().all(|binding| match binding.kind {
+                StaticBindingKind::PythonModule { module } => file
+                    .text(module)
+                    .and_then(|module| module.split('.').next())
+                    .is_some_and(|module| self.module_value(module).is_none()),
+                StaticBindingKind::PythonImport { module, export } => {
+                    let Some(module) = file
+                        .text(module)
+                        .and_then(|module| super::EdgePythonModules::name(file, module))
+                    else {
+                        return false;
+                    };
+                    match export.and_then(|export| file.text(export)) {
+                        Some(export) => match self.edge_python.path(&module) {
+                            // A module of the selected sources re-exports a binding it holds.
+                            Some(path) => self.files.get(path).is_some_and(|source| {
+                                source.by_name.contains_key(export)
+                                    && self.python_external_name(
+                                        source, export, 0, dotted, visited, work,
+                                    )
+                            }),
+                            None => {
+                                self.module_value(&module).is_none()
+                                    && self.module_value(&format!("{module}.{export}")).is_none()
+                            }
+                        },
+                        None => self.module_value(&module).is_none(),
+                    }
+                }
+                _ => false,
+            })
+    }
+
+    fn python_generic_marker(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+    ) -> bool {
+        let Some(text) = file.text(range) else {
+            return false;
+        };
+        let mut names = text.split('.').map(str::trim);
+        let Some(name) = names.next() else {
+            return false;
+        };
+        let Some(binding) = edge_python_binding(self, file, name, range.start, work) else {
+            return false;
+        };
+        let StaticBindingKind::PythonImport { module, export } = binding.kind else {
+            return false;
+        };
+        let Some(module) = file.text(module) else {
+            return false;
+        };
+        let typing = ["typing", "typing_extensions"].contains(&module);
+        if !typing || self.edge_python.0.contains_key(module) {
+            return false;
+        }
+        match export {
+            Some(export) => file.text(export) == Some("Generic") && names.next().is_none(),
+            None => names.next() == Some("Generic") && names.next().is_none(),
+        }
+    }
+
     pub(super) fn python_member_value(
         &self,
-        class: Target<'source>,
+        receiver: Value<'source>,
         name: &str,
         work: &mut Work,
     ) -> Option<Value<'source>> {
-        let class = self.python_receiver(class, work)?;
+        let receiver = self.python_receiver(receiver, work)?;
+        let instance = matches!(receiver, Value::Instance(_));
+        let class = match receiver {
+            Value::Symbol(class) | Value::Instance(class) => class,
+            Value::Member { .. } | Value::Module(_) => return None,
+        };
         if class.symbol.kinds.contains(&SymbolKind::Module) {
             let file = self.files.get(class.file.path.as_str())?;
             return self.export_value(file, name, work);
         }
         let member = self
-            .python_own_member(class, name)
+            .python_own_member(class, name, work)
             .or_else(|| self.python_base_member(class, name, work));
         let assigned = member.is_some_and(|target| self.python_assigned_member(target));
         if member.is_some() && !assigned {
+            if !self.python_member_slot_available(class, instance, name, member?, work) {
+                return None;
+            }
+            if instance
+                && let Some(declaration) = member
+                && let Some(assigned) = self.python_property_result(declaration, work)
+            {
+                return Some(Value::Member {
+                    declaration,
+                    assigned,
+                });
+            }
             return member.map(Value::Symbol);
         }
         let declaration = self
             .python_declared_base_member(class, name, work)
             .or(member)?;
+        if !self.python_member_slot_available(class, instance, name, declaration, work) {
+            return None;
+        }
         match member.filter(|own| key(*own) != key(declaration)) {
             Some(assigned) => Some(Value::Member {
                 declaration,
@@ -167,6 +455,31 @@ impl<'source> Index<'source> {
             .is_some_and(|caller| class.symbol.item_range.encloses(caller.symbol.item_range))
     }
 
+    pub(super) fn python_slot_relation(
+        &self,
+        class: Target<'source>,
+        written: Target<'source>,
+        declaration: Target<'source>,
+        instance: bool,
+        work: &mut Work,
+    ) -> Option<bool> {
+        let order = self.edge_python_classes.0.get(&key(class))?;
+        let owner = declaration.symbol.container.as_deref()?;
+        for &ancestor in &order.classes {
+            if !work.charge() {
+                return None;
+            }
+            if ancestor == key(written) {
+                return Some(true);
+            }
+            if !instance && ancestor == ClassKey::Declaration(declaration.file.path.as_str(), owner)
+            {
+                return Some(false);
+            }
+        }
+        order.complete.then_some(false)
+    }
+
     fn python_declared_base_member(
         &self,
         class: Target<'source>,
@@ -174,12 +487,18 @@ impl<'source> Index<'source> {
         work: &mut Work,
     ) -> Option<Target<'source>> {
         let order = self.edge_python_classes.0.get(&key(class))?;
-        for &(path, qualified) in order.classes.iter().skip(1) {
+        for &ancestor in order.classes.iter().skip(1) {
             if !work.charge() {
                 return None;
             }
+            if ancestor.blocks_member(name) {
+                return None;
+            }
+            let ClassKey::Declaration(path, qualified) = ancestor else {
+                continue;
+            };
             let base = self.files.get(path)?.qualified_target(qualified)?;
-            if let Some(target) = self.python_own_member(base, name)
+            if let Some(target) = self.python_own_member(base, name, work)
                 && !self.python_assigned_member(target)
             {
                 return Some(target);
@@ -190,35 +509,117 @@ impl<'source> Index<'source> {
 
     pub(super) fn python_receiver(
         &self,
-        mut target: Target<'source>,
+        mut value: Value<'source>,
         work: &mut Work,
-    ) -> Option<Target<'source>> {
+    ) -> Option<Value<'source>> {
         let mut visited = BTreeSet::new();
         loop {
-            if !work.charge() || !visited.insert(key(target)) {
+            if !work.charge() {
+                return None;
+            }
+            let target = match value {
+                Value::Instance(_) => return Some(value),
+                Value::Member { assigned, .. }
+                    if assigned.symbol.kinds.contains(&SymbolKind::Constructible) =>
+                {
+                    return Some(Value::Instance(assigned));
+                }
+                Value::Symbol(target)
+                | Value::Member {
+                    assigned: target, ..
+                } => target,
+                Value::Module(_) => return self.value_target(value).map(Value::Symbol),
+            };
+            if !visited.insert(key(target)) {
                 return None;
             }
             if target.symbol.kinds.contains(&SymbolKind::Constructible)
                 || target.symbol.kinds.contains(&SymbolKind::Module)
             {
-                return Some(target);
+                return Some(Value::Symbol(target));
             }
             let file = self.files.get(target.file.path.as_str())?;
-            target = match file.python_values.get(&target.symbol.name_range?.end)? {
+            value = match file.python_values.get(&target.symbol.name_range?.end)? {
                 StaticBindingKind::PythonAnnotation { annotation } => {
-                    self.python_annotation(file, *annotation, work)?
+                    match self.python_class_object_annotation(file, *annotation, work) {
+                        Some(class) => return Some(Value::Symbol(class)),
+                        None => Value::Instance(self.python_annotation(file, *annotation, work)?),
+                    }
                 }
                 StaticBindingKind::PythonInstance { constructor } => {
                     let callable = self.edge_python_name(file, *constructor, work)?;
-                    self.python_call_result(callable, work)?
+                    Value::Instance(self.python_call_result(callable, work)?)
                 }
                 StaticBindingKind::PythonAlias { value } => {
-                    let value = work.python_lookup(|work| self.python_name(file, *value, work))?;
-                    self.python_value_receiver(value)?
+                    work.python_lookup(|work| self.python_name(file, *value, work))?
                 }
                 _ => return None,
             };
         }
+    }
+
+    /// The class a `type[Class]` annotation names, when `type` is the builtin.
+    fn python_class_object_annotation(
+        &self,
+        file: &File<'source>,
+        annotation: ByteRange,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let written = file.text(annotation)?;
+        let inner = written
+            .trim()
+            .strip_prefix("type[")?
+            .strip_suffix(']')?
+            .trim();
+        if file.by_name.contains_key("type") || file.blocked(annotation.start, work) {
+            return None;
+        }
+        let offset = inner.as_ptr() as usize - written.as_ptr() as usize;
+        let start = annotation.start + u64::try_from(offset).ok()?;
+        let range = ByteRange {
+            start,
+            end: start + u64::try_from(inner.len()).ok()?,
+        };
+        self.python_annotation(file, range, work)
+    }
+
+    fn python_property_result(
+        &self,
+        getter: Target<'source>,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let file = self.files.get(getter.file.path.as_str())?;
+        let range = getter.symbol.name_range?;
+        let StaticBindingKind::PythonFunction {
+            annotation,
+            decorator: Some(decorator),
+        } = file.python_values.get(&range.end)?
+        else {
+            return None;
+        };
+        if file.text(*decorator)? != "property" || file.blocked(decorator.start, work) {
+            return None;
+        }
+        for binding in file.by_name.get("property").into_iter().flatten() {
+            if !work.charge() || binding.scope.contains(decorator.start) {
+                return None;
+            }
+        }
+        let class = file.qualified_target(getter.symbol.container.as_deref()?)?;
+        for binding in file
+            .by_name
+            .get(getter.symbol.name.as_str())
+            .into_iter()
+            .flatten()
+        {
+            if !work.charge() {
+                return None;
+            }
+            if binding.scope == class.symbol.item_range && binding.name != range {
+                return None;
+            }
+        }
+        self.python_annotation(file, *annotation, work)
     }
 
     pub(super) fn python_call_result(
@@ -230,10 +631,16 @@ impl<'source> Index<'source> {
             return Some(callable);
         }
         if !callable.symbol.kinds.contains(&SymbolKind::Callable) {
-            return None;
+            // A value that holds a class object constructs an instance of that class.
+            return match self.python_receiver(Value::Symbol(callable), work)? {
+                Value::Symbol(class) if class.symbol.kinds.contains(&SymbolKind::Constructible) => {
+                    Some(class)
+                }
+                _ => None,
+            };
         }
         let file = self.files.get(callable.file.path.as_str())?;
-        let StaticBindingKind::PythonFunction { annotation } =
+        let StaticBindingKind::PythonFunction { annotation, .. } =
             file.python_values.get(&callable.symbol.name_range?.end)?
         else {
             return None;
@@ -245,9 +652,35 @@ impl<'source> Index<'source> {
         &self,
         class: Target<'source>,
         name: &str,
+        work: &mut Work,
     ) -> Option<Target<'source>> {
         let file = self.files.get(class.file.path.as_str())?;
-        file.qualified_target(&format!("{}.{name}", class.symbol.qualified_name))
+        let target = file.qualified_target(&format!("{}.{name}", class.symbol.qualified_name))?;
+        if !target.symbol.kinds.contains(&SymbolKind::Callable) {
+            return Some(target);
+        }
+        let bindings = file
+            .by_name
+            .get(name)?
+            .iter()
+            .copied()
+            .filter(|binding| binding.scope == class.symbol.item_range);
+        // Getter, setter and deleter facets of one property are one member slot.
+        let mut property = true;
+        for binding in bindings.clone() {
+            if !work.charge() {
+                return None;
+            }
+            property &= file.target_at(binding.name).is_some_and(|facet| {
+                facet.symbol.kinds.contains(&SymbolKind::Property)
+                    && facet.symbol.qualified_name == target.symbol.qualified_name
+            });
+        }
+        if property {
+            return Some(target);
+        }
+        let binding = self.python_binding_group(file, bindings, work)?;
+        file.target_at(binding.name)
     }
 
     pub(super) fn python_base_member(
@@ -257,12 +690,18 @@ impl<'source> Index<'source> {
         work: &mut Work,
     ) -> Option<Target<'source>> {
         let order = self.edge_python_classes.0.get(&key(class))?;
-        for &(path, qualified) in order.classes.iter().skip(1) {
+        for &ancestor in order.classes.iter().skip(1) {
             if !work.charge() {
                 return None;
             }
+            if ancestor.blocks_member(name) {
+                return None;
+            }
+            let ClassKey::Declaration(path, qualified) = ancestor else {
+                continue;
+            };
             let base = self.files.get(path)?.qualified_target(qualified)?;
-            if let Some(target) = self.python_own_member(base, name) {
+            if let Some(target) = self.python_own_member(base, name, work) {
                 return Some(target);
             }
         }
@@ -271,9 +710,9 @@ impl<'source> Index<'source> {
 }
 
 fn merge_order<'source>(
-    class: Key<'source>,
-    bases: &[Option<Key<'source>>],
-    orders: &BTreeMap<Key<'source>, ClassOrder<'source>>,
+    class: ClassKey<'source>,
+    bases: &[Option<ClassKey<'source>>],
+    orders: &BTreeMap<ClassKey<'source>, ClassOrder<'source>>,
     work: &mut Work,
 ) -> Option<ClassOrder<'source>> {
     let mut partial = ClassOrder::partial(class);

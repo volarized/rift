@@ -447,6 +447,9 @@ impl<'source> File<'source> {
                 continue;
             }
             let name = self.text(binding.name)?;
+            if matches!(binding.kind, StaticBindingKind::PythonMemberWrite { .. }) {
+                continue;
+            }
             self.by_name.entry(name).or_default().push(binding);
             match binding.kind {
                 StaticBindingKind::PythonAnnotation { .. }
@@ -482,6 +485,10 @@ impl<'source> File<'source> {
             for call in self.facts.calls() {
                 if !work.charge() {
                     return None;
+                }
+                if call.range == call.callee_range {
+                    // A bare decorator application is no call expression inside a receiver.
+                    continue;
                 }
                 self.python_calls
                     .entry(call.range.start)
@@ -750,6 +757,7 @@ struct Index<'source> {
     javascript: javascript::PackageModes<'source>,
     edge_python: python_edges::EdgePythonModules,
     edge_python_classes: python_edges::ClassOrders<'source>,
+    python_writes: BTreeMap<&'source str, Vec<(&'source str, ByteRange)>>,
     syntax_publication: rift_core::ProviderRevision,
     unavailable_sources: usize,
     /// Budget every file pass consumed, joined or not.
@@ -796,6 +804,23 @@ impl<'source> Index<'source> {
             }
         }
         let edge_python = python_edges::EdgePythonModules::build_edge(&files, work)?;
+        let mut python_writes = BTreeMap::<_, Vec<_>>::new();
+        for file in files
+            .values()
+            .filter(|file| file.document.facts.language().name == "python")
+        {
+            for binding in file.facts.bindings() {
+                if !work.charge() {
+                    return None;
+                }
+                if let StaticBindingKind::PythonMemberWrite { receiver } = binding.kind {
+                    python_writes
+                        .entry(file.text(binding.name)?)
+                        .or_default()
+                        .push((file.document.path.as_str(), receiver));
+                }
+            }
+        }
         let rust = rust::Namespaces::new(&files, work)?;
         let javascript = javascript::PackageModes::new(namespace, &files, work)?;
         let provider = ProviderId::new(SYNTAX_PROVIDER_ID).ok()?;
@@ -808,6 +833,7 @@ impl<'source> Index<'source> {
             javascript,
             edge_python,
             edge_python_classes: python_edges::ClassOrders::default(),
+            python_writes,
             syntax_publication,
             unavailable_sources,
             #[cfg(test)]
@@ -1040,7 +1066,11 @@ impl<'source> Index<'source> {
         edge: &rift_syntax::HeritageEdge,
         work: &mut Work,
     ) -> Option<StaticOccurrence> {
-        let target = self.edge_type_target(file, edge.target, work)?;
+        let target = if file.document.facts.language().name == "python" {
+            self.edge_python_base(file, edge.target, work)?
+        } else {
+            self.edge_type_target(file, edge.target, work)?
+        };
         let from = if file.document.facts.language().name == "rust" {
             self.edge_type_target(file, edge.from, work)?
         } else {
