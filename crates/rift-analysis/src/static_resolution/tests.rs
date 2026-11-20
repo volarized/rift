@@ -767,11 +767,11 @@ fn resolution(
     metadata: &[(&str, &str)],
     work_max: usize,
 ) -> StaticResolution {
-    resolution_by(language, sources, metadata, work_max, resolve)
+    resolution_by(language, sources, metadata, work_max, &resolve)
 }
 
 /// A static pass over one fixture: what [`resolve`] receives and answers.
-type Pass = fn(
+type Pass<'pass> = &'pass dyn Fn(
     &rift_provider::NormalizedGraph,
     &[StaticSource<'_>],
     &NamespaceInput<'_>,
@@ -784,7 +784,7 @@ fn resolution_by(
     sources: &[(&str, &str)],
     metadata: &[(&str, &str)],
     work_max: usize,
-    pass: Pass,
+    pass: Pass<'_>,
 ) -> StaticResolution {
     let language = Language::from_identity_segment(language).expect("fixture language");
     let parsed = sources
@@ -1117,9 +1117,11 @@ fn javascript_empty_analysis_completes_without_an_unresolved_site() {
     assert!(!result.exhausted);
 }
 
-/// Resolves the files in path order under one budget: the pass the join of separately
-/// resolved files must equal.
+/// Resolves the files one after another in path order, each with what is left of the pass
+/// budget or its own share, whichever is less: the pass the join of separately resolved
+/// files must equal.
 fn resolved_in_one_pass(
+    file_work: super::FileWork,
     graph: &rift_provider::NormalizedGraph,
     documents: &[StaticSource<'_>],
     input: &NamespaceInput<'_>,
@@ -1135,39 +1137,70 @@ fn resolved_in_one_pass(
                 if !work.charge() {
                     break;
                 }
-                index.resolve_file(file, work, resolution);
+                let left = work.budget.remaining();
+                let share = file_work.max(file);
+                let apart = index.resolve_file_apart(file, left.min(share), &resolution.edge_calls);
+                work.exhausted = apart.exhausted && left < share;
+                let over_share = apart.exhausted && !work.exhausted;
+                work.budget = rift_core::LoopBudget::new(left - apart.used);
+                resolution.join(file, apart.resolution, over_share);
+                if work.exhausted {
+                    break;
+                }
             }
         },
     )
 }
 
+/// Resolves the files across the pool with `file_work` as each file's share.
+fn resolved_apart(
+    file_work: super::FileWork,
+    graph: &rift_provider::NormalizedGraph,
+    documents: &[StaticSource<'_>],
+    input: &NamespaceInput<'_>,
+    work_max: usize,
+) -> StaticResolution {
+    super::resolve_by(
+        graph,
+        documents,
+        input,
+        work_max,
+        |index, work, resolution| index.resolve_files(file_work, work, resolution),
+    )
+}
+
+const APART_SOURCES: [(&str, &str); 4] = [
+    (
+        "a.ts",
+        "import { leaf } from './b.js'; export function root(input: Box) { leaf(); input.read(); eval('x'); } interface Box { read(): void; }",
+    ),
+    (
+        "b.ts",
+        "export function leaf() { helper(); helper(); } function helper() { const value = { count: 1 }; return value.count; }",
+    ),
+    (
+        "c.ts",
+        "import { root } from './a.js'; class Base { run() {} } class Derived extends Base { run() { root(undefined as never); this.run(); } }",
+    ),
+    ("d.ts", "function {"),
+];
+
 #[test]
 fn files_resolved_apart_equal_one_pass_under_every_budget() {
-    let sources = [
-        (
-            "a.ts",
-            "import { leaf } from './b.js'; export function root(input: Box) { leaf(); input.read(); eval('x'); } interface Box { read(): void; }",
-        ),
-        (
-            "b.ts",
-            "export function leaf() { helper(); helper(); } function helper() { const value = { count: 1 }; return value.count; }",
-        ),
-        (
-            "c.ts",
-            "import { root } from './a.js'; class Base { run() {} } class Derived extends Base { run() { root(undefined as never); this.run(); } }",
-        ),
-        ("d.ts", "function {"),
-    ];
-    let printed = |work_max, pass: Pass| {
-        let result = resolution_by("typescript", &sources, &[], work_max, pass);
+    let captured = super::FileWork::CAPTURED;
+    let printed = |work_max, pass: Pass<'_>| {
+        let result = resolution_by("typescript", &APART_SOURCES, &[], work_max, pass);
         (result.exhausted, format!("{result:?}"))
+    };
+    let one_pass: Pass<'_> = &|graph, documents, input, work_max| {
+        resolved_in_one_pass(captured, graph, documents, input, work_max)
     };
     let mut budgets = 0_usize;
     for work_max in 0..WORK_MAX {
-        let (exhausted, one_pass) = printed(work_max, resolved_in_one_pass);
+        let (exhausted, expected) = printed(work_max, one_pass);
         assert_eq!(
-            printed(work_max, resolve).1,
-            one_pass,
+            printed(work_max, &resolve).1,
+            expected,
             "work_max={work_max}"
         );
         budgets += 1;
@@ -1176,10 +1209,10 @@ fn files_resolved_apart_equal_one_pass_under_every_budget() {
         }
     }
     // The sweep covers a budget ending inside the index, inside each file, and none.
-    assert!(budgets > sources.len(), "budgets={budgets}");
-    let (exhausted, complete) = printed(WORK_MAX, resolved_in_one_pass);
+    assert!(budgets > APART_SOURCES.len(), "budgets={budgets}");
+    let (exhausted, complete) = printed(WORK_MAX, one_pass);
     assert!(!exhausted);
-    assert_eq!(printed(WORK_MAX, resolve).1, complete);
+    assert_eq!(printed(WORK_MAX, &resolve).1, complete);
     assert!(complete.contains("role: Call"), "{complete}");
 }
 
@@ -1243,6 +1276,130 @@ fn many_conditional_items_leave_only_the_inactive_ones_out() {
             .iter()
             .all(|call| target(call) == "rift://symbol/local/rust/fixture/leaf")
     );
+}
+
+#[test]
+fn work_done_once_the_budget_ends_stays_inside_the_budget() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let files = (0..24)
+        .map(|file| format!("f{file:02}.ts"))
+        .collect::<Vec<_>>();
+    let source = "function leaf() {} function root() { leaf(); leaf(); leaf(); }";
+    let sources = files
+        .iter()
+        .map(|path| (path.as_str(), source))
+        .collect::<Vec<_>>();
+    let left = AtomicUsize::new(0);
+    let performed = AtomicUsize::new(0);
+    let measured = |work_max| {
+        resolution_by(
+            "typescript",
+            &sources,
+            &[],
+            work_max,
+            &|graph, documents, input, work_max| {
+                super::resolve_by(
+                    graph,
+                    documents,
+                    input,
+                    work_max,
+                    |index, work, resolution| {
+                        left.store(work.budget.remaining(), Ordering::Relaxed);
+                        index.resolve_files(super::FileWork::CAPTURED, work, resolution);
+                        performed.store(index.performed.load(Ordering::Relaxed), Ordering::Relaxed);
+                    },
+                )
+            },
+        )
+    };
+    let complete = measured(1_000_000);
+    assert!(!complete.exhausted);
+    assert_eq!(complete.analyzed_sources, files.len());
+    let needed = performed.load(Ordering::Relaxed);
+    let index = 1_000_000 - left.load(Ordering::Relaxed);
+    // Budgets that end from inside the first file to inside the last.
+    let mut cut_early = 0;
+    for work_max in (index..index + needed).step_by(needed / 64 + 1) {
+        let cut = measured(work_max);
+        let left = left.load(Ordering::Relaxed);
+        let performed = performed.load(Ordering::Relaxed);
+        assert!(
+            performed <= left,
+            "work_max={work_max}, performed={performed}, left={left}"
+        );
+        if cut.exhausted && cut.analyzed_sources < files.len() / 4 {
+            cut_early += 1;
+            // The files after the cut start no pass: the work stays with the files joined.
+            assert!(
+                performed < needed / 2,
+                "work_max={work_max}, performed={performed}, needed={needed}"
+            );
+        }
+    }
+    assert!(cut_early > 0);
+}
+
+#[test]
+fn a_file_past_its_share_reports_its_unit_and_later_files_keep_their_facts() {
+    let complete = resolution("typescript", &APART_SOURCES, &[], WORK_MAX);
+    assert!(!complete.exhausted);
+    let unavailable = |result: &StaticResolution| {
+        result
+            .edge_calls
+            .iter()
+            .filter(|(_, coverage)| coverage.unavailable)
+            .map(|(unit, _)| format!("{unit:?}"))
+            .collect::<Vec<_>>()
+    };
+    let calls_in = |result: &StaticResolution, path| calls(result, path).count();
+    let mut kept_later_files = false;
+    // Every floor from none to one that holds each file: the join equals the pass in
+    // order, the pass budget is never the bound, and what a file loses stays its own.
+    for floor in 0..WORK_MAX {
+        let file_work = super::FileWork {
+            floor,
+            per_element: 0,
+        };
+        let apart = resolution_by(
+            "typescript",
+            &APART_SOURCES,
+            &[],
+            WORK_MAX,
+            &|graph, documents, input, work_max| {
+                resolved_apart(file_work, graph, documents, input, work_max)
+            },
+        );
+        let one_pass = resolution_by(
+            "typescript",
+            &APART_SOURCES,
+            &[],
+            WORK_MAX,
+            &|graph, documents, input, work_max| {
+                resolved_in_one_pass(file_work, graph, documents, input, work_max)
+            },
+        );
+        assert_eq!(
+            format!("{apart:?}"),
+            format!("{one_pass:?}"),
+            "floor={floor}"
+        );
+        assert!(!apart.exhausted, "floor={floor}");
+        let over = unavailable(&apart);
+        kept_later_files |= over.iter().any(|unit| unit.contains("a.ts"))
+            && !over.iter().any(|unit| unit.contains("b.ts"))
+            && calls_in(&apart, "b.ts") == calls_in(&complete, "b.ts")
+            && calls_in(&apart, "b.ts") > 0;
+        if unavailable(&apart) == unavailable(&complete) {
+            assert_eq!(
+                format!("{apart:?}"),
+                format!("{complete:?}"),
+                "floor={floor}"
+            );
+            break;
+        }
+    }
+    assert!(kept_later_files);
 }
 
 #[test]
