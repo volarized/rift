@@ -579,7 +579,11 @@ impl<'source> Index<'source> {
         edge: &rift_syntax::HeritageEdge,
         work: &mut Work,
     ) -> Option<StaticOccurrence> {
-        let target = self.edge_type_target(file, edge.target, work)?;
+        let target = if file.document.facts.language().name == "python" {
+            self.edge_python_base(file, edge.target, work)?
+        } else {
+            self.edge_type_target(file, edge.target, work)?
+        };
         let from = file
             .target_at(edge.from)
             .or_else(|| self.edge_type_target(file, edge.from, work))?;

@@ -135,9 +135,7 @@ impl<'source> Index<'source> {
             let base = if self.python_generic_marker(file, edge.target, work) {
                 Some(ClassKey::Generic)
             } else {
-                self.edge_python_name(file, edge.target, work)
-                    .filter(|target| target.symbol.kinds.contains(&SymbolKind::Constructible))
-                    .map(key)
+                self.edge_python_base(file, edge.target, work).map(key)
             };
             bases.push(base);
         }

@@ -250,3 +250,48 @@ fn test_python_package_self_imports_store_submodule_imports_and_calls() {
     assert!(index.edges().is_complete());
     assert_eq!(index.edges().dropped_edges(), 0);
 }
+
+fn stored(
+    index: &WorkspaceIndex,
+    source: &str,
+    kind: &str,
+    from: &str,
+    to: &str,
+) -> Option<String> {
+    let edge = index.edges().edges().find(|edge| {
+        edge.kind().as_ref() == kind
+            && edge.from().as_str() == format!("rift://symbol/local/python/{from}")
+            && edge.to().as_str() == format!("rift://symbol/local/python/{to}")
+    })?;
+    let range = edge.occurrence().range();
+    let start = usize::try_from(range.start()).ok()?;
+    let end = usize::try_from(range.end()).ok()?;
+    Some(source[start..end].to_owned())
+}
+
+#[test]
+fn test_python_callable_aliases_store_calls_and_class_bases() {
+    let source = "def target(): pass\nclass Base:\n    def leaf(self): pass\nalias = target\nKind = Base\ndef aliased(): return alias()\ndef built(): return Kind()\nclass Child(Kind):\n    def use(self): return self.leaf()\nruntime = unknown.attr\nclass Other(runtime): pass\n";
+    let (_directory, index) = build(&[("main.py", source)]);
+    for (kind, from, to, spelling) in [
+        ("calls", "main/aliased", "main/target", "alias()"),
+        ("calls", "main/built", "main/Base", "Kind()"),
+        ("extends", "main/Child", "main/Base", "Kind"),
+        ("calls", "main/Child/use", "main/Base/leaf", "self.leaf()"),
+    ] {
+        assert_eq!(
+            stored(&index, source, kind, from, to).as_deref(),
+            Some(spelling),
+            "{kind} {from} -> {to}: {:?}",
+            index.edges()
+        );
+    }
+    assert!(
+        index
+            .edges()
+            .edges()
+            .all(|edge| edge.kind().as_ref() != "extends"
+                || edge.from().as_str() != "rift://symbol/local/python/main/Other")
+    );
+    assert!(index.edges().is_complete());
+}

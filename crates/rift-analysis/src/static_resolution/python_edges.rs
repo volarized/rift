@@ -84,9 +84,46 @@ impl<'source> Index<'source> {
             }
             _ => self.edge_python_name(file, call.callee_range, work)?,
         };
-        (target.symbol.kinds.contains(&SymbolKind::Callable)
-            || target.symbol.kinds.contains(&SymbolKind::Constructible))
-        .then_some(target)
+        self.python_callable_alias(target, work)
+    }
+
+    /// A class base names a class, directly or through unchanged aliases; other values stay
+    /// unresolved.
+    pub(super) fn edge_python_base(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let target = self.edge_python_name(file, range, work)?;
+        self.python_callable_alias(target, work)
+            .filter(|target| target.symbol.kinds.contains(&SymbolKind::Constructible))
+    }
+
+    /// Follows unchanged variable aliases (`alias = target`) to the callable or class they name.
+    fn python_callable_alias(
+        &self,
+        mut target: Target<'source>,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let mut visited = BTreeSet::new();
+        loop {
+            if target.symbol.kinds.contains(&SymbolKind::Callable)
+                || target.symbol.kinds.contains(&SymbolKind::Constructible)
+            {
+                return Some(target);
+            }
+            let name = target.symbol.name_range?;
+            if !work.charge() || !visited.insert((target.file.path.as_str(), name.start)) {
+                return None;
+            }
+            let file = self.files.get(target.file.path.as_str())?;
+            let StaticBindingKind::PythonAlias { value } = *file.python_values.get(&name.end)?
+            else {
+                return None;
+            };
+            target = self.edge_python_name(file, value, work)?;
+        }
     }
 
     fn python_super_member(
