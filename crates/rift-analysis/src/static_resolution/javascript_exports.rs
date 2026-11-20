@@ -284,6 +284,23 @@ pub(super) fn module_file<'index, 'source>(
     files: &'index BTreeMap<&'source str, File<'source>>,
     path: &str,
 ) -> Option<&'index File<'source>> {
+    if let Some(directory) = path.strip_suffix('/') {
+        // A directory specifier names only the directory's index module.
+        let mut found = None;
+        for name in ["index.ts", "index.tsx", "index.js"] {
+            let candidate = if directory.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{directory}/{name}")
+            };
+            if let Some(file) = files.get(candidate.as_str())
+                && found.replace(file).is_some()
+            {
+                return None;
+            }
+        }
+        return found;
+    }
     if let Some(file) = files.get(path).filter(|file| {
         matches!(
             file.document.facts.language().name.as_str(),
@@ -618,15 +635,18 @@ pub(super) fn literal_contents(source: &str) -> Option<&str> {
     source.strip_prefix(quote)?.strip_suffix(quote)
 }
 
+/// The project path a relative specifier names from `from`. A specifier ending in `/`,
+/// and `.` or `..` alone, names a directory: the path then ends in `/`.
 pub(super) fn relative_path(from: &str, module: &str, work: &mut Work) -> Option<String> {
-    let relative = module.starts_with("./") || module.starts_with("../");
-    if !relative || module.contains(['\\', '?', '#', '%']) {
+    let directory = module.ends_with('/') || matches!(module, "." | "..");
+    let relative = module.starts_with("./") || module.starts_with("../") || directory;
+    if !relative || module.contains(['\\', '?', '#', '%']) || module.starts_with('/') {
         return None;
     }
     let mut segments = from
         .rsplit_once('/')
         .map_or_else(Vec::new, |(directory, _)| directory.split('/').collect());
-    for segment in module.split('/') {
+    for segment in module.strip_suffix('/').unwrap_or(module).split('/') {
         if !work.charge() {
             return None;
         }
@@ -639,5 +659,9 @@ pub(super) fn relative_path(from: &str, module: &str, work: &mut Work) -> Option
             name => segments.push(name),
         }
     }
-    Some(segments.join("/"))
+    let mut path = segments.join("/");
+    if directory {
+        path.push('/');
+    }
+    Some(path)
 }

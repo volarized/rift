@@ -1811,6 +1811,28 @@ exports.Command = Command;
 }
 
 #[test]
+fn test_imports_of_a_directory_specifier_name_its_index_module() {
+    // `'./'` and `'.'` name the directory of the importing file, and a directory names
+    // its index module only.
+    let (_directory, index) = workspace_with_manifest(
+        &[
+            (
+                "stream.ts",
+                "export const stream = (value: number) => value\n",
+            ),
+            ("index.ts", "export { stream } from './stream'\n"),
+            (
+                "text.ts",
+                "import { stream } from './'\nimport { stream as again } from '.'\nimport { stream as gone } from './missing/'\nexport const text = (value: number) => [stream(value), again(value), gone(value)]\n",
+            ),
+        ],
+        module_manifest(),
+    );
+    assert_eq!(call_count(&index, "text.ts/text", "stream.ts/stream"), 2);
+    assert!(has_edge(&index, EdgeKind::Imports, "text.ts", "index.ts"));
+}
+
+#[test]
 fn test_members_of_a_constructed_value_belong_to_its_class() {
     // `new Item().read()` reads a member of the class `new` constructs, as a binding
     // initialized by that `new` does.
