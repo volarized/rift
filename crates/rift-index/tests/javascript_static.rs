@@ -1833,6 +1833,24 @@ fn test_imports_of_a_directory_specifier_name_its_index_module() {
 }
 
 #[test]
+fn test_typescript_private_fields_keep_their_declared_types() {
+    // A private field's written type types its value as a public field's does.
+    let source = "export class Node { insert() { return 1 } }
+export class Trie {
+  #root: Node = new Node()
+  plain: Node = new Node()
+  #loose = 1
+  insert() { return [this.#root.insert(), this.plain.insert(), this.#loose] }
+}
+";
+    let (_directory, index) = workspace_with_manifest(&[("main.ts", source)], module_manifest());
+    assert_eq!(
+        call_count(&index, "main.ts/Trie/insert", "main.ts/Node/insert"),
+        2
+    );
+}
+
+#[test]
 fn test_members_of_a_constructed_value_belong_to_its_class() {
     // `new Item().read()` reads a member of the class `new` constructs, as a binding
     // initialized by that `new` does.

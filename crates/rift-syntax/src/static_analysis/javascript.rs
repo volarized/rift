@@ -950,7 +950,12 @@ impl Kinds {
         }
         if (self.type_identifier == Some(annotation.kind_id())
             || self.nested_type == Some(annotation.kind_id()))
-            && ([self.identifier, self.property_identifier].contains(&name.kind_id())
+            && ([
+                self.identifier,
+                self.property_identifier,
+                self.private_property,
+            ]
+            .contains(&name.kind_id())
                 || self.type_identifier == Some(name.kind_id()))
         {
             facts
@@ -1132,11 +1137,6 @@ impl Kinds {
         Ok(())
     }
 
-    /// Records the names an object pattern takes from a call, each with its key.
-    fn record_destructured(
-        &self,
-        pattern: Node<'_>,
-        declarator: Node<'_>,
     /// Binds the names an object pattern takes from `require` to the exports their keys
     /// name, as the member form `require('./lib').name` does. Answers whether it bound
     /// them: a pattern with a default, a rest or a nested entry binds no export.
@@ -1201,6 +1201,11 @@ impl Kinds {
         Ok(true)
     }
 
+    /// Records the names an object pattern takes from a call, each with its key.
+    fn record_destructured(
+        &self,
+        pattern: Node<'_>,
+        declarator: Node<'_>,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
         let Some(shapes) = &self.type_shapes else {
