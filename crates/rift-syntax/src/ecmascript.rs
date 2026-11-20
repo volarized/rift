@@ -425,6 +425,9 @@ pub(crate) struct EcmaScriptKinds {
     class_expression: u16,
     /// Function expressions that make the variable holding one callable.
     function_values: Vec<u16>,
+    /// Expressions that hold the same value as their operand: a type assertion first,
+    /// then `as`, `satisfies` and a non-null mark. Empty on the JavaScript grammar.
+    value_assertions: Vec<u16>,
     /// `Some` on the TypeScript grammars.
     enum_body: Option<u16>,
     property_identifier: u16,
@@ -548,6 +551,16 @@ impl EcmaScriptKinds {
             ]
             .map(|kind| kind_id(language, kind))
             .to_vec(),
+            value_assertions: [
+                "type_assertion",
+                "as_expression",
+                "satisfies_expression",
+                "non_null_expression",
+            ]
+            .into_iter()
+            .map(|kind| language.id_for_node_kind(kind, true))
+            .filter(|id| *id != 0)
+            .collect(),
             enum_body: None,
             property_identifier: kind_id(language, PROPERTY_IDENTIFIER_KIND),
             method_definition: kind_id(language, METHOD_DEFINITION_KIND),
@@ -711,6 +724,33 @@ impl EcmaScriptKinds {
                 break;
             };
             value = child;
+        }
+        value
+    }
+
+    /// The value an initializer holds once parentheses and assertions are read through.
+    ///
+    /// `<T>value`, `value as T`, `value satisfies T` and `value!` hold `value` itself. The
+    /// grammar also reads a generic arrow function after a parse error as a type assertion
+    /// over the arrow. Syntax admission bounds the depth.
+    fn asserted_value<'tree>(&self, value: Node<'tree>) -> Node<'tree> {
+        let mut value = self.expression_value(value);
+        while self.value_assertions.contains(&value.kind_id()) {
+            // A type assertion, listed first, writes its type before the value; the
+            // other forms write the value first.
+            let cast = self.value_assertions.first() == Some(&value.kind_id());
+            let operand = if cast {
+                u32::try_from(value.named_child_count())
+                    .ok()
+                    .and_then(|count| count.checked_sub(1))
+                    .and_then(|last| value.named_child(last))
+            } else {
+                value.named_child(0)
+            };
+            let Some(operand) = operand else {
+                break;
+            };
+            value = self.expression_value(operand);
         }
         value
     }
@@ -1691,7 +1731,7 @@ impl GrammarRules for EcmaScriptRules<'_> {
                 .is_some_and(|value| {
                     self.kinds
                         .function_values
-                        .contains(&self.kinds.expression_value(value).kind_id())
+                        .contains(&self.kinds.asserted_value(value).kind_id())
                 })
         {
             kinds.push(SymbolKind::Callable);

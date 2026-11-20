@@ -1036,6 +1036,33 @@ export function emit() { const doc = new Doc(); doc.indented((d) => d.write('a')
 }
 
 #[test]
+fn test_typescript_function_values_behind_assertions_stay_callable() {
+    // A function written under a type assertion, `as`, `satisfies` or a non-null mark is
+    // the same function value. The grammar also reads a generic arrow that follows a parse
+    // error as a type assertion over the arrow.
+    let source = "export type Handler = () => number
+export const cast = <Handler>function () { return 1 }
+export const named = (() => 2) as Handler
+export const checked = (() => 3) satisfies Handler
+export const present = (() => 4)!
+export const plain = <Handler>(1 as unknown)
+export function run() { return cast() + named() + checked() + present() }
+export function refuse() { return plain() }
+";
+    let (_directory, index) = workspace_with_manifest(&[("main.ts", source)], module_manifest());
+    for target in ["cast", "named", "checked", "present"] {
+        assert_eq!(
+            call_count(&index, "main.ts/run", &format!("main.ts/{target}")),
+            1,
+            "{target} in {:?}",
+            calls(&index)
+        );
+    }
+    // An assertion over a value that is no function names no callable.
+    assert_eq!(call_count(&index, "main.ts/refuse", "main.ts/plain"), 0);
+}
+
+#[test]
 fn test_typescript_members_through_type_parameter_constraints() {
     // A value typed by a type parameter has at least the members its declared constraint
     // names. An unconstrained parameter and a constraint that is no declaration name none,
