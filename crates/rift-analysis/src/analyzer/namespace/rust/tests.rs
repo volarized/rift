@@ -3333,3 +3333,79 @@ fn partial_library_extraction_keeps_original_source_and_incomplete_coverage() {
     assert!(publication.coverage[0].inventory_complete);
     assert!(!publication.coverage[0].identity_complete);
 }
+
+fn export_at(identity: &str) -> super::super::ExportBinding {
+    let identity = rift_core::SymbolId::new(identity).expect("fixture identity");
+    super::super::ExportBinding {
+        path: "src/lib.rs".to_owned(),
+        binding: rift_syntax::SyntaxExportBinding {
+            kind: rift_syntax::SyntaxExportKind::Named,
+            range: rift_syntax::ByteRange { start: 0, end: 1 },
+            local: None,
+            exported: None,
+            source: None,
+            container: None,
+            type_only: false,
+        },
+        identity: identity.clone(),
+        target: identity,
+        target_path: "src/lib.rs".to_owned(),
+        target_qualified_name: "Item".to_owned(),
+        name: "Item".to_owned(),
+        qualified_name: "Item".to_owned(),
+    }
+}
+
+/// The scan the export path index replaces: bindings in order, each identity parsed, ending
+/// at the first binding at `path` or the first identity that does not parse.
+fn scanned_export(
+    exports: &[super::super::ExportBinding],
+    path: &[String],
+) -> (Option<usize>, usize) {
+    for (index, export) in exports.iter().enumerate() {
+        let Ok(identity) = SymbolIdentity::parse(export.identity.as_str()) else {
+            return (None, index + 1);
+        };
+        if identity.qualified_path() == path {
+            return (Some(index), index + 1);
+        }
+    }
+    (None, exports.len())
+}
+
+#[test]
+fn export_paths_answer_and_charge_what_a_scan_in_order_does() {
+    let identities = [
+        "rift://symbol/local/rust/root/a/Item",
+        "rift://symbol/local/rust/root/b/Item",
+        "rift://symbol/local/rust/root/a/Item",
+        "rift://symbol/local/typescript/root/b/Item",
+        "not a symbol identity",
+        "rift://symbol/local/rust/root/c/Item",
+        "rift://symbol/local/rust/root/b/Item",
+    ];
+    let paths = [
+        vec!["root".to_owned(), "a".to_owned(), "Item".to_owned()],
+        vec!["root".to_owned(), "b".to_owned(), "Item".to_owned()],
+        vec!["root".to_owned(), "c".to_owned(), "Item".to_owned()],
+        vec!["root".to_owned(), "absent".to_owned()],
+    ];
+    let mut exports = Vec::new();
+    let mut indexed = super::ExportPaths::default();
+    for path in &paths {
+        assert_eq!(indexed.first(&exports, path), (None, 0));
+    }
+    // The bindings join one at a time, as the passes add them.
+    for identity in identities {
+        exports.push(export_at(identity));
+        for path in &paths {
+            assert_eq!(
+                indexed.first(&exports, path),
+                scanned_export(&exports, path),
+                "exports={}, path={path:?}",
+                exports.len()
+            );
+        }
+    }
+    assert_eq!(indexed.first(&exports, &paths[2]), (None, 5));
+}
