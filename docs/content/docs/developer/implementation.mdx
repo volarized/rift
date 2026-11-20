@@ -448,6 +448,11 @@ owns its map, source catalog, configuration, and preparation counts.
 [`local_index_preparing`](/docs/developer/protocol/mcp#reads) warning remains until their selected
 local scope is complete, including an exact symbol read that already found a declaration. A `facets` read refuses while source preparation is incomplete.
 
+Static calls, references, and containment resolve across files. A publication of a part of the
+sources leaves that pass out: it holds no static edge and reports unavailable static call coverage
+for every source unit. The publication that completes preparation runs the pass once over every
+source. A publication after an edit runs it again.
+
 The index keeps each file's symbols but not its complete syntax element table: a parse shares its syntax elements with
 the path-independent syntax facts, and the index releases them when it takes the facts. A `facets`
 read parses the captured bytes again under the same provider and syntax bounds, once per file per

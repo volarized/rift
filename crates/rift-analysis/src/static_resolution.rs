@@ -103,6 +103,25 @@ pub(crate) fn prepare_javascript_reexports(
     javascript_reexports::prepare(input, prepared, selected, placements, aliases_max);
 }
 
+/// The coverage of a selection whose static pass has not run: no occurrence, and every
+/// supported unit reports unavailable call coverage.
+pub(crate) fn deferred(documents: &[StaticSource<'_>]) -> StaticResolution {
+    let edge_calls: BTreeMap<_, _> = documents
+        .iter()
+        .filter(|document| supported_language(document.facts))
+        .map(|document| {
+            let mut coverage = EdgeCallCoverage::captured(document);
+            coverage.unavailable = true;
+            (document.placement.unit().clone(), coverage)
+        })
+        .collect();
+    StaticResolution {
+        unavailable_sources: edge_calls.len(),
+        edge_calls,
+        ..StaticResolution::default()
+    }
+}
+
 /// Runs one static pass over a captured source selection.
 pub(crate) fn resolve(
     graph: &NormalizedGraph,
