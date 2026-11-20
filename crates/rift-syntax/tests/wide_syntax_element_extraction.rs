@@ -13,8 +13,9 @@
 //! The smaller file grows until one analysis takes [`SMALL_RUN_MIN`] of CPU time or reaches
 //! the same source, syntax element or calibration bound as before.
 //!
-//! Wide-syntax-element cases measure one provider each under the existing test deadline.
-//! A registry coverage test requires a case for every shipped language and dialect.
+//! One aggregate case walks every registered provider under the single test deadline it has
+//! on main; wide-syntax-element cases also measure one provider each, and a registry coverage
+//! test requires a case for every shipped language and dialect.
 //! Attached-document cases walk [`registry::providers`] and select supported shapes.
 
 use std::time::Duration;
@@ -57,6 +58,10 @@ const REPEATS: usize = 3;
 
 /// Target CPU time of one smaller-file analysis, within the existing input bounds.
 const SMALL_RUN_MIN: Duration = Duration::from_millis(20);
+
+/// Process CPU time the aggregate case may spend over every provider: the 60-second test
+/// deadline it has on main, held in CPU time so another process's load cannot spend it.
+const AGGREGATE_CPU_MAX: Duration = Duration::from_secs(60);
 
 /// CPU work accumulated by one sample before normalizing by its analysis count.
 const CPU_SAMPLE_MIN: Duration = SMALL_RUN_MIN.saturating_mul(2);
@@ -255,6 +260,35 @@ fn assert_wide_provider(language: ShippedLanguage) {
         "every generated line must reach the walk as a syntax_element: language={language:?}, \
          syntax_elements={}, lines={lines}",
         document.syntax_elements().len(),
+    );
+}
+
+/// The aggregate case from main: every registered provider inside one test deadline and one
+/// [`AGGREGATE_CPU_MAX`] of process CPU, so the whole wide-syntax-element proof keeps the bound
+/// it always had. The per-provider cases in
+/// [`wide_providers`] name the provider that fails.
+#[test]
+fn every_provider_reads_a_syntax_element_with_many_children_in_linear_time() {
+    let start = ProcessTime::try_now().expect("the process CPU clock must be available");
+    for provider in registry::providers() {
+        let language = provider.language();
+        let line = wide_line(language);
+        let build = |count| line.repeat(count);
+        let (document, lines) = analyze_linearly(provider, build, WIDE_SYNTAX_ELEMENT_LINES_MIN);
+        assert!(
+            document.syntax_elements().len() > lines,
+            "every generated line must reach the walk as a syntax_element: language={language:?}, \
+             syntax_elements={}, lines={lines}",
+            document.syntax_elements().len(),
+        );
+    }
+    let spent = start
+        .try_elapsed()
+        .expect("the process CPU clock must be readable");
+    assert!(
+        spent <= AGGREGATE_CPU_MAX,
+        "every provider's wide syntax element proof must fit the aggregate bound in process CPU \
+         time: spent={spent:?}, bound={AGGREGATE_CPU_MAX:?}"
     );
 }
 

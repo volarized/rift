@@ -608,6 +608,27 @@ mod tests {
     use crate::workspace::WorkspaceIndexLimits;
     use rift_error::errors;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_stat_reuse_filesystem_allowlist_is_closed() {
+        use nix::sys::statfs::{EXT4_SUPER_MAGIC, OVERLAYFS_SUPER_MAGIC, TMPFS_MAGIC};
+
+        assert!(super::supports_stat_reuse_type(EXT4_SUPER_MAGIC));
+        assert!(super::supports_stat_reuse_type(TMPFS_MAGIC));
+        assert!(!super::supports_stat_reuse_type(OVERLAYFS_SUPER_MAGIC));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_stat_reuse_filesystem_allowlist_is_closed() {
+        for supported in ["apfs", "hfs"] {
+            assert!(super::supports_stat_reuse_type(supported));
+        }
+        for unsupported in ["msdos", "exfat", "nfs", "unknown"] {
+            assert!(!super::supports_stat_reuse_type(unsupported));
+        }
+    }
+
     #[test]
     fn test_capture_refuses_path_replaced_after_read() {
         use std::fs::OpenOptions;
