@@ -20,6 +20,8 @@ pub(super) struct Namespaces<'source> {
     types: BTreeMap<Vec<String>, Option<Target<'source>>>,
     methods: BTreeMap<Vec<String>, Vec<Method<'source>>>,
     members: BTreeMap<Vec<String>, Option<Target<'source>>>,
+    fields: BTreeMap<Vec<String>, Option<Target<'source>>>,
+    member_calls: BTreeSet<(&'source str, ByteRange)>,
     field_types: BTreeMap<Vec<String>, Target<'source>>,
     bounds: BTreeMap<(&'source str, ByteRange), Vec<ByteRange>>,
     unavailable: BTreeSet<(&'source str, ByteRange)>,
@@ -152,6 +154,9 @@ impl<'source> Namespaces<'source> {
             for call in file.facts.calls() {
                 if !work.charge() {
                     return None;
+                }
+                if matches!(call.callee, StaticCallee::Member { .. }) {
+                    self.member_calls.insert((path, call.callee_range));
                 }
                 self.initializers
                     .entry((path, call.range))
@@ -344,7 +349,7 @@ impl<'source> Namespaces<'source> {
         work: &mut Work,
     ) -> Option<()> {
         let mut types = BTreeMap::new();
-        for (path, target) in &self.members {
+        for (path, target) in &self.fields {
             if !work.charge() {
                 return None;
             }
@@ -445,7 +450,12 @@ impl<'source> Namespaces<'source> {
             symbol,
         };
         if symbol.container.is_some() {
-            insert(&mut self.members, path.clone(), target);
+            let members = if symbol.kind == "field_declaration" {
+                &mut self.fields
+            } else {
+                &mut self.members
+            };
+            insert(members, path.clone(), target);
         }
         if symbol.kind == "variant" {
             insert(&mut self.values, path, target);

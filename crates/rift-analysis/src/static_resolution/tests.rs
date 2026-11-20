@@ -1679,3 +1679,47 @@ fn test_rust_crate_visible_nested_modules_keep_import_targets() {
         "rift://symbol/local/rust/fixture/provider/nested/Count/read"
     );
 }
+
+#[test]
+fn test_rust_field_and_method_names_keep_exact_access_targets() {
+    let source = "struct Item { value: usize } impl Item { fn value(&self) -> usize { self.value } fn call(&self) { self.value(); } fn invalid(&self) { self.missing; } fn missing(&self) {} }";
+    let result = resolution(
+        "rust",
+        &[("src/lib.rs", source)],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    let reads = result
+        .occurrences
+        .iter()
+        .filter(|edge| edge.role == ReferenceRole::Read && edge.edge_kind.is_none())
+        .collect::<Vec<_>>();
+    assert_eq!(reads.len(), 2);
+    let field = reads
+        .iter()
+        .find(|edge| {
+            source_of(edge, source) == "self.value"
+                && edge.binding.range().start()
+                    == u64::try_from(source.find("self.value }").expect("field access"))
+                        .expect("offset")
+        })
+        .expect("field read");
+    let target = field
+        .target_binding
+        .as_ref()
+        .expect("target binding")
+        .range();
+    assert!(
+        target.start()
+            < u64::try_from(source.find("impl Item").expect("implementation")).expect("offset"),
+        "field access must target the field declaration: {target:?}"
+    );
+    assert!(
+        reads
+            .iter()
+            .any(|edge| source_of(edge, source) == "self.value"
+                && edge.binding.range().start()
+                    == u64::try_from(source.find("self.value();").expect("method call"))
+                        .expect("offset"))
+    );
+}

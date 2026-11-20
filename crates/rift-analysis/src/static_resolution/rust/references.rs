@@ -153,16 +153,20 @@ impl<'source> Namespaces<'source> {
                 .start
                 .checked_add(u64::try_from(receiver.len()).ok()?)?,
         };
-        let field = self
-            .receiver_target(file, receiver, work)
+        if self
+            .member_calls
+            .contains(&(file.document.path.as_str(), range))
+        {
+            return self.receiver_method(file, receiver, member.trim(), work);
+        }
+        self.receiver_target(file, receiver, work)
             .and_then(|owner| {
                 let mut path = owner.admitted_path()?;
                 path.push(member.trim().to_owned());
-                self.members.get(&path).copied().flatten().filter(|target| {
+                self.fields.get(&path).copied().flatten().filter(|target| {
                     target.symbol.kind == "field_declaration" && self.available(*target)
                 })
-            });
-        field.or_else(|| self.receiver_method(file, receiver, member.trim(), work))
+            })
     }
 
     pub(super) fn receiver_method(
