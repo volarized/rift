@@ -110,6 +110,17 @@ pub(crate) fn resolve(
     namespace: &NamespaceInput<'_>,
     work_max: usize,
 ) -> StaticResolution {
+    resolve_by(graph, documents, namespace, work_max, Index::resolve_files)
+}
+
+/// Runs one static pass whose files `files` resolves against the built index.
+fn resolve_by<'source>(
+    graph: &'source NormalizedGraph,
+    documents: &'source [StaticSource<'source>],
+    namespace: &NamespaceInput<'_>,
+    work_max: usize,
+    files: impl FnOnce(&Index<'source>, &mut Work, &mut StaticResolution),
+) -> StaticResolution {
     let mut edge_calls: BTreeMap<_, _> = documents
         .iter()
         .filter(|document| supported_language(document.facts))
@@ -136,14 +147,16 @@ pub(crate) fn resolve(
         edge_calls,
         ..StaticResolution::default()
     };
-    for file in index.files.values() {
-        if !work.charge() {
-            break;
-        }
-        index.resolve_file(file, &mut work, &mut resolution);
-    }
+    files(&index, &mut work, &mut resolution);
     resolution.exhausted = work.exhausted;
     resolution
+}
+
+/// What one file's pass adds, held apart until the files join in path order.
+struct FileResolution {
+    resolution: StaticResolution,
+    /// Budget the pass consumed.
+    used: usize,
 }
 
 #[derive(Debug)]
@@ -586,6 +599,71 @@ impl<'source> Index<'source> {
         Some(index)
     }
 
+    /// Resolves every file and joins the results in path order.
+    ///
+    /// One file's pass reads the index and that file alone, so the passes run across the
+    /// worker pool with the `parallel` feature. Each pass starts with the whole budget
+    /// left; the join then charges the files in path order. A file whose pass fits what
+    /// is left by then answers what a pass with exactly that budget answers, and its
+    /// result stands. The first file that does not fit runs again with exactly what is
+    /// left, and the files after it stay unresolved, as they do when one pass visits the
+    /// files in order.
+    fn resolve_files(&self, work: &mut Work, resolution: &mut StaticResolution) {
+        let files = self.files.values().collect::<Vec<_>>();
+        let budget = work.budget.remaining();
+        let resolve =
+            |file: &&File<'source>| self.resolve_file_apart(file, budget, &resolution.edge_calls);
+        #[cfg(feature = "parallel")]
+        let resolved = {
+            use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+            files.par_iter().map(resolve).collect::<Vec<_>>()
+        };
+        #[cfg(not(feature = "parallel"))]
+        let resolved = files.iter().map(resolve).collect::<Vec<_>>();
+        for (file, mut apart) in files.into_iter().zip(resolved) {
+            if !work.charge() {
+                break;
+            }
+            let left = work.budget.remaining();
+            if apart.used > left {
+                apart = self.resolve_file_apart(file, left, &resolution.edge_calls);
+                work.exhausted = true;
+            }
+            work.budget = LoopBudget::new(left.saturating_sub(apart.used));
+            resolution.join(file, apart.resolution);
+            if work.exhausted {
+                break;
+            }
+        }
+    }
+
+    /// One file's pass under its own budget, with a result of its own.
+    fn resolve_file_apart(
+        &self,
+        file: &File<'source>,
+        budget: usize,
+        edge_calls: &BTreeMap<rift_core::SourceUnitId, EdgeCallCoverage>,
+    ) -> FileResolution {
+        let mut work = Work::new(budget);
+        let mut resolution = StaticResolution::default();
+        let unit = file.document.placement.unit();
+        if let Some(coverage) = edge_calls.get(unit) {
+            resolution.edge_calls.insert(
+                unit.clone(),
+                EdgeCallCoverage {
+                    language: coverage.language.clone(),
+                    unavailable: coverage.unavailable,
+                    unresolved: Vec::new(),
+                },
+            );
+        }
+        self.resolve_file(file, &mut work, &mut resolution);
+        FileResolution {
+            resolution,
+            used: budget.saturating_sub(work.budget.remaining()),
+        }
+    }
+
     fn resolve_file(&self, file: &File<'source>, work: &mut Work, result: &mut StaticResolution) {
         for range in file.facts.unsupported_bindings() {
             if file.inactive(*range, work) {
@@ -838,6 +916,21 @@ impl<'source> Index<'source> {
 }
 
 impl StaticResolution {
+    /// Adds one file's result after the results of the files before it.
+    fn join(&mut self, file: &File<'_>, mut apart: Self) {
+        self.occurrences.append(&mut apart.occurrences);
+        self.analyzed_sources += apart.analyzed_sources;
+        self.unresolved_sites += apart.unresolved_sites;
+        let unit = file.document.placement.unit();
+        if let Some((coverage, apart)) = self
+            .edge_calls
+            .get_mut(unit)
+            .zip(apart.edge_calls.get_mut(unit))
+        {
+            coverage.unresolved.append(&mut apart.unresolved);
+        }
+    }
+
     fn record(&mut self, occurrence: Option<StaticOccurrence>) {
         match occurrence {
             Some(occurrence) => self.occurrences.push(occurrence),

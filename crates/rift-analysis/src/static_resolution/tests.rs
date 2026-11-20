@@ -767,6 +767,25 @@ fn resolution(
     metadata: &[(&str, &str)],
     work_max: usize,
 ) -> StaticResolution {
+    resolution_by(language, sources, metadata, work_max, resolve)
+}
+
+/// A static pass over one fixture: what [`resolve`] receives and answers.
+type Pass = fn(
+    &rift_provider::NormalizedGraph,
+    &[StaticSource<'_>],
+    &NamespaceInput<'_>,
+    usize,
+) -> StaticResolution;
+
+/// Resolves the fixture with `pass`.
+fn resolution_by(
+    language: &str,
+    sources: &[(&str, &str)],
+    metadata: &[(&str, &str)],
+    work_max: usize,
+    pass: Pass,
+) -> StaticResolution {
     let language = Language::from_identity_segment(language).expect("fixture language");
     let parsed = sources
         .iter()
@@ -862,7 +881,7 @@ fn resolution(
             placement: &placed.placement,
         })
         .collect::<Vec<_>>();
-    resolve(semantics.graph(), &documents, &input, work_max)
+    pass(semantics.graph(), &documents, &input, work_max)
 }
 
 fn calls<'source>(
@@ -1096,6 +1115,72 @@ fn javascript_empty_analysis_completes_without_an_unresolved_site() {
     assert_eq!(result.unavailable_sources, 0);
     assert_eq!(result.unresolved_sites, 0);
     assert!(!result.exhausted);
+}
+
+/// Resolves the files in path order under one budget: the pass the join of separately
+/// resolved files must equal.
+fn resolved_in_one_pass(
+    graph: &rift_provider::NormalizedGraph,
+    documents: &[StaticSource<'_>],
+    input: &NamespaceInput<'_>,
+    work_max: usize,
+) -> StaticResolution {
+    super::resolve_by(
+        graph,
+        documents,
+        input,
+        work_max,
+        |index, work, resolution| {
+            for file in index.files.values() {
+                if !work.charge() {
+                    break;
+                }
+                index.resolve_file(file, work, resolution);
+            }
+        },
+    )
+}
+
+#[test]
+fn files_resolved_apart_equal_one_pass_under_every_budget() {
+    let sources = [
+        (
+            "a.ts",
+            "import { leaf } from './b.js'; export function root(input: Box) { leaf(); input.read(); eval('x'); } interface Box { read(): void; }",
+        ),
+        (
+            "b.ts",
+            "export function leaf() { helper(); helper(); } function helper() { const value = { count: 1 }; return value.count; }",
+        ),
+        (
+            "c.ts",
+            "import { root } from './a.js'; class Base { run() {} } class Derived extends Base { run() { root(undefined as never); this.run(); } }",
+        ),
+        ("d.ts", "function {"),
+    ];
+    let printed = |work_max, pass: Pass| {
+        let result = resolution_by("typescript", &sources, &[], work_max, pass);
+        (result.exhausted, format!("{result:?}"))
+    };
+    let mut budgets = 0_usize;
+    for work_max in 0..WORK_MAX {
+        let (exhausted, one_pass) = printed(work_max, resolved_in_one_pass);
+        assert_eq!(
+            printed(work_max, resolve).1,
+            one_pass,
+            "work_max={work_max}"
+        );
+        budgets += 1;
+        if !exhausted {
+            break;
+        }
+    }
+    // The sweep covers a budget ending inside the index, inside each file, and none.
+    assert!(budgets > sources.len(), "budgets={budgets}");
+    let (exhausted, complete) = printed(WORK_MAX, resolved_in_one_pass);
+    assert!(!exhausted);
+    assert_eq!(printed(WORK_MAX, resolve).1, complete);
+    assert!(complete.contains("role: Call"), "{complete}");
 }
 
 #[test]
