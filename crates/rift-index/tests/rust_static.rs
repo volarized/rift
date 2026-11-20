@@ -1492,3 +1492,63 @@ fn test_rust_reference_receivers_see_implementations_in_other_modules() {
     assert_eq!(targets.len(), 1, "{targets:?}");
     assert!(targets[0].ends_with("/fixture/&Map/walk"), "{targets:?}");
 }
+
+#[test]
+fn test_rust_closure_parameter_patterns_bind_their_names() {
+    // `|Item { value, .. }|` binds `value` in the closure; the struct expression inside
+    // still names `Item`. A pattern name shadows a module function of that name, and a
+    // tuple struct pattern does not bind its own type name.
+    let source = "pub struct Item { pub value: u8, pub key: u8 }\npub struct Wrapper(pub u8);\npub fn helper() -> u8 { 1 }\npub fn value() -> u8 { 2 }\npub fn convert(items: Vec<Item>) -> Vec<Item> { items.into_iter().map(|Item { value, .. }| Item { value, key: 0 }).collect() }\npub fn shadow(pairs: Vec<(fn() -> u8, u8)>) -> Vec<u8> { pairs.into_iter().map(|(helper, _)| helper()).collect() }\npub fn shorthand(items: Vec<Item>) -> u8 { let Item { value, .. } = items[0]; value; 0 }\npub fn wrap(items: Vec<Wrapper>) -> Vec<Wrapper> { items.into_iter().map(|Wrapper(inner)| Wrapper(inner)).collect() }\npub fn mutable(items: Vec<u8>) -> Vec<u8> { items.into_iter().map(|mut item| { item += helper(); item }).collect() }\n";
+    let (_directory, index) = fixture_index(PLAIN_MANIFEST, &[("src/lib.rs", source)]);
+    for (from, to) in [
+        ("/fixture/convert", "/fixture/Item"),
+        ("/fixture/wrap", "/fixture/Wrapper"),
+        ("/fixture/mutable", "/fixture/helper"),
+    ] {
+        assert!(
+            has_edge(&index, EdgeKind::Calls, from, to),
+            "missing {from} -> {to}"
+        );
+    }
+    assert!(!has_edge(
+        &index,
+        EdgeKind::Calls,
+        "/fixture/shadow",
+        "/fixture/helper"
+    ));
+    assert!(!has_edge(
+        &index,
+        EdgeKind::Reads,
+        "/fixture/shorthand",
+        "/fixture/value"
+    ));
+}
+
+#[test]
+fn test_rust_tuple_struct_constructors_are_calls() {
+    // `Wrapper(1)` calls the tuple struct's constructor; a body-local tuple struct shadows the
+    // module one, and a local value of that name is not a constructor.
+    let source = "pub struct Wrapper(pub u8);\npub fn build() -> Wrapper { Wrapper(1) }\npub fn local() -> u8 { struct Wrapper(u8); let inner = Wrapper(2); inner.0 }\npub fn value(make: fn(u8) -> u8) -> u8 { let Wrapper = make; Wrapper(3) }\n";
+    let (_directory, index) = fixture_index(PLAIN_MANIFEST, &[("src/lib.rs", source)]);
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "/fixture/build",
+        "/fixture/Wrapper"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "/fixture/local",
+        "/local/Wrapper"
+    ));
+    assert!(!has_edge(
+        &index,
+        EdgeKind::Calls,
+        "/fixture/local",
+        "/fixture/Wrapper"
+    ));
+    assert!(!index.edges().edges().any(|edge| {
+        edge.kind() == EdgeKind::Calls && edge.from().as_str().ends_with("/fixture/value")
+    }));
+}

@@ -952,6 +952,14 @@ impl<'source> Namespaces<'source> {
                 path.push(name.to_owned());
                 self.lookup(file, position, &path, Namespace::Value, work)
                     .or_else(|| self.glob_target(file, position, name, Namespace::Value, work))
+                    .or_else(|| {
+                        // `Name(..)` with a struct `Name` calls its tuple constructor.
+                        // A struct declared in an enclosing body comes first.
+                        Self::local_type(file, position, name, work)
+                            .filter(|target| self.available(*target))
+                            .or_else(|| self.lookup(file, position, &path, Namespace::Type, work))
+                            .filter(|target| target.symbol.kind == "struct")
+                    })
             }
             Binding::Blocked => None,
         }

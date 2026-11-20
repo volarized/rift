@@ -61,6 +61,8 @@ pub(super) struct Kinds {
     alias: u16,
     path: u16,
     pattern: u16,
+    named_patterns: [u16; 3],
+    shorthand_field: u16,
     value_type: u16,
     return_type: u16,
     left: u16,
@@ -131,6 +133,12 @@ pub(super) fn kinds() -> &'static Kinds {
             alias: field("alias"),
             path: field("path"),
             pattern: field("pattern"),
+            named_patterns: [
+                id("struct_pattern"),
+                id("tuple_struct_pattern"),
+                id("generic_pattern"),
+            ],
+            shorthand_field: id("shorthand_field_identifier"),
             value_type: field("type"),
             return_type: field("return_type"),
             left: field("left"),
@@ -673,28 +681,55 @@ impl Kinds {
             } else {
                 byte_range(scope)?.start
             };
+        self.bind_pattern(pattern, scope, available_from, facts)
+    }
+
+    /// Binds every name a pattern introduces in `scope`: identifiers and `{ name }`
+    /// shorthand fields, never the type path of a struct or tuple struct pattern. A macro
+    /// in the pattern leaves the scope's bindings unsupported.
+    fn bind_pattern(
+        &self,
+        pattern: Node<'_>,
+        scope: Node<'_>,
+        available_from: u64,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
         let mut pending = vec![pattern];
-        let mut cursor = element.walk();
+        let mut cursor = pattern.walk();
         while let Some(element) = pending.pop() {
+            let kind = element.kind_id();
             if [
                 self.scoped_identifier,
                 self.scoped_type_identifier,
                 self.type_identifier,
             ]
-            .contains(&element.kind_id())
+            .contains(&kind)
             {
                 continue;
             }
-            if element.kind_id() == self.identifier {
+            if kind == self.edge_macro {
+                facts.unsupported_bindings.push(byte_range(scope)?);
+                return Ok(());
+            }
+            if kind == self.identifier || kind == self.shorthand_field {
                 facts.bindings.push(binding(
                     element,
                     scope,
                     available_from,
                     StaticBindingKind::Shadow,
                 )?);
-            } else {
-                pending.extend(element.named_children(&mut cursor));
+                continue;
             }
+            let path = if self.named_patterns.contains(&kind) {
+                element.child_by_field_id(self.value_type)
+            } else {
+                None
+            };
+            pending.extend(
+                element
+                    .named_children(&mut cursor)
+                    .filter(|child| Some(*child) != path),
+            );
         }
         Ok(())
     }
@@ -707,15 +742,24 @@ impl Kinds {
         let Some(scope) = enclosing(syntax_element, &self.functions) else {
             return Ok(());
         };
+        if syntax_element.kind_id() != self.closure_parameters {
+            return Ok(());
+        }
+        // A closure's pattern parameters bind their names for the whole closure body.
         let mut cursor = syntax_element.walk();
-        let has_unparsed_pattern = syntax_element.named_children(&mut cursor).any(|child| {
-            !child.is_extra()
-                && child.kind_id() != self.parameter
-                && child.kind_id() != self.identifier
-                && !child.is_missing()
-        });
-        if syntax_element.kind_id() == self.closure_parameters && has_unparsed_pattern {
-            facts.unsupported_bindings.push(byte_range(scope)?);
+        let patterns = syntax_element
+            .named_children(&mut cursor)
+            .filter(|child| {
+                !child.is_extra()
+                    && child.kind_id() != self.parameter
+                    && child.kind_id() != self.identifier
+            })
+            .collect::<Vec<_>>();
+        for pattern in patterns {
+            if pattern.is_missing() {
+                continue;
+            }
+            self.bind_pattern(pattern, scope, byte_range(scope)?.start, facts)?;
         }
         Ok(())
     }
