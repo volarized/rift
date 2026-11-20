@@ -635,6 +635,10 @@ impl State {
     /// and the rest are the least recently used. Measuring stops at the first view that
     /// passes the bound. Measuring every remaining view again after each release answered
     /// the same and walked each retained index once per release.
+    ///
+    /// The views left after the releases are the ones measured to fit, so their material
+    /// is known; the releases changed only the released keys the store charges. The
+    /// measure settles when that sum fits, with no second walk.
     fn release_measured(&mut self, kept: &str, bytes_max: usize) -> (usize, bool) {
         let cached = self.material_bytes();
         if cached == usize::MAX || cached <= bytes_max {
@@ -645,6 +649,7 @@ impl State {
         let mut charged = get_size2::StandardTracker::default();
         let mut views_bytes = 0_usize;
         let mut fits = 0_usize;
+        let mut fit_bytes = 0_usize;
         for (position, (key, held)) in order.iter().enumerate() {
             let (bytes, next) = Self::view_bytes(key.capacity(), held, true, charged);
             charged = next;
@@ -654,15 +659,21 @@ impl State {
                 break;
             }
             fits = position + 1;
+            fit_bytes = views_bytes;
         }
         let released = self.views.len() - fits.max(1);
         for _ in 0..released {
             self.release_least_recent(Some(kept));
         }
         // With nothing released the measure is the one `exceeds` takes. A release grows
-        // the released keys by a few bytes the measure did not count, so the caller
-        // checks the views left once more; their cached charges usually answer.
-        (released, released == 0)
+        // the released keys by a few bytes: the views left are charged what the walk
+        // measured for them, and the store is charged again with the keys it now holds.
+        // Only when those few bytes pass the bound does the caller measure once more.
+        let left = self.store_bytes(self.views.len()).saturating_add(fit_bytes);
+        (
+            released,
+            released == 0 || (left != usize::MAX && left <= bytes_max),
+        )
     }
 }
 

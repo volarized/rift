@@ -568,6 +568,7 @@ fn one_shared_measure_releases_what_measuring_after_each_release_does() {
     assert_eq!(bounds.len(), 4);
     let mut released_some = false;
     let mut kept_shared = false;
+    let mut settled_after_release = false;
     for bound in bounds {
         // Bounds on both sides of each charge, closer than one released key's bytes.
         for bytes_max in (bound.saturating_sub(96)..=bound.saturating_add(96)).step_by(8) {
@@ -579,7 +580,10 @@ fn one_shared_measure_releases_what_measuring_after_each_release_does() {
             let mut actual = actual.state.lock().expect("state");
             let expected_released = released_one_at_a_time(&mut expected, kept, bytes_max);
             let (mut released, settled) = actual.release_measured(kept, bytes_max);
-            if !settled {
+            if settled {
+                assert!(!actual.exceeds(bytes_max), "bytes_max={bytes_max}");
+                settled_after_release |= released > 0;
+            } else {
                 released += released_one_at_a_time(&mut actual, kept, bytes_max);
             }
             assert_eq!(released, expected_released, "bytes_max={bytes_max}");
@@ -600,6 +604,10 @@ fn one_shared_measure_releases_what_measuring_after_each_release_does() {
     assert!(
         kept_shared,
         "a bound the shared charge fits keeps every view"
+    );
+    assert!(
+        settled_after_release,
+        "a release that leaves fitting views settles in the one measure"
     );
 }
 
