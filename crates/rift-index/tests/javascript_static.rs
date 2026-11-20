@@ -1295,3 +1295,47 @@ export function free() { const ctx = make('a'); return ctx.data }
     }));
 }
 
+#[test]
+fn test_typescript_imports_through_a_reexport_keep_the_written_module() {
+    // An import names the module it is written against. When the name is declared in
+    // another file, reached through a reexport, the terminal declaration and the written
+    // module are both stored.
+    let bridge = "export type { Item } from './leaf.ts'
+export { missing } from './absent.ts'
+";
+    let leaf = "export interface Item { value: number }
+export class Value {}
+";
+    let probe = "import type { Item } from './bridge.ts'
+import { Value } from './leaf.ts'
+import { missing } from './bridge.ts'
+import { other } from './nowhere.ts'
+export function use(value: Item) { return [new Value(), missing, other] }
+";
+    let (_directory, index) = workspace_with_manifest(
+        &[
+            ("bridge.ts", bridge),
+            ("leaf.ts", leaf),
+            ("probe.ts", probe),
+        ],
+        module_manifest(),
+    );
+    let imports = |to: &str| {
+        index
+            .edges()
+            .edges()
+            .filter(|edge| {
+                edge.kind() == EdgeKind::Imports
+                    && edge.from().as_str().ends_with(".%2Fprobe.ts")
+                    && edge.to().as_str().ends_with(to)
+            })
+            .count()
+    };
+    assert_eq!(imports("leaf.ts/Item"), 1);
+    assert_eq!(imports(".%2Fbridge.ts"), 1);
+    assert_eq!(imports("leaf.ts/Value"), 1);
+    // A name declared in the written module adds no module edge, and neither does a name
+    // or a module that resolves to nothing.
+    assert_eq!(imports(".%2Fleaf.ts"), 0);
+    assert_eq!(imports("nowhere.ts"), 0);
+}

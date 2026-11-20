@@ -4,7 +4,7 @@ use rift_core::{ReferenceRole, SourceRange, SymbolId};
 use rift_protocol::identity::SymbolIdentity;
 use rift_protocol::read::{EdgeKind, SymbolKind};
 use rift_provider::NormalizedTarget;
-use rift_syntax::{ByteRange, StaticBindingKind, SyntaxSymbol};
+use rift_syntax::{ByteRange, StaticBinding, StaticBindingKind, SyntaxSymbol};
 
 use super::javascript::MemberMode;
 use super::{File, Index, StaticOccurrence, StaticResolution, Target, Work};
@@ -104,6 +104,12 @@ impl<'source> Index<'source> {
             if let StaticBindingKind::JavaScriptEdgeNamespace { module } = binding.kind {
                 result.record(self.javascript_namespace_import(file, binding.name, module, work));
             }
+            if let StaticBindingKind::JavaScriptImport { module, .. } = binding.kind
+                && let Some(written) = self.javascript_written_import(file, binding, module, work)
+            {
+                // An import without a separate written module is no unresolved site.
+                result.record(Some(written));
+            }
             if let StaticBindingKind::JavaScriptRequire {
                 module,
                 export: None,
@@ -154,12 +160,6 @@ impl<'source> Index<'source> {
         }
     }
 
-    fn javascript_contains(
-        &self,
-        file: &File<'source>,
-        work: &mut Work,
-        result: &mut StaticResolution,
-    ) {
     /// The source of an occurrence written outside every declaration of its file: the
     /// file's own module. A file can declare into another module (an ambient module
     /// declaration), so its declarations alone do not always name one module.
@@ -176,6 +176,12 @@ impl<'source> Index<'source> {
         self.javascript_module_identity(file, work)
     }
 
+    fn javascript_contains(
+        &self,
+        file: &File<'source>,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
         let module = self.javascript_module_identity(file, work);
         self.javascript_alias_edges(file, module.as_ref(), work, result);
         for symbol in file.document.facts.symbols() {
@@ -374,6 +380,34 @@ impl<'source> Index<'source> {
         Some(occurrence)
     }
 
+    /// The written module of an import whose name is declared in another file.
+    ///
+    /// The terminal declaration is stored by the import itself. A name reached through a
+    /// reexport also keeps the module the import is written against. A name declared in
+    /// that module, an unresolved name and an unresolved module add nothing.
+    fn javascript_written_import(
+        &self,
+        file: &File<'source>,
+        binding: &StaticBinding,
+        module: ByteRange,
+        work: &mut Work,
+    ) -> Option<StaticOccurrence> {
+        if file.inactive(binding.name, work) {
+            return None;
+        }
+        let terminal = self.javascript_import(file, binding, work)?;
+        let path = super::javascript_exports::relative_path(
+            file.document.path.as_str(),
+            file.text(module)?,
+            work,
+        )?;
+        let written = self.edge_javascript_module(&path)?;
+        if written.document.path == terminal.file.path {
+            return None;
+        }
+        self.javascript_namespace_import(file, binding.name, module, work)
+    }
+
     fn javascript_module_occurrence(
         &self,
         file: &File<'source>,
@@ -436,6 +470,10 @@ impl<'source> Index<'source> {
             let parsed = SymbolIdentity::parse(identity.as_str()).ok()?;
             let mut path = parsed.qualified_path().to_vec();
             path.pop()?;
+            if path.is_empty() {
+                // An ambient module declaration is named outside the file's module.
+                continue;
+            }
             let module =
                 SymbolIdentity::new(parsed.owner().clone(), parsed.language().clone(), path)
                     .ok()?;
@@ -470,10 +508,6 @@ impl<'source> Index<'source> {
         }
         // A constructor is invoked through `super`, never inherited and replaced.
         if symbol.name == "constructor" {
-            if path.is_empty() {
-                // An ambient module declaration is named outside the file's module.
-                continue;
-            }
             return;
         }
         let Some(from) = self.javascript_identity(Target {
