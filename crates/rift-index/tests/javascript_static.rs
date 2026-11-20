@@ -643,8 +643,9 @@ export class Child extends Parent implements Contract {
 #[test]
 fn test_member_writes_refuse_calls_only_on_the_class_their_receiver_denotes() {
     // Each class calls its own `leaf` through `this`. A write refuses that call only when
-    // its receiver denotes the class: `this` inside it, its prototype, or a binding
-    // constructed as it. Writes through other objects name other objects.
+    // it names that member on a receiver that denotes the class: `this` inside it, its
+    // prototype, or a binding constructed as it. Writes through other objects name other
+    // objects, and a computed key names no member at all.
     let source = "export class Item {
   leaf() { return 1 }
   use() { return this.leaf() }
@@ -658,19 +659,22 @@ Keyed.prototype['leaf'] = function () { return 2 };
 export class Built { leaf() { return 1 } use() { return this.leaf() } }
 const built = new Built();
 built[Symbol.iterator] = 1;
+export class Assigned { leaf() { return 1 } use() { return this.leaf() } }
+const assigned = new Assigned();
+assigned.leaf = () => 2;
 export class Bound { constructor() { this.leaf = this.leaf.bind(this) } leaf() { return 1 } use() { return this.leaf() } }
 export class Rebound { constructor(other) { this.leaf = other.leaf.bind(this) } leaf() { return 1 } use() { return this.leaf() } }
 ";
     for path in ["main.mjs", "main.ts"] {
         let (_directory, index) = workspace_with_manifest(&[(path, source)], module_manifest());
         let found = calls(&index);
-        for class in ["Item", "Tagged", "Bound"] {
+        for class in ["Item", "Tagged", "Bound", "Patched", "Built"] {
             assert!(
                 found.contains(&(format!("{class}/use"), format!("{class}/leaf"))),
                 "{path}: {class} keeps its call in {found:?}"
             );
         }
-        for class in ["Patched", "Named", "Keyed", "Built", "Rebound"] {
+        for class in ["Named", "Keyed", "Assigned", "Rebound"] {
             assert!(
                 !found
                     .iter()
@@ -685,7 +689,7 @@ export class Rebound { constructor(other) { this.leaf = other.leaf.bind(this) } 
 fn test_typescript_member_write_through_a_declared_class_binding_refuses_its_calls() {
     let source = "export class Typed { leaf() { return 1 } use() { return this.leaf() } }
 export class Free { leaf() { return 1 } use() { return this.leaf() } }
-export function patch(item: Typed, bag: Record<string, unknown>, key: string) { item[key] = 1; bag[key] = 2; (bag as any).leaf = 3 }
+export function patch(item: Typed, bag: Record<string, unknown>, key: string) { item.leaf = () => 1; bag[key] = 2; (bag as any).leaf = 3 }
 ";
     let (_directory, index) = workspace_with_manifest(&[("main.ts", source)], module_manifest());
     let found = calls(&index);

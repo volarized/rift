@@ -307,8 +307,10 @@ impl<'source> Index<'source> {
         }
     }
 
-    /// Whether a write in the class's file can replace `member` of `class`.
+    /// Whether a write in the class's file gives `member` of `class` another value.
     ///
+    /// Only a write that names the member counts: a dotted name or a quoted literal key. A
+    /// computed key states no member, so it leaves every declared member as declared.
     /// A write changes a member of the object its receiver denotes. Source establishes
     /// that object as this class through `this` inside the class, the class name, its
     /// `prototype`, or a binding declared or constructed as the class. Any other receiver
@@ -328,13 +330,15 @@ impl<'source> Index<'source> {
             let Some((receiver, property)) = super::written_member(target) else {
                 continue;
             };
-            if property
-                .is_some_and(|property| ![member, "constructor", "prototype"].contains(&property))
-            {
+            // A computed key names no member: source does not state which one it writes.
+            let Some(property) = property else {
+                continue;
+            };
+            if ![member, "constructor", "prototype"].contains(&property) {
                 continue;
             }
             let end = start.saturating_add(target.len() as u64);
-            if property == Some(member)
+            if property == member
                 && super::rebinds_itself(file.document.source, target, receiver, end)
             {
                 continue;
@@ -596,7 +600,6 @@ impl<'source> File<'source> {
         }
         Some(MemberMode::Instance)
     }
-}
 
     /// The mode of the member of `class` whose source holds `position`.
     fn javascript_holding_member_mode(
@@ -620,3 +623,4 @@ impl<'source> File<'source> {
         }
         Some(mode)
     }
+}
