@@ -8,6 +8,9 @@ use rift_protocol::read::{EdgeKind, SymbolKind};
 use super::javascript::MemberMode;
 use super::{File, Index, Target, Work};
 
+/// Maximum parentheses, assertions and non-null marks unwrapped around a write receiver.
+const RECEIVER_WRAPPERS_MAX: u32 = 8;
+
 /// Maximum aliases followed while resolving an explicit receiver type.
 const DECLARED_TYPE_DEPTH_MAX: u32 = 32;
 
@@ -214,7 +217,7 @@ impl<'source> Index<'source> {
             let file = self.files.get(class.file.path.as_str())?;
             if role == ReferenceRole::Call
                 && class.symbol.kind != "interface"
-                && file.assignments.may_replace_method(member)
+                && self.javascript_member_replaced(file, class, member, work)
             {
                 return None;
             }
@@ -241,6 +244,110 @@ impl<'source> Index<'source> {
         match tail {
             Some(tail) => self.javascript_object_member(found, tail, role, work),
             None => Some(found),
+        }
+    }
+
+    /// Whether a write in the class's file can replace `member` of `class`.
+    ///
+    /// A write changes a member of the object its receiver denotes. Source establishes
+    /// that object as this class through `this` inside the class, the class name, its
+    /// `prototype`, or a binding declared or constructed as the class. Any other receiver
+    /// names another object, whatever property it writes. A member stored back bound to its
+    /// own receiver is the same member.
+    fn javascript_member_replaced(
+        &self,
+        file: &File<'source>,
+        class: Target<'source>,
+        member: &str,
+        work: &mut Work,
+    ) -> bool {
+        for &(start, target) in &file.assignments.member_writes {
+            if !work.charge() {
+                return true;
+            }
+            let Some((receiver, property)) = super::written_member(target) else {
+                continue;
+            };
+            if property
+                .is_some_and(|property| ![member, "constructor", "prototype"].contains(&property))
+            {
+                continue;
+            }
+            let end = start.saturating_add(target.len() as u64);
+            if property == Some(member)
+                && super::rebinds_itself(file.document.source, target, receiver, end)
+            {
+                continue;
+            }
+            if self.javascript_receiver_denotes(file, class, receiver, start, work) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn javascript_receiver_denotes(
+        &self,
+        file: &File<'source>,
+        class: Target<'source>,
+        receiver: &str,
+        position: u64,
+        work: &mut Work,
+    ) -> bool {
+        let same = |target: Target<'source>| {
+            target.file.path == class.file.path && std::ptr::eq(target.symbol, class.symbol)
+        };
+        let mut receiver = receiver.trim();
+        // `(this as any)` and `item!` denote the same object as the expression they wrap.
+        for _ in 0..RECEIVER_WRAPPERS_MAX {
+            let inner = receiver
+                .strip_prefix('(')
+                .and_then(|inner| inner.strip_suffix(')'))
+                .map(|inner| inner.split(" as ").next().unwrap_or(inner))
+                .or_else(|| receiver.strip_suffix('!'));
+            match inner {
+                Some(inner) => receiver = inner.trim(),
+                None => break,
+            }
+        }
+        if receiver == "this" {
+            return self
+                .javascript_class_receiver(file, position, work)
+                .is_some_and(|(owner, _)| same(owner));
+        }
+        let name = receiver
+            .strip_suffix(".prototype")
+            .unwrap_or(receiver)
+            .trim();
+        if name.contains(['.', '[', '(', ' ']) {
+            return false;
+        }
+        let Some(binding) = super::javascript::js_binding(
+            file,
+            &self.javascript,
+            name,
+            position,
+            ReferenceRole::Read,
+            work,
+        ) else {
+            return false;
+        };
+        if file.target_at(binding.name).is_some_and(same) {
+            return true;
+        }
+        if name.len() != receiver.len() {
+            return false;
+        }
+        if let Some(&Some(annotation)) = file.declared_types.get(&binding.name) {
+            return self
+                .javascript_declared_type(file, annotation, work)
+                .is_some_and(same);
+        }
+        match binding.kind {
+            rift_syntax::StaticBindingKind::JavaScriptInstance { constructor } => self
+                .javascript_target(file, constructor, ReferenceRole::Call, work)
+                .is_some_and(same),
+            _ => false,
         }
     }
 

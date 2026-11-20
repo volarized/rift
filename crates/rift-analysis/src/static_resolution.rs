@@ -229,40 +229,91 @@ struct File<'source> {
 struct AssignmentTargets<'source> {
     names: BTreeSet<&'source str>,
     members: BTreeSet<(&'source str, &'source str)>,
-    properties: BTreeSet<&'source str>,
+    /// Every member or subscript target, with its start offset.
+    member_writes: Vec<(u64, &'source str)>,
     unknown: bool,
 }
 
 impl<'source> AssignmentTargets<'source> {
-    fn add(&mut self, target: &'source str, work: &mut Work) -> Option<()> {
+    fn add(&mut self, target: &'source str, start: u64) {
         let target = target.trim();
         if target.starts_with('(') || target.contains(['[', ']', '\\', '/']) {
             self.unknown = true;
         }
         let Some((receiver, path)) = target.split_once('.') else {
+        if target.contains(['.', '[']) {
+            self.member_writes.push((start, target));
+        }
             self.names.insert(target);
-            return Some(());
+            return;
         };
-        let mut properties = path.split('.').map(str::trim);
-        if let Some(first) = properties.next() {
+        if let Some(first) = path.split('.').map(str::trim).next() {
             self.members.insert((receiver.trim(), first));
-            self.properties.insert(first);
         }
-        for property in properties {
-            if !work.charge() {
-                return None;
+    }
+}
+
+/// The object expression and the property one assignment target writes.
+///
+/// Syntax capture splits a destructuring pattern into its member and name targets, so a
+/// target is a name, a member expression or a subscript. `None` is a target without a
+/// member. `Some((receiver, None))` writes a computed property whose name source does not
+/// state; a quoted literal key names its property like a dotted one.
+fn written_member(target: &str) -> Option<(&str, Option<&str>)> {
+    let target = target.trim();
+    if let Some(inner) = target.strip_suffix(']') {
+        let mut depth = 0_usize;
+        let mut open = None;
+        for (index, character) in inner.char_indices().rev() {
+            match character {
+                ']' => depth += 1,
+                '[' if depth == 0 => {
+                    open = Some(index);
+                    break;
+                }
+                '[' => depth -= 1,
+                _ => {}
             }
-            self.properties.insert(property);
         }
-        Some(())
+        let open = open?;
+        let receiver = inner[..open].trim().trim_end_matches("?.").trim();
+        if receiver.is_empty() {
+            return None;
+        }
+        let key = inner[open + 1..].trim();
+        let literal = ['\'', '"', '`'].into_iter().find_map(|quote| {
+            key.strip_prefix(quote)?
+                .strip_suffix(quote)
+                .filter(|name| !name.contains([quote, '\\', '$']))
+        });
+        return Some((receiver, literal));
     }
 
-    fn may_replace_method(&self, method: &str) -> bool {
-        self.unknown
-            || [method, "constructor", "prototype"]
-                .iter()
-                .any(|property| self.properties.contains(property))
-    }
+    let (receiver, property) = target.rsplit_once('.')?;
+    let receiver = receiver.trim().trim_end_matches('?').trim();
+    let property = property.trim();
+    let named = !property.is_empty()
+        && property
+            .chars()
+            .all(|character| character.is_alphanumeric() || matches!(character, '_' | '$' | '#'));
+    named.then_some((receiver, Some(property)))
+}
+/// Whether the assignment after `target` stores the member itself, bound to its receiver.
+///
+/// `this.run = this.run.bind(this)` keeps the declared member: the value is that member
+/// with a fixed receiver, not another function.
+fn rebinds_itself(source: &str, target: &str, receiver: &str, end: u64) -> bool {
+    let rebound = || {
+        let rest = source.get(usize::try_from(end).ok()?..)?.trim_start();
+        let rest = rest.strip_prefix('=')?.trim_start();
+        let rest = rest.strip_prefix(target)?.strip_prefix(".bind(")?;
+        let rest = rest.strip_prefix(receiver)?.strip_prefix(')')?;
+        Some(
+            rest.trim_start_matches([' ', '\t'])
+                .starts_with([';', '\n', '\r', '}', ',', ')']),
+        )
+    };
+    rebound().unwrap_or(false)
 }
 
 impl<'source> File<'source> {
@@ -351,7 +402,7 @@ impl<'source> File<'source> {
             if !work.charge() {
                 return None;
             }
-            self.assignments.add(self.text(*range)?, work)?;
+            self.assignments.add(self.text(*range)?, range.start);
         }
         Some(())
     }

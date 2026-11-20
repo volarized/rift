@@ -640,3 +640,62 @@ export class Child extends Parent implements Contract {
     ));
 }
 
+#[test]
+fn test_member_writes_refuse_calls_only_on_the_class_their_receiver_denotes() {
+    // Each class calls its own `leaf` through `this`. A write refuses that call only when
+    // its receiver denotes the class: `this` inside it, its prototype, or a binding
+    // constructed as it. Writes through other objects name other objects.
+    let source = "export class Item {
+  leaf() { return 1 }
+  use() { return this.leaf() }
+  unrelated(target, key) { target[key] = 1; const made = {}; made[key] = 2; target.child.leaf = 3 }
+}
+export class Tagged { leaf() { return 1 } use() { return this.leaf() } tag() { this['label'] = 1 } }
+export class Patched { leaf() { return 1 } use() { return this.leaf() } patch(key, value) { this[key] = value } }
+export class Named { leaf() { return 1 } use() { return this.leaf() } patch(value) { this.leaf = value } }
+export class Keyed { leaf() { return 1 } use() { return this.leaf() } }
+Keyed.prototype['leaf'] = function () { return 2 };
+export class Built { leaf() { return 1 } use() { return this.leaf() } }
+const built = new Built();
+built[Symbol.iterator] = 1;
+export class Bound { constructor() { this.leaf = this.leaf.bind(this) } leaf() { return 1 } use() { return this.leaf() } }
+export class Rebound { constructor(other) { this.leaf = other.leaf.bind(this) } leaf() { return 1 } use() { return this.leaf() } }
+";
+    for path in ["main.mjs", "main.ts"] {
+        let (_directory, index) = workspace_with_manifest(&[(path, source)], module_manifest());
+        let found = calls(&index);
+        for class in ["Item", "Tagged", "Bound"] {
+            assert!(
+                found.contains(&(format!("{class}/use"), format!("{class}/leaf"))),
+                "{path}: {class} keeps its call in {found:?}"
+            );
+        }
+        for class in ["Patched", "Named", "Keyed", "Built", "Rebound"] {
+            assert!(
+                !found
+                    .iter()
+                    .any(|(from, _)| from == &format!("{class}/use")),
+                "{path}: {class} must stay unresolved in {found:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_typescript_member_write_through_a_declared_class_binding_refuses_its_calls() {
+    let source = "export class Typed { leaf() { return 1 } use() { return this.leaf() } }
+export class Free { leaf() { return 1 } use() { return this.leaf() } }
+export function patch(item: Typed, bag: Record<string, unknown>, key: string) { item[key] = 1; bag[key] = 2; (bag as any).leaf = 3 }
+";
+    let (_directory, index) = workspace_with_manifest(&[("main.ts", source)], module_manifest());
+    let found = calls(&index);
+    assert!(
+        !found.iter().any(|(from, _)| from == "Typed/use"),
+        "{found:?}"
+    );
+    assert!(
+        found.contains(&("Free/use".to_owned(), "Free/leaf".to_owned())),
+        "{found:?}"
+    );
+}
+
