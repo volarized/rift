@@ -1363,6 +1363,25 @@ fn test_rust_inactive_alternative_modules_are_never_endpoints() {
 }
 
 #[test]
+fn test_rust_enclosing_trait_implementation_selects_its_member() {
+    // Inside `impl t::A for Error`, `Error::make` names A's member even though `t::B` also
+    // gives `Error` a `make`; outside any implementation the two stay ambiguous.
+    let source = "pub mod t { pub trait A { fn make(value: u8) -> Self; fn wrap(value: u8) -> Self; } pub trait B { fn make(value: u8) -> Self; } }\npub struct Error;\nimpl t::A for Error { fn make(_: u8) -> Self { Error } fn wrap(value: u8) -> Self { Error::make(value) } }\nimpl t::B for Error { fn make(_: u8) -> Self { Error } }\nmod outside { use super::t::B; pub fn build() -> super::Error { super::Error::make(1) } }\n";
+    let (_directory, index) = fixture_index(PLAIN_MANIFEST, &[("src/lib.rs", source)]);
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "/Error/wrap",
+        "/Error/make"
+    ));
+    assert!(!index.edges().edges().any(|edge| {
+        edge.kind() == EdgeKind::Calls
+            && edge.from().as_str().ends_with("/outside/build")
+            && edge.to().as_str().ends_with("/make")
+    }));
+}
+
+#[test]
 fn test_rust_struct_expressions_name_body_local_structs_first() {
     let source = "pub struct Adapter { pub value: u8 }\npub fn collect() -> u8 { struct Adapter { value: u8 } let adapter = Adapter { value: 1 }; adapter.value }\npub fn module_level() -> u8 { Adapter { value: 2 }.value }\n";
     let (_directory, index) = fixture_index(PLAIN_MANIFEST, &[("src/lib.rs", source)]);

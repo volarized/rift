@@ -1032,10 +1032,13 @@ impl<'source> Namespaces<'source> {
         let mut path = owner.admitted_path()?;
         path.push(member.to_owned());
         let candidates = self.methods.get(&path)?;
-        let mut selected = None;
-        let mut inherent = false;
+        let mut inherent = Vec::new();
+        let mut implemented = Vec::new();
         for method in candidates {
             if !work.charge() {
+                return None;
+            }
+            if !self.available(method.target) {
                 return None;
             }
             let range = method.implementation.type_path;
@@ -1047,21 +1050,31 @@ impl<'source> Namespaces<'source> {
                 .heritage_edges()
                 .iter()
                 .any(|edge| edge.from == range);
-            if inherent && trait_impl {
-                continue;
+            if trait_impl {
+                implemented.push(method);
+            } else {
+                inherent.push(method);
             }
-            if !self.available(method.target) {
-                return None;
-            }
-            if !trait_impl && !inherent {
-                selected = None;
-                inherent = true;
-            }
-            if selected.is_some() {
-                return None;
-            }
-            selected = Some(method.target);
         }
+        // Inherent methods take precedence. Among trait implementations, the trait of the
+        // implementation enclosing the site is in scope there; compiled code cannot have
+        // another in-scope candidate of the same name, so that implementation is selected.
+        let selected = match (inherent.as_slice(), implemented.as_slice()) {
+            ([method], _) | ([], [method]) => Some(method.target),
+            ([], methods) => {
+                let mut enclosing = methods.iter().filter(|method| {
+                    method.target.file.path == file.document.path
+                        && method.implementation.range.contains(position)
+                });
+                let first = enclosing.next();
+                if enclosing.next().is_some() {
+                    None
+                } else {
+                    first.map(|method| method.target)
+                }
+            }
+            _ => None,
+        };
         let target = selected?;
         (target.symbol.visibility.as_deref() == Some("pub")
             || self.declaration_visible(file, position, target, work)
