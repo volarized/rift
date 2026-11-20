@@ -586,3 +586,57 @@ export const unknown = wrap((value) => value.leaf());
     }
 }
 
+#[test]
+fn test_overrides_need_an_inherited_member_and_never_a_constructor() {
+    let source = "export interface Contract { run(): void; name: string }
+export interface Wider extends Contract { run(): void }
+export class Implemented implements Contract { name = ''; run() {} }
+export class Parent { constructor() {} run() {} static make() {} }
+export class Child extends Parent implements Contract {
+  name = '';
+  constructor() { super() }
+  override run() {}
+  static make() {}
+}
+";
+    let (_directory, index) = workspace_with_manifest(&[("main.ts", source)], module_manifest());
+    let mut overrides = index
+        .edges()
+        .edges()
+        .filter(|edge| edge.kind() == EdgeKind::Overrides)
+        .map(|edge| {
+            let tail = |identity: &str| {
+                identity
+                    .rsplit_once("main.ts/")
+                    .expect("member")
+                    .1
+                    .to_owned()
+            };
+            (tail(edge.from().as_str()), tail(edge.to().as_str()))
+        })
+        .collect::<Vec<_>>();
+    overrides.sort();
+    overrides.dedup();
+    assert_eq!(
+        overrides,
+        [
+            ("Child/make".to_owned(), "Parent/make".to_owned()),
+            ("Child/run".to_owned(), "Parent/run".to_owned()),
+            ("Wider/run".to_owned(), "Contract/run".to_owned()),
+        ]
+    );
+    assert!(has_edge(
+        &index,
+        EdgeKind::Implements,
+        "/Implemented",
+        "/Contract"
+    ));
+    assert!(has_edge(&index, EdgeKind::Extends, "/Child", "/Parent"));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "/Child/constructor",
+        "/Parent"
+    ));
+}
+

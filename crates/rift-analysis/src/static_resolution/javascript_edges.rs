@@ -450,6 +450,10 @@ impl<'source> Index<'source> {
         {
             return;
         }
+        // A constructor is invoked through `super`, never inherited and replaced.
+        if symbol.name == "constructor" {
+            return;
+        }
         let Some(from) = self.javascript_identity(Target {
             file: file.document,
             symbol,
@@ -465,7 +469,9 @@ impl<'source> Index<'source> {
             if !work.charge() {
                 return;
             }
-            if Some(edge.from) != class.symbol.name_range {
+            // An implemented interface is fulfilled, not inherited: only `extends` passes
+            // a member down for the declaration to replace.
+            if Some(edge.from) != class.symbol.name_range || edge.kind != EdgeKind::Extends {
                 continue;
             }
             let base = self.edge_javascript_target(file, edge.target, work);
