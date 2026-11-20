@@ -390,16 +390,29 @@ impl ReadService {
         Ok(self.index.edges().is_complete() && self.index.symbol_view()?.objects_complete())
     }
 
-    /// Reports captured objects omitted from edges because their identities are unestablished.
-    #[must_use]
-    pub fn edge_identity_warning(&self) -> Option<ReadWarning> {
-        let omitted = self
-            .index
+    /// Captured objects whose identities are unestablished, which edge inventories omit.
+    fn edge_identity_omissions(&self) -> usize {
+        self.index
             .normalized_graph()
             .records()
             .iter()
             .filter(|object| object.identity().is_none())
-            .count();
+            .count()
+    }
+
+    /// Whether edge inventories omit no captured object for an unestablished identity.
+    ///
+    /// An inventory that omits one still answers its edges between identified endpoints, but
+    /// cannot establish an absence or an aggregate.
+    #[must_use]
+    pub fn edge_identities_complete(&self) -> bool {
+        self.edge_identity_omissions() == 0
+    }
+
+    /// Reports captured objects omitted from edges because their identities are unestablished.
+    #[must_use]
+    pub fn edge_identity_warning(&self) -> Option<ReadWarning> {
+        let omitted = self.edge_identity_omissions();
         (omitted > 0).then(|| ReadWarning::EdgeCoverageMissing {
             kinds: Vec::new(),
             detail: format!(

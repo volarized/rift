@@ -97,6 +97,9 @@ impl AcquiredAdjacency {
         required: rift_search::sparql::SemanticInventory,
     ) -> Result<(), RiftError> {
         self.incomplete |= !reads.static_edges_complete()?;
+        // Captures without identities are left out of the inventory: its rows stand, but an
+        // absence or an aggregate over it is no claim the inventory can make.
+        self.partial |= !reads.edge_identities_complete();
         self.captured_inventory = Some(required);
         Ok(())
     }
@@ -166,6 +169,12 @@ impl AcquiredAdjacency {
 
     pub(super) const fn is_incomplete(&self) -> bool {
         self.incomplete
+    }
+
+    /// Whether the read is incomplete or left part of an inventory out: either way an
+    /// absence or an aggregate over it is no claim the acquired facts make.
+    pub(super) const fn leaves_facts_out(&self) -> bool {
+        self.incomplete || self.partial
     }
 
     pub(super) const fn remote_view(&self) -> Option<&CapturedView> {
@@ -546,10 +555,11 @@ impl RiftMcp {
         {
             return Err(coverage_failure());
         }
-        if walk.local.is_some() || walk.local_reverse.is_some() {
-            walk.acquired
-                .warnings
-                .extend(resolved.published.reads.edge_identity_warning());
+        if (walk.local.is_some() || walk.local_reverse.is_some())
+            && let Some(warning) = resolved.published.reads.edge_identity_warning()
+        {
+            walk.acquired.warnings.push(warning);
+            walk.acquired.partial = true;
         }
         walk.verify_installed().await?;
         Ok(Ok(walk.acquired))

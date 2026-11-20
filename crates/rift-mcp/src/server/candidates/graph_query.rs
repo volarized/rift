@@ -659,7 +659,7 @@ impl AcquiredGraph {
         if coverage == ProjectedRetrievals::Unavailable {
             return Ok(insufficient_coverage(warnings).into());
         }
-        let partial = acquired.is_incomplete()
+        let partial = acquired.leaves_facts_out()
             || coverage == ProjectedRetrievals::Partial
             || inventory == InventoryCoverage::Partial;
         if partial && !query.admits_partial_rows() && !query.admits_partial_witness() {
