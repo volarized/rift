@@ -1,4 +1,48 @@
 #[test]
+fn test_commonjs_prototype_methods_supply_callers_and_containment() {
+    let source = "function leaf() {} function View() {} View.prototype.render = function render() { leaf(); render(); }; function Other() {} Other.prototype.lookup = function() { leaf(); };";
+    for (language, path) in [("javascript", "main.cjs"), ("typescript", "main.cts")] {
+        let result = resolution(language, &[(path, source)], &[], WORK_MAX);
+        let body_calls = calls(&result, path).collect::<Vec<_>>();
+        assert_eq!(body_calls.len(), 3, "{language}: {result:?}");
+        assert!(
+            body_calls[0]
+                .edge_from
+                .as_ref()
+                .expect("method caller")
+                .as_str()
+                .ends_with("/View/render")
+        );
+        assert!(target(body_calls[1]).ends_with("/View/render"));
+        assert!(
+            body_calls[2]
+                .edge_from
+                .as_ref()
+                .expect("method caller")
+                .as_str()
+                .ends_with("/Other/lookup")
+        );
+        let contains = result
+            .occurrences
+            .iter()
+            .filter(|edge| {
+                edge.edge_kind == Some(rift_protocol::read::EdgeKind::Contains)
+                    && target(edge).ends_with("/View/render")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(contains.len(), 1);
+        assert!(
+            contains[0]
+                .edge_from
+                .as_ref()
+                .expect("constructor owner")
+                .as_str()
+                .ends_with("/View")
+        );
+    }
+}
+
+#[test]
 fn test_commonjs_module_require_imports_keep_file_and_lexical_binding_facts() {
     let source = "var other = require('./other.cjs'); var path = require('node:path'); function use() { return other; } function usePath() { return path; } module.exports = other;";
     for (language, path, other) in [

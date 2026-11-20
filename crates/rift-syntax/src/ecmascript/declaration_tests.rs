@@ -31,6 +31,69 @@ fn javascript(text: &str) -> SyntaxDocument {
 }
 
 #[test]
+fn test_commonjs_prototype_methods_refuse_constructors_with_colliding_lexical_identities() {
+    let source = "unknown(function() { function View() {} View.prototype.render = function() {}; }); unknown(function() { function View() {} View.prototype.render = function() {}; });";
+    for document in [javascript(source), typescript(source)] {
+        assert!(
+            !document
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.kind == "method")
+        );
+    }
+}
+
+#[test]
+fn test_commonjs_prototype_methods_refuse_replaced_constructor_or_prototype_values() {
+    for change in [
+        "View = Other;",
+        "View.prototype = Other.prototype;",
+        "View[key] = other;",
+        "eval('replace()');",
+    ] {
+        let source =
+            format!("function View() {{}} {change} View.prototype.render = function() {{}};");
+        for document in [javascript(&source), typescript(&source)] {
+            assert!(
+                !document
+                    .symbols()
+                    .iter()
+                    .any(|symbol| symbol.kind == "method"),
+                "{change}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_commonjs_prototype_methods_keep_lexical_constructor_owners() {
+    let source = "function View() {} View.prototype.render = function render() { const opts = { value: 1 }; };\nfunction nested() { function View() {} View.prototype.lookup = function() {}; }\nfunction shadow(View) { View.prototype.hidden = function() {}; }\nfunction duplicate() { function View() {} function View() {} View.prototype.ambiguous = function() {}; }\nUnknown.prototype.missing = function() {};";
+    for document in [javascript(source), typescript(source)] {
+        for name in ["View.render", "nested.View.lookup"] {
+            let method = symbol(&document, name);
+            assert_eq!(method.kind, "method");
+            assert_eq!(
+                method.container.as_deref(),
+                name.rsplit_once('.').map(|(parent, _)| parent)
+            );
+            assert_eq!(
+                spelled(source, method.name_range.expect("method name")),
+                method.name
+            );
+            assert!(spelled(source, method.item_range).contains("prototype"));
+            assert!(spelled(source, method.body_range.expect("method body")).starts_with('{'));
+        }
+        assert_eq!(symbol(&document, "View.render.opts.value").kind, "property");
+        assert!(
+            !document
+                .symbols()
+                .iter()
+                .any(|symbol| ["hidden", "ambiguous", "missing"].contains(&symbol.name.as_str()))
+        );
+    }
+}
+
+#[test]
 fn test_commonjs_function_assignments_keep_names_and_lexical_children() {
     let source = "exports.run = function(value) { const local = {}; };\nexports.other = function inner() { const local = {}; };\nmodule.exports.third = function named() {};\nmodule.exports = function(value) {};";
     for document in [javascript(source), typescript(source)] {

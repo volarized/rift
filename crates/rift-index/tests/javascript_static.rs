@@ -31,6 +31,79 @@ fn workspace_with_manifest(
 }
 
 #[test]
+fn test_commonjs_prototype_methods_keep_hoisted_constructor_identities() {
+    for path in ["main.cjs", "main.cts"] {
+        let (_directory, index) = workspace(&[(
+            path,
+            "View.prototype.render = function() { leaf(); }; function View() {} function leaf() {}",
+        )]);
+        assert!(
+            index
+                .edges()
+                .edges()
+                .any(|edge| edge.kind() == EdgeKind::Calls
+                    && edge.from().as_str().ends_with("/View/render")
+                    && edge.to().as_str().ends_with("/leaf"))
+        );
+    }
+}
+
+#[test]
+fn test_commonjs_prototype_methods_store_distinct_constructor_members() {
+    let source = "function leaf() {} function View() {} View.prototype.render = function render() { leaf(); }; function Other() {} Other.prototype.lookup = function() { leaf(); };";
+    for path in ["main.cjs", "main.cts"] {
+        let (_directory, index) = workspace(&[(path, source)]);
+        let members = index
+            .edges()
+            .edges()
+            .filter(|edge| {
+                edge.kind() == EdgeKind::Contains
+                    && (edge.to().as_str().ends_with("/render")
+                        || edge.to().as_str().ends_with("/lookup"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(members.len(), 2, "{path}: {members:?}");
+        assert!(
+            members
+                .iter()
+                .any(|edge| edge.from().as_str().ends_with("/View")
+                    && edge.to().as_str().ends_with("/View/render"))
+        );
+        assert!(
+            members
+                .iter()
+                .any(|edge| edge.from().as_str().ends_with("/Other")
+                    && edge.to().as_str().ends_with("/Other/lookup"))
+        );
+        let calls = index
+            .edges()
+            .edges()
+            .filter(|edge| edge.kind() == EdgeKind::Calls)
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        assert!(
+            calls
+                .iter()
+                .all(|edge| edge.to().as_str().ends_with("/leaf")
+                    && (edge.from().as_str().ends_with("/View/render")
+                        || edge.from().as_str().ends_with("/Other/lookup")))
+        );
+        let language =
+            rift_protocol::read::Language::from_identity_segment(if path.ends_with("cts") {
+                "typescript"
+            } else {
+                "javascript"
+            })
+            .expect("language");
+        assert!(
+            index
+                .identity_coverage_complete(&language)
+                .expect("identity coverage")
+        );
+    }
+}
+
+#[test]
 fn test_commonjs_module_require_imports_store_known_file_targets() {
     for (path, other) in [("main.js", "other.js"), ("main.cts", "other.cts")] {
         for declaration in ["var", "let", "const"] {

@@ -733,14 +733,23 @@ fn declaration_anchors_with_public(
         .filter(|binding| binding.source.is_none())
         .filter_map(|binding| Some((binding.range, binding.local?, binding.container.as_deref())))
         .collect::<BTreeSet<_>>();
-    for symbol in syntax.symbols().iter().filter(|symbol| {
-        symbol.syntax_element_kind != Some("assignment_expression")
-            || symbol.kinds.contains(&SymbolKind::Public)
-            || public.contains(&symbol.qualified_name)
-            || symbol.name_range.is_some_and(|name| {
-                assignments.contains(&(symbol.item_range, name, symbol.container.as_deref()))
-            })
-    }) {
+    let mut declarations = syntax
+        .symbols()
+        .iter()
+        .filter(|symbol| {
+            symbol.syntax_element_kind != Some("assignment_expression")
+                || (symbol.kind == "method" && symbol.container.is_some())
+                || symbol.kinds.contains(&SymbolKind::Public)
+                || public.contains(&symbol.qualified_name)
+                || symbol.name_range.is_some_and(|name| {
+                    assignments.contains(&(symbol.item_range, name, symbol.container.as_deref()))
+                })
+        })
+        .collect::<Vec<_>>();
+    // A checked out-of-line member may precede its hoisted constructor in source.
+    // Process containing declarations first without changing the document's source order.
+    declarations.sort_by_key(|symbol| symbol.qualified_name.len());
+    for symbol in declarations {
         if conflicting_assignment_name(&symbol.qualified_name, &conflicts) {
             continue;
         }

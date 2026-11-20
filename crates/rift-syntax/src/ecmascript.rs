@@ -72,6 +72,7 @@ use rift_core::line::{LINE_FEED, LineEnding, lines_inclusive, without_ending};
 use rift_error::errors;
 use rift_protocol::read::{Documentation, DocumentationFormat, Language, SymbolKind, SyntaxKind};
 mod commonjs;
+mod members;
 
 use tree_sitter::{Node, Parser};
 
@@ -1859,7 +1860,7 @@ pub(crate) fn analyze_included(
         kinds,
         exports: ModuleExports::read(tree.root_node(), source.text, kinds)?,
     };
-    commonjs::record(
+    let assignments = commonjs::record(
         tree.root_node(),
         source,
         limits,
@@ -1887,6 +1888,17 @@ pub(crate) fn analyze_included(
         &rules,
         capture.as_mut(),
     )?;
+    let static_facts = capture.map(crate::static_analysis::Capture::finish);
+    if let Some(facts) = &static_facts {
+        members::record(
+            &rules,
+            source.text,
+            language,
+            facts,
+            &assignments,
+            &mut symbols,
+        )?;
+    }
     symbols.sort_by_key(|symbol| symbol.range.start);
     Ok(SyntaxDocument::new(
         language.clone(),
@@ -1897,7 +1909,7 @@ pub(crate) fn analyze_included(
     )
     .with_source_witness(source.text)
     .with_export_bindings(export_bindings)
-    .with_static_facts(capture.map(crate::static_analysis::Capture::finish))
+    .with_static_facts(static_facts)
     .with_syntax_limits(limits))
 }
 

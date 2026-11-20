@@ -4,13 +4,13 @@ use rift_error::{RiftError, errors};
 use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::Node;
 
-pub(super) fn record(
-    root: Node<'_>,
+pub(super) fn record<'tree>(
+    root: Node<'tree>,
     source: SyntaxSource<'_>,
     limits: SyntaxLimits,
     kinds: &EcmaScriptKinds,
     bindings: &mut BTreeMap<usize, SyntaxExportBinding>,
-) -> Result<(), RiftError> {
+) -> Result<Vec<Node<'tree>>, RiftError> {
     let mut pending = vec![(root, 0_usize)];
     let mut blocked = BTreeSet::new();
     let mut replaced = BTreeSet::new();
@@ -61,7 +61,7 @@ pub(super) fn record(
             (child, depth + 1)
         });
     }
-    for syntax_element in assignments {
+    for &syntax_element in &assignments {
         if !module_execution(syntax_element, &blocked) {
             continue;
         }
@@ -73,7 +73,7 @@ pub(super) fn record(
         }
         bindings.insert(syntax_element.id(), binding);
     }
-    Ok(())
+    Ok(assignments)
 }
 
 fn receiver(text: &str) -> bool {
