@@ -755,7 +755,7 @@ fn admitted_facts<'source>(
             && (document.facts.symbols().is_empty()
                 || !matches!(
                     document.facts.language().name.as_str(),
-                    "javascript" | "typescript"
+                    "javascript" | "typescript" | "rust"
                 )))
     {
         return None;

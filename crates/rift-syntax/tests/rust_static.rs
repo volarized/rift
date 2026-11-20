@@ -334,3 +334,44 @@ fn test_rust_local_return_facts_keep_authored_initializer_and_return_type() {
     );
     assert!(facts.bindings().iter().any(|binding| matches!(binding.kind, rift_syntax::StaticBindingKind::RustValue { initializer } if text(binding.name) == "copy" && text(initializer) == "self.copy()")));
 }
+
+#[test]
+fn test_rust_macro_token_errors_keep_authored_declarations_and_ranges() {
+    let path = ProjectPath::new("src/lib.rs").expect("path");
+    let source = "macro_rules! marker { (~) => {}; } fn leaf() {} fn run() { leaf(); }";
+    let document = RustSyntaxProvider::default()
+        .analyze(
+            SyntaxSource {
+                path: &path,
+                text: source,
+            },
+            SyntaxLimits::default(),
+        )
+        .expect("syntax");
+    let marker = document
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.name == "marker")
+        .expect("macro");
+    assert_eq!(
+        &source[usize::try_from(marker.item_range.start).expect("start")
+            ..usize::try_from(marker.item_range.end).expect("end")],
+        "macro_rules! marker { (~) => {}; }"
+    );
+    let invalid = RustSyntaxProvider::default()
+        .invalid_declarations(
+            SyntaxSource {
+                path: &path,
+                text: source,
+            },
+            SyntaxLimits::default(),
+            &[marker.item_range],
+        )
+        .expect("validation");
+    assert!(
+        invalid.is_empty(),
+        "opaque body errors do not invalidate the macro header"
+    );
+    let facts = document.facts().static_facts().expect("static facts");
+    assert_eq!(facts.calls().len(), 1);
+}

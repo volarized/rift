@@ -562,6 +562,11 @@ impl<'source> Capture<'source> {
         visited: crate::extract::Visited<'_, '_>,
     ) -> Result<(), RiftError> {
         let syntax_element = visited.syntax_element();
+        if (syntax_element.is_error() || syntax_element.is_missing())
+            && let Grammar::Rust(kinds, _) = &self.grammar
+        {
+            kinds.record_error(syntax_element, &mut self.facts.0)?;
+        }
         if syntax_element.is_missing() || syntax_element.is_extra() {
             return Ok(());
         }

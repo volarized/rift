@@ -688,3 +688,41 @@ fn test_rust_field_reads_keep_stored_calls_and_refuse_method_values() {
                 && edge.from().as_str().ends_with("/Item/invalid"))
     );
 }
+
+#[test]
+fn test_rust_macro_token_errors_keep_unaffected_stored_facts() {
+    // #822: opaque macro matchers must not suppress unrelated source facts.
+    let directory = tempfile::tempdir().expect("workspace");
+    let root = directory.path();
+    std::fs::create_dir(root.join("src")).expect("source directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='fixture'\nversion='0.1.0'\n",
+    )
+    .expect("manifest");
+    let source = "#[macro_export] macro_rules! marker { (~) => {}; } pub struct Item { pub value: usize } impl Item { pub fn new() -> Self { Self { value: 1 } } pub fn read(&self) -> usize { self.value } } pub fn use_item() -> usize { let item = Item::new(); item.read() }";
+    std::fs::write(root.join("src/lib.rs"), source).expect("source");
+    let index = WorkspaceIndex::build(
+        root,
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &TextFileInclusion::default(),
+    )
+    .expect("index");
+    let view = index.symbol_view().expect("symbols");
+    for record in view.normalized_graph().records() {
+        assert!(record.identity().is_some(), "missing identity: {record:?}");
+    }
+    for (kind, from, to) in [
+        (EdgeKind::Calls, "/fixture/use_item", "/Item/new"),
+        (EdgeKind::Calls, "/fixture/use_item", "/Item/read"),
+        (EdgeKind::Reads, "/Item/read", "/Item/value"),
+    ] {
+        assert!(
+            index.edges().edges().any(|edge| edge.kind() == kind
+                && edge.from().as_str().ends_with(from)
+                && edge.to().as_str().ends_with(to)),
+            "missing {kind:?} {from} -> {to}"
+        );
+    }
+}

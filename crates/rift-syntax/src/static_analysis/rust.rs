@@ -44,6 +44,7 @@ pub(super) struct Kinds {
     non_method_bounds: [u16; 2],
     bounds: u16,
     edge_macro: u16,
+    macro_definition: u16,
     assignment: [u16; 2],
     scopes: [u16; 3],
     functions: [u16; 3],
@@ -104,6 +105,7 @@ pub(super) fn kinds() -> &'static Kinds {
             non_method_bounds: [id("lifetime"), id("removed_trait_bound")],
             bounds: field("bounds"),
             edge_macro: id("macro_invocation"),
+            macro_definition: id("macro_definition"),
             assignment: [id("assignment_expression"), id("compound_assignment_expr")],
             scopes: [id("source_file"), id("block"), id("declaration_list")],
             functions: [
@@ -135,6 +137,18 @@ impl Kinds {
         facts: &mut StaticFactsParts,
         budget: &mut rift_core::LoopBudget,
     ) -> Result<(), RiftError> {
+        let mut ancestor = Some(syntax_element);
+        // The shared walk already bounds parent depth. Opaque macro contents and
+        // parser recovery subtrees cannot establish executable facts.
+        while let Some(element) = ancestor {
+            if element.kind_id() == self.macro_definition
+                || element.is_error()
+                || element.is_missing()
+            {
+                return Ok(());
+            }
+            ancestor = element.parent();
+        }
         let id = syntax_element.kind_id();
         self.record_reference(syntax_element, facts)?;
         if id == self.call {
@@ -183,6 +197,19 @@ impl Kinds {
             self.record_pattern(syntax_element, scope, facts)?;
         } else if id == self.parameters || id == self.closure_parameters {
             self.record_patterns(syntax_element, facts)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn record_error(
+        &self,
+        element: Node<'_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        if enclosing(element, &[self.macro_definition]).is_none()
+            && let Some(scope) = enclosing(element, &self.scopes)
+        {
+            facts.unsupported_bindings.push(byte_range(scope)?);
         }
         Ok(())
     }
