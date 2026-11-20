@@ -71,7 +71,7 @@ impl Scope {
 type Inventory<'a> = BTreeMap<&'a str, &'a SelectedFile<'a>>;
 type Child = (String, Vec<String>, Scope);
 
-fn text_range(source: &str, range: ByteRange) -> Option<&str> {
+pub(super) fn text_range(source: &str, range: ByteRange) -> Option<&str> {
     source.get(usize::try_from(range.start).ok()?..usize::try_from(range.end).ok()?)
 }
 
@@ -892,7 +892,7 @@ impl Context<'_> {
                 Some(())
             },
             &mut |range, name, target| {
-                requested.push((path.clone(), range, name, target));
+                requested.push((path.clone(), range, name, target, None));
                 Some(())
             },
         )?;
@@ -955,7 +955,13 @@ fn invocation_name(source: &str, range: ByteRange) -> Option<&str> {
         .filter(|name| super::crate_name_is_valid(name))
 }
 
-pub(super) type Export = (rift_core::ProjectPath, ByteRange, String, Vec<String>);
+pub(super) type Export = (
+    rift_core::ProjectPath,
+    ByteRange,
+    String,
+    Vec<String>,
+    Option<ByteRange>,
+);
 
 pub(super) fn children<'a>(
     file: &'a SelectedFile<'a>,
@@ -1076,15 +1082,15 @@ impl Context<'_> {
         scope: &mut Scope,
         exports: &mut Vec<Export>,
     ) {
-        // Original public imports remain declarations when macro effects are unknown.
+        // Original explicit imports remain declarations when macro effects are unknown.
         // Their own attributes and paths are checked before recording an alias.
         if let Some(tokens) = tokens
             && let Some(item) = tokens.range(range)
         {
             let mut requested = Vec::new();
             if tokens
-                .public_imports(&item, &mut |range, name, target| {
-                    requested.push((file.path.clone(), range, name, target));
+                .public_imports(&item, true, &mut |range, name, target, visibility| {
+                    requested.push((file.path.clone(), range, name, target, visibility));
                     Some(())
                 })
                 .is_some()

@@ -707,7 +707,7 @@ fn local_exports(
     'passes: for _ in 0..requested.len() {
         let before = prepared.exports.len();
         for request in requested {
-            let (namespace, (path, range, name, _)) = request;
+            let (namespace, (path, range, name, _, _)) = request;
             let Some(next) = work.checked_add(1) else {
                 break 'passes;
             };
@@ -752,6 +752,14 @@ fn local_exports(
             {
                 continue;
             }
+            if let Some(range) = request.1.4 {
+                let Some(visibility) = macros::text_range(file.source, range) else {
+                    continue;
+                };
+                prepared
+                    .alias_visibilities
+                    .insert(identity.clone(), visibility.to_owned());
+            }
             completed.insert(identity.clone());
             prepared.exports.push(export_binding(
                 request,
@@ -774,7 +782,7 @@ fn export_binding(
     identity: SymbolId,
     target: (SymbolId, String, String),
 ) -> super::ExportBinding {
-    let (_, (path, range, name, _)) = request;
+    let (_, (path, range, name, _, _)) = request;
     let (target, target_path, target_qualified_name) = target;
     super::ExportBinding {
         path: path.as_str().to_owned(),
@@ -805,7 +813,7 @@ fn export_target(
     work: &mut usize,
     work_max: usize,
 ) -> Option<(SymbolId, String, String)> {
-    let (namespace, (_, _, _, target)) = request;
+    let (namespace, (_, _, _, target, _)) = request;
     let local = requested_path(namespace, target).and_then(|target_path| {
         for export in &prepared.exports {
             *work = work.checked_add(1)?;
@@ -898,7 +906,7 @@ fn conflicting_requests(
 ) -> std::collections::BTreeSet<SymbolId> {
     let mut seen = std::collections::BTreeSet::new();
     let mut refused = std::collections::BTreeSet::new();
-    for (namespace, (path, range, name, _)) in requested {
+    for (namespace, (path, range, name, _, _)) in requested {
         let Some(identity) = export_identity(input, namespace, name) else {
             continue;
         };

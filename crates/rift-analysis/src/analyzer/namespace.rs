@@ -50,6 +50,7 @@ pub(crate) struct PreparedNamespace {
     pub(crate) public_names: BTreeMap<String, BTreeSet<String>>,
     pub(crate) mappings: BTreeMap<String, BTreeMap<String, rift_syntax::LogicalDeclaration>>,
     pub(crate) exports: Vec<ExportBinding>,
+    pub(crate) alias_visibilities: BTreeMap<SymbolId, String>,
     pub(crate) unresolved_exports: bool,
     /// Original file paths no namespace reaches by construction: their declarations carry
     /// no identity because the language assigns none there, not because analysis failed.
@@ -114,6 +115,7 @@ pub(crate) fn placed_aliases(
                 identity: export.identity.clone(),
                 target_identity,
                 range,
+                visibility: prepared.alias_visibilities.get(&export.identity).cloned(),
             });
     }
     Ok(aliases)
@@ -143,6 +145,7 @@ pub(crate) fn prepare_context(
     let rust = rust::prepare(input, selected);
     prepared.anchors.extend(rust.anchors);
     prepared.exports.extend(rust.exports);
+    prepared.alias_visibilities.extend(rust.alias_visibilities);
     prepared.unresolved_exports |= rust.unresolved_exports;
     prepared.outside_namespaces.extend(rust.outside_namespaces);
     let mut roots = input.import_roots().to_vec();
