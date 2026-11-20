@@ -109,6 +109,32 @@ fn test_rust_captured_configuration_selects_stored_facts_without_guessing() {
                 .starts_with("#[cfg(")
         }));
     }
+}
+
+#[test]
+fn test_rust_captured_configuration_refuses_invalid_flags_and_moved_metadata() {
+    let package = PackageIdentity {
+        manager: "cargo".into(),
+        registry: "crates.io".into(),
+        name: "fixture".into(),
+        version: "0.1.0".into(),
+    };
+    let owner = package.owner().expect("owner");
+    let origin = ContributionOrigin::new(
+        Some(SourceLocation::Dependency { package }),
+        SourceKind::Authored,
+    )
+    .expect("origin");
+    let language = ShippedLanguage::Rust.language();
+    let manifest = ProjectPath::new("Cargo.toml").expect("manifest path");
+    let path = ProjectPath::new("src/lib.rs").expect("source path");
+    let source = "pub fn run() {}";
+    let files = [PackageSource::new(&path, source)];
+    let context = [PackageSource::new(
+        &manifest,
+        "[package]\nname='fixture'\nversion='0.1.0'\n",
+    )];
+    let absent: &[&str] = &[];
     let input = ExactPackageInput::new(
         &owner,
         &language,
