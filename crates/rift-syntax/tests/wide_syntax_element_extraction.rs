@@ -13,8 +13,9 @@
 //! The smaller file grows until one analysis takes [`SMALL_RUN_MIN`] of CPU time or reaches
 //! the same source, syntax element or calibration bound as before.
 //!
-//! Wide-syntax-element cases measure one provider each under the existing test deadline.
-//! A registry coverage test requires a case for every shipped language and dialect.
+//! One aggregate case walks every registered provider under the single test deadline it has
+//! on main; wide-syntax-element cases also measure one provider each, and a registry coverage
+//! test requires a case for every shipped language and dialect.
 //! Attached-document cases walk [`registry::providers`] and select supported shapes.
 
 use std::time::Duration;
@@ -256,6 +257,25 @@ fn assert_wide_provider(language: ShippedLanguage) {
          syntax_elements={}, lines={lines}",
         document.syntax_elements().len(),
     );
+}
+
+/// The aggregate case from main: every registered provider inside one test deadline, so the
+/// whole wide-syntax-element proof keeps the bound it always had. The per-provider cases in
+/// [`wide_providers`] name the provider that fails.
+#[test]
+fn every_provider_reads_a_syntax_element_with_many_children_in_linear_time() {
+    for provider in registry::providers() {
+        let language = provider.language();
+        let line = wide_line(language);
+        let build = |count| line.repeat(count);
+        let (document, lines) = analyze_linearly(provider, build, WIDE_SYNTAX_ELEMENT_LINES_MIN);
+        assert!(
+            document.syntax_elements().len() > lines,
+            "every generated line must reach the walk as a syntax_element: language={language:?}, \
+             syntax_elements={}, lines={lines}",
+            document.syntax_elements().len(),
+        );
+    }
 }
 
 mod wide_providers {
