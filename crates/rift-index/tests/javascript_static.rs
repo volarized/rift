@@ -1414,3 +1414,56 @@ exports.use = use;
         );
     }
 }
+
+#[test]
+fn test_commonjs_named_function_assigned_to_module_exports_keeps_its_name() {
+    // A named function expression assigned to `module.exports` is declared under the name
+    // it is written with, and the module's default export is that declaration. A function
+    // without a name keeps the export name.
+    let library = "function leaf() { return 1 }
+module.exports = function bind(fn) { return leaf(fn) };
+";
+    let anonymous = "module.exports = function (value) { return value };
+";
+    let main = "const bind = require('./lib.js');
+const plain = require('./anonymous.js');
+function use() { return [bind(1), plain(2)] }
+exports.use = use;
+";
+    let (_directory, index) = workspace(&[
+        ("lib.js", library),
+        ("anonymous.js", anonymous),
+        ("main.js", main),
+    ]);
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "lib.js/bind",
+        "lib.js/leaf"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "main.js/use",
+        "lib.js/bind"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "main.js/use",
+        "anonymous.js/default"
+    ));
+    assert!(
+        !index
+            .edges()
+            .edges()
+            .any(|edge| edge.to().as_str().ends_with("lib.js/default"))
+    );
+    let language =
+        rift_protocol::read::Language::from_identity_segment("javascript").expect("language");
+    assert!(
+        index
+            .identity_coverage_complete(&language)
+            .expect("identity coverage")
+    );
+}

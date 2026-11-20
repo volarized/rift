@@ -1194,6 +1194,34 @@ pub(crate) struct EcmaScriptRules<'text> {
 }
 
 impl EcmaScriptRules<'_> {
+    /// The name range of a named function a module-scope assignment gives to
+    /// `module.exports`: the function is declared under the name it is written with.
+    fn default_function_name(&self, assignment: Node<'_>) -> Option<crate::ByteRange> {
+        let binding = self.exports.bindings.get(&assignment.id())?;
+        let function = self.kinds.expression_value(
+            self.kinds
+                .child(assignment, EcmaScriptGrammarField::Right)?,
+        );
+        let written = self.kinds.child(function, EcmaScriptGrammarField::Name)?;
+        let written = extract::byte_range(written).ok()?;
+        (binding.kind == SyntaxExportKind::Default && binding.local == Some(written))
+            .then_some(written)
+    }
+
+    /// The name an exported function assignment declares: the written name of a named
+    /// function given to `module.exports`, else the export name.
+    fn export_function_name<'text>(
+        &self,
+        assignment: Node<'_>,
+        text: &'text str,
+    ) -> Option<&'text str> {
+        let name = self.kinds.export_function_name(assignment, text)?;
+        let written = self.default_function_name(assignment).and_then(|range| {
+            text.get(usize::try_from(range.start).ok()?..usize::try_from(range.end).ok()?)
+        });
+        Some(written.unwrap_or(name))
+    }
+
     /// The export statement directly carrying this declaration.
     fn declaration_export<'tree>(&self, visited: Visited<'_, 'tree>) -> Option<Node<'tree>> {
         let mut parent = visited.parent()?;
@@ -1623,6 +1651,9 @@ impl GrammarRules for EcmaScriptRules<'_> {
         if self.exports.objects.contains(&syntax_element.id()) {
             return extract::byte_range(syntax_element).map(Some);
         }
+        if let Some(written) = self.default_function_name(syntax_element) {
+            return Ok(Some(written));
+        }
         let named_by_itself = syntax_element.kind_id() == self.kinds.identifier
             || syntax_element.kind_id() == self.kinds.shorthand_property_identifier_pattern
             || syntax_element.kind_id() == self.kinds.property_identifier;
@@ -1678,7 +1709,7 @@ impl GrammarRules for EcmaScriptRules<'_> {
             }));
         }
         if let Some((_, function)) = self.kinds.export_function(syntax_element, text) {
-            let Some(name) = self.kinds.export_function_name(syntax_element, text) else {
+            let Some(name) = self.export_function_name(syntax_element, text) else {
                 return Ok(None);
             };
             let body = self.kinds.child(function, EcmaScriptGrammarField::Body);
@@ -1779,7 +1810,7 @@ impl GrammarRules for EcmaScriptRules<'_> {
     }
 
     fn container_name(&self, syntax_element: Node<'_>, text: &str) -> Option<String> {
-        if let Some(name) = self.kinds.export_function_name(syntax_element, text) {
+        if let Some(name) = self.export_function_name(syntax_element, text) {
             return Some(name.to_owned());
         }
         if self.exports.objects.contains(&syntax_element.id()) {

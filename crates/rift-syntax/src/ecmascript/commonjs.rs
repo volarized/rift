@@ -208,8 +208,12 @@ fn assignment(
         return Ok(None);
     };
     let range = extract::byte_range(syntax_element)?;
-    if let Some((property, _)) = kinds.export_function(syntax_element, source) {
-        let name = extract::byte_range(property)?;
+    if let Some((property, function)) = kinds.export_function(syntax_element, source) {
+        // A named function assigned to `module.exports` is declared under its own name.
+        let written = (target == ExportTarget::Module)
+            .then(|| kinds.child(function, EcmaScriptGrammarField::Name))
+            .flatten();
+        let name = extract::byte_range(written.unwrap_or(property))?;
         return Ok(Some(SyntaxExportBinding {
             kind: if target == ExportTarget::Property {
                 SyntaxExportKind::Named
@@ -225,9 +229,6 @@ fn assignment(
         }));
     }
     if target == ExportTarget::Property {
-        return Ok(None);
-    }
-    let Some(value) = kinds.child(syntax_element, EcmaScriptGrammarField::Right) else {
         // `exports.name = local` exports the declaration the local name binds.
         let property = kinds.child(left, EcmaScriptGrammarField::Property);
         let value = kinds.child(syntax_element, EcmaScriptGrammarField::Right);
@@ -246,6 +247,9 @@ fn assignment(
             container: None,
             type_only: false,
         }));
+    }
+    let Some(value) = kinds.child(syntax_element, EcmaScriptGrammarField::Right) else {
+        return Ok(None);
     };
     if value.kind() != "call_expression"
         || value
