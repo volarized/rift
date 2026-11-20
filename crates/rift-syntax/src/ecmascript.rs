@@ -1451,17 +1451,13 @@ impl EcmaScriptRules<'_> {
     /// whitespace holding at most one line break. Each step reads the previous
     /// sibling the shared walk recorded, so the walk costs the run's length.
     fn jsdoc_run<'tree>(&self, front: Visited<'_, 'tree>, text: &str) -> Vec<Node<'tree>> {
-        self.jsdoc_run_node(front.syntax_element(), text)
-    }
-
-    fn jsdoc_run_node<'tree>(&self, front: Node<'tree>, text: &str) -> Vec<Node<'tree>> {
         let mut run = Vec::new();
         let mut front = front;
-        while let Some(previous) = front.prev_sibling().filter(Node::is_named) {
-            if !self.attaches(previous, front, text) {
+        while let Some(previous) = front.previous_sibling() {
+            if !self.attaches(previous.syntax_element(), front.syntax_element(), text) {
                 break;
             }
-            run.push(previous);
+            run.push(previous.syntax_element());
             front = previous;
         }
         run
@@ -1491,15 +1487,7 @@ impl EcmaScriptRules<'_> {
         statement: Visited<'_, '_>,
         text: &str,
     ) -> Result<(Vec<Documentation>, Vec<ByteRange>), RiftError> {
-        self.attached_jsdoc_node(statement.syntax_element(), text)
-    }
-
-    fn attached_jsdoc_node(
-        &self,
-        statement: Node<'_>,
-        text: &str,
-    ) -> Result<(Vec<Documentation>, Vec<ByteRange>), RiftError> {
-        let mut run = self.jsdoc_run_node(statement, text);
+        let mut run = self.jsdoc_run(statement, text);
         run.reverse();
         let mut blocks = Vec::with_capacity(run.len());
         let mut ranges = Vec::with_capacity(run.len());
@@ -1896,7 +1884,7 @@ pub(crate) fn analyze_included(
             crate::static_analysis::Capture::for_javascript(source.text)
         }
     });
-    let (syntax_elements, mut symbols, export_bindings) = extract::extract_with_capture(
+    let ((syntax_elements, mut symbols, export_bindings), visits) = extract::extract_with_visits(
         tree.root_node(),
         source,
         limits,
@@ -1911,6 +1899,7 @@ pub(crate) fn analyze_included(
             source.text,
             language,
             facts,
+            &visits,
             &assignments,
             &mut symbols,
         )?;

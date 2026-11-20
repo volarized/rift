@@ -8,7 +8,7 @@ use rift_protocol::read::{Language, SymbolKind};
 use tree_sitter::Node;
 
 use super::{EcmaScriptGrammarField, EcmaScriptRules, EcmaScriptSymbolKind};
-use crate::extract::{self, Declaration, GrammarRules};
+use crate::extract::{self, Declaration, GrammarRules, Visited, Visits};
 use crate::{ByteRange, StaticBinding, StaticBindingKind, StaticFacts, SyntaxSymbol};
 
 struct Bindings<'source> {
@@ -65,14 +65,17 @@ impl<'source> Bindings<'source> {
         }
     }
 
-    fn owner(&self, receiver: Node<'_>, source: &str, prototype: bool) -> Option<usize> {
+    fn owner(&self, function: MemberFunction<'_, '_>, source: &str) -> Option<usize> {
+        let receiver = function.receiver;
+        let prototype = function.prototype;
         let name = source.get(receiver.byte_range())?;
         if prototype && self.replaced.contains(name) {
             return None;
         }
-        let mut ancestor = receiver.parent();
+        let mut ancestor = Some(function.visited);
         // The shared walk has admitted the source depth before this lookup.
-        while let Some(scope) = ancestor {
+        while let Some(visited) = ancestor {
+            let scope = visited.syntax_element();
             if self.blocked.contains(&extract::byte_range(scope).ok()?) {
                 return None;
             }
@@ -83,14 +86,15 @@ impl<'source> Bindings<'source> {
                 }
                 return self.symbols.get(&binding.name).copied().flatten();
             }
-            ancestor = scope.parent();
+            ancestor = visited.parent();
         }
         None
     }
 }
 
 #[derive(Clone, Copy)]
-struct MemberFunction<'tree> {
+struct MemberFunction<'walk, 'tree> {
+    visited: Visited<'walk, 'tree>,
     assignment: Node<'tree>,
     receiver: Node<'tree>,
     name: Node<'tree>,
@@ -98,11 +102,12 @@ struct MemberFunction<'tree> {
     prototype: bool,
 }
 
-fn member_function<'tree>(
+fn member_function<'walk, 'tree>(
     rules: &EcmaScriptRules<'_>,
-    assignment: Node<'tree>,
+    visited: Visited<'walk, 'tree>,
     source: &str,
-) -> Option<MemberFunction<'tree>> {
+) -> Option<MemberFunction<'walk, 'tree>> {
+    let assignment = visited.syntax_element();
     let kinds = rules.kinds;
     let left = kinds.child(assignment, EcmaScriptGrammarField::Left)?;
     if left.kind_id() != kinds.member_expression {
@@ -135,6 +140,7 @@ fn member_function<'tree>(
         .function_values
         .contains(&value.kind_id())
         .then_some(MemberFunction {
+            visited,
             assignment,
             receiver,
             name,
@@ -143,29 +149,35 @@ fn member_function<'tree>(
         })
 }
 
-pub(super) fn record(
+pub(super) fn record<'tree>(
     rules: &EcmaScriptRules<'_>,
     source: &str,
     language: &Language,
     facts: &StaticFacts,
-    assignments: &[Node<'_>],
+    visits: &Visits<'tree>,
+    assignments: &[Node<'tree>],
     symbols: &mut Vec<SyntaxSymbol>,
 ) -> Result<(), RiftError> {
     let functions = assignments
         .iter()
-        .filter_map(|&assignment| member_function(rules, assignment, source))
+        .filter_map(|&assignment| {
+            let visited = visits.containing(extract::byte_range(assignment).ok()?)?;
+            (visited.syntax_element() == assignment)
+                .then(|| member_function(rules, visited, source))
+                .flatten()
+        })
         .collect::<Vec<_>>();
     if functions.is_empty() {
         return Ok(());
     }
     let bindings = Bindings::new(source, facts, symbols);
-    let mut declarations = DeclarationNames::new(functions[0].assignment, rules, facts, symbols);
+    let mut declarations = DeclarationNames::new(visits, rules, facts, symbols);
     let mut containers = BTreeMap::new();
     // Assignments and declarations share the admitted syntax count. Renaming touches only
     // declarations in a callable's source interval, at most once per admitted ancestor depth.
     for function in functions {
         let assignment = function.assignment;
-        let Some(owner) = bindings.owner(function.receiver, source, function.prototype) else {
+        let Some(owner) = bindings.owner(function, source) else {
             continue;
         };
         if (function.prototype && !matches!(symbols[owner].kind, "function" | "class"))
@@ -186,7 +198,7 @@ pub(super) fn record(
             name,
             !function.prototype && matches!(symbols[owner].kind, "function" | "class"),
         )?;
-        let parent = qualification(rules, assignment, source, &containers);
+        let parent = qualification(rules, function.visited, source, &containers);
         declarations
             .outlined
             .insert(extract::byte_range(function.value)?);
@@ -214,14 +226,15 @@ pub(super) fn record(
 
 fn qualification(
     rules: &EcmaScriptRules<'_>,
-    assignment: Node<'_>,
+    assignment: Visited<'_, '_>,
     source: &str,
     containers: &BTreeMap<usize, String>,
 ) -> String {
     let mut parts = Vec::new();
     let mut ancestor = assignment.parent();
     // Parent traversal is bounded by the shared walk's admitted depth.
-    while let Some(element) = ancestor {
+    while let Some(visited) = ancestor {
+        let element = visited.syntax_element();
         if let Some(container) = containers.get(&element.id()) {
             parts.push(container.clone());
             break;
@@ -229,14 +242,14 @@ fn qualification(
         if let Some(name) = rules.container_name(element, source) {
             parts.push(name);
         }
-        ancestor = element.parent();
+        ancestor = visited.parent();
     }
     parts.reverse();
     parts.join(".")
 }
 
-struct DeclarationNames<'tree> {
-    root: Node<'tree>,
+struct DeclarationNames<'walk, 'tree> {
+    visits: &'walk Visits<'tree>,
     ordered: Vec<usize>,
     names: BTreeMap<String, usize>,
     known: BTreeSet<usize>,
@@ -245,17 +258,13 @@ struct DeclarationNames<'tree> {
     outlined: BTreeSet<ByteRange>,
 }
 
-impl<'tree> DeclarationNames<'tree> {
+impl<'walk, 'tree> DeclarationNames<'walk, 'tree> {
     fn new(
-        mut root: Node<'tree>,
+        visits: &'walk Visits<'tree>,
         rules: &EcmaScriptRules<'_>,
         facts: &StaticFacts,
         symbols: &[SyntaxSymbol],
     ) -> Self {
-        // The source walk admitted every ancestor and declaration before this pass.
-        while let Some(parent) = root.parent() {
-            root = parent;
-        }
         let bodies = symbols
             .iter()
             .filter(|symbol| symbol.kinds.contains(&SymbolKind::Callable))
@@ -270,7 +279,7 @@ impl<'tree> DeclarationNames<'tree> {
         let mut ordered = (0..symbols.len()).collect::<Vec<_>>();
         ordered.sort_by_key(|&index| symbols[index].range.start);
         let mut declarations = Self {
-            root,
+            visits,
             ordered,
             names: BTreeMap::new(),
             known: BTreeSet::new(),
@@ -296,14 +305,11 @@ impl<'tree> DeclarationNames<'tree> {
 
     fn identity_known(&self, symbol: &SyntaxSymbol, rules: &EcmaScriptRules<'_>) -> bool {
         let range = symbol.name_range.unwrap_or(symbol.item_range);
-        let (Ok(start), Ok(end)) = (usize::try_from(range.start), usize::try_from(range.end))
-        else {
-            return false;
-        };
-        let mut ancestor = self.root.descendant_for_byte_range(start, end);
+        let mut ancestor = self.visits.containing(range);
         // Unnamed function values cannot supply a qualified owner. A checked member
         // assignment supplies its own receiver path, even inside an unnamed callback.
-        while let Some(element) = ancestor {
+        while let Some(visited) = ancestor {
+            let element = visited.syntax_element();
             if rules.kinds.function_values.contains(&element.kind_id()) {
                 let Ok(value) = extract::byte_range(element) else {
                     return false;
@@ -320,7 +326,7 @@ impl<'tree> DeclarationNames<'tree> {
                     return false;
                 }
             }
-            ancestor = element.parent();
+            ancestor = visited.parent();
         }
         true
     }
@@ -387,7 +393,7 @@ fn replace_parent(name: &str, parent: &str, qualified: &str) -> String {
 fn method_declaration(
     rules: &EcmaScriptRules<'_>,
     source: &str,
-    function: MemberFunction<'_>,
+    function: MemberFunction<'_, '_>,
     name: &str,
     static_member: bool,
 ) -> Result<Declaration, RiftError> {
@@ -401,7 +407,7 @@ fn method_declaration(
         kinds.push(SymbolKind::Static);
     }
     let (documentation, documentation_ranges) =
-        rules.attached_jsdoc_node(statement(function, rules), source)?;
+        rules.attached_jsdoc(statement(function, rules), source)?;
     Ok(Declaration {
         name: name.to_owned(),
         kind: EcmaScriptSymbolKind::Method.word(),
@@ -415,7 +421,7 @@ fn method_declaration(
 
 fn method(
     rules: &EcmaScriptRules<'_>,
-    function: MemberFunction<'_>,
+    function: MemberFunction<'_, '_>,
     declaration: Declaration,
     container: String,
     qualified_name: String,
@@ -424,7 +430,7 @@ fn method(
 ) -> Result<SyntaxSymbol, RiftError> {
     let item_range = extract::byte_range(function.assignment)?;
     let start = rules
-        .jsdoc_run_node(statement(function, rules), source)
+        .jsdoc_run(statement(function, rules), source)
         .last()
         .copied()
         .map(extract::byte_range)
@@ -457,12 +463,15 @@ fn method(
     })
 }
 
-fn statement<'tree>(function: MemberFunction<'tree>, rules: &EcmaScriptRules<'_>) -> Node<'tree> {
+fn statement<'walk, 'tree>(
+    function: MemberFunction<'walk, 'tree>,
+    rules: &EcmaScriptRules<'_>,
+) -> Visited<'walk, 'tree> {
     function
-        .assignment
+        .visited
         .parent()
-        .filter(|parent| parent.kind_id() == rules.kinds.expression_statement)
-        .unwrap_or(function.assignment)
+        .filter(|parent| parent.syntax_element().kind_id() == rules.kinds.expression_statement)
+        .unwrap_or(function.visited)
 }
 
 fn text(source: &str, range: ByteRange) -> Option<&str> {
