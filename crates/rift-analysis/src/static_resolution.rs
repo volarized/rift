@@ -735,6 +735,11 @@ impl<'source> Index<'source> {
                     if file.document.facts.language().name == "python" {
                         occurrence.edge_from =
                             Some(self.python_identity(file, range, file.qualified_target(".")?)?);
+                    } else if matches!(
+                        file.document.facts.language().name.as_str(),
+                        "javascript" | "typescript"
+                    ) {
+                        occurrence.edge_from = self.javascript_module_from(file, range, work);
                     }
                     Some(occurrence)
                 });

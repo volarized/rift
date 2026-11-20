@@ -1208,6 +1208,40 @@ export function free(base: Base) { const { ctx } = base.process('a'); return ctx
 }
 
 #[test]
+fn test_typescript_module_augmentation_keeps_the_file_imports() {
+    // A file that augments another module is still a module of its own: the augmentation
+    // declares into the other module, and the file's imports stay the file's.
+    let main = "import type { Base } from './other.ts'
+import { value } from './other.ts'
+declare module './other' {
+  interface Added { added: Base }
+}
+export const use: Base = value
+";
+    let other = "export interface Base { base: number }
+export const value: Base = { base: 1 }
+";
+    let (_directory, index) =
+        workspace_with_manifest(&[("main.ts", main), ("other.ts", other)], module_manifest());
+    for target in ["other.ts/Base", "other.ts/value"] {
+        assert!(
+            index.edges().edges().any(|edge| {
+                edge.kind() == EdgeKind::Imports
+                    && edge.from().as_str().ends_with(".%2Fmain.ts")
+                    && edge.to().as_str().ends_with(target)
+            }),
+            "{target}"
+        );
+    }
+    assert!(has_edge(
+        &index,
+        EdgeKind::HasType,
+        "main.ts/use",
+        "other.ts/Base"
+    ));
+}
+
+#[test]
 fn test_typescript_members_of_values_bound_to_declared_call_results() {
     // A name bound to a call takes the named type the resolved callee declares as its
     // return type.

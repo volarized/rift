@@ -86,12 +86,14 @@ impl<'source> Index<'source> {
                     self.javascript_module_reference(file, reference.target, reference.role, work)
                 });
             if let Some(occurrence) = &mut occurrence {
-                occurrence.edge_from = self.javascript_assignment_reference_from(
-                    file,
-                    reference.target,
-                    reference.role,
-                    work,
-                );
+                occurrence.edge_from = self
+                    .javascript_assignment_reference_from(
+                        file,
+                        reference.target,
+                        reference.role,
+                        work,
+                    )
+                    .or_else(|| self.javascript_module_from(file, reference.target, work));
             }
             result.record(occurrence);
         }
@@ -158,6 +160,22 @@ impl<'source> Index<'source> {
         work: &mut Work,
         result: &mut StaticResolution,
     ) {
+    /// The source of an occurrence written outside every declaration of its file: the
+    /// file's own module. A file can declare into another module (an ambient module
+    /// declaration), so its declarations alone do not always name one module.
+    pub(super) fn javascript_module_from(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+    ) -> Option<SymbolId> {
+        let scopes = self.javascript.scopes.get(file.document.path.as_str())?;
+        if scopes.definitions.resolve(range.start, range.end).is_some() {
+            return None;
+        }
+        self.javascript_module_identity(file, work)
+    }
+
         let module = self.javascript_module_identity(file, work);
         self.javascript_alias_edges(file, module.as_ref(), work, result);
         for symbol in file.document.facts.symbols() {
@@ -452,6 +470,10 @@ impl<'source> Index<'source> {
         }
         // A constructor is invoked through `super`, never inherited and replaced.
         if symbol.name == "constructor" {
+            if path.is_empty() {
+                // An ambient module declaration is named outside the file's module.
+                continue;
+            }
             return;
         }
         let Some(from) = self.javascript_identity(Target {
