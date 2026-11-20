@@ -1714,21 +1714,16 @@ impl WorkspaceIndexPreparation {
         Ok(self.total().expect("discovery has completed"))
     }
 
-    /// Next bounded publication count: the first completed batch, then doubled counts,
-    /// ending exactly at the selected file total.
+    /// Next bounded publication count: the first completed batch, then the selected file
+    /// total.
+    ///
+    /// Every publication builds semantic facts, documentation, and the declaration
+    /// inventory over all of its prepared files. A publication of a growing part of the
+    /// files builds them again for the files the one before it held, so preparation
+    /// publishes the first batch for early reads and then the complete index.
     #[must_use]
     pub fn next_checkpoint(&self) -> Option<usize> {
-        let total = self.total()?;
-        let prepared = self.prepared();
-        if prepared == total {
-            return None;
-        }
-        let next = if prepared == 0 {
-            SOURCE_BATCH_FILES
-        } else {
-            prepared.saturating_mul(2)
-        };
-        Some(next.min(total))
+        checkpoint_after(self.prepared(), self.total()?)
     }
 
     /// Number of selected visible files, once discovery has completed.
@@ -6810,6 +6805,17 @@ fn read_text_file(
 /// the reads run past a `workspace_bytes_max` refusal.
 const SOURCE_BATCH_FILES: usize = 512;
 
+/// The publication count that follows `prepared` of `total` selected files.
+fn checkpoint_after(prepared: usize, total: usize) -> Option<usize> {
+    if prepared == total {
+        None
+    } else if prepared == 0 {
+        Some(SOURCE_BATCH_FILES.min(total))
+    } else {
+        Some(total)
+    }
+}
+
 /// Counts one kept file's bytes against `workspace_bytes_max`.
 fn count_workspace_bytes(
     workspace_bytes: &mut usize,
@@ -8146,6 +8152,26 @@ mod tests {
                 .discovered_paths_unchanged(&visibility, &|| false)
                 .expect("discovery has not run")
         );
+    }
+
+    #[test]
+    fn preparation_publishes_the_first_batch_and_then_the_complete_index() {
+        let checkpoints = |total: usize| {
+            let mut counts = Vec::new();
+            let mut prepared = 0;
+            while let Some(next) = checkpoint_after(prepared, total) {
+                assert!(prepared < next && next <= total, "total={total}");
+                counts.push(next);
+                prepared = next;
+            }
+            counts
+        };
+        assert_eq!(checkpoints(0), Vec::<usize>::new());
+        assert_eq!(checkpoints(300), [300]);
+        assert_eq!(checkpoints(SOURCE_BATCH_FILES), [SOURCE_BATCH_FILES]);
+        assert_eq!(checkpoints(514), [SOURCE_BATCH_FILES, 514]);
+        assert_eq!(checkpoints(19_466), [SOURCE_BATCH_FILES, 19_466]);
+        assert_eq!(checkpoints(1_000_000), [SOURCE_BATCH_FILES, 1_000_000]);
     }
 
     #[test]
