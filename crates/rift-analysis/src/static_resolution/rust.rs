@@ -27,6 +27,7 @@ pub(super) struct Namespaces<'source> {
     bounds: BTreeMap<(&'source str, ByteRange), Vec<ByteRange>>,
     unavailable: BTreeSet<(&'source str, ByteRange)>,
     return_owners: BTreeMap<(&'source str, ByteRange), Target<'source>>,
+    referents: BTreeMap<(&'source str, ByteRange), (Target<'source>, Target<'source>)>,
     initializers: BTreeMap<(&'source str, ByteRange), Option<&'source StaticCall>>,
     conditional_modules: BTreeSet<Vec<String>>,
     inactive_modules: BTreeSet<Vec<String>>,
@@ -162,6 +163,7 @@ impl<'source> Namespaces<'source> {
         namespaces.index_field_types(files, work)?;
         namespaces.index_bounds(files, work)?;
         namespaces.index_returns(files, work)?;
+        namespaces.index_referents(files, work)?;
         Some(namespaces)
     }
 
@@ -287,6 +289,192 @@ impl<'source> Namespaces<'source> {
             }
         }
         Some(())
+    }
+
+    /// Records the nominal type behind each `&T` / `&mut T` implementation owner: method
+    /// and field lookup through such a receiver also reaches `T`'s members.
+    fn index_referents(
+        &mut self,
+        files: &BTreeMap<&'source str, File<'source>>,
+        work: &mut Work,
+    ) -> Option<()> {
+        for (&path, file) in files
+            .iter()
+            .filter(|(_, file)| file.document.facts.language().name == "rust")
+        {
+            for implementation in file.facts.inherent_impls() {
+                if !work.charge() {
+                    return None;
+                }
+                let Some(owner) = file
+                    .target_at(implementation.type_path)
+                    .filter(|owner| structural_owner(*owner) && owner.symbol.name.starts_with('&'))
+                else {
+                    continue;
+                };
+                let Some(reference) = file.facts.references().iter().find(|reference| {
+                    work.charge()
+                        && reference.role == rift_core::ReferenceRole::Type
+                        && implementation.type_path.encloses(reference.target)
+                }) else {
+                    continue;
+                };
+                // Only `&`, a lifetime and `mut` may precede the referent's path.
+                let Some(prefix) = file
+                    .text(ByteRange {
+                        start: implementation.type_path.start,
+                        end: reference.target.start,
+                    })
+                    .and_then(|prefix| prefix.strip_prefix('&'))
+                else {
+                    continue;
+                };
+                let prefix = prefix.trim_start();
+                let prefix = prefix
+                    .strip_prefix('\'')
+                    .map_or(prefix, |lifetime| {
+                        lifetime.trim_start_matches(|character: char| {
+                            character.is_alphanumeric() || character == '_'
+                        })
+                    })
+                    .trim_start();
+                let prefix = prefix.strip_prefix("mut").unwrap_or(prefix);
+                if !prefix.trim().is_empty() {
+                    continue;
+                }
+                if let Some(referent) =
+                    self.type_target(file, reference.target, work)
+                        .filter(|referent| {
+                            matches!(referent.symbol.kind, "struct" | "enum" | "union_item")
+                        })
+                {
+                    self.referents
+                        .insert((path, owner.symbol.item_range), (owner, referent));
+                }
+            }
+        }
+        Some(())
+    }
+
+    /// The nominal type a reference implementation owner refers to.
+    fn referent(&self, owner: Target<'source>) -> Option<Target<'source>> {
+        self.referents
+            .get(&(owner.file.path.as_str(), owner.symbol.item_range))
+            .map(|(_, referent)| *referent)
+    }
+
+    /// Method lookup through a receiver whose owner is `&T` / `&mut T`, following the
+    /// language's receiver probing order over the reference's own implementations (`A`)
+    /// and `T`'s methods (`B`), each classified by its `self` parameter:
+    ///
+    /// 1. receiver type itself: `A` by value, `B` by `&self` (`&mut self` for `&mut T`);
+    /// 2. `&R`: `A` by `&self`; 3. `&mut R`: `A` by `&mut self`;
+    /// 4. `T`: `B` by value; 5. `B` by the other reference kind.
+    ///
+    /// The first step with candidates decides: one candidate, or one inherent method among
+    /// them, is selected; anything else, or a receiver form not listed, stays unresolved.
+    fn receiver_method_of(
+        &self,
+        file: &File<'source>,
+        position: u64,
+        owner: Target<'source>,
+        member: &str,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let Some(referent) = self.referent(owner) else {
+            return self.inherent_method(file, position, owner, member, work);
+        };
+        let unique = owner.symbol.name.starts_with("&mut");
+        let mut reference = Vec::new();
+        let mut nominal = Vec::new();
+        // Implementations for the same reference kind of `T` may sit in other modules,
+        // each with its own owner identity; all of them are the receiver type's methods.
+        let owners = self
+            .referents
+            .values()
+            .filter(|(other, other_referent)| {
+                other_referent.file.path == referent.file.path
+                    && other_referent.symbol.item_range == referent.symbol.item_range
+                    && other.symbol.name.starts_with("&mut") == unique
+            })
+            .map(|(other, _)| (*other, true))
+            .chain([(referent, false)])
+            .collect::<Vec<_>>();
+        let mut visited = BTreeSet::new();
+        for (candidates, is_reference) in owners {
+            let side = if is_reference {
+                &mut reference
+            } else {
+                &mut nominal
+            };
+            let Some(mut path) = candidates.admitted_path() else {
+                continue;
+            };
+            if !visited.insert(path.clone()) {
+                continue;
+            }
+            path.push(member.to_owned());
+            for method in self.methods.get(&path).into_iter().flatten() {
+                if !work.charge() || !self.available(method.target) {
+                    return None;
+                }
+                let kind = self_kind(method.target)?;
+                if kind != SelfKind::Absent {
+                    side.push((*method, kind, trait_method(method)?));
+                }
+            }
+        }
+        let (first, last) = if unique {
+            (SelfKind::Unique, SelfKind::Shared)
+        } else {
+            (SelfKind::Shared, SelfKind::Unique)
+        };
+        if reference
+            .iter()
+            .chain(&nominal)
+            .any(|(_, kind, _)| *kind == SelfKind::Other)
+        {
+            return None;
+        }
+        let steps = [
+            (Some(SelfKind::Value), Some(first)),
+            (Some(SelfKind::Shared), None),
+            (Some(SelfKind::Unique), None),
+            (None, Some(SelfKind::Value)),
+            (None, Some(last)),
+        ];
+        for (from_reference, from_nominal) in steps {
+            let found = reference
+                .iter()
+                .filter(|(_, kind, _)| Some(*kind) == from_reference)
+                .chain(
+                    nominal
+                        .iter()
+                        .filter(|(_, kind, _)| Some(*kind) == from_nominal),
+                )
+                .collect::<Vec<_>>();
+            if found.is_empty() {
+                continue;
+            }
+            let inherent = found
+                .iter()
+                .filter(|(_, _, implemented)| !implemented)
+                .collect::<Vec<_>>();
+            let target = match (inherent.as_slice(), found.as_slice()) {
+                ([(method, _, _)], _) | ([], [(method, _, _)]) => method.target,
+                _ => return None,
+            };
+            return (target.symbol.visibility.as_deref() == Some("pub")
+                || self.declaration_visible(file, position, target, work)
+                || target.symbol.visibility.is_none())
+            .then_some(target);
+        }
+        None
+    }
+
+    /// The owner whose fields a receiver of `owner` reads: a reference owner's referent.
+    fn field_owner(&self, owner: Target<'source>) -> Target<'source> {
+        self.referent(owner).unwrap_or(owner)
     }
 
     fn index_aliases(
@@ -1388,6 +1576,83 @@ fn unadmitted_alternatives<'source>(
         }
     }
     Some(unadmitted)
+}
+
+/// Whether a method belongs to a trait implementation rather than an inherent one.
+fn trait_method(method: &Method<'_>) -> Option<bool> {
+    Some(
+        method
+            .target
+            .file
+            .facts
+            .static_facts()?
+            .heritage_edges()
+            .iter()
+            .any(|edge| edge.from == method.implementation.type_path),
+    )
+}
+
+/// How a method takes its receiver.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelfKind {
+    /// `self` or `mut self`.
+    Value,
+    /// `&self`, with or without a lifetime.
+    Shared,
+    /// `&mut self`, with or without a lifetime.
+    Unique,
+    /// A typed receiver such as `self: Box<Self>`, or an unrecognized form.
+    Other,
+    /// No `self` parameter: not callable with method syntax.
+    Absent,
+}
+
+/// The receiver form written on a method's `self` parameter.
+fn self_kind(method: Target<'_>) -> Option<SelfKind> {
+    let source = method.file.source;
+    let facts = method.file.facts.static_facts()?;
+    let Some(binding) = facts.bindings().iter().find(|binding| {
+        matches!(
+            binding.kind,
+            rift_syntax::StaticBindingKind::RustReceiver { .. }
+        ) && method.symbol.item_range.encloses(binding.scope)
+            && source.get(
+                usize::try_from(binding.name.start).unwrap_or(usize::MAX)
+                    ..usize::try_from(binding.name.end).unwrap_or(usize::MAX),
+            ) == Some("self")
+    }) else {
+        return Some(SelfKind::Absent);
+    };
+    let start = usize::try_from(method.symbol.item_range.start).ok()?;
+    let name = usize::try_from(binding.name.start).ok()?;
+    let end = usize::try_from(binding.name.end).ok()?;
+    let before = source.get(start..name)?;
+    let parameter = before.rsplit_once('(')?.1.trim();
+    let after = source.get(end..)?.trim_start();
+    if after.starts_with(':') {
+        return Some(SelfKind::Other);
+    }
+    let Some(reference) = parameter.strip_prefix('&') else {
+        return Some(if matches!(parameter, "" | "mut") {
+            SelfKind::Value
+        } else {
+            SelfKind::Other
+        });
+    };
+    let reference = reference.trim_start();
+    let reference = reference
+        .strip_prefix('\'')
+        .map_or(reference, |lifetime| {
+            lifetime.trim_start_matches(|character: char| {
+                character.is_alphanumeric() || character == '_'
+            })
+        })
+        .trim();
+    Some(match reference {
+        "" => SelfKind::Shared,
+        "mut" => SelfKind::Unique,
+        _ => SelfKind::Other,
+    })
 }
 
 fn structural_owner(target: Target<'_>) -> bool {

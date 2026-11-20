@@ -1239,6 +1239,46 @@ fn test_rust_alternative_path_modules_keep_every_declaration_identity() {
     }
 }
 
+const PLAIN_MANIFEST: &str = "[package]\nname='fixture'\nversion='0.1.0'\n";
+
+#[test]
+fn test_rust_reference_receivers_reach_the_referent_members() {
+    // A method of an impl for `&mut Reader` reaches `Reader`'s methods and fields
+    // through its receiver. `both` follows the probing order: the implementation's `&self`
+    // method (receiver `&&mut Reader`) comes before `Reader`'s `&self` method after a
+    // dereference. `Other::step` and the unknown `missing` are never targets.
+    let source = "pub trait Visit { fn visit(self) -> u8; fn both(&self) -> u8; }\npub struct Reader { pub count: u8 }\npub struct Other { pub count: u8 }\nimpl Reader { fn step(&mut self) -> u8 { self.count } fn both(&self) -> u8 { 0 } }\nimpl Other { fn step(&self) -> u8 { self.count } }\nimpl<'a> Visit for &'a mut Reader {\n    fn visit(self) -> u8 { self.step() + self.count + self.both() + self.missing() }\n    fn both(&self) -> u8 { 1 }\n}\n";
+    let (_directory, index) = fixture_index(PLAIN_MANIFEST, &[("src/lib.rs", source)]);
+    for (kind, to) in [
+        (EdgeKind::Calls, "/Reader/step"),
+        (EdgeKind::Reads, "/Reader/step"),
+        (EdgeKind::Reads, "/Reader/count"),
+        (EdgeKind::Calls, "/&mut%20Reader/both"),
+    ] {
+        assert!(
+            has_edge(&index, kind, "/visit", to),
+            "missing {kind:?} visit -> {to}"
+        );
+    }
+    let visit_targets = index
+        .edges()
+        .edges()
+        .filter(|edge| {
+            edge.from().as_str().ends_with("/visit")
+                && matches!(edge.kind(), EdgeKind::Calls | EdgeKind::Reads)
+        })
+        .map(|edge| edge.to().as_str().to_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        visit_targets
+            .iter()
+            .all(|to| to.ends_with("/fixture/Reader/step")
+                || to.ends_with("/fixture/Reader/count")
+                || to.ends_with("/fixture/&mut%20Reader/both")),
+        "{visit_targets:?}"
+    );
+}
+
 #[test]
 fn test_rust_inactive_alternative_modules_are_never_endpoints() {
     // `pub use self::imp::Write` names `std::io` under the default feature; the inactive
@@ -1280,4 +1320,62 @@ fn test_rust_inactive_alternative_modules_are_never_endpoints() {
             "inactive alternative endpoint: {edge:?}"
         );
     }
+}
+
+#[test]
+fn test_rust_reference_receivers_follow_the_probing_order() {
+    // In `impl Source for &Value`, `self.read()` (self: &Value) selects the reference
+    // implementation's by-value `read` before `Value`'s by-value `read`; `self.peek()` finds
+    // `Value`'s `&self` method first.
+    let source = "pub trait Source { fn read(self) -> u8; fn copy(self) -> u8; }\npub struct Value;\nimpl Value { pub fn peek(&self) -> u8 { 0 } }\nimpl Source for Value { fn read(self) -> u8 { 1 } fn copy(self) -> u8 { self.read() } }\nimpl<'a> Source for &'a Value { fn read(self) -> u8 { self.peek() } fn copy(self) -> u8 { self.read() } }\n";
+    let (_directory, index) = fixture_index(PLAIN_MANIFEST, &[("src/lib.rs", source)]);
+    let calls = index
+        .edges()
+        .edges()
+        .filter(|edge| edge.kind() == EdgeKind::Calls)
+        .map(|edge| {
+            (
+                edge.from().as_str().to_owned(),
+                edge.to().as_str().to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let reference_copy = calls
+        .iter()
+        .filter(|(from, _)| from.ends_with("/copy") && from.contains('&'))
+        .map(|(_, to)| to.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(reference_copy.len(), 1, "{calls:?}");
+    assert!(
+        reference_copy[0].contains('&') && reference_copy[0].ends_with("/read"),
+        "{calls:?}"
+    );
+    assert!(
+        calls.iter().any(|(from, to)| from.ends_with("/read")
+            && from.contains('&')
+            && to.ends_with("/Value/peek")),
+        "{calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|(from, to)| from.ends_with("/Value/copy") && to.ends_with("/Value/read")),
+        "{calls:?}"
+    );
+}
+
+#[test]
+fn test_rust_reference_receivers_see_implementations_in_other_modules() {
+    // `self: &Map` in a module other than the one implementing `Walk for &Map` still finds
+    // that implementation's by-value `walk` before `Map`'s by-value `walk`.
+    let source = "pub trait Walk { fn walk(self) -> u8; }\npub struct Map;\nimpl Walk for Map { fn walk(self) -> u8 { 1 } }\nimpl<'a> Walk for &'a Map { fn walk(self) -> u8 { 2 } }\npub mod de {\n    pub trait Read { fn read(self) -> u8; }\n    impl<'a> Read for &'a super::Map { fn read(self) -> u8 { use super::Walk; self.walk() } }\n}\n";
+    let (_directory, index) = fixture_index(PLAIN_MANIFEST, &[("src/lib.rs", source)]);
+    let targets = index
+        .edges()
+        .edges()
+        .filter(|edge| edge.kind() == EdgeKind::Calls && edge.from().as_str().ends_with("/read"))
+        .map(|edge| edge.to().as_str().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(targets.len(), 1, "{targets:?}");
+    assert!(targets[0].ends_with("/fixture/&Map/walk"), "{targets:?}");
 }

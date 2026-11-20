@@ -168,7 +168,7 @@ impl<'source> Namespaces<'source> {
         };
         self.receiver_target(file, receiver, work)
             .and_then(|owner| {
-                let mut path = owner.admitted_path()?;
+                let mut path = self.field_owner(owner).admitted_path()?;
                 path.push(member.trim().to_owned());
                 self.fields.get(&path).copied().flatten().filter(|target| {
                     target.symbol.kind == "field_declaration"
@@ -201,7 +201,7 @@ impl<'source> Namespaces<'source> {
         }
         let type_path = match self.receiver_owner_at_depth(file, receiver, work, depth)? {
             ReceiverOwner::Target(owner) => {
-                return self.inherent_method(file, receiver.start, owner, member, work);
+                return self.receiver_method_of(file, receiver.start, owner, member, work);
             }
             ReceiverOwner::TypePath(type_path) => type_path,
         };
@@ -276,7 +276,7 @@ impl<'source> Namespaces<'source> {
             else {
                 return None;
             };
-            let mut path = target.admitted_path()?;
+            let mut path = self.field_owner(target).admitted_path()?;
             path.push(member.trim().to_owned());
             self.fields.get(&path).copied().flatten().filter(|target| {
                 self.available(*target)
@@ -384,7 +384,7 @@ impl<'source> Namespaces<'source> {
         else {
             return None;
         };
-        let mut path = owner.admitted_path()?;
+        let mut path = self.field_owner(owner).admitted_path()?;
         path.push(member.trim().to_owned());
         self.fields.get(&path).copied().flatten().filter(|target| {
             self.available(*target) && self.declaration_visible(file, range.start, *target, work)
