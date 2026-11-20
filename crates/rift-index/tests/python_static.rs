@@ -196,3 +196,57 @@ fn test_python_overloads_do_not_store_replaced_slots() {
                 || edge.to().as_str() != "rift://symbol/local/python/main/Owner/build")
     );
 }
+
+#[test]
+fn test_python_package_self_imports_store_submodule_imports_and_calls() {
+    let package = "from . import leaf\n";
+    let sibling = "from . import leaf\ndef use(): return leaf.target()\n";
+    let (_directory, index) = build(&[
+        ("pkg/__init__.py", package),
+        ("pkg/leaf.py", "def target(): pass\n"),
+        ("pkg/sibling.py", sibling),
+    ]);
+    for (kind, from, to, path, source, spelling) in [
+        (
+            "imports",
+            "pkg",
+            "pkg/leaf",
+            "pkg/__init__.py",
+            package,
+            "leaf",
+        ),
+        (
+            "imports",
+            "pkg/sibling",
+            "pkg/leaf",
+            "pkg/sibling.py",
+            sibling,
+            "leaf",
+        ),
+        (
+            "calls",
+            "pkg/sibling/use",
+            "pkg/leaf/target",
+            "pkg/sibling.py",
+            sibling,
+            "leaf.target()",
+        ),
+    ] {
+        let edge = index
+            .edges()
+            .edges()
+            .find(|edge| {
+                edge.kind().as_ref() == kind
+                    && edge.from().as_str() == format!("rift://symbol/local/python/{from}")
+                    && edge.to().as_str() == format!("rift://symbol/local/python/{to}")
+            })
+            .unwrap_or_else(|| panic!("{kind} {from} -> {to}: {:?}", index.edges()));
+        let binding = edge.occurrence();
+        assert_eq!(binding.unit().key().as_str(), path);
+        let start = usize::try_from(binding.range().start()).expect("start");
+        let end = usize::try_from(binding.range().end()).expect("end");
+        assert_eq!(&source[start..end], spelling);
+    }
+    assert!(index.edges().is_complete());
+    assert_eq!(index.edges().dropped_edges(), 0);
+}

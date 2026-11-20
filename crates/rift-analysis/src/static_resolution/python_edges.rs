@@ -363,10 +363,15 @@ impl<'source> Index<'source> {
                     let Some(export) = export else {
                         return self.module_value(&module);
                     };
-                    name = file.text(export)?;
+                    let exported = file.text(export)?;
                     let Some(path) = self.edge_python.path(&module) else {
-                        return self.module_value(&format!("{module}.{name}"));
+                        return self.module_value(&format!("{module}.{exported}"));
                     };
+                    if path == file.document.path.as_str() && exported == name {
+                        // A package importing a name from itself binds its submodule.
+                        return self.module_value(&format!("{module}.{exported}"));
+                    }
+                    name = exported;
                     file = self.files.get(path)?;
                 }
                 StaticBindingKind::PythonModule { module } => {
