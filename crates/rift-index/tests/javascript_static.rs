@@ -1579,3 +1579,67 @@ export function use(item) { return item.run() }
         edge.kind() == EdgeKind::Calls && edge.from().as_str().ends_with("main.ts/use")
     }));
 }
+
+#[test]
+fn test_commonjs_module_exports_of_a_declared_name_exports_that_declaration() {
+    // `module.exports = name` makes the declaration `name` binds the module's value, as
+    // `export default name` does for a module. A module that assigns its value twice, and
+    // a name assigned again, export nothing a call can trust. `new` constructs a function
+    // written with the `function` keyword, never an arrow function.
+    let error = "function AxiosError(message) { this.message = message }
+AxiosError.prototype.toJSON = function toJSON() { return {} };
+module.exports = AxiosError;
+";
+    let value = "'use strict';
+function sanitize(value) { return value }
+module.exports = sanitize;
+";
+    let replaced = "function first() { return 1 }
+function second() { return 2 }
+module.exports = first;
+module.exports = second;
+";
+    let moved = "let moved = function () { return 1 };
+moved = function () { return 2 };
+module.exports = moved;
+";
+    let main = "const AxiosError = require('./error.js');
+var sanitize = require('./value');
+const replaced = require('./replaced.js');
+const moved = require('./moved.js');
+function use() { sanitize(1); return new AxiosError('x') }
+const arrow = () => 1;
+function refuse() { return [replaced(), moved(), new arrow()] }
+function shadowed(require) { const local = require('./value'); return local(1) }
+exports.use = use;
+exports.refuse = refuse;
+exports.shadowed = shadowed;
+";
+    let (_directory, index) = workspace(&[
+        ("error.js", error),
+        ("value.js", value),
+        ("replaced.js", replaced),
+        ("moved.js", moved),
+        ("main.js", main),
+    ]);
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "main.js/use",
+        "value.js/sanitize"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "main.js/use",
+        "error.js/AxiosError"
+    ));
+    for caller in ["main.js/refuse", "main.js/shadowed"] {
+        assert!(
+            !index.edges().edges().any(|edge| {
+                edge.kind() == EdgeKind::Calls && edge.from().as_str().ends_with(caller)
+            }),
+            "{caller}"
+        );
+    }
+}

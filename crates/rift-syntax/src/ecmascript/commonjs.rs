@@ -251,6 +251,19 @@ fn assignment(
     let Some(value) = kinds.child(syntax_element, EcmaScriptGrammarField::Right) else {
         return Ok(None);
     };
+    if value.kind_id() == kinds.identifier {
+        // `module.exports = name` exports the declaration the name binds, as
+        // `export default name` does.
+        return Ok(Some(SyntaxExportBinding {
+            kind: SyntaxExportKind::Default,
+            range,
+            local: Some(extract::byte_range(value)?),
+            exported: None,
+            source: None,
+            container: None,
+            type_only: false,
+        }));
+    }
     if value.kind() != "call_expression"
         || value
             .child_by_field_name("function")

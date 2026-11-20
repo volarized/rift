@@ -132,6 +132,17 @@ fn manifest_directory(path: &str) -> Option<&str> {
     }
 }
 
+/// Whether `new` can construct the target: in JavaScript every function written with the
+/// `function` keyword is a constructor; an arrow function, a method and a generator are not.
+fn javascript_constructor_function(target: Target<'_>) -> bool {
+    javascript_source(target.file.path.as_str())
+        && target.symbol.kind == "function"
+        && matches!(
+            target.symbol.syntax_element_kind,
+            Some("function_declaration" | "function_expression" | "assignment_expression")
+        )
+}
+
 fn package_mode(text: &str) -> ModuleMode {
     match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(text) {
         Ok(manifest) => match manifest.get("type") {
@@ -289,6 +300,7 @@ impl<'source> Index<'source> {
             if !work.charge() {
                 return false;
             }
+                || javascript_constructor_function(target)
             let Some(named) =
                 self.javascript_target(file, annotation, rift_core::ReferenceRole::Type, work)
             else {
@@ -439,18 +451,6 @@ impl<'source> Index<'source> {
         if role != rift_core::ReferenceRole::Type
             && binding.kind == StaticBindingKind::Shadow
             && let Some(owner) = self
-                .javascript_callback_parameter(file, binding, work)
-                .or_else(|| self.javascript_destructured_name(file, binding, work))
-        {
-            return self.javascript_class_member(owner, member, MemberMode::Instance, role, work);
-        }
-        match binding.kind {
-            StaticBindingKind::JavaScriptEdgeNamespace { module } => self.javascript_export(
-                file,
-                file.text(module)?,
-                member,
-                ModuleMode::Esm,
-                role,
             StaticBindingKind::JavaScriptTypeImport { module, export }
                 if role == rift_core::ReferenceRole::Type =>
             {
@@ -467,6 +467,18 @@ impl<'source> Index<'source> {
                     work,
                 )
             }
+                .javascript_callback_parameter(file, binding, work)
+                .or_else(|| self.javascript_destructured_name(file, binding, work))
+        {
+            return self.javascript_class_member(owner, member, MemberMode::Instance, role, work);
+        }
+        match binding.kind {
+            StaticBindingKind::JavaScriptEdgeNamespace { module } => self.javascript_export(
+                file,
+                file.text(module)?,
+                member,
+                ModuleMode::Esm,
+                role,
                 work,
             ),
             StaticBindingKind::JavaScriptInstance { constructor } => {
