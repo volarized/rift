@@ -195,6 +195,28 @@ impl<'source> Exports<'_, 'source> {
             StaticBindingKind::JavaScriptEdgeNamespace { module } => Some(Export::Module {
                 module: file.text(module)?,
             }),
+            // A required name exported again is a reexport of that module's export.
+            StaticBindingKind::JavaScriptRequire {
+                require,
+                module,
+                export,
+            } if super::javascript::builtin_commonjs_name(
+                file,
+                self.modes,
+                "require",
+                require.start,
+                work,
+            ) =>
+            {
+                let module = file.text(module)?;
+                Some(match export {
+                    Some(export) => Export::Reexport {
+                        module,
+                        name: file.text(export)?,
+                    },
+                    None => Export::Module { module },
+                })
+            }
             _ => None,
         }
     }

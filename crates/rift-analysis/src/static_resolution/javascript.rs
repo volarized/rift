@@ -530,14 +530,7 @@ impl<'source> Index<'source> {
         position: u64,
         work: &mut Work,
     ) -> bool {
-        (self.javascript.mode(file.document.path.as_str(), work) == ModuleMode::CommonJs
-            || typescript_commonjs(file.document.path.as_str()))
-            && !file.blocked(position, work)
-            && matches!(
-                file.binding(name, position, |_| true, work),
-                Binding::Missing
-            )
-            && !file.javascript_reassigned(name, None)
+        builtin_commonjs_name(file, &self.javascript, name, position, work)
     }
 
     fn javascript_commonjs_member(
@@ -688,4 +681,22 @@ pub(super) fn js_binding<'source>(
     let available =
         binding.available_from <= position || role == rift_core::ReferenceRole::Type || deferred;
     (!ambiguous && available).then_some(binding)
+}
+/// Whether `name` at `position` is the `CommonJS` builtin: the file runs as `CommonJS` and
+/// no binding in scope takes the name.
+pub(super) fn builtin_commonjs_name<'source>(
+    file: &File<'source>,
+    modes: &PackageModes<'source>,
+    name: &str,
+    position: u64,
+    work: &mut Work,
+) -> bool {
+    (modes.mode(file.document.path.as_str(), work) == ModuleMode::CommonJs
+        || typescript_commonjs(file.document.path.as_str()))
+        && !file.blocked(position, work)
+        && matches!(
+            file.binding(name, position, |_| true, work),
+            Binding::Missing
+        )
+        && !file.javascript_reassigned(name, None)
 }

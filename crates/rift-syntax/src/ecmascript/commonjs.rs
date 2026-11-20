@@ -228,7 +228,24 @@ fn assignment(
         return Ok(None);
     }
     let Some(value) = kinds.child(syntax_element, EcmaScriptGrammarField::Right) else {
-        return Ok(None);
+        // `exports.name = local` exports the declaration the local name binds.
+        let property = kinds.child(left, EcmaScriptGrammarField::Property);
+        let value = kinds.child(syntax_element, EcmaScriptGrammarField::Right);
+        let Some((property, value)) = property
+            .filter(|property| property.kind_id() == kinds.property_identifier)
+            .zip(value.filter(|value| value.kind_id() == kinds.identifier))
+        else {
+            return Ok(None);
+        };
+        return Ok(Some(SyntaxExportBinding {
+            kind: SyntaxExportKind::Named,
+            range,
+            local: Some(extract::byte_range(value)?),
+            exported: Some(extract::byte_range(property)?),
+            source: None,
+            container: None,
+            type_only: false,
+        }));
     };
     if value.kind() != "call_expression"
         || value

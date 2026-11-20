@@ -1339,3 +1339,78 @@ export function use(value: Item) { return [new Value(), missing, other] }
     assert_eq!(imports(".%2Fleaf.ts"), 0);
     assert_eq!(imports("nowhere.ts"), 0);
 }
+
+#[test]
+fn test_commonjs_names_destructured_from_require_import_their_exports() {
+    // An object pattern over `require` binds each name to the export its key names, as
+    // the member form `require('./lib').name` does. An export assigned from a name is the
+    // declaration that name binds, and a required name exported again is a reexport.
+    let library = "class Item { run() { return 1 } }
+function make(name) { return new Item(name) }
+function hidden() { return 2 }
+let moved = function () { return 3 }
+moved = hidden
+exports.Item = Item;
+exports.make = make;
+exports.moved = moved;
+";
+    let index_file = "const { Item, make } = require('./lib.js');
+exports.Item = Item;
+module.exports.build = make;
+";
+    let main = "const { Item, make: build } = require('./lib.js');
+const { absent } = require('./nowhere.js');
+const { Item: Deep = null, ...rest } = require('./lib.js');
+const whole = require('./lib.js');
+const Picked = require('./lib.js').Item;
+const entry = require('./index.js');
+function use() { const item = new Item(); return [build('a'), item.run(), absent, rest, Deep] }
+function through() { return [whole.make('b'), new Picked(), new entry.Item(), entry.build('c')] }
+function shadowed(require) { const { make } = require('./lib.js'); return make('b') }
+function replaced() { return whole.moved() }
+exports.use = use;
+";
+    let (_directory, index) = workspace(&[
+        ("lib.js", library),
+        ("index.js", index_file),
+        ("main.js", main),
+    ]);
+    // The import belongs to the name it binds, as in the member form.
+    for (name, target) in [
+        ("main.js/Item", "lib.js/Item"),
+        ("main.js/build", "lib.js/make"),
+    ] {
+        assert!(has_edge(&index, EdgeKind::Imports, name, target), "{name}");
+    }
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "main.js/use",
+        "lib.js/make"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "main.js/use",
+        "lib.js/Item"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "main.js/use",
+        "lib.js/Item/run"
+    ));
+    assert_eq!(call_count(&index, "main.js/through", "lib.js/make"), 2);
+    assert_eq!(call_count(&index, "main.js/through", "lib.js/Item"), 2);
+    // A pattern with a default or a rest entry binds no export, a `require` that names a
+    // parameter binds nothing, and an export assigned from a name written again keeps no
+    // call.
+    for caller in ["main.js/shadowed", "main.js/replaced"] {
+        assert!(
+            !index.edges().edges().any(|edge| {
+                edge.kind() == EdgeKind::Calls && edge.from().as_str().ends_with(caller)
+            }),
+            "{caller}"
+        );
+    }
+}

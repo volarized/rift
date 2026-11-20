@@ -1027,7 +1027,9 @@ impl Kinds {
         if name.kind_id() != self.identifier {
             let start = facts.bindings.len();
             self.record_destructured(name, syntax_element, facts)?;
-            self.record_parameter(name, scope, facts)?;
+            if !self.record_required_names(name, syntax_element, scope, source, facts)? {
+                self.record_parameter(name, scope, facts)?;
+            }
             if !is_var && scope.kind_id() == self.scopes[0] {
                 facts.javascript_module_syntax |= facts.bindings[start..].iter().any(|binding| {
                     let start = usize::try_from(binding.name.start).ok();
@@ -1135,6 +1137,70 @@ impl Kinds {
                 .filter(|constructor| self.receiver(*constructor))
         {
             return Ok(StaticBindingKind::JavaScriptInstance {
+    /// Binds the names an object pattern takes from `require` to the exports their keys
+    /// name, as the member form `require('./lib').name` does. Answers whether it bound
+    /// them: a pattern with a default, a rest or a nested entry binds no export.
+    fn record_required_names(
+        &self,
+        pattern: Node<'_>,
+        declarator: Node<'_>,
+        scope: Node<'_>,
+        source: &str,
+        facts: &mut StaticFactsParts,
+    ) -> Result<bool, RiftError> {
+        let Some(value) = declarator
+            .child_by_field_id(self.value)
+            .filter(|value| value.kind_id() == self.call && pattern.kind_id() == self.patterns[0])
+        else {
+            return Ok(false);
+        };
+        let StaticBindingKind::JavaScriptRequire {
+            require,
+            module,
+            export: None,
+        } = self.initializer(value, source)?
+        else {
+            return Ok(false);
+        };
+        let mut names = Vec::new();
+        let mut cursor = pattern.walk();
+        for entry in pattern
+            .named_children(&mut cursor)
+            .filter(|entry| !entry.is_extra())
+        {
+            let (name, key) = if entry.kind_id() == self.shorthand_pattern {
+                (Some(entry), Some(entry))
+            } else if entry.kind_id() == self.pair_pattern {
+                (entry.child_by_field_id(self.value), entry.named_child(0))
+            } else {
+                (None, None)
+            };
+            let Some((name, key)) = name
+                .filter(|name| name.kind_id() == self.identifier || name == &entry)
+                .zip(key.filter(|key| {
+                    [self.property_identifier, self.shorthand_pattern].contains(&key.kind_id())
+                }))
+            else {
+                return Ok(false);
+            };
+            names.push((name, byte_range(key)?));
+        }
+        let available = byte_range(declarator)?.end;
+        for (name, key) in names {
+            facts.bindings.push(binding(
+                name,
+                scope,
+                available,
+                StaticBindingKind::JavaScriptRequire {
+                    require,
+                    module,
+                    export: Some(key),
+                },
+            )?);
+        }
+        Ok(true)
+    }
+
                 constructor: byte_range(constructor)?,
             });
         }
