@@ -51,21 +51,47 @@ pub(crate) fn invalid_declarations(
         source,
         limits,
         &declarations,
-        header_terminator,
+        HeaderRules {
+            terminator: header_terminator,
+            recovered: recovered_header,
+        },
     )
 }
 
 fn invalid_ranges(
     root: Node<'_>,
+    // TypeScript variance annotations (`in`, `out`) are not in the grammar. The parser
+    // confines that error to the type parameter list, which names no declaration.
+    let recovered_header = [ShippedLanguage::TypeScript, ShippedLanguage::TypeScriptTsx]
+        .iter()
+        .any(|shipped| shipped.language() == *language)
+        .then(|| {
+            let id = grammar.field_id_for_name("type_parameters");
+            assert!(
+                id.is_some(),
+                "shipped grammar must define header field: field=type_parameters"
+            );
+            id
+        })
+        .flatten();
     source: SyntaxSource<'_>,
     limits: SyntaxLimits,
     declarations: &BTreeSet<ByteRange>,
-    header_terminator: Option<u16>,
+    rules: HeaderRules,
 ) -> Result<BTreeSet<ByteRange>, RiftError> {
     let mut invalid = BTreeSet::new();
     let body_field = root.language().field_id_for_name("body");
     let mut pending = vec![(root, 0_usize, false)];
     let mut visited = 0_usize;
+/// Grammar facts that decide which header errors keep a declaration's name.
+#[derive(Clone, Copy)]
+struct HeaderRules {
+    /// Token that ends a header before an optional body.
+    terminator: Option<u16>,
+    /// Header field whose own errors leave the name and the other header parts intact.
+    recovered: Option<NonZeroU16>,
+}
+
     let mut cursor = root.walk();
     while let Some((syntax_element, depth, in_error)) = pending.pop() {
         visited += 1;
@@ -87,8 +113,7 @@ fn invalid_ranges(
         let in_error = in_error || syntax_element.is_error() || syntax_element.is_missing();
         if declarations.contains(&range)
             && (in_error
-                || (syntax_element != root
-                    && header_has_error(syntax_element, body_field, header_terminator)))
+                || (syntax_element != root && header_has_error(syntax_element, body_field, rules)))
         {
             invalid.insert(range);
         }
@@ -103,22 +128,28 @@ fn invalid_ranges(
 fn header_has_error(
     syntax_element: Node<'_>,
     body_field: Option<NonZeroU16>,
-    header_terminator: Option<u16>,
+    rules: HeaderRules,
 ) -> bool {
-    let Some(body) = body_field.and_then(|field| syntax_element.child_by_field_id(field.get()))
-    else {
+    let body = body_field.and_then(|field| syntax_element.child_by_field_id(field.get()));
+    let recovered = rules
+        .recovered
+        .and_then(|field| syntax_element.child_by_field_id(field.get()));
+    if body.is_none() && recovered.is_none() {
         return syntax_element.has_error();
-    };
+    }
     let mut cursor = syntax_element.walk();
     syntax_element
+///
+/// Neither does an error confined to the recovered header field: the name, the
+/// heritage clause and every other header part are then outside the error.
         .children(&mut cursor)
         .take_while(|child| {
             // Python can place a body error before an empty block. A missing
             // colon still belongs to the header and must be validated.
-            let header_ended = header_terminator == Some(child.kind_id()) && !child.is_missing();
-            *child != body && !header_ended
+            let header_ended = rules.terminator == Some(child.kind_id()) && !child.is_missing();
+            Some(*child) != body && !header_ended
         })
-        .any(|child| child.has_error())
+        .any(|child| child.has_error() && Some(child) != recovered)
 }
 
 #[cfg(test)]
@@ -193,6 +224,61 @@ mod tests {
             .expect("source facts")
             .into_facts();
         let ranges = facts
+    #[test]
+    fn type_parameter_errors_keep_declarations_named_outside_them() {
+        for (extension, text, expected) in [
+            (
+                "ts",
+                "interface Base<T> { base: T }\ninterface Task<out T, in U = string> extends Base<T> { value: T }\n",
+                &[][..],
+            ),
+            ("ts", "type Alias<out T> = Array<T>;\n", &[][..]),
+            (
+                "ts",
+                "class Other<T> {}\nclass Box<in out T> extends Other<T> { item!: T }\n",
+                &[][..],
+            ),
+            (
+                "tsx",
+                "interface Task<out T> { value: T }\nconst view = <div />;\n",
+                &[][..],
+            ),
+            // An error on the heritage clause still refuses the declaration.
+            (
+                "ts",
+                "interface Broken<out T> extends { value: T }\n",
+                &["Broken"][..],
+            ),
+            // So does an error in a header part of a declaration without a body.
+            ("ts", "type Broken<out T> = ;\n", &["Broken"][..]),
+            // Other grammars keep refusing a broken type parameter list.
+            ("py", "class Broken[???]:\n    pass\n", &["Broken"][..]),
+        ] {
+            let path = ProjectPath::new(format!("main.{extension}")).expect("source path");
+            let source = SyntaxSource { path: &path, text };
+            let provider = crate::registry::provider_for_extension(extension).expect("provider");
+            let document = provider
+                .analyze(source, SyntaxLimits::DEFAULT)
+                .expect("source facts");
+            assert!(document.has_errors(), "{extension}: {text:?}");
+            let ranges = document
+                .symbols()
+                .iter()
+                .map(|symbol| symbol.item_range)
+                .collect::<Vec<_>>();
+            let invalid = provider
+                .invalid_declarations(source, SyntaxLimits::DEFAULT, &ranges)
+                .expect("declaration validation");
+            let names = document
+                .symbols()
+                .iter()
+                .filter(|symbol| invalid.contains(&symbol.item_range))
+                .map(|symbol| symbol.name.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(names, expected, "{extension}: {text:?}");
+        }
+    }
+
             .symbols()
             .iter()
             .map(|symbol| symbol.item_range)

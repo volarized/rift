@@ -378,3 +378,106 @@ fn test_commonjs_function_assignments_refuse_colliding_default_slots() {
         );
     }
 }
+
+fn has_edge(index: &WorkspaceIndex, kind: EdgeKind, from: &str, to: &str) -> bool {
+    index.edges().edges().any(|edge| {
+        edge.kind() == kind
+            && edge.from().as_str().ends_with(from)
+            && edge.to().as_str().ends_with(to)
+    })
+}
+
+fn module_manifest() -> &'static str {
+    r#"{"name":"fixture","version":"1.0.0","type":"module"}"#
+}
+
+#[test]
+fn test_typescript_variance_annotations_keep_identity_heritage_and_members() {
+    let source = "export interface Base<T> { base: T }
+export interface Mid<out T = unknown, in U = string> extends Base<T> { value: T; run(input: U): T }
+export interface Wide<out Shape extends Base<string> = Base<string>> extends Mid<Shape> {}
+export interface Leaf extends Mid<string> { leaf: number }
+export class Box<in out T> extends Other<T> implements Mid<T> { value!: T; run(input: string): T { return this.value } }
+export class Other<T> { other!: T }
+export type Alias<out T> = Mid<T>;
+export function use(item: Mid<string>, wide: Wide, alias: Alias<number>) { return item.value }
+";
+    let (_directory, index) = workspace_with_manifest(&[("main.ts", source)], module_manifest());
+    let language =
+        rift_protocol::read::Language::from_identity_segment("typescript").expect("language");
+    assert!(
+        index
+            .identity_coverage_complete(&language)
+            .expect("identity coverage")
+    );
+    for (from, to) in [
+        ("/Mid", "/Base"),
+        ("/Wide", "/Mid"),
+        ("/Leaf", "/Mid"),
+        ("/Box", "/Other"),
+    ] {
+        assert!(
+            has_edge(&index, EdgeKind::Extends, from, to),
+            "{from} extends {to}"
+        );
+    }
+    assert!(has_edge(&index, EdgeKind::Implements, "/Box", "/Mid"));
+    for member in ["/Mid/value", "/Mid/run"] {
+        assert!(
+            has_edge(&index, EdgeKind::Contains, "/Mid", member),
+            "{member}"
+        );
+    }
+    assert!(has_edge(&index, EdgeKind::Contains, "/Box", "/Box/value"));
+    // Written constraint and default types outside the error stay type uses.
+    assert!(has_edge(&index, EdgeKind::HasType, "/Wide", "/Base"));
+    for target in ["/Mid", "/Wide", "/Alias"] {
+        assert!(
+            has_edge(&index, EdgeKind::HasType, "/use", target),
+            "use has type {target}"
+        );
+    }
+    assert!(has_edge(&index, EdgeKind::Reads, "/use", "/Mid/value"));
+    assert!(has_edge(&index, EdgeKind::Reads, "/Box/run", "/Box/value"));
+}
+
+#[test]
+fn test_typescript_variance_parameter_names_shadow_module_declarations() {
+    // Each module declaration shares its name with a type parameter whose list holds
+    // a variance annotation. A use of that name inside the declaration is the parameter.
+    let source = "export type T = number;
+export type O = string;
+export interface Other { other: number }
+export const out = 1;
+export interface Held<out T = unknown> { held: T; plain: Other }
+export interface Pair<in out O extends Other> { pair: O }
+export class Kept<in T> { kept!: T; read(): T { return this.kept } }
+export interface Plain { plain: T; second: O }
+";
+    let (_directory, index) = workspace_with_manifest(&[("main.ts", source)], module_manifest());
+    for (from, to) in [
+        ("/Held/held", "/T"),
+        ("/Held", "/T"),
+        ("/Pair/pair", "/O"),
+        ("/Pair", "/O"),
+        ("/Kept/kept", "/T"),
+        ("/Kept/read", "/T"),
+    ] {
+        assert!(
+            !has_edge(&index, EdgeKind::HasType, from, to),
+            "{from} must not use module {to}"
+        );
+    }
+    assert!(!index.edges().edges().any(|edge| {
+        matches!(
+            edge.kind(),
+            EdgeKind::Reads | EdgeKind::Writes | EdgeKind::HasType
+        ) && edge.to().as_str().ends_with("/out")
+    }));
+    // Names that are not parameters keep resolving, inside and outside the declarations.
+    assert!(has_edge(&index, EdgeKind::HasType, "/Held/plain", "/Other"));
+    assert!(has_edge(&index, EdgeKind::HasType, "/Pair", "/Other"));
+    assert!(has_edge(&index, EdgeKind::HasType, "/Plain/plain", "/T"));
+    assert!(has_edge(&index, EdgeKind::HasType, "/Plain/second", "/O"));
+}
+

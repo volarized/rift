@@ -451,6 +451,60 @@ impl Kinds {
 
     fn member(&self, syntax_element: Node<'_>) -> Result<StaticCallee, RiftError> {
         if syntax_element.kind_id() != self.member {
+        if let Some(scope) = scope {
+            self.record_type_parameter_errors(parameter, scope, facts)?;
+        }
+        Ok(())
+    }
+
+    /// Names the parser left inside an error of a type parameter list.
+    ///
+    /// The grammar has no variance annotation, so `out T` parses as a parameter named `out`
+    /// followed by an error holding `T`, or as an error holding `out` before the parameter.
+    /// Each such name is declared by the list: it shadows outer declarations for the whole
+    /// declaration and never resolves outside it. Errors between two parameters are read
+    /// with the parameter that follows them, trailing errors with the last parameter.
+    fn record_type_parameter_errors(
+        &self,
+        parameter: Node<'_>,
+        scope: Node<'_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let mut errors = Vec::new();
+        let mut cursor = parameter.walk();
+        errors.extend(parameter.children(&mut cursor).filter(Node::is_error));
+        // Sibling walks stop at the next parameter, so each is bounded by the list.
+        let mut before = parameter.prev_sibling();
+        while let Some(sibling) = before.filter(|sibling| sibling.is_error() || !sibling.is_named())
+        {
+            errors.extend(sibling.is_error().then_some(sibling));
+            before = sibling.prev_sibling();
+        }
+        let mut trailing = Vec::new();
+        let mut after = parameter.next_sibling();
+        while let Some(sibling) = after.filter(|sibling| sibling.is_error() || !sibling.is_named())
+        {
+            trailing.extend(sibling.is_error().then_some(sibling));
+            after = sibling.next_sibling();
+        }
+        if after.is_none() {
+            errors.append(&mut trailing);
+        }
+        let available_from = byte_range(scope)?.start;
+        for error in errors {
+            let mut names = error.walk();
+            for name in error.named_children(&mut names) {
+                if name.kind_id() == self.identifier || self.type_identifier == Some(name.kind_id())
+                {
+                    facts.bindings.push(binding(
+                        name,
+                        scope,
+                        available_from,
+                        StaticBindingKind::Shadow,
+                    )?);
+                }
+            }
+        }
             return Ok(StaticCallee::Unsupported);
         }
         let receiver = syntax_element
