@@ -568,7 +568,7 @@ impl<'source> Capture<'source> {
         if (syntax_element.is_error() || syntax_element.is_missing())
             && let Grammar::Rust(kinds, _) = &self.grammar
         {
-            kinds.record_error(syntax_element, &mut self.facts.0)?;
+            kinds.record_error(visited, &mut self.facts.0)?;
         }
         if syntax_element.is_missing() || syntax_element.is_extra() {
             return Ok(());
@@ -580,7 +580,7 @@ impl<'source> Capture<'source> {
                 kinds.record(syntax_element, self.source, &mut self.facts.0)
             }
             Grammar::Rust(kinds, budget) => {
-                kinds.record(syntax_element, self.source, &mut self.facts.0, budget)
+                kinds.record(visited, self.source, &mut self.facts.0, budget)
             }
         }
     }

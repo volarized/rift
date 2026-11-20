@@ -10,7 +10,7 @@ use super::{
     StaticBindingKind, StaticCallee, StaticFactsParts, StaticInherentImpl, binding, call,
     enclosing, field, identifier, kind,
 };
-use crate::extract::byte_range;
+use crate::extract::{Visited, byte_range};
 
 pub(super) struct Kinds {
     identifier: u16,
@@ -140,22 +140,24 @@ pub(super) fn kinds() -> &'static Kinds {
 impl Kinds {
     pub(super) fn record(
         &self,
-        syntax_element: Node<'_>,
+        visited: Visited<'_, '_>,
         source: &str,
         facts: &mut StaticFactsParts,
         budget: &mut rift_core::LoopBudget,
     ) -> Result<(), RiftError> {
-        let mut ancestor = Some(syntax_element);
+        let syntax_element = visited.syntax_element();
+        let mut ancestor = Some(visited);
         // The shared walk already bounds parent depth. Opaque macro contents and
         // parser recovery subtrees cannot establish executable facts.
-        while let Some(element) = ancestor {
+        while let Some(current) = ancestor {
+            let element = current.syntax_element();
             if element.kind_id() == self.macro_definition
                 || element.is_error()
                 || element.is_missing()
             {
                 return Ok(());
             }
-            ancestor = element.parent();
+            ancestor = current.parent();
         }
         let id = syntax_element.kind_id();
         self.record_reference(syntax_element, facts)?;
@@ -213,12 +215,22 @@ impl Kinds {
 
     pub(super) fn record_error(
         &self,
-        element: Node<'_>,
+        visited: Visited<'_, '_>,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
-        if enclosing(element, &[self.macro_definition]).is_none()
-            && let Some(scope) = enclosing(element, &self.scopes)
-        {
+        let mut ancestor = visited.parent();
+        let mut scope = None;
+        while let Some(current) = ancestor {
+            let element = current.syntax_element();
+            if element.kind_id() == self.macro_definition {
+                return Ok(());
+            }
+            if scope.is_none() && self.scopes.contains(&element.kind_id()) {
+                scope = Some(element);
+            }
+            ancestor = current.parent();
+        }
+        if let Some(scope) = scope {
             facts.unsupported_bindings.push(byte_range(scope)?);
         }
         Ok(())
