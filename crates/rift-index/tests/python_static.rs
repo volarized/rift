@@ -317,3 +317,21 @@ fn test_python_bare_decorators_store_calls() {
     );
     assert!(index.edges().is_complete());
 }
+
+#[test]
+fn test_python_rebound_locals_and_property_setters_store_member_facts() {
+    let source = "class Response:\n    @property\n    def elapsed(self): return 1\n    @elapsed.setter\n    def elapsed(self, value): pass\n    def close(self): pass\ndef fetch() -> Response: return Response()\ndef send(response: Response):\n    response.elapsed = 2\n    while response:\n        response.close()\n        response = fetch()\n";
+    let (_directory, index) = build(&[("main.py", source)]);
+    for (kind, to, spelling) in [
+        ("writes", "main/Response/elapsed", "response.elapsed"),
+        ("calls", "main/Response/close", "response.close()"),
+    ] {
+        assert_eq!(
+            stored(&index, source, kind, "main/send", to).as_deref(),
+            Some(spelling),
+            "{kind} -> {to}: {:?}",
+            index.edges()
+        );
+    }
+    assert!(index.edges().is_complete());
+}

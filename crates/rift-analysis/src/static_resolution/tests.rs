@@ -15,6 +15,7 @@ mod python_aliases;
 mod python_ancestry;
 mod python_decorators;
 mod python_imports;
+mod python_joins;
 mod python_overloads;
 
 #[test]

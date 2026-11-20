@@ -87,6 +87,58 @@ impl<'source> Index<'source> {
         self.python_callable_alias(target, work)
     }
 
+    /// A local name bound more than once in one callable scope, by assignments that all
+    /// produce an instance of the same class, holds that instance wherever it is read: in
+    /// every branch and on every loop iteration. Returns the earliest available binding.
+    fn python_receiver_join(
+        &self,
+        file: &File<'source>,
+        scope: ByteRange,
+        candidates: impl Iterator<Item = &'source StaticBinding>,
+        work: &mut Work,
+    ) -> Option<&'source StaticBinding> {
+        let module = scope.start == 0 && scope.end == file.document.source.len() as u64;
+        if module || file.class_scopes.contains(&scope) {
+            return None;
+        }
+        let mut agreed = None;
+        let mut selected: Option<&StaticBinding> = None;
+        let mut count = 0_usize;
+        for binding in candidates {
+            if !work.charge() {
+                return None;
+            }
+            if !matches!(
+                binding.kind,
+                StaticBindingKind::PythonAnnotation { .. }
+                    | StaticBindingKind::PythonInstance { .. }
+                    | StaticBindingKind::PythonAlias { .. }
+            ) {
+                return None;
+            }
+            let value = work.python_lookup(|work| {
+                let value = self.binding_value(file, binding, work)?;
+                self.python_receiver(value, work)
+            })?;
+            let Value::Instance(class) = value else {
+                return None;
+            };
+            let class = (
+                class.file.path.as_str(),
+                class.symbol.qualified_name.as_str(),
+            );
+            if agreed.is_some_and(|agreed| agreed != class) {
+                return None;
+            }
+            agreed = Some(class);
+            count += 1;
+            if selected.is_none_or(|earliest| binding.available_from < earliest.available_from) {
+                selected = Some(binding);
+            }
+        }
+        (count > 1).then_some(selected?)
+    }
+
     /// A class base names a class, directly or through unchanged aliases; other values stay
     /// unresolved.
     pub(super) fn edge_python_base(
@@ -505,7 +557,10 @@ fn edge_python_binding<'source>(
                 .iter()
                 .copied()
                 .filter(|binding| binding.scope == scope);
-            let selected = index.python_binding_group(file, candidates, work)?;
+            let selected = match index.python_binding_group(file, candidates.clone(), work) {
+                Some(selected) => selected,
+                None => index.python_receiver_join(file, scope, candidates, work)?,
+            };
             if selected.available_from > position {
                 return None;
             }
