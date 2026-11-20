@@ -199,8 +199,10 @@ pub(super) fn selected_release(
         .filter(|entry| {
             entry.manager == rift_dependency::STANDARD_LIBRARY_MANAGER
                 && entry.availability == rift_protocol::dependencies::PackageAvailability::Canonical
-                && rift_dependency::StandardLibrary::from_name(&entry.name)
-                    .is_some_and(|library| library.runtime() == runtime)
+                && rift_dependency::StandardLibrary::from_name(&entry.name).is_some_and(|library| {
+                    library.runtime() == runtime
+                        || (library == rift_dependency::StandardLibrary::Rust && runtime == "rust")
+                })
         })
         .filter_map(|entry| entry.version.as_deref())
         .collect();
@@ -234,12 +236,22 @@ mod tests {
         context.add_standard_libraries(StandardLibraryAnswer {
             entries: vec![
                 entry("python", PackageSelector::Version("3.12.9".to_owned())),
+                entry("rust", PackageSelector::Version("1.98.1".to_owned())),
                 entry("node", PackageSelector::Requirement(">=0".to_owned())),
             ],
             ..StandardLibraryAnswer::default()
         });
         let release = selected_release(&context, &runtime).expect("exact CPython pin");
         assert_eq!(release.to_string(), "rift://revision/stdlib/cpython@3.12.9");
+        let rust = SymbolOwner::Runtime {
+            runtime: "rust".to_owned(),
+        };
+        assert_eq!(
+            selected_release(&context, &rust)
+                .expect("Rust source owner")
+                .to_string(),
+            "rift://revision/stdlib/rust@1.98.1"
+        );
         assert!(
             selected_release(
                 &context,

@@ -94,7 +94,7 @@ impl CalleeRoots {
             index_root,
             engine_roots: &engine_roots,
         };
-        let registries = registry_sources(cargo_home().as_deref());
+        let registries = registry_spellings(registry_sources(cargo_home().as_deref()));
         let mut packages: Vec<PackageRoot> = context
             .install_folders()
             .flat_map(|folder| folder_roots(folder, &registries, spellings))
@@ -147,7 +147,7 @@ impl CalleeRoots {
         }
         Ok(None)
     }
-    /// Captures a package call's admitted file and, for npm, its namespace manifest.
+    /// Captures a package or runtime target's admitted file and npm namespace manifest.
     ///
     /// # Errors
     /// Refuses an unadmitted source, changed owner, unreadable bytes or a file over the bound.
@@ -158,29 +158,27 @@ impl CalleeRoots {
         bytes_max: u64,
     ) -> Result<(rift_lsp::uri::PackageFile, String, Option<String>), RiftError> {
         let unavailable = installed_source_unavailable;
+        let file = self.package_file(callee, trees)?;
         let uri = callee.document().ok_or_else(unavailable)?;
-        let Some(EngineAddress::Package(file)) = self.address(trees, uri)? else {
-            return Err(unavailable());
-        };
-        let CalleePackage::Installed(package) = callee.package() else {
-            return Err(unavailable());
-        };
-        if file.origin()
-            != &(rift_core::SourceLocation::Dependency {
-                package: package.clone(),
-            })
-            || file.path() != callee.path()
-        {
-            return Err(unavailable());
-        }
         let relative = file.root().project_path(uri)?;
         let root = file
             .root()
             .filesystem_path()
             .canonicalize()
             .map_err(|_| unavailable())?;
-        let text = capture_admitted_text(&root, relative.as_str(), bytes_max)?;
-        let metadata = if package.manager == NPM_MANAGER {
+        let text = if relative.as_str().is_empty() && root.is_file() {
+            capture_admitted_text(
+                root.parent().ok_or_else(unavailable)?,
+                root.file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .ok_or_else(unavailable)?,
+                bytes_max,
+            )?
+        } else {
+            capture_admitted_text(&root, relative.as_str(), bytes_max)?
+        };
+        let metadata = if matches!(callee.package(), CalleePackage::Installed(package) if package.manager == NPM_MANAGER)
+        {
             Some(capture_admitted_text(
                 &root,
                 PACKAGE_MANIFEST_FILE_NAME,
@@ -190,6 +188,51 @@ impl CalleeRoots {
             None
         };
         Ok((*file, text, metadata))
+    }
+
+    /// Captures a namespace source below the same admitted root as an engine target.
+    ///
+    /// # Errors
+    /// Refuses a changed owner, escaped path, unreadable source or exceeded byte bound.
+    pub fn capture_package_source(
+        &self,
+        callee: &PackageCallee,
+        trees: &[&Path],
+        path: &ProjectPath,
+        bytes_max: u64,
+    ) -> Result<String, RiftError> {
+        let file = self.package_file(callee, trees)?;
+        let root = file
+            .root()
+            .filesystem_path()
+            .canonicalize()
+            .map_err(|_| installed_source_unavailable())?;
+        capture_admitted_text(&root, path.as_str(), bytes_max)
+    }
+
+    fn package_file(
+        &self,
+        callee: &PackageCallee,
+        trees: &[&Path],
+    ) -> Result<Box<rift_lsp::uri::PackageFile>, RiftError> {
+        let unavailable = installed_source_unavailable;
+        let uri = callee.document().ok_or_else(unavailable)?;
+        let Some(EngineAddress::Package(file)) = self.address(trees, uri)? else {
+            return Err(unavailable());
+        };
+        let origin = match callee.package() {
+            CalleePackage::Installed(package) => rift_core::SourceLocation::Dependency {
+                package: package.clone(),
+            },
+            CalleePackage::Runtime(runtime) => rift_core::SourceLocation::Stdlib {
+                runtime: Some(runtime.clone()),
+            },
+            CalleePackage::StandardLibrary(_) => return Err(unavailable()),
+        };
+        if file.origin() != &origin || file.path() != callee.path() {
+            return Err(unavailable());
+        }
+        Ok(file)
     }
 }
 
@@ -258,7 +301,14 @@ fn folder_roots(
     registries: &[PathBuf],
     spellings: RootSpellings<'_>,
 ) -> Vec<PackageRoot> {
-    let origin = &folder.origin;
+    let mut origin = folder.origin.clone();
+    if let rift_core::SourceLocation::Stdlib {
+        runtime: Some(runtime),
+    } = &mut origin
+        && runtime.runtime == "rustc"
+    {
+        "rust".clone_into(&mut runtime.runtime);
+    }
     match &folder.location {
         InstallLocation::Path(path) => spellings
             .of(path)
@@ -281,7 +331,7 @@ fn folder_roots(
                 .collect()
         }
         InstallLocation::CargoRegistry(directory) => {
-            let rift_core::SourceLocation::Dependency { package } = origin else {
+            let rift_core::SourceLocation::Dependency { package } = &origin else {
                 return Vec::new();
             };
             // The dependency context accepts this owner from the lockfile's registry
@@ -318,6 +368,19 @@ fn crates_io_source(root: &Path) -> bool {
             .is_some_and(|hash| {
                 hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
             })
+}
+
+/// Retains the configured and canonical spelling of each bounded registry root.
+fn registry_spellings(sources: Vec<PathBuf>) -> Vec<PathBuf> {
+    let canonical = sources
+        .iter()
+        .filter_map(|source| source.canonicalize().ok())
+        .collect::<Vec<_>>();
+    let mut spellings = sources;
+    spellings.extend(canonical);
+    spellings.sort();
+    spellings.dedup();
+    spellings
 }
 
 /// `$CARGO_HOME`, or `.cargo` below the home folder when it is unset, as Cargo reads it.
@@ -812,7 +875,7 @@ mod tests {
             spelled(&folder_roots(&sysroot, &[], spellings)),
             [(
                 "file:///toolchain/lib/rustlib/src/rust/library".to_owned(),
-                "stdlib/rustc@1.98.1".to_owned()
+                "stdlib/rust@1.98.1".to_owned()
             )],
             "a folder outside the tree has one spelling"
         );
@@ -1156,6 +1219,120 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn runtime_capture_keeps_namespace_sources_below_the_accepted_root() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let tree = directory.path().canonicalize()?;
+        let library = tree.join("library");
+        std::fs::create_dir_all(library.join("alloc/src/vec"))?;
+        let path = ProjectPath::new("alloc/src/vec/mod.rs")?;
+        let source = "pub struct Vec;";
+        let manifest = "[package]\nname='alloc'\nversion='0.0.0'\n";
+        std::fs::write(library.join(path.as_str()), source)?;
+        std::fs::write(library.join("alloc/Cargo.toml"), manifest)?;
+        let runtime = rift_protocol::read::RuntimeIdentity {
+            runtime: "rust".to_owned(),
+            version: "1.98.1".to_owned(),
+        };
+        let roots = CalleeRoots::from_packages(vec![PackageRoot::with_origin(
+            TreeRoot::new(&library)?,
+            rift_core::SourceLocation::Stdlib {
+                runtime: Some(runtime.clone()),
+            },
+        )]);
+        let mut target = callee(CalleePackage::Runtime(runtime), path.as_str());
+        target.document = Some(std::sync::Arc::new(
+            TreeRoot::new(&library)?.document_uri(&path)?,
+        ));
+        let (file, held, metadata) = roots.capture_package_call(&target, &[&tree], 1024)?;
+        assert_eq!(file.path(), &path);
+        assert_eq!(held, source);
+        assert!(metadata.is_none());
+        let manifest_path = ProjectPath::new("alloc/Cargo.toml")?;
+        assert_eq!(
+            roots.capture_package_source(&target, &[&tree], &manifest_path, 1024)?,
+            manifest
+        );
+        assert!(
+            roots
+                .capture_package_source(&target, &[&tree], &manifest_path, 4)
+                .is_err()
+        );
+        target.package = CalleePackage::Runtime(rift_protocol::read::RuntimeIdentity {
+            runtime: "rust".to_owned(),
+            version: "1.97.0".to_owned(),
+        });
+        assert!(roots.capture_package_call(&target, &[&tree], 1024).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_cache_aliases_address_the_engines_canonical_source_path() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let tree = directory.path().canonicalize()?;
+        let physical = tree.join("cargo/registry/src/index.crates.io-1949cf8c6b5b557f");
+        std::fs::create_dir_all(&physical)?;
+        let alias = tree.join("cache");
+        std::os::unix::fs::symlink(tree.join("cargo"), &alias)?;
+        let registries = super::registry_spellings(vec![
+            alias.join("registry/src/index.crates.io-1949cf8c6b5b557f"),
+        ]);
+        let folder = installed(
+            identity("cargo", "serde", "1.0.228"),
+            InstallLocation::CargoRegistry("serde-1.0.228".to_owned()),
+        );
+        let roots = CalleeRoots::from_packages(folder_roots(
+            &folder,
+            &registries,
+            RootSpellings {
+                index_root: &tree,
+                engine_roots: &[],
+            },
+        ));
+        for base in [
+            &physical,
+            &alias.join("registry/src/index.crates.io-1949cf8c6b5b557f"),
+        ] {
+            let uri = TreeRoot::new(base)?
+                .document_uri(&ProjectPath::new("serde-1.0.228/src/lib.rs")?)?;
+            let Some(EngineAddress::Package(file)) = roots.address(&[&tree], &uri)? else {
+                return Err("admitted cache source".into());
+            };
+            assert_eq!(file.path().as_str(), "src/lib.rs");
+            assert_eq!(file.origin(), &folder.origin);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn installed_capture_accepts_an_admitted_single_module_stub() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let tree = directory.path().canonicalize()?;
+        let site = tree.join("site-packages");
+        std::fs::create_dir_all(&site)?;
+        let path = ProjectPath::new("greeting.pyi")?;
+        let source = "def greet(name: str) -> str: ...\n";
+        std::fs::write(site.join(path.as_str()), source)?;
+        let package = identity("pypi", "greeting", "1.0.0");
+        let roots = CalleeRoots::from_packages(vec![PackageRoot::within(
+            &TreeRoot::new(&site)?,
+            path.clone(),
+            package.clone(),
+        )]);
+        let mut target = callee(CalleePackage::Installed(package), path.as_str());
+        target.document = Some(std::sync::Arc::new(
+            TreeRoot::new(&site)?.document_uri(&path)?,
+        ));
+        let (file, held, metadata) = roots.capture_package_call(&target, &[&tree], 1024)?;
+        assert_eq!(file.path(), &path);
+        assert_eq!(file.import_root(), Some(&path));
+        assert_eq!(held, source);
+        assert!(metadata.is_none());
+        assert!(roots.capture_package_call(&target, &[&tree], 4).is_err());
+        Ok(())
+    }
+
     fn declaration(id: &str, kind: &str, package: &PackageIdentity) -> CalleeDeclaration {
         CalleeDeclaration {
             id: SymbolId(id.to_owned()),
@@ -1409,11 +1586,11 @@ mod tests {
         );
         assert_eq!(
             classify("std/src/fs.rs")?,
-            "stdlib/rustc@1.98.1 std/src/fs.rs"
+            "stdlib/rust@1.98.1 std/src/fs.rs"
         );
         assert_eq!(
             classify("vendor/stray/src/lib.rs")?,
-            "stdlib/rustc@1.98.1 vendor/stray/src/lib.rs"
+            "stdlib/rust@1.98.1 vendor/stray/src/lib.rs"
         );
         Ok(())
     }

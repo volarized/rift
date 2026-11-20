@@ -43,6 +43,7 @@ rift-protocol.workspace = true
 rift-ranking.workspace = true
 rift-search.workspace = true
 rift-server.workspace = true
+rift-syntax.workspace = true
 rayon.workspace = true
 schemars.workspace = true
 semver.workspace = true
