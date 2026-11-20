@@ -179,6 +179,7 @@ fn test_rust_use_paths_stay_inside_their_recorded_scope() {
             path: vec![ByteRange { start: 0, end: 1 }],
             scope: ByteRange { start: 2, end: 3 },
             glob: false,
+            visibility: None,
         }],
         ..StaticFactsParts::default()
     };
@@ -196,6 +197,7 @@ fn test_rust_use_path_components_share_the_syntax_bound() {
                 path: vec![range; 3],
                 scope: range,
                 glob: false,
+                visibility: None,
             };
             3
         ],
@@ -374,4 +376,31 @@ fn test_rust_macro_token_errors_keep_authored_declarations_and_ranges() {
     );
     let facts = document.facts().static_facts().expect("static facts");
     assert_eq!(facts.calls().len(), 1);
+}
+
+#[test]
+fn test_rust_reexport_imports_keep_authored_visibility_ranges() {
+    let path = ProjectPath::new("src/lib.rs").expect("path");
+    let source = "pub(crate) use crate::Item; use crate::Other;";
+    let document = RustSyntaxProvider::default()
+        .analyze(
+            SyntaxSource {
+                path: &path,
+                text: source,
+            },
+            SyntaxLimits::default(),
+        )
+        .expect("syntax");
+    let uses = document
+        .facts()
+        .static_facts()
+        .expect("static facts")
+        .rust_uses();
+    let visibility = uses[0].visibility.expect("restricted visibility");
+    assert_eq!(
+        &source[usize::try_from(visibility.start).expect("start")
+            ..usize::try_from(visibility.end).expect("end")],
+        "pub(crate)"
+    );
+    assert!(uses[1].visibility.is_none());
 }

@@ -591,7 +591,11 @@ impl<'source> Index<'source> {
             }
             if let Some((range, target)) = self.import_target(file, binding, work) {
                 let occurrence = target.and_then(|target| {
-                    self.occurrence(file, range, range, ReferenceRole::Import, target)
+                    if file.document.facts.language().name == "rust" {
+                        self.rust_import_occurrence(file, range, target, work)
+                    } else {
+                        self.occurrence(file, range, range, ReferenceRole::Import, target)
+                    }
                 });
                 result.record(occurrence);
             }

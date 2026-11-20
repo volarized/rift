@@ -31,6 +31,13 @@ pub(super) struct Namespaces<'source> {
     inactive_modules: BTreeSet<Vec<String>>,
     modules: BTreeMap<Vec<String>, Option<Target<'source>>>,
     crate_roots: BTreeMap<String, Option<&'source str>>,
+    exports: BTreeMap<Vec<String>, Option<Export<'source>>>,
+}
+
+struct Export<'source> {
+    module: Vec<String>,
+    target: Vec<String>,
+    visibility: Option<&'source str>,
 }
 
 struct FileNamespace<'source> {
@@ -133,6 +140,7 @@ impl<'source> Namespaces<'source> {
         {
             namespaces.index_file(file, work)?;
         }
+        namespaces.index_exports(files, work)?;
         namespaces.index_aliases(files, work)?;
         namespaces.index_members(files, work)?;
         namespaces.index_methods(files, work)?;
@@ -140,6 +148,75 @@ impl<'source> Namespaces<'source> {
         namespaces.index_bounds(files, work)?;
         namespaces.index_returns(files, work)?;
         Some(namespaces)
+    }
+
+    fn index_exports(
+        &mut self,
+        files: &BTreeMap<&'source str, File<'source>>,
+        work: &mut Work,
+    ) -> Option<()> {
+        for file in files
+            .values()
+            .filter(|file| file.document.facts.language().name == "rust")
+        {
+            for imported in file
+                .facts
+                .rust_uses()
+                .iter()
+                .filter(|imported| !imported.glob)
+            {
+                if !work.charge() {
+                    return None;
+                }
+                if file.conditional(imported.range, work) {
+                    continue;
+                }
+                let Some(module) = self
+                    .module(file, imported.range.start, work)
+                    .map(<[String]>::to_vec)
+                else {
+                    continue;
+                };
+                let namespace = self.files.get(file.document.path.as_str())?;
+                let scope = namespace
+                    .inline
+                    .iter()
+                    .find(|(_, path)| path.as_slice() == module.as_slice())
+                    .and_then(|(symbol, _)| symbol.body_range)
+                    .unwrap_or(ByteRange {
+                        start: 0,
+                        end: u64::try_from(file.document.source.len()).ok()?,
+                    });
+                if imported.scope != scope {
+                    continue;
+                }
+                let Some(binding) = file.facts.bindings().iter().find(|binding| work.charge() && matches!(binding.kind, StaticBindingKind::RustUse { path } if path == imported.range)) else { continue; };
+                let mut path = module.clone();
+                path.push(file.text(binding.name)?.to_owned());
+                let parts = file.use_parts(imported.range, work)?;
+                let parts = parts.iter().map(String::as_str).collect::<Vec<_>>();
+                let target = if matches!(parts.first(), Some(&"std" | &"core" | &"alloc")) {
+                    parts.iter().map(|part| (*part).to_owned()).collect()
+                } else {
+                    let Some(target) = self.absolute_path(file, imported.range.start, &parts, work)
+                    else {
+                        continue;
+                    };
+                    target
+                };
+                let visibility = imported.visibility.and_then(|range| file.text(range));
+                insert(
+                    &mut self.exports,
+                    path,
+                    Export {
+                        module,
+                        target,
+                        visibility,
+                    },
+                );
+            }
+        }
+        Some(())
     }
 
     fn index_returns(
@@ -428,6 +505,22 @@ impl<'source> Namespaces<'source> {
             }
             self.index_target(file, symbol, path, work);
         }
+        if namespace.base.is_empty() {
+            for alias in file.document.placement.aliases() {
+                if !work.charge() {
+                    return None;
+                }
+                let identity =
+                    rift_protocol::identity::SymbolIdentity::parse(alias.identity.as_str()).ok()?;
+                let depth = alias.qualified_name.split("::").count();
+                let path = identity.qualified_path();
+                let base = path.get(..path.len().checked_sub(depth)?)?;
+                if !namespace.base.is_empty() && namespace.base != base {
+                    return None;
+                }
+                namespace.base = base.to_vec();
+            }
+        }
         if let [crate_name] = namespace.base.as_slice() {
             self.crate_roots
                 .entry(crate_name.clone())
@@ -520,6 +613,86 @@ impl<'source> Namespaces<'source> {
         let path = self.absolute_path(file, range.start, &parts, work)?;
         self.lookup(file, range.start, &path, Namespace::Value, work)
             .or_else(|| self.lookup(file, range.start, &path, Namespace::Type, work))
+    }
+
+    fn import_source(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let path = self.module(file, range.start, work)?;
+        let namespace = self.files.get(file.document.path.as_str())?;
+        let scope = namespace
+            .inline
+            .iter()
+            .find(|(_, inline)| inline.as_slice() == path)
+            .and_then(|(symbol, _)| symbol.body_range)
+            .unwrap_or(ByteRange {
+                start: 0,
+                end: u64::try_from(file.document.source.len()).ok()?,
+            });
+        let imported = file
+            .facts
+            .rust_uses()
+            .iter()
+            .find(|imported| work.charge() && imported.range == range)?;
+        if imported.scope != scope {
+            return None;
+        }
+        self.types
+            .get(path)
+            .copied()
+            .flatten()
+            .filter(|target| target.symbol.kind == "module" && self.available(*target))
+    }
+
+    fn written_import(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        if file.conditional(range, work) || file.blocked(range.start, work) {
+            return None;
+        }
+        let parts = file.use_parts(range, work)?;
+        let parts = parts.iter().map(String::as_str).collect::<Vec<_>>();
+        let path = self.absolute_path(file, range.start, &parts, work)?;
+        let (_, parent) = path.split_last()?;
+        let module = self
+            .lookup(file, range.start, parent, Namespace::Type, work)
+            .filter(|target| target.symbol.kind == "module")?;
+        if self.import(file, range, work).is_some() {
+            return Some(module);
+        }
+        let source = self.module(file, range.start, work)?;
+        let mut current = path;
+        // A bounded local re-export chain can end at an authored external import.
+        // Only the actual written local module is emitted as an endpoint.
+        for _ in 0..RECEIVER_DEPTH_MAX {
+            if !work.charge() {
+                return None;
+            }
+            let export = self.exports.get(&current)?.as_ref()?;
+            if !namespace_visible(source, &export.module, export.visibility) {
+                return None;
+            }
+            if export.target.first() != source.first() {
+                return Some(module);
+            }
+            if self
+                .lookup(file, range.start, &export.target, Namespace::Type, work)
+                .is_some()
+                || self
+                    .lookup(file, range.start, &export.target, Namespace::Value, work)
+                    .is_some()
+            {
+                return Some(module);
+            }
+            current = export.target.clone();
+        }
+        None
     }
 
     fn direct_call(
@@ -685,6 +858,16 @@ impl<'source> Namespaces<'source> {
         namespace: Namespace,
         work: &mut Work,
     ) -> Option<Target<'source>> {
+        if let Some(export) = self.exports.get(path) {
+            let export = export.as_ref()?;
+            if !namespace_visible(
+                self.module(file, position, work)?,
+                &export.module,
+                export.visibility,
+            ) {
+                return None;
+            }
+        }
         let index = match namespace {
             Namespace::Type => &self.types,
             Namespace::Value => &self.values,

@@ -776,3 +776,71 @@ fn test_rust_private_associated_calls_use_the_declaring_module() {
                 && edge.to().as_str().ends_with("/Item/hidden"))
     );
 }
+
+#[test]
+fn test_rust_reexport_imports_keep_the_written_module() {
+    // #828: keep the authored module and terminal declaration as separate facts.
+    let directory = tempfile::tempdir().expect("workspace");
+    let root = directory.path();
+    std::fs::create_dir(root.join("src")).expect("source directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='fixture'\nversion='0.1.0'\n",
+    )
+    .expect("manifest");
+    std::fs::write(root.join("src/lib.rs"), "pub struct Item; mod bridge; mod client; mod denied { use crate::closed::Item; } mod closed { use crate::Item; }").expect("root source");
+    std::fs::write(root.join("src/bridge.rs"), "pub(crate) use crate::Item;")
+        .expect("bridge source");
+    std::fs::write(
+        root.join("src/client.rs"),
+        "use crate::bridge::Item; pub fn use_item(_: Item) {}",
+    )
+    .expect("client source");
+    let index = WorkspaceIndex::build(
+        root,
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &TextFileInclusion::default(),
+    )
+    .expect("index");
+    assert!(
+        index
+            .symbol_view()
+            .expect("symbols")
+            .normalized_graph()
+            .records()
+            .iter()
+            .all(|record| record.identity().is_some())
+    );
+    for (from, to) in [
+        ("/fixture/bridge", "/fixture/Item"),
+        ("/fixture/client", "/fixture/bridge"),
+    ] {
+        assert!(
+            index
+                .edges()
+                .edges()
+                .any(|edge| edge.kind() == EdgeKind::Imports
+                    && edge.from().as_str().ends_with(from)
+                    && edge.to().as_str().ends_with(to)),
+            "missing {from} -> {to}"
+        );
+    }
+    assert!(
+        !index
+            .edges()
+            .edges()
+            .any(|edge| edge.kind() == EdgeKind::Imports
+                && edge.from().as_str().ends_with("/fixture/denied"))
+    );
+    assert!(
+        index
+            .edges()
+            .edges()
+            .any(|edge| edge.kind() == EdgeKind::Aliases
+                && edge.from().as_str().ends_with("/bridge/Item")
+                && edge.to().as_str().ends_with("/fixture/Item")),
+        "missing reexport alias"
+    );
+}
+

@@ -393,7 +393,11 @@ impl<'a> Tokens<'a> {
                 return Some(());
             }
         }
-        if !consume(&mut input, &["pub", "use"]) {
+        if input.first() != Some(&"pub") {
+            return Some(());
+        }
+        visibility(&mut input)?;
+        if !consume(&mut input, &["use"]) {
             return Some(());
         }
         let range = self.module_range(item)?;

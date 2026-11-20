@@ -146,6 +146,8 @@ pub struct StaticRustUse {
     pub scope: ByteRange,
     /// Whether the path imports every visible member.
     pub glob: bool,
+    /// Authored visibility on the use declaration; absent for a private import.
+    pub visibility: Option<ByteRange>,
 }
 
 /// One Rust implementation and the type its methods belong to.
@@ -413,6 +415,7 @@ impl StaticFacts {
         });
         let imports = self.rust_uses().iter().all(|row| {
             valid(row.range)
+                && row.visibility.is_none_or(valid)
                 && valid(row.scope)
                 && row.scope.encloses(row.range)
                 && !row.path.is_empty()

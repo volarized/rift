@@ -95,29 +95,36 @@ impl<'source> Index<'source> {
                 result.record(self.rust_edge(file, range, EdgeKind::Overrides, target, base));
             }
         }
-        for imported in file
-            .facts
-            .rust_uses()
-            .iter()
-            .filter(|imported| imported.glob)
-        {
+        for imported in file.facts.rust_uses() {
             if !work.charge() {
                 return;
             }
-            let occurrence = self
-                .rust
-                .import(file, imported.range, work)
-                .and_then(|target| {
-                    self.occurrence(
-                        file,
-                        imported.range,
-                        imported.range,
-                        ReferenceRole::Import,
-                        target,
-                    )
-                });
+            let target = if imported.glob {
+                self.rust.import(file, imported.range, work)
+            } else {
+                self.rust.written_import(file, imported.range, work)
+            };
+            let occurrence = target
+                .and_then(|target| self.rust_import_occurrence(file, imported.range, target, work));
             result.record(occurrence);
         }
+    }
+
+    pub(in crate::static_resolution) fn rust_import_occurrence(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        target: Target<'source>,
+        work: &mut Work,
+    ) -> Option<StaticOccurrence> {
+        let mut occurrence = self.occurrence(file, range, range, ReferenceRole::Import, target)?;
+        if let Some(source) = self.rust.import_source(file, range, work) {
+            let source = self.occurrence(file, range, range, ReferenceRole::Import, source)?;
+            if let rift_provider::NormalizedTarget::Symbol(from) = source.target {
+                occurrence.edge_from = Some(from);
+            }
+        }
+        Some(occurrence)
     }
 
     fn rust_edge(
