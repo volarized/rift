@@ -121,6 +121,7 @@ async fn extra_project_profiles_serve_distinct_scopes_through_one_connection() -
     let primary_hits = beacons(&client, "local").await?;
     assert_eq!(primary_hits["local"].1.as_deref(), Some(PRIMARY_SOURCE));
     let all = crate::workspace_client::query_after_population(&client, &rift_protocol::query::QueryParams {
+            include: rift_protocol::query::QueryInclude::default(),
         query: "SELECT (COUNT(?hit) AS ?count) { SERVICE :search { ?hit :query 'beacon'; :target 'file'; :scope 'all' } }".to_owned(),
         language: rift_protocol::query::QueryLanguage::Sparql,
     ..Default::default()

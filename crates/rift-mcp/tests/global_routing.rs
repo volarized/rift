@@ -2753,7 +2753,10 @@ fn case_search_request(query: &str) -> TestResult<rift_cloud_client::PackageSear
                 .map(|candidate| candidate.text().to_owned())
                 .collect(),
         ),
-        include: Some(rift_cloud_client::PackageSearchRequestInclude { source: Some(true) }),
+        include: Some(rift_cloud_client::PackageSearchRequestInclude {
+            source: Some(true),
+            providers: None,
+        }),
         packages: Some(vec![rift_cloud_client::PackageIdentity {
             manager: "cargo".to_owned(),
             registry: "crates.io".to_owned(),

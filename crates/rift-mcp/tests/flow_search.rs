@@ -69,6 +69,7 @@ const QUERY_CONFIGURATION: &str = "[search.query]\n";
 
 fn sparql(query: String) -> QueryParams {
     QueryParams {
+        include: rift_protocol::query::QueryInclude::default(),
         max_results: 10,
         query,
         language: QueryLanguage::Sparql,
@@ -151,8 +152,8 @@ async fn static_javascript_finds_a_path_around_the_ranked_middle_step() -> TestR
 async fn assert_javascript_evidence(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
 ) -> TestResult {
-    let query = sparql(format!(
-        "SELECT ?index ?name ?unit ?start ?end {{
+    let mut query = sparql(format!(
+        "SELECT ?step ?index ?name ?unit ?start ?end {{
            SERVICE :flows {{
              ?flow :query '{SEED}'; :max_results 1; :steps ?step .
              ?step :index ?index; :value ?symbol;
@@ -162,7 +163,7 @@ async fn assert_javascript_evidence(
          }} ORDER BY ?index ?start"
     ));
     let answer = query_after_population(client, &query).await?;
-    let rows = rows(&answer)?;
+    let bindings = rows(&answer)?;
     let sites = JAVASCRIPT_SOURCE
         .match_indices("middle();")
         .map(|(start, _)| start);
@@ -172,12 +173,27 @@ async fn assert_javascript_evidence(
     let expected = sites
         .map(|start| (1, "middle", start))
         .chain([(2, "finish", outgoing)]);
-    let actual = rows.iter().map(call_site).collect::<TestResult<Vec<_>>>()?;
+    let actual = bindings
+        .iter()
+        .map(call_site)
+        .collect::<TestResult<Vec<_>>>()?;
     assert_eq!(
         actual,
         expected.collect::<Vec<_>>(),
         "flow evidence: {answer}"
     );
+    assert!(
+        bindings
+            .iter()
+            .all(|row| row["step"].get("providers").is_none())
+    );
+    query.include.providers = true;
+    let included = query_after_population(client, &query).await?;
+    let included = rows(&included)?;
+    assert_eq!(included.len(), bindings.len());
+    for row in included {
+        assert_eq!(row["step"]["providers"], serde_json::json!(["static"]));
+    }
     Ok(())
 }
 
@@ -221,6 +237,7 @@ async fn static_rust_reads_steps_across_pages() -> TestResult {
     let middle = captured_seed(&client, "middle", RUST_PATH).await?;
     let finish = captured_seed(&client, "finish", RUST_PATH).await?;
     let parameters = QueryParams {
+        include: rift_protocol::query::QueryInclude::default(),
         max_results: 2,
         ..flows("")
     };

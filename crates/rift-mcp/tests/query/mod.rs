@@ -20,6 +20,7 @@ pub(crate) fn declaration(name: &str, path: &str) -> QueryParams {
     let name = Literal::from(name);
     let unit = rift_protocol::identity::encode_source_unit_key(path);
     QueryParams {
+        include: rift_protocol::query::QueryInclude::default(),
         query: format!(
             "SELECT ?symbol ?name ?kind ?language ?unit ?source ?start ?end {{ ?symbol a :Symbol; :name {name}; :name ?name; :kind ?kind; :language ?language . ?syntax_element :of ?symbol; :index 0; :source ?source; :range [ :unit <rift://source/project/{unit}>; :unit ?unit; :start ?start; :end ?end ] }}"
         ),
@@ -81,6 +82,7 @@ pub(crate) fn projected_retrieval(
     projected.push_str(projection);
     let query = format!("SELECT {projected} {{ SERVICE :search {{ {group} }} }} ORDER BY ?index");
     Ok(QueryParams {
+        include: rift_protocol::query::QueryInclude::default(),
         query,
         language: QueryLanguage::Sparql,
         page: parameters.page,
@@ -110,6 +112,7 @@ pub(crate) fn result_page(
 pub(crate) fn path(seed: &str, expression: &str) -> TestResult<QueryParams> {
     let seed = NamedNodeRef::new(seed)?;
     Ok(QueryParams {
+        include: rift_protocol::query::QueryInclude::default(),
         query: format!(
             "SELECT DISTINCT ?symbol {{ {seed} {expression} ?symbol }} ORDER BY ?symbol"
         ),

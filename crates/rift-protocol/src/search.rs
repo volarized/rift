@@ -13,7 +13,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use strum::VariantArray;
 
-/// One auditable step in a search traversal. `edge` retains its occurrence, provider, and
+/// One auditable step in a search traversal. `edge` retains its occurrence, requested providers, and
 /// derivation; `direction` records how the walk followed it.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -415,6 +415,9 @@ pub struct SymbolChange {
 #[serde(deny_unknown_fields)]
 #[schemars(example = serde_json::json!({"source": true}))]
 pub struct SearchInclude {
+    /// Attaches the sorted analyses that produced each merged edge.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub providers: bool,
     /// Attaches the source text around each hit.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub source: bool,
@@ -428,7 +431,7 @@ impl SearchInclude {
     /// Whether the caller requested no extra payload.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        !self.source && !self.score
+        !self.source && !self.score && !self.providers
     }
 }
 

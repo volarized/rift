@@ -53,7 +53,7 @@ async fn incoming_references(configuration: &str, provider: &str) -> TestResult 
             "search_retrieval",
             &json!({"target":"symbol", "traversal":{
                 "seed":seed, "direction":"incoming", "kinds":["references"]
-            }}),
+            }, "include": {"providers": true}}),
         ),
     )
     .await?;
@@ -74,7 +74,7 @@ async fn incoming_references(configuration: &str, provider: &str) -> TestResult 
     assert_eq!(edge["from"], hit["hit"]["symbol"]["id"], "{answer:#}");
     assert_eq!(edge["to"], json!(seed), "{answer:#}");
     assert_eq!(edge["kinds"], json!(["references"]), "{answer:#}");
-    assert_eq!(edge["provider"], provider, "{answer:#}");
+    assert_eq!(edge["providers"], json!([provider]), "{answer:#}");
     assert_eq!(edge["derivation"], json!("resolution"), "{answer:#}");
     assert_eq!(
         std::fs::read_to_string(directory.path().join("service.py"))?,

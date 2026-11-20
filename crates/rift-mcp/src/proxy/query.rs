@@ -240,7 +240,9 @@ impl RiftProxy {
                         }
                     }
                 }
-                let answer = dataset.build().evaluate(&query, &cancellation)?.into();
+                let dataset = dataset.build();
+                let mut answer = dataset.evaluate(&query, &cancellation)?.into();
+                dataset.annotate_providers(&mut answer)?;
                 let view = proxy_view(selected.iter().filter_map(|result| result.view.as_ref()))?;
                 if cancellation.is_cancelled() {
                     return errors::search::query_cancelled().fail();
@@ -249,6 +251,7 @@ impl RiftProxy {
                     &view,
                     &answer,
                     QueryPageOptions {
+                        include: params.include,
                         configuration: &configuration,
                         page: params.page,
                         max_results: params.max_results,

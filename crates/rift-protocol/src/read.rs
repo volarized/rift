@@ -1897,8 +1897,9 @@ pub struct Edge {
     /// whether the provider supplied a source syntax element.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub occurrence: Option<SourceUnitSpan>,
-    /// Which analysis produced this edge.
-    pub provider: EdgeProvider,
+    /// Sorted analyses that produced this edge, present when `include.providers` is `true`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub providers: std::collections::BTreeSet<EdgeProvider>,
     /// How this edge was established.
     pub derivation: EdgeDerivation,
     /// How likely a `heuristic` edge is to hold, from 0 to 1. Absent for any other
@@ -1933,12 +1934,12 @@ pub struct Edge {
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum EdgeProvider {
-    /// Static analysis captured into the index.
-    Static,
     /// A language engine embedded in Rift, such as ty.
     Engine,
     /// A language server reached through LSP.
     Lsp,
+    /// Static analysis captured into the index.
+    Static,
 }
 
 /// How this edge was established. Every edge reaches Rift from a provider, and this field

@@ -38,3 +38,6 @@ pub mod source;
 pub mod source_read;
 pub mod symbol_read;
 pub mod workspace;
+
+mod edge_projection;
+mod stored_edge;

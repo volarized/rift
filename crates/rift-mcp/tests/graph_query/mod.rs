@@ -21,6 +21,7 @@ async fn statement(
     query_after_population(
         client,
         &QueryParams {
+            include: rift_protocol::query::QueryInclude::default(),
             max_results: 2,
             query: text.into(),
             language: QueryLanguage::Sparql,
@@ -170,6 +171,7 @@ async fn graph_paths_and_physical_usages_select_exact_pages() -> TestResult {
     let first = statement(&client, format!("SELECT ?u ?start ?source {{ <{leaf}> :usages ?u . ?u :range/:start ?start; :source ?source }} ORDER BY ?start")).await?;
     assert_eq!(first["pagination"]["pages"], 2);
     let parameters = QueryParams {
+        include: rift_protocol::query::QueryInclude::default(),
         query: format!(
             "SELECT ?u ?start ?source {{ <{leaf}> :usages ?u . ?u :range/:start ?start; :source ?source }} ORDER BY ?start"
         ),
@@ -252,7 +254,8 @@ async fn static_edge_provider_filters_captured_calls() -> TestResult {
     )
     .await?;
     assert_eq!(
-        raw["results"][0]["traversal_path"][0]["edge"]["provider"], "static",
+        raw["results"][0]["traversal_path"][0]["edge"].get("providers"),
+        None,
         "{raw}"
     );
     let answer = statement(&client, format!("ASK {{ <{seed}> :calls ?target . ?target :name 'perform' . ?edge a :Edge; :from <{seed}>; :to ?target; :kinds :calls; :provider 'static' }}")).await?;
@@ -261,6 +264,29 @@ async fn static_edge_provider_filters_captured_calls() -> TestResult {
         json!({"result":"boolean", "value":true}),
         "{answer}"
     );
+    let text = format!(
+        "SELECT ?edge {{ <{seed}> :calls ?target . ?edge a :Edge; :from <{seed}>; :to ?target; :kinds :calls }}"
+    );
+    let mut revision = None;
+    for included in [false, true, false] {
+        let request = rift_protocol::query::QueryParams {
+            query: text.clone(),
+            include: rift_protocol::query::QueryInclude {
+                providers: included,
+            },
+            revision: revision.clone(),
+            ..Default::default()
+        };
+        let answer = crate::workspace_client::query_after_population(&client, &request).await?;
+        let rows = query::rows(&answer)?;
+        assert_eq!(rows.len(), 1, "{answer}");
+        assert_eq!(
+            rows[0]["edge"].get("providers"),
+            included.then(|| json!(["static"])).as_ref()
+        );
+        assert_eq!(answer["pagination"]["total"], 1);
+        revision = Some(serde_json::from_value(answer["revision"].clone())?);
+    }
     client.cancel().await?;
     task.await?;
     Ok(())

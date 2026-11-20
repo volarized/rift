@@ -1,5 +1,6 @@
 //! Inheritance edges from advertised LSP operations.
 
+use rift_protocol::index::StoredEdge;
 use std::collections::BTreeSet;
 
 use lsp_types::{Location, Range};
@@ -7,7 +8,7 @@ use rift_core::{ProjectPath, SymbolId as CoreSymbolId};
 use rift_error::{RiftError, errors};
 use rift_lsp::{EngineSession, LineIndex, PositionEncoding, TreeRoot};
 use rift_protocol::read::{
-    Edge, EdgeDerivation, EdgeKind, EdgeProvider, ExactKind, Extensions, ReadWarning, SymbolId,
+    EdgeDerivation, EdgeKind, EdgeProvider, ExactKind, Extensions, ReadWarning, SymbolId,
     TraversalDirection,
 };
 use tokio::time::Instant;
@@ -40,7 +41,7 @@ pub async fn graph_heritage_edges(
     kind: EdgeKind,
     direction: TraversalDirection,
     deadline: Instant,
-) -> Result<(Vec<Edge>, Vec<ReadWarning>), RiftError> {
+) -> Result<(Vec<StoredEdge>, Vec<ReadWarning>), RiftError> {
     let identity = CoreSymbolId::new(seed.as_str())?;
     let Some(declaration) = super::edge_declarations(reads, &identity)?
         .into_iter()
@@ -113,7 +114,7 @@ fn edge_locations(
     seed: &SymbolId,
     (kind, direction): (EdgeKind, TraversalDirection),
     report: EdgeEngineReport,
-) -> Result<Vec<Edge>, RiftError> {
+) -> Result<Vec<StoredEdge>, RiftError> {
     let identity = CoreSymbolId::new(seed.as_str())?;
     let roots = [
         TreeRoot::new(slot.workspace_root())?,
@@ -158,8 +159,13 @@ fn edge_locations(
     Ok(edges)
 }
 
-fn edge_protocol(from: SymbolId, to: SymbolId, kind: EdgeKind, provider: EdgeProvider) -> Edge {
-    Edge {
+fn edge_protocol(
+    from: SymbolId,
+    to: SymbolId,
+    kind: EdgeKind,
+    provider: EdgeProvider,
+) -> StoredEdge {
+    StoredEdge {
         producer: None,
         from,
         to,
@@ -180,7 +186,7 @@ fn edge_impl_header(
     range: Range,
     encoding: PositionEncoding,
     kind: EdgeKind,
-    edges: &mut Vec<Edge>,
+    edges: &mut Vec<StoredEdge>,
 ) -> Result<(), RiftError> {
     let Some(file) = reads.index().file(path) else {
         return Ok(());

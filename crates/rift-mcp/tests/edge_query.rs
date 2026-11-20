@@ -26,6 +26,7 @@ async fn test_edge_static_calls_agree_in_both_directions_and_with_flows() -> Tes
         ),
     ] {
         let params = QueryParams {
+            include: rift_protocol::query::QueryInclude::default(),
             query: text,
             language: QueryLanguage::Sparql,
             page: 1,
@@ -65,6 +66,7 @@ async fn test_edge_heritage_imports_aliases_and_outgoing_references_are_queryabl
         "ASK { ?alias :aliases ?target }".to_owned(),
     ] {
         let params = QueryParams {
+            include: rift_protocol::query::QueryInclude::default(),
             query: text,
             language: QueryLanguage::Sparql,
             page: 1,
@@ -128,6 +130,7 @@ async fn test_edge_readiness_budget_reports_a_typed_warning_for_calls_and_struct
         format!("SELECT ?usage {{ <{worker}> :usages ?usage }}"),
     ] {
         let params = QueryParams {
+            include: rift_protocol::query::QueryInclude::default(),
             query: text,
             language: QueryLanguage::Sparql,
             page: 1,
@@ -178,6 +181,7 @@ async fn test_edge_rust_struct_usages_and_call_directions_agree_on_the_same_engi
     let worker = captured_seed(&client, "Worker", "lib.rs").await?;
     let run = captured_seed(&client, "run", "lib.rs").await?;
     let usages = QueryParams {
+        include: rift_protocol::query::QueryInclude::default(),
         query: format!("SELECT ?usage ?kind {{ <{worker}> :usages ?usage . ?usage :kind ?kind }}"),
         language: QueryLanguage::Sparql,
         page: 1,
@@ -190,6 +194,7 @@ async fn test_edge_rust_struct_usages_and_call_directions_agree_on_the_same_engi
         "{usages}"
     );
     let outgoing = QueryParams {
+        include: rift_protocol::query::QueryInclude::default(),
         query: format!("SELECT ?target {{ <{run}> :calls ?target }}"),
         language: QueryLanguage::Sparql,
         page: 1,
@@ -202,6 +207,7 @@ async fn test_edge_rust_struct_usages_and_call_directions_agree_on_the_same_engi
     for row in targets {
         let target = workspace_client::query::iri(row, "target")?;
         let incoming = QueryParams {
+            include: rift_protocol::query::QueryInclude::default(),
             query: format!("SELECT ?caller {{ ?caller :calls <{target}> }}"),
             language: QueryLanguage::Sparql,
             page: 1,
@@ -219,6 +225,7 @@ async fn test_edge_rust_struct_usages_and_call_directions_agree_on_the_same_engi
     }
     let trait_area = worker.replace("/Worker", "/Task/area");
     let incoming = QueryParams {
+        include: rift_protocol::query::QueryInclude::default(),
         query: format!("SELECT ?caller {{ ?caller :calls <{trait_area}> }}"),
         language: QueryLanguage::Sparql,
         page: 1,
@@ -339,6 +346,7 @@ async fn test_edge_cold_calls_wait_and_reference_answers_need_no_declaration_mar
         let answer = query_after_population(
             &client,
             &QueryParams {
+                include: rift_protocol::query::QueryInclude::default(),
                 query,
                 language: QueryLanguage::Sparql,
                 page: 1,
@@ -370,6 +378,7 @@ async fn test_edge_queries_page_targets_at_the_same_revision() -> TestResult {
     let (_directory, client, task) = served_workspace(&[("entry.mjs", source)], None).await?;
     let root = captured_seed(&client, "root", "entry.mjs").await?;
     let mut params = QueryParams {
+        include: rift_protocol::query::QueryInclude::default(),
         query: format!("SELECT ?target {{ <{root}> :calls ?target }} ORDER BY ?target"),
         language: QueryLanguage::Sparql,
         page: 1,

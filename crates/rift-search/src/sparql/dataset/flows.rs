@@ -14,7 +14,13 @@ use crate::sparql::{
 };
 
 /// The source unit and half-open byte offsets of one call site, when established.
-pub type FlowCallSite = Option<(SourceUnitId, u64, u64)>;
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct FlowCallSite {
+    /// Physical source unit and half-open byte range, when established.
+    pub occurrence: Option<(SourceUnitId, u64, u64)>,
+    /// Analyses that established this call at this occurrence.
+    pub providers: std::collections::BTreeSet<rift_protocol::read::EdgeProvider>,
+}
 
 /// Paths of call edges and original call sites from one ranked retrieval.
 pub type QueryFlows = FlowResult<Arc<SymbolId>, FlowCallSite>;
@@ -80,7 +86,17 @@ fn write_sites(
     target: &Arc<SymbolId>,
 ) -> Result<(), RiftError> {
     let sites = flows.evidence(Arc::clone(caller), Arc::clone(target));
-    for (unit, start, end) in sites.into_iter().flatten().flatten() {
+    for site in sites.into_iter().flatten() {
+        for provider in &site.providers {
+            writer.0.push(Triple::new(
+                step.clone(),
+                term("provider"),
+                Literal::from(provider.as_ref()),
+            ));
+        }
+        let Some((unit, start, end)) = &site.occurrence else {
+            continue;
+        };
         let key = format!("{} {} {} {}", target.as_str(), unit.as_str(), start, end);
         let occurrence = QueryOccurrence {
             target: target.as_ref().clone(),

@@ -13,7 +13,8 @@ use rift_protocol::read::{Pagination, ReadWarning, SearchResult};
 use rift_protocol::search_read::SearchUnavailable;
 use rift_protocol::symbol_read::{CapturedView, SymbolUnavailableReason};
 use rift_search::sparql::{
-    AdjacencySelection, GraphDataset, GraphLimits, GraphQuery, QueryCancellation, SemanticInventory,
+    AdjacencySelection, GraphDataset, GraphLimits, GraphQuery, QueryAnswerProjection,
+    QueryCancellation, SemanticInventory,
 };
 
 use super::{RiftMcp, read_failure};
@@ -29,6 +30,7 @@ use edges::AcquiredAdjacency;
 
 /// Settings and presentation retained with one query execution.
 pub(crate) struct QueryPageOptions<'a> {
+    pub(crate) include: rift_protocol::query::QueryInclude,
     pub(crate) configuration: &'a QueryConfiguration,
     pub(crate) page: u64,
     pub(crate) max_results: u64,
@@ -55,7 +57,7 @@ impl RiftMcp {
             rift_protocol::query::QUERY_MAX_RESULTS,
         )
         .map_err(read_failure)?;
-        let paging = (params.page, params.max_results);
+        let paging = (params.page, params.max_results, params.include);
         let deadline = self.request_deadline().await;
         let limits = GraphLimits::default();
         let query = tokio::time::timeout_at(
@@ -130,7 +132,7 @@ impl RiftMcp {
     async fn retained_query_page(
         &self,
         key: [u8; 32],
-        paging: (u64, u64),
+        paging: (u64, u64, rift_protocol::query::QueryInclude),
         revision: rift_protocol::revision::Revision,
         configuration: QueryConfiguration,
         deadline: RequestDeadline,
@@ -148,6 +150,7 @@ impl RiftMcp {
                     &view,
                     &answer,
                     QueryPageOptions {
+                        include: paging.2,
                         configuration: &configuration,
                         page: paging.0,
                         max_results: paging.1,
@@ -475,7 +478,7 @@ impl AcquiredGraph {
         deadline: RequestDeadline,
         cancellation: &QueryCancellation,
         views: &std::sync::OnceLock<rift_server::LocalSymbolViews>,
-        paging: (u64, u64),
+        paging: (u64, u64, rift_protocol::query::QueryInclude),
         key: [u8; 32],
     ) -> Result<QueryOutput, RiftError> {
         let Self {
@@ -578,7 +581,7 @@ struct QueryRetention<'answer> {
     key: [u8; 32],
     answer: &'answer QueryAnswer,
     configuration: &'answer QueryConfiguration,
-    paging: (u64, u64),
+    paging: (u64, u64, rift_protocol::query::QueryInclude),
     warnings: Vec<ReadWarning>,
     display: QueryDisplay,
     acquired: &'answer AcquiredAdjacency,
@@ -615,6 +618,7 @@ impl QueryRetention<'_> {
                 &view,
                 self.answer,
                 QueryPageOptions {
+                    include: self.paging.2,
                     configuration: self.configuration,
                     page: self.paging.0,
                     max_results: self.paging.1,
@@ -660,7 +664,8 @@ fn evaluate_acquired_query(
     cancellation: &QueryCancellation,
     acquired: &AcquiredAdjacency,
 ) -> Result<Option<QueryAnswer>, RiftError> {
-    let answer: QueryAnswer = dataset.evaluate(query, cancellation)?.into();
+    let mut answer: QueryAnswer = dataset.evaluate(query, cancellation)?.into();
+    dataset.annotate_providers(&mut answer)?;
     Ok(
         (!acquired.is_incomplete() || matches!(answer, QueryAnswer::Boolean { value: true }))
             .then_some(answer),
@@ -673,9 +678,14 @@ pub(crate) fn query_page(
     answer: &QueryAnswer,
     options: QueryPageOptions<'_>,
 ) -> Result<QueryOutput, RiftError> {
+    let provider = rift_search::sparql::VocabularyProperty::Provider.iri();
+    let visible = |triple: &&rift_protocol::query::RdfTriple| {
+        !matches!(&triple.predicate,
+        rift_protocol::query::RdfTerm::Iri { value } if value == provider.as_str())
+    };
     let total = match answer {
         QueryAnswer::Bindings { bindings, .. } => bindings.len(),
-        QueryAnswer::Graph { triples } => triples.len(),
+        QueryAnswer::Graph { triples } => triples.iter().filter(visible).count(),
         QueryAnswer::Boolean { .. } => 1,
     };
     let pagination = Pagination::new(options.page, options.max_results, total as u64);
@@ -693,10 +703,17 @@ pub(crate) fn query_page(
             bindings: bindings[start..end].to_vec(),
         },
         QueryAnswer::Graph { triples } => QueryAnswer::Graph {
-            triples: triples[start..end].to_vec(),
+            triples: triples
+                .iter()
+                .filter(visible)
+                .skip(start)
+                .take(end - start)
+                .cloned()
+                .collect(),
         },
         QueryAnswer::Boolean { value } => QueryAnswer::Boolean { value: *value },
     };
+    let answer = answer.project(options.include);
     let output = QueryOutput::new(
         QueryReadResult::Results(Box::new(QueryResult {
             answer,
@@ -768,6 +785,91 @@ mod tests {
     use serde_json::{Value, json};
 
     type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    #[test]
+    fn query_pages_project_requested_providers_before_counting_graph_rows() -> TestResult {
+        use rift_protocol::query::{QueryInclude, RdfTerm, RdfTriple};
+        use rift_protocol::read::EdgeProvider;
+        let providers = [
+            EdgeProvider::Engine,
+            EdgeProvider::Lsp,
+            EdgeProvider::Static,
+        ]
+        .into_iter()
+        .collect();
+        let edge = RdfTerm::BlankNode {
+            value: "edge".to_owned(),
+            providers,
+        };
+        let triple = |predicate: &str, object| RdfTriple {
+            subject: edge.clone(),
+            predicate: RdfTerm::Iri {
+                value: format!("urn:rift:vocabulary:{predicate}"),
+            },
+            object,
+        };
+        let mut triples = vec![triple(
+            "to",
+            RdfTerm::Iri {
+                value: "rift://symbol/local/rust/app/callee".to_owned(),
+            },
+        )];
+        triples.extend(["engine", "lsp", "static"].map(|provider| {
+            triple(
+                "provider",
+                RdfTerm::Literal {
+                    value: provider.to_owned(),
+                    datatype: "http://www.w3.org/2001/XMLSchema#string".to_owned(),
+                },
+            )
+        }));
+        let answer = QueryAnswer::Graph { triples };
+        let view = CapturedView {
+            id: rift_protocol::symbol_read::CapturedViewId::parse(&"a".repeat(64))?,
+            expires_at: "2099-01-01T00:00:00Z".to_owned(),
+        };
+        for included in [false, true] {
+            for page in [1, 2] {
+                let output = query_page(
+                    &view,
+                    &answer,
+                    QueryPageOptions {
+                        include: QueryInclude {
+                            providers: included,
+                        },
+                        configuration: &QueryConfiguration::default(),
+                        page,
+                        max_results: 1,
+                        warnings: Vec::new(),
+                        display: QueryDisplay::default(),
+                    },
+                )?;
+                let QueryReadResult::Results(result) = output.result else {
+                    panic!("paged graph")
+                };
+                assert_eq!(result.pagination, Some(Pagination::new(page, 1, 1)));
+                let QueryAnswer::Graph { triples } = &result.answer else {
+                    panic!("graph answer")
+                };
+                assert_eq!(triples.len(), usize::from(page == 1));
+                if page == 1 {
+                    let value = serde_json::to_value(&triples[0])?;
+                    assert!(
+                        value["predicate"]["value"]
+                            .as_str()
+                            .is_some_and(|value| !value.ends_with(":provider"))
+                    );
+                    assert_eq!(
+                        value["subject"].get("providers"),
+                        included
+                            .then(|| json!(["engine", "lsp", "static"]))
+                            .as_ref()
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn query_key_names_normalized_text_revision_and_selection() -> TestResult {
@@ -1221,14 +1323,14 @@ mod tests {
                         B => (C, 3),
                         _ => return json_response(&json!({"outcome":"unavailable","reason":"insufficient_coverage"})),
                     };
-                    let source = request["include"] == json!({"source": true});
+                    let source = request["include"]["source"] == json!(true);
                     let (seed_symbol, seed_source) = graph_fixture_symbol(seed, source);
                     let (next_symbol, next_source) = graph_fixture_symbol(next, source);
                     let sources = seed_source.into_iter().chain(next_source).collect::<Vec<_>>();
                     let result = json!({
                         "groups": [{"seed":seed,"complete":true,"edges":[{
                             "id": format!("{number:064x}"),
-                            "edge":{"from":seed,"to":next,"kind":facet,"kinds":[facet],"provider": "static", "derivation":"resolution"}
+                            "edge":{"from":seed,"to":next,"kind":facet,"kinds":[facet],"providers": ["static"], "derivation":"resolution"}
                         }]}],
                         "symbols":[seed_symbol,next_symbol],
                         "sources":sources,
@@ -1279,7 +1381,7 @@ mod tests {
                     "groups": [{"seed":seed,"complete":true,"edges":[{
                         "id": format!("{id:064x}"),
                         "edge":{"from":caller,"to":seed,"kind":"calls",
-                            "kinds":["calls"],"provider": "static", "derivation":"resolution"}
+                            "kinds":["calls"],"providers": ["static"], "derivation":"resolution"}
                     }]}],
                     "symbols":[symbol(seed),symbol(caller)],
                     "analyzer_revision":"analyzer-v1","corpus_revision":"corpus-v1",
@@ -1599,7 +1701,10 @@ mod tests {
         );
         let requests = requests.lock().await;
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0]["include"], json!({"source": true}));
+        assert_eq!(
+            requests[0]["include"],
+            json!({"source": true, "providers": true})
+        );
         service.abort();
         Ok(())
     }
