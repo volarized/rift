@@ -1652,3 +1652,30 @@ fn test_rust_non_trait_bound_does_not_supply_a_same_named_method() {
     );
     assert_eq!(calls(&result, "src/lib.rs").count(), 0);
 }
+
+#[test]
+fn test_rust_crate_visible_nested_modules_keep_import_targets() {
+    let source = "mod provider; mod consumer;";
+    let consumer =
+        "use crate::provider::nested::Count; fn root<T: Count>(item: &T) { item.read(); }";
+    let result = resolution(
+        "rust",
+        &[
+            ("src/lib.rs", source),
+            (
+                "src/provider.rs",
+                "pub(crate) mod nested { pub(crate) trait Count { fn read(&self); } }",
+            ),
+            ("src/consumer.rs", consumer),
+        ],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    let found = calls(&result, "src/consumer.rs").collect::<Vec<_>>();
+    assert_eq!(found.len(), 1);
+    assert_eq!(source_of(found[0], consumer), "item.read()");
+    assert_eq!(
+        target(found[0]),
+        "rift://symbol/local/rust/fixture/provider/nested/Count/read"
+    );
+}

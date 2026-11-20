@@ -586,3 +586,50 @@ fn test_rust_reference_and_slice_impls_keep_distinct_stored_identities() {
     assert!(!edges.iter().any(|edge| edge.kind() == EdgeKind::Implements
         && edge.from().as_str().ends_with("/fixture/Item")));
 }
+
+#[test]
+fn test_rust_restricted_module_visibility_keeps_stored_imports() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let root = directory.path();
+    std::fs::create_dir(root.join("src")).expect("source directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='fixture'\nversion='0.1.0'\n",
+    )
+    .expect("manifest");
+    std::fs::write(root.join("src/lib.rs"), "mod provider; mod consumer;").expect("root source");
+    std::fs::write(root.join("src/provider.rs"), "pub(crate) mod nested { pub(crate) trait Count { fn read(&self); } } mod private { pub trait Hidden { fn read(&self); } }").expect("provider source");
+    std::fs::write(root.join("src/consumer.rs"), "use crate::provider::nested::Count; use crate::provider::private::Hidden; fn root<T: Count>(item: &T) { item.read(); } fn denied<T: Hidden>(item: &T) { item.read(); }").expect("consumer source");
+    let index = WorkspaceIndex::build(
+        root,
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &TextFileInclusion::default(),
+    )
+    .expect("index");
+    assert!(
+        index
+            .symbol_view()
+            .expect("symbols")
+            .normalized_graph()
+            .records()
+            .iter()
+            .all(|record| record.identity().is_some())
+    );
+    for kind in [EdgeKind::Imports, EdgeKind::Calls, EdgeKind::Reads] {
+        assert!(
+            index
+                .edges()
+                .edges()
+                .any(|edge| edge.kind() == kind
+                    && edge.to().as_str().contains("/provider/nested/Count")),
+            "missing {kind:?}: {:?}",
+            index.edges().edges().collect::<Vec<_>>()
+        );
+    }
+    assert!(!index.edges().edges().any(|edge| matches!(
+        edge.kind(),
+        EdgeKind::Imports | EdgeKind::Calls | EdgeKind::Reads
+    )
+        && edge.to().as_str().contains("/provider/private/Hidden")));
+}

@@ -27,7 +27,7 @@ pub(super) struct Namespaces<'source> {
     initializers: BTreeMap<(&'source str, ByteRange), Option<&'source StaticCall>>,
     conditional_modules: BTreeSet<Vec<String>>,
     inactive_modules: BTreeSet<Vec<String>>,
-    modules: BTreeMap<Vec<String>, bool>,
+    modules: BTreeMap<Vec<String>, Option<Target<'source>>>,
     crate_roots: BTreeMap<String, Option<&'source str>>,
 }
 
@@ -88,7 +88,9 @@ impl<'source> Namespaces<'source> {
         self.lookup(file, range.start, &path, Namespace::Type, work)
             .or_else(|| {
                 self.members.get(&path).copied().flatten().filter(|target| {
-                    target.symbol.kinds.contains(&SymbolKind::Type) && self.available(*target)
+                    !self.types.contains_key(&path)
+                        && target.symbol.kinds.contains(&SymbolKind::Type)
+                        && self.available(*target)
                 })
             })
     }
@@ -416,11 +418,7 @@ impl<'source> Namespaces<'source> {
                     namespace.inline.push((symbol, path.clone()));
                 }
                 insert(&mut self.types, path.clone(), target);
-                let public = symbol.visibility.as_deref() == Some("pub");
-                self.modules
-                    .entry(path)
-                    .and_modify(|admitted| *admitted = false)
-                    .or_insert(public);
+                insert(&mut self.modules, path, target);
                 continue;
             }
             self.index_target(file, symbol, path, work);
@@ -695,10 +693,17 @@ impl<'source> Namespaces<'source> {
             if !work.charge() || self.module_unavailable(module) {
                 return false;
             }
-            if self.modules.get(module) == Some(&false)
-                && !source.starts_with(&module[..length - 1])
-            {
-                return false;
+            if let Some(target) = self.modules.get(module) {
+                let Some(target) = target else {
+                    return false;
+                };
+                if !namespace_visible(
+                    source,
+                    &module[..length - 1],
+                    target.symbol.visibility.as_deref(),
+                ) {
+                    return false;
+                }
             }
         }
         let visibility = target.symbol.visibility.as_deref();
@@ -1050,4 +1055,15 @@ fn is_value_binding(kind: StaticBindingKind) -> bool {
             | StaticBindingKind::RustReceiver { .. }
             | StaticBindingKind::RustValue { .. }
     )
+}
+
+fn namespace_visible(source: &[String], namespace: &[String], visibility: Option<&str>) -> bool {
+    match visibility {
+        Some("pub") => true,
+        Some("pub(crate)") => source.first() == namespace.first(),
+        Some("pub(super)") => namespace
+            .split_last()
+            .is_some_and(|(_, parent)| source.starts_with(parent)),
+        _ => source.starts_with(namespace),
+    }
 }
