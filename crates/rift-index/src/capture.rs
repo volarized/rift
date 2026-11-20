@@ -21,6 +21,8 @@ use tempfile::NamedTempFile;
 
 use crate::change_set::FileDigest;
 use crate::workspace::{WorkspaceIndexLimits, metadata_is_executable, read_file_bytes};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use nix::sys::statfs::statfs;
 use rift_error::{RiftError, errors};
 use same_file::Handle;
 
@@ -28,9 +30,68 @@ use same_file::Handle;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RootIdentity(Arc<Handle>);
 
+/// Whether file metadata on the workspace filesystem records a status change time that
+/// every write moves.
+///
+/// A rewrite can keep a file's length and restore its modification time; only a moved
+/// status change time shows that rewrite. Without a verified status change time, an
+/// unchanged stat proves nothing, so every capture reads every path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StatusChangeTime {
+    /// The filesystem moves the status change time on every write.
+    Verified,
+    /// The platform records no status change time, or the filesystem type is not known
+    /// to move it on every write.
+    Unverified,
+}
+
+impl StatusChangeTime {
+    /// The value for the filesystem holding `root`: verified for APFS and HFS+ on macOS
+    /// and ext4 and tmpfs on Linux, unverified for Windows and every other filesystem type.
+    pub(crate) fn of(root: &Path) -> Self {
+        if filesystem_verifies_status_change_time(root) {
+            Self::Verified
+        } else {
+            Self::Unverified
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn supports_stat_reuse_type(filesystem_type: nix::sys::statfs::FsType) -> bool {
+    use nix::sys::statfs::{EXT4_SUPER_MAGIC, TMPFS_MAGIC};
+
+    matches!(filesystem_type, EXT4_SUPER_MAGIC | TMPFS_MAGIC)
+}
+
+#[cfg(target_os = "macos")]
+fn supports_stat_reuse_type(filesystem_type_name: &str) -> bool {
+    matches!(filesystem_type_name, "apfs" | "hfs")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn filesystem_verifies_status_change_time(root: &Path) -> bool {
+    statfs(root).is_ok_and(|filesystem| {
+        #[cfg(target_os = "linux")]
+        {
+            supports_stat_reuse_type(filesystem.filesystem_type())
+        }
+        #[cfg(target_os = "macos")]
+        {
+            supports_stat_reuse_type(filesystem.filesystem_type_name())
+        }
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn filesystem_verifies_status_change_time(_root: &Path) -> bool {
+    false
+}
+
+/// Whether a capture of `root` on this platform can reuse recorded digests.
 #[cfg(test)]
 pub(crate) fn supports_stat_reuse(root: &Path) -> bool {
-    CaptureBoundary::create(root).is_some()
+    CaptureBoundary::create(root, StatusChangeTime::of(root)).is_some()
 }
 
 /// A timestamped file on the workspace filesystem, created before capture reads.
@@ -47,10 +108,16 @@ pub(crate) struct CaptureBoundary {
 
 impl CaptureBoundary {
     /// Creates a boundary under `.rift`; failure disables reuse for this capture.
-    pub(crate) fn create(root: &Path) -> Option<Self> {
+    ///
+    /// Without a verified status change time there is no boundary, so the capture reads
+    /// every path.
+    pub(crate) fn create(root: &Path, status_change_time: StatusChangeTime) -> Option<Self> {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt as _;
 
+        if status_change_time == StatusChangeTime::Unverified {
+            return None;
+        }
         let root_metadata = fs::metadata(root).ok()?;
         if !root_metadata.is_dir() {
             return None;
@@ -63,6 +130,10 @@ impl CaptureBoundary {
         }
         let directory_metadata = fs::symlink_metadata(&directory).ok()?;
         if !directory_metadata.is_dir() {
+            return None;
+        }
+        #[cfg(unix)]
+        if directory_metadata.dev() != root_metadata.dev() {
             return None;
         }
         let file = NamedTempFile::new_in(&directory).ok()?;
@@ -90,8 +161,9 @@ impl CaptureBoundary {
         let old_status = stat.status.device == self.device
             && (stat.status.changed_seconds, stat.status.changed_nanoseconds)
                 < (self.changed_seconds, self.changed_nanoseconds);
+        // Without a status change time, metadata cannot prove a file old.
         #[cfg(not(unix))]
-        let old_status = true;
+        let old_status = false;
         old_modified && old_status
     }
 
@@ -101,7 +173,7 @@ impl CaptureBoundary {
             && (self.changed_seconds, self.changed_nanoseconds)
                 >= (previous.changed_seconds, previous.changed_nanoseconds);
         #[cfg(not(unix))]
-        let status_follows = true;
+        let status_follows = false;
         self.modified >= previous.modified && status_follows
     }
 }
@@ -117,9 +189,11 @@ pub(crate) fn root_identity(root: &Path) -> Option<RootIdentity> {
 ///
 /// A stat records length, modification and creation times, and read-only permissions.
 /// Unix metadata also records status-change time, device, inode, and mode. A capture
-/// reuses digests only when the stat matches and modification time precedes the filesystem
-/// boundary that validated the bytes; Unix status-change time must precede it too.
+/// reuses digests only when the stat matches and both the modification time and the
+/// status change time precede the filesystem boundary that validated the bytes.
 /// Reuse retains that original boundary, preventing reuse within the same timestamp tick.
+/// Only filesystem types with a verified status change time reuse digests; Windows and
+/// every other type read every file again.
 ///
 /// A record holds the paths of one capture alone, so it stays within `files_max`, and it
 /// is reused only under the limits, root identity, and filesystem boundary it was captured
@@ -133,6 +207,9 @@ pub struct LastCapture {
     read: usize,
     boundary: Option<CaptureBoundary>,
     root_identity: Option<RootIdentity>,
+    /// The status change time every capture from this record uses; `None` reads it from
+    /// the workspace filesystem.
+    status_change_time: Option<StatusChangeTime>,
 }
 
 /// One path's metadata and its validated project-relative spelling, when indexed.
@@ -152,12 +229,14 @@ pub(crate) struct CaptureSelection {
 }
 
 impl LastCapture {
-    /// An empty record for one capture of up to `paths` paths under `limits`.
+    /// An empty record for one capture of up to `paths` paths under `limits`, keeping the
+    /// status change time `last` captured with.
     pub(crate) fn under(
         limits: WorkspaceIndexLimits,
         paths: usize,
         boundary: Option<CaptureBoundary>,
         root_identity: Option<RootIdentity>,
+        last: &Self,
     ) -> Self {
         Self {
             limits: Some(limits),
@@ -166,7 +245,26 @@ impl LastCapture {
             read: 0,
             boundary,
             root_identity,
+            status_change_time: last.status_change_time,
         }
+    }
+
+    /// An empty record whose captures use `status_change_time` instead of the value the
+    /// workspace filesystem reports.
+    #[cfg(test)]
+    pub(crate) fn with_status_change_time(status_change_time: StatusChangeTime) -> Self {
+        Self {
+            status_change_time: Some(status_change_time),
+            ..Self::default()
+        }
+    }
+
+    /// The boundary for the next capture of `root` from this record.
+    pub(crate) fn boundary_at(&self, root: &Path) -> Option<CaptureBoundary> {
+        let status_change_time = self
+            .status_change_time
+            .unwrap_or_else(|| StatusChangeTime::of(root));
+        CaptureBoundary::create(root, status_change_time)
     }
 
     pub(crate) fn selection_for(
@@ -183,6 +281,14 @@ impl LastCapture {
     #[must_use]
     pub fn read_paths(&self) -> usize {
         self.read
+    }
+
+    /// Whether the next capture may keep this record's digests for paths whose stat did not
+    /// move: false when this record's capture had no filesystem boundary, such as on a
+    /// filesystem without a verified status change time.
+    #[must_use]
+    pub const fn reuses_unchanged_paths(&self) -> bool {
+        self.boundary.is_some()
     }
 
     /// The recorded capture of `path` when `stat` matches it under the same limits.

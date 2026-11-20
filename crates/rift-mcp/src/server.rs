@@ -8630,6 +8630,16 @@ done
         Ok((directory, assembled))
     }
 
+    /// Whether the server's last capture lets the next one reuse its selection and digests.
+    fn reuses_unchanged_paths(server: &RiftMcp) -> bool {
+        server
+            .last_capture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .files
+            .reuses_unchanged_paths()
+    }
+
     #[tokio::test]
     async fn unchanged_reads_do_not_walk_without_a_watcher_event() -> TestResult {
         let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
@@ -8643,13 +8653,19 @@ done
             .value()
             .clone();
         assert_eq!(search_symbols(server, "beacon").await?.results.len(), 1);
-        assert_eq!(
-            recorder
-                .metrics()
-                .find("index.directory_walks", &[])
-                .map(|series| series.value().clone()),
-            Some(walks)
-        );
+        let walked = recorder
+            .metrics()
+            .find("index.directory_walks", &[])
+            .map(|series| series.value().clone());
+        if reuses_unchanged_paths(server) {
+            assert_eq!(walked, Some(walks));
+        } else {
+            assert_ne!(
+                walked,
+                Some(walks),
+                "without a verified status change time every capture walks"
+            );
+        }
 
         let current = Arc::clone(&server.published.read().await.current);
         fs::create_dir_all(directory.path().join("uncaptured/empty/deep"))?;
@@ -8688,13 +8704,19 @@ done
             .observe_paths([CoreProjectPath::new("lib.rs")?])?;
         let (observed, _) = server.capture_tree(&current).await?;
         assert_eq!(observed, edited);
-        assert_eq!(
-            recorder
-                .metrics()
-                .find("index.directory_walks", &[])
-                .map(|series| series.value().clone()),
-            Some(walks)
-        );
+        let walked = recorder
+            .metrics()
+            .find("index.directory_walks", &[])
+            .map(|series| series.value().clone());
+        if reuses_unchanged_paths(server) {
+            assert_eq!(walked, Some(walks));
+        } else {
+            assert_ne!(
+                walked,
+                Some(walks),
+                "without a verified status change time every capture walks"
+            );
+        }
 
         fs::write(directory.path().join("added.rs"), "pub fn added() {}\n")?;
         server
