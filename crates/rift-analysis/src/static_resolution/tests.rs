@@ -1,4 +1,57 @@
 #[test]
+fn test_commonjs_local_object_members_resolve_only_stable_callables() {
+    for (change, expected) in [
+        ("", 2),
+        ("object.run = other;", 1),
+        ("object[key] = other;", 1),
+        ("object = other;", 1),
+        ("[object] = values;", 1),
+        ("ob\\u006aect = other;", 1),
+        ("object.r\\u0075n = other;", 1),
+        ("object.run = function() {};", 1),
+        ("function change(object) { object.run = other; }", 2),
+        ("other.run = unknown;", 2),
+    ] {
+        for initializer in ["{}", "Object.create(null)"] {
+            let source = format!(
+                "function leaf() {{}} var object = {initializer}; object /* assignment */ . run = function() {{ leaf(); }}; {change} object /* call */ . run();"
+            );
+            for (language, path) in [("javascript", "main.cjs"), ("typescript", "main.cts")] {
+                let result = resolution(language, &[(path, &source)], &[], WORK_MAX);
+                assert_eq!(
+                    calls(&result, path).count(),
+                    expected,
+                    "{language}: {source}: {result:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_commonjs_local_object_members_resolve_only_their_receiver_binding() {
+    for source in [
+        "var res = {}; res.clear = function clear() { const opts = { expires: 1 }; return opts.expires; }; res.set = function() { const opts = {}; opts.expires = 2; return opts; }; module.exports = res;",
+        "function root(receiver) { receiver.clear = function() { const opts = { expires: 1 }; return opts.expires; }; receiver.set = function() { const opts = {}; opts.expires = 2; }; }",
+    ] {
+        for (language, path) in [("javascript", "main.cjs"), ("typescript", "main.cts")] {
+            let result = resolution(language, &[(path, source)], &[], WORK_MAX);
+            let accesses = result
+                .occurrences
+                .iter()
+                .filter(|edge| {
+                    matches!(edge.role, ReferenceRole::Read | ReferenceRole::Write)
+                        && target(edge).ends_with("/expires")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(accesses.len(), 1, "{language}: {source}: {accesses:?}");
+            assert_eq!(accesses[0].role, ReferenceRole::Read);
+            assert_eq!(source_of(accesses[0], source), "opts.expires");
+        }
+    }
+}
+
+#[test]
 fn test_commonjs_prototype_methods_supply_callers_and_containment() {
     let source = "function leaf() {} function View() {} View.prototype.render = function render() { leaf(); render(); }; function Other() {} Other.prototype.lookup = function() { leaf(); };";
     for (language, path) in [("javascript", "main.cjs"), ("typescript", "main.cts")] {
@@ -281,6 +334,8 @@ fn test_commonjs_function_assignments_refuse_later_export_mutations() {
         "function change() { module.exports = replacement; }",
         "function change() { exports[key] = replacement; }",
         "function change() { exports.run++; }",
+        "function change() { exp\\u006frts.run = replacement; }",
+        "function change() { exports.r\\u0075n = replacement; }",
     ] {
         let source = format!("exports.run = function() {{}}; {mutation} exports.run();");
         for (language, path) in [("javascript", "main.cjs"), ("typescript", "main.cts")] {

@@ -409,9 +409,13 @@ impl<'source> File<'source> {
             if !work.charge() {
                 return None;
             }
+            if self.text(range)?.contains('\\') {
+                self.unknown_member_writes.insert(None);
+            }
             let Some(member) = self.members.get(&range).copied().flatten() else {
                 continue;
             };
+            self.index_javascript_object_write(member, work);
             let Some((receiver, slot)) = self.javascript_export_slot(member) else {
                 continue;
             };
@@ -471,6 +475,9 @@ impl<'source> File<'source> {
     }
 
     fn javascript_export_is_stable(&self, binding: &rift_syntax::SyntaxExportBinding) -> bool {
+        if self.unknown_member_writes.contains(&None) {
+            return false;
+        }
         let slot = match binding.kind {
             SyntaxExportKind::Default => ExportSlot::Default,
             SyntaxExportKind::Named => match binding.exported.and_then(|range| self.text(range)) {

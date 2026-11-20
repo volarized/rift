@@ -42,14 +42,30 @@ impl<'source> Index<'source> {
                 )?;
                 continue;
             }
+            let file = self.files.get(owner.file.path.as_str())?;
+            let declared =
+                file.qualified_target(&format!("{}.{}", owner.symbol.qualified_name, member));
+            if let Some(target) = declared.filter(|target| {
+                target.symbol.syntax_element_kind == Some("assignment_expression")
+                    && target.symbol.kind == "method"
+                    && (!matches!(owner.symbol.kind, "function" | "class")
+                        || target.symbol.kinds.contains(&SymbolKind::Static))
+            }) {
+                if role == ReferenceRole::Call
+                    && !file.javascript_member_is_stable(owner.symbol, member, target.symbol)
+                {
+                    return None;
+                }
+                owner = target;
+                continue;
+            }
             if owner.symbol.kind == "class" {
                 owner =
                     self.javascript_class_member(owner, member, MemberMode::Static, role, work)?;
                 continue;
             }
-            let file = self.files.get(owner.file.path.as_str())?;
             let namespace = matches!(owner.symbol.kind, "namespace" | "enum" | "object");
-            let object_value = matches!(owner.symbol.kind, "variable" | "property")
+            let object_value = matches!(owner.symbol.kind, "variable" | "property" | "object")
                 && owner
                     .symbol
                     .body_range
@@ -58,8 +74,17 @@ impl<'source> Index<'source> {
             if !namespace && !object_value {
                 return None;
             }
-            owner =
-                file.qualified_target(&format!("{}.{}", owner.symbol.qualified_name, member))?;
+            let target = declared?;
+            if object_value && !owner.symbol.body_range?.encloses(target.symbol.item_range) {
+                return None;
+            }
+            if role == ReferenceRole::Call
+                && object_value
+                && !file.javascript_member_is_stable(owner.symbol, member, target.symbol)
+            {
+                return None;
+            }
+            owner = target;
         }
         Some(owner)
     }
@@ -242,6 +267,67 @@ impl<'source> Index<'source> {
 }
 
 impl<'source> File<'source> {
+    pub(super) fn index_javascript_object_write(
+        &mut self,
+        member: &rift_syntax::StaticMember,
+        work: &mut Work,
+    ) {
+        let Some(receiver) = self.text(member.receiver) else {
+            return;
+        };
+        let binding = match self.binding(receiver, member.receiver.start, |_| true, work) {
+            super::Binding::Found(binding)
+                if binding.kind == rift_syntax::StaticBindingKind::Local =>
+            {
+                binding
+            }
+            super::Binding::Blocked => {
+                self.unknown_member_writes.insert(Some(receiver));
+                return;
+            }
+            _ => return,
+        };
+        let name = member.member.and_then(|range| self.text(range));
+        self.member_writes
+            .entry((binding.name, name))
+            .and_modify(|position| {
+                if *position != Some(member.range.start) {
+                    *position = None;
+                }
+            })
+            .or_insert(Some(member.range.start));
+    }
+
+    fn javascript_member_is_stable(
+        &self,
+        owner: &rift_syntax::SyntaxSymbol,
+        member: &str,
+        target: &rift_syntax::SyntaxSymbol,
+    ) -> bool {
+        if self.javascript_reassigned(&owner.name, None)
+            || self.unknown_member_writes.contains(&None)
+            || self
+                .unknown_member_writes
+                .contains(&Some(owner.name.as_str()))
+        {
+            return false;
+        }
+        let Some(name) = owner.name_range else {
+            return false;
+        };
+        if self.member_writes.contains_key(&(name, None)) {
+            return false;
+        }
+        match self.member_writes.get(&(name, Some(member))) {
+            None => true,
+            Some(Some(position)) => {
+                target.syntax_element_kind == Some("assignment_expression")
+                    && *position == target.item_range.start
+            }
+            Some(None) => false,
+        }
+    }
+
     pub(super) fn javascript_container(
         &self,
         name: &str,

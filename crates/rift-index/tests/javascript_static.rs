@@ -31,6 +31,48 @@ fn workspace_with_manifest(
 }
 
 #[test]
+fn test_commonjs_local_object_members_store_distinct_lexical_identities() {
+    let source = "var res = {}; res.clear = function clear() { const opts = { expires: 1 }; return opts.expires; }; res.set = function() { const opts = {}; opts.expires = 2; return opts; }; module.exports = res;";
+    for path in ["main.cjs", "main.cts"] {
+        let (_directory, index) = workspace(&[(path, source)]);
+        let reads = index
+            .edges()
+            .edges()
+            .filter(|edge| {
+                edge.kind() == EdgeKind::Reads && edge.to().as_str().ends_with("/expires")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reads.len(), 1);
+        assert!(reads[0].to().as_str().ends_with("/res/clear/opts/expires"));
+        assert!(!index.edges().edges().any(
+            |edge| edge.kind() == EdgeKind::Writes && edge.to().as_str().ends_with("/expires")
+        ));
+        for owner in ["clear", "set"] {
+            assert!(
+                index
+                    .edges()
+                    .edges()
+                    .any(|edge| edge.kind() == EdgeKind::Contains
+                        && edge.from().as_str().ends_with(&format!("/res/{owner}"))
+                        && edge.to().as_str().ends_with(&format!("/res/{owner}/opts")))
+            );
+        }
+        let language =
+            rift_protocol::read::Language::from_identity_segment(if path.ends_with("cts") {
+                "typescript"
+            } else {
+                "javascript"
+            })
+            .expect("language");
+        assert!(
+            index
+                .identity_coverage_complete(&language)
+                .expect("identity coverage")
+        );
+    }
+}
+
+#[test]
 fn test_commonjs_prototype_methods_keep_hoisted_constructor_identities() {
     for path in ["main.cjs", "main.cts"] {
         let (_directory, index) = workspace(&[(

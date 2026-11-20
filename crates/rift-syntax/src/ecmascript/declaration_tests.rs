@@ -31,6 +31,78 @@ fn javascript(text: &str) -> SyntaxDocument {
 }
 
 #[test]
+fn test_commonjs_local_object_members_distinguish_receiver_declarations_from_body_aliases() {
+    for (source, method, alias) in [
+        (
+            "var res = {}; res.clear = function() { var res = this; return res; };",
+            "res.clear",
+            "res.clear.res",
+        ),
+        (
+            "function View() {} View.prototype.render = function() { var View = this; return View; };",
+            "View.render",
+            "View.render.View",
+        ),
+    ] {
+        for document in [javascript(source), typescript(source)] {
+            assert_eq!(symbol(&document, method).kind, "method");
+            assert_eq!(symbol(&document, alias).kind, "variable");
+        }
+    }
+}
+
+#[test]
+fn test_commonjs_local_object_members_keep_attached_documentation() {
+    for (prefix, assignment, name) in [
+        ("var object = {};", "object.run", "object.run"),
+        ("function View() {}", "View.prototype.run", "View.run"),
+    ] {
+        for gap in ["\n", "\n\n"] {
+            let source = format!("{prefix}\n/** Runs. */{gap}{assignment} = function() {{}};");
+            for document in [javascript(&source), typescript(&source)] {
+                let method = symbol(&document, name);
+                assert!(spelled(&source, method.item_range).starts_with(assignment));
+                if gap == "\n" {
+                    assert_eq!(method.documentation[0].text, "Runs.");
+                    assert!(spelled(&source, method.range).starts_with("/** Runs. */"));
+                    assert_eq!(
+                        spelled(&source, method.documentation_ranges[0]),
+                        "/** Runs. */"
+                    );
+                } else {
+                    assert!(method.documentation.is_empty());
+                    assert!(spelled(&source, method.range).starts_with(assignment));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_commonjs_local_object_members_keep_callable_owners() {
+    let source = "var res = {}; res.clear = function clear() { const opts = { expires: 1 }; return opts.expires; }; res.set = function() { const opts = {}; opts.expires = 2; return opts; }; module.exports = res;";
+    for document in [javascript(source), typescript(source)] {
+        for name in ["res.clear", "res.set"] {
+            let method = symbol(&document, name);
+            assert_eq!(method.kind, "method");
+            assert_eq!(method.container.as_deref(), Some("res"));
+        }
+        let property = symbol(&document, "res.clear.opts.expires");
+        assert_eq!(
+            spelled(source, property.name_range.expect("property name")),
+            "expires"
+        );
+        assert_eq!(symbol(&document, "res.set.opts").kind, "variable");
+        assert!(
+            !document
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.qualified_name == "res.set.opts.expires")
+        );
+    }
+}
+
+#[test]
 fn test_commonjs_prototype_methods_refuse_constructors_with_colliding_lexical_identities() {
     let source = "unknown(function() { function View() {} View.prototype.render = function() {}; }); unknown(function() { function View() {} View.prototype.render = function() {}; });";
     for document in [javascript(source), typescript(source)] {

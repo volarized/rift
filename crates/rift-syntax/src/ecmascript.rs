@@ -40,6 +40,10 @@
 //!   scope, as a class does: a local or a method of an object literal
 //!   qualifies under the declaration holding it (`outer.local`,
 //!   `options.open`), never at module scope.
+//! - A function assigned to a literal member declares a method when its
+//!   receiver uniquely resolves to a local variable, function, or class.
+//!   A prototype method belongs to its local function or class. Declarations
+//!   in the method body keep that method's qualified name as their owner.
 //! - A class field and a constructor parameter property declare a
 //!   `property` of the class; an enum member declares an `enum_member` of
 //!   the enum. The anonymous class `export default class { .. }` declares a
@@ -1447,13 +1451,17 @@ impl EcmaScriptRules<'_> {
     /// whitespace holding at most one line break. Each step reads the previous
     /// sibling the shared walk recorded, so the walk costs the run's length.
     fn jsdoc_run<'tree>(&self, front: Visited<'_, 'tree>, text: &str) -> Vec<Node<'tree>> {
+        self.jsdoc_run_node(front.syntax_element(), text)
+    }
+
+    fn jsdoc_run_node<'tree>(&self, front: Node<'tree>, text: &str) -> Vec<Node<'tree>> {
         let mut run = Vec::new();
         let mut front = front;
-        while let Some(previous) = front.previous_sibling() {
-            if !self.attaches(previous.syntax_element(), front.syntax_element(), text) {
+        while let Some(previous) = front.prev_sibling().filter(Node::is_named) {
+            if !self.attaches(previous, front, text) {
                 break;
             }
-            run.push(previous.syntax_element());
+            run.push(previous);
             front = previous;
         }
         run
@@ -1483,7 +1491,15 @@ impl EcmaScriptRules<'_> {
         statement: Visited<'_, '_>,
         text: &str,
     ) -> Result<(Vec<Documentation>, Vec<ByteRange>), RiftError> {
-        let mut run = self.jsdoc_run(statement, text);
+        self.attached_jsdoc_node(statement.syntax_element(), text)
+    }
+
+    fn attached_jsdoc_node(
+        &self,
+        statement: Node<'_>,
+        text: &str,
+    ) -> Result<(Vec<Documentation>, Vec<ByteRange>), RiftError> {
+        let mut run = self.jsdoc_run_node(statement, text);
         run.reverse();
         let mut blocks = Vec::with_capacity(run.len());
         let mut ranges = Vec::with_capacity(run.len());

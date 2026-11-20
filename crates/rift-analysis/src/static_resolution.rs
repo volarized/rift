@@ -203,6 +203,8 @@ struct File<'source> {
     declared_types: BTreeMap<ByteRange, Option<ByteRange>>,
     members: BTreeMap<ByteRange, Option<&'source rift_syntax::StaticMember>>,
     export_writes: BTreeMap<javascript_exports::ExportSlot<'source>, Option<u64>>,
+    member_writes: BTreeMap<(ByteRange, Option<&'source str>), Option<u64>>,
+    unknown_member_writes: BTreeSet<Option<&'source str>>,
 }
 
 #[derive(Default)]
@@ -262,6 +264,8 @@ impl<'source> File<'source> {
             declared_types: BTreeMap::new(),
             members: BTreeMap::new(),
             export_writes: BTreeMap::new(),
+            member_writes: BTreeMap::new(),
+            unknown_member_writes: BTreeSet::new(),
         };
         file.index_bindings(work)?;
         file.index_symbols(work)?;
