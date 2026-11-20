@@ -984,15 +984,16 @@ pub(super) fn children<'a>(
         library,
     };
     let ordinary = super::module_children(file, directory, inventory);
+    // Keyed by the declaring item: alternative `mod` items of one name each keep their file.
     let direct = ordinary
         .iter()
-        .filter(|(_, local)| local.len() == 1)
-        .map(|(path, local)| (local[0].as_str(), (path, local)))
+        .filter(|(_, local, _)| local.len() == 1)
+        .map(|(path, local, item)| (*item, (path, local)))
         .collect::<BTreeMap<_, _>>();
     let mut children = ordinary
         .iter()
-        .filter(|(_, local)| local.len() > 1)
-        .map(|(path, local)| (path.clone(), local.clone(), Scope::default()))
+        .filter(|(_, local, _)| local.len() > 1)
+        .map(|(path, local, _)| (path.clone(), local.clone(), Scope::default()))
         .collect::<Vec<_>>();
     let tokens = context.tokens(file, directory, &scope);
     if file.syntax.macro_invocations().is_none() || tokens.is_none() {
@@ -1006,8 +1007,7 @@ pub(super) fn children<'a>(
                 scope.define(file, symbol, transparent, original);
             }
             Event::Symbol(symbol) => {
-                let name = super::source_identifier(&symbol.name);
-                let child = name.as_deref().and_then(|name| direct.get(name)).copied();
+                let child = direct.get(&symbol.item_range).copied();
                 if let Some((path, local)) = child {
                     children.push((path.clone(), local.clone(), scope.clone()));
                 }

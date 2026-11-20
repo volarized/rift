@@ -145,10 +145,14 @@ impl<'source> Namespaces<'source> {
         work: &mut Work,
     ) -> Option<Self> {
         let mut namespaces = Self::default();
+        let alternatives = unadmitted_alternatives(files, work)?;
         for file in files
             .values()
             .filter(|file| file.document.facts.language().name == "rust")
         {
+            if alternatives.contains(file.document.path.as_str()) {
+                continue;
+            }
             namespaces.index_file(file, work)?;
         }
         namespaces.index_exports(files, work)?;
@@ -303,7 +307,14 @@ impl<'source> Namespaces<'source> {
                     file: file.document,
                     symbol,
                 };
-                if symbol.kind == "impl_item" || file.conditional(symbol.item_range, work) {
+                // A declaration in a module only an inactive or unknown configuration
+                // admits is never an alias endpoint.
+                if symbol.kind == "impl_item"
+                    || file.conditional(symbol.item_range, work)
+                    || self
+                        .module_at(file.document.path.as_str(), symbol.item_range.start, work)
+                        .is_none()
+                {
                     continue;
                 }
                 let identity = rift_core::symbol_identity(
@@ -494,16 +505,7 @@ impl<'source> Namespaces<'source> {
                 continue;
             };
             if namespace.base.is_empty() {
-                let depth = if structural_owner(target) {
-                    symbol
-                        .container
-                        .as_deref()
-                        .map_or(0, |container| container.split("::").count())
-                        + 1
-                } else {
-                    symbol.qualified_name.split("::").count()
-                };
-                namespace.base = path.get(..path.len().checked_sub(depth)?)?.to_vec();
+                namespace.base = declaring_module(target, &path)?;
             }
             if file.inactive(symbol.item_range, work) {
                 if symbol.kind == "module" {
@@ -1287,6 +1289,105 @@ fn inherent_member<'source>(
                     target.symbol.kind == "impl_item" && target.symbol.qualified_name == container
                 })
     })
+}
+
+/// The module path a declaration's file establishes, from the declaration's identity.
+fn declaring_module(target: Target<'_>, path: &[String]) -> Option<Vec<String>> {
+    let depth = if structural_owner(target) {
+        target
+            .symbol
+            .container
+            .as_deref()
+            .map_or(0, |container| container.split("::").count())
+            + 1
+    } else {
+        target.symbol.qualified_name.split("::").count()
+    };
+    Some(path.get(..path.len().checked_sub(depth)?)?.to_vec())
+}
+
+/// Files of a module that several `#[path]` alternatives declare, other than the one the
+/// admitted configuration selects.
+///
+/// Each alternative file keeps its declarations, but only the file an active `mod` item
+/// names contributes resolved facts and endpoints. A module whose selection is unknown
+/// (no active item, an unknown condition, or a path relative to an inline module) admits
+/// none of its alternatives.
+fn unadmitted_alternatives<'source>(
+    files: &BTreeMap<&'source str, File<'source>>,
+    work: &mut Work,
+) -> Option<BTreeSet<&'source str>> {
+    let mut modules = BTreeMap::<Vec<String>, Vec<&'source str>>::new();
+    let mut declared = Vec::new();
+    for (&path, file) in files
+        .iter()
+        .filter(|(_, file)| file.document.facts.language().name == "rust")
+    {
+        let mut base = None;
+        for symbol in file.document.facts.symbols() {
+            if !work.charge() {
+                return None;
+            }
+            let target = Target {
+                file: file.document,
+                symbol,
+            };
+            let Some(qualified) = target.admitted_path() else {
+                continue;
+            };
+            if base.is_none() {
+                base = declaring_module(target, &qualified);
+            }
+            if symbol.kind == "module" && symbol.body_range.is_none() {
+                declared.push((file, symbol, qualified));
+            }
+        }
+        if let Some(base) = base {
+            modules.entry(base).or_default().push(path);
+        }
+    }
+    let mut unadmitted = BTreeSet::new();
+    for (module, paths) in modules.into_iter().filter(|(_, paths)| paths.len() > 1) {
+        let mut selected = BTreeSet::new();
+        let mut unknown = false;
+        for (file, symbol, _) in declared.iter().filter(|(_, _, path)| *path == module) {
+            if !work.charge() {
+                return None;
+            }
+            if file.inactive(symbol.item_range, work) {
+                continue;
+            }
+            match &symbol.module_path {
+                Some(rift_syntax::RustModulePath::Literal { path, .. })
+                    if symbol.container.is_none() && !file.conditional(symbol.item_range, work) =>
+                {
+                    let directory = file
+                        .document
+                        .path
+                        .as_str()
+                        .rsplit_once('/')
+                        .map_or("", |(directory, _)| directory);
+                    selected.insert(if directory.is_empty() {
+                        path.as_str().to_owned()
+                    } else {
+                        format!("{directory}/{}", path.as_str())
+                    });
+                }
+                _ => unknown = true,
+            }
+        }
+        let admitted = paths
+            .iter()
+            .copied()
+            .filter(|path| !unknown && selected.contains(*path))
+            .collect::<Vec<_>>();
+        if let [admitted] = admitted.as_slice() {
+            unadmitted.extend(paths.iter().copied().filter(|path| path != admitted));
+        } else {
+            unadmitted.extend(paths);
+        }
+    }
+    Some(unadmitted)
 }
 
 fn structural_owner(target: Target<'_>) -> bool {

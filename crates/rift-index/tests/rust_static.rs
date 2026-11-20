@@ -1138,3 +1138,146 @@ fn test_rust_multiline_member_reads_keep_captured_receiver_ranges() {
                 && matches!(edge.kind(), EdgeKind::Calls | EdgeKind::Reads))
     );
 }
+
+fn fixture_index(manifest: &str, files: &[(&str, &str)]) -> (tempfile::TempDir, WorkspaceIndex) {
+    let directory = tempfile::tempdir().expect("workspace");
+    let root = directory.path();
+    std::fs::write(root.join("Cargo.toml"), manifest).expect("manifest");
+    for (path, source) in files {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("source directory");
+        std::fs::write(path, source).expect("source");
+    }
+    let index = WorkspaceIndex::build(
+        root,
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &TextFileInclusion::default(),
+    )
+    .expect("index");
+    (directory, index)
+}
+
+fn has_edge(index: &WorkspaceIndex, kind: EdgeKind, from: &str, to: &str) -> bool {
+    index.edges().edges().any(|edge| {
+        edge.kind() == kind
+            && edge.from().as_str().ends_with(from)
+            && edge.to().as_str().ends_with(to)
+    })
+}
+
+#[test]
+fn test_rust_alternative_path_modules_keep_every_declaration_identity() {
+    // Alternative `#[path]` files of one module keep searchable declarations; only the
+    // admitted alternative contributes resolved facts.
+    let manifest = "[package]\nname='fixture'\nversion='0.1.0'\n[features]\nalternate=[]\n";
+    let library = "#[cfg(feature = \"alternate\")]\n#[path = \"other.rs\"]\nmod imp;\n#[cfg(not(feature = \"alternate\"))]\n#[path = \"default.rs\"]\nmod imp;\n#[cfg(not(feature = \"alternate\"))]\n#[path = \"first.rs\"]\nmod pick;\n#[cfg(feature = \"alternate\")]\n#[path = \"second.rs\"]\nmod pick;\npub mod item { pub struct Item; }\npub fn run() -> u8 { imp::read() + pick::read() }\n";
+    let module =
+        "pub struct Item { pub value: u8 }\npub fn read() -> u8 { Item { value: 1 }.value }\n";
+    let (_directory, index) = fixture_index(
+        manifest,
+        &[
+            ("src/lib.rs", library),
+            ("src/other.rs", module),
+            ("src/default.rs", module),
+            ("src/first.rs", module),
+            ("src/second.rs", module),
+        ],
+    );
+    let view = index.symbol_view().expect("symbols");
+    for record in view.normalized_graph().records() {
+        assert!(record.identity().is_some(), "missing identity: {record:?}");
+    }
+    let language = view
+        .files()
+        .next()
+        .expect("file")
+        .syntax()
+        .language()
+        .clone();
+    assert!(
+        index
+            .identity_coverage_complete(&language)
+            .expect("coverage")
+    );
+    for file in [
+        "src/other.rs",
+        "src/default.rs",
+        "src/first.rs",
+        "src/second.rs",
+    ] {
+        let declared = view
+            .files()
+            .find(|candidate| candidate.path().as_str() == file)
+            .expect("module file");
+        let symbols = declared.syntax().symbols();
+        assert!(!symbols.is_empty(), "{file}");
+        assert!(
+            (0..symbols.len())
+                .all(|position| view.symbol_identity_at(declared.path(), position).is_some()),
+            "{file} declarations lack identities"
+        );
+    }
+    for (from, to) in [
+        ("/fixture/run", "/imp/read"),
+        ("/fixture/run", "/pick/read"),
+    ] {
+        assert!(
+            has_edge(&index, EdgeKind::Calls, from, to),
+            "missing {from} -> {to}"
+        );
+    }
+    // Inactive alternatives contribute no resolved facts, and the unrelated `item::Item`
+    // keeps its own identity.
+    for edge in index.edges().edges() {
+        let unit = edge.occurrence().unit().to_string();
+        assert!(
+            !unit.ends_with("other.rs") && !unit.ends_with("second.rs"),
+            "fact from an inactive alternative: {edge:?}"
+        );
+        assert!(!edge.to().as_str().ends_with("/item/Item") || edge.kind() == EdgeKind::Contains);
+    }
+}
+
+#[test]
+fn test_rust_inactive_alternative_modules_are_never_endpoints() {
+    // `pub use self::imp::Write` names `std::io` under the default feature; the inactive
+    // `#[path]` alternative is not a local endpoint for implementations or type uses.
+    let manifest =
+        "[package]\nname='fixture'\nversion='0.1.0'\n[features]\ndefault=['std']\nstd=[]\n";
+    let io = "pub use self::imp::Write;\npub use self::local::Flush;\n#[cfg(not(feature = \"std\"))]\n#[path = \"core.rs\"]\nmod imp;\n#[cfg(feature = \"std\")]\nuse std::io as imp;\n#[cfg(feature = \"std\")]\nmod local;\n";
+    let library = "pub mod io;\npub struct Sink;\nimpl io::Write for Sink { fn write(&mut self, _: &[u8]) -> std::io::Result<usize> { Ok(0) } fn flush(&mut self) -> std::io::Result<()> { Ok(()) } }\nimpl io::Flush for Sink { fn flush(&mut self) {} }\npub fn run(_writer: &mut dyn io::Write, _flush: &dyn io::Flush) {}\n";
+    let (_directory, index) = fixture_index(
+        manifest,
+        &[
+            ("src/lib.rs", library),
+            ("src/io/mod.rs", io),
+            (
+                "src/io/core.rs",
+                "pub trait Write { fn write(&mut self, buf: &[u8]) -> usize; fn flush(&mut self); }\n",
+            ),
+            (
+                "src/io/local.rs",
+                "pub trait Flush { fn flush(&mut self); }\n",
+            ),
+        ],
+    );
+    assert!(has_edge(
+        &index,
+        EdgeKind::Implements,
+        "/fixture/Sink",
+        "/local/Flush"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::HasType,
+        "/fixture/run",
+        "/local/Flush"
+    ));
+    for edge in index.edges().edges() {
+        assert!(
+            !edge.to().as_str().contains("/imp/") || edge.from().as_str().contains("/imp/"),
+            "inactive alternative endpoint: {edge:?}"
+        );
+    }
+}
