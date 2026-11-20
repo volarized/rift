@@ -8,16 +8,124 @@ use super::super::{File, Index, Target, Work};
 use super::{Value, edge_python_binding};
 use rift_syntax::{ByteRange, StaticBindingKind};
 
+/// Classes the Python `builtins` module provides, which a module may name without binding.
+const BUILTIN_CLASSES: [&str; 96] = [
+    "ArithmeticError",
+    "AssertionError",
+    "AttributeError",
+    "BaseException",
+    "BaseExceptionGroup",
+    "BlockingIOError",
+    "BrokenPipeError",
+    "BufferError",
+    "BytesWarning",
+    "ChildProcessError",
+    "ConnectionAbortedError",
+    "ConnectionError",
+    "ConnectionRefusedError",
+    "ConnectionResetError",
+    "DeprecationWarning",
+    "EOFError",
+    "EncodingWarning",
+    "EnvironmentError",
+    "Exception",
+    "ExceptionGroup",
+    "FileExistsError",
+    "FileNotFoundError",
+    "FloatingPointError",
+    "FutureWarning",
+    "GeneratorExit",
+    "IOError",
+    "ImportError",
+    "ImportWarning",
+    "IndentationError",
+    "IndexError",
+    "InterruptedError",
+    "IsADirectoryError",
+    "KeyError",
+    "KeyboardInterrupt",
+    "LookupError",
+    "MemoryError",
+    "ModuleNotFoundError",
+    "NameError",
+    "NotADirectoryError",
+    "NotImplementedError",
+    "OSError",
+    "OverflowError",
+    "PendingDeprecationWarning",
+    "PermissionError",
+    "ProcessLookupError",
+    "PythonFinalizationError",
+    "RecursionError",
+    "ReferenceError",
+    "ResourceWarning",
+    "RuntimeError",
+    "RuntimeWarning",
+    "StopAsyncIteration",
+    "StopIteration",
+    "SyntaxError",
+    "SyntaxWarning",
+    "SystemError",
+    "SystemExit",
+    "TabError",
+    "TimeoutError",
+    "TypeError",
+    "UnboundLocalError",
+    "UnicodeDecodeError",
+    "UnicodeEncodeError",
+    "UnicodeError",
+    "UnicodeTranslateError",
+    "UnicodeWarning",
+    "UserWarning",
+    "ValueError",
+    "Warning",
+    "ZeroDivisionError",
+    "bool",
+    "bytearray",
+    "bytes",
+    "classmethod",
+    "complex",
+    "dict",
+    "enumerate",
+    "filter",
+    "float",
+    "frozenset",
+    "int",
+    "list",
+    "map",
+    "memoryview",
+    "object",
+    "property",
+    "range",
+    "reversed",
+    "set",
+    "slice",
+    "staticmethod",
+    "str",
+    "super",
+    "tuple",
+    "type",
+    "zip",
+];
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ClassKey<'source> {
     Declaration(&'source str, &'source str),
     Generic,
+    /// A base declared outside the selected sources, named by its written base expression.
+    /// Its own ancestors are outside the selected sources too.
+    External(&'source str, u64),
 }
 
 impl ClassKey<'_> {
     fn blocks_member(self, name: &str) -> bool {
-        // Generic's private and special members have no declaration in the selected sources.
-        self == Self::Generic && name.starts_with('_')
+        match self {
+            // Generic's private and special members have no declaration in the selected sources.
+            Self::Generic => name.starts_with('_'),
+            // Any member may be declared by a class outside the selected sources.
+            Self::External(..) => true,
+            Self::Declaration(..) => false,
+        }
     }
 }
 
@@ -80,6 +188,17 @@ impl<'source> Index<'source> {
                 complete: true,
             },
         )]);
+        for base in pending.values().flatten().flatten() {
+            if let ClassKey::External(..) = base {
+                orders.insert(
+                    *base,
+                    ClassOrder {
+                        classes: vec![*base],
+                        complete: true,
+                    },
+                );
+            }
+        }
         while !pending.is_empty() {
             let mut ready = Vec::new();
             for (class, bases) in &pending {
@@ -134,12 +253,102 @@ impl<'source> Index<'source> {
             }
             let base = if self.python_generic_marker(file, edge.target, work) {
                 Some(ClassKey::Generic)
+            } else if let Some(base) = self.edge_python_base(file, edge.target, work) {
+                Some(key(base))
             } else {
-                self.edge_python_base(file, edge.target, work).map(key)
+                self.python_external_class(file, edge.target, work)
+                    .then_some(ClassKey::External(
+                        file.document.path.as_str(),
+                        edge.target.start,
+                    ))
             };
             bases.push(base);
         }
         Some(bases)
+    }
+
+    /// A base expression names a class outside the selected sources: an unbound name (a
+    /// builtin class), or a name every binding of which imports it from a module outside them,
+    /// directly or through modules of the selected sources.
+    fn python_external_class(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+    ) -> bool {
+        let Some(text) = file.text(range) else {
+            return false;
+        };
+        // A subscripted or called base can supply other bases through `__mro_entries__`; the
+        // captured base range holds only the name before its subscript or arguments.
+        let applied = usize::try_from(range.end)
+            .ok()
+            .and_then(|end| file.document.source.get(end..))
+            .is_none_or(|rest| rest.trim_start().starts_with(['[', '(']));
+        let named = !applied
+            && text.split('.').map(str::trim).all(|part| {
+                !part.is_empty() && part.chars().all(|c| c == '_' || c.is_alphanumeric())
+            });
+        let mut parts = text.split('.').map(str::trim);
+        let Some(name) = parts.next().filter(|_| named) else {
+            return false;
+        };
+        let dotted = parts.next().is_some();
+        let mut visited = BTreeSet::new();
+        self.python_external_name(file, name, range.start, dotted, &mut visited, work)
+    }
+
+    fn python_external_name<'index>(
+        &'index self,
+        file: &'index File<'source>,
+        name: &'index str,
+        position: u64,
+        dotted: bool,
+        visited: &mut BTreeSet<(&'index str, &'index str)>,
+        work: &mut Work,
+    ) -> bool {
+        if !work.charge() || !visited.insert((file.document.path.as_str(), name)) {
+            return false;
+        }
+        if file.blocked(position, work) {
+            return false;
+        }
+        let Some(bindings) = file.by_name.get(name) else {
+            // Python resolves a name no scope binds among the builtins.
+            return !dotted && BUILTIN_CLASSES.contains(&name);
+        };
+        !bindings.is_empty()
+            && bindings.iter().all(|binding| match binding.kind {
+                StaticBindingKind::PythonModule { module } => file
+                    .text(module)
+                    .and_then(|module| module.split('.').next())
+                    .is_some_and(|module| self.module_value(module).is_none()),
+                StaticBindingKind::PythonImport { module, export } => {
+                    let Some(module) = file
+                        .text(module)
+                        .and_then(|module| super::EdgePythonModules::name(file, module))
+                    else {
+                        return false;
+                    };
+                    match export.and_then(|export| file.text(export)) {
+                        Some(export) => match self.edge_python.path(&module) {
+                            // A module of the selected sources re-exports a binding it holds.
+                            Some(path) => self.files.get(path).is_some_and(|source| {
+                                source.by_name.contains_key(export)
+                                    && self.python_external_name(
+                                        source, export, 0, dotted, visited, work,
+                                    )
+                            }),
+                            None => {
+                                self.module_value(&module).is_none()
+                                    && self.module_value(&format!("{module}.{export}")).is_none()
+                            }
+                        },
+                        None => self.module_value(&module).is_none(),
+                    }
+                }
+                _ => false,
+            })
     }
 
     fn python_generic_marker(
