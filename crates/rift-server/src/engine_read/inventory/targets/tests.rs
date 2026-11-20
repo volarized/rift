@@ -244,3 +244,61 @@ fn a_file_only_position_names_no_first_declaration() -> TestResult {
     ));
     Ok(())
 }
+
+#[test]
+fn local_type_sites_keep_definition_answers_in_the_type_inventory() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().canonicalize()?;
+    std::fs::write(
+        root.join("graph.py"),
+        "class Foreign: pass\nclass Child:\n    item: Foreign\n",
+    )?;
+    let reads = fixture(&root)?;
+    let path = ProjectPath::new("graph.py")?;
+    let file = reads.index().file(&path).ok_or("file")?;
+    let seeds = reads
+        .local_search_view_input(true)?
+        .inventory_seeds()?
+        .0
+        .into_iter()
+        .collect();
+    let site = sites(&reads, file, &seeds, selection())?
+        .into_iter()
+        .find(|site| site.kinds.contains(&EdgeKind::HasType))
+        .ok_or("annotation")?;
+    let caller = site.caller.clone();
+    let location = Location {
+        uri: TreeRoot::new(&root)?.document_uri(&path)?,
+        range: lsp_types::Range::new(Position::new(0, 6), Position::new(0, 13)),
+    };
+    let roots = CalleeRoots::default();
+    let mapping = Mapping {
+        reads: &reads,
+        roots: &roots,
+        workspace: &root,
+        encoding: PositionEncoding::Utf16,
+        provider: EdgeProvider::Lsp,
+    };
+    let found = mapping.resolve(
+        Vec::new(),
+        Vec::new(),
+        vec![Answer {
+            site,
+            locations: vec![location],
+        }],
+    )?;
+    assert!(found.packages.is_empty());
+    assert!(found.warnings.is_empty());
+    let edges = reads.inventory_type_edges(
+        &root,
+        PositionEncoding::Utf16,
+        found.types,
+        EdgeProvider::Lsp,
+    )?;
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].from, caller);
+    assert!(edges[0].to.as_str().ends_with("/Foreign"));
+    assert_eq!(edges[0].kinds, vec![EdgeKind::HasType]);
+    assert_eq!(edges[0].provider, EdgeProvider::Lsp);
+    Ok(())
+}

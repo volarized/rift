@@ -2149,10 +2149,11 @@ async fn search_traversal_outgoing_over_an_unavailable_global_api_drops_package_
     Ok(())
 }
 
-/// An unnamed runtime target does not invalidate a separately established local call.
-/// Complete lists and negative answers still require the missing provider coverage.
+/// Captured runtime sources name targets without a global collection, beside local calls.
+/// Negative answers still require the missing provider coverage.
 #[tokio::test]
-async fn search_calls_prove_local_witness_when_a_runtime_target_has_no_collection() -> TestResult {
+async fn search_calls_keep_local_and_captured_runtime_targets_without_a_global_collection()
+-> TestResult {
     let configuration = format!("[global]\nenabled = false\n{OUTGOING_ENGINE}");
     let (_directory, client, _server_task) = workspace_client::served_prepared_workspace(
         OUTGOING_FILES,
@@ -2175,8 +2176,27 @@ async fn search_calls_prove_local_witness_when_a_runtime_target_has_no_collectio
             "{answer}"
         );
     }
+    let answer = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "search",
+            &json!({"query":format!("SELECT ?t {{ <{caller}> :calls ?t }}")}),
+        ),
+    )
+    .await?;
+    let targets = workspace_client::query::rows(&answer)?
+        .iter()
+        .map(|row| workspace_client::query::iri(row, "t"))
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+    assert_eq!(
+        targets,
+        std::collections::BTreeSet::from([
+            leaf.as_str(),
+            "rift://symbol/stdlib/cpython/python/builtins/len"
+        ]),
+        "{answer}"
+    );
     for query in [
-        format!("SELECT ?t {{ <{caller}> :calls ?t }}"),
         format!("ASK {{ <{caller}> :calls <rift://symbol/local/python/absent> }}"),
         format!("ASK {{ <{caller}> :calls ?t FILTER NOT EXISTS {{ ?t :calls ?other }} }}"),
     ] {

@@ -355,14 +355,17 @@ impl Mapping<'_> {
         for answer in targets {
             for location in answer.locations {
                 for &kind in &answer.site.kinds {
-                    self.target(
+                    if self.target(
                         &answer.site.caller,
                         &location,
                         (kind, TraversalDirection::Outgoing),
                         (&answer.site.name, Some(&answer.site.source)),
                         &mut edges,
                         &mut missing,
-                    )?;
+                    )? && kind == EdgeKind::HasType
+                    {
+                        local_types.push((answer.site.caller.clone(), vec![location.clone()]));
+                    }
                 }
             }
         }

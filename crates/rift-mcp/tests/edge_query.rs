@@ -360,7 +360,7 @@ async fn test_edge_cold_calls_wait_and_reference_answers_need_no_declaration_mar
         let answer = query_after_population(
             &client,
             &QueryParams {
-                query,
+                query: query.clone(),
                 language: QueryLanguage::Sparql,
                 page: 1,
                 max_results: 10,
@@ -369,7 +369,7 @@ async fn test_edge_cold_calls_wait_and_reference_answers_need_no_declaration_mar
         )
         .await?;
         let rows = workspace_client::query::rows(&answer)?;
-        assert!(!rows.is_empty(), "{answer}");
+        assert!(!rows.is_empty(), "{query}: {answer}");
         if let Some(target) = target {
             assert!(
                 rows.iter()
