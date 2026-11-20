@@ -1878,3 +1878,90 @@ export function refuse() { return [new make().read(), new Missing().read()] }
             && edge.to().as_str().ends_with("/read")
     }));
 }
+
+#[test]
+fn test_array_method_callbacks_take_the_declared_element_type() {
+    // A callback of a standard array method takes the element type the receiver's
+    // declared array type writes, at the method's element positions.
+    let source = "export class Option { name() { return 'o' } }
+export class Command {
+  options: Option[] = []
+  list(): Array<Option> { return this.options }
+  each() { this.options.forEach((option) => option.name()) }
+  mapped() { return this.list().map((option) => option.name()) }
+  filtered(extra: readonly Option[]) { return extra.filter((option) => option.name()) }
+  found(maybe: Option[] | undefined) { return maybe.find((option) => option.name()) }
+  reduced() { return this.options.reduce((total, option) => option.name(), '') }
+  sorted() { return this.options.sort((left, right) => left.name().length - right.name().length) }
+  loose(values: any[]) { return values.forEach((value) => value.name()) }
+  accumulator(values: Option[]) { return values.reduce((total, value) => total.name(), 0) }
+  shadow(options: Option[]) {
+    const inner = (options) => options.forEach((option) => option.name())
+    return inner
+  }
+}
+";
+    let (_directory, index) = workspace_with_manifest(&[("main.ts", source)], module_manifest());
+    for caller in ["each", "mapped", "filtered", "found", "reduced", "sorted"] {
+        assert!(
+            has_edge(
+                &index,
+                EdgeKind::Calls,
+                &format!("main.ts/Command/{caller}"),
+                "main.ts/Option/name"
+            ),
+            "{caller}"
+        );
+    }
+    // An element type the receiver does not declare, the accumulator position and a
+    // parameter that shadows the declared array type nothing.
+    for caller in ["loose", "accumulator", "shadow"] {
+        assert!(
+            !index.edges().edges().any(|edge| {
+                edge.kind() == EdgeKind::Calls
+                    && edge
+                        .from()
+                        .as_str()
+                        .contains(&format!("main.ts/Command/{caller}"))
+                    && edge.to().as_str().ends_with("main.ts/Option/name")
+            }),
+            "{caller}"
+        );
+    }
+    let script = "class Option { name() { return 'o' } }
+class Command {
+  constructor() {
+    /** @type {Option[]} */
+    this.options = [];
+    this.plain = [];
+  }
+  /** @returns {Command[]} */
+  ancestors() { return [this] }
+  /** @param {Option[]} list */
+  each(list) { list.forEach((option) => option.name()) }
+  fields() { this.options.forEach((option) => option.name()) }
+  walk() { this.ancestors().forEach((cmd) => cmd.fields()) }
+  folded() { return this.ancestors().reduce((all, cmd) => cmd.fields(), {}) }
+  loose() { this.plain.forEach((option) => option.name()) }
+}
+exports.Command = Command;
+";
+    let (_directory, index) = workspace(&[("command.js", script)]);
+    for (from, to) in [
+        ("command.js/Command/each", "command.js/Option/name"),
+        ("command.js/Command/fields", "command.js/Option/name"),
+        ("command.js/Command/walk", "command.js/Command/fields"),
+        ("command.js/Command/folded", "command.js/Command/fields"),
+    ] {
+        assert!(
+            has_edge(&index, EdgeKind::Calls, from, to),
+            "{from} -> {to}"
+        );
+    }
+    assert!(!has_edge(
+        &index,
+        EdgeKind::Calls,
+        "command.js/Command/loose",
+        "command.js/Option/name"
+    ));
+}

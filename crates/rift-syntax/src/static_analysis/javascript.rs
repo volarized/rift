@@ -55,6 +55,7 @@ pub(super) struct Kinds {
     parameters: u16,
     arrow: u16,
     import: u16,
+    argument_list: u16,
     import_clause: u16,
     import_specifier: u16,
     namespace_import: u16,
@@ -111,10 +112,9 @@ struct TypeShapeKinds {
     getter: u16,
     /// Field holding a callable's declared return type.
     return_type: u16,
-    /// A method with a body, a `return` statement and a call's argument list.
+    /// A method with a body and a `return` statement.
     method: u16,
     return_statement: u16,
-    argument_list: u16,
     /// Field holding an arrow function's or a function's body.
     body: u16,
     /// Fields holding a type parameter's constraint and a pattern pair's key.
@@ -127,6 +127,8 @@ struct TypeShapeKinds {
 }
 
 impl TypeShapeKinds {
+    /// An array type, a `readonly` type operator and a generic's type argument list.
+    array: [u16; 3],
     fn resolve(grammar: &tree_sitter::Language) -> Self {
         let id = |name| kind(grammar, name);
         Self {
@@ -153,7 +155,6 @@ impl TypeShapeKinds {
             return_type: field(grammar, "return_type"),
             method: id("method_definition"),
             return_statement: id("return_statement"),
-            argument_list: id("arguments"),
             body: field(grammar, "body"),
             constraint: field(grammar, "constraint"),
             key: field(grammar, "key"),
@@ -162,6 +163,7 @@ impl TypeShapeKinds {
         }
     }
 }
+            array: [id("array_type"), id("readonly_type"), id("type_arguments")],
 
 pub(super) fn kinds() -> &'static Kinds {
     static KINDS: OnceLock<Kinds> = OnceLock::new();
@@ -215,6 +217,20 @@ fn named_expression_kinds(grammar: &tree_sitter::Language) -> [u16; 3] {
 fn excluded_value_kinds(grammar: &tree_sitter::Language) -> Vec<u16> {
     [
         "import_statement",
+fn scope_kinds(grammar: &tree_sitter::Language, program: u16) -> [u16; 8] {
+    let id = |name| kind(grammar, name);
+    [
+        program,
+        id("statement_block"),
+        id("switch_body"),
+        id("for_statement"),
+        id("for_in_statement"),
+        id("catch_clause"),
+        id("class_static_block"),
+        id("class_body"),
+    ]
+}
+
         "export_clause",
         "namespace_export",
         "type_query",
@@ -300,22 +316,14 @@ impl Kinds {
             import: id("import_statement"),
             import_clause: id("import_clause"),
             import_specifier: id("import_specifier"),
+            argument_list: id("arguments"),
             namespace_import: id("namespace_import"),
             export_specifier: id("export_specifier"),
             export: id("export_statement"),
             module_syntax: ModuleSyntaxKinds::resolve(grammar),
             with: id("with_statement"),
             catch: id("catch_clause"),
-            scopes: [
-                program,
-                id("statement_block"),
-                id("switch_body"),
-                id("for_statement"),
-                id("for_in_statement"),
-                id("catch_clause"),
-                id("class_static_block"),
-                id("class_body"),
-            ],
+            scopes: scope_kinds(grammar, program),
             function_scopes,
             name: field("name"),
             value: field("value"),
@@ -485,15 +493,12 @@ impl Kinds {
         &self,
         value: Node<'_>,
     ) -> Result<Option<StaticFunctionContext>, RiftError> {
-        let Some((shapes, parent)) = self.type_shapes.as_ref().zip(value.parent()) else {
+        let Some(parent) = value.parent() else {
             return Ok(None);
         };
-        if parent.child_by_field_id(self.value) == Some(value)
-            && let Some(name) = parent.child_by_field_id(self.name)
-        {
-            return Ok(Some(StaticFunctionContext::Initializer(byte_range(name)?)));
-        }
-        if parent.kind_id() == shapes.argument_list
+        // An argument position types a callback in either grammar: a declared parameter of
+        // the callee, or the element type of an array a standard array method walks.
+        if parent.kind_id() == self.argument_list
             && let Some(call) = parent.parent()
         {
             let mut cursor = parent.walk();
@@ -715,6 +720,14 @@ impl Kinds {
             trailing.extend(sibling.is_error().then_some(sibling));
             after = sibling.next_sibling();
         }
+        let Some(shapes) = &self.type_shapes else {
+            return Ok(None);
+        };
+        if parent.child_by_field_id(self.value) == Some(value)
+            && let Some(name) = parent.child_by_field_id(self.name)
+        {
+            return Ok(Some(StaticFunctionContext::Initializer(byte_range(name)?)));
+        }
         if after.is_none() {
             errors.append(&mut trailing);
         }
@@ -762,6 +775,10 @@ impl Kinds {
         facts.calls.push(call(syntax_element, callee, shape)?);
         Ok(())
     }
+        if let Some((name, written)) = owner.zip(self.element_type(annotation, source)) {
+            facts.element_returns.push((name, byte_range(written)?));
+            return Ok(());
+        }
 
     fn member(&self, syntax_element: Node<'_>) -> Result<StaticCallee, RiftError> {
         if syntax_element.kind_id() != self.member {
@@ -878,6 +895,44 @@ impl Kinds {
         self.patterns.contains(&id)
             || (id == self.pair_pattern && parent.child_by_field_id(self.value) == Some(child))
             || (self.default_patterns.contains(&id)
+    /// The named element type an array type writes: `T[]`, `readonly T[]`, `Array<T>` and
+    /// `ReadonlyArray<T>`, with `T` a type name or a generic type's name.
+    fn element_type<'tree>(&self, written: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+        let shapes = self.type_shapes.as_ref()?;
+        let written = if written.kind_id() == shapes.array[1] {
+            written.named_child(0)?
+        } else {
+            written
+        };
+        let element = if written.kind_id() == shapes.array[0] {
+            written.named_child(0)?
+        } else if self.generic == Some(written.kind_id())
+            && matches!(
+                written
+                    .child_by_field_id(self.name)
+                    .and_then(|name| text(name, source)),
+                Some("Array" | "ReadonlyArray")
+            )
+        {
+            let mut cursor = written.walk();
+            let arguments = written
+                .named_children(&mut cursor)
+                .find(|child| child.kind_id() == shapes.array[2])?;
+            let mut cursor = arguments.walk();
+            let mut named = arguments
+                .named_children(&mut cursor)
+                .filter(|child| !child.is_extra());
+            let first = named.next()?;
+            if named.next().is_some() {
+                return None;
+            }
+            first
+        } else {
+            return None;
+        };
+        self.named_type(element)
+    }
+
                 && parent.child_by_field_id(self.left) == Some(child))
     }
 
@@ -1129,6 +1184,12 @@ impl Kinds {
         {
             facts.bindings.push(binding(
                 name,
+        if let Some(element) = self.element_type(annotation, source) {
+            facts
+                .element_types
+                .push((byte_range(name)?, byte_range(element)?));
+            return Ok(());
+        }
                 scope,
                 byte_range(scope)?.start,
                 StaticBindingKind::Local,

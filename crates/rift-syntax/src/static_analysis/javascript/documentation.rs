@@ -81,9 +81,10 @@ impl Kinds {
         Ok(())
     }
 
-    /// Types the parameters and the result of a function from the documentation comment
-    /// written right before it. Only spaces, names, `.`, `=` and `:` may stand between the
-    /// comment and the function, as in `exports.name = function` or `key: function`.
+    /// Types the parameters and the result of a function, or the value a `@type` tag
+    /// names, from the documentation comment written right before it. Only spaces, names,
+    /// line comments, `.`, `=` and `:` may stand between the comment and what it types, as
+    /// in `exports.name = function`, `key: function` or `let name =`.
     pub(in crate::static_analysis) fn record_documented_function(
         &self,
         element: Node<'_>,
@@ -91,59 +92,98 @@ impl Kinds {
         documentation: &mut Documentation,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
+        if self.type_shapes.is_some() {
+            return Ok(());
+        }
         let function = element.kind_id() == self.arrow
             || element.kind_id() == self.function_scopes[6]
             || self.function.contains(&element.kind_id())
             || self.named_expression[..2].contains(&element.kind_id());
-        if !function || self.type_shapes.is_some() {
+        let typed = if function {
+            None
+        } else {
+            self.documented_value(element)
+        };
+        if !function && typed.is_none() {
             return Ok(());
         }
-        let Some(comment) = documentation.pending.take() else {
+        let Some(comment) = documentation.pending else {
             return Ok(());
         };
         let element_range = byte_range(element)?;
-        let gap = usize::try_from(comment.end)
-            .ok()
-            .zip(usize::try_from(element_range.start).ok())
-            .and_then(|(start, end)| source.get(start..end));
-        let adjacent = gap.is_some_and(|gap| {
-            gap.chars().all(|character| {
-                character.is_whitespace()
-                    || character.is_alphanumeric()
-                    || matches!(character, '_' | '$' | '.' | '=' | ':')
-            }) && !gap.contains("=>")
-        });
-        let Some(text) = range_text(source, comment).filter(|_| adjacent) else {
+        let Some(text) = range_text(source, comment)
+            .filter(|_| adjacent(source, comment.end, element_range.start))
+        else {
+            documentation.pending = None;
             return Ok(());
         };
-        let parameters = self.documented_parameters(element, source);
         let tags = tags(text, comment.start).collect::<Vec<_>>();
+        if let Some(name) = typed {
+            // A value takes the comment only when it carries a `@type` tag; a function
+            // written as the value keeps the comment otherwise.
+            let mut written = tags.iter().filter(|tag| tag.kind == "type");
+            let Some(tag) = written.next() else {
+                return Ok(());
+            };
+            documentation.pending = None;
+            if written.next().is_none()
+                && let Some(written) = tag.written
+            {
+                record_written(source, byte_range(name)?, written, facts);
+            }
+            return Ok(());
+        }
+        documentation.pending = None;
+        let parameters = self.documented_parameters(element, source);
         for (name, range) in &parameters {
             let mut written = tags.iter().filter(|tag| {
                 matches!(tag.kind, "param" | "arg" | "argument") && tag.name == Some(*name)
             });
             if let (Some(tag), None) = (written.next(), written.next())
-                && let Some(written) = tag.written.and_then(|written| named_type(source, written))
+                && let Some(written) = tag.written
             {
-                facts.declared_types.push((*range, written));
+                record_written(source, *range, written, facts);
             }
         }
         let mut returns = tags
             .iter()
             .filter(|tag| matches!(tag.kind, "returns" | "return"));
         if let (Some(tag), None) = (returns.next(), returns.next())
-            && let Some(written) = tag.written.and_then(|written| named_type(source, written))
+            && let Some(written) = tag.written
             && let Some(owner) = self.function_owner(element)?
         {
-            facts.return_types.push((element_range, written));
-            facts.declared_returns.push(StaticDeclaredReturn {
-                owner,
-                function: element_range,
-                member: None,
-                annotation: written,
-            });
+            if let Some(named) = named_type(source, written) {
+                facts.return_types.push((element_range, named));
+                facts.declared_returns.push(StaticDeclaredReturn {
+                    owner,
+                    function: element_range,
+                    member: None,
+                    annotation: named,
+                });
+            } else if let Some(element) = element_type(source, written) {
+                facts.element_returns.push((owner, element));
+            }
         }
         Ok(())
+    }
+
+    /// The name a `@type` tag types: a variable, or the field `this.name` assigns.
+    fn documented_value<'tree>(&self, element: Node<'tree>) -> Option<Node<'tree>> {
+        if element.kind_id() == self.variable {
+            return element
+                .child_by_field_id(self.name)
+                .filter(|name| name.kind_id() == self.identifier);
+        }
+        if element.kind_id() != self.assignment[0] {
+            return None;
+        }
+        let left = element
+            .child_by_field_id(self.left)
+            .filter(|left| left.kind_id() == self.member)?;
+        left.child_by_field_id(self.object)
+            .filter(|object| object.kind_id() == self.receivers[0])?;
+        left.child_by_field_id(self.property)
+            .filter(|property| property.kind_id() == self.property_identifier)
     }
 
     /// The simple parameters of a function: a name, or a name with a default value.
@@ -184,6 +224,75 @@ impl Kinds {
         }
         names
     }
+}
+
+/// Whether only spaces, names, line comments, `.`, `=` and `:` stand between `from` and
+/// `to`.
+fn adjacent(source: &str, from: u64, to: u64) -> bool {
+    let gap = usize::try_from(from)
+        .ok()
+        .zip(usize::try_from(to).ok())
+        .and_then(|(start, end)| source.get(start..end));
+    gap.is_some_and(|gap| {
+        gap.lines().all(|line| {
+            let code = line.find("//").map_or(line, |comment| &line[..comment]);
+            code.chars().all(|character| {
+                character.is_whitespace()
+                    || character.is_alphanumeric()
+                    || matches!(character, '_' | '$' | '.' | '=' | ':')
+            }) && !code.contains("=>")
+        })
+    })
+}
+
+/// Records the type a tag writes for `name`: a named type, or an array's element type.
+fn record_written(source: &str, name: ByteRange, written: ByteRange, facts: &mut StaticFactsParts) {
+    if let Some(named) = named_type(source, written) {
+        facts.declared_types.push((name, named));
+    } else if let Some(element) = element_type(source, written) {
+        facts.element_types.push((name, element));
+    }
+}
+
+/// The named element type an array type writes: `T[]`, `Array<T>`, `Array.<T>` or
+/// `ReadonlyArray<T>`, optionally in parentheses and with `null` or `undefined` members.
+fn element_type(source: &str, written: ByteRange) -> Option<ByteRange> {
+    let text = range_text(source, written)?;
+    let mut found = None;
+    let mut offset = 0_usize;
+    for member in text.split('|') {
+        let trimmed = member.trim_matches(|character: char| {
+            character.is_whitespace() || "()?!=".contains(character)
+        });
+        let at = offset + member.find(trimmed)?;
+        offset += member.len() + 1;
+        if matches!(trimmed, "null" | "undefined") {
+            continue;
+        }
+        let (inner, inner_at) = if let Some(inner) = trimmed.strip_suffix("[]") {
+            (inner.trim(), at)
+        } else {
+            let open = trimmed.find('<')?;
+            let head = trimmed[..open].trim_end_matches('.');
+            if !matches!(head, "Array" | "ReadonlyArray") {
+                return None;
+            }
+            let inner = trimmed[open + 1..].strip_suffix('>')?;
+            (inner.trim(), at + open + 1)
+        };
+        if found.is_some() {
+            return None;
+        }
+        let start = written
+            .start
+            .checked_add(u64::try_from(inner_at + trimmed[inner_at - at..].find(inner)?).ok()?)?;
+        found = Some(ByteRange {
+            start,
+            end: start.checked_add(u64::try_from(inner.len()).ok()?)?,
+        });
+    }
+    let found = found?;
+    named_type(source, found).filter(|named| *named == found)
 }
 
 fn range_text(source: &str, range: ByteRange) -> Option<&str> {

@@ -309,6 +309,16 @@ pub struct StaticFactsParts {
     pub reexports: Vec<StaticReexport>,
     /// Assignment targets.
     pub assignments: Vec<ByteRange>,
+    /// Plain name targets of assignments whose value is a function written in place.
+    pub function_writes: Vec<ByteRange>,
+    /// Declaration names whose written type is an array, with the named element type.
+    pub element_types: Vec<(ByteRange, ByteRange)>,
+    /// Declarations whose function writes an array return type, with the named element
+    /// type: the owning declaration's name and the element type.
+    pub element_returns: Vec<(ByteRange, ByteRange)>,
+    /// Functions written as members of an object literal, with that literal: `this` inside
+    /// them is the literal.
+    pub object_members: Vec<(ByteRange, ByteRange)>,
     /// Scopes with unsupported binding shapes.
     pub unsupported_bindings: Vec<ByteRange>,
     /// Rust use paths.
@@ -453,6 +463,30 @@ impl StaticFacts {
         &self.0.assignments
     }
 
+    /// Plain name targets of assignments whose value is a function written in place.
+    #[must_use]
+    pub fn function_writes(&self) -> &[ByteRange] {
+        &self.0.function_writes
+    }
+
+    /// Declaration names written with an array type, and the named element type.
+    #[must_use]
+    pub fn element_types(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.element_types
+    }
+
+    /// Declarations whose function returns a written array type, and its element type.
+    #[must_use]
+    pub fn element_returns(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.element_returns
+    }
+
+    /// Functions written as members of an object literal, and the literal.
+    #[must_use]
+    pub fn object_members(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.object_members
+    }
+
     /// Scopes where an unsupported binding can affect lookup.
     #[must_use]
     pub fn unsupported_bindings(&self) -> &[ByteRange] {
@@ -497,6 +531,10 @@ impl StaticFacts {
             vector_capacity(&self.0.bindings),
             vector_capacity(&self.0.reexports),
             vector_capacity(&self.0.assignments),
+            vector_capacity(&self.0.function_writes),
+            vector_capacity(&self.0.element_types),
+            vector_capacity(&self.0.element_returns),
+            vector_capacity(&self.0.object_members),
             vector_capacity(&self.0.unsupported_bindings),
             vector_capacity(&self.0.inherent_impls),
             vector_capacity(&self.0.rust_uses),
@@ -533,6 +571,10 @@ impl StaticFacts {
             self.bindings().len(),
             self.reexports().len(),
             self.assignments().len(),
+            self.function_writes().len(),
+            self.element_types().len(),
+            self.element_returns().len(),
+            self.object_members().len(),
             self.unsupported_bindings().len(),
             self.inherent_impls().len(),
             self.rust_uses().len(),
@@ -584,6 +626,25 @@ impl StaticFacts {
             })
     }
 
+    /// Whether assignment targets, array element types and object literal members hold
+    /// source ranges.
+    fn written_values_valid(&self, valid: impl Fn(ByteRange) -> bool + Copy) -> bool {
+        self.assignments()
+            .iter()
+            .chain(self.function_writes())
+            .copied()
+            .all(valid)
+            && self
+                .element_types()
+                .iter()
+                .chain(self.element_returns())
+                .all(|(name, element)| valid(*name) && valid(*element))
+            && self
+                .object_members()
+                .iter()
+                .all(|(function, object)| valid(*function) && contains(*object, *function))
+    }
+
     pub(crate) fn validate(&self, source: &str, limits: SyntaxLimits) -> Result<(), RiftError> {
         self.validate_counts(&limits)?;
         let valid = |range: ByteRange| {
@@ -629,7 +690,7 @@ impl StaticFacts {
             .all(|(name, annotation)| valid(*name) && valid(*annotation))
             && self.type_signatures().iter().all(|(name, _)| valid(*name))
             && self.typed_values_valid(valid);
-        let assignments = self.assignments().iter().copied().all(valid);
+        let assignments = self.written_values_valid(valid);
         let members = self.members().iter().all(|member| {
             valid(member.range)
                 && valid(member.receiver)

@@ -233,6 +233,10 @@ struct File<'source> {
     python_values: BTreeMap<u64, StaticBindingKind>,
     python_calls: BTreeMap<u64, Vec<&'source StaticCall>>,
     declared_types: BTreeMap<ByteRange, Option<ByteRange>>,
+    /// Declaration name to the named element type its written array type states.
+    element_types: BTreeMap<ByteRange, Option<ByteRange>>,
+    /// Start offsets of plain name writes whose value is a function written in place.
+    function_writes: BTreeSet<u64>,
     type_signatures: BTreeSet<(ByteRange, bool)>,
     callbacks: javascript_callbacks::Callbacks<'source>,
     members: BTreeMap<ByteRange, Option<&'source rift_syntax::StaticMember>>,
@@ -356,6 +360,8 @@ impl<'source> File<'source> {
             python_values: BTreeMap::new(),
             python_calls: BTreeMap::new(),
             declared_types: BTreeMap::new(),
+            element_types: BTreeMap::new(),
+            function_writes: BTreeSet::new(),
             type_signatures: BTreeSet::new(),
             callbacks: javascript_callbacks::Callbacks::default(),
             members: BTreeMap::new(),
@@ -420,6 +426,21 @@ impl<'source> File<'source> {
                 .entry(name)
                 .and_modify(|entry| *entry = None)
                 .or_insert(Some(annotation));
+        }
+        for &(name, element) in self.facts.element_types() {
+            if !work.charge() {
+                return None;
+            }
+            self.element_types
+                .entry(name)
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(element));
+        }
+        for range in self.facts.function_writes() {
+            if !work.charge() {
+                return None;
+            }
+            self.function_writes.insert(range.start);
         }
         for &signature in self.facts.type_signatures() {
             if !work.charge() {

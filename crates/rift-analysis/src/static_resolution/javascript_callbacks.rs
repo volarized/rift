@@ -33,7 +33,35 @@ pub(super) struct Callbacks<'source> {
     /// Owning declaration name to its declared return entries; absent when two functions
     /// share the owner, as overloads do.
     returns: BTreeMap<ByteRange, Option<Vec<DeclaredReturn>>>,
+    /// Owning declaration name to the element type of the array its function returns;
+    /// absent when two functions share the owner.
+    element_returns: BTreeMap<ByteRange, Option<ByteRange>>,
 }
+
+/// What a standard array method gives one of its callback's parameters.
+enum ArrayCallback<'source> {
+    /// The call is not an array method call on a receiver with a declared array type.
+    Other,
+    /// The element type at an element position; nothing at another position.
+    Element(Option<Target<'source>>),
+}
+
+/// Standard array methods whose callback walks the array's elements, with the callback
+/// parameter positions that receive an element.
+const ARRAY_CALLBACKS: [(&str, &[u32]); 12] = [
+    ("forEach", &[0]),
+    ("map", &[0]),
+    ("filter", &[0]),
+    ("find", &[0]),
+    ("findIndex", &[0]),
+    ("findLast", &[0]),
+    ("some", &[0]),
+    ("every", &[0]),
+    ("flatMap", &[0]),
+    ("reduce", &[1]),
+    ("reduceRight", &[1]),
+    ("sort", &[0, 1]),
+];
 
 impl<'source> Callbacks<'source> {
     /// Whether `range` is a call.
@@ -109,6 +137,16 @@ impl<'source> Callbacks<'source> {
             }
             callbacks.destructured.insert(name, (key, call));
         }
+        for &(owner, element) in facts.element_returns() {
+            if !work.charge() {
+                return None;
+            }
+            callbacks
+                .element_returns
+                .entry(owner)
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(element));
+        }
         let mut writers = BTreeMap::<ByteRange, ByteRange>::new();
         for declared in facts.declared_returns() {
             if !work.charge() {
@@ -154,8 +192,17 @@ impl<'source> Index<'source> {
                 StaticFunctionContext::Initializer(name) => {
                     self.javascript_function_type(file, name, work)?
                 }
-                StaticFunctionContext::Argument { call, index } => {
+                StaticFunctionContext::Argument {
+                    call,
+                    index: argument,
+                } => {
                     let call = file.callbacks.calls.get(&call).copied()?;
+                    if let ArrayCallback::Element(element) =
+                        self.javascript_array_callback(file, call, argument, index, work)
+                    {
+                        return element;
+                    }
+                    let index = argument;
                     let callee = self.javascript_call(file, call, work)?;
                     let declared = self.files.get(callee.file.path.as_str())?;
                     let parameter = declared
@@ -338,6 +385,153 @@ impl<'source> Index<'source> {
             file = owner;
         }
         None
+    }
+
+    /// What a standard array method gives a callback parameter: the call is
+    /// `receiver.method(callback)` with `method` an element-walking array method, the
+    /// callback its first argument and the receiver's declared type an array. An element
+    /// position takes the element type; another position takes nothing.
+    fn javascript_array_callback(
+        &self,
+        file: &File<'source>,
+        call: &StaticCall,
+        argument: u32,
+        parameter: u32,
+        work: &mut Work,
+    ) -> ArrayCallback<'source> {
+        let rift_syntax::StaticCallee::Member { receiver, member } = call.callee else {
+            return ArrayCallback::Other;
+        };
+        let Some(positions) = ARRAY_CALLBACKS
+            .iter()
+            .find(|(name, _)| file.text(member) == Some(*name))
+            .map(|(_, positions)| *positions)
+            .filter(|_| argument == 0)
+        else {
+            return ArrayCallback::Other;
+        };
+        let Some((owner, element)) = self.javascript_element_type(file, receiver, work) else {
+            // An array method on a receiver of another type is that type's own method.
+            return ArrayCallback::Other;
+        };
+        ArrayCallback::Element(
+            positions
+                .contains(&parameter)
+                .then(|| self.javascript_declared_type(owner, element, work))
+                .flatten(),
+        )
+    }
+
+    /// The file and written element type of the array a receiver holds: a name declared
+    /// with an array type, a field declared with one, or a call whose callee declares an
+    /// array return type.
+    pub(super) fn javascript_element_type<'index>(
+        &'index self,
+        file: &'index File<'source>,
+        receiver: ByteRange,
+        work: &mut Work,
+    ) -> Option<(&'index File<'source>, ByteRange)> {
+        if file.callbacks.is_call(receiver) {
+            let call = file.callbacks.calls.get(&receiver).copied()?;
+            return work.javascript_lookup(|work| {
+                let callee = self.javascript_call(file, call, work)?;
+                let declared = self.files.get(callee.file.path.as_str())?;
+                let element = declared
+                    .callbacks
+                    .element_returns
+                    .get(&callee.symbol.name_range?)
+                    .copied()
+                    .flatten()?;
+                Some((declared, element))
+            });
+        }
+        if let Some(member) = file.members.get(&receiver).copied().flatten() {
+            let name = file.text(member.member?)?;
+            let owner = self.javascript_receiver_class(file, member.receiver, work)?;
+            return self.javascript_field_element(owner, name, work);
+        }
+        let name = file.text(receiver)?.trim();
+        let binding = super::javascript::js_binding(
+            file,
+            &self.javascript,
+            name,
+            receiver.start,
+            ReferenceRole::Read,
+            work,
+        )?;
+        let element = file.element_types.get(&binding.name).copied().flatten()?;
+        Some((file, element))
+    }
+
+    /// The class a member receiver denotes: `this` inside a class, or a name declared as
+    /// a class or interface.
+    fn javascript_receiver_class(
+        &self,
+        file: &File<'source>,
+        receiver: ByteRange,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let text = file.text(receiver)?.trim();
+        if text == "this" {
+            let scopes = self.javascript.scopes.get(file.document.path.as_str())?;
+            let symbol = *scopes
+                .classes
+                .resolve(receiver.start, receiver.start.checked_add(1)?)?;
+            return Some(Target {
+                file: file.document,
+                symbol,
+            });
+        }
+        let binding = super::javascript::js_binding(
+            file,
+            &self.javascript,
+            text,
+            receiver.start,
+            ReferenceRole::Read,
+            work,
+        )?;
+        let annotation = file.declared_types.get(&binding.name).copied().flatten()?;
+        self.javascript_declared_type(file, annotation, work)
+    }
+
+    /// The written element type of the field `name` of `owner`: its declaration's array
+    /// type, or the documented array type of a `this.name` assignment inside the class.
+    fn javascript_field_element<'index>(
+        &'index self,
+        owner: Target<'source>,
+        name: &str,
+        work: &mut Work,
+    ) -> Option<(&'index File<'source>, ByteRange)> {
+        let file = self.files.get(owner.file.path.as_str())?;
+        if let Some(element) = file
+            .qualified_target(&format!("{}.{name}", owner.symbol.qualified_name))
+            .and_then(|field| field.symbol.name_range)
+            .and_then(|range| file.element_types.get(&range).copied().flatten())
+        {
+            return Some((file, element));
+        }
+        let mut found = None;
+        for &(written, element) in file.facts.element_types() {
+            if !work.charge() {
+                return None;
+            }
+            // The written name is the property of `this.name`.
+            let receiver = ByteRange {
+                start: written.start.saturating_sub(5),
+                end: written.start,
+            };
+            let assigned = owner.symbol.range.encloses(written)
+                && file.text(written) == Some(name)
+                && file.text(receiver) == Some("this.");
+            if assigned
+                && found
+                    .replace(element)
+                    .is_some_and(|previous| previous != element)
+            {
+                return None;
+            }
+        }
+        Some((file, found?))
     }
 
     /// The class or interface the result of the call at `range` is declared as: the named
