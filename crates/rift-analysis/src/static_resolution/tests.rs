@@ -1532,3 +1532,123 @@ fn test_rust_public_type_reexport_keeps_public_method_access() {
         "rift://symbol/local/rust/fixture/inner/types/Item/new"
     );
 }
+
+#[test]
+fn test_rust_inactive_generic_bounds_do_not_change_outer_receivers() {
+    let source = "trait Count { fn read(&self); } trait Other { fn read(&self); } fn root<T: Count>(item: &T) { #[cfg(any())] fn inactive<T: Other>(item: &T) {} fn T() -> OtherItem { loop {} } item.read(); } struct OtherItem; impl OtherItem { fn read(&self) {} }";
+    let result = resolution(
+        "rust",
+        &[("src/lib.rs", source)],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    assert_eq!(
+        calls(&result, "src/lib.rs").map(target).collect::<Vec<_>>(),
+        ["rift://symbol/local/rust/fixture/Count/read"]
+    );
+}
+
+#[test]
+fn test_rust_local_return_receiver_uses_the_factory_declaration_scope() {
+    let source = "mod items; use crate::items::make; fn root() { let item = make(); item.read(); }";
+    let result = resolution(
+        "rust",
+        &[
+            ("src/lib.rs", source),
+            (
+                "src/items.rs",
+                "pub struct Item; impl Item { pub fn read(&self) {} } pub fn make() -> Item { Item }",
+            ),
+        ],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    let found = calls(&result, "src/lib.rs")
+        .map(|edge| (source_of(edge, source), target(edge)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        found,
+        [
+            ("make()", "rift://symbol/local/rust/fixture/items/make"),
+            (
+                "item.read()",
+                "rift://symbol/local/rust/fixture/items/Item/read"
+            )
+        ]
+    );
+}
+
+#[test]
+fn test_rust_local_receiver_depth_refuses_without_exhausting_the_pass() {
+    use std::fmt::Write as _;
+    let mut source =
+        "struct Item; impl Item { fn read(&self) {} } fn root(item: &Item) {".to_owned();
+    for index in 0..80 {
+        let previous = if index == 0 {
+            "item".to_owned()
+        } else {
+            format!("value{}", index - 1)
+        };
+        write!(source, "let value{index} = {previous};").expect("fixture source");
+    }
+    source.push_str("value79.read(); }");
+    let result = resolution(
+        "rust",
+        &[("src/lib.rs", &source)],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    assert_eq!(calls(&result, "src/lib.rs").count(), 0);
+    assert!(result.unresolved_sites > 0);
+    assert!(!result.exhausted);
+}
+
+#[test]
+fn test_rust_alias_of_a_bounded_receiver_keeps_its_type_parameter_scope() {
+    let source = "trait Count { fn read(&self); } fn root<T: Count>(item: &T) { let alias = item; alias.read(); }";
+    let result = resolution(
+        "rust",
+        &[("src/lib.rs", source)],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    let found = calls(&result, "src/lib.rs").collect::<Vec<_>>();
+    assert_eq!(found.len(), 1);
+    assert_eq!(source_of(found[0], source), "alias.read()");
+    assert_eq!(
+        target(found[0]),
+        "rift://symbol/local/rust/fixture/Count/read"
+    );
+}
+
+#[test]
+fn test_rust_unit_self_constructor_keeps_its_authored_owner() {
+    let source =
+        "struct Item; impl Item { fn read(&self) {} fn root() { let item = Self; item.read(); } }";
+    let result = resolution(
+        "rust",
+        &[("src/lib.rs", source)],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    let found = calls(&result, "src/lib.rs").collect::<Vec<_>>();
+    assert_eq!(found.len(), 1);
+    assert_eq!(source_of(found[0], source), "item.read()");
+    assert_eq!(
+        target(found[0]),
+        "rift://symbol/local/rust/fixture/Item/read"
+    );
+}
+
+#[test]
+fn test_rust_non_trait_bound_does_not_supply_a_same_named_method() {
+    let source =
+        "struct Item; impl Item { fn read(&self) {} } fn root<T: Item>(item: &T) { item.read(); }";
+    let result = resolution(
+        "rust",
+        &[("src/lib.rs", source)],
+        &[("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")],
+        WORK_MAX,
+    );
+    assert_eq!(calls(&result, "src/lib.rs").count(), 0);
+}

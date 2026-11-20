@@ -2,6 +2,9 @@
 
 mod references;
 
+// Exhausting initializer lookup depth leaves the authored site unresolved.
+const RECEIVER_DEPTH_MAX: usize = 64;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use rift_protocol::read::SymbolKind;
@@ -20,6 +23,8 @@ pub(super) struct Namespaces<'source> {
     field_types: BTreeMap<Vec<String>, Target<'source>>,
     bounds: BTreeMap<(&'source str, ByteRange), Vec<ByteRange>>,
     unavailable: BTreeSet<(&'source str, ByteRange)>,
+    return_owners: BTreeMap<(&'source str, ByteRange), Target<'source>>,
+    initializers: BTreeMap<(&'source str, ByteRange), Option<&'source StaticCall>>,
     conditional_modules: BTreeSet<Vec<String>>,
     inactive_modules: BTreeSet<Vec<String>>,
     modules: BTreeMap<Vec<String>, bool>,
@@ -119,7 +124,54 @@ impl<'source> Namespaces<'source> {
         namespaces.index_methods(files, work)?;
         namespaces.index_field_types(files, work)?;
         namespaces.index_bounds(files, work)?;
+        namespaces.index_returns(files, work)?;
         Some(namespaces)
+    }
+
+    fn index_returns(
+        &mut self,
+        files: &BTreeMap<&'source str, File<'source>>,
+        work: &mut Work,
+    ) -> Option<()> {
+        for (&path, file) in files
+            .iter()
+            .filter(|(_, file)| file.document.facts.language().name == "rust")
+        {
+            for call in file.facts.calls() {
+                if !work.charge() {
+                    return None;
+                }
+                self.initializers
+                    .entry((path, call.range))
+                    .and_modify(|call| *call = None)
+                    .or_insert(Some(call));
+            }
+            for &(name, result) in file.facts.declared_types() {
+                if file.declared_types.get(&name).copied().flatten() != Some(result) {
+                    continue;
+                }
+                if !work.charge() {
+                    return None;
+                }
+                if file.conditional(result, work) {
+                    continue;
+                }
+                let Some(callable) = file.target_at(name).and_then(Target::callable) else {
+                    continue;
+                };
+                let owner = self.edge_type_target(file, result, work).or_else(|| {
+                    if file.text(result)? != "Self" {
+                        return None;
+                    }
+                    file.qualified_target(callable.symbol.container.as_deref()?)
+                        .filter(|target| target.symbol.kind == "trait" && self.available(*target))
+                });
+                if let Some(owner) = owner {
+                    self.return_owners.insert((path, name), owner);
+                }
+            }
+        }
+        Some(())
     }
 
     fn index_aliases(
@@ -191,6 +243,15 @@ impl<'source> Namespaces<'source> {
             .filter(|(_, file)| file.document.facts.language().name == "rust")
         {
             for &(name, bound) in file.facts.declared_types() {
+                if file
+                    .target_at(name)
+                    .is_some_and(|target| target.symbol.kinds.contains(&SymbolKind::Callable))
+                {
+                    continue;
+                }
+                if file.conditional(name, work) {
+                    continue;
+                }
                 if !work.charge() {
                     return None;
                 }
@@ -392,6 +453,19 @@ impl<'source> Namespaces<'source> {
         call: &StaticCall,
         work: &mut Work,
     ) -> Option<Target<'source>> {
+        self.call_at_depth(file, call, work, RECEIVER_DEPTH_MAX)
+    }
+
+    fn call_at_depth(
+        &self,
+        file: &File<'source>,
+        call: &StaticCall,
+        work: &mut Work,
+        depth: usize,
+    ) -> Option<Target<'source>> {
+        if depth == 0 {
+            return None;
+        }
         if file.conditional(call.range, work) {
             return None;
         }
@@ -400,7 +474,7 @@ impl<'source> Namespaces<'source> {
             StaticCallee::Direct => self.direct_call(file, call, work),
             StaticCallee::Qualified => self.qualified_call(file, call, work),
             StaticCallee::Member { receiver, member } => {
-                self.receiver_method(file, receiver, file.text(member)?, work)
+                self.receiver_method_at_depth(file, receiver, file.text(member)?, work, depth)
             }
             StaticCallee::Unsupported | StaticCallee::Constructor => None,
         }
@@ -924,5 +998,6 @@ fn is_value_binding(kind: StaticBindingKind) -> bool {
             | StaticBindingKind::Shadow
             | StaticBindingKind::RustUse { .. }
             | StaticBindingKind::RustReceiver { .. }
+            | StaticBindingKind::RustValue { .. }
     )
 }

@@ -496,3 +496,47 @@ fn test_rust_reexport_cycles_and_ambiguous_entries_stay_unresolved() {
         );
     }
 }
+
+#[test]
+fn test_rust_local_declared_returns_keep_stored_receivers_and_shadowing() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let root = directory.path();
+    std::fs::create_dir(root.join("src")).expect("source directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='fixture'\nversion='0.1.0'\n",
+    )
+    .expect("manifest");
+    std::fs::write(root.join("src/lib.rs"), "pub struct Item { pub value: usize } impl Item { pub fn copy(&self) -> Self { Self { value: self.value } } pub fn read(&self) -> usize { self.value } pub fn use_copy(&self) -> usize { let copy = self.copy(); copy.read() } pub fn alias(&self) -> usize { let copy = self.copy(); let next = copy; next.read() } pub fn shadow(&self) { let copy = self.copy(); let copy = 0; copy.read(); } pub fn unknown(&self) { let copy = opaque(); copy.read(); } } fn opaque() -> impl Sized { 0 } pub fn make() -> Item { Item { value: 0 } } pub fn free() { let item = make(); item.read(); }").expect("source");
+    let index = WorkspaceIndex::build(
+        root,
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &TextFileInclusion::default(),
+    )
+    .expect("index");
+    let view = index.symbol_view().expect("symbols");
+    assert!(
+        view.normalized_graph()
+            .records()
+            .iter()
+            .all(|record| record.identity().is_some())
+    );
+    for from in ["/Item/use_copy", "/Item/alias", "/fixture/free"] {
+        for kind in [EdgeKind::Calls, EdgeKind::Reads] {
+            assert!(
+                index.edges().edges().any(|edge| edge.kind() == kind
+                    && edge.from().as_str().ends_with(from)
+                    && edge.to().as_str().ends_with("/Item/read")),
+                "missing {kind:?} {from} -> Item.read"
+            );
+        }
+    }
+    assert!(!index.edges().edges().any(|edge| {
+        edge.kind() == EdgeKind::Calls
+            && ["/Item/shadow", "/Item/unknown"]
+                .iter()
+                .any(|from| edge.from().as_str().ends_with(from))
+            && edge.to().as_str().ends_with("/Item/read")
+    }));
+}

@@ -263,3 +263,30 @@ fn test_rust_conditional_items_keep_their_authored_attribute_ranges() {
     assert_eq!(text(condition.attribute), "#[cfg(feature=\"std\")]");
     assert_eq!(text(condition.range), "fn leaf() {}");
 }
+
+#[test]
+fn test_rust_local_return_facts_keep_authored_initializer_and_return_type() {
+    let path = ProjectPath::new("src/lib.rs").expect("path");
+    let source = "struct Item; impl Item { fn copy(&self) -> Self { Self } fn run(&self) { let copy = self.copy(); } }";
+    let document = RustSyntaxProvider::default()
+        .analyze(
+            SyntaxSource {
+                path: &path,
+                text: source,
+            },
+            SyntaxLimits::default(),
+        )
+        .expect("syntax");
+    let facts = document.facts().static_facts().expect("static facts");
+    let text = |range: rift_syntax::ByteRange| {
+        &source[usize::try_from(range.start).expect("offset")
+            ..usize::try_from(range.end).expect("offset")]
+    };
+    assert!(
+        facts
+            .declared_types()
+            .iter()
+            .any(|&(name, result)| text(name) == "copy" && text(result) == "Self")
+    );
+    assert!(facts.bindings().iter().any(|binding| matches!(binding.kind, rift_syntax::StaticBindingKind::RustValue { initializer } if text(binding.name) == "copy" && text(initializer) == "self.copy()")));
+}

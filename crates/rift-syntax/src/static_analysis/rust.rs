@@ -55,6 +55,7 @@ pub(super) struct Kinds {
     path: u16,
     pattern: u16,
     value_type: u16,
+    return_type: u16,
     left: u16,
     body: u16,
 }
@@ -117,6 +118,7 @@ pub(super) fn kinds() -> &'static Kinds {
             path: field("path"),
             pattern: field("pattern"),
             value_type: field("type"),
+            return_type: field("return_type"),
             left: field("left"),
             body: field("body"),
         }
@@ -157,6 +159,9 @@ impl Kinds {
             self.record_closure_argument(syntax_element, facts)?;
         } else if id == self.functions[0] {
             self.record_function(syntax_element, facts)?;
+            self.record_return(syntax_element, facts)?;
+        } else if id == self.functions[1] {
+            self.record_return(syntax_element, facts)?;
         } else if self.assignment.contains(&id) {
             self.record_mutation(syntax_element, facts)?;
         } else if id == self.edge_macro {
@@ -313,12 +318,28 @@ impl Kinds {
         let closure = syntax_element
             .child_by_field_id(self.value)
             .is_some_and(|value| value.kind_id() == self.functions[2]);
-        let kind = match value_type {
-            Some(value_type) => StaticBindingKind::RustReceiver {
+        let initializer = syntax_element
+            .child_by_field_id(self.value)
+            .filter(|value| {
+                [
+                    self.call,
+                    self.identifier,
+                    self.scoped_identifier,
+                    self.self_value,
+                    self.type_identifier,
+                    self.field_expression,
+                ]
+                .contains(&value.kind_id())
+            });
+        let kind = match (value_type, closure, initializer) {
+            (Some(value_type), _, _) => StaticBindingKind::RustReceiver {
                 type_path: byte_range(value_type)?,
             },
-            None if closure => StaticBindingKind::Local,
-            None => StaticBindingKind::Shadow,
+            (_, true, _) => StaticBindingKind::Local,
+            (_, _, Some(initializer)) => StaticBindingKind::RustValue {
+                initializer: byte_range(initializer)?,
+            },
+            _ => StaticBindingKind::Shadow,
         };
         let available_from = if is_let {
             byte_range(syntax_element)?.end
@@ -459,6 +480,23 @@ impl Kinds {
                 byte_range(scope)?.start,
                 StaticBindingKind::Shadow,
             )?);
+        }
+        Ok(())
+    }
+
+    fn record_return(
+        &self,
+        element: Node<'_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let name = element.child_by_field_id(self.name);
+        let return_type = element
+            .child_by_field_id(self.return_type)
+            .and_then(|value| self.named_type(value));
+        if let Some((name, return_type)) = name.zip(return_type) {
+            facts
+                .declared_types
+                .push((byte_range(name)?, byte_range(return_type)?));
         }
         Ok(())
     }

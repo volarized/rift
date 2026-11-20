@@ -117,6 +117,11 @@ pub enum StaticBindingKind {
     },
     /// Rust type parameter whose declared bounds remain in its lexical scope.
     RustTypeParameter,
+    /// Local Rust value whose initializer can establish its declared return owner.
+    RustValue {
+        /// Authored initializer expression.
+        initializer: ByteRange,
+    },
 }
 
 /// One named export forwarded directly from another module.
@@ -474,6 +479,7 @@ impl StaticBinding {
             StaticBindingKind::JavaScriptInstance { constructor } => valid(constructor),
             StaticBindingKind::RustUse { path } => valid(path),
             StaticBindingKind::RustReceiver { type_path } => valid(type_path),
+            StaticBindingKind::RustValue { initializer } => valid(initializer),
             StaticBindingKind::Local
             | StaticBindingKind::Shadow
             | StaticBindingKind::RustTypeParameter => true,
