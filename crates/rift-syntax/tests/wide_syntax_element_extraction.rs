@@ -59,6 +59,10 @@ const REPEATS: usize = 3;
 /// Target CPU time of one smaller-file analysis, within the existing input bounds.
 const SMALL_RUN_MIN: Duration = Duration::from_millis(20);
 
+/// Process CPU time the aggregate case may spend over every provider: the 60-second test
+/// deadline it has on main, held in CPU time so another process's load cannot spend it.
+const AGGREGATE_CPU_MAX: Duration = Duration::from_secs(60);
+
 /// CPU work accumulated by one sample before normalizing by its analysis count.
 const CPU_SAMPLE_MIN: Duration = SMALL_RUN_MIN.saturating_mul(2);
 
@@ -259,11 +263,13 @@ fn assert_wide_provider(language: ShippedLanguage) {
     );
 }
 
-/// The aggregate case from main: every registered provider inside one test deadline, so the
-/// whole wide-syntax-element proof keeps the bound it always had. The per-provider cases in
+/// The aggregate case from main: every registered provider inside one test deadline and one
+/// [`AGGREGATE_CPU_MAX`] of process CPU, so the whole wide-syntax-element proof keeps the bound
+/// it always had. The per-provider cases in
 /// [`wide_providers`] name the provider that fails.
 #[test]
 fn every_provider_reads_a_syntax_element_with_many_children_in_linear_time() {
+    let start = ProcessTime::try_now().expect("the process CPU clock must be available");
     for provider in registry::providers() {
         let language = provider.language();
         let line = wide_line(language);
@@ -276,6 +282,14 @@ fn every_provider_reads_a_syntax_element_with_many_children_in_linear_time() {
             document.syntax_elements().len(),
         );
     }
+    let spent = start
+        .try_elapsed()
+        .expect("the process CPU clock must be readable");
+    assert!(
+        spent <= AGGREGATE_CPU_MAX,
+        "every provider's wide syntax element proof must fit the aggregate bound in process CPU \
+         time: spent={spent:?}, bound={AGGREGATE_CPU_MAX:?}"
+    );
 }
 
 mod wide_providers {
