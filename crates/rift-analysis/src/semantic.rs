@@ -672,6 +672,29 @@ impl WorkspaceSemantics {
             std::slice::from_ref(&self.syntax_provider),
         )
     }
+
+    /// The references and edges of the captured graph by the Contribution that supplies
+    /// them, for a caller that assembles every record.
+    #[must_use]
+    pub fn assembly_sources(&self) -> rift_provider::AssemblySources<'_> {
+        rift_provider::AssemblySources::new(&self.graph)
+    }
+
+    /// Assembles one captured record as [`Self::assembled_record`] does, reading its
+    /// references and edges from `sources`.
+    #[must_use]
+    pub fn assembled_record_from(
+        &self,
+        sources: &rift_provider::AssemblySources<'_>,
+        record: &rift_core::SymbolRecord,
+    ) -> Option<AssembledSymbol> {
+        SymbolAssembler::assemble_from(
+            &self.graph,
+            sources,
+            record,
+            std::slice::from_ref(&self.syntax_provider),
+        )
+    }
 }
 
 impl get_size2::GetSize for WorkspaceSemantics {
