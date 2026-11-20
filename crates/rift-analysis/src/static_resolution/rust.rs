@@ -68,6 +68,16 @@ impl<'source> Namespaces<'source> {
         range: ByteRange,
         work: &mut Work,
     ) -> Option<Target<'source>> {
+        if let Some(target) = file.target_at(range)
+            && structural_owner(target)
+        {
+            return self.available(target).then_some(target);
+        }
+        if file.text(range)? == "Self"
+            && let Some(owner) = self.structural_self(file, range.start, work)
+        {
+            return Some(owner);
+        }
         let parts = path_segments(file.text(range)?, work)?;
         if let [name] = parts.as_slice()
             && let Some(target) = Self::local_type(file, range.start, name, work)
@@ -374,7 +384,15 @@ impl<'source> Namespaces<'source> {
                 continue;
             };
             if namespace.base.is_empty() {
-                let depth = symbol.qualified_name.split("::").count();
+                let depth = if structural_owner(target) {
+                    symbol
+                        .container
+                        .as_deref()
+                        .map_or(0, |container| container.split("::").count())
+                        + 1
+                } else {
+                    symbol.qualified_name.split("::").count()
+                };
                 namespace.base = path.get(..path.len().checked_sub(depth)?)?.to_vec();
             }
             if file.inactive(symbol.item_range, work) {
@@ -547,6 +565,11 @@ impl<'source> Namespaces<'source> {
     ) -> Option<Target<'source>> {
         let parts = path_segments(file.text(call.callee_range)?, work)?;
         let position = call.range.start;
+        if let ["Self", member] = parts.as_slice()
+            && let Some(owner) = self.structural_self(file, position, work)
+        {
+            return self.inherent_method(file, position, owner, member, work);
+        }
         let path = self.resolved_path(file, position, &parts, work)?;
         if let Some(target) = self.lookup(file, position, &path, Namespace::Value, work) {
             return Some(target);
@@ -581,7 +604,9 @@ impl<'source> Namespaces<'source> {
                 .filter(|target| self.available(*target))?
                 .callable();
         }
-        if !matches!(owner.symbol.kind, "struct" | "enum" | "union_item") {
+        if !matches!(owner.symbol.kind, "struct" | "enum" | "union_item")
+            && !structural_owner(owner)
+        {
             return None;
         }
         let mut path = owner.admitted_path()?;
@@ -705,6 +730,11 @@ impl<'source> Namespaces<'source> {
     ) -> Option<Vec<String>> {
         let (head, tail) = parts.split_first()?;
         if *head == "Self" {
+            if let Some(owner) = self.structural_self(file, position, work) {
+                let mut path = owner.admitted_path()?;
+                path.extend(tail.iter().map(|part| (*part).to_owned()));
+                return Some(path);
+            }
             let implementation = file
                 .facts
                 .inherent_impls()
@@ -766,6 +796,22 @@ impl<'source> Namespaces<'source> {
             }
             Binding::Blocked => None,
         }
+    }
+
+    fn structural_self(
+        &self,
+        file: &File<'source>,
+        position: u64,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let implementation = file
+            .facts
+            .inherent_impls()
+            .iter()
+            .filter(|implementation| work.charge() && implementation.range.contains(position))
+            .min_by_key(|implementation| implementation.range.end - implementation.range.start)?;
+        file.target_at(implementation.type_path)
+            .filter(|target| structural_owner(*target) && self.available(*target))
     }
 
     fn absolute_path(
@@ -954,6 +1000,10 @@ fn inherent_member<'source>(
                     target.symbol.kind == "impl_item" && target.symbol.qualified_name == container
                 })
     })
+}
+
+fn structural_owner(target: Target<'_>) -> bool {
+    target.symbol.kind == "impl_item" && target.symbol.name.starts_with(['&', '['])
 }
 
 fn insert<T>(index: &mut BTreeMap<Vec<String>, Option<T>>, path: Vec<String>, target: T) {

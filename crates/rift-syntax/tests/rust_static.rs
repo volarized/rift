@@ -4,6 +4,50 @@ use rift_core::ProjectPath;
 use rift_syntax::{RustSyntaxProvider, SyntaxLimits, SyntaxProvider, SyntaxSource};
 
 #[test]
+fn test_rust_reference_and_slice_impls_keep_authored_owner_ranges() {
+    let path = ProjectPath::new("src/lib.rs").expect("path");
+    let source = "impl<'a> Count for &'a Item { fn read(&self) {} } impl Count for &mut Item { fn read(&self) {} } impl Count for [u8] { fn read(&self) {} } impl Count for &[u8] { fn read(&self) {} }";
+    let document = RustSyntaxProvider::default()
+        .analyze(
+            SyntaxSource {
+                path: &path,
+                text: source,
+            },
+            SyntaxLimits::default(),
+        )
+        .expect("syntax");
+    let implementations = document
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.kind == "impl_item")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        implementations
+            .iter()
+            .map(|symbol| symbol.name.as_str())
+            .collect::<Vec<_>>(),
+        ["&Item", "&mut Item", "[u8]", "&[u8]"]
+    );
+    let facts = document.facts().static_facts().expect("static facts");
+    assert_eq!(
+        facts
+            .inherent_impls()
+            .iter()
+            .map(
+                |implementation| &source[usize::try_from(implementation.type_path.start)
+                    .expect("start")
+                    ..usize::try_from(implementation.type_path.end).expect("end")]
+            )
+            .collect::<Vec<_>>(),
+        ["&'a Item", "&mut Item", "[u8]", "&[u8]"]
+    );
+    for implementation in implementations {
+        assert!(document.symbols().iter().any(|member| member.name == "read"
+            && member.container.as_deref() == Some(implementation.name.as_str())));
+    }
+}
+
+#[test]
 fn test_rust_grouped_imports_keep_each_binding() {
     let path = ProjectPath::new("src/lib.rs").expect("path");
     let source = "use crate::jobs::{Task, leaf as run};";

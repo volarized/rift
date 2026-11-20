@@ -674,8 +674,7 @@ impl GrammarRules for RustGrammarRules {
             RustGrammarSyntaxKind::LetDeclaration => declaration_name(syntax_element, text),
             RustGrammarSyntaxKind::ImplItem => {
                 let item = syntax_element.child_by_field_name(RustGrammarField::Type.as_str())?;
-                text.get(implemented_type(item).byte_range())
-                    .map(|value| value.split_whitespace().collect::<String>())
+                implemented_type_name(item, text)
             }
             _ => None,
         }
@@ -722,6 +721,12 @@ fn rust_parser() -> Result<Parser, RiftError> {
 }
 
 fn declaration_name(syntax_element: Node<'_>, text: &str) -> Option<String> {
+    if syntax_element.kind() == RustGrammarSyntaxKind::ImplItem.as_str() {
+        return implemented_type_name(
+            syntax_element.child_by_field_name(RustGrammarField::Type.as_str())?,
+            text,
+        );
+    }
     if RustGrammarSyntaxKind::from_kind(syntax_element.kind())
         == Some(RustGrammarSyntaxKind::LetDeclaration)
     {
@@ -767,6 +772,71 @@ fn implemented_type(syntax_element: Node<'_>) -> Node<'_> {
     syntax_element
         .child_by_field_name(RustGrammarField::Type.as_str())
         .unwrap_or(syntax_element)
+}
+
+/// References retain mutability and slices retain their element type. Lifetimes
+/// and generic arguments do not change the declaration's logical owner name.
+fn implemented_type_name(element: Node<'_>, text: &str) -> Option<String> {
+    enum Part<'tree> {
+        Type(Node<'tree>),
+        ArrayEnd(Option<Node<'tree>>),
+    }
+    static KINDS: OnceLock<([u16; 4], [u16; 3])> = OnceLock::new();
+    let (kinds, fields) = KINDS.get_or_init(|| {
+        let grammar = rust_grammar();
+        (
+            [
+                "generic_type",
+                "reference_type",
+                "mutable_specifier",
+                "array_type",
+            ]
+            .map(|kind| grammar.id_for_node_kind(kind, true)),
+            ["type", "length", "element"].map(|field| {
+                grammar
+                    .field_id_for_name(field)
+                    .expect("pinned type field")
+                    .get()
+            }),
+        )
+    });
+    let mut pending = vec![Part::Type(element)];
+    let mut name = String::new();
+    // Each part visits one type child or closes it, bounded by syntax depth.
+    while let Some(part) = pending.pop() {
+        match part {
+            Part::ArrayEnd(length) => {
+                if let Some(length) = length {
+                    name.push(';');
+                    name.extend(text.get(length.byte_range())?.split_whitespace());
+                }
+                name.push(']');
+            }
+            Part::Type(element) => match element.kind_id() {
+                kind if kind == kinds[0] => {
+                    pending.push(Part::Type(element.child_by_field_id(fields[0])?));
+                }
+                kind if kind == kinds[1] => {
+                    name.push('&');
+                    let mut cursor = element.walk();
+                    if element
+                        .named_children(&mut cursor)
+                        .any(|child| child.kind_id() == kinds[2])
+                    {
+                        name.push_str("mut ");
+                    }
+                    pending.push(Part::Type(element.child_by_field_id(fields[0])?));
+                }
+                kind if kind == kinds[3] => {
+                    name.push('[');
+                    pending.push(Part::ArrayEnd(element.child_by_field_id(fields[1])));
+                    pending.push(Part::Type(element.child_by_field_id(fields[2])?));
+                }
+                _ => name.extend(text.get(element.byte_range())?.split_whitespace()),
+            },
+        }
+    }
+    Some(name)
 }
 
 /// The attribute that exports a `macro_rules!` macro from its crate.

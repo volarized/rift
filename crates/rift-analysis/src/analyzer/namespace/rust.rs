@@ -428,6 +428,7 @@ fn file_anchors(
             })
     };
     let mut anchors = BTreeMap::new();
+    let mut owners = BTreeMap::<String, Vec<String>>::new();
     for symbol in syntax.symbols().iter().filter(|symbol| supported(symbol)) {
         let base = match symbol.container.as_deref() {
             Some(container) => format!("{container}::{}", symbol.name),
@@ -436,13 +437,25 @@ fn file_anchors(
         if symbol.qualified_name != base {
             continue;
         }
-        let Some(names) = base
-            .split("::")
-            .map(source_identifier)
-            .collect::<Option<Vec<_>>>()
-        else {
+        let structural = symbol.kind == "impl_item" && symbol.name.starts_with(['&', '[']);
+        let names = if structural {
+            let mut names = match symbol.container.as_deref() {
+                Some(container) => owner_path(container, &owners),
+                None => Some(Vec::new()),
+            };
+            if let Some(names) = &mut names {
+                names.push(symbol.name.nfc().collect());
+            }
+            names
+        } else {
+            owner_path(&base, &owners)
+        };
+        let Some(names) = names else {
             continue;
         };
+        if structural {
+            owners.insert(base, names.clone());
+        }
         let mut qualified_path = namespace.to_vec();
         qualified_path.extend(names);
         let Ok(identity) = SymbolIdentity::new(
@@ -457,6 +470,29 @@ fn file_anchors(
         }
     }
     anchors
+}
+
+fn owner_path(base: &str, owners: &BTreeMap<String, Vec<String>>) -> Option<Vec<String>> {
+    let mut prefix = base;
+    // Each step removes a path component; structural owners stay one component.
+    loop {
+        if let Some(owner) = owners.get(prefix) {
+            let mut names = owner.clone();
+            if let Some(suffix) = base.get(prefix.len()..)?.strip_prefix("::") {
+                names.extend(
+                    suffix
+                        .split("::")
+                        .map(source_identifier)
+                        .collect::<Option<Vec<_>>>()?,
+                );
+            }
+            return Some(names);
+        }
+        let Some((parent, _)) = prefix.rsplit_once("::") else {
+            return base.split("::").map(source_identifier).collect();
+        };
+        prefix = parent;
+    }
 }
 
 pub(super) fn library(input: &NamespaceInput<'_>) -> Option<(String, String)> {

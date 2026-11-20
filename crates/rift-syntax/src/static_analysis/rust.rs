@@ -18,6 +18,7 @@ pub(super) struct Kinds {
     type_identifier: u16,
     generic_type: u16,
     reference_type: u16,
+    array_type: u16,
     self_parameter: u16,
     self_value: u16,
     scoped_identifier: u16,
@@ -72,6 +73,7 @@ pub(super) fn kinds() -> &'static Kinds {
             type_identifier: id("type_identifier"),
             generic_type: id("generic_type"),
             reference_type: id("reference_type"),
+            array_type: id("array_type"),
             self_parameter: id("self_parameter"),
             self_value: id("self"),
             scoped_identifier: id("scoped_identifier"),
@@ -369,7 +371,7 @@ impl Kinds {
             } else {
                 self.value_type
             })
-            .and_then(|value_type| self.named_type(value_type))
+            .and_then(|value_type| self.implementation_type(value_type))
         else {
             return Ok(());
         };
@@ -442,7 +444,7 @@ impl Kinds {
     ) -> Result<(), RiftError> {
         if let Some(value_type) = syntax_element
             .child_by_field_id(self.value_type)
-            .and_then(|value_type| self.named_type(value_type))
+            .and_then(|value_type| self.implementation_type(value_type))
         {
             facts.inherent_impls.push(StaticInherentImpl {
                 range: byte_range(syntax_element)?,
@@ -459,6 +461,21 @@ impl Kinds {
         }
         (!element.is_missing()
             && [self.type_identifier, self.scoped_type_identifier].contains(&element.kind_id()))
+        .then_some(element)
+    }
+
+    fn implementation_type<'tree>(&self, element: Node<'tree>) -> Option<Node<'tree>> {
+        if element.kind_id() == self.generic_type {
+            return element.child_by_field_id(self.value_type);
+        }
+        ([
+            self.type_identifier,
+            self.scoped_type_identifier,
+            self.reference_type,
+            self.array_type,
+        ]
+        .contains(&element.kind_id())
+            && !element.is_missing())
         .then_some(element)
     }
 

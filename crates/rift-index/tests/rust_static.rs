@@ -540,3 +540,49 @@ fn test_rust_local_declared_returns_keep_stored_receivers_and_shadowing() {
             && edge.to().as_str().ends_with("/Item/read")
     }));
 }
+
+#[test]
+fn test_rust_reference_and_slice_impls_keep_distinct_stored_identities() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let root = directory.path();
+    std::fs::create_dir(root.join("src")).expect("source directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='fixture'\nversion='0.1.0'\n",
+    )
+    .expect("manifest");
+    let source = "pub trait Count { fn read(&self) -> usize; } pub struct Item; impl<'a> Count for &'a Item { fn read(&self) -> usize { 1 } } impl Count for &mut Item { fn read(&self) -> usize { 2 } } impl Count for [u8] { fn read(&self) -> usize { 3 } } impl Count for &[u8] { fn read(&self) -> usize { 4 } }";
+    std::fs::write(root.join("src/lib.rs"), source).expect("source");
+    let index = WorkspaceIndex::build(
+        root,
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &TextFileInclusion::default(),
+    )
+    .expect("index");
+    let view = index.symbol_view().expect("symbols");
+    for record in view.normalized_graph().records() {
+        assert!(record.identity().is_some(), "missing identity: {record:?}");
+    }
+    let edges = index.edges().edges().collect::<Vec<_>>();
+    assert_eq!(
+        edges
+            .iter()
+            .filter(|edge| edge.kind() == EdgeKind::Implements
+                && edge.to().as_str().ends_with("/fixture/Count"))
+            .count(),
+        4,
+        "{edges:?}"
+    );
+    assert_eq!(
+        edges
+            .iter()
+            .filter(|edge| edge.kind() == EdgeKind::Overrides
+                && edge.to().as_str().ends_with("/Count/read"))
+            .count(),
+        4,
+        "{edges:?}"
+    );
+    assert!(!edges.iter().any(|edge| edge.kind() == EdgeKind::Implements
+        && edge.from().as_str().ends_with("/fixture/Item")));
+}
