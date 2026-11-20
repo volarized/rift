@@ -184,3 +184,26 @@ fn typescript_sites_name_packages_and_node_modules() {
             .is_some_and(|count| *count >= 1)
     );
 }
+
+#[test]
+fn python_annotation_sites_name_owned_types_without_crossing_generic_bindings() {
+    let source = "from greeting import Base, T\nimport greeting as pkg\nclass Holder:\n    item: Base\n    other: pkg.Base\n\ndef generic[T](value: T) -> T:\n    pass\n";
+    let result = resolution(
+        "python",
+        &[("app.py", source)],
+        &[(
+            "pyproject.toml",
+            "[project]\nname='app'\nversion='1.0.0'\ndependencies=['greeting']\n",
+        )],
+        WORK_MAX,
+    );
+    let types = targets(&result, ReferenceRole::Type);
+    assert!(
+        types.contains("rift://symbol/pypi/pypi.org/greeting/python/greeting/Base"),
+        "{types:?}"
+    );
+    assert!(
+        !types.contains("rift://symbol/pypi/pypi.org/greeting/python/greeting/T"),
+        "{types:?}"
+    );
+}

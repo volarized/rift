@@ -89,6 +89,7 @@ impl EdgePythonKinds {
             }
         } else if self.definitions.contains(&id) {
             self.edge_definition(visited, facts)?;
+            self.edge_type_parameters(syntax_element, facts)?;
         } else if self.imports.contains(&id) {
             self.edge_import(visited, facts)?;
         } else if self.parameters.contains(&id) {
@@ -97,10 +98,105 @@ impl EdgePythonKinds {
             if let Some(target) = syntax_element.child_by_field_id(self.left) {
                 self.edge_shadow(target, visited, facts)?;
             }
+        } else if [self.identifier, self.attribute].contains(&id)
+            || syntax_element.kind() == "member_type"
+        {
+            self.edge_annotation(syntax_element, facts)?;
         } else if self.unsupported.contains(&id)
             && let Some(scope) = edge_enclosing(visited, &self.scopes)
         {
             facts.unsupported_bindings.push(byte_range(scope)?);
+        }
+        Ok(())
+    }
+
+    fn edge_type_parameters(
+        &self,
+        definition: Node<'_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let Some(parameters) = definition.child_by_field_name("type_parameters") else {
+            return Ok(());
+        };
+        let mut cursor = parameters.walk();
+        for parameter in parameters.named_children(&mut cursor) {
+            let mut candidate = Some(parameter);
+            let mut name = None;
+            // A declared name sits below `type`, `constrained_type` or `splat_type` wrappers.
+            for _ in 0..4 {
+                let Some(element) = candidate else {
+                    break;
+                };
+                if element.kind_id() == self.identifier {
+                    name = Some(element);
+                    break;
+                }
+                candidate = element.named_child(0);
+            }
+            if let Some(name) = name {
+                facts.bindings.push(binding(
+                    name,
+                    definition,
+                    byte_range(definition)?.start,
+                    StaticBindingKind::Shadow,
+                )?);
+            } else {
+                facts.unsupported_bindings.push(byte_range(definition)?);
+            }
+        }
+        Ok(())
+    }
+
+    fn edge_annotation(
+        &self,
+        element: Node<'_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        if element
+            .parent()
+            .is_some_and(|parent| matches!(parent.kind(), "attribute" | "member_type"))
+        {
+            return Ok(());
+        }
+        let mut current = element;
+        let mut annotation = false;
+        while let Some(parent) = current.parent() {
+            if parent.kind() == "type" {
+                annotation = true;
+            }
+            if parent.kind() == "type_alias_statement"
+                && parent.child_by_field_name("left").is_some_and(|left| {
+                    left.start_byte() <= element.start_byte()
+                        && element.end_byte() <= left.end_byte()
+                })
+            {
+                return Ok(());
+            }
+            if self.definitions.contains(&parent.kind_id()) {
+                if parent
+                    .child_by_field_name("type_parameters")
+                    .is_some_and(|parameters| {
+                        parameters.start_byte() <= element.start_byte()
+                            && element.end_byte() <= parameters.end_byte()
+                    })
+                {
+                    return Ok(());
+                }
+                break;
+            }
+            if matches!(
+                parent.kind(),
+                "block" | "module" | "expression_statement" | "call"
+            ) {
+                break;
+            }
+            current = parent;
+        }
+        if annotation {
+            facts.references.push(super::StaticReference {
+                range: byte_range(element)?,
+                role: rift_core::ReferenceRole::Type,
+            });
         }
         Ok(())
     }

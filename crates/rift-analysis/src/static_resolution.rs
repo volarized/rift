@@ -543,6 +543,8 @@ impl<'source> Index<'source> {
         }
         if file.document.facts.language().name == "rust" {
             self.rust_references(file, work, result);
+        } else if file.document.facts.language().name == "python" {
+            self.named_type_references(file, work, result);
         }
         if !work.exhausted {
             result.analyzed_sources += 1;
@@ -620,6 +622,55 @@ impl<'source> Index<'source> {
             edge_kind: None,
             declared: false,
         })
+    }
+
+    fn named_type_references(
+        &self,
+        file: &File<'source>,
+        work: &mut Work,
+        result: &mut StaticResolution,
+    ) {
+        for reference in file
+            .facts
+            .references()
+            .iter()
+            .filter(|reference| reference.role == ReferenceRole::Type)
+        {
+            if !work.charge() {
+                return;
+            }
+            let occurrence = self
+                .edge_type_target(file, reference.range, work)
+                .filter(|target| {
+                    target
+                        .symbol
+                        .kinds
+                        .contains(&rift_protocol::read::SymbolKind::Type)
+                })
+                .and_then(|target| {
+                    self.occurrence(
+                        file,
+                        reference.range,
+                        reference.range,
+                        reference.role,
+                        target,
+                    )
+                });
+            if occurrence.is_none()
+                && let Some(target) = self.external_type(file, reference.range, work)
+                && let Some(external) = Self::external_occurrence(
+                    file,
+                    reference.range,
+                    reference.range,
+                    reference.role,
+                    target,
+                )
+            {
+                result.external.push(external);
+                continue;
+            }
+            result.record_kind(occurrence, rift_protocol::read::EdgeKind::HasType);
+        }
     }
 
     fn edge_type_target(
