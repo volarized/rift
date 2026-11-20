@@ -4176,6 +4176,33 @@ impl WorkspaceIndex {
                 .contains(&language.identity_segment()))
     }
 
+    /// The readable object of every identified record, each record assembled once. The
+    /// graph's references and edges are read once for all of them.
+    fn assembled_objects(
+        &self,
+        objects: &BTreeMap<SymbolId, usize>,
+    ) -> BTreeMap<SymbolId, Result<ReadableSymbol, RiftError>> {
+        let sources = self.semantics.assembly_sources();
+        objects
+            .iter()
+            .map(|(identity, position)| {
+                let record = &self.semantics.graph().records()[*position];
+                let object = self
+                    .semantics
+                    .assembled_record_from(&sources, record)
+                    .and_then(ReadableSymbol::new)
+                    .ok_or_else(|| {
+                        errors::index::workspace_provider()
+                            .source(ReadableSymbolMissing {
+                                identity: identity.as_str().to_owned(),
+                            })
+                            .error()
+                    });
+                (identity.clone(), object)
+            })
+            .collect()
+    }
+
     fn build_symbol_declarations(&self) -> Result<SymbolDeclarations, RiftError> {
         let mut declarations = SymbolDeclarations {
             objects: SymbolDeclarations::object_positions(self.semantics.graph().records()),
@@ -4203,21 +4230,7 @@ impl WorkspaceIndex {
                 }
             }
         }
-        for (identity, position) in &declarations.objects {
-            let record = &self.semantics.graph().records()[*position];
-            let object = self
-                .semantics
-                .assembled_record(record)
-                .and_then(ReadableSymbol::new)
-                .ok_or_else(|| {
-                    errors::index::workspace_provider()
-                        .source(ReadableSymbolMissing {
-                            identity: identity.as_str().to_owned(),
-                        })
-                        .error()
-                });
-            declarations.assembled.insert(identity.clone(), object);
-        }
+        declarations.assembled = self.assembled_objects(&declarations.objects);
         for file in self.files() {
             if !file.syntax().left_out_symbols().is_empty() {
                 declarations

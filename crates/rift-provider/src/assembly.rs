@@ -228,6 +228,54 @@ fn wire_symbol_origin(origin: &ContributionOrigin) -> SymbolOrigin {
     }
 }
 
+/// Positions of a graph's references and edges by the Contribution that supplies them.
+///
+/// [`SymbolAssembler::assemble`] reads every reference and every edge of the graph for one
+/// record. A caller that assembles every record of a graph builds this once, and
+/// [`SymbolAssembler::assemble_from`] then reads the references and edges of the record's
+/// own Contributions.
+#[derive(Debug)]
+pub struct AssemblySources<'graph> {
+    references: BTreeMap<&'graph ContributionKey, Vec<usize>>,
+    edges: BTreeMap<&'graph ContributionKey, Vec<usize>>,
+}
+
+impl<'graph> AssemblySources<'graph> {
+    /// Reads every reference and edge of `graph` once.
+    #[must_use]
+    pub fn new(graph: &'graph NormalizedGraph) -> Self {
+        let mut references: BTreeMap<_, Vec<usize>> = BTreeMap::new();
+        for (position, reference) in graph.references().iter().enumerate() {
+            references
+                .entry(reference.source())
+                .or_default()
+                .push(position);
+        }
+        let mut edges: BTreeMap<_, Vec<usize>> = BTreeMap::new();
+        for (position, edge) in graph.edges().iter().enumerate() {
+            edges.entry(edge.source()).or_default().push(position);
+        }
+        Self { references, edges }
+    }
+
+    /// Positions the Contributions of `record` supply, in graph order.
+    fn positions(
+        by_source: &BTreeMap<&'graph ContributionKey, Vec<usize>>,
+        record: &SymbolRecord,
+    ) -> Vec<usize> {
+        let mut positions: Vec<usize> = record
+            .contributions()
+            .iter()
+            .filter_map(|key| by_source.get(key))
+            .flatten()
+            .copied()
+            .collect();
+        positions.sort_unstable();
+        positions.dedup();
+        positions
+    }
+}
+
 /// Deterministic readable Symbol assembly.
 #[derive(Debug)]
 pub struct SymbolAssembler;
@@ -244,6 +292,30 @@ impl SymbolAssembler {
         graph: &NormalizedGraph,
         record: &SymbolRecord,
         precedence: &[ProviderId],
+    ) -> Option<AssembledSymbol> {
+        Self::assemble_with(graph, record, precedence, None)
+    }
+
+    /// Assembles one normalized record of the graph `sources` was built from.
+    ///
+    /// Answers what [`Self::assemble`] answers. It reads the references and edges of the
+    /// record's Contributions from `sources`, so assembling every record costs the graph's
+    /// references and edges once.
+    #[must_use]
+    pub fn assemble_from(
+        graph: &NormalizedGraph,
+        sources: &AssemblySources<'_>,
+        record: &SymbolRecord,
+        precedence: &[ProviderId],
+    ) -> Option<AssembledSymbol> {
+        Self::assemble_with(graph, record, precedence, Some(sources))
+    }
+
+    fn assemble_with(
+        graph: &NormalizedGraph,
+        record: &SymbolRecord,
+        precedence: &[ProviderId],
+        sources: Option<&AssemblySources<'_>>,
     ) -> Option<AssembledSymbol> {
         if record.index_revision() != graph.index_revision() {
             return None;
@@ -299,18 +371,34 @@ impl SymbolAssembler {
                 )
             })
             .collect();
-        let references = graph
-            .references()
-            .iter()
-            .filter(|reference| record.contributions().contains(reference.source()))
-            .cloned()
-            .collect();
-        let edges = graph
-            .edges()
-            .iter()
-            .filter(|edge| record.contributions().contains(edge.source()))
-            .cloned()
-            .collect();
+        let (references, edges) = match sources {
+            Some(sources) => (
+                AssemblySources::positions(&sources.references, record)
+                    .into_iter()
+                    .filter_map(|position| graph.references().get(position))
+                    .cloned()
+                    .collect(),
+                AssemblySources::positions(&sources.edges, record)
+                    .into_iter()
+                    .filter_map(|position| graph.edges().get(position))
+                    .cloned()
+                    .collect(),
+            ),
+            None => (
+                graph
+                    .references()
+                    .iter()
+                    .filter(|reference| record.contributions().contains(reference.source()))
+                    .cloned()
+                    .collect(),
+                graph
+                    .edges()
+                    .iter()
+                    .filter(|edge| record.contributions().contains(edge.source()))
+                    .cloned()
+                    .collect(),
+            ),
+        };
         Some(AssembledSymbol {
             index_revision: record.index_revision(),
             identity: record.identity().cloned(),
@@ -591,9 +679,12 @@ mod tests {
         SourceApplicability, SourceKind, SourceLocation, SourceRange, SourceRevision, SourceUnitId,
         SymbolId, SymbolKind, TreeRevision,
     };
-    use rift_core::{Documentation, DocumentationFormat, Extensions, Language};
+    use rift_core::{
+        ContributionEdge, DeclarationBinding, Documentation, DocumentationFormat, EdgeKind,
+        Extensions, Language, ReferenceRole, SemanticReference,
+    };
 
-    use super::{PresentationField, SymbolAssembler};
+    use super::{AssemblySources, PresentationField, SymbolAssembler};
     use crate::{Normalizer, ProviderPublication, PublicationLimits, PublicationSet};
 
     fn provider(value: &str) -> ProviderId {
@@ -781,6 +872,111 @@ mod tests {
                 symbol
             );
         }
+    }
+
+    /// A graph whose Contributions supply references and edges, several per record.
+    fn linked_graph() -> crate::NormalizedGraph {
+        let limits = PublicationLimits::default();
+        let linked = |symbol: &str, name: &str, targets: &[&str]| {
+            let plain = contribution(
+                "syntax",
+                1,
+                symbol,
+                name,
+                Some(&format!("rift://symbol/local/rust/app/{name}")),
+                None,
+            );
+            let references = targets
+                .iter()
+                .enumerate()
+                .map(|(position, target)| {
+                    let start = u64::try_from(position).expect("position") * 10 + 20;
+                    SemanticReference::new(
+                        DeclarationBinding::new(
+                            SourceUnitId::parse("rift://source/rift.sources.project/src/lib.rs")
+                                .expect("source unit"),
+                            SourceRange::new(start, start + 4).expect("range"),
+                        ),
+                        ReferenceRole::Call,
+                        vec![reference("syntax", target)],
+                    )
+                    .expect("reference")
+                })
+                .collect();
+            let edges = targets
+                .iter()
+                .map(|target| {
+                    ContributionEdge::new(EdgeKind::Implementation, reference("syntax", target))
+                })
+                .collect();
+            Contribution::builder(
+                plain.key().clone(),
+                plain.applicability(),
+                plain.facts().expect("portable facts").clone(),
+                plain.origin().clone(),
+            )
+            .source(plain.source().expect("source").clone())
+            .identity_anchor(plain.identity_anchor().expect("identity").clone())
+            .namespaced(plain.namespaced().clone())
+            .references(references)
+            .edges(edges)
+            .build()
+            .expect("linked contribution")
+        };
+        let syntax = ProviderPublication::new(
+            provider("syntax"),
+            ProviderRevision::new(1).expect("revision"),
+            vec![
+                linked("syntax-alpha", "Alpha", &["syntax-beta", "syntax-gamma"]),
+                linked("syntax-beta", "Beta", &["syntax-gamma"]),
+                linked("syntax-gamma", "Gamma", &[]),
+                linked("syntax-delta", "Delta", &["syntax-alpha", "syntax-beta"]),
+            ],
+            limits,
+        )
+        .expect("syntax publication");
+        let set = PublicationSet::empty(limits)
+            .replaced(syntax)
+            .expect("publications");
+        Normalizer::normalize(
+            IndexRevision::new(1).expect("index"),
+            SourceRevision::new(1).expect("source"),
+            TreeRevision::new(1).expect("tree"),
+            &Arc::new(set),
+            None,
+        )
+        .expect("graph")
+    }
+
+    #[test]
+    fn records_assembled_from_sources_equal_records_assembled_one_at_a_time() {
+        for graph in [graph(), linked_graph()] {
+            let sources = AssemblySources::new(&graph);
+            for precedence in [vec![], vec![provider("syntax")], vec![provider("lsp")]] {
+                for record in graph.records() {
+                    let one = SymbolAssembler::assemble(&graph, record, &precedence);
+                    let from =
+                        SymbolAssembler::assemble_from(&graph, &sources, record, &precedence);
+                    assert_eq!(format!("{from:?}"), format!("{one:?}"));
+                }
+            }
+        }
+        let graph = linked_graph();
+        let sources = AssemblySources::new(&graph);
+        assert!(
+            graph.references().len() >= 5,
+            "the fixture supplies references"
+        );
+        assert!(graph.edges().len() >= 5, "the fixture supplies edges");
+        let (mut references, mut edges) = (0, 0);
+        for record in graph.records() {
+            let assembled =
+                SymbolAssembler::assemble_from(&graph, &sources, record, &[]).expect("assembly");
+            references += assembled.references().len();
+            edges += assembled.edges().len();
+        }
+        assert_eq!(references, graph.references().len());
+        assert_eq!(edges, graph.edges().len());
     }
 
     #[test]
