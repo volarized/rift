@@ -282,33 +282,54 @@ pub(super) fn configured(
     depth: usize,
     feature: &impl Fn(&str) -> Option<bool>,
 ) -> Option<Condition> {
+    configured_with_flags(input, library, depth, feature, &|_| None)
+}
+
+pub(super) fn configured_with_flags(
+    input: &[&str],
+    library: bool,
+    depth: usize,
+    feature: &impl Fn(&str) -> Option<bool>,
+    flag: &impl Fn(&[&str]) -> Option<bool>,
+) -> Option<Condition> {
     if depth == 0 {
         return None;
     }
     match input {
-        ["test"] => Some(if library {
-            Condition::Known(false)
-        } else {
-            Condition::Unknown
-        }),
+        ["test"] => Some(flag(input).map_or_else(
+            || {
+                if library {
+                    Condition::Known(false)
+                } else {
+                    Condition::Unknown
+                }
+            },
+            Condition::Known,
+        )),
         ["true"] => Some(Condition::Known(true)),
         ["false"] => Some(Condition::Known(false)),
-        [name] if super::crate_name_is_valid(name) => Some(Condition::Unknown),
-        ["feature", "=", value] => {
-            Some(feature(value).map_or(Condition::Unknown, Condition::Known))
+        [name] if super::crate_name_is_valid(name) => {
+            Some(flag(input).map_or(Condition::Unknown, Condition::Known))
         }
+        ["feature", "=", value] if value.starts_with('"') && value.ends_with('"') => Some(
+            flag(input)
+                .or_else(|| feature(value))
+                .map_or(Condition::Unknown, Condition::Known),
+        ),
         [name, "=", value]
             if super::crate_name_is_valid(name)
                 && value.starts_with('"')
                 && value.ends_with('"') =>
         {
-            Some(Condition::Unknown)
+            Some(flag(input).map_or(Condition::Unknown, Condition::Known))
         }
         ["not", "(", rest @ .., ")"] => {
-            configured(rest, library, depth - 1, feature).map(|value| match value {
-                Condition::Known(value) => Condition::Known(!value),
-                Condition::Unknown => Condition::Unknown,
-            })
+            configured_with_flags(rest, library, depth - 1, feature, flag).map(
+                |value| match value {
+                    Condition::Known(value) => Condition::Known(!value),
+                    Condition::Unknown => Condition::Unknown,
+                },
+            )
         }
         [operation @ ("all" | "any"), "(", rest @ .., ")"] => {
             let mut rest = rest;
@@ -331,7 +352,8 @@ pub(super) fn configured(
                 if nested != 0 || split == 0 {
                     return None;
                 }
-                let value = configured(&rest[..split], library, depth - 1, feature)?;
+                let value =
+                    configured_with_flags(&rest[..split], library, depth - 1, feature, flag)?;
                 result = if *operation == "all" {
                     match (result, value) {
                         (Condition::Known(false), _) | (_, Condition::Known(false)) => {

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use rift_core::ProjectPath;
 use rift_error::{RiftError, errors};
 use rift_protocol::identity::{
     SYMBOL_ID_BYTES_MAX, SymbolIdentity, SymbolOwner, parse_local_scope,
@@ -16,6 +17,7 @@ use super::{
 pub struct NamespaceInput<'input> {
     owner: &'input SymbolOwner,
     release_version: Option<&'input str>,
+    rust_configuration: Option<(&'input ProjectPath, &'input [&'input str])>,
     language: &'input Language,
     files: &'input [PackageSource<'input>],
     context_sources: &'input [PackageSource<'input>],
@@ -35,6 +37,7 @@ impl<'input> NamespaceInput<'input> {
         Self {
             owner: input.owner,
             release_version: Some(input.release_version),
+            rust_configuration: input.rust_configuration,
             language: input.language,
             files: input.files,
             context_sources: input.context_sources,
@@ -129,6 +132,7 @@ impl<'input> NamespaceInput<'input> {
         Ok(Self {
             owner,
             release_version: None,
+            rust_configuration: None,
             language,
             files,
             context_sources,
@@ -141,6 +145,51 @@ impl<'input> NamespaceInput<'input> {
             dependencies: &[],
             build_paths: None,
         })
+    }
+
+    /// Supplies the complete configuration flags captured for one selected Cargo manifest.
+    ///
+    /// The caller captures these flags with the same selected source build. An empty
+    /// list establishes absent flags; other manifests retain unknown custom flags.
+    ///
+    /// # Errors
+    /// Returns the input refusal for a missing manifest, malformed flags, or exceeded bounds.
+    pub fn with_rust_configuration(
+        mut self,
+        manifest: &'input ProjectPath,
+        flags: &'input [&'input str],
+    ) -> Result<Self, RiftError> {
+        let original = self
+            .files
+            .iter()
+            .chain(self.context_sources)
+            .find(|file| file.path() == manifest);
+        self.validate_count(flags.len())?;
+        let bytes = self
+            .files
+            .iter()
+            .chain(self.context_sources)
+            .try_fold(0_u64, |bytes, file| {
+                counted_bytes(bytes, file.text().len(), self.bytes_max)
+            })?;
+        let _bytes = flags.iter().try_fold(bytes, |bytes, flag| {
+            counted_bytes(bytes, flag.len(), self.bytes_max)
+        })?;
+        if self.language.name != "rust"
+            || !(manifest.as_str() == "Cargo.toml" || manifest.as_str().ends_with("/Cargo.toml"))
+            || original.is_none()
+            || !crate::analyzer::namespace::rust_configuration_is_valid(flags)
+        {
+            return Err(invalid());
+        }
+        self.rust_configuration = Some((manifest, flags));
+        Ok(self)
+    }
+
+    pub(crate) const fn rust_configuration(
+        self,
+    ) -> Option<(&'input ProjectPath, &'input [&'input str])> {
+        self.rust_configuration
     }
 
     /// Adds dependency witnesses without copying their foreign objects.

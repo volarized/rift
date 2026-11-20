@@ -127,6 +127,10 @@ pub(super) fn prepare(
     prepare_context(&input.namespace_input(), selected)
 }
 
+pub(crate) fn rust_configuration_is_valid(flags: &[&str]) -> bool {
+    rust::configuration::valid_flags(flags)
+}
+
 pub(crate) fn library(input: &NamespaceInput<'_>) -> Option<(String, String)> {
     rust::library(input)
 }
