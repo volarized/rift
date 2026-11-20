@@ -1146,7 +1146,8 @@ returns a typed error; the caller can reduce `max_results`.
 
 The server retains each answer in a view for 15 minutes, so a later `page` with the same
 `revision` reads it without evaluating the query again. Two `[search.query]` keys bound the
-retained views:
+retained views. The same bounds apply separately to proxy candidate and combined query
+answer stores; the 16 MiB candidate response bound still applies:
 
 ```toml
 [search.query]

@@ -15,6 +15,7 @@ use rift_protocol::revision::Revision;
 use rift_protocol::search_read::{SearchReadResult, SearchUnavailable};
 use rift_protocol::symbol_read::{CapturedView, CapturedViewId, SymbolUnavailableReason};
 use rift_search::sparql::{GraphDataset, GraphLimits, GraphQuery, QueryCancellation};
+use rift_server::RetainedViewLimits;
 use rmcp::handler::server::tool::IntoCallToolResult as _;
 use rmcp::model::{CallToolRequestParams, CallToolResponse};
 
@@ -25,9 +26,6 @@ use crate::validation::ConfigurationState;
 
 const QUERY_WORKERS: usize = 2;
 const VIEW_PREFIX: &str = "proxy.";
-/// Combined answers one proxy retains at once; a full store releases the least recently
-/// used, whose later page evaluates again.
-const RETAINED_ANSWERS_MAX: usize = 256;
 
 type Response = Result<CallToolResponse, rmcp::ErrorData>;
 
@@ -73,8 +71,8 @@ impl QueryRoutes {
 
     /// Retains one answer, releasing the least recently used ones past the count or byte
     /// bound. An answer larger than the byte bound alone is not retained.
-    fn retain(&self, answer: RetainedAnswer, now: SystemTime) {
-        let bytes_max = crate::global::candidates::CANDIDATE_BYTES_MAX;
+    fn retain(&self, answer: RetainedAnswer, limits: RetainedViewLimits, now: SystemTime) {
+        let bytes_max = limits.bytes_max();
         if answer.bytes.len() > bytes_max {
             return;
         }
@@ -86,7 +84,10 @@ impl QueryRoutes {
         // Each retained row holds at most `bytes_max` bytes, so the sum stays bounded.
         let mut retained: usize = rows.iter().map(|row| row.bytes.len()).sum();
         while !rows.is_empty()
-            && (rows.len() >= RETAINED_ANSWERS_MAX || retained + answer.bytes.len() > bytes_max)
+            && (rows.len() >= limits.views_max()
+                || retained
+                    .checked_add(answer.bytes.len())
+                    .is_none_or(|size| size > bytes_max))
         {
             retained -= rows.remove(0).bytes.len();
         }
@@ -123,6 +124,20 @@ impl From<RiftError> for ProducerFailure {
 }
 
 impl RiftProxy {
+    /// Reads the primary project's accepted bounds on the existing query worker.
+    pub(super) async fn retention_limits(&self) -> Result<RetainedViewLimits, RiftError> {
+        let root = Arc::clone(&self.root);
+        self.query_routes
+            .work(move || {
+                Ok(RetainedViewLimits::from(
+                    &ConfigurationState::accept(&root)
+                        .search_configuration()
+                        .query,
+                ))
+            })
+            .await
+    }
+
     /// Uses the primary backend for ordinary queries. Explicit registered owners route
     /// to their project. The proxy evaluates retrieval spanning accepted projects.
     pub(super) async fn query_forward(
@@ -286,7 +301,7 @@ impl RiftProxy {
         let cancellation = QueryCancellation::new();
         let _guard = CancelQuery(cancellation.clone());
         let root = Arc::clone(&self.root);
-        let (mut answer, retained) = self
+        let (mut answer, retained, retention) = self
             .query_routes
             .work(move || {
                 let configuration = ConfigurationState::accept(&root)
@@ -331,11 +346,12 @@ impl RiftProxy {
                         display,
                     },
                 )?;
-                Ok((page, retained))
+                Ok((page, retained, RetainedViewLimits::from(&configuration)))
             })
             .await?;
         if let Some(retained) = retained {
-            self.query_routes.retain(retained, SystemTime::now());
+            self.query_routes
+                .retain(retained, retention, SystemTime::now());
         }
         if let QueryReadResult::Results(result) = &mut answer.result {
             result.revision = revision;

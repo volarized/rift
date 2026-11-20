@@ -311,3 +311,136 @@ async fn test_a_combined_query_pins_later_pages_by_its_revision() -> TestResult 
     );
     Ok(())
 }
+
+fn retained_answer(serial: u64, bytes: usize) -> super::RetainedAnswer {
+    let mut key = [0; 32];
+    key[..8].copy_from_slice(&serial.to_le_bytes());
+    super::RetainedAnswer {
+        key,
+        view: rift_protocol::symbol_read::CapturedView {
+            id: rift_protocol::symbol_read::CapturedViewId::parse(&format!("proxy.answer{serial}"))
+                .expect("view"),
+            expires_at: "2030-01-01T00:00:00Z".to_owned(),
+        },
+        expires: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000_000),
+        bytes: vec![0; bytes].into(),
+    }
+}
+
+#[test]
+fn query_retention_uses_configured_count_and_lru() {
+    let store = super::QueryRoutes::default();
+    let limits = rift_server::RetainedViewLimits::new(2, 100);
+    let now = std::time::SystemTime::UNIX_EPOCH;
+    let first = retained_answer(0, 4).key;
+    let second = retained_answer(1, 4).key;
+    store.retain(retained_answer(0, 4), limits, now);
+    store.retain(retained_answer(1, 4), limits, now);
+    assert!(store.retained(&first, now).is_some());
+    store.retain(retained_answer(2, 4), limits, now);
+    assert!(store.retained(&first, now).is_some());
+    assert!(store.retained(&second, now).is_none());
+    assert!(store.retained(&retained_answer(2, 4).key, now).is_some());
+}
+
+#[test]
+fn query_retention_accepts_more_than_the_default_count() {
+    let store = super::QueryRoutes::default();
+    let limits = rift_server::RetainedViewLimits::new(257, 1 << 20);
+    let now = std::time::SystemTime::UNIX_EPOCH;
+    for serial in 0..257 {
+        store.retain(retained_answer(serial, 1), limits, now);
+    }
+    assert!(store.retained(&retained_answer(0, 1).key, now).is_some());
+    assert!(store.retained(&retained_answer(256, 1).key, now).is_some());
+}
+
+#[test]
+fn query_retention_uses_configured_bytes_and_preserves_views_on_refusal() {
+    let store = super::QueryRoutes::default();
+    let limits = rift_server::RetainedViewLimits::new(256, 8);
+    let now = std::time::SystemTime::UNIX_EPOCH;
+    store.retain(retained_answer(0, 4), limits, now);
+    store.retain(retained_answer(1, 4), limits, now);
+    assert!(store.retained(&retained_answer(0, 4).key, now).is_some());
+    store.retain(retained_answer(2, 4), limits, now);
+    assert!(store.retained(&retained_answer(1, 4).key, now).is_none());
+    store.retain(retained_answer(3, 9), limits, now);
+    assert!(store.retained(&retained_answer(0, 4).key, now).is_some());
+    assert!(store.retained(&retained_answer(2, 4).key, now).is_some());
+    assert!(store.retained(&retained_answer(3, 9).key, now).is_none());
+}
+
+#[test]
+fn query_retention_accepts_more_than_the_old_aggregate_byte_bound() {
+    let store = super::QueryRoutes::default();
+    let limits = rift_server::RetainedViewLimits::new(2, 64 << 20);
+    let now = std::time::SystemTime::UNIX_EPOCH;
+    store.retain(retained_answer(0, 9 << 20), limits, now);
+    store.retain(retained_answer(1, 9 << 20), limits, now);
+    assert!(store.retained(&retained_answer(0, 0).key, now).is_some());
+    assert!(store.retained(&retained_answer(1, 0).key, now).is_some());
+}
+
+#[tokio::test]
+async fn proxy_retention_uses_the_primary_project_configuration() -> TestResult {
+    let primary = tempfile::tempdir()?;
+    let extra = tempfile::tempdir()?;
+    std::fs::write(
+        primary.path().join("rift.toml"),
+        "[search.query]\nretained_views = 2\nretained_size = '32mb'\n",
+    )?;
+    std::fs::write(
+        extra.path().join("rift.toml"),
+        "[search.query]\nretained_views = 1\nretained_size = '1mb'\n",
+    )?;
+    let proxy = proxy_with_api(primary.path(), extra.path())?;
+    assert_eq!(
+        proxy.retention_limits().await?,
+        rift_server::RetainedViewLimits::new(2, 32 << 20)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn combined_query_re_evaluates_a_view_released_by_configured_count() -> TestResult {
+    let primary = tempfile::tempdir()?;
+    let extra = tempfile::tempdir()?;
+    std::fs::write(
+        primary.path().join("rift.toml"),
+        "[search]\ndefault_scope = 'all'\n[search.query]\nretained_views = 1\nretained_size = '1mb'\n",
+    )?;
+    let proxy = proxy_with_api(primary.path(), extra.path())?;
+    let revised = |digit: &str| RecordingUpstream {
+        revision: Some(format!("rift://revision/tree/{}", digit.repeat(64))),
+        ..RecordingUpstream::default()
+    };
+    let (local, _local_connection) = connect_upstream(&proxy, revised("a")).await?;
+    let (api, _api_connection) = connect_upstream(&proxy.backends["api"], revised("b")).await?;
+    let mut first = pattern_search("")?;
+    first
+        .arguments
+        .get_or_insert_default()
+        .insert("max_results".to_owned(), json!(1));
+    let CallToolResponse::Complete(answer) = proxy.query_forward(&first).await?? else {
+        return Err("complete query result".into());
+    };
+    let result: QueryResult =
+        serde_json::from_value(answer.structured_content.ok_or("typed result")?)?;
+    let revision = result.revision.ok_or("combined revision")?;
+    let mut other = first.clone();
+    let arguments = other.arguments.get_or_insert_default();
+    let statement = format!(
+        "{} ORDER BY ?symbol",
+        arguments["query"].as_str().ok_or("statement")?
+    );
+    arguments.insert("query".to_owned(), json!(statement));
+    assert_eq!(binding_count(proxy.query_forward(&other).await??)?, 1);
+    let arguments = first.arguments.get_or_insert_default();
+    arguments.insert("page".to_owned(), json!(2));
+    arguments.insert("revision".to_owned(), json!(revision));
+    assert_eq!(binding_count(proxy.query_forward(&first).await??)?, 1);
+    assert_eq!(tools(&local), ["search_retrieval"; 3]);
+    assert_eq!(tools(&api), ["search_retrieval"; 3]);
+    Ok(())
+}
