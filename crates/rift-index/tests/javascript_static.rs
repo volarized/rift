@@ -1700,3 +1700,59 @@ export function refuse(either: StateStorage | Other, list: StateStorage[] | null
             && edge.to().as_str().ends_with("/getItem")
     }));
 }
+
+#[test]
+fn test_calls_through_bindings_of_declared_callable_results_and_other_writes() {
+    // A name bound to a call result is callable when the resolved callee declares a
+    // callable return type; the call targets the binding, never a function body. A write
+    // refuses only the binding it writes: a write to an inner binding of the same name
+    // leaves the outer one callable.
+    let source = "export type Handler = (value: number) => number
+export interface Signature { (value: number): number }
+export function some(): Handler { return (value) => value }
+export function signed(): Signature { return (value) => value }
+export function plain() { return (value: number) => value }
+export function pick<T>(value: T): T { return value }
+export function use() {
+  const handler = some()
+  const other = signed()
+  return [handler(1), other(2)]
+}
+export function inner() {
+  const check = () => helper(1)
+  const helper = (value: number) => {
+    let helper
+    helper = value
+    return helper
+  }
+  return check()
+}
+export function refuse() {
+  const loose = plain()
+  const generic = pick(() => 1)
+  let moved = some()
+  moved = plain()
+  return [loose(1), generic(), moved(2)]
+}
+";
+    let (_directory, index) = workspace_with_manifest(&[("main.ts", source)], module_manifest());
+    for (from, to) in [
+        ("main.ts/use", "main.ts/use/handler"),
+        ("main.ts/use", "main.ts/use/other"),
+        ("main.ts/inner/check", "main.ts/inner/helper"),
+    ] {
+        assert!(
+            has_edge(&index, EdgeKind::Calls, from, to),
+            "{from} -> {to}"
+        );
+    }
+    for name in ["loose", "generic", "moved"] {
+        assert!(
+            !index.edges().edges().any(|edge| {
+                edge.kind() == EdgeKind::Calls
+                    && edge.to().as_str().ends_with(&format!("/refuse/{name}"))
+            }),
+            "{name}"
+        );
+    }
+}

@@ -246,6 +246,58 @@ impl<'source> Index<'source> {
     fn javascript_function_type<'index>(
         &'index self,
         file: &'index File<'source>,
+    /// Whether the binding holds a call result the resolved callee declares callable.
+    ///
+    /// `const handler = some()` with `some(): Handler` and `Handler` a function type: the
+    /// call targets the binding `handler`; no function body is chosen for it. A callee
+    /// without a declared return type, a return type written as a type parameter and a
+    /// binding assigned again leave the binding uncalled.
+    pub(super) fn javascript_callable_result(
+        &self,
+        target: Target<'source>,
+        work: &mut Work,
+    ) -> bool {
+        let Some(file) = self.files.get(target.file.path.as_str()) else {
+            return false;
+        };
+        let Some(&(None, call)) = target
+            .symbol
+            .name_range
+            .and_then(|name| file.callbacks.destructured.get(&name))
+        else {
+            return false;
+        };
+        let written = target
+            .symbol
+            .name_range
+            .and_then(|name| file.text(name))
+            .is_none_or(|name| file.javascript_reassigned(name, None));
+        let Some(call) = file
+            .callbacks
+            .calls
+            .get(&call)
+            .copied()
+            .filter(|_| !written)
+        else {
+            return false;
+        };
+        work.javascript_lookup(|work| {
+            let callee = self.javascript_call(file, call, work)?;
+            let declared = self.files.get(callee.file.path.as_str())?;
+            let entries = declared
+                .callbacks
+                .returns
+                .get(&callee.symbol.name_range?)?
+                .as_ref()?;
+            let [(None, annotation)] = entries.as_slice() else {
+                return None;
+            };
+            self.javascript_written_signature(declared, *annotation, false, work)
+                .then_some(())
+        })
+        .is_some()
+    }
+
         name: ByteRange,
         work: &mut Work,
     ) -> Option<(&'index File<'source>, ByteRange)> {
