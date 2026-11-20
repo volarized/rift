@@ -54,6 +54,7 @@ pub(super) struct Kinds {
     namespace_import: u16,
     export_specifier: u16,
     export: u16,
+    module_syntax: ModuleSyntaxKinds,
     with: u16,
     catch: u16,
     scopes: [u16; 8],
@@ -70,6 +71,27 @@ pub(super) struct Kinds {
     left: u16,
     argument: u16,
     parameter: u16,
+}
+
+struct ModuleSyntaxKinds {
+    meta_property: u16,
+    await_expression: u16,
+    await_token: u16,
+}
+
+impl ModuleSyntaxKinds {
+    fn resolve(grammar: &tree_sitter::Language) -> Self {
+        let await_token = grammar.id_for_node_kind("await", false);
+        assert!(
+            await_token != 0,
+            "the pinned ECMAScript grammar must define the await token"
+        );
+        Self {
+            meta_property: kind(grammar, "meta_property"),
+            await_expression: kind(grammar, "await_expression"),
+            await_token,
+        }
+    }
 }
 
 pub(super) fn kinds() -> &'static Kinds {
@@ -211,6 +233,7 @@ impl Kinds {
             namespace_import: id("namespace_import"),
             export_specifier: id("export_specifier"),
             export: id("export_statement"),
+            module_syntax: ModuleSyntaxKinds::resolve(grammar),
             with: id("with_statement"),
             catch: id("catch_clause"),
             scopes: [
@@ -248,6 +271,7 @@ impl Kinds {
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
         let id = syntax_element.kind_id();
+        self.record_module_syntax(syntax_element, source, facts);
         self.record_reference(syntax_element, facts)?;
         self.record_member(syntax_element, facts)?;
         self.record_declared_type(syntax_element, facts)?;
@@ -265,7 +289,7 @@ impl Kinds {
         } else if self.type_parameter == Some(id) {
             self.record_type_parameter(syntax_element, facts)?;
         } else if self.function.contains(&id) || id == self.class || self.edge_types.contains(&id) {
-            self.record_declaration(syntax_element, facts)?;
+            self.record_declaration(syntax_element, source, facts)?;
         } else if id == self.import_specifier || self.is_default_import(syntax_element) {
             self.record_import(syntax_element, source, facts)?;
         } else if id == self.namespace_import {
@@ -276,6 +300,40 @@ impl Kinds {
             self.record_shadow_or_mutation(syntax_element, facts)?;
         }
         Ok(())
+    }
+
+    fn record_module_syntax(&self, element: Node<'_>, source: &str, facts: &mut StaticFactsParts) {
+        if facts.javascript_module_syntax {
+            return;
+        }
+        let id = element.kind_id();
+        if [self.import, self.export].contains(&id)
+            || (id == self.module_syntax.meta_property
+                && element.child(0).and_then(|first| text(first, source)) == Some("import"))
+        {
+            facts.javascript_module_syntax = true;
+            return;
+        }
+        let await_loop = id == self.for_in && {
+            let mut cursor = element.walk();
+            // Immediate children are bounded by the admitted source and syntax selection.
+            element
+                .children(&mut cursor)
+                .any(|child| child.kind_id() == self.module_syntax.await_token)
+        };
+        if (id == self.module_syntax.await_expression || await_loop)
+            && enclosing(element, &self.function_scopes)
+                .is_some_and(|scope| scope.kind_id() == self.function_scopes[0])
+        {
+            facts.javascript_module_syntax = true;
+        }
+    }
+
+    fn wrapper_name(name: Option<&str>) -> bool {
+        matches!(
+            name,
+            Some("require" | "module" | "exports" | "__dirname" | "__filename")
+        )
     }
 
     fn record_member(
@@ -568,6 +626,7 @@ impl Kinds {
     fn record_declaration(
         &self,
         syntax_element: Node<'_>,
+        source: &str,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
         let scope = enclosing(syntax_element, &self.scopes);
@@ -575,6 +634,12 @@ impl Kinds {
             .child_by_field_id(self.name)
             .filter(|syntax_element| !syntax_element.is_missing());
         if let Some((name, scope)) = name.zip(scope) {
+            if syntax_element.kind_id() == self.class
+                && scope.kind_id() == self.scopes[0]
+                && Self::wrapper_name(text(name, source))
+            {
+                facts.javascript_module_syntax = true;
+            }
             let available = if syntax_element.kind_id() == self.class
                 || self.edge_types.first() == Some(&syntax_element.kind_id())
             {
@@ -611,10 +676,26 @@ impl Kinds {
             return Ok(());
         };
         if name.kind_id() != self.identifier {
-            return self.record_parameter(name, scope, facts);
+            let start = facts.bindings.len();
+            self.record_parameter(name, scope, facts)?;
+            if !is_var && scope.kind_id() == self.scopes[0] {
+                facts.javascript_module_syntax |= facts.bindings[start..].iter().any(|binding| {
+                    let start = usize::try_from(binding.name.start).ok();
+                    let end = usize::try_from(binding.name.end).ok();
+                    Self::wrapper_name(
+                        start
+                            .zip(end)
+                            .and_then(|(start, end)| source.get(start..end)),
+                    )
+                });
+            }
+            return Ok(());
+        }
+        if !is_var && scope.kind_id() == self.scopes[0] && Self::wrapper_name(text(name, source)) {
+            facts.javascript_module_syntax = true;
         }
         let kind = match syntax_element.child_by_field_id(self.value) {
-            Some(value) if !is_var => self.initializer(value, source)?,
+            Some(value) => self.initializer(value, source)?,
             _ => StaticBindingKind::Local,
         };
         facts

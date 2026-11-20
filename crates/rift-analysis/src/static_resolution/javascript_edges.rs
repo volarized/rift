@@ -74,6 +74,15 @@ impl<'source> Index<'source> {
             if let StaticBindingKind::JavaScriptEdgeNamespace { module } = binding.kind {
                 result.record(self.javascript_namespace_import(file, binding.name, module, work));
             }
+            if let StaticBindingKind::JavaScriptRequire {
+                module,
+                export: None,
+                require,
+            } = binding.kind
+                && self.builtin_require(file, require.start, work)
+            {
+                result.record(self.javascript_namespace_import(file, binding.name, module, work));
+            }
         }
         for export in file.document.facts.export_bindings().unwrap_or_default() {
             if !work.charge() {

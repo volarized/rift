@@ -640,9 +640,9 @@ impl<'source> Index<'source> {
     ) -> Option<(ByteRange, Option<Target<'source>>)> {
         match binding.kind {
             StaticBindingKind::JavaScriptImport { .. }
-            | StaticBindingKind::JavaScriptRequire { .. } => {
-                Some((binding.name, self.javascript_import(file, binding, work)))
-            }
+            | StaticBindingKind::JavaScriptRequire {
+                export: Some(_), ..
+            } => Some((binding.name, self.javascript_import(file, binding, work))),
             StaticBindingKind::RustUse { path } => Some((path, self.rust.import(file, path, work))),
             StaticBindingKind::PythonImport {
                 export: Some(_), ..

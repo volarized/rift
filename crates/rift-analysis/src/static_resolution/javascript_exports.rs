@@ -169,7 +169,7 @@ impl<'source> Exports<'_, 'source> {
                 actual == ModuleMode::CommonJs
                     || super::javascript::typescript_commonjs(file.document.path.as_str())
             }
-            ModuleMode::Unknown => false,
+            ModuleMode::Unknown | ModuleMode::NodeDefault => false,
         }
     }
 
@@ -553,7 +553,7 @@ fn matches_export_form(source: &str, mode: ModuleMode) -> bool {
         ModuleMode::CommonJs => {
             source.starts_with("module.exports") || source.starts_with("exports.")
         }
-        ModuleMode::Unknown => false,
+        ModuleMode::Unknown | ModuleMode::NodeDefault => false,
     }
 }
 

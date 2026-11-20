@@ -5,12 +5,18 @@ use rift_index::{WorkspaceIndex, WorkspaceIndexLimits};
 use rift_protocol::read::EdgeKind;
 
 fn workspace(files: &[(&str, &str)]) -> (tempfile::TempDir, WorkspaceIndex) {
-    let directory = tempfile::tempdir().expect("workspace");
-    std::fs::write(
-        directory.path().join("package.json"),
+    workspace_with_manifest(
+        files,
         r#"{"name":"fixture","version":"1.0.0","type":"commonjs"}"#,
     )
-    .expect("manifest");
+}
+
+fn workspace_with_manifest(
+    files: &[(&str, &str)],
+    manifest: &str,
+) -> (tempfile::TempDir, WorkspaceIndex) {
+    let directory = tempfile::tempdir().expect("workspace");
+    std::fs::write(directory.path().join("package.json"), manifest).expect("manifest");
     for (path, source) in files {
         std::fs::write(directory.path().join(path), source).expect("source");
     }
@@ -22,6 +28,48 @@ fn workspace(files: &[(&str, &str)]) -> (tempfile::TempDir, WorkspaceIndex) {
     )
     .expect("index");
     (directory, index)
+}
+
+#[test]
+fn test_commonjs_module_require_imports_store_known_file_targets() {
+    for (path, other) in [("main.js", "other.js"), ("main.cts", "other.cts")] {
+        for declaration in ["var", "let", "const"] {
+            let source = format!(
+                "{declaration} other = require('./other'); function use() {{ return other; }} module.exports = other;"
+            );
+            let (_directory, index) = workspace_with_manifest(
+                &[
+                    (path, &source),
+                    (other, "var app = { value: 1 }; module.exports = app;"),
+                ],
+                r#"{"name":"fixture","version":"1.0.0"}"#,
+            );
+            let imports = index
+                .edges()
+                .edges()
+                .filter(|edge| edge.kind() == EdgeKind::Imports)
+                .collect::<Vec<_>>();
+            assert_eq!(imports.len(), 1, "{path} {declaration}: {imports:?}");
+            assert!(imports[0].from().as_str().contains("main."));
+            assert!(imports[0].to().as_str().contains("other."));
+            assert!(!imports[0].to().as_str().ends_with("/app"));
+            assert!(index.edges().edges().any(
+                |edge| edge.kind() == EdgeKind::Reads && edge.to().as_str().ends_with("/other")
+            ));
+            let language =
+                rift_protocol::read::Language::from_identity_segment(if path.ends_with("cts") {
+                    "typescript"
+                } else {
+                    "javascript"
+                })
+                .expect("language");
+            assert!(
+                index
+                    .identity_coverage_complete(&language)
+                    .expect("identity coverage")
+            );
+        }
+    }
 }
 
 #[test]

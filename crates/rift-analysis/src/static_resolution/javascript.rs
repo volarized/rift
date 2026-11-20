@@ -11,12 +11,14 @@ use crate::NamespaceInput;
 pub(super) enum ModuleMode {
     Esm,
     CommonJs,
+    NodeDefault,
     Unknown,
 }
 
 /// Module-mode declarations captured from the nearest package manifest.
 pub(super) struct PackageModes<'source> {
     modes: BTreeMap<String, ModuleMode>,
+    module_syntax: std::collections::BTreeSet<&'source str>,
     pub(super) owner: rift_protocol::identity::SymbolOwner,
     pub(super) scopes: BTreeMap<&'source str, Scopes<'source>>,
 }
@@ -53,16 +55,21 @@ impl<'source> PackageModes<'source> {
             modes.entry(directory.to_owned()).or_insert(mode);
         }
         let mut scopes = BTreeMap::new();
+        let mut module_syntax = std::collections::BTreeSet::new();
         for file in files.values().filter(|file| {
             matches!(
                 file.document.facts.language().name.as_str(),
                 "javascript" | "typescript"
             )
         }) {
+            if file.facts.has_javascript_module_syntax() {
+                module_syntax.insert(file.document.path.as_str());
+            }
             scopes.insert(file.document.path.as_str(), Scopes::new(file, work)?);
         }
         Some(Self {
             modes,
+            module_syntax,
             owner: namespace.owner().clone(),
             scopes,
         })
@@ -81,6 +88,13 @@ impl<'source> PackageModes<'source> {
                 return ModuleMode::Unknown;
             }
             if let Some(&mode) = self.modes.get(directory) {
+                if mode == ModuleMode::NodeDefault {
+                    return if self.module_syntax.contains(path) {
+                        ModuleMode::Esm
+                    } else {
+                        ModuleMode::CommonJs
+                    };
+                }
                 return mode;
             }
             if directory.is_empty() {
@@ -110,6 +124,7 @@ fn package_mode(text: &str) -> ModuleMode {
         Ok(manifest) => match manifest.get("type") {
             Some(value) if value.as_str() == Some("module") => ModuleMode::Esm,
             Some(value) if value.as_str() == Some("commonjs") => ModuleMode::CommonJs,
+            None => ModuleMode::NodeDefault,
             _ => ModuleMode::Unknown,
         },
         Err(_) => ModuleMode::Unknown,
@@ -237,6 +252,19 @@ impl<'source> Index<'source> {
         if file.blocked(binding.name.start, work) {
             return None;
         }
+        if let StaticBindingKind::JavaScriptRequire { export, .. } = binding.kind {
+            export?;
+            return self
+                .javascript_require_value(file, binding, rift_core::ReferenceRole::Type, work)
+                .or_else(|| {
+                    self.javascript_require_value(
+                        file,
+                        binding,
+                        rift_core::ReferenceRole::Read,
+                        work,
+                    )
+                });
+        }
         self.javascript_binding_target(file, binding, rift_core::ReferenceRole::Type, work)
             .or_else(|| {
                 self.javascript_binding_target(file, binding, rift_core::ReferenceRole::Read, work)
@@ -270,36 +298,55 @@ impl<'source> Index<'source> {
                 }
                 self.javascript_export(file, file.text(module)?, name, ModuleMode::Esm, role, work)
             }
-            StaticBindingKind::JavaScriptRequire {
-                module,
-                export,
-                require,
-            } if self.builtin_require(file, require.start, work) => {
-                if let Some(export) = export {
-                    self.javascript_export(
-                        file,
-                        file.text(module)?,
-                        file.text(export)?,
-                        ModuleMode::CommonJs,
-                        role,
-                        work,
-                    )
-                } else {
-                    let value = super::javascript_exports::Exports {
-                        files: &self.files,
-                        modes: &self.javascript,
-                    }
-                    .resolve_module_value(
-                        file,
-                        file.text(module)?,
-                        role,
-                        work,
-                    )?;
-                    self.javascript_export_value(value, role, work)
-                }
+            StaticBindingKind::JavaScriptRequire { .. }
+                if matches!(
+                    role,
+                    rift_core::ReferenceRole::Read | rift_core::ReferenceRole::Write
+                ) =>
+            {
+                file.target_at(binding.name)
+            }
+            StaticBindingKind::JavaScriptRequire { .. } => {
+                self.javascript_require_value(file, binding, role, work)
             }
             _ => None,
         }
+    }
+
+    fn javascript_require_value(
+        &self,
+        file: &File<'source>,
+        binding: &StaticBinding,
+        role: rift_core::ReferenceRole,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let StaticBindingKind::JavaScriptRequire {
+            module,
+            export,
+            require,
+        } = binding.kind
+        else {
+            return None;
+        };
+        if !self.builtin_require(file, require.start, work) {
+            return None;
+        }
+        if let Some(export) = export {
+            return self.javascript_export(
+                file,
+                file.text(module)?,
+                file.text(export)?,
+                ModuleMode::CommonJs,
+                role,
+                work,
+            );
+        }
+        let value = super::javascript_exports::Exports {
+            files: &self.files,
+            modes: &self.javascript,
+        }
+        .resolve_module_value(file, file.text(module)?, role, work)?;
+        self.javascript_export_value(value, role, work)
     }
 
     fn javascript_member(
@@ -391,7 +438,12 @@ impl<'source> Index<'source> {
         }
     }
 
-    fn builtin_require(&self, file: &File<'source>, position: u64, work: &mut Work) -> bool {
+    pub(super) fn builtin_require(
+        &self,
+        file: &File<'source>,
+        position: u64,
+        work: &mut Work,
+    ) -> bool {
         self.builtin_commonjs_name(file, "require", position, work)
     }
 

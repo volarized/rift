@@ -1,4 +1,150 @@
 #[test]
+fn test_commonjs_module_require_imports_keep_file_and_lexical_binding_facts() {
+    let source = "var other = require('./other.cjs'); var path = require('node:path'); function use() { return other; } function usePath() { return path; } module.exports = other;";
+    for (language, path, other) in [
+        ("javascript", "main.cjs", "other.cjs"),
+        ("typescript", "main.cts", "other.cts"),
+    ] {
+        let document = syntax(path, source);
+        let facts = document.facts().static_facts().expect("static facts");
+        let binding = facts
+            .bindings()
+            .iter()
+            .find(|binding| {
+                &source[usize::try_from(binding.name.start).expect("start")
+                    ..usize::try_from(binding.name.end).expect("end")]
+                    == "other"
+            })
+            .expect("local binding");
+        assert!(matches!(
+            binding.kind,
+            rift_syntax::StaticBindingKind::JavaScriptRequire { export: None, .. }
+        ));
+        let result = resolution(
+            language,
+            &[
+                (path, source),
+                (other, "var app = { value: 1 }; module.exports = app;"),
+            ],
+            &[],
+            WORK_MAX,
+        );
+        let imports = result
+            .occurrences
+            .iter()
+            .filter(|edge| {
+                edge.role == ReferenceRole::Import && edge.binding.unit().key().as_str() == path
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(imports.len(), 1, "{language}: {imports:?}");
+        assert!(imports[0].target_binding.is_none(), "file import");
+        assert!(target(imports[0]).contains("other."));
+        assert!(
+            result
+                .occurrences
+                .iter()
+                .any(|edge| edge.role == ReferenceRole::Read && target(edge).ends_with("/path")),
+            "{language}: local external require binding"
+        );
+        assert_eq!(
+            result
+                .occurrences
+                .iter()
+                .filter(|edge| edge.role == ReferenceRole::Read && target(edge).ends_with("/other"))
+                .count(),
+            2,
+            "{language}"
+        );
+    }
+}
+
+#[test]
+fn test_commonjs_module_require_imports_obey_package_default_and_module_syntax() {
+    let require = "var other = require('./other.js'); function use() { return other; }";
+    let metadata = [("package.json", r#"{"name":"fixture","version":"1.0.0"}"#)];
+    for (prefix, expected) in [
+        ("", 1),
+        ("async function nested() { await task; }", 1),
+        ("const nested = async () => { await task; };", 1),
+        ("{ let module; }", 1),
+        ("var module;", 1),
+        ("void import('./side.js');", 1),
+        ("export {};", 0),
+        ("import './side.js';", 0),
+        ("const url = import.meta.url;", 0),
+        ("await task;", 0),
+        ("for await (const item of items) {}", 0),
+        ("const module = {};", 0),
+        ("let __filename;", 0),
+        ("class __dirname {}", 0),
+        ("const { module } = wrapper;", 0),
+    ] {
+        let source = format!("{prefix}\n{require}");
+        let result = resolution(
+            "javascript",
+            &[("main.js", &source), ("other.js", "module.exports = {};")],
+            &metadata,
+            WORK_MAX,
+        );
+        assert_eq!(
+            result
+                .occurrences
+                .iter()
+                .filter(|edge| edge.role == ReferenceRole::Import)
+                .count(),
+            expected,
+            "{prefix}: {result:?}"
+        );
+    }
+    for prefix in [
+        "function use(require) {",
+        "function use(require, require) {",
+        "function use() { const require = loader;",
+        "function use() { require = loader;",
+    ] {
+        let source = format!("{prefix} var other = require('./other.js'); return other; }}");
+        let result = resolution(
+            "javascript",
+            &[("main.js", &source), ("other.js", "module.exports = {};")],
+            &metadata,
+            WORK_MAX,
+        );
+        assert!(
+            !result
+                .occurrences
+                .iter()
+                .any(|edge| edge.role == ReferenceRole::Import),
+            "{prefix}"
+        );
+    }
+}
+
+#[test]
+fn test_commonjs_module_require_imports_refuse_ambiguous_file_candidates() {
+    for (language, path) in [("javascript", "main.cjs"), ("typescript", "main.cts")] {
+        let result = resolution(
+            language,
+            &[
+                (
+                    path,
+                    "var other = require('./other'); function use() { return other; }",
+                ),
+                ("other.js", "module.exports = {};"),
+                ("other.ts", "module.exports = {};"),
+            ],
+            &[],
+            WORK_MAX,
+        );
+        assert!(
+            !result
+                .occurrences
+                .iter()
+                .any(|edge| edge.role == ReferenceRole::Import)
+        );
+    }
+}
+
+#[test]
 fn test_commonjs_function_assignments_resolve_export_and_local_names() {
     let source = "function leaf() {}\nexports.run = function(value) { leaf(); };\nexports.other = function inner() { inner(); leaf(); };\nmodule.exports.third = function named() { leaf(); };\nfunction hidden(exports) { exports.run(); }\ninner();";
     for (language, path, other) in [

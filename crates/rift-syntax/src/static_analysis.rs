@@ -164,6 +164,8 @@ pub struct StaticInherentImpl {
 /// Collections retained by static syntax capture.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StaticFactsParts {
+    /// Whether ECMAScript syntax requires module interpretation without an explicit mode.
+    pub javascript_module_syntax: bool,
     /// Value accesses and type references.
     pub references: Vec<StaticReference>,
     /// Receiver and property spans for member expressions.
@@ -201,6 +203,12 @@ pub struct StaticFactsParts {
 pub struct StaticFacts(StaticFactsParts);
 
 impl StaticFacts {
+    /// Whether captured ECMAScript syntax requires module interpretation without an explicit mode.
+    #[must_use]
+    pub fn has_javascript_module_syntax(&self) -> bool {
+        self.0.javascript_module_syntax
+    }
+
     /// Captured value accesses and type references.
     #[must_use]
     pub fn references(&self) -> &[StaticReference] {
