@@ -88,8 +88,10 @@ pub struct QueryResult {
     /// The indexed revision this answer read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<crate::revision::Revision>,
-    /// Coverage and discovery limits affecting the query result. For `SERVICE :flows`,
-    /// `traversal_truncated` reports the visited symbol count and names the bound in `detail`.
+    /// Coverage and discovery limits affecting the query result. An answer read from partly
+    /// covered facts carries the warnings that name what is missing, and every row it returns
+    /// stands. For `SERVICE :flows`, `traversal_truncated` reports the visited symbol count and
+    /// names the bound in `detail`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<ReadWarning>,
 }

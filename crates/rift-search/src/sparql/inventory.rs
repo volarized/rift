@@ -15,6 +15,17 @@ pub struct OccurrenceSelection {
     pub enclosing: bool,
 }
 
+/// Required type definitions and inheritance from semantic providers.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TypeSelection {
+    /// The query can inspect inferred type definitions.
+    pub definitions: bool,
+    /// The query can inspect class inheritance.
+    pub extends: bool,
+    /// The query can inspect interface implementations.
+    pub implements: bool,
+}
+
 /// Resolved adjacency needed by a query over the selected domain.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SemanticAdjacency {

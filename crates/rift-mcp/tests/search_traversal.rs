@@ -2151,7 +2151,7 @@ async fn search_traversal_outgoing_over_an_unavailable_global_api_drops_package_
 }
 
 /// An unnamed runtime target does not invalidate a separately established local call.
-/// Complete lists and negative answers still require the missing provider coverage.
+/// Partial rows name missing provider coverage; negative answers still require it.
 #[tokio::test]
 async fn search_calls_prove_local_witness_when_a_runtime_target_has_no_collection() -> TestResult {
     let configuration = format!("[global]\nenabled = false\n{OUTGOING_ENGINE}");
@@ -2176,8 +2176,26 @@ async fn search_calls_prove_local_witness_when_a_runtime_target_has_no_collectio
             "{answer}"
         );
     }
+    let rows = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "search",
+            &json!({"query":format!("SELECT ?t {{ <{caller}> :calls ?t }}")}),
+        ),
+    )
+    .await?;
+    assert_eq!(
+        rows["answer"]["bindings"],
+        json!([{"t":{"type":"iri","value":leaf}}]),
+        "{rows}"
+    );
+    assert!(
+        rows["warnings"].as_array().is_some_and(|warnings| warnings
+            .iter()
+            .any(|warning| warning["code"] == "edge_coverage_missing")),
+        "{rows}"
+    );
     for query in [
-        format!("SELECT ?t {{ <{caller}> :calls ?t }}"),
         format!("ASK {{ <{caller}> :calls <rift://symbol/local/python/absent> }}"),
         format!("ASK {{ <{caller}> :calls ?t FILTER NOT EXISTS {{ ?t :calls ?other }} }}"),
     ] {

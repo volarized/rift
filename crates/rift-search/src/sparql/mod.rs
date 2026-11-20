@@ -65,6 +65,7 @@ pub use dataset::{
 pub use evaluation::{GraphAnswer, GraphTerm, QueryCancellation, SolutionTable};
 pub use inventory::{
     OccurrenceSelection, SemanticAdjacency, SemanticEdges, SemanticHeritage, SemanticInventory,
+    TypeSelection,
 };
 pub use limits::{
     ALGEBRA_DEPTH_MAX, ANSWER_BYTES_MAX, BRACKETS_MAX, COMPUTED_BYTES_MAX, EVALUATION_TIMEOUT,

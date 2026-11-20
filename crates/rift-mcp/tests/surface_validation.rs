@@ -79,14 +79,19 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
     let reaches_dependencies = request_reaches_dependencies(name, request)
         .expect("a validated exact request carries a canonical symbol identity");
     assert_source_unit_ids_use_served_resolvers(structured, &context, reaches_dependencies);
+    // A whole-inventory query over a corpus that mixes languages answers from partly
+    // covered calls and names the missing coverage; no other warning reaches a clean corpus.
+    let coverage_only = name == "search"
+        && structured["warnings"].as_array().is_some_and(|warnings| {
+            warnings.iter().all(|warning| {
+                matches!(
+                    warning["code"].as_str(),
+                    Some("edge_coverage_missing" | "engine_analysis_unavailable")
+                )
+            })
+        });
     assert!(
-        structured.get("warnings").is_none()
-            || (name == "search"
-                && structured["warnings"]
-                    .as_array()
-                    .is_some_and(|warnings| warnings
-                        .iter()
-                        .all(|warning| warning["code"] == "engine_analysis_unavailable"))),
+        structured.get("warnings").is_none() || coverage_only,
         "{context}: {structured:#}"
     );
     assert!(

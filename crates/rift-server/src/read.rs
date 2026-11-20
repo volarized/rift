@@ -33,7 +33,9 @@ use crate::history::{StoredHistory, SymbolTimelines};
 mod canonical;
 mod facets;
 mod symbol;
-pub use canonical::{LocalSymbolViewInput, LocalSymbolViews, RetainedViewLimits};
+pub use canonical::{
+    InventoryCoverage, LocalSymbolViewInput, LocalSymbolViews, RetainedViewLimits,
+};
 
 /// Inputs for one cancellable current-tree read-service build.
 pub struct ReadServiceBuild<'a> {

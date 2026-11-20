@@ -47,18 +47,7 @@ impl EngineSession {
             partial_result_params: PartialResultParams::default(),
         };
         let response = self.request::<GotoImplementation>(params).await?;
-        Ok(match response {
-            None => Vec::new(),
-            Some(GotoDefinitionResponse::Scalar(location)) => vec![location],
-            Some(GotoDefinitionResponse::Array(locations)) => locations,
-            Some(GotoDefinitionResponse::Link(locations)) => locations
-                .into_iter()
-                .map(|link| Location {
-                    uri: link.target_uri,
-                    range: link.target_selection_range,
-                })
-                .collect(),
-        })
+        Ok(definition_locations(response))
     }
 
     /// Prepares the type hierarchy items used to read inheritance edges.
@@ -137,5 +126,21 @@ impl EngineSession {
             .request::<TypeHierarchySubtypes>(params)
             .await?
             .unwrap_or_default())
+    }
+}
+
+/// The declaration selection ranges shared by definition response forms.
+pub(super) fn definition_locations(response: Option<GotoDefinitionResponse>) -> Vec<Location> {
+    match response {
+        None => Vec::new(),
+        Some(GotoDefinitionResponse::Scalar(location)) => vec![location],
+        Some(GotoDefinitionResponse::Array(locations)) => locations,
+        Some(GotoDefinitionResponse::Link(locations)) => locations
+            .into_iter()
+            .map(|link| Location {
+                uri: link.target_uri,
+                range: link.target_selection_range,
+            })
+            .collect(),
     }
 }

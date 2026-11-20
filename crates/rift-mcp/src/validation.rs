@@ -311,6 +311,7 @@ struct VisibleWorkspaceFiles {
 /// Read index and configuration policy published as one immutable value.
 #[derive(Debug)]
 pub(crate) struct PublishedWorkspace {
+    pub(crate) engine_inventory: Arc<crate::server::candidates::EngineInventoryCache>,
     pub(crate) reads: Arc<ReadService>,
     pub(crate) configuration: ConfigurationState,
     pub(crate) fingerprint: WorkspaceFingerprint,
@@ -362,6 +363,11 @@ impl PublishedWorkspace {
             Arc::new(map)
         };
         Self {
+            engine_inventory: if self.configuration.fingerprint == configuration.fingerprint {
+                Arc::clone(&self.engine_inventory)
+            } else {
+                Arc::default()
+            },
             reads: Arc::clone(&self.reads),
             configuration,
             fingerprint: self.fingerprint.clone(),
@@ -2269,6 +2275,7 @@ pub(crate) fn empty_workspace_preparation_with_owner(
     };
     let map = publication_map(&reads, Some(&preparation_state), &configuration);
     let published = Arc::new(PublishedWorkspace {
+        engine_inventory: Arc::default(),
         fingerprint: reads.workspace_fingerprint().clone(),
         reads: Arc::new(reads),
         configuration,
@@ -2717,6 +2724,7 @@ fn whole_workspace_candidate(
         })?;
     let map = publication_map(&reads, None, &configuration);
     Ok(PublishedWorkspace {
+        engine_inventory: Arc::default(),
         fingerprint: reads.workspace_fingerprint().clone(),
         reads: Arc::new(reads),
         configuration,
@@ -2816,6 +2824,7 @@ fn shared_workspace_candidate(
     )?;
     let map = publication_map(&reads, previous.preparation.as_ref(), &configuration);
     Ok(PublishedWorkspace {
+        engine_inventory: Arc::default(),
         fingerprint: reads.workspace_fingerprint().clone(),
         reads: Arc::new(reads),
         configuration,
@@ -4635,6 +4644,7 @@ fn preparation_publication(
     };
     let map = publication_map(&reads, preparation.as_ref(), configuration);
     Ok(Arc::new(PublishedWorkspace {
+        engine_inventory: Arc::default(),
         fingerprint: reads.workspace_fingerprint().clone(),
         reads: Arc::new(reads),
         configuration: configuration.clone(),
