@@ -824,3 +824,29 @@ export function run(item: Item, respond: Respond) { return later(item) }
         edge.kind() == EdgeKind::Contains && edge.from().as_str().ends_with("respond.ts/Respond")
     }));
 }
+
+#[test]
+fn test_typescript_function_value_keeps_its_identity_through_a_body_error() {
+    // The grammar reads `global` as a keyword: its use as a value is a parse error
+    // inside the arrow body. The variable is still named by its own header.
+    let source = "export const inspect = () => {
+  const global = globalThis as any
+  return global?.process?.env
+}
+export function run() { return inspect() }
+";
+    let (_directory, index) = workspace_with_manifest(&[("main.ts", source)], module_manifest());
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "main.ts/run",
+        "main.ts/inspect"
+    ));
+    let view = index.symbol_view().expect("view");
+    assert!(view.normalized_graph().records().iter().any(|record| {
+        record
+            .identity()
+            .is_some_and(|identity| identity.as_str().ends_with("main.ts/inspect"))
+    }));
+}
+
