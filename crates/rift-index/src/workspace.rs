@@ -1822,7 +1822,7 @@ impl WorkspaceIndexPreparation {
                 source: &source,
                 other: &other,
                 last,
-                boundary: CaptureBoundary::create(&self.root),
+                boundary: last.boundary_at(&self.root),
                 root_identity: root_identity(&self.root),
                 cancelled,
             },
@@ -5673,7 +5673,7 @@ fn capture_paths(
         paths,
         limits,
         last,
-        CaptureBoundary::create(root),
+        last.boundary_at(root),
         root_identity(root),
         &|| false,
     )
@@ -5779,7 +5779,7 @@ fn recorded_capture_path_lists(
         .len()
         .checked_add(other.len())
         .ok_or_else(|| errors::index::workspace_too_many_files().path(root).error())?;
-    let mut next = LastCapture::under(limits, held, boundary, root_identity.clone());
+    let mut next = LastCapture::under(limits, held, boundary, root_identity.clone(), last);
     let retained_selection = last.selection.as_ref().filter(|selection| {
         let same_root = selection.root == root;
         let same_source = std::ptr::eq(selection.source.as_slice(), source);
@@ -6170,7 +6170,7 @@ impl LastCapture {
             source: &selection.source,
             other: &selection.other,
             last: self,
-            boundary: CaptureBoundary::create(&root),
+            boundary: self.boundary_at(&root),
             root_identity: identity,
             cancelled,
         };
@@ -6224,7 +6224,7 @@ pub fn capture_selected_paths_cancellable(
         .iter()
         .map(|path| root.join(path.as_str()))
         .collect::<Vec<_>>();
-    let boundary = CaptureBoundary::create(&root);
+    let boundary = last.boundary_at(&root);
     let root_identity = root_identity(&root);
     capture_path_lists_with_boundary(
         &root,
@@ -6271,7 +6271,7 @@ fn recorded_capture_digests_attempt(
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<RecordedCapture, RiftError> {
     let root = canonical_root(root)?;
-    let boundary = CaptureBoundary::create(&root);
+    let boundary = last.boundary_at(&root);
     let root_identity = root_identity(&root);
     let language = rift_tracing::traced!(
         component = "index",
@@ -14488,6 +14488,21 @@ mod tests {
         .expect("the capture must read the tree")
     }
 
+    /// Whether `root` lacks a verified status change time, after checking that the retained
+    /// selection then asks for discovery: such a selection test has nothing further to prove.
+    fn selection_needs_discovery(root: &Path, last: &LastCapture) -> bool {
+        if crate::capture::supports_stat_reuse(root) {
+            return false;
+        }
+        assert!(
+            last.recapture_selected_cancellable(root, WorkspaceIndexLimits::default(), &|| false)
+                .expect("metadata capture")
+                .is_none(),
+            "selection reuse needs a verified status change time"
+        );
+        true
+    }
+
     #[test]
     fn selected_capture_reuses_validated_paths_and_matches_cold_after_an_edit() {
         let (directory, _) = two_file_workspace();
@@ -14500,6 +14515,9 @@ mod tests {
         fs::write(root.join("refused.rs"), [0xff, 0]).expect("refused source");
         advance_capture_clock(&root, &[source.clone(), text, root.join("refused.rs")]);
         let (first, last) = captured_after(&root, &LastCapture::default());
+        if selection_needs_discovery(&root, &last) {
+            return;
+        }
         let project = last
             .project_path(&root, &source)
             .expect("validated source path");
@@ -14573,6 +14591,9 @@ mod tests {
         fs::write(&exclude, "").expect("empty excludes");
         advance_capture_clock(&root, &[root.clone(), nested.clone(), exclude.clone()]);
         let (first, last) = captured_after(&root, &LastCapture::default());
+        if selection_needs_discovery(&root, &last) {
+            return;
+        }
         assert!(
             first
                 .get(&ProjectPath::new("nested/lib.rs").expect("path"))
@@ -14607,6 +14628,9 @@ mod tests {
         std::os::unix::fs::symlink(policy.path(), root.join(".gitignore")).expect("policy link");
         advance_capture_clock(&root, &[root.clone(), policy.path().to_path_buf()]);
         let (first, last) = captured_after(&root, &LastCapture::default());
+        if selection_needs_discovery(&root, &last) {
+            return;
+        }
         assert!(
             first
                 .get(&ProjectPath::new("lib.rs").expect("path"))
@@ -14714,6 +14738,16 @@ mod tests {
 
     #[test]
     fn visible_capture_reuses_selected_reads_and_retains_refused_raw_bytes() {
+        visible_capture_reuses_selected_reads_from(&LastCapture::default);
+    }
+
+    #[test]
+    fn visible_capture_without_verified_status_change_time_reads_raw_edits() {
+        visible_capture_reuses_selected_reads_from(&unverified_status_change_time);
+    }
+
+    /// Captures visible raw bytes in a chain of records that starts from `start`.
+    fn visible_capture_reuses_selected_reads_from(start: &dyn Fn() -> LastCapture) {
         let directory = tempfile::tempdir().expect("workspace");
         let root = directory.path();
         let entries: [(&str, &[u8]); 4] = [
@@ -14746,7 +14780,7 @@ mod tests {
                 .map(|(path, _)| root.join(path))
                 .collect::<Vec<_>>(),
         );
-        let (indexed, visible, last) = capture(&LastCapture::default());
+        let (indexed, visible, last) = capture(&start());
         assert_eq!(
             last.read_paths(),
             entries.len(),
@@ -14767,13 +14801,15 @@ mod tests {
         let (again_indexed, again_visible, next) = capture(&last);
         assert_eq!(again_indexed, indexed);
         assert_eq!(again_visible, visible);
-        if crate::capture::supports_stat_reuse(root) {
-            assert_eq!(
-                next.read_paths(),
-                0,
-                "unchanged raw content uses the original stat proof"
-            );
-        }
+        assert_eq!(
+            next.read_paths(),
+            if start().boundary_at(root).is_some() {
+                0
+            } else {
+                entries.len()
+            },
+            "unchanged raw content uses the original stat proof, otherwise a full read"
+        );
         let binary = root.join("binary.rs");
         let modified = fs::metadata(&binary)
             .expect("binary stat")
@@ -15548,7 +15584,38 @@ mod tests {
         assert_eq!(second.fingerprint(), first.fingerprint());
     }
 
-    #[cfg(windows)]
+    /// A record whose captures run without a verified status change time, as on Windows.
+    fn unverified_status_change_time() -> LastCapture {
+        LastCapture::with_status_change_time(crate::capture::StatusChangeTime::Unverified)
+    }
+
+    #[test]
+    fn test_capture_without_verified_status_change_time_has_no_boundary() {
+        let (directory, _) = two_file_workspace();
+        let root = directory.path();
+        assert!(
+            crate::capture::CaptureBoundary::create(
+                root,
+                crate::capture::StatusChangeTime::Unverified
+            )
+            .is_none()
+        );
+        assert!(unverified_status_change_time().boundary_at(root).is_none());
+        let (_, last) = captured_after(root, &unverified_status_change_time());
+        let (_, next) = captured_after(root, &last);
+        assert_eq!(
+            next.read_paths(),
+            2,
+            "a record keeps the status change time it was captured with"
+        );
+        assert!(
+            next.recapture_selected_cancellable(root, WorkspaceIndexLimits::default(), &|| false)
+                .expect("metadata capture")
+                .is_none(),
+            "selection reuse needs a verified status change time"
+        );
+    }
+
     #[test]
     fn test_capture_full_reads_windows_rewrites_with_writer_open()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -15559,7 +15626,7 @@ mod tests {
         let root = directory.path();
         let path = root.join("src/lib.rs");
         let mut writer = OpenOptions::new().read(true).write(true).open(&path)?;
-        let (_, mut last) = captured_after(root, &LastCapture::default());
+        let (_, mut last) = captured_after(root, &unverified_status_change_time());
         for (index, name) in (0..32)
             .map(|index| if index % 2 == 0 { "beta" } else { "zeta" })
             .enumerate()
@@ -15586,13 +15653,12 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(not(unix))]
     #[test]
     fn test_capture_full_reads_repeated_same_size_rewrites_with_restored_modification_time() {
         let (directory, modified) = two_file_workspace();
         let root = directory.path();
         let path = root.join("src/lib.rs");
-        let (_, mut last) = captured_after(root, &LastCapture::default());
+        let (_, mut last) = captured_after(root, &unverified_status_change_time());
         for (index, name) in (0..32)
             .map(|index| if index % 2 == 0 { "beta" } else { "zeta" })
             .enumerate()
@@ -15616,6 +15682,72 @@ mod tests {
             );
             last = next;
         }
+    }
+
+    /// Same-size rewrites that restore an earlier modification time, as Git's racily-clean
+    /// check exercises them: each capture in one chain of records equals a cold build.
+    fn retained_capture_matches_cold_build_across_restored_rewrites(start: &LastCapture) {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path();
+        let source = root.join("source.rs");
+        fs::write(&source, b"fn alpha() {}\n").expect("source");
+        let paired = |last: &LastCapture, case: &str| {
+            let (captured, next) = captured_after(root, last);
+            let cold = WorkspaceIndex::build(
+                root,
+                WorkspaceIndexLimits::default(),
+                &SourceVisibility::default(),
+                &TextFileInclusion::default(),
+            )
+            .expect("cold build");
+            assert_eq!(
+                captured,
+                cold.digests(),
+                "incremental capture must match cold build after {case}"
+            );
+            (captured, next)
+        };
+        let (mut previous, mut last) = paired(start, "initial capture");
+        fs::write(&source, b"fn bravo() {}\n").expect("ordinary edit");
+        let (captured, next) = paired(&last, "ordinary edit");
+        assert_ne!(captured, previous, "ordinary edit changes captured digests");
+        (previous, last) = (captured, next);
+        for (case, restored, bytes) in [
+            (
+                "racy rewrite",
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_750_000_000),
+                b"fn delta() {}\n",
+            ),
+            (
+                "restored old modification time rewrite",
+                std::time::UNIX_EPOCH + std::time::Duration::from_hours(438_288),
+                b"fn gamma() {}\n",
+            ),
+        ] {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&source)
+                .and_then(|file| file.set_modified(restored))
+                .expect("set baseline modification time");
+            let (baseline, next) = paired(&last, "baseline");
+            assert_eq!(baseline, previous, "a time change keeps file contents");
+            rewrite(&source, bytes, restored);
+            let (captured, next) = paired(&next, case);
+            assert_ne!(captured, previous, "{case} changes captured digests");
+            (previous, last) = (captured, next);
+        }
+    }
+
+    #[test]
+    fn retained_capture_matches_cold_build_across_restored_rewrites_on_this_platform() {
+        retained_capture_matches_cold_build_across_restored_rewrites(&LastCapture::default());
+    }
+
+    #[test]
+    fn retained_capture_without_verified_status_change_time_matches_cold_build() {
+        retained_capture_matches_cold_build_across_restored_rewrites(
+            &unverified_status_change_time(),
+        );
     }
 
     #[test]
