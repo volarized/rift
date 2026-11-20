@@ -3392,6 +3392,7 @@ impl WorkspaceIndex {
             .get_or_init(|| self.build_symbol_declarations().map(Arc::new))
             .as_ref()
             .map_err(Clone::clone)?;
+        let mut owners = Vec::new();
         for block in &self.documentation.index().blocks {
             let Some(owner) = &block.symbol else {
                 continue;
@@ -3401,10 +3402,10 @@ impl WorkspaceIndex {
                 let Some(matched) = self.declaration_match(path, *index) else {
                     continue;
                 };
-                layer.associate_document(declaration_identity(matched), &block.identity)?;
+                owners.push((declaration_identity(matched), &block.identity));
             }
         }
-        Ok(())
+        layer.associate_documents(owners)
     }
 
     /// Keeps this snapshot's documentation collection alive for one publication.
