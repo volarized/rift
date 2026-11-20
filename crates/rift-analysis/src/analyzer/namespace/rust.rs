@@ -715,6 +715,7 @@ fn local_exports(
     let refused = conflicting_requests(input, &files, requested, &configurations);
     // Build declaration and identity lookups once for every later binding and pass.
     let mut declarations = None;
+    let mut export_paths = ExportPaths::default();
     let mut completed = std::collections::BTreeSet::new();
     'passes: for _ in 0..requested.len() {
         let before = prepared.exports.len();
@@ -757,7 +758,7 @@ fn local_exports(
             let target = export_target(
                 input,
                 declarations,
-                prepared,
+                (prepared, &mut export_paths),
                 &configurations,
                 request,
                 &mut work,
@@ -816,10 +817,54 @@ fn export_binding(
     }
 }
 
+/// The first export binding at each qualified path, in the order the bindings were added.
+///
+/// Every request of every pass asks which earlier binding its target path names. Reading
+/// each binding's identity again for each question made one pass cost the requests times
+/// the bindings; the bindings only grow, so each identity is parsed once, when it joins.
+#[derive(Default)]
+struct ExportPaths {
+    first: BTreeMap<Vec<String>, usize>,
+    /// The first binding whose identity does not parse; a scan stops there.
+    unparsed: Option<usize>,
+    indexed: usize,
+}
+
+impl ExportPaths {
+    /// The first binding at `path` and the bindings a scan in order reads to answer:
+    /// up to and including the match or the first unparsed identity, else all of them.
+    fn first(
+        &mut self,
+        exports: &[super::ExportBinding],
+        path: &[String],
+    ) -> (Option<usize>, usize) {
+        for (index, export) in exports.iter().enumerate().skip(self.indexed) {
+            match SymbolIdentity::parse(export.identity.as_str()) {
+                Ok(identity) => {
+                    self.first
+                        .entry(identity.qualified_path().to_vec())
+                        .or_insert(index);
+                }
+                Err(_) => {
+                    self.unparsed.get_or_insert(index);
+                }
+            }
+        }
+        self.indexed = exports.len();
+        let found = self.first.get(path).copied();
+        let last = match (found, self.unparsed) {
+            (Some(found), Some(unparsed)) => found.min(unparsed),
+            (Some(last), None) | (None, Some(last)) => last,
+            (None, None) => return (None, exports.len()),
+        };
+        (found.filter(|found| *found == last), last.saturating_add(1))
+    }
+}
+
 fn export_target(
     input: &NamespaceInput<'_>,
     declarations: &LocalDeclarations<'_>,
-    prepared: &super::PreparedNamespace,
+    (prepared, export_paths): (&super::PreparedNamespace, &mut ExportPaths),
     configurations: &configuration::Configurations<'_>,
     request: &(Vec<String>, macros::Export),
     work: &mut usize,
@@ -827,22 +872,22 @@ fn export_target(
 ) -> Option<(SymbolId, String, String)> {
     let (namespace, (_, _, _, target)) = request;
     let local = requested_path(namespace, target).and_then(|target_path| {
-        for export in &prepared.exports {
-            *work = work.checked_add(1)?;
-            if *work > work_max {
-                return None;
-            }
-            if SymbolIdentity::parse(export.identity.as_str())
-                .ok()?
-                .qualified_path()
-                == target_path
-            {
-                return Some((
-                    export.target.clone(),
-                    export.target_path.clone(),
-                    export.target_qualified_name.clone(),
-                ));
-            }
+        // The charge is what reading the bindings in order costs, so the bound holds
+        // the same requests as before.
+        let (found, read) = export_paths.first(&prepared.exports, &target_path);
+        *work = work.checked_add(read)?;
+        if *work > work_max {
+            return None;
+        }
+        if let Some(export) = found.and_then(|found| prepared.exports.get(found)) {
+            return Some((
+                export.target.clone(),
+                export.target_path.clone(),
+                export.target_qualified_name.clone(),
+            ));
+        }
+        if export_paths.unparsed.is_some() {
+            return None;
         }
         local_target(
             input,

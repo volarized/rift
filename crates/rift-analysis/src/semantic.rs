@@ -528,6 +528,9 @@ impl WorkspaceSemantics {
                 )
             )
         });
+        // Containment and override occurrences live on as edges alone; the publication
+        // keeps the remaining occurrences without the room the others took.
+        resolution.occurrences.shrink_to_fit();
         self.static_occurrence_order = (0..resolution.occurrences.len()).collect();
         self.static_occurrence_order.sort_unstable_by_key(|index| {
             (
@@ -536,6 +539,13 @@ impl WorkspaceSemantics {
             )
         });
         self.static_resolution = resolution;
+    }
+
+    /// Leaves the static pass to a later publication of the same sources: this one holds
+    /// no static occurrence and reports unavailable call coverage for every unit.
+    pub(crate) fn defer_static_resolution(&mut self, sources: &[StaticSource<'_>]) {
+        self.static_resolution = crate::static_resolution::deferred(sources);
+        self.static_occurrence_order = Vec::new();
     }
 
     pub(crate) fn static_occurrences(&self) -> &[StaticOccurrence] {

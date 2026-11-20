@@ -99,9 +99,9 @@ impl GraphQuery {
 
     /// Whether each row this SELECT returns from partially covered facts still holds.
     ///
-    /// Joins, projections, ordering, distinct, slicing, and filters or bindings over one
-    /// row's values only keep or combine rows the covered facts support, so every returned
-    /// row stands. Anything else - an `OPTIONAL`, a negation, an `EXISTS`, an aggregate - can
+    /// Joins, property paths, projections, ordering, distinct, slicing, and filters or
+    /// bindings over one row's values only keep or combine rows the covered facts support, so
+    /// every returned row stands. Anything else - an `OPTIONAL`, a negation, an `EXISTS`, an aggregate - can
     /// answer differently once the missing facts join, so such a query needs complete coverage.
     #[must_use]
     pub fn admits_partial_rows(&self) -> bool {
@@ -115,7 +115,7 @@ impl GraphQuery {
         // Admission bounds the number and depth of patterns inspected here.
         while let Some(expression) = pending.pop() {
             match expression {
-                QueryExpression::Bgp { .. } => {}
+                QueryExpression::Bgp { .. } | QueryExpression::Path { .. } => {}
                 QueryExpression::Filter { inner, .. } | QueryExpression::Extend { inner, .. }
                     if row_expressions_only =>
                 {
@@ -337,6 +337,8 @@ mod tests {
         let cases = [
             ("SELECT ?s WHERE { ?s a :Symbol }", true),
             ("SELECT ?s ?t WHERE { ?s :calls ?t }", true),
+            ("SELECT ?s ?t WHERE { ?s :reads|:writes ?t }", true),
+            ("SELECT ?s ?t WHERE { ?s :calls+ ?t }", true),
             (
                 "SELECT DISTINCT ?name WHERE { ?s :calls ?t . ?t :name ?name } ORDER BY ?name LIMIT 2",
                 true,

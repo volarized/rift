@@ -80,6 +80,33 @@ impl<T> EnclosingDefinitions<T> {
         None
     }
 
+    /// Every span containing `start..end`, the smallest first, when every two spans nest
+    /// or stay apart; `None` for a list that overlaps without nesting, where the caller
+    /// reads its spans in its own order.
+    ///
+    /// The walk bisects like [`Self::resolve`] and climbs the container links, so it
+    /// costs the nesting depth rather than the span count.
+    #[must_use]
+    pub fn containing(&self, start: u64, end: u64) -> Option<impl Iterator<Item = &T>> {
+        if !self.nested {
+            return None;
+        }
+        let mut candidate = self
+            .spans
+            .partition_point(|(span_start, ..)| *span_start <= start)
+            .checked_sub(1);
+        Some(std::iter::from_fn(move || {
+            while let Some(index) = candidate {
+                candidate = self.parents[index];
+                let (_, span_end, value) = &self.spans[index];
+                if end <= *span_end {
+                    return Some(value);
+                }
+            }
+            None
+        }))
+    }
+
     /// How many spans this holds.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -191,6 +218,57 @@ mod tests {
                 scanned(&spans, start, end)
             );
         }
+    }
+
+    /// Every containing span by a scan over every span.
+    fn scanned_containing(spans: &[(u64, u64, usize)], start: u64, end: u64) -> Vec<usize> {
+        let mut containing = spans
+            .iter()
+            .filter(|(span_start, span_end, _)| *span_start <= start && end <= *span_end)
+            .map(|(.., value)| *value)
+            .collect::<Vec<_>>();
+        containing.sort_unstable();
+        containing
+    }
+
+    #[test]
+    fn containing_spans_come_smallest_first_and_equal_a_scan() {
+        let mut spans = vec![(0, 10_000, 0), (0, 10_000, 1), (40, 40, 2)];
+        let mut value = 3;
+        for outer in 0..10_u64 {
+            let base = outer * 1_000;
+            spans.push((base, base + 900, value));
+            value += 1;
+            for inner in 0..4_u64 {
+                let start = base + 10 + inner * 200;
+                spans.push((start, start + 150, value));
+                spans.push((start, start + 150, value + 1));
+                spans.push((start + 20, start + 60, value + 2));
+                value += 3;
+            }
+        }
+        let enclosing = EnclosingDefinitions::new(spans.clone());
+        let size = |value: &usize| spans[*value].1 - spans[*value].0;
+        for offset in 0..10_100 {
+            let chain = enclosing
+                .containing(offset, offset + 1)
+                .expect("nested spans")
+                .copied()
+                .collect::<Vec<_>>();
+            assert!(
+                chain.is_sorted_by_key(size),
+                "offset={offset}, chain={chain:?}"
+            );
+            let mut found = chain;
+            found.sort_unstable();
+            assert_eq!(
+                found,
+                scanned_containing(&spans, offset, offset + 1),
+                "offset={offset}"
+            );
+        }
+        let overlapping = EnclosingDefinitions::new([(0, 30, 0), (20, 50, 1)]);
+        assert!(overlapping.containing(21, 22).is_none());
     }
 
     #[test]

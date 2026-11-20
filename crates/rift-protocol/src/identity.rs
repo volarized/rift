@@ -335,14 +335,39 @@ impl SymbolIdentity {
     #[must_use]
     pub fn wire_identity(&self) -> String {
         let owner = self.owner.wire_owner();
-        let language = self.language.identity_segment();
-        let path = self
+        let language = &self.language;
+        // Every parse serializes once to prove the spelling canonical, so the text is
+        // written into one buffer sized for the unescaped spelling.
+        let path_bytes = self
             .qualified_path
             .iter()
-            .map(|part| encode_component(part))
-            .collect::<Vec<_>>()
-            .join("/");
-        format!("{SYMBOL_URI_PREFIX}{owner}/{language}/{path}")
+            .map(|part| part.len().saturating_add(1))
+            .fold(0usize, usize::saturating_add);
+        let mut wire = String::with_capacity(
+            SYMBOL_URI_PREFIX
+                .len()
+                .saturating_add(owner.len())
+                .saturating_add(language.name.len())
+                .saturating_add(language.dialect.as_ref().map_or(0, String::len))
+                .saturating_add(2)
+                .saturating_add(path_bytes),
+        );
+        wire.push_str(SYMBOL_URI_PREFIX);
+        wire.push_str(&owner);
+        wire.push('/');
+        wire.push_str(&language.name);
+        if let Some(dialect) = &language.dialect {
+            wire.push(':');
+            wire.push_str(dialect);
+        }
+        wire.push('/');
+        for (position, part) in self.qualified_path.iter().enumerate() {
+            if position > 0 {
+                wire.push('/');
+            }
+            wire.extend(utf8_percent_encode(part, COMPONENT_ESCAPE_SET));
+        }
+        wire
     }
 
     fn validated_wire_identity(&self) -> Result<String, RiftError> {
