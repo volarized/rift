@@ -541,7 +541,10 @@ impl<'source> Index<'source> {
             let file = self.files.get(target.file.path.as_str())?;
             value = match file.python_values.get(&target.symbol.name_range?.end)? {
                 StaticBindingKind::PythonAnnotation { annotation } => {
-                    Value::Instance(self.python_annotation(file, *annotation, work)?)
+                    match self.python_class_object_annotation(file, *annotation, work) {
+                        Some(class) => return Some(Value::Symbol(class)),
+                        None => Value::Instance(self.python_annotation(file, *annotation, work)?),
+                    }
                 }
                 StaticBindingKind::PythonInstance { constructor } => {
                     let callable = self.edge_python_name(file, *constructor, work)?;
@@ -553,6 +556,31 @@ impl<'source> Index<'source> {
                 _ => return None,
             };
         }
+    }
+
+    /// The class a `type[Class]` annotation names, when `type` is the builtin.
+    fn python_class_object_annotation(
+        &self,
+        file: &File<'source>,
+        annotation: ByteRange,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let written = file.text(annotation)?;
+        let inner = written
+            .trim()
+            .strip_prefix("type[")?
+            .strip_suffix(']')?
+            .trim();
+        if file.by_name.contains_key("type") || file.blocked(annotation.start, work) {
+            return None;
+        }
+        let offset = inner.as_ptr() as usize - written.as_ptr() as usize;
+        let start = annotation.start + u64::try_from(offset).ok()?;
+        let range = ByteRange {
+            start,
+            end: start + u64::try_from(inner.len()).ok()?,
+        };
+        self.python_annotation(file, range, work)
     }
 
     fn python_property_result(
@@ -603,7 +631,13 @@ impl<'source> Index<'source> {
             return Some(callable);
         }
         if !callable.symbol.kinds.contains(&SymbolKind::Callable) {
-            return None;
+            // A value that holds a class object constructs an instance of that class.
+            return match self.python_receiver(Value::Symbol(callable), work)? {
+                Value::Symbol(class) if class.symbol.kinds.contains(&SymbolKind::Constructible) => {
+                    Some(class)
+                }
+                _ => None,
+            };
         }
         let file = self.files.get(callable.file.path.as_str())?;
         let StaticBindingKind::PythonFunction { annotation, .. } =

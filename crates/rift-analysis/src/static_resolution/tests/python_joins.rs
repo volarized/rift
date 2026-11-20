@@ -50,3 +50,34 @@ fn test_python_rebound_locals_refuse_competing_and_unknown_values() {
         assert_eq!(leaf_targets(body), [], "{body}");
     }
 }
+
+#[test]
+fn test_python_class_object_values_construct_their_class() {
+    let observed = leaf_targets(
+        "class Factory:\n    item_class: type[Item] = Item\n    alias = Item\ndef build(factory: Factory, item: Item | None = None):\n    if item is None:\n        item = factory.item_class()\n    item.leaf()\ndef direct(factory: Factory):\n    made = factory.alias()\n    made.leaf()\n",
+    );
+    assert_eq!(
+        observed,
+        [
+            (
+                "rift://symbol/local/python/main/build".to_owned(),
+                "rift://symbol/local/python/main/Item/leaf".to_owned()
+            ),
+            (
+                "rift://symbol/local/python/main/direct".to_owned(),
+                "rift://symbol/local/python/main/Item/leaf".to_owned()
+            ),
+        ]
+    );
+}
+
+#[test]
+fn test_python_class_object_values_refuse_instances_and_shadowed_type() {
+    for body in [
+        "class Factory:\n    item: Item = Item()\ndef build(factory: Factory):\n    made = factory.item()\n    made.leaf()\n",
+        "type = make\nclass Factory:\n    item_class: type[Item] = Item\ndef build(factory: Factory):\n    made = factory.item_class()\n    made.leaf()\n",
+        "class Factory:\n    item_class: type = Item\ndef build(factory: Factory):\n    made = factory.item_class()\n    made.leaf()\n",
+    ] {
+        assert_eq!(leaf_targets(body), [], "{body}");
+    }
+}
