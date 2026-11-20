@@ -335,3 +335,21 @@ fn test_python_rebound_locals_and_property_setters_store_member_facts() {
     }
     assert!(index.edges().is_complete());
 }
+
+#[test]
+fn test_python_reads_before_a_later_rebinding_store_member_facts() {
+    let source = "class Item:\n    value = 0\n    def leaf(self): pass\ndef make() -> Item: return Item()\ndef use(items):\n    item = make()\n    item.value = 1\n    item.leaf()\n    item = items.pop()\n    return item\n";
+    let (_directory, index) = build(&[("main.py", source)]);
+    for (kind, to, spelling) in [
+        ("writes", "main/Item/value", "item.value"),
+        ("calls", "main/Item/leaf", "item.leaf()"),
+    ] {
+        assert_eq!(
+            stored(&index, source, kind, "main/use", to).as_deref(),
+            Some(spelling),
+            "{kind} -> {to}: {:?}",
+            index.edges()
+        );
+    }
+    assert!(index.edges().is_complete());
+}

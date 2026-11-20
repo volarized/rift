@@ -202,6 +202,11 @@ pub struct StaticFactsParts {
     pub inherent_impls: Vec<StaticInherentImpl>,
     /// Items whose admission depends on unresolved Rust configuration.
     pub conditional_items: Vec<ByteRange>,
+    /// Python loop statements, whose bodies run again after their later statements.
+    pub loops: Vec<ByteRange>,
+    /// Python lambda, comprehension and generator expression scopes, whose bodies can run
+    /// after later statements of the enclosing scope.
+    pub expression_scopes: Vec<ByteRange>,
 }
 
 /// Calls and binding evidence retained after the syntax tree is released.
@@ -278,6 +283,18 @@ impl StaticFacts {
         &self.0.conditional_items
     }
 
+    /// Python loop statements.
+    #[must_use]
+    pub fn loops(&self) -> &[ByteRange] {
+        &self.0.loops
+    }
+
+    /// Python lambda, comprehension and generator expression scopes.
+    #[must_use]
+    pub fn expression_scopes(&self) -> &[ByteRange] {
+        &self.0.expression_scopes
+    }
+
     pub(crate) fn retained_bytes(&self) -> usize {
         [
             vector_capacity(&self.0.heritage_edges),
@@ -289,6 +306,8 @@ impl StaticFacts {
             vector_capacity(&self.0.unsupported_bindings),
             vector_capacity(&self.0.inherent_impls),
             vector_capacity(&self.0.conditional_items),
+            vector_capacity(&self.0.loops),
+            vector_capacity(&self.0.expression_scopes),
         ]
         .into_iter()
         .fold(0, usize::saturating_add)
@@ -305,6 +324,8 @@ impl StaticFacts {
             self.unsupported_bindings().len(),
             self.inherent_impls().len(),
             self.conditional_items().len(),
+            self.loops().len(),
+            self.expression_scopes().len(),
         ];
         if lengths
             .into_iter()
@@ -349,6 +370,12 @@ impl StaticFacts {
             valid(row.range) && valid(row.type_path) && contains(row.range, row.type_path)
         });
         let conditional = self.conditional_items().iter().copied().all(valid);
+        let flow = self
+            .loops()
+            .iter()
+            .chain(self.expression_scopes())
+            .copied()
+            .all(valid);
         if !(edges
             && calls
             && references
@@ -357,7 +384,8 @@ impl StaticFacts {
             && assignments
             && unsupported
             && implementations
-            && conditional)
+            && conditional
+            && flow)
         {
             return errors::syntax::facts_range_invalid().fail();
         }

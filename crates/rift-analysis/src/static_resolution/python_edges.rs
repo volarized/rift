@@ -489,17 +489,16 @@ fn edge_python_binding<'source>(
     if file.blocked(position, work) {
         return None;
     }
-    let in_body = file
-        .enclosing_callable(ByteRange {
-            start: position,
-            end: position.saturating_add(1),
-        })
-        .is_some_and(|callable| {
-            callable
-                .symbol
-                .body_range
-                .is_some_and(|body| body.contains(position))
-        });
+    let callable = file.enclosing_callable(ByteRange {
+        start: position,
+        end: position.saturating_add(1),
+    });
+    let in_body = callable.is_some_and(|callable| {
+        callable
+            .symbol
+            .body_range
+            .is_some_and(|body| body.contains(position))
+    });
     let bindings = file.by_name.get(name)?;
     let module = ByteRange {
         start: 0,
@@ -553,10 +552,11 @@ fn edge_python_binding<'source>(
             global = is_global;
             nonlocal = !is_global;
         } else {
+            let later = later_bindings(file, bindings, scope, position, callable, in_body, work)?;
             let candidates = bindings
                 .iter()
                 .copied()
-                .filter(|binding| binding.scope == scope);
+                .filter(|binding| binding.scope == scope && !later.contains(&binding.name.start));
             let selected = match index.python_binding_group(file, candidates.clone(), work) {
                 Some(selected) => selected,
                 None => index.python_receiver_join(file, scope, candidates, work)?,
@@ -569,6 +569,47 @@ fn edge_python_binding<'source>(
                 .then_some(selected);
         }
     }
+}
+
+/// Bindings of one name that cannot have run before a read at `position`.
+///
+/// In the body of the callable whose scope holds the name, a binding that starts after the read
+/// cannot have run yet unless a loop holds both, or the read sits in a lambda, comprehension or
+/// generator expression.
+fn later_bindings(
+    file: &File<'_>,
+    bindings: &[&StaticBinding],
+    scope: ByteRange,
+    position: u64,
+    callable: Option<Target<'_>>,
+    in_body: bool,
+    work: &mut Work,
+) -> Option<BTreeSet<u64>> {
+    let mut later = BTreeSet::new();
+    let ordered = in_body
+        && callable.is_some_and(|callable| callable.symbol.item_range == scope)
+        && !file
+            .facts
+            .expression_scopes()
+            .iter()
+            .any(|range| range.contains(position));
+    if !ordered {
+        return Some(later);
+    }
+    for &binding in bindings {
+        if !work.charge() {
+            return None;
+        }
+        let repeated = file
+            .facts
+            .loops()
+            .iter()
+            .any(|range| range.contains(position) && range.contains(binding.name.start));
+        if binding.scope == scope && binding.available_from > position && !repeated {
+            later.insert(binding.name.start);
+        }
+    }
+    Some(later)
 }
 
 impl File<'_> {

@@ -81,3 +81,30 @@ fn test_python_class_object_values_refuse_instances_and_shadowed_type() {
         assert_eq!(leaf_targets(body), [], "{body}");
     }
 }
+
+#[test]
+fn test_python_reads_before_a_later_rebinding_keep_their_receiver() {
+    let observed = leaf_targets(
+        "def use(items):\n    item = make()\n    item.leaf()\n    item = items.pop()\n    return item\n",
+    );
+    assert_eq!(
+        observed,
+        [(
+            "rift://symbol/local/python/main/use".to_owned(),
+            "rift://symbol/local/python/main/Item/leaf".to_owned()
+        )]
+    );
+}
+
+#[test]
+fn test_python_reads_before_a_later_rebinding_refuse_loops_and_delayed_bodies() {
+    for body in [
+        "def looped(items):\n    item = make()\n    for other in items:\n        item.leaf()\n        item = other\n",
+        "def waiting(items):\n    item = make()\n    while items:\n        item.leaf()\n        item = items.pop()\n",
+        "def delayed(items):\n    item = make()\n    later = lambda: item.leaf()\n    item = items.pop()\n    return later\n",
+        "def generated(items):\n    item = make()\n    later = (item.leaf() for _ in items)\n    item = items.pop()\n    return later\n",
+        "def outer(items):\n    item = make()\n    def inner(): return item.leaf()\n    item = items.pop()\n    return inner\n",
+    ] {
+        assert_eq!(leaf_targets(body), [], "{body}");
+    }
+}

@@ -46,6 +46,7 @@ pub(super) struct EdgePythonKinds {
     right: u16,
     guards: guards::TypeGuards,
     return_type: u16,
+    loops: [u16; 2],
 }
 
 pub(super) fn edge_python_kinds() -> &'static EdgePythonKinds {
@@ -110,6 +111,7 @@ pub(super) fn edge_python_kinds() -> &'static EdgePythonKinds {
             right: field("right"),
             guards: guards::TypeGuards::new(&grammar),
             return_type: field("return_type"),
+            loops: [id("for_statement"), id("while_statement")],
         }
     })
 }
@@ -123,6 +125,11 @@ impl EdgePythonKinds {
     ) -> Result<(), RiftError> {
         let syntax_element = visited.syntax_element();
         let id = syntax_element.kind_id();
+        if self.loops.contains(&id) {
+            facts.loops.push(byte_range(syntax_element)?);
+        } else if self.scopes[3..].contains(&id) {
+            facts.expression_scopes.push(byte_range(syntax_element)?);
+        }
         if id == self.call {
             if let Some(callee) = syntax_element.child_by_field_id(self.function) {
                 facts
