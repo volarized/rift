@@ -1184,6 +1184,68 @@ fn files_resolved_apart_equal_one_pass_under_every_budget() {
 }
 
 #[test]
+fn a_name_bound_in_many_scopes_resolves_to_its_innermost_binding() {
+    // More bindings of one name than a lookup reads in declaration order, in sibling and
+    // nested scopes, so the lookup goes through the scopes around each read.
+    let functions = 24;
+    let mut source = String::from("const e = 0; e;\n");
+    for function in 0..functions {
+        source.push_str(&format!(
+            "function f{function}() {{ const e = {function}; e; function inner() {{ e; }} function own() {{ const e = 1; e; }} }}\n"
+        ));
+    }
+    let result = resolution("typescript", &[("main.ts", &source)], &[], 1_000_000);
+    assert!(!result.exhausted);
+    let reads = result
+        .occurrences
+        .iter()
+        .filter(|edge| edge.role == ReferenceRole::Read)
+        .map(|edge| {
+            target(edge)
+                .rsplit_once(".%2Fmain.ts/")
+                .expect("local target")
+                .1
+        })
+        .collect::<Vec<_>>();
+    let mut expected = vec!["e".to_owned()];
+    for function in 0..functions {
+        expected.push(format!("f{function}/e"));
+        expected.push(format!("f{function}/e"));
+        expected.push(format!("f{function}/own/e"));
+    }
+    assert_eq!(reads, expected);
+}
+
+#[test]
+fn many_conditional_items_leave_only_the_inactive_ones_out() {
+    // More conditional items than a lookup reads in order: nested and sibling items.
+    let mut source = String::from("fn leaf() {}\n");
+    for item in 0..24 {
+        source.push_str(&format!(
+            "#[cfg(feature=\"off\")] fn off{item}() {{ leaf(); }}\n#[cfg(feature=\"std\")] mod on{item} {{ pub fn call() {{ crate::leaf(); }} #[cfg(feature=\"off\")] pub fn skip() {{ crate::leaf(); }} }}\n"
+        ));
+    }
+    source.push_str("fn root() { leaf(); }\n");
+    let manifest =
+        "[package]\nname='fixture'\nversion='0.1.0'\n[features]\ndefault=['std']\nstd=[]\noff=[]\n";
+    let result = resolution(
+        "rust",
+        &[("src/lib.rs", &source)],
+        &[("Cargo.toml", manifest)],
+        1_000_000,
+    );
+    assert!(!result.exhausted);
+    let found = calls(&result, "src/lib.rs").collect::<Vec<_>>();
+    // One call from each active module and one from `root`; none from an inactive item.
+    assert_eq!(found.len(), 25);
+    assert!(
+        found
+            .iter()
+            .all(|call| target(call) == "rift://symbol/local/rust/fixture/leaf")
+    );
+}
+
+#[test]
 fn javascript_cycles_malformed_sources_and_work_exhaustion_remain_distinct() {
     let sources = [
         ("main.mjs", "import { start } from './cycle.mjs'; start();"),

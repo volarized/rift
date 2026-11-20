@@ -218,10 +218,54 @@ impl Target<'_> {
 
 type Bindings<'source> = BTreeMap<&'source str, Vec<&'source StaticBinding>>;
 
+/// Bindings of one name by scope, each scope's bindings in declaration order.
+type ScopedBindings<'source> = EnclosingDefinitions<Vec<&'source StaticBinding>>;
+
+/// Bindings of one name a lookup still reads in declaration order. A longer list is read
+/// through its scopes, so a lookup costs the scopes around the position.
+const SCANNED_BINDINGS_MAX: usize = 16;
+
+/// Conditional items of one file with what the configuration admits for each.
+#[derive(Default)]
+struct Conditions {
+    items: Vec<(ByteRange, Option<bool>)>,
+    /// The items by range when they nest, so a lookup reads the items around a position.
+    nested: Option<EnclosingDefinitions<Option<bool>>>,
+}
+
+impl Conditions {
+    fn new(items: Vec<(ByteRange, Option<bool>)>) -> Self {
+        let nested = (items.len() > SCANNED_BINDINGS_MAX).then(|| {
+            EnclosingDefinitions::new(
+                items
+                    .iter()
+                    .map(|(item, admitted)| (item.start, item.end, *admitted)),
+            )
+        });
+        Self { items, nested }
+    }
+
+    /// Whether an item containing `position` satisfies `holds`, or the budget ended.
+    fn any(&self, position: u64, work: &mut Work, holds: impl Fn(Option<bool>) -> bool) -> bool {
+        let containing = self
+            .nested
+            .as_ref()
+            .and_then(|nested| nested.containing(position, position.checked_add(1)?));
+        match containing {
+            Some(mut containing) => containing.any(|admitted| !work.charge() || holds(*admitted)),
+            None => self.items.iter().any(|(item, admitted)| {
+                !work.charge() || item.contains(position) && holds(*admitted)
+            }),
+        }
+    }
+}
+
 struct File<'source> {
     document: &'source StaticSource<'source>,
     facts: &'source StaticFacts,
     by_name: Bindings<'source>,
+    /// The names with more than [`SCANNED_BINDINGS_MAX`] bindings whose scopes nest.
+    by_scope: BTreeMap<&'source str, ScopedBindings<'source>>,
     by_range: BTreeMap<ByteRange, Option<&'source SyntaxSymbol>>,
     by_qualified_name: BTreeMap<&'source str, Vec<&'source SyntaxSymbol>>,
     callables: EnclosingDefinitions<&'source SyntaxSymbol>,
@@ -231,7 +275,7 @@ struct File<'source> {
     python_values: BTreeMap<u64, StaticBindingKind>,
     python_calls: BTreeMap<u64, Vec<&'source StaticCall>>,
     declared_types: BTreeMap<ByteRange, Option<ByteRange>>,
-    conditions: Vec<(ByteRange, Option<bool>)>,
+    conditions: Conditions,
 }
 
 #[derive(Default)]
@@ -285,6 +329,7 @@ impl<'source> File<'source> {
             document,
             facts,
             by_name: BTreeMap::new(),
+            by_scope: BTreeMap::new(),
             by_range: BTreeMap::new(),
             by_qualified_name: BTreeMap::new(),
             callables: EnclosingDefinitions::new([]),
@@ -294,18 +339,20 @@ impl<'source> File<'source> {
             python_values: BTreeMap::new(),
             python_calls: BTreeMap::new(),
             declared_types: BTreeMap::new(),
-            conditions: Vec::new(),
+            conditions: Conditions::default(),
         };
+        let mut conditions = Vec::new();
         for item in facts.conditional_items() {
             if !work.charge() {
                 return None;
             }
-            file.conditions.push((
+            conditions.push((
                 item.range,
                 file.text(item.attribute)
                     .and_then(|text| configuration?.attribute(text)),
             ));
         }
+        file.conditions = Conditions::new(conditions);
         file.index_bindings(work)?;
         file.index_symbols(work)?;
         Some(file)
@@ -330,6 +377,26 @@ impl<'source> File<'source> {
                 }
                 _ => {}
             }
+        }
+        for (name, bindings) in &self.by_name {
+            if bindings.len() <= SCANNED_BINDINGS_MAX {
+                continue;
+            }
+            let mut scopes = BTreeMap::<ByteRange, Vec<&StaticBinding>>::new();
+            for &binding in bindings {
+                if !work.charge() {
+                    return None;
+                }
+                scopes.entry(binding.scope).or_default().push(binding);
+            }
+            self.by_scope.insert(
+                name,
+                EnclosingDefinitions::new(
+                    scopes
+                        .into_iter()
+                        .map(|(scope, bindings)| (scope.start, scope.end, bindings)),
+                ),
+            );
         }
         if self.document.facts.language().name == "python" {
             for call in self.facts.calls() {
@@ -469,6 +536,67 @@ impl<'source> File<'source> {
             .any(|scope| !work.charge() || scope.contains(position))
     }
 
+    /// Reads the bindings of `name` in the smallest scope that holds `position` and a
+    /// binding `admits`, in declaration order. `read` receives each with whether it is the
+    /// first of its scope; a scope read before a smaller one is found starts over there.
+    ///
+    /// A name with few bindings is read in declaration order. A name with many is read
+    /// through its scopes, the smallest first, so a file that binds one short name in
+    /// thousands of functions pays the scopes around the position for each lookup.
+    /// `None` when the budget ended; `Some(false)` when the file binds no such name.
+    fn innermost_bindings(
+        &self,
+        name: &str,
+        position: u64,
+        work: &mut Work,
+        admits: impl Fn(&'source StaticBinding) -> bool,
+        mut read: impl FnMut(&'source StaticBinding, bool),
+    ) -> Option<bool> {
+        let Some(bindings) = self.by_name.get(name) else {
+            return Some(false);
+        };
+        let scopes = self
+            .by_scope
+            .get(name)
+            .and_then(|scopes| scopes.containing(position, position.checked_add(1)?));
+        if let Some(scopes) = scopes {
+            for scope in scopes {
+                let mut first = true;
+                for &binding in scope {
+                    if !work.charge() {
+                        return None;
+                    }
+                    if admits(binding) {
+                        read(binding, first);
+                        first = false;
+                    }
+                }
+                if !first {
+                    break;
+                }
+            }
+            return Some(true);
+        }
+        let mut innermost: Option<ByteRange> = None;
+        for &binding in bindings {
+            if !work.charge() {
+                return None;
+            }
+            if !binding.scope.contains(position) || !admits(binding) {
+                continue;
+            }
+            match innermost {
+                Some(scope) if scope == binding.scope => read(binding, false),
+                Some(scope) if !scope.encloses(binding.scope) => {}
+                _ => {
+                    innermost = Some(binding.scope);
+                    read(binding, true);
+                }
+            }
+        }
+        Some(true)
+    }
+
     fn binding(
         &self,
         name: &str,
@@ -476,42 +604,34 @@ impl<'source> File<'source> {
         accepts: impl Fn(StaticBindingKind) -> bool,
         work: &mut Work,
     ) -> Binding<'source> {
-        let Some(bindings) = self.by_name.get(name) else {
-            return Binding::Missing;
-        };
+        let rust = self.document.facts.language().name == "rust";
         let mut best: Option<&StaticBinding> = None;
         let mut ambiguous = false;
-        for &binding in bindings {
-            if !work.charge() {
-                return Binding::Blocked;
-            }
-            if !binding.scope.contains(position) || !accepts(binding.kind) {
-                continue;
-            }
-            let rust = self.document.facts.language().name == "rust";
-            if rust && binding.available_from > position {
-                continue;
-            }
-            match best {
+        let found = self.innermost_bindings(
+            name,
+            position,
+            work,
+            |binding| accepts(binding.kind) && !(rust && binding.available_from > position),
+            |binding, first| match best {
                 Some(current)
-                    if rust
-                        && current.scope == binding.scope
-                        && binding.available_from > current.available_from =>
+                    if !first && rust && binding.available_from > current.available_from =>
                 {
                     best = Some(binding);
                     ambiguous = false;
                 }
                 Some(current)
-                    if rust
-                        && current.scope == binding.scope
-                        && binding.available_from < current.available_from => {}
-                Some(current) if current.scope == binding.scope => ambiguous = true,
-                Some(current) if !current.scope.encloses(binding.scope) => {}
+                    if !first && rust && binding.available_from < current.available_from => {}
+                Some(_) if !first => ambiguous = true,
                 _ => {
                     best = Some(binding);
                     ambiguous = false;
                 }
-            }
+            },
+        );
+        match found {
+            None => return Binding::Blocked,
+            Some(false) => return Binding::Missing,
+            Some(true) => {}
         }
         match best {
             None => Binding::Missing,
