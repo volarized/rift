@@ -2087,3 +2087,42 @@ export function refuse() { return api.value() }
         edge.kind() == EdgeKind::Calls && edge.from().as_str().ends_with("probe.ts/refuse")
     }));
 }
+
+#[test]
+fn test_this_inside_object_literal_methods_names_the_literal_members() {
+    // Outside every class, `this` in a method of an object literal is that literal: its
+    // members resolve there. An arrow function keeps the surrounding `this`, a nested
+    // `function` binds its own, and a local of a method is no member.
+    let source = "module.exports = (function cookies() {
+  return {
+    write: function write(name) { return name },
+    read(name) { return this.write(name) },
+    remove: function remove(name) { this.write(name) },
+    nested: function nested() {
+      return function inner() { return this.write(1) }
+    },
+    shadow() {
+      const helper = 1
+      return this.helper
+    },
+  }
+})();
+";
+    let (_directory, index) = workspace(&[("main.js", source)]);
+    let calls = calls(&index);
+    for caller in ["read", "remove"] {
+        assert!(
+            calls
+                .iter()
+                .any(|(from, to)| from.ends_with(caller) && to.ends_with("write")),
+            "{caller}: {calls:?}"
+        );
+    }
+    assert!(
+        !calls.iter().any(|(from, _)| from.ends_with("inner")),
+        "{calls:?}"
+    );
+    assert!(!index.edges().edges().any(|edge| {
+        edge.kind() == EdgeKind::Reads && edge.to().as_str().ends_with("/shadow/helper")
+    }));
+}

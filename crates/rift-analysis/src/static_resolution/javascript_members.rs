@@ -234,7 +234,11 @@ impl<'source> Index<'source> {
         role: ReferenceRole,
         work: &mut Work,
     ) -> Option<Target<'source>> {
-        let (class, mode) = self.javascript_class_receiver(file, position, work)?;
+        let Some((class, mode)) = self.javascript_class_receiver(file, position, work) else {
+            return (receiver == "this")
+                .then(|| self.javascript_object_receiver(file, position, member, work))
+                .flatten();
+        };
         if receiver == "this" {
             return self.javascript_class_member(class, member, mode, role, work);
         }
@@ -249,6 +253,68 @@ impl<'source> Index<'source> {
             }
         }
         found
+    }
+
+    /// The member `member` of the object literal whose method holds `position`, for `this`
+    /// outside every class. The method must be the nearest function that binds `this`; the
+    /// member is a direct member of that literal, written once.
+    fn javascript_object_receiver(
+        &self,
+        file: &File<'source>,
+        position: u64,
+        member: &str,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let entries = file.facts.object_members();
+        let mut holder: Option<(rift_syntax::ByteRange, rift_syntax::ByteRange)> = None;
+        for &(function, object) in entries {
+            if !work.charge() {
+                return None;
+            }
+            if function.contains(position)
+                && holder.is_none_or(|(inner, _)| inner.encloses(function))
+            {
+                holder = Some((function, object));
+            }
+        }
+        let (function, object) = holder?;
+        let scopes = self.javascript.scopes.get(file.document.path.as_str())?;
+        if scopes
+            .functions
+            .resolve(position, position.checked_add(1)?)
+            .is_some_and(|inner| function.encloses(*inner) && *inner != function)
+        {
+            return None;
+        }
+        let mut found: Option<&rift_syntax::SyntaxSymbol> = None;
+        for symbol in file.document.facts.symbols() {
+            if !work.charge() {
+                return None;
+            }
+            let item = symbol.item_range;
+            if symbol.name != member || !object.encloses(item) {
+                continue;
+            }
+            // A local of a member function, or a member of a nested literal, is no member.
+            let nested = entries.iter().any(|&(inner, other)| {
+                (object.encloses(inner) && inner.encloses(item) && inner != item)
+                    || (other != object && object.encloses(other) && other.encloses(item))
+            });
+            if nested {
+                continue;
+            }
+            // A member and the named function written as its value share the name.
+            found = match found {
+                Some(previous) if previous.item_range.encloses(item) => Some(previous),
+                Some(previous) if item.encloses(previous.item_range) => Some(symbol),
+                Some(_) => return None,
+                None => Some(symbol),
+            };
+        }
+        Some(Target {
+            file: file.document,
+            symbol: found?,
+        })
     }
 
     pub(super) fn javascript_class_member(
