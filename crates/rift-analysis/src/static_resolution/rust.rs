@@ -996,7 +996,33 @@ impl<'source> Namespaces<'source> {
         if matches!(*head, "crate" | "self" | "super") {
             return self.absolute_path(file, position, parts, work);
         }
-        match file.binding(head, position, is_type_binding, work) {
+        let binding = file.binding(head, position, is_type_binding, work);
+        let module = self.module(file, position, work)?;
+        let mut local = module.to_vec();
+        local.push((*head).to_owned());
+        if let Some(target) = self.types.get(&local).copied().flatten()
+            && target.admitted_path().as_deref() == Some(local.as_slice())
+            && let Binding::Found(imported) = binding
+        {
+            let namespace = self.files.get(file.document.path.as_str())?;
+            let scope = namespace
+                .inline
+                .iter()
+                .find(|(_, path)| path.as_slice() == module)
+                .and_then(|(symbol, _)| symbol.body_range)
+                .unwrap_or(ByteRange {
+                    start: 0,
+                    end: u64::try_from(file.document.source.len()).ok()?,
+                });
+            if imported.scope == scope {
+                return None;
+            }
+            if imported.scope.encloses(scope) {
+                local.extend(tail.iter().map(|part| (*part).to_owned()));
+                return Some(local);
+            }
+        }
+        match binding {
             Binding::Found(binding) => match binding.kind {
                 StaticBindingKind::RustUse { path } => {
                     if file.conditional(path, work) {

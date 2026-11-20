@@ -915,3 +915,69 @@ fn test_rust_function_pointer_results_keep_declared_member_owners() {
     );
 }
 
+#[test]
+fn test_rust_local_traits_take_precedence_over_glob_imports() {
+    // #833: local declarations hide wildcard imports in the type namespace.
+    let directory = tempfile::tempdir().expect("workspace");
+    let root = directory.path();
+    std::fs::create_dir(root.join("src")).expect("source directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='fixture'\nversion='0.1.0'\n",
+    )
+    .expect("manifest");
+    std::fs::write(root.join("src/lib.rs"), "pub struct Item; pub use std::error::Error as Bound; mod inner { use super::*; pub trait Bound { fn run(&self); } impl Bound for Item { fn run(&self) {} } } mod other { pub trait Bound {} } mod ambiguous { use crate::inner::*; use crate::other::*; impl Bound for crate::Item {} } mod conflict { use crate::other::Bound; pub trait Bound {} impl Bound for crate::Item {} }").expect("source");
+    let index = WorkspaceIndex::build(
+        root,
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &TextFileInclusion::default(),
+    )
+    .expect("index");
+    assert!(
+        index
+            .symbol_view()
+            .expect("symbols")
+            .normalized_graph()
+            .records()
+            .iter()
+            .all(|record| record.identity().is_some())
+    );
+    let file = index
+        .files()
+        .find(|file| file.path().as_str() == "src/lib.rs")
+        .expect("source file");
+    let declared = file
+        .syntax()
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.qualified_name == "inner::Bound")
+        .expect("local trait");
+    assert_eq!(declared.container.as_deref(), Some("inner"));
+    let source = std::fs::read_to_string(root.join("src/lib.rs")).expect("source");
+    assert_eq!(
+        &source[usize::try_from(declared.item_range.start).expect("start")
+            ..usize::try_from(declared.item_range.end).expect("end")],
+        "pub trait Bound { fn run(&self); }"
+    );
+    for (kind, from, to) in [
+        (EdgeKind::Implements, "/fixture/Item", "/inner/Bound"),
+        (EdgeKind::Overrides, "/Item/run", "/inner/Bound/run"),
+    ] {
+        assert!(
+            index.edges().edges().any(|edge| edge.kind() == kind
+                && edge.from().as_str().ends_with(from)
+                && edge.to().as_str().ends_with(to)),
+            "missing {kind:?} {from} -> {to}"
+        );
+    }
+    assert_eq!(
+        index
+            .edges()
+            .edges()
+            .filter(|edge| edge.kind() == EdgeKind::Implements)
+            .count(),
+        1
+    );
+}
+
