@@ -333,9 +333,26 @@ without pagination. SPARQL `LIMIT` and `OFFSET` bound the result set before pagi
 The server bounds statement size, algebra, fact acquisition, and the evaluated answer.
 `[search.query] page_limit` sets the maximum encoded bytes per page, from 1 KiB to 4 MiB.
 
-A query requiring missing facts returns typed unavailability before evaluation.
-This applies to `ASK`, counts, negation, bindings, and graphs. Available-empty facts differ
-from unavailable facts. A query needing only published symbol names does not require
+A query over the captured inventory - every symbol, call, reference, or usage it holds - answers
+from partly covered facts. This holds for a `SELECT` that joins, projects, filters, binds, orders,
+or slices, and for an `ASK` that finds a witness; every row such an answer returns stands.
+
+The answer's warnings name what is missing:
+
+- `source_unavailable` or `large_file_unparsed` - a file left out of the index
+- `framework_context_unresolved` - a framework whose context is unresolved; the file's ordinary
+  declarations still answer
+- `engine_analysis_unavailable` - a language whose engine analysis is missing; the captured static
+  facts still answer
+
+Any other query needs complete coverage and returns `insufficient_coverage` with the same warnings:
+
+- an empty result or a false `ASK`, which claims an absence
+- an aggregate such as a count
+- a negation, `EXISTS`, `MINUS`, or `OPTIONAL`
+- a graph result
+
+Available-empty facts differ from unavailable facts. A query needing only published symbol names does not require
 unavailable syntax elements, history, or engine facts. Supplied syntax facts are preserved; query evaluation
 does not reparse source to manufacture a complete syntax family.
 

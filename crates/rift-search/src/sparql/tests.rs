@@ -780,3 +780,27 @@ fn normalized_query_text_preserves_literals_and_normalizes_syntax() -> Result<()
     assert_ne!(first.normalized_text(), changed.normalized_text());
     Ok(())
 }
+
+#[test]
+fn semantic_inventory_requests_engine_types_and_heritage() {
+    let limits = GraphLimits::default();
+    for (predicate, selected) in [
+        ("hasType", "types"),
+        ("extends", "extends"),
+        ("implements", "implements"),
+    ] {
+        for query in [
+            format!("SELECT ?s ?t {{ ?s :{predicate} ?t }}"),
+            format!("SELECT ?s ?t {{ ?s :{predicate}+ ?t }}"),
+        ] {
+            let parsed = GraphQuery::parse(&query, &limits).expect("query");
+            let required = parsed.semantic_inventory().expect("inventory");
+            let enabled = match selected {
+                "types" => required.adjacency.types.definitions,
+                "extends" => required.adjacency.types.extends,
+                _ => required.adjacency.types.implements,
+            };
+            assert!(enabled, "{query}: {required:?}");
+        }
+    }
+}

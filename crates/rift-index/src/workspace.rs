@@ -2567,6 +2567,15 @@ impl IndexContents {
 }
 
 impl WorkspaceIndexWarning {
+    /// Whether the file's declarations are missing from the index. Every warning but an
+    /// unresolved framework context names a file left out whole or held as text alone; a
+    /// file whose framework context is unresolved keeps its ordinary syntax and every
+    /// declaration it holds, and loses only the framework-specific facts.
+    #[must_use]
+    pub const fn leaves_declarations_out(&self) -> bool {
+        !matches!(self, Self::FrameworkContextUnresolved { .. })
+    }
+
     /// Whether the file keeps its text in the index: the provider refused its source for
     /// its size alone, so the file is held as text no declaration was extracted from.
     #[must_use]
@@ -4173,7 +4182,10 @@ impl WorkspaceIndex {
             .get_or_init(|| self.build_symbol_declarations().map(Arc::new))
             .as_ref()
             .map_err(Clone::clone)?;
-        Ok(self.warnings.is_empty()
+        Ok(!self
+            .warnings
+            .iter()
+            .any(WorkspaceIndexWarning::leaves_declarations_out)
             && !declarations
                 .incomplete_languages
                 .contains(&language.identity_segment()))

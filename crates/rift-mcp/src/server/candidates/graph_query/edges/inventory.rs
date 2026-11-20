@@ -1,0 +1,651 @@
+//! Bounded inventory acquisition retained with its published source.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+use futures_util::{StreamExt, stream};
+use rift_error::RiftError;
+use rift_protocol::edge_read::QueryOccurrence;
+use rift_protocol::identity::SymbolIdentity;
+use rift_protocol::read::{EdgeKind, ReadWarning, SymbolId, TraversalDirection};
+use rift_search::sparql::{GraphLimits, SymbolRelation};
+
+use super::{
+    AcquiredAdjacency, RequestDeadline, ResolvedWorkspace, RiftMcp, coverage_failure, relation,
+};
+
+mod cache;
+pub(crate) use cache::EngineInventoryCache;
+
+/// The declarations a whole-inventory read walks and the facts it reads for each.
+#[derive(Clone, Copy)]
+struct InventorySelection<'seeds> {
+    seeds: &'seeds [SymbolId],
+    facts: rift_server::EngineInventorySelection,
+}
+
+/// Calls and references one whole-inventory read collected, and whether part of the
+/// inventory is missing from them.
+#[derive(Debug, Default)]
+pub(super) struct InventoryRead {
+    pub(super) local: Vec<QueryOccurrence>,
+    pub(super) outgoing_references: BTreeMap<SymbolId, Vec<usize>>,
+    pub(super) calls: BTreeMap<SymbolId, rift_server::GraphCalls>,
+    pub(super) edge_facts: Vec<rift_protocol::read::Edge>,
+    pub(super) local_edges: Vec<(SymbolId, SymbolRelation, SymbolId)>,
+    outgoing_edges: BTreeMap<SymbolId, Vec<usize>>,
+    incoming_edges: BTreeMap<SymbolId, Vec<usize>>,
+    pub(super) warnings: Vec<ReadWarning>,
+    pub(super) partial: bool,
+    pub(super) records: usize,
+    missing: MissingKinds,
+    reference_pairs: BTreeSet<(SymbolId, SymbolId)>,
+}
+
+/// The kinds some selected declaration's captured or engine answer left incomplete.
+#[derive(Debug, Default)]
+struct MissingKinds {
+    calls: BTreeSet<SymbolId>,
+    references: BTreeSet<SymbolId>,
+}
+
+impl InventoryRead {
+    /// Marks the read partial and names the kinds whose answer is incomplete for some
+    /// selected declaration.
+    fn report_missing(&mut self) {
+        let kinds: Vec<EdgeKind> = [
+            (!self.missing.calls.is_empty(), EdgeKind::Calls),
+            (!self.missing.references.is_empty(), EdgeKind::References),
+        ]
+        .into_iter()
+        .filter_map(|(missing, kind)| missing.then_some(kind))
+        .collect();
+        if kinds.is_empty() {
+            return;
+        }
+        self.partial = true;
+        let named: Vec<&str> = kinds.iter().map(AsRef::as_ref).collect();
+        self.extend_warnings([ReadWarning::EdgeCoverageMissing {
+            detail: format!(
+                "the captured facts do not cover every declaration the inventory selects \
+                 for {}, so edges outside that coverage are missing from this answer",
+                named.join(", ")
+            ),
+            kinds,
+        }]);
+    }
+
+    fn charge(&mut self, records: usize) -> Result<(), RiftError> {
+        let maximum = GraphLimits::default().triples_max();
+        self.records = self
+            .records
+            .checked_add(records)
+            .filter(|records| *records <= maximum)
+            .ok_or_else(coverage_failure)?;
+        Ok(())
+    }
+
+    fn extend_warnings(&mut self, warnings: impl IntoIterator<Item = ReadWarning>) {
+        for warning in warnings {
+            if !self.warnings.contains(&warning) {
+                self.warnings.push(warning);
+            }
+        }
+    }
+
+    fn admit_edge(&mut self, from: SymbolId, kind: SymbolRelation, to: SymbolId) {
+        let position = self.local_edges.len();
+        self.outgoing_edges
+            .entry(from.clone())
+            .or_default()
+            .push(position);
+        self.incoming_edges
+            .entry(to.clone())
+            .or_default()
+            .push(position);
+        self.local_edges.push((from, kind, to));
+    }
+
+    pub(super) fn edges(
+        &self,
+        seed: &SymbolId,
+        kind: SymbolRelation,
+        direction: TraversalDirection,
+    ) -> impl Iterator<Item = &(SymbolId, SymbolRelation, SymbolId)> {
+        let positions = match direction {
+            TraversalDirection::Outgoing => self.outgoing_edges.get(seed),
+            TraversalDirection::Incoming => self.incoming_edges.get(seed),
+        };
+        positions
+            .into_iter()
+            .flatten()
+            .filter_map(|position| self.local_edges.get(*position))
+            .filter(move |(_, relation, _)| *relation == kind)
+    }
+
+    fn admit_references(
+        &mut self,
+        seed: &SymbolId,
+        occurrences: Vec<QueryOccurrence>,
+    ) -> Result<(), RiftError> {
+        self.admit_reference_read(seed, occurrences, false)
+    }
+
+    fn admit_occurrences(
+        &mut self,
+        seed: &SymbolId,
+        occurrences: Vec<QueryOccurrence>,
+    ) -> Result<(), RiftError> {
+        self.admit_reference_read(seed, occurrences, true)
+    }
+
+    fn admit_reference_read(
+        &mut self,
+        seed: &SymbolId,
+        occurrences: Vec<QueryOccurrence>,
+        physical: bool,
+    ) -> Result<(), RiftError> {
+        for occurrence in occurrences {
+            let pair = occurrence
+                .enclosing
+                .as_ref()
+                .map(|caller| (caller.clone(), seed.clone()));
+            if !physical
+                && pair
+                    .as_ref()
+                    .is_none_or(|pair| self.reference_pairs.contains(pair))
+            {
+                continue;
+            }
+            self.charge(1)?;
+            if let Some((caller, target)) = pair {
+                if self
+                    .reference_pairs
+                    .insert((caller.clone(), target.clone()))
+                {
+                    self.admit_edge(caller.clone(), SymbolRelation::References, target);
+                }
+                self.outgoing_references
+                    .entry(caller)
+                    .or_default()
+                    .push(self.local.len());
+            }
+            self.local.push(occurrence);
+        }
+        Ok(())
+    }
+
+    fn admit_calls(
+        &mut self,
+        seed: &SymbolId,
+        calls: rift_server::GraphCalls,
+        replace: bool,
+    ) -> Result<(), RiftError> {
+        self.charge(calls.local.iter().map(|(_, sites)| 1 + sites.len()).sum())?;
+        if replace || !self.calls.contains_key(seed) {
+            self.calls.insert(seed.clone(), calls);
+        } else if let Some(held) = self.calls.get_mut(seed) {
+            held.merge(calls);
+        }
+        Ok(())
+    }
+}
+
+/// Reads the inventory from the captured static facts alone.
+fn captured_inventory(
+    reads: &rift_server::ReadService,
+    inventory: &InventorySelection<'_>,
+) -> Result<InventoryRead, RiftError> {
+    let mut read = InventoryRead::default();
+    for seed in inventory.seeds {
+        if inventory.facts.references {
+            let references =
+                rift_server::captured_graph_references(reads, seed, inventory.facts.enclosing)?;
+            read.edge_facts.extend(references.edges);
+            if !references.complete {
+                read.missing.references.insert(seed.clone());
+            }
+            if inventory.facts.occurrences.is_some() {
+                read.admit_occurrences(seed, references.occurrences)?;
+            } else {
+                read.admit_references(seed, references.occurrences)?;
+            }
+        }
+        if inventory.facts.calls {
+            let calls =
+                rift_server::captured_graph_calls(reads, seed, TraversalDirection::Outgoing)?;
+            if !calls.complete {
+                read.missing.calls.insert(seed.clone());
+            }
+            read.admit_calls(seed, calls, true)?;
+        }
+    }
+    read.report_missing();
+    Ok(read)
+}
+
+impl RiftMcp {
+    /// Acquires the calls, references and usages a whole-inventory query reads.
+    ///
+    /// The captured static facts answer first. Configured engines read every established
+    /// declaration in file groups, bounded by the source configuration, worker count,
+    /// pending requests, dataset capacity, and request deadline. A failed group keeps the
+    /// captured facts and earlier engine answers, and reports the missing analysis.
+    pub(in crate::server::candidates::graph_query) async fn acquire_semantic_inventory(
+        &self,
+        resolved: &ResolvedWorkspace,
+        required: rift_search::sparql::SemanticInventory,
+        deadline: RequestDeadline,
+    ) -> Result<AcquiredAdjacency, RiftError> {
+        let reads = &resolved.published.reads;
+        let mut acquired = AcquiredAdjacency::default();
+        if required.edges {
+            acquired.capture_edge_inventory(reads, required)?;
+        }
+        if !required.adjacency.calls
+            && !required.adjacency.references
+            && required.occurrences.is_none()
+            && !required.adjacency.types.definitions
+            && !required.adjacency.types.extends
+            && !required.adjacency.types.implements
+        {
+            return Ok(acquired);
+        }
+        let references = required.adjacency.references || required.occurrences.is_some();
+        let enclosing = required.adjacency.references
+            || required.occurrences.is_some_and(|usage| usage.enclosing);
+        let capture = Arc::clone(reads);
+        let (seeds, coverage) = self
+            .blocking
+            .run("semantic inventory seeds", move || {
+                capture.local_search_view_input(true)?.inventory_seeds()
+            })
+            .await?;
+        acquired.partial |= coverage == rift_server::InventoryCoverage::Partial;
+        let engines = self.engine_pool_for(&resolved.published).await;
+        let mut served = BTreeMap::new();
+        for seed in &seeds {
+            let identity = SymbolIdentity::parse(seed.as_str())?;
+            let language = identity.language();
+            if engines.engine_for(language).is_some() {
+                served
+                    .entry(language.identity_segment())
+                    .or_insert_with(|| language.clone());
+            }
+        }
+        let workers = resolved
+            .published
+            .configuration
+            .server_configuration()
+            .num_workers;
+        let inventory = InventorySelection {
+            seeds: &seeds,
+            facts: rift_server::EngineInventorySelection {
+                calls: required.adjacency.calls,
+                references,
+                enclosing,
+                occurrences: required.occurrences,
+                types: required.adjacency.types,
+                batch_inputs: usize::try_from(workers).unwrap_or(1),
+                records_max: GraphLimits::default().triples_max(),
+            },
+        };
+        let skipped = if served.is_empty() {
+            None
+        } else if resolved.stale.is_some() {
+            Some(
+                "the published index lags the captured tree, so the inventory answers from \
+                 the captured static facts alone"
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
+        let engine = if served.is_empty() || skipped.is_some() {
+            None
+        } else {
+            let end = deadline.walk_end(resolved.capture_elapsed);
+            match Box::pin(self.engine_inventory(resolved, &engines, &inventory, end)).await {
+                Ok(engine) => Some(engine),
+                Err(error) if super::super::lacks_coverage(&error) => None,
+                Err(error) => return Err(error),
+            }
+        };
+        let read = if let Some(engine) = engine {
+            engine
+        } else {
+            let detail = skipped.unwrap_or_else(|| {
+                "the language engine could not answer for the whole inventory, so it answers \
+                 from the captured static facts alone"
+                    .to_owned()
+            });
+            self.captured_fallback(reads, &inventory, served, detail)
+                .await?
+        };
+        acquired.admit_inventory(&read)?;
+        Ok(acquired)
+    }
+
+    async fn captured_fallback(
+        &self,
+        reads: &Arc<rift_server::ReadService>,
+        inventory: &InventorySelection<'_>,
+        served: BTreeMap<String, rift_protocol::read::Language>,
+        detail: String,
+    ) -> Result<Arc<InventoryRead>, RiftError> {
+        let capture = Arc::clone(reads);
+        let seeds = inventory.seeds.to_vec();
+        let selection = inventory.facts;
+        let mut captured = self
+            .blocking
+            .run("captured edge inventory", move || {
+                captured_inventory(
+                    &capture,
+                    &InventorySelection {
+                        seeds: &seeds,
+                        facts: selection,
+                    },
+                )
+            })
+            .await?;
+        for language in served.into_values() {
+            captured.partial = true;
+            captured
+                .warnings
+                .push(ReadWarning::EngineAnalysisUnavailable {
+                    language: Some(language),
+                    detail: detail.clone(),
+                });
+        }
+        Ok(Arc::new(captured))
+    }
+
+    /// Reads file groups through engine batches and maps their locations on the worker pool.
+    async fn engine_inventory(
+        &self,
+        resolved: &ResolvedWorkspace,
+        engines: &rift_server::EnginePool,
+        inventory: &InventorySelection<'_>,
+        end: tokio::time::Instant,
+    ) -> Result<Arc<InventoryRead>, RiftError> {
+        let mut cache = resolved.published.engine_inventory.entries.lock().await;
+        if let Some(read) = cache.get(inventory.facts, tokio::time::Instant::now()) {
+            return Ok(read);
+        }
+        let read = self
+            .read_engine_inventory(resolved, engines, inventory, end)
+            .await?;
+        if !self
+            .engine_tree_matches(&resolved.published)
+            .await
+            .map_err(|_| coverage_failure())?
+        {
+            return Err(coverage_failure());
+        }
+        let read = Arc::new(read);
+        cache.remember(inventory.facts, Arc::clone(&read), end);
+        Ok(read)
+    }
+
+    async fn read_engine_inventory(
+        &self,
+        resolved: &ResolvedWorkspace,
+        engines: &rift_server::EnginePool,
+        inventory: &InventorySelection<'_>,
+        end: tokio::time::Instant,
+    ) -> Result<InventoryRead, RiftError> {
+        let reads = Arc::clone(&resolved.published.reads);
+        let seeds = inventory.seeds.to_vec();
+        let capture = Arc::clone(&reads);
+        let selection = inventory.facts;
+        let (files, mut read) = self
+            .blocking
+            .run("engine inventory files", move || {
+                let inventory = InventorySelection {
+                    seeds: &seeds,
+                    facts: selection,
+                };
+                Ok((
+                    capture.engine_inventory_files(&seeds, selection)?,
+                    captured_inventory(&capture, &inventory)?,
+                ))
+            })
+            .await?;
+        let workers = selection.batch_inputs.max(1);
+        let requests = stream::iter(files.into_iter().map(|file| {
+            let capture = Arc::clone(&reads);
+            async move {
+                let answer = tokio::time::timeout_at(end, file.read(engines, selection, end))
+                    .await
+                    .map_err(|_| {
+                        rift_error::errors::lsp::engine_analyzing()
+                            .attempts(0_u64)
+                            .error()
+                    })??;
+                let Some(answer) = answer else {
+                    return Ok(None);
+                };
+                self.blocking
+                    .run("engine inventory locations", move || {
+                        answer.resolve(&capture, &rift_server::CalleeRoots::default())
+                    })
+                    .await
+                    .map(Some)
+            }
+        }))
+        .buffer_unordered(workers);
+        tokio::pin!(requests);
+        read.partial = false;
+        read.warnings
+            .retain(|warning| !matches!(warning, ReadWarning::EdgeCoverageMissing { .. }));
+        let mut coverage = EngineCoverage {
+            occurrences: inventory.facts.occurrences.is_some(),
+            ..EngineCoverage::default()
+        };
+        while let Some(answer) = requests.next().await {
+            coverage.admit(&mut read, answer)?;
+        }
+        coverage.finish(&mut read);
+        read.report_missing();
+        Ok(read)
+    }
+
+    pub(super) async fn inventory_for_kind(
+        &self,
+        resolved: &ResolvedWorkspace,
+        kind: EdgeKind,
+        seed: Option<&SymbolId>,
+        occurrences: Option<rift_search::sparql::OccurrenceSelection>,
+        end: tokio::time::Instant,
+    ) -> Result<Arc<InventoryRead>, RiftError> {
+        let workers = resolved
+            .published
+            .configuration
+            .server_configuration()
+            .num_workers;
+        let facts = rift_server::EngineInventorySelection {
+            calls: kind == EdgeKind::Calls,
+            references: kind == EdgeKind::References,
+            enclosing: kind == EdgeKind::References,
+            occurrences,
+            types: rift_search::sparql::TypeSelection {
+                definitions: kind == EdgeKind::HasType,
+                extends: kind == EdgeKind::Extends,
+                implements: kind == EdgeKind::Implements,
+            },
+            batch_inputs: usize::try_from(workers).unwrap_or(1),
+            records_max: GraphLimits::default().triples_max(),
+        };
+        {
+            let mut cache = resolved.published.engine_inventory.entries.lock().await;
+            if let Some(read) = cache.get(facts, tokio::time::Instant::now()) {
+                return Ok(read);
+            }
+        }
+        if let Some(seed) = seed {
+            let engines = self.engine_pool_for(&resolved.published).await;
+            let seeds = [seed.clone()];
+            return self
+                .read_engine_inventory(
+                    resolved,
+                    &engines,
+                    &InventorySelection {
+                        seeds: &seeds,
+                        facts,
+                    },
+                    end,
+                )
+                .await
+                .map(Arc::new);
+        }
+        let capture = Arc::clone(&resolved.published.reads);
+        let seeds = self
+            .blocking
+            .run("engine inventory seeds", move || {
+                Ok(capture.local_search_view_input(true)?.inventory_seeds()?.0)
+            })
+            .await?;
+        let engines = self.engine_pool_for(&resolved.published).await;
+        self.engine_inventory(
+            resolved,
+            &engines,
+            &InventorySelection {
+                seeds: &seeds,
+                facts,
+            },
+            end,
+        )
+        .await
+    }
+}
+
+#[derive(Default)]
+struct EngineCoverage {
+    occurrences: bool,
+    seen_calls: BTreeSet<SymbolId>,
+    calls: BTreeMap<SymbolId, bool>,
+    references: BTreeMap<SymbolId, bool>,
+}
+
+impl EngineCoverage {
+    fn admit(
+        &mut self,
+        read: &mut InventoryRead,
+        answer: Result<Option<rift_server::EngineInventory>, RiftError>,
+    ) -> Result<(), RiftError> {
+        match answer {
+            Ok(Some(answer)) => {
+                read.extend_warnings(answer.warnings);
+                for (seed, calls) in answer.calls {
+                    self.calls
+                        .entry(seed.clone())
+                        .and_modify(|complete| *complete &= calls.complete)
+                        .or_insert(calls.complete);
+                    read.extend_warnings(calls.edge_warnings.iter().cloned());
+                    let replace = self.seen_calls.insert(seed.clone());
+                    read.admit_calls(&seed, calls, replace)?;
+                }
+                for (seed, references) in answer.references {
+                    read.edge_facts.extend(references.edges);
+                    self.references
+                        .entry(seed.clone())
+                        .and_modify(|complete| *complete &= references.complete)
+                        .or_insert(references.complete);
+                    read.extend_warnings(references.edge_warnings);
+                    if self.occurrences {
+                        read.admit_occurrences(&seed, references.occurrences)?;
+                    } else {
+                        read.admit_references(&seed, references.occurrences)?;
+                    }
+                }
+                for edge in answer.types.into_iter().chain(answer.heritage) {
+                    read.charge(1)?;
+                    let kind = edge.kinds.first().copied().ok_or_else(coverage_failure)?;
+                    read.admit_edge(edge.from.clone(), relation(kind)?, edge.to.clone());
+                    read.edge_facts.push(edge);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                read.partial = true;
+                read.extend_warnings([ReadWarning::EngineAnalysisUnavailable {
+                    language: None,
+                    detail: if error.slug() == rift_error::errors::lsp::engine_analyzing::SLUG {
+                        format!("the language engine was still analyzing when `[server] readiness_timeout` was spent, so this inventory carries none of its edges from that file: {}", error.detail())
+                    } else { error.detail() },
+                }]);
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self, read: &mut InventoryRead) {
+        for (seed, complete) in self.calls {
+            if complete {
+                read.missing.calls.remove(&seed);
+            }
+        }
+        for (seed, complete) in self.references {
+            if complete {
+                read.missing.references.remove(&seed);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rift_protocol::read::{SourceUnitId, SourceUnitSpan, TextRange};
+
+    fn references() -> (SymbolId, Vec<QueryOccurrence>) {
+        let target = SymbolId("rift://symbol/local/rust/test/target".to_owned());
+        let caller = SymbolId("rift://symbol/local/rust/test/caller".to_owned());
+        let occurrences = [10, 30]
+            .into_iter()
+            .map(|start| QueryOccurrence {
+                target: target.clone(),
+                enclosing: Some(caller.clone()),
+                source: SourceUnitSpan {
+                    unit: SourceUnitId("rift://source/project/lib.rs".to_owned()),
+                    range: TextRange {
+                        start,
+                        end: start + 6,
+                    },
+                },
+                kind: EdgeKind::References,
+            })
+            .collect();
+        (target, occurrences)
+    }
+
+    #[test]
+    fn reference_pairs_charge_each_caller_once() {
+        let (target, occurrences) = references();
+        let mut read = InventoryRead {
+            records: GraphLimits::default().triples_max() - 1,
+            ..InventoryRead::default()
+        };
+        read.admit_references(&target, occurrences)
+            .expect("two occurrences of one pair fit one remaining record");
+        assert_eq!(read.local_edges.len(), 1);
+        assert_eq!(read.local.len(), 1);
+        assert_eq!(read.records, GraphLimits::default().triples_max());
+    }
+
+    #[test]
+    fn occurrence_reads_keep_each_reference_range() {
+        let (target, occurrences) = references();
+        let mut read = InventoryRead::default();
+        read.admit_occurrences(&target, occurrences)
+            .expect("physical references");
+        let starts: Vec<_> = read
+            .local
+            .iter()
+            .map(|occurrence| occurrence.source.range.start)
+            .collect();
+        assert_eq!(starts, vec![10, 30]);
+        assert_eq!(read.local_edges.len(), 1);
+        assert_eq!(read.records, 2);
+    }
+}

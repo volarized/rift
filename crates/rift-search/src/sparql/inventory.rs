@@ -15,26 +15,26 @@ pub struct OccurrenceSelection {
     pub enclosing: bool,
 }
 
+/// Required type definitions and inheritance from semantic providers.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TypeSelection {
+    /// The query can inspect inferred type definitions.
+    pub definitions: bool,
+    /// The query can inspect class inheritance.
+    pub extends: bool,
+    /// The query can inspect interface implementations.
+    pub implements: bool,
+}
+
 /// Resolved adjacency needed by a query over the selected domain.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SemanticAdjacency {
     /// The query can inspect call edges.
     pub calls: bool,
-    /// The query can inspect type uses resolved at captured type positions.
-    pub type_uses: bool,
     /// The query can inspect caller-to-target reference edges.
     pub references: bool,
-    /// Inheritance and implementation operations selected by the query.
-    pub heritage: SemanticHeritage,
-}
-
-/// Heritage kinds whose configured engine can add to captured facts.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct SemanticHeritage {
-    /// The query can inspect inheritance edges.
-    pub extends: bool,
-    /// The query can inspect implementation edges.
-    pub implements: bool,
+    /// The type definitions and inheritance a query can inspect.
+    pub types: TypeSelection,
 }
 
 /// The semantic and physical facts needed from a complete selected domain.
@@ -87,15 +87,15 @@ impl SemanticInventory {
                 Some("references") => self.adjacency.references = true,
                 Some("hasType") => {
                     self.edges = true;
-                    self.adjacency.type_uses = true;
+                    self.adjacency.types.definitions = true;
                 }
                 Some("extends") => {
                     self.edges = true;
-                    self.adjacency.heritage.extends = true;
+                    self.adjacency.types.extends = true;
                 }
                 Some("implements") => {
                     self.edges = true;
-                    self.adjacency.heritage.implements = true;
+                    self.adjacency.types.implements = true;
                 }
                 Some(
                     "imports" | "aliases" | "declares" | "contains" | "overrides" | "reads"
@@ -142,20 +142,22 @@ impl SemanticInventory {
                         Some("references") => self.adjacency.references = true,
                         Some("hasType") => {
                             self.edges = true;
-                            self.adjacency.type_uses = true;
+                            self.adjacency.types.definitions = true;
                         }
                         Some("extends") => {
                             self.edges = true;
-                            self.adjacency.heritage.extends = true;
+                            self.adjacency.types.extends = true;
                         }
                         Some("implements") => {
                             self.edges = true;
-                            self.adjacency.heritage.implements = true;
+                            self.adjacency.types.implements = true;
                         }
                         Some(
                             "imports" | "aliases" | "declares" | "contains" | "overrides" | "reads"
                             | "writes",
-                        ) => self.edges = true,
+                        ) => {
+                            self.edges = true;
+                        }
                         Some("usages") => {
                             self.occurrences.get_or_insert_default();
                         }

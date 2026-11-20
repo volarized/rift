@@ -26,7 +26,10 @@ use super::exact::{exact_request, selected_release};
 use super::installed::InstalledTarget;
 
 mod flows;
+mod inventory;
 pub(super) use flows::{AcquiredFlows, FlowAcquisition};
+pub(crate) use inventory::EngineInventoryCache;
+use inventory::InventoryRead;
 
 const REQUESTS_MAX: u64 = 64;
 const RECORDS_MAX: u64 = 10_000;
@@ -43,9 +46,50 @@ pub(super) struct AcquiredAdjacency {
     view: Option<CapturedView>,
     warnings: Vec<ReadWarning>,
     incomplete: bool,
+    partial: bool,
 }
 
 impl AcquiredAdjacency {
+    fn admit_inventory(&mut self, read: &InventoryRead) -> Result<(), RiftError> {
+        let maximum = GraphLimits::default().triples_max();
+        if self.local_edges.len().saturating_add(read.records) > maximum {
+            return Err(coverage_failure());
+        }
+        self.partial |= read.partial;
+        self.edge_facts.extend(read.edge_facts.iter().cloned());
+        self.local.extend(read.local.iter().cloned());
+        self.local_edges.extend(read.local_edges.iter().cloned());
+        for (seed, calls) in &read.calls {
+            self.edge_facts.extend(calls.edges.iter().cloned());
+            for (target, ranges) in &calls.local {
+                self.local
+                    .extend(ranges.iter().cloned().map(|source| QueryOccurrence {
+                        target: target.clone(),
+                        enclosing: Some(seed.clone()),
+                        source,
+                        kind: EdgeKind::Calls,
+                    }));
+            }
+            self.local_edges.extend(
+                calls
+                    .local
+                    .iter()
+                    .map(|(target, _)| (seed.clone(), SymbolRelation::Calls, target.clone())),
+            );
+        }
+        for warning in &read.warnings {
+            if !self.warnings.contains(warning) {
+                self.warnings.push(warning.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether part of a whole inventory is missing while every acquired fact stands.
+    pub(super) const fn is_partial(&self) -> bool {
+        self.partial
+    }
+
     fn capture_edge_inventory(
         &mut self,
         reads: &rift_server::ReadService,
@@ -409,218 +453,6 @@ impl AcquiredAdjacency {
 }
 
 impl RiftMcp {
-    pub(super) async fn acquire_semantic_inventory(
-        &self,
-        resolved: &ResolvedWorkspace,
-        required: rift_search::sparql::SemanticInventory,
-        deadline: RequestDeadline,
-    ) -> Result<AcquiredAdjacency, RiftError> {
-        let reads = &resolved.published.reads;
-        let engines = self.engine_pool_for(&resolved.published).await;
-        let captured_only = !reads.uses_edge_engines(&engines);
-        let full_adjacency = required.complete_adjacency
-            && (required.adjacency.calls
-                || required.adjacency.references
-                || required.occurrences.is_some());
-        let resolved_adjacency = required.adjacency.calls
-            || required.adjacency.references
-            || required.adjacency.type_uses
-            || required.adjacency.heritage.extends
-            || required.adjacency.heritage.implements
-            || required.occurrences.is_some();
-        if (captured_only && !full_adjacency) || !resolved_adjacency {
-            let mut acquired = AcquiredAdjacency::default();
-            acquired.capture_edge_inventory(reads, required)?;
-            return Ok(acquired);
-        }
-        let mut acquired = if required.adjacency.calls
-            || required.adjacency.references
-            || required.occurrences.is_some()
-        {
-            self.acquire_engine_inventory(resolved, required, &engines, deadline)
-                .await?
-        } else {
-            let mut acquired = AcquiredAdjacency::default();
-            acquired.capture_edge_inventory(reads, required)?;
-            acquired
-        };
-        if required.adjacency.type_uses {
-            self.acquire_type_inventory(resolved, &engines, deadline, &mut acquired)
-                .await?;
-        }
-        if required.adjacency.heritage.extends || required.adjacency.heritage.implements {
-            self.acquire_heritage_inventory(
-                resolved,
-                required.adjacency.heritage,
-                &engines,
-                deadline,
-                &mut acquired,
-            )
-            .await?;
-        }
-        if !self
-            .engine_tree_matches(&resolved.published)
-            .await
-            .map_err(|_| coverage_failure())?
-        {
-            return Err(coverage_failure());
-        }
-        Ok(acquired)
-    }
-
-    async fn acquire_engine_inventory(
-        &self,
-        resolved: &ResolvedWorkspace,
-        required: rift_search::sparql::SemanticInventory,
-        engines: &rift_server::EnginePool,
-        deadline: RequestDeadline,
-    ) -> Result<AcquiredAdjacency, RiftError> {
-        let reads = &resolved.published.reads;
-        let context = reads.dependency_context();
-        if resolved.stale.is_some() || context.is_degraded() || !context.entries().is_empty() {
-            return Err(coverage_failure());
-        }
-        let references = required.adjacency.references || required.occurrences.is_some();
-        let enclosing = required.adjacency.references
-            || required.occurrences.is_some_and(|usage| usage.enclosing);
-        let operations = u64::from(required.adjacency.calls) + u64::from(references);
-        let maximum = usize::try_from(REQUESTS_MAX / operations.max(1)).unwrap_or(usize::MAX);
-        let capture = Arc::clone(reads);
-        let seeds = self
-            .blocking
-            .run("semantic inventory seeds", move || {
-                capture
-                    .local_search_view_input(true)?
-                    .semantic_seeds(maximum)
-            })
-            .await?;
-        let end = deadline.walk_end(resolved.capture_elapsed);
-        let mut acquired = AcquiredAdjacency::default();
-        if required.edges {
-            acquired.capture_edge_inventory(reads, required)?;
-        }
-        let mut remaining = usize::try_from(RECORDS_MAX).unwrap_or(usize::MAX);
-        let roots = rift_server::CalleeRoots::default();
-        for seed in seeds {
-            if references {
-                let references = Box::pin(rift_server::graph_references(
-                    reads, engines, &seed, enclosing, end,
-                ))
-                .await?;
-                if !references.complete {
-                    return Err(coverage_failure());
-                }
-                remaining = remaining
-                    .checked_sub(references.occurrences.len())
-                    .ok_or_else(coverage_failure)?;
-                acquired.edge_facts.extend(references.edges);
-                acquired.admit_references(&seed, references.occurrences);
-            }
-            if required.adjacency.calls {
-                let calls = Box::pin(rift_server::graph_calls(
-                    reads,
-                    engines,
-                    &roots,
-                    &seed,
-                    TraversalDirection::Outgoing,
-                    end,
-                ))
-                .await?;
-                if !calls.complete {
-                    return Err(coverage_failure());
-                }
-                if !calls.packages.is_empty() {
-                    return Err(coverage_failure());
-                }
-                acquired.edge_facts.extend(calls.edges);
-                for (target, occurrences) in calls.local {
-                    remaining = remaining
-                        .checked_sub(1 + occurrences.len())
-                        .ok_or_else(coverage_failure)?;
-                    acquired
-                        .local_edges
-                        .push((seed.clone(), SymbolRelation::Calls, target));
-                }
-            }
-        }
-        Ok(acquired)
-    }
-
-    async fn acquire_type_inventory(
-        &self,
-        resolved: &ResolvedWorkspace,
-        engines: &rift_server::EnginePool,
-        deadline: RequestDeadline,
-        acquired: &mut AcquiredAdjacency,
-    ) -> Result<(), RiftError> {
-        let reads = &resolved.published.reads;
-        let report = Box::pin(rift_server::graph_type_uses(
-            reads,
-            engines,
-            deadline.walk_end(resolved.capture_elapsed),
-        ))
-        .await?;
-        acquired.incomplete |= !report.complete;
-        acquired.warnings.extend(report.edge_warnings);
-        acquired.edge_facts.extend(report.edges);
-        for occurrence in report.occurrences {
-            if acquired.local_edges.len() == usize::try_from(RECORDS_MAX).unwrap_or(usize::MAX) {
-                return Err(coverage_failure());
-            }
-            if let Some(caller) = occurrence.enclosing {
-                acquired
-                    .local_edges
-                    .push((caller, SymbolRelation::HasType, occurrence.target));
-            }
-        }
-        Ok(())
-    }
-
-    async fn acquire_heritage_inventory(
-        &self,
-        resolved: &ResolvedWorkspace,
-        required: rift_search::sparql::SemanticHeritage,
-        engines: &rift_server::EnginePool,
-        deadline: RequestDeadline,
-        acquired: &mut AcquiredAdjacency,
-    ) -> Result<(), RiftError> {
-        let reads = &resolved.published.reads;
-        let kinds = [
-            (required.extends, EdgeKind::Extends),
-            (required.implements, EdgeKind::Implements),
-        ]
-        .into_iter()
-        .filter_map(|(selected, kind)| selected.then_some(kind))
-        .collect::<Vec<_>>();
-        let (edges, warnings) = Box::pin(rift_server::graph_heritage_inventory(
-            reads,
-            engines,
-            &kinds,
-            usize::try_from(REQUESTS_MAX).unwrap_or(usize::MAX),
-            deadline.walk_end(resolved.capture_elapsed),
-        ))
-        .await?;
-        acquired.incomplete |= warnings
-            .iter()
-            .any(|warning| matches!(warning, ReadWarning::EngineAnalysisUnavailable { .. }));
-        acquired.warnings.extend(warnings);
-        if acquired.local_edges.len().saturating_add(edges.len())
-            > usize::try_from(RECORDS_MAX).unwrap_or(usize::MAX)
-        {
-            return Err(coverage_failure());
-        }
-        for edge in edges {
-            let [kind] = edge.kinds.as_slice() else {
-                return Err(coverage_failure());
-            };
-            acquired
-                .local_edges
-                .push((edge.from.clone(), relation(*kind)?, edge.to.clone()));
-            acquired.edge_facts.push(edge);
-        }
-        Ok(())
-    }
-
     pub(super) async fn acquire_adjacency(
         &self,
         resolved: &ResolvedWorkspace,
@@ -778,52 +610,12 @@ impl<'request> AdjacencyWalk<'request> {
         let deadline = self.deadline.walk_end(self.resolved.capture_elapsed);
         match (direction, self.step.kind) {
             (TraversalDirection::Incoming, EdgeKind::References) => {
-                let references = Box::pin(rift_server::graph_references(
-                    reads,
-                    engines,
-                    seed,
-                    self.selected
-                        .is_some_and(AdjacencySelection::requires_enclosing),
-                    deadline,
-                ))
-                .await;
-                let references = match references {
-                    Ok(references) => references,
-                    Err(error)
-                        if error.slug() == errors::server::search_coverage_unavailable::SLUG =>
-                    {
-                        self.acquired.incomplete = true;
-                        return Ok(());
-                    }
-                    Err(error) => return Err(error),
-                };
-                self.acquired.incomplete |= !references.complete;
-                self.acquired.edge_facts.extend(references.edges);
-                self.acquired.warnings.extend(references.edge_warnings);
-                let occurrences = references.occurrences;
-                charge_records(&mut self.remaining, occurrences.len())?;
-                frontier.extend(occurrences.iter().filter_map(|item| item.enclosing.clone()));
-                self.acquired.admit_references(seed, occurrences);
+                self.incoming_references(seed, frontier).await?;
             }
             (TraversalDirection::Outgoing, EdgeKind::References) => {
-                let references = Box::pin(rift_server::outgoing_reference_edges(
-                    reads, engines, seed, deadline,
-                ))
-                .await?;
-                self.acquired.incomplete |= !references.complete;
-                self.acquired.warnings.extend(references.edge_warnings);
-                self.acquired.edge_facts.extend(references.edges);
-                charge_records(&mut self.remaining, references.occurrences.len())?;
-                for occurrence in references.occurrences {
-                    frontier.insert(occurrence.target.clone());
-                    self.acquired.local_edges.push((
-                        seed.clone(),
-                        SymbolRelation::References,
-                        occurrence.target.clone(),
-                    ));
-                    self.acquired.local.push(occurrence);
-                }
+                self.outgoing_references(seed, frontier).await?;
             }
+            (_, EdgeKind::HasType) => self.type_step(seed, frontier).await?,
             (_, EdgeKind::Calls) => self.edge_call_step(seed, frontier).await?,
             (_, kind @ (EdgeKind::Extends | EdgeKind::Implements)) => {
                 let (edges, warnings) = Box::pin(rift_server::graph_heritage_edges(
@@ -855,6 +647,135 @@ impl<'request> AdjacencyWalk<'request> {
         Ok(())
     }
 
+    async fn type_step(
+        &mut self,
+        seed: &SymbolId,
+        frontier: &mut BTreeSet<SymbolId>,
+    ) -> Result<(), RiftError> {
+        let direction = self.step.direction;
+        let selected = (direction == TraversalDirection::Outgoing).then_some(seed);
+        let deadline = self.deadline.walk_end(self.resolved.capture_elapsed);
+        let inventory = Box::pin(self.server.inventory_for_kind(
+            self.resolved,
+            EdgeKind::HasType,
+            selected,
+            None,
+            deadline,
+        ))
+        .await?;
+        self.acquired.incomplete |= inventory.partial;
+        self.acquired
+            .warnings
+            .extend(inventory.warnings.iter().cloned());
+        self.acquired.edge_facts.extend(
+            inventory
+                .edge_facts
+                .iter()
+                .filter(|edge| {
+                    edge.kinds.contains(&EdgeKind::HasType)
+                        && match direction {
+                            TraversalDirection::Outgoing => &edge.from == seed,
+                            TraversalDirection::Incoming => &edge.to == seed,
+                        }
+                })
+                .cloned(),
+        );
+        self.edge_static_step(seed, EdgeKind::HasType, frontier)?;
+        for (from, kind, to) in inventory.edges(seed, SymbolRelation::HasType, direction) {
+            charge_records(&mut self.remaining, 1)?;
+            frontier.insert(match direction {
+                TraversalDirection::Outgoing => to.clone(),
+                TraversalDirection::Incoming => from.clone(),
+            });
+            self.acquired
+                .local_edges
+                .push((from.clone(), *kind, to.clone()));
+        }
+        Ok(())
+    }
+
+    async fn incoming_references(
+        &mut self,
+        seed: &SymbolId,
+        frontier: &mut BTreeSet<SymbolId>,
+    ) -> Result<(), RiftError> {
+        let reads = &self.resolved.published.reads;
+        let (engines, _) = self.local.as_ref().ok_or_else(coverage_failure)?;
+        let deadline = self.deadline.walk_end(self.resolved.capture_elapsed);
+        let references = Box::pin(rift_server::graph_references(
+            reads,
+            engines,
+            seed,
+            self.selected
+                .is_some_and(AdjacencySelection::requires_enclosing),
+            deadline,
+        ))
+        .await;
+        let references = match references {
+            Ok(references) => references,
+            Err(error) if error.slug() == errors::server::search_coverage_unavailable::SLUG => {
+                self.acquired.incomplete = true;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        self.acquired.incomplete |= !references.complete;
+        self.acquired.edge_facts.extend(references.edges);
+        self.acquired.warnings.extend(references.edge_warnings);
+        let occurrences = references.occurrences;
+        charge_records(&mut self.remaining, occurrences.len())?;
+        frontier.extend(occurrences.iter().filter_map(|item| item.enclosing.clone()));
+        self.acquired.admit_references(seed, occurrences);
+        Ok(())
+    }
+
+    async fn outgoing_references(
+        &mut self,
+        seed: &SymbolId,
+        frontier: &mut BTreeSet<SymbolId>,
+    ) -> Result<(), RiftError> {
+        let deadline = self.deadline.walk_end(self.resolved.capture_elapsed);
+        let inventory = Box::pin(self.server.inventory_for_kind(
+            self.resolved,
+            EdgeKind::References,
+            None,
+            self.selected.map_or(
+                Some(rift_search::sparql::OccurrenceSelection {
+                    source: false,
+                    enclosing: true,
+                }),
+                |selected| selected.occurrences,
+            ),
+            deadline,
+        ))
+        .await?;
+        self.acquired.incomplete |= inventory.partial;
+        self.acquired
+            .warnings
+            .extend(inventory.warnings.iter().cloned());
+        self.acquired.edge_facts.extend(
+            inventory
+                .edge_facts
+                .iter()
+                .filter(|edge| edge.kinds.contains(&EdgeKind::References) && &edge.from == seed)
+                .cloned(),
+        );
+        if let Some(indices) = inventory.outgoing_references.get(seed) {
+            charge_records(&mut self.remaining, indices.len())?;
+            for index in indices {
+                let occurrence = inventory.local[*index].clone();
+                frontier.insert(occurrence.target.clone());
+                self.acquired.local_edges.push((
+                    seed.clone(),
+                    SymbolRelation::References,
+                    occurrence.target.clone(),
+                ));
+                self.acquired.local.push(occurrence);
+            }
+        }
+        Ok(())
+    }
+
     async fn edge_call_step(
         &mut self,
         seed: &SymbolId,
@@ -882,6 +803,22 @@ impl<'request> AdjacencyWalk<'request> {
                 deadline,
             ))
             .await
+        } else if direction == TraversalDirection::Outgoing
+            && !self.configuration.enabled
+            && self.selected.is_some()
+        {
+            let inventory = Box::pin(self.server.inventory_for_kind(
+                self.resolved,
+                EdgeKind::Calls,
+                Some(seed),
+                None,
+                deadline,
+            ))
+            .await?;
+            self.acquired
+                .warnings
+                .extend(inventory.warnings.iter().cloned());
+            Ok(inventory.calls.get(seed).cloned().unwrap_or_default())
         } else {
             Box::pin(rift_server::graph_calls(
                 reads, engines, roots, seed, direction, deadline,
@@ -909,6 +846,7 @@ impl<'request> AdjacencyWalk<'request> {
             // The unnamed dependency does not erase independently established
             // local calls. Only a positive ASK witness can use incomplete adjacency.
             self.acquired.incomplete = true;
+            calls.packages.clear();
         }
         self.admit_local_calls(seed, calls, frontier)?;
         Ok(())

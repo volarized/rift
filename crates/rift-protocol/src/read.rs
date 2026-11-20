@@ -1642,8 +1642,9 @@ pub enum ReadWarning {
     },
     /// A language engine serves the seed's language, and this read carries none of its
     /// edges: the engine answered about bytes the served revision does not carry, answered
-    /// more than the walk's symbol bound holds, or was still analyzing when
-    /// `[server] readiness_timeout` was spent. The indexed edges stand; whatever
+    /// more than the walk's symbol bound holds, was still analyzing when
+    /// `[server] readiness_timeout` was spent, or a whole-inventory query selected more
+    /// declarations than the engine requests one query sends. The indexed edges stand; whatever
     /// the engine resolves on top of them is missing. The warning states that an engine's
     /// analysis is absent from this answer; it never states that the seed has no such
     /// neighbor. An engine still analyzing keeps loading, and a later read, served from a

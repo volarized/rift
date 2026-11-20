@@ -1,6 +1,7 @@
 //! Exercises the public SPARQL route against authored bytes and a real embedded engine.
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 
 use crate::workspace_client::{TestResult, query, query_after_population, served_workspace};
 use rift_protocol::query::{QueryLanguage, QueryParams};
@@ -13,6 +14,42 @@ const SOURCE: &str = "def graph_root() -> int:\n    return graph_leaf() + graph_
     def graph_mid() -> int:\n    return graph_leaf() + graph_root()\n\n\
     def graph_leaf() -> int:\n    return 1\n\n\
     def graph_orphan() -> int:\n    return 0\n";
+
+#[tokio::test]
+async fn engine_inventory_resolves_inferred_calls_past_sixty_four_declarations() -> TestResult {
+    let mut source = String::from(
+        "class Worker:\n    def perform(self) -> int:\n        return 1\n\ndef worker() -> Worker:\n    return Worker()\n",
+    );
+    for index in 0..80 {
+        write!(
+            source,
+            "\ndef caller_{index}() -> int:\n    return worker().perform()\n"
+        )?;
+    }
+    let (_directory, client, _server_task) = served_workspace(
+        &[("pyproject.toml", METADATA), ("graph.py", &source)],
+        Some(CONFIGURATION.to_owned()),
+    )
+    .await?;
+    let answer = query_after_population(
+        &client,
+        &QueryParams {
+            query: "SELECT ?from ?to WHERE { ?s :calls ?t . ?s :name ?from . ?t :name ?to FILTER(?to = 'perform') }".to_owned(),
+            max_results: 100,
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert_eq!(named_pairs(&answer, "from", "to")?.len(), 80, "{answer}");
+    let occurrences = query_after_population(&client, &QueryParams {
+        query: "SELECT ?caller ?u { ?caller :calls ?target . ?target :name 'perform'; :usages ?u . ?u :of ?caller; :kind 'calls' }".to_owned(),
+        max_results: 100,
+        ..Default::default()
+    }).await?;
+    assert_eq!(occurrences["pagination"]["total"], 80, "{occurrences}");
+    client.cancel().await?;
+    Ok(())
+}
 
 async fn statement(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
@@ -44,6 +81,166 @@ async fn identity(
         return Err(format!("expected one symbol: {answer}").into());
     };
     Ok(query::iri(row, "symbol")?.to_owned())
+}
+
+#[tokio::test]
+async fn an_anchored_call_read_keeps_local_edges_beside_unaddressed_callees() -> TestResult {
+    let source = "def leaf() -> int:\n    return 1\n\ndef root() -> int:\n    print('root')\n    return leaf()\n";
+    let (_directory, client, _server_task) = served_workspace(
+        &[("pyproject.toml", METADATA), ("graph.py", source)],
+        Some(CONFIGURATION.to_owned()),
+    )
+    .await?;
+    let root = identity(&client, "root").await?;
+    let query = format!("SELECT ?to {{ <{root}> :calls ?target . ?target :name ?to }}");
+    let answer = statement(&client, query).await?;
+    assert!(
+        query::rows(&answer)?
+            .iter()
+            .any(|row| query::literal(row, "to").is_ok_and(|name| name == "leaf")),
+        "{answer}"
+    );
+    assert!(
+        warning_codes(&answer).contains("edge_coverage_missing"),
+        "{answer}"
+    );
+    let count = statement(
+        &client,
+        format!("SELECT (COUNT(?t) AS ?n) {{ <{root}> :calls ?t }}"),
+    )
+    .await?;
+    assert_eq!(count["reason"], "insufficient_coverage", "{count}");
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn engine_calls_cover_value_initializers_and_module_statements() -> TestResult {
+    let source = "class Worker:\n    def perform(self) -> int:\n        return 1\n\ndef worker() -> Worker:\n    return Worker()\n\nresult = worker().perform()\nworker().perform()\n";
+    let (_directory, client, _server_task) = served_workspace(
+        &[("pyproject.toml", METADATA), ("graph.py", source)],
+        Some(CONFIGURATION.to_owned()),
+    )
+    .await?;
+    let calls = statement(
+        &client,
+        "SELECT ?from ?to { ?s :calls ?t . ?s :name ?from . ?t :name ?to; :name 'perform' }",
+    )
+    .await?;
+    assert_eq!(calls["pagination"]["total"], 2, "{calls}");
+    assert!(
+        named_pairs(&calls, "from", "to")?.contains(&("result", "perform")),
+        "{calls}"
+    );
+    let result = identity(&client, "result").await?;
+    let anchored = statement(
+        &client,
+        format!("ASK {{ <{result}> :calls ?target . ?target :name 'perform' }}"),
+    )
+    .await?;
+    assert_eq!(
+        anchored["answer"],
+        json!({"result":"boolean", "value":true}),
+        "{anchored}"
+    );
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn engine_inventory_follows_source_and_configuration_changes() -> TestResult {
+    let source = "class First:\n    pass\n\nclass Second:\n    pass\n\ndef make() -> First:\n    return First()\n\nvalue = make()\n";
+    let (directory, client, _server_task) = served_workspace(
+        &[("pyproject.toml", METADATA), ("graph.py", source)],
+        Some(CONFIGURATION.to_owned()),
+    )
+    .await?;
+    let query = "SELECT ?type { ?s :name 'value'; :hasType ?t . ?t :name ?type }";
+    let first = statement(&client, query).await?;
+    assert_eq!(
+        query::literal(&query::rows(&first)?[0], "type")?,
+        "First",
+        "{first}"
+    );
+    std::fs::write(
+        directory.path().join("graph.py"),
+        source
+            .replace("-> First", "-> Second")
+            .replace("return First()", "return Second()"),
+    )?;
+    let second = statement(&client, query).await?;
+    assert_eq!(
+        query::literal(&query::rows(&second)?[0], "type")?,
+        "Second",
+        "{second}"
+    );
+    let configuration = std::fs::read_to_string(directory.path().join("rift.toml"))?;
+    std::fs::write(
+        directory.path().join("rift.toml"),
+        configuration.replace("[languages.python.lsp]\nembedded='ty'\n", ""),
+    )?;
+    let without_engine = statement(&client, query).await?;
+    assert!(query::rows(&without_engine)?.is_empty(), "{without_engine}");
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn engine_inventory_keeps_inferred_types_and_declared_heritage() -> TestResult {
+    let source = "class Parent:\n    pass\n\nclass Child(Parent):\n    pass\n\nclass Grandchild(Child):\n    pass\n\ndef make() -> Child:\n    return Child()\n\nvalue = make()\n";
+    let (_directory, client, _server_task) = served_workspace(
+        &[("pyproject.toml", METADATA), ("graph.py", source)],
+        Some(CONFIGURATION.to_owned()),
+    )
+    .await?;
+    let _value = identity(&client, "value").await?;
+    let types = statement(
+        &client,
+        "SELECT ?from ?to { ?s :hasType ?t . ?s :name ?from . ?t :name ?to }",
+    )
+    .await?;
+    assert!(
+        named_pairs(&types, "from", "to")?.contains(&("value", "Child")),
+        "{types}"
+    );
+    let child = identity(&client, "Child").await?;
+    let incoming = statement(
+        &client,
+        format!("ASK {{ ?value :name 'value'; :hasType <{child}> }}"),
+    )
+    .await?;
+    assert_eq!(
+        incoming["answer"],
+        json!({"result":"boolean", "value":true}),
+        "{incoming}"
+    );
+    let heritage = statement(
+        &client,
+        "SELECT ?from ?to { ?s :extends ?t . ?s :name ?from . ?t :name ?to }",
+    )
+    .await?;
+    assert!(
+        named_pairs(&heritage, "from", "to")?.contains(&("Child", "Parent")),
+        "{heritage}"
+    );
+    assert!(
+        !named_pairs(&heritage, "from", "to")?.contains(&("Grandchild", "Parent")),
+        "{heritage}"
+    );
+    assert!(
+        !named_pairs(&heritage, "from", "to")?.contains(&("value", "Parent")),
+        "{heritage}"
+    );
+    let value = identity(&client, "value").await?;
+    let parent = identity(&client, "Parent").await?;
+    let absent = statement(&client, format!("ASK {{ <{value}> :extends <{parent}> }}")).await?;
+    assert_eq!(
+        absent["answer"],
+        json!({"result":"boolean", "value":false}),
+        "{absent}"
+    );
+    client.cancel().await?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -299,5 +496,229 @@ async fn assert_edge_provider(
             assert!(rows.is_empty(), "{answer}");
         }
     }
+    Ok(())
+}
+
+fn warning_codes(answer: &Value) -> BTreeSet<&str> {
+    answer["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|warning| warning["code"].as_str())
+        .collect()
+}
+
+fn named_pairs<'a>(
+    answer: &'a Value,
+    from: &str,
+    to: &str,
+) -> TestResult<BTreeSet<(&'a str, &'a str)>> {
+    query::rows(answer)?
+        .iter()
+        .map(|row| Ok((query::literal(row, from)?, query::literal(row, to)?)))
+        .collect()
+}
+
+/// An unresolved framework in one package of the workspace leaves every captured
+/// declaration in place, so the symbol inventory answers and names the framework
+/// condition instead of refusing (#759).
+#[tokio::test]
+async fn an_unresolved_framework_reports_a_warning_beside_the_symbol_inventory() -> TestResult {
+    let (_directory, client, _server_task) = served_workspace(
+        &[
+            ("package.json", "{\"name\":\"core\",\"version\":\"1.0.0\"}"),
+            (
+                "src/core.ts",
+                "export function construct_core(): number {\n  return 1;\n}\n",
+            ),
+            (
+                "docs/package.json",
+                "{\"name\":\"docs\",\"devDependencies\":{\"tailwindcss\":\"^4.0.0\"}}",
+            ),
+            (
+                "docs/layout.tsx",
+                "export function DocsLayout() {\n  return <div className=\"flex\" />;\n}\n",
+            ),
+        ],
+        None,
+    )
+    .await?;
+    let inventory = query_after_population(
+        &client,
+        &QueryParams {
+            query: "SELECT ?name WHERE { ?s a :Symbol; :name ?name }".to_owned(),
+            max_results: 100,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let names: BTreeSet<_> = query::rows(&inventory)?
+        .iter()
+        .map(|row| query::literal(row, "name"))
+        .collect::<Result<_, _>>()?;
+    assert!(
+        names.contains("construct_core") && names.contains("DocsLayout"),
+        "{inventory}"
+    );
+    assert!(
+        warning_codes(&inventory).contains("framework_context_unresolved"),
+        "{inventory}"
+    );
+    client.cancel().await?;
+    Ok(())
+}
+
+const DEPENDENT_METADATA: &str = "[project]\nname='graph-app'\nversion='0.1.0'\ndependencies=['greeting']\n[build-system]\nrequires=['setuptools==80.9.0']\nbuild-backend='setuptools.build_meta'\n[tool.setuptools]\npy-modules=['app']\n";
+const DEPENDENT_SOURCE: &str = "from greeting.core import greet\n\n\
+    def app_helper() -> str:\n    return 'rift'\n\n\
+    def app_caller() -> str:\n    return greet(app_helper())\n";
+
+/// Captured static calls and references answer an inventory query in a project whose
+/// dependency context names packages, and what the engine could not add is a warning,
+/// not a refusal (#760).
+#[tokio::test]
+async fn captured_calls_answer_an_inventory_beside_a_dependency_context() -> TestResult {
+    let (_directory, client, _server_task) = served_workspace(
+        &[
+            ("pyproject.toml", DEPENDENT_METADATA),
+            (
+                "uv.lock",
+                "version = 1\n[[package]]\nname='graph-app'\nversion='0.1.0'\nsource={editable='.'}\n[[package]]\nname='greeting'\nversion='1.0.0'\nsource={registry='https://pypi.org/simple'}\n",
+            ),
+            ("app.py", DEPENDENT_SOURCE),
+        ],
+        Some(CONFIGURATION.to_owned()),
+    )
+    .await?;
+    for (relation, statement) in [
+        (
+            "calls",
+            "SELECT ?from ?to WHERE { ?s :calls ?t . ?s :name ?from . ?t :name ?to }",
+        ),
+        (
+            "references",
+            "SELECT ?from ?to WHERE { ?s :references ?t . ?s :name ?from . ?t :name ?to }",
+        ),
+    ] {
+        let answer = query_after_population(
+            &client,
+            &QueryParams {
+                query: statement.to_owned(),
+                max_results: 100,
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert!(
+            named_pairs(&answer, "from", "to")?.contains(&("app_caller", "app_helper")),
+            "{relation}: {answer}"
+        );
+    }
+    client.cancel().await?;
+    Ok(())
+}
+
+/// A failed engine keeps the captured call inventory and names the missing analysis (#760).
+#[tokio::test]
+async fn captured_calls_answer_an_inventory_when_the_engine_is_unavailable() -> TestResult {
+    let mut source = String::from("def bound_leaf() -> int:\n    return 1\n");
+    for index in 0..80 {
+        source.push_str(
+            &[
+                "\ndef bound_caller_",
+                &index.to_string(),
+                "() -> int:\n    return bound_leaf()\n",
+            ]
+            .concat(),
+        );
+    }
+    let (_directory, client, _server_task) = served_workspace(
+        &[("pyproject.toml", METADATA), ("graph.py", &source)],
+        Some("[languages.python.lsp]\ncommand = ['rift-test-missing-engine']\n".to_owned()),
+    )
+    .await?;
+    let answer = query_after_population(
+        &client,
+        &QueryParams {
+            query: "SELECT ?from ?to WHERE { ?s :calls ?t . ?s :name ?from . ?t :name ?to }"
+                .to_owned(),
+            max_results: 100,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let pairs = named_pairs(&answer, "from", "to")?;
+    assert_eq!(pairs.len(), 80, "{answer}");
+    assert!(
+        pairs.contains(&("bound_caller_79", "bound_leaf")),
+        "{answer}"
+    );
+    assert!(
+        warning_codes(&answer).contains("engine_analysis_unavailable"),
+        "{answer}"
+    );
+    let count = statement(&client, "SELECT (COUNT(?t) AS ?n) WHERE { ?s :calls ?t }").await?;
+    assert_eq!(count["outcome"], "unavailable", "{count}");
+    assert_eq!(count["reason"], "insufficient_coverage", "{count}");
+    assert!(
+        warning_codes(&count).contains("engine_analysis_unavailable"),
+        "{count}"
+    );
+    client.cancel().await?;
+    Ok(())
+}
+
+/// A file left out of the index makes the symbol inventory partial: the captured symbols
+/// answer with the warning that names the file, and a question whose answer claims an
+/// absence refuses with the same warning.
+#[tokio::test]
+async fn a_left_out_file_makes_the_symbol_inventory_partial_but_answered() -> TestResult {
+    let (_directory, client, _server_task) = served_workspace(
+        &[
+            ("pyproject.toml", METADATA),
+            ("graph.py", SOURCE),
+            ("blob.py", "held = 1\0\n"),
+        ],
+        None,
+    )
+    .await?;
+    let inventory = statement(
+        &client,
+        "SELECT ?name WHERE { ?s a :Symbol; :name ?name } ORDER BY ?name",
+    )
+    .await?;
+    assert_eq!(
+        inventory["pagination"]["total"]
+            .as_u64()
+            .map(|total| total > 0),
+        Some(true),
+        "{inventory}"
+    );
+    assert!(
+        warning_codes(&inventory).contains("source_unavailable"),
+        "{inventory}"
+    );
+    for absent in [
+        "SELECT ?s WHERE { ?s a :Symbol; :name 'held' }",
+        "ASK { ?s a :Symbol; :name 'held' }",
+        "SELECT (COUNT(?s) AS ?n) WHERE { ?s a :Symbol }",
+    ] {
+        let answer = statement(&client, absent).await?;
+        assert_eq!(
+            answer["reason"], "insufficient_coverage",
+            "{absent}: {answer}"
+        );
+        assert!(
+            warning_codes(&answer).contains("source_unavailable"),
+            "{absent}: {answer}"
+        );
+    }
+    let witness = statement(&client, "ASK { ?s a :Symbol; :name 'graph_leaf' }").await?;
+    assert_eq!(
+        witness["answer"],
+        json!({"result":"boolean", "value":true}),
+        "{witness}"
+    );
+    client.cancel().await?;
     Ok(())
 }

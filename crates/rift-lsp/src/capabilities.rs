@@ -32,6 +32,15 @@ pub struct EdgeCapabilities {
     pub type_hierarchy: bool,
 }
 
+/// Advertised declaration and inferred type definition operations.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DefinitionCapabilities {
+    /// Whether the engine resolves source positions to declarations.
+    pub definition: bool,
+    /// Whether the engine resolves a symbol's inferred type to its declaration.
+    pub type_definition: bool,
+}
+
 /// What one engine advertised at initialize.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Capabilities {
@@ -42,6 +51,8 @@ pub struct Capabilities {
     /// Whether the engine serves `textDocument/prepareCallHierarchy` and
     /// `callHierarchy/outgoingCalls`.
     pub call_hierarchy: bool,
+    /// Advertised declaration and inferred type definition operations.
+    pub definitions: DefinitionCapabilities,
     /// Advertised implementation and type hierarchy operations.
     pub edges: EdgeCapabilities,
     /// Whether the engine serves `textDocument/diagnostic`.
@@ -57,6 +68,7 @@ impl Default for Capabilities {
             position_encoding: PositionEncoding::Utf16,
             references: false,
             call_hierarchy: false,
+            definitions: DefinitionCapabilities::default(),
             edges: EdgeCapabilities::default(),
             pull_diagnostics: false,
             diagnostic_identifier: None,
@@ -125,6 +137,18 @@ impl Capabilities {
             position_encoding,
             references,
             call_hierarchy,
+            definitions: DefinitionCapabilities {
+                definition: match advertised.definition_provider {
+                    Some(OneOf::Left(served)) => served,
+                    Some(OneOf::Right(_)) => true,
+                    None => false,
+                },
+                type_definition: match advertised.type_definition_provider {
+                    Some(lsp_types::TypeDefinitionProviderCapability::Simple(served)) => served,
+                    Some(lsp_types::TypeDefinitionProviderCapability::Options(_)) => true,
+                    None => false,
+                },
+            },
             edges: EdgeCapabilities {
                 implementation: match advertised.implementation_provider {
                     Some(lsp_types::ImplementationProviderCapability::Simple(served)) => served,
@@ -203,6 +227,8 @@ pub fn offered() -> ClientCapabilities {
         text_document: Some(TextDocumentClientCapabilities {
             references: Some(ReferenceClientCapabilities::default()),
             implementation: Some(lsp_types::GotoCapability::default()),
+            type_definition: Some(lsp_types::GotoCapability::default()),
+            definition: Some(lsp_types::GotoCapability::default()),
             type_hierarchy: Some(lsp_types::TypeHierarchyClientCapabilities::default()),
             call_hierarchy: Some(CallHierarchyClientCapabilities::default()),
             diagnostic: Some(DiagnosticClientCapabilities {

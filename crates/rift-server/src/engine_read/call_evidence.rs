@@ -17,6 +17,7 @@ use super::{CallCorroboration, CallDestination, CallProvider, GraphCalls};
 pub(super) async fn confirm_reference_sites(
     reads: &ReadService,
     engines: &crate::EnginePool,
+    seed: &SymbolId,
     mut calls: GraphCalls,
     deadline: tokio::time::Instant,
 ) -> GraphCalls {
@@ -49,6 +50,9 @@ pub(super) async fn confirm_reference_sites(
                 calls.edge_warnings.push(warning);
             }
         }
+        let Some(provider) = report.edges.first().map(|edge| edge.provider) else {
+            continue;
+        };
         let positions = report
             .occurrences
             .into_iter()
@@ -75,9 +79,13 @@ pub(super) async fn confirm_reference_sites(
                 provider: CallProvider::EngineReferences,
                 agrees: true,
             };
-            calls
-                .local
-                .push((target.clone(), vec![record.authored.clone()]));
+            calls.push_local(
+                seed,
+                target.clone(),
+                vec![confirmed.authored.clone()],
+                TraversalDirection::Outgoing,
+                provider,
+            );
             calls.corroboration.push(confirmed);
         }
     }

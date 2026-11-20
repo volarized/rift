@@ -74,3 +74,23 @@ async fn test_edge_advertised_operations_preserve_locations_and_hierarchy_items(
     let _stderr = session.shutdown().await;
     join(engine).await;
 }
+
+#[tokio::test]
+async fn type_definition_batch_preserves_link_selection_ranges() {
+    let (_workspace, mut session, engine) = started(|mut engine| async move {
+        engine.handshake(json!({"typeDefinitionProvider": true})).await;
+        let (id, _) = engine.expect_request("textDocument/typeDefinition").await;
+        let range = json!({"start":{"line":2,"character":6},"end":{"line":2,"character":10}});
+        engine.respond(&id, json!([{"targetUri":"file:///workspace/types.py", "targetRange":range, "targetSelectionRange":range}])).await;
+        let (id, _) = engine.expect_request("shutdown").await;
+        engine.respond(&id, serde_json::Value::Null).await;
+        assert_eq!(engine.next_message().await["method"], "exit");
+    }).await;
+    let answer = session
+        .type_definition_batch(&[(path("value.py"), Position::new(0, 0))])
+        .await
+        .expect("type definition");
+    assert_eq!(answer[0][0].range.start, Position::new(2, 6));
+    session.shutdown().await;
+    join(engine).await;
+}

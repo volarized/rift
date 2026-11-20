@@ -15,6 +15,7 @@ use rift_protocol::symbol_read::{CapturedView, SymbolUnavailableReason};
 use rift_search::sparql::{
     AdjacencySelection, GraphDataset, GraphLimits, GraphQuery, QueryCancellation, SemanticInventory,
 };
+use rift_server::InventoryCoverage;
 
 use super::{RiftMcp, read_failure};
 use crate::output::{Json, QueryDisplay, QueryOutput, ToolFailure};
@@ -26,6 +27,7 @@ pub(crate) mod retrieval;
 
 use super::super::RequestDeadline;
 use edges::AcquiredAdjacency;
+pub(crate) use edges::EngineInventoryCache;
 
 /// Settings and presentation retained with one query execution.
 pub(crate) struct QueryPageOptions<'a> {
@@ -382,7 +384,7 @@ fn project_retrievals(
         };
         let (flows, partial) = flows.finish(limit, warnings);
         if partial {
-            if flows.paths.is_empty() || !query.projects_flow_rows() {
+            if flows.paths.is_empty() || !query.admits_partial_rows() {
                 return Ok(ProjectedRetrievals::Unavailable);
             }
             coverage = ProjectedRetrievals::Partial;
@@ -434,8 +436,8 @@ fn project_semantic_inventory(
     dataset: &mut rift_search::sparql::GraphDatasetBuilder,
     cancellation: &QueryCancellation,
     deadline: std::time::Instant,
-) -> Result<(), RiftError> {
-    input.project_symbols(
+) -> Result<InventoryCoverage, RiftError> {
+    let coverage = input.project_symbols(
         rift_search::sparql::SymbolSelection::All,
         dataset,
         cancellation,
@@ -446,7 +448,84 @@ fn project_semantic_inventory(
         input,
         required.edges || required.adjacency.references || required.adjacency.calls,
         required.occurrences,
+    )?;
+    Ok(if acquired.is_partial() {
+        InventoryCoverage::Partial
+    } else {
+        coverage
+    })
+}
+
+/// Whether a symbol selection reads the captured inventory rather than one identity.
+const fn reads_inventory(selection: rift_search::sparql::SymbolSelection<'_>) -> bool {
+    !matches!(
+        selection,
+        rift_search::sparql::SymbolSelection::Identified(_)
     )
+}
+
+/// What a projection that reads the captured inventory, or one exact selection, reads from.
+#[derive(Clone, Copy)]
+struct InventoryProjection<'read> {
+    query: &'read GraphQuery,
+    input: &'read rift_server::LocalSymbolViewInput,
+    reads: &'read rift_server::ReadService,
+    acquired: &'read AcquiredAdjacency,
+    local_semantics: Option<SemanticInventory>,
+    exact: Option<&'read exact::ExactFacts>,
+}
+
+/// Projects the local facts a query without an adjacency selection reads. Returns the
+/// inventory's coverage when the projection read the captured inventory rather than one
+/// exact selection or identity.
+fn project_inventory(
+    projection: InventoryProjection<'_>,
+    dataset: &mut rift_search::sparql::GraphDatasetBuilder,
+    cancellation: &QueryCancellation,
+    deadline: std::time::Instant,
+) -> Result<Option<InventoryCoverage>, RiftError> {
+    let InventoryProjection {
+        query,
+        input,
+        reads,
+        acquired,
+        local_semantics,
+        exact,
+    } = projection;
+    if let Some(required) = local_semantics {
+        return project_semantic_inventory(
+            input,
+            acquired,
+            required,
+            dataset,
+            cancellation,
+            deadline,
+        )
+        .map(Some);
+    }
+    if let Some(exact) = exact {
+        exact.project(dataset)?;
+        return Ok(None);
+    }
+    if let Some(selection) = query.syntax_element_selection() {
+        let coverage =
+            input.project_syntax_elements(reads, selection, dataset, cancellation, deadline)?;
+        return Ok(reads_inventory(selection.symbols).then_some(coverage));
+    }
+    if let Some(selection) = query.symbol_selection() {
+        let coverage = input.project_symbols(selection, dataset, cancellation, deadline)?;
+        return Ok(reads_inventory(selection).then_some(coverage));
+    }
+    Ok(None)
+}
+
+/// Whether an answer claims an absence: no rows, no triples, or a false `ASK`.
+fn claims_absence(answer: &QueryAnswer) -> bool {
+    match answer {
+        QueryAnswer::Bindings { bindings, .. } => bindings.is_empty(),
+        QueryAnswer::Graph { triples } => triples.is_empty(),
+        QueryAnswer::Boolean { value } => !value,
+    }
 }
 
 fn constrain_provider_expiry<'view>(
@@ -489,11 +568,18 @@ impl AcquiredGraph {
             configuration,
             mut warnings,
         } = self;
-        if acquired.is_incomplete() && !query.admits_partial_witness() {
-            return Ok(incomplete_flows(warnings).into());
+        if acquired.is_incomplete() {
+            warnings.push(ReadWarning::EdgeCoverageMissing {
+                kinds: Vec::new(),
+                detail: "the selected edge read is incomplete, so edges outside its captured and engine coverage are missing from this answer".to_owned(),
+            });
+            if !query.admits_partial_rows() && !query.admits_partial_witness() {
+                return Ok(insufficient_coverage(warnings).into());
+            }
         }
         let input = reads.local_search_view_input(true)?;
         let mut dataset = GraphDataset::builder(limits);
+        let mut inventory = InventoryCoverage::Complete;
         if let Some(selected) = &selected {
             if let Err(error) = acquired.project(&mut dataset, selected, &input) {
                 if lacks_coverage(&error) {
@@ -512,36 +598,38 @@ impl AcquiredGraph {
                 cancellation,
                 deadline.at().into_std(),
             )?;
-        } else if let Some(required) = local_semantics {
-            project_semantic_inventory(
-                &input,
-                &acquired,
-                required,
+        } else {
+            let inventory_read = project_inventory(
+                InventoryProjection {
+                    query,
+                    input: &input,
+                    reads: &reads,
+                    acquired: &acquired,
+                    local_semantics,
+                    exact: exact.as_ref(),
+                },
                 &mut dataset,
                 cancellation,
                 deadline.at().into_std(),
             )?;
-        } else if let Some(exact) = &exact {
-            exact.project(&mut dataset)?;
-        } else if let Some(selection) = query.syntax_element_selection() {
-            input.project_syntax_elements(
-                &reads,
-                selection,
-                &mut dataset,
-                cancellation,
-                deadline.at().into_std(),
-            )?;
-        } else if let Some(selection) = query.symbol_selection() {
-            input.project_symbols(
-                selection,
-                &mut dataset,
-                cancellation,
-                deadline.at().into_std(),
-            )?;
+            if let Some(read) = inventory_read {
+                inventory = read;
+                for warning in input.warnings()? {
+                    if !warnings.contains(&warning) {
+                        warnings.push(warning);
+                    }
+                }
+            }
         }
         let coverage = project_retrievals(query, &mut retrieved, &mut dataset, &mut warnings)?;
         if coverage == ProjectedRetrievals::Unavailable {
-            return Ok(incomplete_flows(warnings).into());
+            return Ok(insufficient_coverage(warnings).into());
+        }
+        let partial = acquired.is_incomplete()
+            || coverage == ProjectedRetrievals::Partial
+            || inventory == InventoryCoverage::Partial;
+        if partial && !query.admits_partial_rows() && !query.admits_partial_witness() {
+            return Ok(insufficient_coverage(warnings).into());
         }
         if query.names_local_graph() {
             if selected.is_some() {
@@ -552,12 +640,12 @@ impl AcquiredGraph {
         let Some(answer) =
             evaluate_acquired_query(&dataset.build(), query, cancellation, &acquired)?
         else {
-            return Ok(query_unavailable(SymbolUnavailableReason::InsufficientCoverage).into());
+            return Ok(insufficient_coverage(warnings).into());
         };
-        if coverage == ProjectedRetrievals::Partial
-            && matches!(&answer, QueryAnswer::Bindings { bindings, .. } if bindings.is_empty())
-        {
-            return Ok(incomplete_flows(warnings).into());
+        // Over partial coverage an empty answer would claim an absence the missing facts may
+        // contradict, so it refuses with the warnings that name what is missing.
+        if partial && claims_absence(&answer) {
+            return Ok(insufficient_coverage(warnings).into());
         }
         let views = views.get().ok_or_else(retention_failure)?;
         let retention = QueryRetention {
@@ -661,10 +749,10 @@ fn evaluate_acquired_query(
     acquired: &AcquiredAdjacency,
 ) -> Result<Option<QueryAnswer>, RiftError> {
     let answer: QueryAnswer = dataset.evaluate(query, cancellation)?.into();
-    Ok(
-        (!acquired.is_incomplete() || matches!(answer, QueryAnswer::Boolean { value: true }))
-            .then_some(answer),
-    )
+    Ok((!acquired.is_incomplete()
+        || matches!(answer, QueryAnswer::Boolean { value: true })
+        || (query.admits_partial_rows() && !claims_absence(&answer)))
+    .then_some(answer))
 }
 
 /// Selects one fixed-size answer page within the accepted response byte bound.
@@ -753,7 +841,7 @@ fn query_unavailable(reason: SymbolUnavailableReason) -> QueryReadResult {
     QueryReadResult::Unavailable(unavailable(reason))
 }
 
-fn incomplete_flows(warnings: Vec<ReadWarning>) -> QueryReadResult {
+fn insufficient_coverage(warnings: Vec<ReadWarning>) -> QueryReadResult {
     QueryReadResult::Unavailable(SearchUnavailable::Unavailable {
         reason: SymbolUnavailableReason::InsufficientCoverage,
         view: None,

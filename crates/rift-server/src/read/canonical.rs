@@ -25,6 +25,27 @@ pub struct LocalSymbolViewInput {
     expires: Option<SystemTime>,
 }
 
+/// How much of the selected captured symbol inventory one projection holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InventoryCoverage {
+    /// Every source selected for indexing contributed its declarations.
+    Complete,
+    /// Some selected sources are left out of the index or hold declarations without an
+    /// established identity; the captured warnings name them. Every projected fact stands.
+    Partial,
+}
+
+impl InventoryCoverage {
+    /// The coverage of two projections read together.
+    #[must_use]
+    pub const fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Complete, Self::Complete) => Self::Complete,
+            _ => Self::Partial,
+        }
+    }
+}
+
 impl LocalSymbolViewInput {
     /// Attaches encoded query material to the existing view and byte bounds.
     ///
@@ -143,7 +164,45 @@ impl LocalSymbolViewInput {
         Ok(seeds)
     }
 
+    /// Collects every established canonical declaration for a captured inventory read,
+    /// with the coverage of the inventory they come from.
+    ///
+    /// A source left out of the index, a declaration without an established identity, and a
+    /// language whose identities are incomplete each make the inventory partial; the
+    /// declarations that are established still answer.
+    ///
+    /// # Errors
+    /// Returns the captured publication failure.
+    pub fn inventory_seeds(
+        &self,
+    ) -> Result<(Vec<rift_protocol::read::SymbolId>, InventoryCoverage), RiftError> {
+        let index = &self.material.index;
+        let mut coverage = if self.ready
+            && index.objects_complete()
+            && index.unestablished_objects().next().is_none()
+        {
+            InventoryCoverage::Complete
+        } else {
+            InventoryCoverage::Partial
+        };
+        let mut seeds = Vec::new();
+        for (id, object) in index.objects() {
+            let object = object?;
+            let facts = object.facts();
+            if !index.identity_coverage_complete(facts.language()) {
+                coverage = InventoryCoverage::Partial;
+            }
+            seeds.push(rift_protocol::read::SymbolId(id.as_str().to_owned()));
+        }
+        Ok((seeds, coverage))
+    }
+
     /// Projects captured symbol facts for a query whose algebra requires only symbols.
+    ///
+    /// An identified symbol answers exactly or refuses: its absence is a claim only complete
+    /// coverage of its language makes. A named or whole inventory projects every captured
+    /// object and reports [`InventoryCoverage::Partial`] when some selected source is left
+    /// out of the index.
     ///
     /// # Errors
     /// Returns the captured publication failure or a graph admission refusal.
@@ -153,7 +212,7 @@ impl LocalSymbolViewInput {
         dataset: &mut rift_search::sparql::GraphDatasetBuilder,
         cancellation: &rift_search::sparql::QueryCancellation,
         deadline: std::time::Instant,
-    ) -> Result<(), RiftError> {
+    ) -> Result<InventoryCoverage, RiftError> {
         use rift_search::sparql::{GraphFact, RevisionIri, SymbolAddress, SymbolSelection};
 
         if !self.ready {
@@ -200,13 +259,14 @@ impl LocalSymbolViewInput {
                     .operation("graph symbol acquisition")
                     .fail();
             }
-            return check();
+            check()?;
+            return Ok(InventoryCoverage::Complete);
         }
-        if !index.objects_complete() {
-            return errors::server::search_coverage_unavailable()
-                .operation("graph symbol acquisition")
-                .fail();
-        }
+        let coverage = if index.objects_complete() {
+            InventoryCoverage::Complete
+        } else {
+            InventoryCoverage::Partial
+        };
         for (identity, symbol) in index.objects() {
             check()?;
             let identity = rift_protocol::read::SymbolId(identity.as_str().to_owned());
@@ -225,10 +285,12 @@ impl LocalSymbolViewInput {
                 SymbolAddress::Unestablished(contribution.reference()),
             )?;
         }
-        check()
+        check()?;
+        Ok(coverage)
     }
 
-    /// Projects the revision-pinned syntax read of each selected canonical declaration.
+    /// Projects the revision-pinned syntax read of each selected canonical declaration,
+    /// with the coverage [`Self::project_symbols`] reports for the selected symbols.
     ///
     /// # Errors
     /// Returns a syntax read or graph admission refusal before completing the projection.
@@ -239,11 +301,11 @@ impl LocalSymbolViewInput {
         dataset: &mut rift_search::sparql::GraphDatasetBuilder,
         cancellation: &rift_search::sparql::QueryCancellation,
         deadline: std::time::Instant,
-    ) -> Result<(), RiftError> {
+    ) -> Result<InventoryCoverage, RiftError> {
         use rift_protocol::read::{FacetsParams, SymbolId};
         use rift_search::sparql::SymbolAddress;
 
-        self.project_symbols(selection.symbols, dataset, cancellation, deadline)?;
+        let coverage = self.project_symbols(selection.symbols, dataset, cancellation, deadline)?;
         for (identity, symbol) in self.material.index.objects() {
             check_graph_projection(cancellation, deadline)?;
             let id = SymbolId(identity.as_str().to_owned());
@@ -276,7 +338,7 @@ impl LocalSymbolViewInput {
                 request.page += 1;
             }
         }
-        Ok(())
+        Ok(coverage)
     }
 
     /// Root of the immutable publication admitted by this input.
