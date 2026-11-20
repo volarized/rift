@@ -115,15 +115,17 @@ async fn python_inventory_names_dependency_calls_heritage_references_and_types()
     Ok(())
 }
 
-#[tokio::test]
-async fn python_inventory_names_observed_standard_library_targets() -> TestResult {
-    let directory = tempfile::tempdir()?;
-    let root = directory.path().canonicalize()?;
-    installed_python_workspace(&root)?;
+pub(super) fn observed_python_environment(root: &Path) -> TestResult {
     let home = root.join("base/bin");
     std::fs::create_dir_all(&home)?;
     std::fs::write(home.join("python3.12"), "")?;
-    for path in ["base/lib/python3.12", "base/Lib", "base/bin/Lib"] {
+    for path in [
+        "base/lib/python3.12",
+        "base/Lib",
+        "base/bin/Lib",
+        ".venv/lib/python3.12/site-packages",
+        ".venv/Lib/site-packages",
+    ] {
         std::fs::create_dir_all(root.join(path))?;
     }
     std::fs::write(
@@ -141,6 +143,15 @@ async fn python_inventory_names_observed_standard_library_targets() -> TestResul
             std::fs::read_to_string(&project)?
         ),
     )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn python_inventory_names_observed_standard_library_targets() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().canonicalize()?;
+    installed_python_workspace(&root)?;
+    observed_python_environment(&root)?;
     std::fs::write(
         root.join("app.py"),
         "class Buffer(list):\n    pass\n\ndef size():\n    return len([])\n\ndef numbers(value: list[int]) -> list[int]:\n    return value\n",

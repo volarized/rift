@@ -2150,7 +2150,7 @@ async fn search_traversal_outgoing_over_an_unavailable_global_api_drops_package_
 }
 
 /// Captured runtime sources name targets without a global collection, beside local calls.
-/// Negative answers still require the missing provider coverage.
+/// Known calls support negative answers; uncaptured continuations remain incomplete.
 #[tokio::test]
 async fn search_calls_keep_local_and_captured_runtime_targets_without_a_global_collection()
 -> TestResult {
@@ -2196,15 +2196,25 @@ async fn search_calls_keep_local_and_captured_runtime_targets_without_a_global_c
         ]),
         "{answer}"
     );
-    for query in [
-        format!("ASK {{ <{caller}> :calls <rift://symbol/local/python/absent> }}"),
-        format!("ASK {{ <{caller}> :calls ?t FILTER NOT EXISTS {{ ?t :calls ?other }} }}"),
-    ] {
-        let answer =
-            call_retrying_acceptance(&client, tool_request("search", &json!({"query":query})))
-                .await?;
-        assert_eq!(answer["reason"], "insufficient_coverage", "{answer}");
-    }
+    let absent = call_retrying_acceptance(
+        &client,
+        tool_request("search", &json!({"query":format!("ASK {{ <{caller}> :calls <rift://symbol/local/python/absent> }}")})),
+    )
+    .await?;
+    assert_eq!(
+        absent["answer"],
+        json!({"result":"boolean","value":false}),
+        "{absent}"
+    );
+    let continuation = call_retrying_acceptance(
+        &client,
+        tool_request("search", &json!({"query":format!("ASK {{ <{caller}> :calls ?t FILTER NOT EXISTS {{ ?t :calls ?other }} }}")})),
+    )
+    .await?;
+    assert_eq!(
+        continuation["reason"], "insufficient_coverage",
+        "{continuation}"
+    );
     client.cancel().await?;
     Ok(())
 }

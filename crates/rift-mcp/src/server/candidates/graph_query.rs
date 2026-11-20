@@ -1028,7 +1028,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         crate::server::hermetic_workspace(
             directory.path(),
-            "[languages.toml]\nenabled = false\n[languages.python]\nstdlib = false\n[languages.python.lsp]\nembedded = 'ty'\n",
+            "[global]\nenabled = false\n[languages.toml]\nenabled = false\n[languages.python]\nstdlib = false\n[languages.python.lsp]\nembedded = 'ty'\n",
         )?;
         std::fs::write(
             directory.path().join("pyproject.toml"),
@@ -1043,6 +1043,7 @@ mod tests {
             "from helper import beacon\n\nbeacon()\n\ndef caller() -> int:\n    return beacon() + beacon()\n\ncaller()\n",
         )?;
         let root = directory.path().canonicalize()?;
+        dependency_inventory::observed_python_environment(&root)?;
         let server =
             RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
         let count = server

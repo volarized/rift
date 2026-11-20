@@ -1276,7 +1276,7 @@ async fn outgoing_walks_over_scripted_engines_match_the_served_schemas() -> Test
 /// A named runtime call remains schema-valid beside a warning for missing edge coverage.
 #[cfg(unix)]
 #[tokio::test]
-async fn a_runtime_walk_with_missing_edge_coverage_matches_the_served_schema() -> TestResult {
+async fn a_runtime_walk_with_captured_sources_matches_the_served_schema() -> TestResult {
     let global = GlobalFixture::start_with(global_api::FixtureOptions {
         python_collection: true,
         ..global_api::FixtureOptions::default()
@@ -1324,9 +1324,9 @@ async fn a_runtime_walk_with_missing_edge_coverage_matches_the_served_schema() -
     assert!(
         structured["warnings"]
             .as_array()
-            .is_some_and(|warnings| warnings
-                .iter()
-                .any(|warning| warning["code"] == "edge_coverage_missing")),
+            .into_iter()
+            .flatten()
+            .all(|warning| warning["code"] != "edge_coverage_missing"),
         "{structured}"
     );
     client.cancel().await?;
