@@ -295,3 +295,25 @@ fn test_python_callable_aliases_store_calls_and_class_bases() {
     );
     assert!(index.edges().is_complete());
 }
+
+#[test]
+fn test_python_bare_decorators_store_calls() {
+    let source = "def decorate(fn=None): return fn\n@decorate\ndef bare(): return 1\n@decorate()\ndef called(): return 2\nclass Owner:\n    @property\n    def value(self): return 1\n";
+    let (_directory, index) = build(&[("main.py", source)]);
+    for (from, spelling) in [("main/bare", "decorate"), ("main/called", "decorate()")] {
+        assert_eq!(
+            stored(&index, source, "calls", from, "main/decorate").as_deref(),
+            Some(spelling),
+            "{from}: {:?}",
+            index.edges()
+        );
+    }
+    assert!(
+        index
+            .edges()
+            .edges()
+            .filter(|edge| edge.kind().as_ref() == "calls")
+            .all(|edge| edge.to().as_str() == "rift://symbol/local/python/main/decorate")
+    );
+    assert!(index.edges().is_complete());
+}

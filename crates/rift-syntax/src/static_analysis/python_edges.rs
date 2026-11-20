@@ -129,6 +129,19 @@ impl EdgePythonKinds {
                     .calls
                     .push(call(syntax_element, callee, self.edge_callee(callee)?)?);
             }
+        } else if id == self.decorator {
+            // A decorator written without arguments is called with the decorated definition.
+            if let Some(expression) = syntax_element
+                .named_children(&mut syntax_element.walk())
+                .find(|element| !element.is_extra())
+                .filter(|expression| {
+                    [self.identifier, self.attribute].contains(&expression.kind_id())
+                })
+            {
+                facts
+                    .calls
+                    .push(call(expression, expression, self.edge_callee(expression)?)?);
+            }
         } else if self.definitions.contains(&id) {
             self.edge_definition(visited, facts)?;
         } else if self.imports.contains(&id) {

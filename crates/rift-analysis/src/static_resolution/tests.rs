@@ -13,6 +13,7 @@ const WORK_MAX: usize = 10_000;
 
 mod python_aliases;
 mod python_ancestry;
+mod python_decorators;
 mod python_imports;
 mod python_overloads;
 

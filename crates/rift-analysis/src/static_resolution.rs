@@ -270,6 +270,10 @@ impl<'source> File<'source> {
                 if !work.charge() {
                     return None;
                 }
+                if call.range == call.callee_range {
+                    // A bare decorator application is no call expression inside a receiver.
+                    continue;
+                }
                 self.python_calls
                     .entry(call.range.start)
                     .or_default()
