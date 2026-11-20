@@ -129,6 +129,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn navigation_keeps_standard_library_definition_locations() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path();
+        let file = root.join("app.py");
+        std::fs::write(&file, "def size():\n    return len([])\n").expect("source");
+        let params = json!({"textDocument":{"uri":super::super::path_to_uri(&file).expect("URI")},"position":{"line":1,"character":12}});
+        let answer = super::super::with_database(root, |database, canonical_root| {
+            definitions(
+                database,
+                &Exchange {
+                    spelled_root: root,
+                    canonical_root,
+                    sent_text: None,
+                },
+                &params,
+            )
+        })
+        .expect("definition");
+        assert_eq!(
+            answer[0]["uri"], "vendored://stdlib/builtins.pyi",
+            "{answer}"
+        );
+        assert_ne!(answer[0]["range"]["start"], Value::Null, "{answer}");
+    }
+
+    #[test]
     fn inferred_instance_type_names_its_local_class() {
         let directory = tempfile::tempdir().expect("workspace");
         let root = directory.path();

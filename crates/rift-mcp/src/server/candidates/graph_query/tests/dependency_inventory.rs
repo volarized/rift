@@ -115,6 +115,51 @@ async fn python_inventory_names_dependency_calls_heritage_references_and_types()
     Ok(())
 }
 
+#[tokio::test]
+async fn python_inventory_names_observed_standard_library_targets() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().canonicalize()?;
+    installed_python_workspace(&root)?;
+    let home = root.join("base/bin");
+    std::fs::create_dir_all(&home)?;
+    std::fs::write(home.join("python3.12"), "")?;
+    for path in ["base/lib/python3.12", "base/Lib", "base/bin/Lib"] {
+        std::fs::create_dir_all(root.join(path))?;
+    }
+    std::fs::write(
+        root.join(".venv/pyvenv.cfg"),
+        format!(
+            "home = {}\nimplementation = CPython\nversion_info = 3.12.3\n",
+            home.display()
+        ),
+    )?;
+    let project = root.join("pyproject.toml");
+    std::fs::write(
+        &project,
+        format!(
+            "{}\n[tool.ty.environment]\npython = '.venv'\n",
+            std::fs::read_to_string(&project)?
+        ),
+    )?;
+    std::fs::write(
+        root.join("app.py"),
+        "class Buffer(list):\n    pass\n\ndef size():\n    return len([])\n\ndef numbers(value: list[int]) -> list[int]:\n    return value\n",
+    )?;
+    let server = RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
+    for (kind, name) in [
+        ("calls", "len"),
+        ("references", "len"),
+        ("extends", "list"),
+        ("has_type", "list"),
+    ] {
+        let ids = targets(&server, kind, "engine").await?;
+        let expected = format!("rift://symbol/stdlib/cpython/python/builtins/{name}");
+        assert!(ids.contains(&expected), "{kind}: {ids:?}");
+    }
+    server.engine_pool().await.shutdown().await;
+    Ok(())
+}
+
 #[cfg(unix)]
 pub(in crate::server::candidates::graph_query) fn recorded_rust_workspace(
     root: &Path,

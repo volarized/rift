@@ -748,28 +748,31 @@ fn open_file(database: &mut ProjectDatabase, file: File) {
     }
 }
 
-/// One reference target as a `file://` URI and UTF-8 range; `None` for a
-/// target outside the filesystem, such as a vendored stub. The canonical
-/// workspace prefix swaps back to the root spelling the session addressed,
-/// so an answer echoes the caller's own paths, symlinked temp roots
-/// included.
+/// One reference target as a filesystem or vendored URI and UTF-8 range.
+/// The canonical workspace prefix swaps back to the root spelling the session
+/// addressed, so an answer echoes the caller's own paths, symlinked temp roots
+/// included. Other files establish no address.
 fn target_location(
     database: &ProjectDatabase,
     exchange: &Exchange<'_>,
     file: File,
     range: TextRange,
 ) -> Result<Option<(String, Value)>, AnswerRefusal> {
-    let Some(system_path) = file.path(database).as_system_path() else {
+    let path = file.path(database);
+    let uri = if let Some(vendored) = path.as_vendored_path() {
+        vendored_uri(vendored)
+    } else if let Some(system_path) = path.as_system_path() {
+        let spelled = system_path
+            .as_std_path()
+            .strip_prefix(exchange.canonical_root)
+            .map_or_else(
+                |_| system_path.as_std_path().to_path_buf(),
+                |relative| exchange.spelled_root.join(relative),
+            );
+        path_to_uri(&spelled)?
+    } else {
         return Ok(None);
     };
-    let spelled = system_path
-        .as_std_path()
-        .strip_prefix(exchange.canonical_root)
-        .map_or_else(
-            |_| system_path.as_std_path().to_path_buf(),
-            |relative| exchange.spelled_root.join(relative),
-        );
-    let uri = path_to_uri(&spelled)?;
     let text = source_text(database, file);
     let range = range_at(text.as_str(), range)?;
     Ok(Some((uri, range)))
