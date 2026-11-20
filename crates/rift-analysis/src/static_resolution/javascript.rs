@@ -27,6 +27,7 @@ pub(super) struct Scopes<'source> {
     pub(super) callables: crate::EnclosingDefinitions<&'source rift_syntax::SyntaxSymbol>,
     pub(super) functions: crate::EnclosingDefinitions<rift_syntax::ByteRange>,
     pub(super) blocks: crate::EnclosingDefinitions<rift_syntax::ByteRange>,
+    pub(super) deferred: crate::EnclosingDefinitions<rift_syntax::ByteRange>,
 }
 
 impl<'source> PackageModes<'source> {
@@ -151,10 +152,17 @@ impl<'source> Index<'source> {
                     work,
                 );
             }
-            let binding = js_binding(file, receiver.trim(), range.start, role, work)?;
+            let binding = js_binding(
+                file,
+                &self.javascript,
+                receiver.trim(),
+                range.start,
+                role,
+                work,
+            )?;
             return self.javascript_member(file, binding, member.trim(), role, work);
         }
-        let binding = js_binding(file, name, range.start, role, work)?;
+        let binding = js_binding(file, &self.javascript, name, range.start, role, work)?;
         self.javascript_binding_target(file, binding, role, work)
     }
 
@@ -186,6 +194,7 @@ impl<'source> Index<'source> {
                 } else {
                     let binding = js_binding(
                         file,
+                        &self.javascript,
                         receiver,
                         call.range.start,
                         rift_core::ReferenceRole::Call,
@@ -241,7 +250,9 @@ impl<'source> Index<'source> {
         work: &mut Work,
     ) -> Option<Target<'source>> {
         match binding.kind {
-            StaticBindingKind::Local => file.target_at(binding.name),
+            StaticBindingKind::Local | StaticBindingKind::JavaScriptInstance { .. } => {
+                file.target_at(binding.name)
+            }
             StaticBindingKind::JavaScriptImport { module, export } => {
                 let name = match export {
                     Some(range) => file.text(range)?,
@@ -276,6 +287,12 @@ impl<'source> Index<'source> {
         role: rift_core::ReferenceRole,
         work: &mut Work,
     ) -> Option<Target<'source>> {
+        if role != rift_core::ReferenceRole::Type
+            && let Some(&Some(annotation)) = file.declared_types.get(&binding.name)
+        {
+            let owner = self.javascript_declared_type(file, annotation, work)?;
+            return self.javascript_class_member(owner, member, MemberMode::Instance, role, work);
+        }
         match binding.kind {
             StaticBindingKind::JavaScriptEdgeNamespace { module } => self.javascript_export(
                 file,
@@ -426,6 +443,7 @@ pub(super) enum MemberMode {
 
 pub(super) fn js_binding<'source>(
     file: &File<'source>,
+    modes: &PackageModes<'source>,
     name: &str,
     position: u64,
     role: rift_core::ReferenceRole,
@@ -466,5 +484,12 @@ pub(super) fn js_binding<'source>(
         }
     }
     let binding = best?;
-    (!ambiguous && binding.available_from <= position).then_some(binding)
+    let deferred = modes
+        .scopes
+        .get(file.document.path.as_str())
+        .and_then(|scopes| scopes.deferred.resolve(position, position.checked_add(1)?))
+        .is_some_and(|function| !function.encloses(binding.name));
+    let available =
+        binding.available_from <= position || role == rift_core::ReferenceRole::Type || deferred;
+    (!ambiguous && available).then_some(binding)
 }

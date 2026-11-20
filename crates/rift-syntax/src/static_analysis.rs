@@ -194,6 +194,8 @@ pub struct StaticInherentImpl {
 pub struct StaticFactsParts {
     /// Value accesses and type references.
     pub references: Vec<StaticReference>,
+    /// Declaration names and their explicit named type annotations.
+    pub declared_types: Vec<(ByteRange, ByteRange)>,
     /// Runtime function expressions and their enclosing value ranges.
     pub function_values: Vec<(ByteRange, ByteRange)>,
     /// Function expressions that establish their own receiver.
@@ -230,6 +232,12 @@ impl StaticFacts {
     pub fn references(&self) -> &[StaticReference] {
         &self.0.references
     }
+    /// Declaration names and their explicit named type annotations.
+    #[must_use]
+    pub fn declared_types(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.declared_types
+    }
+
     /// Runtime function expressions and their enclosing value ranges.
     #[must_use]
     pub fn function_values(&self) -> &[(ByteRange, ByteRange)] {
@@ -320,6 +328,7 @@ impl StaticFacts {
     pub(crate) fn retained_bytes(&self) -> usize {
         [
             vector_capacity(&self.0.references),
+            vector_capacity(&self.0.declared_types),
             vector_capacity(&self.0.function_values),
             vector_capacity(&self.0.function_scopes),
             vector_capacity(&self.0.static_blocks),
@@ -344,9 +353,10 @@ impl StaticFacts {
         )
     }
 
-    pub(crate) fn validate(&self, source: &str, limits: SyntaxLimits) -> Result<(), RiftError> {
+    fn validate_counts(&self, limits: &SyntaxLimits) -> Result<(), RiftError> {
         let lengths = [
             self.references().len(),
+            self.declared_types().len(),
             self.function_values().len(),
             self.function_scopes().len(),
             self.static_blocks().len(),
@@ -373,6 +383,11 @@ impl StaticFacts {
         if components.is_none_or(|count| count > limits.syntax_elements_max()) {
             return errors::syntax::facts_count_exceeded().fail();
         }
+        Ok(())
+    }
+
+    pub(crate) fn validate(&self, source: &str, limits: SyntaxLimits) -> Result<(), RiftError> {
+        self.validate_counts(&limits)?;
         let valid = |range: ByteRange| {
             let start = usize::try_from(range.start).ok();
             let end = usize::try_from(range.end).ok();
@@ -410,6 +425,10 @@ impl StaticFacts {
             .reexports()
             .iter()
             .all(|row| valid(row.name) && valid(row.module) && valid(row.export));
+        let declared_types = self
+            .declared_types()
+            .iter()
+            .all(|(name, annotation)| valid(*name) && valid(*annotation));
         let assignments = self.assignments().iter().copied().all(valid);
         let unsupported = self.unsupported_bindings().iter().copied().all(valid);
         let implementations = self.inherent_impls().iter().all(|row| {
@@ -430,6 +449,7 @@ impl StaticFacts {
         let conditional = self.conditional_items().iter().copied().all(valid);
         if !(edges
             && references
+            && declared_types
             && functions
             && calls
             && bindings

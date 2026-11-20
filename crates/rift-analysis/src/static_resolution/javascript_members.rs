@@ -8,6 +8,9 @@ use rift_protocol::read::{EdgeKind, SymbolKind};
 use super::javascript::MemberMode;
 use super::{File, Index, Target, Work};
 
+/// Maximum aliases followed while resolving an explicit receiver type.
+const DECLARED_TYPE_DEPTH_MAX: u32 = 32;
+
 impl<'source> Index<'source> {
     pub(super) fn javascript_object_member(
         &self,
@@ -19,6 +22,25 @@ impl<'source> Index<'source> {
         for member in member.split('.').map(str::trim) {
             if !work.charge() {
                 return None;
+            }
+            let source = self.files.get(owner.file.path.as_str())?;
+            if role != ReferenceRole::Type
+                && let Some(annotation) = owner
+                    .symbol
+                    .name_range
+                    .and_then(|name| source.declared_types.get(&name))
+                    .copied()
+                    .flatten()
+            {
+                let declared = self.javascript_declared_type(source, annotation, work)?;
+                owner = self.javascript_class_member(
+                    declared,
+                    member,
+                    MemberMode::Instance,
+                    role,
+                    work,
+                )?;
+                continue;
             }
             if owner.symbol.kind == "class" {
                 owner =
@@ -40,6 +62,34 @@ impl<'source> Index<'source> {
                 file.qualified_target(&format!("{}.{}", owner.symbol.qualified_name, member))?;
         }
         Some(owner)
+    }
+
+    pub(super) fn javascript_declared_type(
+        &self,
+        file: &File<'source>,
+        annotation: rift_syntax::ByteRange,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let mut current = self.javascript_target(file, annotation, ReferenceRole::Type, work)?;
+        let mut visited = BTreeSet::new();
+        // Alias traversal shares the work budget and has a separate depth bound.
+        for _ in 0..DECLARED_TYPE_DEPTH_MAX {
+            if !work.charge()
+                || !visited.insert((current.file.path, current.symbol.qualified_name.as_str()))
+            {
+                return None;
+            }
+            if matches!(current.symbol.kind, "class" | "interface") {
+                return Some(current);
+            }
+            let source = self.files.get(current.file.path.as_str())?;
+            let annotation = source
+                .declared_types
+                .get(&current.symbol.name_range?)?
+                .as_ref()?;
+            current = self.javascript_target(source, *annotation, ReferenceRole::Type, work)?;
+        }
+        None
     }
 
     fn javascript_class_receiver(
@@ -137,7 +187,10 @@ impl<'source> Index<'source> {
                 continue;
             }
             let file = self.files.get(class.file.path.as_str())?;
-            if role == ReferenceRole::Call && file.assignments.may_replace_method(member) {
+            if role == ReferenceRole::Call
+                && class.symbol.kind != "interface"
+                && file.assignments.may_replace_method(member)
+            {
                 return None;
             }
             let target = file.javascript_declared_member(
@@ -231,9 +284,22 @@ impl<'source> File<'source> {
                 continue;
             }
             if let Some(previous) = found {
-                // A type member can have several signatures for one logical symbol.
-                if role != ReferenceRole::Type || symbol.kind != previous.symbol.kind {
+                if symbol.kind != previous.symbol.kind {
                     return None;
+                }
+                // Overload signatures share a member, but two bodies are ambiguous.
+                if role != ReferenceRole::Type {
+                    if symbol.kind != "method"
+                        || (symbol.body_range.is_some() && previous.symbol.body_range.is_some())
+                    {
+                        return None;
+                    }
+                    if symbol.body_range.is_some() {
+                        found = Some(Target {
+                            file: self.document,
+                            symbol,
+                        });
+                    }
                 }
             } else {
                 found = Some(Target {

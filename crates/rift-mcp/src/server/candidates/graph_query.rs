@@ -320,7 +320,7 @@ impl RiftMcp {
                     .await
             } else if let Some(required) = local_semantics {
                 Ok(Ok(self
-                    .acquire_semantic_inventory(resolved, required, limits, deadline)
+                    .acquire_semantic_inventory(resolved, required, deadline)
                     .await?))
             } else if query.symbol_selection().is_some()
                 || query.syntax_element_selection().is_some()
@@ -428,23 +428,32 @@ fn project_local_endpoints(
 }
 
 fn project_semantic_inventory(
+    reads: &rift_server::ReadService,
     input: &rift_server::LocalSymbolViewInput,
     acquired: &AcquiredAdjacency,
     required: SemanticInventory,
     dataset: &mut rift_search::sparql::GraphDatasetBuilder,
     cancellation: &QueryCancellation,
-    deadline: std::time::Instant,
+    deadline: RequestDeadline,
 ) -> Result<(), RiftError> {
-    input.project_symbols(
-        rift_search::sparql::SymbolSelection::All,
-        dataset,
-        cancellation,
-        deadline,
-    )?;
+    if required.symbols {
+        input.project_symbols(
+            rift_search::sparql::SymbolSelection::All,
+            dataset,
+            cancellation,
+            deadline.at().into_std(),
+        )?;
+    }
+    acquired.project_captured_inventory(dataset, input, reads, cancellation, deadline)?;
     acquired.project_local(
         dataset,
         input,
-        required.edges || required.adjacency.references || required.adjacency.calls,
+        rift_search::sparql::SemanticEdges {
+            relations: required.edges.relations
+                || required.adjacency.references
+                || required.adjacency.calls,
+            ..required.edges
+        },
         required.occurrences,
     )
 }
@@ -514,12 +523,13 @@ impl AcquiredGraph {
             )?;
         } else if let Some(required) = local_semantics {
             project_semantic_inventory(
+                &reads,
                 &input,
                 &acquired,
                 required,
                 &mut dataset,
                 cancellation,
-                deadline.at().into_std(),
+                deadline,
             )?;
         } else if let Some(exact) = &exact {
             exact.project(&mut dataset)?;
@@ -810,6 +820,53 @@ mod tests {
         assert_ne!(
             query_key(&serde, QueryLanguage::Sparql, &revision, 1)?,
             query_key(&tokio, QueryLanguage::Sparql, &revision, 1)?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn occurrence_inventory_does_not_project_unrequested_symbols_and_edges() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        crate::server::hermetic_workspace(directory.path(), "")?;
+        std::fs::write(
+            directory.path().join("entry.ts"),
+            "interface Value {}\ntype Alias = Value;\nconst unused = { first: 1, second: 2, third: 3 };\n",
+        )?;
+        let root = directory.path().canonicalize()?;
+        let server =
+            RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
+        let limits = GraphLimits::builder().triples_max(16).build()?;
+        let query = GraphQuery::parse(
+            "SELECT (COUNT(*) AS ?n) { ?target :usages ?usage }",
+            &limits,
+        )?;
+        let deadline = server.request_deadline().await;
+        let resolved = server
+            .published_workspace(super::super::super::wire::ErrorPhase::Read, deadline)
+            .await
+            .map_err(|failure| format!("{failure:?}"))?;
+        let revision = resolved.published.reads.served_revision()?;
+        let epoch = resolved.published.epoch;
+        let key = query_key(&query, QueryLanguage::Sparql, &revision, epoch)?;
+        let graph = server
+            .prepare_graph(resolved, &query, limits, deadline)
+            .await
+            .map_err(|failure| format!("{failure:?}"))?
+            .map_err(|reason| format!("{reason:?}"))?;
+        let output = graph.evaluate(
+            &query,
+            deadline,
+            &QueryCancellation::new(),
+            &server.local_views,
+            (1, 10),
+            key,
+        )?;
+        assert!(
+            matches!(&output.result, QueryReadResult::Results(result)
+                if matches!(&result.answer, QueryAnswer::Bindings { bindings, .. }
+                    if matches!(&bindings[0]["n"], rift_protocol::query::RdfTerm::Literal { value, .. } if value == "1"))),
+            "{:?}",
+            output.result
         );
         Ok(())
     }

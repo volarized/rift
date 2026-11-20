@@ -13,11 +13,17 @@ use crate::extract::byte_range;
 pub(super) struct Kinds {
     identifier: u16,
     property_identifier: u16,
+    shorthand: u16,
+    excluded_values: Vec<u16>,
     receivers: [u16; 2],
     private_property: u16,
     type_identifier: Option<u16>,
     nested_type: Option<u16>,
     type_parameter: Option<u16>,
+    annotation: Option<u16>,
+    generic: Option<u16>,
+    type_alias: Option<u16>,
+    type_field: Option<u16>,
     parameter_wrappers: Vec<u16>,
     patterns: [u16; 3],
     shorthand_pattern: u16,
@@ -100,20 +106,44 @@ fn edge_type_kinds(grammar: &tree_sitter::Language) -> Vec<u16> {
     .collect()
 }
 
+fn function_declaration_kinds(grammar: &tree_sitter::Language) -> [u16; 2] {
+    [
+        kind(grammar, "function_declaration"),
+        kind(grammar, "generator_function_declaration"),
+    ]
+}
+
+fn named_expression_kinds(grammar: &tree_sitter::Language) -> [u16; 3] {
+    [
+        kind(grammar, "function_expression"),
+        kind(grammar, "generator_function"),
+        kind(grammar, "class"),
+    ]
+}
+
+fn excluded_value_kinds(grammar: &tree_sitter::Language) -> Vec<u16> {
+    [
+        "import_statement",
+        "export_clause",
+        "namespace_export",
+        "type_query",
+        "nested_type_identifier",
+    ]
+    .into_iter()
+    .filter_map(|name| {
+        let kind = grammar.id_for_node_kind(name, true);
+        (kind != 0).then_some(kind)
+    })
+    .collect()
+}
+
 impl Kinds {
     fn resolve_edge(grammar: &tree_sitter::Language) -> Self {
         let id = |name| kind(grammar, name);
         let field = |name| field(grammar, name);
         let program = id("program");
-        let function = [
-            id("function_declaration"),
-            id("generator_function_declaration"),
-        ];
-        let named_expression = [
-            id("function_expression"),
-            id("generator_function"),
-            id("class"),
-        ];
+        let function = function_declaration_kinds(grammar);
+        let named_expression = named_expression_kinds(grammar);
         let arrow = id("arrow_function");
         let typescript = grammar.id_for_node_kind("type_identifier", true) != 0;
         let function_scopes = [
@@ -129,11 +159,17 @@ impl Kinds {
         Kinds {
             identifier: id("identifier"),
             property_identifier: id("property_identifier"),
+            shorthand: id("shorthand_property_identifier"),
+            excluded_values: excluded_value_kinds(grammar),
             receivers: [id("this"), id("super")],
             private_property: id("private_property_identifier"),
             type_identifier: typescript.then(|| id("type_identifier")),
             nested_type: typescript.then(|| id("nested_type_identifier")),
             type_parameter: typescript.then(|| id("type_parameter")),
+            annotation: typescript.then(|| id("type_annotation")),
+            generic: typescript.then(|| id("generic_type")),
+            type_alias: typescript.then(|| id("type_alias_declaration")),
+            type_field: typescript.then(|| field("type")),
             parameter_wrappers: if typescript {
                 vec![id("required_parameter"), id("optional_parameter")]
             } else {
@@ -213,6 +249,7 @@ impl Kinds {
     ) -> Result<(), RiftError> {
         let id = syntax_element.kind_id();
         self.record_reference(syntax_element, facts)?;
+        self.record_declared_type(syntax_element, facts)?;
         self.record_function(syntax_element, facts)?;
         if id == self.call {
             self.record_call(syntax_element, source, facts)?;
@@ -358,11 +395,16 @@ impl Kinds {
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
         let id = element.kind_id();
-        if id == self.member {
-            let parent = element.parent();
+        let lexical = [self.identifier, self.shorthand, self.shorthand_pattern].contains(&id)
+            && self.value_reference(element);
+        if id == self.member || lexical {
+            let access = self.access_target(element);
+            let parent = access.parent();
             let assigned = parent.is_some_and(|parent| {
-                self.assignment.contains(&parent.kind_id())
-                    && parent.child_by_field_id(self.left) == Some(element)
+                let assignment = self.assignment.contains(&parent.kind_id())
+                    || (parent.kind_id() == self.for_in
+                        && parent.child_by_field_id(self.loop_kind).is_none());
+                assignment && parent.child_by_field_id(self.left) == Some(access)
             });
             let updated = parent.is_some_and(|parent| parent.kind_id() == self.update);
             let augmented = parent.is_some_and(|parent| parent.kind_id() == self.assignment[1]);
@@ -394,6 +436,103 @@ impl Kinds {
                     role: rift_core::ReferenceRole::Type,
                 });
             }
+        }
+        Ok(())
+    }
+
+    fn value_reference(&self, element: Node<'_>) -> bool {
+        if enclosing(element, &self.excluded_values).is_some() {
+            return false;
+        }
+        let mut current = element;
+        while let Some(parent) = current.parent() {
+            let id = parent.kind_id();
+            if parent.child_by_field_id(self.name) == Some(current)
+                || id == self.parameters
+                || (id == self.arrow && parent.child_by_field_id(self.parameter) == Some(current))
+                || (self.parameter_wrappers.contains(&id)
+                    && self
+                        .pattern
+                        .and_then(|field| parent.child_by_field_id(field))
+                        == Some(current))
+                || (id == self.for_in
+                    && parent.child_by_field_id(self.loop_kind).is_some()
+                    && parent.child_by_field_id(self.left) == Some(current))
+            {
+                return false;
+            }
+            if !self.pattern_parent(current, parent) {
+                break;
+            }
+            current = parent;
+        }
+        true
+    }
+
+    fn pattern_parent(&self, child: Node<'_>, parent: Node<'_>) -> bool {
+        let id = parent.kind_id();
+        self.patterns.contains(&id)
+            || (id == self.pair_pattern && parent.child_by_field_id(self.value) == Some(child))
+            || (self.default_patterns.contains(&id)
+                && parent.child_by_field_id(self.left) == Some(child))
+    }
+
+    fn access_target<'tree>(&self, element: Node<'tree>) -> Node<'tree> {
+        let mut current = element;
+        while let Some(parent) = current.parent() {
+            if !self.pattern_parent(current, parent) {
+                break;
+            }
+            current = parent;
+        }
+        current
+    }
+
+    fn record_declared_type(
+        &self,
+        element: Node<'_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let name = element.child_by_field_id(self.name).or_else(|| {
+            self.pattern
+                .and_then(|field| element.child_by_field_id(field))
+        });
+        let annotation = if self.type_alias == Some(element.kind_id()) {
+            element.child_by_field_id(self.value)
+        } else {
+            self.type_field
+                .and_then(|field| element.child_by_field_id(field))
+        };
+        let Some((name, mut annotation)) = name.zip(annotation) else {
+            return Ok(());
+        };
+        if self.annotation == Some(annotation.kind_id()) {
+            let mut cursor = annotation.walk();
+            let Some(inner) = annotation
+                .named_children(&mut cursor)
+                .find(|child| !child.is_extra() && !child.is_missing())
+            else {
+                return Ok(());
+            };
+            annotation = inner;
+        }
+        if self.generic == Some(annotation.kind_id()) {
+            let Some(inner) = annotation.child_by_field_id(self.name) else {
+                return Ok(());
+            };
+            annotation = inner;
+        }
+        if name.is_missing() || annotation.is_missing() {
+            return Ok(());
+        }
+        if (self.type_identifier == Some(annotation.kind_id())
+            || self.nested_type == Some(annotation.kind_id()))
+            && ([self.identifier, self.property_identifier].contains(&name.kind_id())
+                || self.type_identifier == Some(name.kind_id()))
+        {
+            facts
+                .declared_types
+                .push((byte_range(name)?, byte_range(annotation)?));
         }
         Ok(())
     }
@@ -676,9 +815,9 @@ impl Kinds {
         } else if id == self.update {
             self.record_mutation(syntax_element, self.argument, facts)?;
         } else if id == self.for_in {
-            if syntax_element.child_by_field_id(self.loop_kind).is_some()
-                && let Some(left) = syntax_element.child_by_field_id(self.left)
-            {
+            if syntax_element.child_by_field_id(self.loop_kind).is_none() {
+                self.record_mutation(syntax_element, self.left, facts)?;
+            } else if let Some(left) = syntax_element.child_by_field_id(self.left) {
                 self.record_parameter(left, syntax_element, facts)?;
             }
         } else if id == self.parameters {

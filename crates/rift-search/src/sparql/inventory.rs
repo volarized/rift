@@ -37,11 +37,22 @@ pub struct SemanticHeritage {
     pub implements: bool,
 }
 
+/// Edge facts selected by a query.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SemanticEdges {
+    /// The query can inspect direct edges between symbols.
+    pub relations: bool,
+    /// The query can inspect original edge records and their analysis.
+    pub metadata: bool,
+}
+
 /// The semantic and physical facts needed from a complete selected domain.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SemanticInventory {
-    /// The query can inspect captured edge kinds.
-    pub edges: bool,
+    /// The query can inspect complete captured symbol metadata.
+    pub symbols: bool,
+    /// Edge facts the query can inspect.
+    pub edges: SemanticEdges,
     /// Resolved edge kinds the query can inspect.
     pub adjacency: SemanticAdjacency,
     /// Embedded graph patterns require complete provider adjacency.
@@ -62,7 +73,7 @@ impl GraphQuery {
                 requirements
             })
             .filter(|requirements| {
-                requirements.edges
+                requirements.edges.relations
                     || requirements.adjacency.calls
                     || requirements.adjacency.references
                     || requirements.occurrences.is_some()
@@ -79,35 +90,41 @@ impl SemanticInventory {
             let subject = &pattern.subject;
             let name = predicate.as_str().strip_prefix(VOCABULARY_NAMESPACE);
             match name {
-                Some("name" | "revision") => {}
+                Some("name" | "revision") => self.symbols = true,
                 Some("provider" | "from" | "to" | "kinds" | "derivation")
-                    if edge(patterns, subject) => {}
-                None if class(pattern) == Some("Edge") => {}
+                    if edge(patterns, subject) =>
+                {
+                    self.edges.metadata = true;
+                }
+                None if class(pattern) == Some("Edge") => self.edges.metadata = true,
                 Some("calls") => self.adjacency.calls = true,
                 Some("references") => self.adjacency.references = true,
                 Some("hasType") => {
-                    self.edges = true;
+                    self.edges.relations = true;
                     self.adjacency.type_uses = true;
                 }
                 Some("extends") => {
-                    self.edges = true;
+                    self.edges.relations = true;
                     self.adjacency.heritage.extends = true;
                 }
                 Some("implements") => {
-                    self.edges = true;
+                    self.edges.relations = true;
                     self.adjacency.heritage.implements = true;
                 }
                 Some(
                     "imports" | "aliases" | "declares" | "contains" | "overrides" | "reads"
                     | "writes",
-                ) => self.edges = true,
+                ) => self.edges.relations = true,
                 Some("usages") => {
                     self.occurrences.get_or_insert_default();
                 }
                 Some("kind" | "language")
                     if patterns.iter().any(|other| {
                         other.subject == *subject && class(other) == Some("Symbol")
-                    }) => {}
+                    }) =>
+                {
+                    self.symbols = true;
+                }
                 Some("source" | "of" | "kind" | "range") if occurrence(patterns, subject) => {
                     let usage = self.occurrences.get_or_insert_default();
                     usage.source |= name == Some("source");
@@ -122,7 +139,7 @@ impl SemanticInventory {
                 {
                     self.occurrences.get_or_insert_default();
                 }
-                None if class(pattern) == Some("Symbol") => {}
+                None if class(pattern) == Some("Symbol") => self.symbols = true,
                 None if class(pattern) == Some("Occurrence") => {
                     self.occurrences.get_or_insert_default();
                 }
@@ -141,21 +158,21 @@ impl SemanticInventory {
                         Some("calls") => self.adjacency.calls = true,
                         Some("references") => self.adjacency.references = true,
                         Some("hasType") => {
-                            self.edges = true;
+                            self.edges.relations = true;
                             self.adjacency.type_uses = true;
                         }
                         Some("extends") => {
-                            self.edges = true;
+                            self.edges.relations = true;
                             self.adjacency.heritage.extends = true;
                         }
                         Some("implements") => {
-                            self.edges = true;
+                            self.edges.relations = true;
                             self.adjacency.heritage.implements = true;
                         }
                         Some(
                             "imports" | "aliases" | "declares" | "contains" | "overrides" | "reads"
                             | "writes",
-                        ) => self.edges = true,
+                        ) => self.edges.relations = true,
                         Some("usages") => {
                             self.occurrences.get_or_insert_default();
                         }

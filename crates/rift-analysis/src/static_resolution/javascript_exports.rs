@@ -86,7 +86,7 @@ impl<'source> Exports<'_, 'source> {
                 }
                 continue;
             };
-            let export = Self::local_export(file, export, role, work)?;
+            let export = self.local_export(file, export, role, work)?;
             let candidate = match export {
                 Export::Declaration(range) => Some(ResolvedExport::Declaration {
                     target: file.target_at(range)?,
@@ -133,6 +133,7 @@ impl<'source> Exports<'_, 'source> {
     }
 
     fn local_export(
+        &self,
         file: &File<'source>,
         export: Export<'source>,
         role: rift_core::ReferenceRole,
@@ -141,7 +142,7 @@ impl<'source> Exports<'_, 'source> {
         let Export::Local { name, position } = export else {
             return Some(export);
         };
-        let binding = js_binding(file, name, position, role, work)?;
+        let binding = js_binding(file, self.modes, name, position, role, work)?;
         match binding.kind {
             StaticBindingKind::Local => Some(Export::Declaration(binding.name)),
             StaticBindingKind::JavaScriptImport { module, export } => Some(Export::Reexport {

@@ -11,6 +11,7 @@ use super::{File, Work};
 impl<'source> Scopes<'source> {
     pub(super) fn new(file: &File<'source>, work: &mut Work) -> Option<Self> {
         let captured = FunctionScopes::capture(file.facts, work)?;
+        let deferred = deferred_scopes(file, work)?;
         let mut classes = Vec::new();
         let mut definitions = Vec::new();
         let mut callables = Vec::new();
@@ -41,6 +42,7 @@ impl<'source> Scopes<'source> {
             .collect::<Vec<_>>();
         Some(Self {
             classes: crate::EnclosingDefinitions::new(classes),
+            deferred,
             definitions: crate::EnclosingDefinitions::new(definitions),
             callables: crate::EnclosingDefinitions::new(callables),
             functions: crate::EnclosingDefinitions::new(functions),
@@ -53,6 +55,52 @@ impl<'source> Scopes<'source> {
             ),
         })
     }
+}
+
+fn deferred_scopes(
+    file: &File<'_>,
+    work: &mut Work,
+) -> Option<crate::EnclosingDefinitions<ByteRange>> {
+    let mut callees = Vec::new();
+    for call in file.facts.calls() {
+        if !work.charge() {
+            return None;
+        }
+        let range = call.callee_range;
+        callees.push((range.start, range.end, range));
+    }
+    let immediate = crate::EnclosingDefinitions::new(callees);
+    let mut functions = BTreeSet::new();
+    for &(range, _) in file.facts.function_values() {
+        if !work.charge() {
+            return None;
+        }
+        functions.insert(range);
+    }
+    for symbol in file.document.facts.symbols() {
+        if !work.charge() {
+            return None;
+        }
+        if matches!(symbol.kind, "function" | "method")
+            && let Some(body) = symbol.body_range
+        {
+            // Decorators and computed names execute before the function's parameters and body.
+            let start = symbol
+                .name_range
+                .filter(|name| name.end <= body.start)
+                .map_or(body.start, |name| name.end);
+            functions.insert(ByteRange {
+                start,
+                end: body.end,
+            });
+        }
+    }
+    let spans = functions
+        .into_iter()
+        .filter(|range| immediate.resolve(range.start, range.end).is_none())
+        .map(|range| (range.start, range.end, range))
+        .collect::<Vec<_>>();
+    Some(crate::EnclosingDefinitions::new(spans))
 }
 
 #[derive(Default)]

@@ -14,6 +14,117 @@ use std::fmt::Write as _;
 use workspace_client::{TestResult, captured_seed, query_after_population, served_workspace};
 
 #[tokio::test]
+async fn test_typescript_deferred_calls_and_declared_receivers_are_queryable() -> TestResult {
+    let (_directory, client, task) = served_workspace(
+        &[
+            ("entry.ts", "import type { Box } from './types.js'; let value = 0; export function root(input: Box) { value += 1; input.run(); later(); return input.value; } const later = () => {};"),
+            ("types.ts", "export interface Box { run(): void; value: number; }"),
+        ],
+        None,
+    ).await?;
+    let params = QueryParams {
+        query: "SELECT ?name { ?source :calls ?target . ?target :name ?name } ORDER BY ?name"
+            .into(),
+        ..QueryParams::default()
+    };
+    let answer = query_after_population(&client, &params).await?;
+    let rows = workspace_client::query::rows(&answer)?;
+    let names = rows
+        .iter()
+        .map(|row| workspace_client::query::literal(row, "name"))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(names, ["later", "run"], "{answer}");
+    let params = QueryParams {
+        query: "SELECT (COUNT(*) AS ?n) { ?source :writes ?target }".into(),
+        ..QueryParams::default()
+    };
+    let answer = query_after_population(&client, &params).await?;
+    let rows = workspace_client::query::rows(&answer)?;
+    assert_eq!(workspace_client::query::literal(&rows[0], "n")?, "1");
+    let params = QueryParams {
+        query: "SELECT (COUNT(DISTINCT ?target) AS ?n) { ?source :calls ?target . ?edge a :Edge; :from ?source; :to ?target; :kinds :calls; :provider 'static' }".into(),
+        ..QueryParams::default()
+    };
+    let answer = query_after_population(&client, &params).await?;
+    let rows = workspace_client::query::rows(&answer)?;
+    assert_eq!(
+        workspace_client::query::literal(&rows[0], "n")?,
+        "2",
+        "{answer}"
+    );
+    client.cancel().await?;
+    task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_static_usage_records_keep_kind_and_enclosing_symbol_together() -> TestResult {
+    let (_directory, client, task) = served_workspace(
+        &[
+            ("entry.ts", "export * as tools from './tools.js';"),
+            ("tools.ts", "export const value = 1;"),
+        ],
+        None,
+    )
+    .await?;
+    let params = QueryParams {
+        query: "SELECT ?source ?kind { ?target :usages ?usage . ?usage :of ?source; :kind ?kind } ORDER BY ?source ?kind".into(),
+        ..QueryParams::default()
+    };
+    let answer = query_after_population(&client, &params).await?;
+    let rows = workspace_client::query::rows(&answer)?;
+    assert_eq!(rows.len(), 2, "{answer}");
+    for (row, (source, kind)) in rows.iter().zip([
+        ("rift://symbol/local/typescript/.%2Fentry.ts", "imports"),
+        (
+            "rift://symbol/local/typescript/.%2Fentry.ts/tools",
+            "aliases",
+        ),
+    ]) {
+        assert_eq!(workspace_client::query::iri(row, "source")?, source);
+        assert_eq!(workspace_client::query::literal(row, "kind")?, kind);
+    }
+    let params = QueryParams {
+        query: "SELECT (COUNT(?usage) AS ?n) { ?target :usages ?usage }".into(),
+        ..QueryParams::default()
+    };
+    let answer = query_after_population(&client, &params).await?;
+    let rows = workspace_client::query::rows(&answer)?;
+    assert_eq!(workspace_client::query::literal(&rows[0], "n")?, "2");
+    client.cancel().await?;
+    task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_static_inventory_projects_repeated_occurrences_with_dataset_bounds() -> TestResult {
+    let count = 10_001;
+    let source = format!(
+        "function leaf() {{}}\nexport function root() {{ {} }}\n",
+        "leaf();".repeat(count)
+    );
+    let (_directory, client, task) = served_workspace(&[("entry.ts", &source)], None).await?;
+    // Each invocation contributes a call occurrence and a callee read.
+    for (predicate, expected) in [("calls", 1), ("references", 1), ("usages", 2 * count)] {
+        let params = QueryParams {
+            query: format!("SELECT (COUNT(*) AS ?count) {{ ?s :{predicate} ?t }}"),
+            ..QueryParams::default()
+        };
+        let answer = query_after_population(&client, &params).await?;
+        let rows = workspace_client::query::rows(&answer)?;
+        assert_eq!(rows.len(), 1, "{params:?}: {answer}");
+        assert_eq!(
+            workspace_client::query::literal(&rows[0], "count")?,
+            expected.to_string(),
+            "{params:?}: {answer}"
+        );
+    }
+    client.cancel().await?;
+    task.await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_typescript_static_facts_are_read_through_sparql() -> TestResult {
     let files = [
         (

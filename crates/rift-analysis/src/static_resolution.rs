@@ -217,6 +217,7 @@ struct File<'source> {
     assignments: AssignmentTargets<'source>,
     python_values: BTreeMap<u64, StaticBindingKind>,
     python_calls: BTreeMap<u64, Vec<&'source StaticCall>>,
+    declared_types: BTreeMap<ByteRange, Option<ByteRange>>,
 }
 
 #[derive(Default)]
@@ -277,6 +278,7 @@ impl<'source> File<'source> {
             assignments: AssignmentTargets::default(),
             python_values: BTreeMap::new(),
             python_calls: BTreeMap::new(),
+            declared_types: BTreeMap::new(),
         };
         file.index_bindings(work)?;
         file.index_symbols(work)?;
@@ -311,6 +313,15 @@ impl<'source> File<'source> {
                     .push(call);
             }
         }
+        for &(name, annotation) in self.facts.declared_types() {
+            if !work.charge() {
+                return None;
+            }
+            self.declared_types
+                .entry(name)
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(annotation));
+        }
         for range in self.facts.assignments() {
             if !work.charge() {
                 return None;
@@ -328,10 +339,22 @@ impl<'source> File<'source> {
             if !work.charge() {
                 return None;
             }
-            self.by_qualified_name
+            let candidates = self
+                .by_qualified_name
                 .entry(&symbol.qualified_name)
-                .or_default()
-                .push(symbol);
+                .or_default();
+            match (self.document.facts.language().name.as_str(), symbol.kind) {
+                ("rust", "impl_item") if !candidates.is_empty() => {}
+                ("rust", _)
+                    if candidates
+                        .first()
+                        .is_some_and(|candidate| candidate.kind == "impl_item") =>
+                {
+                    candidates.clear();
+                    candidates.push(symbol);
+                }
+                _ => candidates.push(symbol),
+            }
             if symbol.name == "default" && symbol.name_range != Some(symbol.item_range) {
                 self.by_range
                     .entry(symbol.item_range)
@@ -342,9 +365,7 @@ impl<'source> File<'source> {
                 self.class_scopes.insert(symbol.item_range);
                 classes.push((symbol.range.start, symbol.range.end, symbol));
             }
-            if (python || self.document.facts.language().name == "rust")
-                && symbol.kinds.contains(&SymbolKind::Callable)
-            {
+            if symbol.kinds.contains(&SymbolKind::Callable) {
                 callables.push((symbol.range.start, symbol.range.end, symbol));
             }
             if let Some(range) = symbol.name_range {

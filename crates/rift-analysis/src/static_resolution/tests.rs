@@ -1,3 +1,139 @@
+#[test]
+fn test_typescript_declared_interface_calls_survive_unrelated_member_writes() {
+    let source = "interface Task { run(): void; } function root(input: Task, other) { other.run = () => {}; input.run(); }";
+    let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);
+    assert_eq!(
+        calls(&result, "main.ts").map(target).collect::<Vec<_>>(),
+        ["rift://symbol/local/typescript/.%2Fmain.ts/Task/run"]
+    );
+}
+
+#[test]
+fn test_typescript_overloaded_methods_keep_one_logical_call_target() {
+    let source = "interface Task { run(value: string): void; run(value: number): void; } class Worker { run(value: string): void; run(value: number): void; run(value: string | number) {} } function root(input: Task) { input.run('a'); const worker = new Worker(); worker.run(1); }";
+    let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);
+    assert_eq!(
+        calls(&result, "main.ts").map(target).collect::<Vec<_>>(),
+        [
+            "rift://symbol/local/typescript/.%2Fmain.ts/Task/run",
+            "rift://symbol/local/typescript/.%2Fmain.ts/Worker",
+            "rift://symbol/local/typescript/.%2Fmain.ts/Worker/run"
+        ]
+    );
+}
+
+#[test]
+fn test_typescript_duplicate_method_implementations_remain_unresolved() {
+    let source = "class Task { run() {} run() {} } const input = new Task(); input.run();";
+    let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);
+    assert_eq!(
+        calls(&result, "main.ts").map(target).collect::<Vec<_>>(),
+        ["rift://symbol/local/typescript/.%2Fmain.ts/Task"]
+    );
+}
+
+#[test]
+fn test_typescript_deferred_calls_resolve_later_lexical_bindings() {
+    let source = "namespace Tasks { export const root = () => leaf(); export const leaf = () => {}; } leaf(); const leaf = () => {};";
+    let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);
+    let resolved = calls(&result, "main.ts").map(target).collect::<Vec<_>>();
+    assert_eq!(
+        resolved,
+        ["rift://symbol/local/typescript/.%2Fmain.ts/Tasks/leaf"]
+    );
+}
+
+#[test]
+fn test_typescript_deferred_callbacks_keep_immediate_shadowing() {
+    let source = "function schedule(callback) {} function root() { schedule(() => leaf()); const leaf = () => {}; } function immediate() { leaf(); const leaf = () => {}; }";
+    let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);
+    let resolved = calls(&result, "main.ts")
+        .filter(|call| target(call).ends_with("/leaf"))
+        .map(target)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        resolved,
+        ["rift://symbol/local/typescript/.%2Fmain.ts/root/leaf"]
+    );
+}
+
+#[test]
+fn test_typescript_forward_class_types_keep_runtime_ordering() {
+    let source = "interface Earlier { item: Later; } new Later(); class Later {}";
+    let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);
+    assert_eq!(
+        result
+            .occurrences
+            .iter()
+            .filter(|edge| edge.role == ReferenceRole::Type && target(edge).ends_with("/Later"))
+            .count(),
+        1
+    );
+    assert_eq!(calls(&result, "main.ts").count(), 0);
+}
+
+#[test]
+fn test_typescript_lexical_accesses_preserve_shadowing_and_assignment_roles() {
+    let source = "let value = 0; function root() { value = 1; value += 2; value++; } function shadow(value) { value++; }";
+    let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);
+    let count = |role| {
+        result
+            .occurrences
+            .iter()
+            .filter(|edge| edge.role == role && target(edge).ends_with("/value"))
+            .count()
+    };
+    assert_eq!(count(ReferenceRole::Read), 2);
+    assert_eq!(count(ReferenceRole::Write), 3);
+}
+
+#[test]
+fn test_typescript_import_and_export_names_are_not_value_accesses() {
+    let source = "import { leaf } from './leaf.js'; export { leaf }; leaf();";
+    let result = resolution(
+        "typescript",
+        &[
+            ("main.ts", source),
+            ("leaf.ts", "export function leaf() {}"),
+        ],
+        &[],
+        WORK_MAX,
+    );
+    assert_eq!(
+        result
+            .occurrences
+            .iter()
+            .filter(|edge| edge.role == ReferenceRole::Read && target(edge).ends_with("/leaf"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn test_typescript_declared_receiver_types_resolve_imported_members() {
+    let source = "import type { Box as Alias } from './types.js'; export function root(input: Alias<string>) { input.leaf(); return input.value; }";
+    let types = "export interface Box<T> { leaf(): void; value: T; } export interface Other { leaf(): void; value: number; }";
+    let result = resolution(
+        "typescript",
+        &[("main.ts", source), ("types.ts", types)],
+        &[],
+        WORK_MAX,
+    );
+    let resolved = calls(&result, "main.ts").map(target).collect::<Vec<_>>();
+    assert_eq!(
+        resolved,
+        ["rift://symbol/local/typescript/.%2Ftypes.ts/Box/leaf"]
+    );
+    assert_eq!(
+        result
+            .occurrences
+            .iter()
+            .filter(|edge| edge.role == ReferenceRole::Read && target(edge).ends_with("/Box/value"))
+            .count(),
+        1
+    );
+}
+
 use rift_protocol::{identity::SymbolOwner, read::Language};
 use rift_syntax::{SyntaxDocument, SyntaxLimits, SyntaxSource, registry};
 
@@ -957,7 +1093,8 @@ fn javascript_cycles_malformed_sources_and_work_exhaustion_remain_distinct() {
     );
     assert_eq!(result.analyzed_sources, 2);
     assert_eq!(result.unavailable_sources, 1);
-    assert_eq!(result.unresolved_sites, 2);
+    // The import, invocation, and callee read each remain unresolved.
+    assert_eq!(result.unresolved_sites, 3);
     assert!(!result.exhausted);
     let exhausted = resolution("javascript", &sources, &[], 1);
     assert!(exhausted.exhausted);
@@ -1585,4 +1722,146 @@ fn test_rust_tuple_bindings_keep_unrelated_calls() {
         WORK_MAX,
     );
     assert_eq!(calls(&result, "src/lib.rs").count(), 1, "{result:?}");
+}
+
+#[test]
+fn test_typescript_declared_receiver_fields_follow_aliases_without_cycles() {
+    let source = "interface Leaf { run(): void; value: number; } interface Outer { inner: Leaf; } type Alias = Outer; type Cycle = Cycle; function root(input: Alias, cycle: Cycle) { input.inner.run(); cycle.run(); return input.inner.value; }";
+    let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);
+    assert_eq!(
+        calls(&result, "main.ts").map(target).collect::<Vec<_>>(),
+        ["rift://symbol/local/typescript/.%2Fmain.ts/Leaf/run"]
+    );
+    assert!(
+        result
+            .occurrences
+            .iter()
+            .any(|edge| edge.role == ReferenceRole::Read && target(edge).ends_with("/Leaf/value"))
+    );
+}
+
+#[test]
+fn test_typescript_deferred_lookup_keeps_immediately_invoked_functions_unresolved() {
+    let source = "(() => leaf())(); const leaf = () => {}; function deferred() { future(); } const future = () => {};";
+    let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);
+    assert_eq!(
+        calls(&result, "main.ts").map(target).collect::<Vec<_>>(),
+        ["rift://symbol/local/typescript/.%2Fmain.ts/future"]
+    );
+}
+
+#[test]
+fn test_typescript_lexical_accesses_keep_patterns_and_loop_sources() {
+    let source = "let value = 0; let other = []; function root({value: local = value}) { ({value} = other); for (const item of other) { value += item; } return {value}; }";
+    let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);
+    let count = |name: &str, role| {
+        result
+            .occurrences
+            .iter()
+            .filter(|edge| edge.role == role && target(edge).ends_with(name))
+            .count()
+    };
+    assert_eq!(count("/value", ReferenceRole::Read), 3);
+    assert_eq!(count("/value", ReferenceRole::Write), 2);
+    assert_eq!(count("/other", ReferenceRole::Read), 2);
+}
+
+#[test]
+fn test_typescript_declared_receiver_types_reject_qualified_alias_cycles() {
+    let source = "type Broken = Broken.Member; function root(input: Broken) { input.run(); }";
+    let result = resolution("typescript", &[("main.ts", source)], &[], 256);
+    assert_eq!(calls(&result, "main.ts").count(), 0);
+    assert!(!result.exhausted);
+}
+
+#[test]
+fn test_typescript_deferred_lookup_keeps_decorator_calls_immediate() {
+    let source = "class Box { @later() run() {} } const later = () => {}; function root(arg = future()) { later(); } const future = () => {};";
+    let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);
+    assert_eq!(
+        calls(&result, "main.ts")
+            .filter(|edge| target(edge).ends_with("/later"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        calls(&result, "main.ts")
+            .filter(|edge| target(edge).ends_with("/future"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn test_typescript_loop_assignment_records_writes_and_invalidates_calls() {
+    let source = "let value = 0; const values = []; function leaf() {} function root() { for (value of values) {} for (leaf of values) { leaf(); } }";
+    let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);
+    assert_eq!(
+        result
+            .occurrences
+            .iter()
+            .filter(|edge| edge.role == ReferenceRole::Write && target(edge).ends_with("/value"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        calls(&result, "main.ts")
+            .filter(|edge| target(edge).ends_with("/leaf"))
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn test_typescript_declared_annotations_keep_partial_extraction() {
+    for broken in [
+        "type Broken = ;",
+        "function bad(input: ) {}",
+        "interface Broken { value: }",
+    ] {
+        let source = format!("{broken} function leaf() {{}} export function root() {{ leaf(); }}");
+        let result = resolution("typescript", &[("main.ts", &source)], &[], WORK_MAX);
+        assert_eq!(
+            calls(&result, "main.ts")
+                .filter(|edge| target(edge).ends_with("/leaf"))
+                .count(),
+            1,
+            "{broken}"
+        );
+    }
+}
+
+#[test]
+fn test_typescript_declared_receiver_types_allow_annotation_comments() {
+    let source =
+        "interface Box { run(): void; } function root(input: /* type */ Box) { input.run(); }";
+    let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);
+    assert_eq!(
+        calls(&result, "main.ts").map(target).collect::<Vec<_>>(),
+        ["rift://symbol/local/typescript/.%2Fmain.ts/Box/run"]
+    );
+}
+
+#[test]
+fn test_typescript_qualified_annotation_names_are_not_value_accesses() {
+    let source = "namespace Types { export interface Value {} } function root(input: Types.Value) { return input; }";
+    let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);
+    assert_eq!(
+        result
+            .occurrences
+            .iter()
+            .filter(|edge| edge.role == ReferenceRole::Read && target(edge).ends_with("/Types"))
+            .count(),
+        0
+    );
+    assert_eq!(
+        result
+            .occurrences
+            .iter()
+            .filter(
+                |edge| edge.role == ReferenceRole::Type && target(edge).ends_with("/Types/Value")
+            )
+            .count(),
+        1
+    );
 }
