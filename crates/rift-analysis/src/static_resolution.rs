@@ -110,7 +110,13 @@ pub(crate) fn resolve(
     namespace: &NamespaceInput<'_>,
     work_max: usize,
 ) -> StaticResolution {
-    resolve_by(graph, documents, namespace, work_max, Index::resolve_files)
+    resolve_by(
+        graph,
+        documents,
+        namespace,
+        work_max,
+        |index, work, resolution| index.resolve_files(FileWork::CAPTURED, work, resolution),
+    )
 }
 
 /// Runs one static pass whose files `files` resolves against the built index.
@@ -157,7 +163,54 @@ struct FileResolution {
     resolution: StaticResolution,
     /// Budget the pass consumed.
     used: usize,
+    /// Whether the pass ended on its budget.
+    exhausted: bool,
 }
+
+/// Budget one file's pass may spend: a floor and an amount for each captured element.
+///
+/// The pass budget bounds the whole selection. Without a bound of its own, one file whose
+/// lookups run long spends what every later file needs, and the selection loses its
+/// static facts from that file on. With it that file alone ends early: its unit reports
+/// unavailable call coverage, and the files after it keep their facts.
+#[derive(Debug, Clone, Copy)]
+struct FileWork {
+    floor: usize,
+    per_element: usize,
+}
+
+impl FileWork {
+    /// The share of a captured source.
+    const CAPTURED: Self = Self {
+        floor: FILE_WORK_FLOOR,
+        per_element: FILE_WORK_PER_ELEMENT,
+    };
+
+    fn max(self, file: &File<'_>) -> usize {
+        self.floor
+            .saturating_add(file.elements().saturating_mul(self.per_element))
+    }
+
+    /// How many of `files`, from the first, may run apart with `left` of the pass budget:
+    /// the longest run whose shares, with the one charge each file costs the pass, fit.
+    fn run(self, files: &[&File<'_>], left: usize) -> usize {
+        let mut reserved = 0_usize;
+        files
+            .iter()
+            .take_while(|file| {
+                reserved = reserved.saturating_add(self.max(file)).saturating_add(1);
+                reserved <= left
+            })
+            .count()
+    }
+}
+
+/// Budget every file's pass may spend whatever it holds.
+const FILE_WORK_FLOOR: usize = 65_536;
+
+/// Budget a file's pass may spend for each call, reference, binding, heritage edge, and
+/// declaration it holds.
+const FILE_WORK_PER_ELEMENT: usize = 256;
 
 #[derive(Debug)]
 struct Work {
@@ -218,10 +271,54 @@ impl Target<'_> {
 
 type Bindings<'source> = BTreeMap<&'source str, Vec<&'source StaticBinding>>;
 
+/// Bindings of one name by scope, each scope's bindings in declaration order.
+type ScopedBindings<'source> = EnclosingDefinitions<Vec<&'source StaticBinding>>;
+
+/// Bindings of one name a lookup still reads in declaration order. A longer list is read
+/// through its scopes, so a lookup costs the scopes around the position.
+const SCANNED_BINDINGS_MAX: usize = 16;
+
+/// Conditional items of one file with what the configuration admits for each.
+#[derive(Default)]
+struct Conditions {
+    items: Vec<(ByteRange, Option<bool>)>,
+    /// The items by range when they nest, so a lookup reads the items around a position.
+    nested: Option<EnclosingDefinitions<Option<bool>>>,
+}
+
+impl Conditions {
+    fn new(items: Vec<(ByteRange, Option<bool>)>) -> Self {
+        let nested = (items.len() > SCANNED_BINDINGS_MAX).then(|| {
+            EnclosingDefinitions::new(
+                items
+                    .iter()
+                    .map(|(item, admitted)| (item.start, item.end, *admitted)),
+            )
+        });
+        Self { items, nested }
+    }
+
+    /// Whether an item containing `position` satisfies `holds`, or the budget ended.
+    fn any(&self, position: u64, work: &mut Work, holds: impl Fn(Option<bool>) -> bool) -> bool {
+        let containing = self
+            .nested
+            .as_ref()
+            .and_then(|nested| nested.containing(position, position.checked_add(1)?));
+        match containing {
+            Some(mut containing) => containing.any(|admitted| !work.charge() || holds(*admitted)),
+            None => self.items.iter().any(|(item, admitted)| {
+                !work.charge() || item.contains(position) && holds(*admitted)
+            }),
+        }
+    }
+}
+
 struct File<'source> {
     document: &'source StaticSource<'source>,
     facts: &'source StaticFacts,
     by_name: Bindings<'source>,
+    /// The names with more than [`SCANNED_BINDINGS_MAX`] bindings whose scopes nest.
+    by_scope: BTreeMap<&'source str, ScopedBindings<'source>>,
     by_range: BTreeMap<ByteRange, Option<&'source SyntaxSymbol>>,
     by_qualified_name: BTreeMap<&'source str, Vec<&'source SyntaxSymbol>>,
     callables: EnclosingDefinitions<&'source SyntaxSymbol>,
@@ -231,7 +328,7 @@ struct File<'source> {
     python_values: BTreeMap<u64, StaticBindingKind>,
     python_calls: BTreeMap<u64, Vec<&'source StaticCall>>,
     declared_types: BTreeMap<ByteRange, Option<ByteRange>>,
-    conditions: Vec<(ByteRange, Option<bool>)>,
+    conditions: Conditions,
 }
 
 #[derive(Default)]
@@ -285,6 +382,7 @@ impl<'source> File<'source> {
             document,
             facts,
             by_name: BTreeMap::new(),
+            by_scope: BTreeMap::new(),
             by_range: BTreeMap::new(),
             by_qualified_name: BTreeMap::new(),
             callables: EnclosingDefinitions::new([]),
@@ -294,18 +392,20 @@ impl<'source> File<'source> {
             python_values: BTreeMap::new(),
             python_calls: BTreeMap::new(),
             declared_types: BTreeMap::new(),
-            conditions: Vec::new(),
+            conditions: Conditions::default(),
         };
+        let mut conditions = Vec::new();
         for item in facts.conditional_items() {
             if !work.charge() {
                 return None;
             }
-            file.conditions.push((
+            conditions.push((
                 item.range,
                 file.text(item.attribute)
                     .and_then(|text| configuration?.attribute(text)),
             ));
         }
+        file.conditions = Conditions::new(conditions);
         file.index_bindings(work)?;
         file.index_symbols(work)?;
         Some(file)
@@ -330,6 +430,26 @@ impl<'source> File<'source> {
                 }
                 _ => {}
             }
+        }
+        for (name, bindings) in &self.by_name {
+            if bindings.len() <= SCANNED_BINDINGS_MAX {
+                continue;
+            }
+            let mut scopes = BTreeMap::<ByteRange, Vec<&StaticBinding>>::new();
+            for &binding in bindings {
+                if !work.charge() {
+                    return None;
+                }
+                scopes.entry(binding.scope).or_default().push(binding);
+            }
+            self.by_scope.insert(
+                name,
+                EnclosingDefinitions::new(
+                    scopes
+                        .into_iter()
+                        .map(|(scope, bindings)| (scope.start, scope.end, bindings)),
+                ),
+            );
         }
         if self.document.facts.language().name == "python" {
             for call in self.facts.calls() {
@@ -412,6 +532,19 @@ impl<'source> File<'source> {
         Some(())
     }
 
+    /// Captured calls, references, bindings, heritage edges, and declarations.
+    fn elements(&self) -> usize {
+        [
+            self.facts.calls().len(),
+            self.facts.references().len(),
+            self.facts.bindings().len(),
+            self.facts.heritage_edges().len(),
+            self.document.facts.symbols().len(),
+        ]
+        .into_iter()
+        .fold(0, usize::saturating_add)
+    }
+
     fn enclosing_callable(&self, range: ByteRange) -> Option<Target<'source>> {
         Some(Target {
             file: self.document,
@@ -469,6 +602,67 @@ impl<'source> File<'source> {
             .any(|scope| !work.charge() || scope.contains(position))
     }
 
+    /// Reads the bindings of `name` in the smallest scope that holds `position` and a
+    /// binding `admits`, in declaration order. `read` receives each with whether it is the
+    /// first of its scope; a scope read before a smaller one is found starts over there.
+    ///
+    /// A name with few bindings is read in declaration order. A name with many is read
+    /// through its scopes, the smallest first, so a file that binds one short name in
+    /// thousands of functions pays the scopes around the position for each lookup.
+    /// `None` when the budget ended; `Some(false)` when the file binds no such name.
+    fn innermost_bindings(
+        &self,
+        name: &str,
+        position: u64,
+        work: &mut Work,
+        admits: impl Fn(&'source StaticBinding) -> bool,
+        mut read: impl FnMut(&'source StaticBinding, bool),
+    ) -> Option<bool> {
+        let Some(bindings) = self.by_name.get(name) else {
+            return Some(false);
+        };
+        let scopes = self
+            .by_scope
+            .get(name)
+            .and_then(|scopes| scopes.containing(position, position.checked_add(1)?));
+        if let Some(scopes) = scopes {
+            for scope in scopes {
+                let mut first = true;
+                for &binding in scope {
+                    if !work.charge() {
+                        return None;
+                    }
+                    if admits(binding) {
+                        read(binding, first);
+                        first = false;
+                    }
+                }
+                if !first {
+                    break;
+                }
+            }
+            return Some(true);
+        }
+        let mut innermost: Option<ByteRange> = None;
+        for &binding in bindings {
+            if !work.charge() {
+                return None;
+            }
+            if !binding.scope.contains(position) || !admits(binding) {
+                continue;
+            }
+            match innermost {
+                Some(scope) if scope == binding.scope => read(binding, false),
+                Some(scope) if !scope.encloses(binding.scope) => {}
+                _ => {
+                    innermost = Some(binding.scope);
+                    read(binding, true);
+                }
+            }
+        }
+        Some(true)
+    }
+
     fn binding(
         &self,
         name: &str,
@@ -476,42 +670,34 @@ impl<'source> File<'source> {
         accepts: impl Fn(StaticBindingKind) -> bool,
         work: &mut Work,
     ) -> Binding<'source> {
-        let Some(bindings) = self.by_name.get(name) else {
-            return Binding::Missing;
-        };
+        let rust = self.document.facts.language().name == "rust";
         let mut best: Option<&StaticBinding> = None;
         let mut ambiguous = false;
-        for &binding in bindings {
-            if !work.charge() {
-                return Binding::Blocked;
-            }
-            if !binding.scope.contains(position) || !accepts(binding.kind) {
-                continue;
-            }
-            let rust = self.document.facts.language().name == "rust";
-            if rust && binding.available_from > position {
-                continue;
-            }
-            match best {
+        let found = self.innermost_bindings(
+            name,
+            position,
+            work,
+            |binding| accepts(binding.kind) && !(rust && binding.available_from > position),
+            |binding, first| match best {
                 Some(current)
-                    if rust
-                        && current.scope == binding.scope
-                        && binding.available_from > current.available_from =>
+                    if !first && rust && binding.available_from > current.available_from =>
                 {
                     best = Some(binding);
                     ambiguous = false;
                 }
                 Some(current)
-                    if rust
-                        && current.scope == binding.scope
-                        && binding.available_from < current.available_from => {}
-                Some(current) if current.scope == binding.scope => ambiguous = true,
-                Some(current) if !current.scope.encloses(binding.scope) => {}
+                    if !first && rust && binding.available_from < current.available_from => {}
+                Some(_) if !first => ambiguous = true,
                 _ => {
                     best = Some(binding);
                     ambiguous = false;
                 }
-            }
+            },
+        );
+        match found {
+            None => return Binding::Blocked,
+            Some(false) => return Binding::Missing,
+            Some(true) => {}
         }
         match best {
             None => Binding::Missing,
@@ -539,6 +725,9 @@ struct Index<'source> {
     edge_python_classes: python_edges::ClassOrders<'source>,
     syntax_publication: rift_core::ProviderRevision,
     unavailable_sources: usize,
+    /// Budget every file pass consumed, joined or not.
+    #[cfg(test)]
+    performed: std::sync::atomic::AtomicUsize,
 }
 
 impl<'source> Index<'source> {
@@ -594,6 +783,8 @@ impl<'source> Index<'source> {
             edge_python_classes: python_edges::ClassOrders::default(),
             syntax_publication,
             unavailable_sources,
+            #[cfg(test)]
+            performed: std::sync::atomic::AtomicUsize::new(0),
         };
         index.edge_python_classes = index.python_class_orders(work)?;
         Some(index)
@@ -601,38 +792,59 @@ impl<'source> Index<'source> {
 
     /// Resolves every file and joins the results in path order.
     ///
-    /// One file's pass reads the index and that file alone, so the passes run across the
-    /// worker pool with the `parallel` feature. Each pass starts with the whole budget
-    /// left; the join then charges the files in path order. A file whose pass fits what
-    /// is left by then answers what a pass with exactly that budget answers, and its
-    /// result stands. The first file that does not fit runs again with exactly what is
-    /// left, and the files after it stay unresolved, as they do when one pass visits the
-    /// files in order.
-    fn resolve_files(&self, work: &mut Work, resolution: &mut StaticResolution) {
+    /// One file's pass reads the index and that file alone, so passes run across the
+    /// worker pool with the `parallel` feature. A pass spends at most its file's share,
+    /// so the files start in runs: the longest run, in path order, whose shares together
+    /// fit what is left of the pass budget. Every pass of a run then has its whole share
+    /// whatever the files before it spend, and its result is the one a pass over the
+    /// files in order gives. When not even the next file's share fits, that file runs
+    /// alone with exactly what is left. The work done is therefore the work joined: no
+    /// pass starts on budget another file may still claim, and none is thrown away.
+    fn resolve_files(
+        &self,
+        file_work: FileWork,
+        work: &mut Work,
+        resolution: &mut StaticResolution,
+    ) {
         let files = self.files.values().collect::<Vec<_>>();
-        let budget = work.budget.remaining();
-        let resolve =
-            |file: &&File<'source>| self.resolve_file_apart(file, budget, &resolution.edge_calls);
-        #[cfg(feature = "parallel")]
-        let resolved = {
-            use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
-            files.par_iter().map(resolve).collect::<Vec<_>>()
-        };
-        #[cfg(not(feature = "parallel"))]
-        let resolved = files.iter().map(resolve).collect::<Vec<_>>();
-        for (file, mut apart) in files.into_iter().zip(resolved) {
-            if !work.charge() {
-                break;
-            }
-            let left = work.budget.remaining();
-            if apart.used > left {
-                apart = self.resolve_file_apart(file, left, &resolution.edge_calls);
-                work.exhausted = true;
-            }
-            work.budget = LoopBudget::new(left.saturating_sub(apart.used));
-            resolution.join(file, apart.resolution);
-            if work.exhausted {
-                break;
+        let mut pending = files.as_slice();
+        while !pending.is_empty() && !work.exhausted {
+            let run = file_work.run(pending, work.budget.remaining());
+            let (run, rest) = pending.split_at(run.max(1));
+            pending = rest;
+            let alone = run.len() == 1;
+            let left = work.budget.remaining().saturating_sub(1);
+            let resolve = |file: &&File<'source>| {
+                let share = file_work.max(file);
+                let budget = if alone { share.min(left) } else { share };
+                self.resolve_file_apart(file, budget, &resolution.edge_calls)
+            };
+            #[cfg(feature = "parallel")]
+            let resolved = {
+                use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+                run.par_iter().map(resolve).collect::<Vec<_>>()
+            };
+            #[cfg(not(feature = "parallel"))]
+            let resolved = run.iter().map(resolve).collect::<Vec<_>>();
+            // One allocation holds the run's occurrences: growing by doubling while the
+            // files join would hold the list up to twice at its largest.
+            resolution.occurrences.reserve(
+                resolved
+                    .iter()
+                    .map(|apart| apart.resolution.occurrences.len())
+                    .fold(0, usize::saturating_add),
+            );
+            for (file, apart) in run.iter().zip(resolved) {
+                if !work.charge() {
+                    return;
+                }
+                let left = work.budget.remaining();
+                // Only a file running alone can end on the pass budget: a run reserves
+                // every share before it starts.
+                work.exhausted = apart.exhausted && left < file_work.max(file);
+                let over_share = apart.exhausted && !work.exhausted;
+                work.budget = LoopBudget::new(left.saturating_sub(apart.used));
+                resolution.join(file, apart.resolution, over_share);
             }
         }
     }
@@ -658,9 +870,14 @@ impl<'source> Index<'source> {
             );
         }
         self.resolve_file(file, &mut work, &mut resolution);
+        let used = budget.saturating_sub(work.budget.remaining());
+        #[cfg(test)]
+        self.performed
+            .fetch_add(used, std::sync::atomic::Ordering::Relaxed);
         FileResolution {
             resolution,
-            used: budget.saturating_sub(work.budget.remaining()),
+            used,
+            exhausted: work.exhausted,
         }
     }
 
@@ -916,11 +1133,16 @@ impl<'source> Index<'source> {
 }
 
 impl StaticResolution {
-    /// Adds one file's result after the results of the files before it.
-    fn join(&mut self, file: &File<'_>, mut apart: Self) {
+    /// Adds one file's result after the results of the files before it. A file whose
+    /// pass ended on its own share keeps what it resolved and reports unavailable call
+    /// coverage for its unit.
+    fn join(&mut self, file: &File<'_>, mut apart: Self, over_share: bool) {
         self.occurrences.append(&mut apart.occurrences);
         self.analyzed_sources += apart.analyzed_sources;
         self.unresolved_sites += apart.unresolved_sites;
+        if over_share {
+            self.unavailable_sources += 1;
+        }
         let unit = file.document.placement.unit();
         if let Some((coverage, apart)) = self
             .edge_calls
@@ -928,6 +1150,7 @@ impl StaticResolution {
             .zip(apart.edge_calls.get_mut(unit))
         {
             coverage.unresolved.append(&mut apart.unresolved);
+            coverage.unavailable |= over_share;
         }
     }
 

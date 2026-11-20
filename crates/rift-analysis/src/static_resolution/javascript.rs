@@ -456,32 +456,27 @@ pub(super) fn js_binding<'source>(
     }
     let mut best: Option<&StaticBinding> = None;
     let mut ambiguous = false;
-    for &binding in file.by_name.get(name)? {
-        if !work.charge() {
-            return None;
-        }
-        if !binding.scope.contains(position) {
-            continue;
-        }
-        let symbol = file.target_at(binding.name).map(|target| target.symbol);
-        if role != rift_core::ReferenceRole::Type
-            && symbol.is_some_and(|symbol| matches!(symbol.kind, "interface" | "type_alias"))
-        {
-            continue;
-        }
-        if role == rift_core::ReferenceRole::Type
-            && symbol.is_some_and(|symbol| symbol.kind == "variable")
-        {
-            continue;
-        }
-        match best {
-            Some(current) if current.scope == binding.scope => ambiguous = true,
-            Some(current) if !current.scope.encloses(binding.scope) => {}
-            _ => {
-                best = Some(binding);
-                ambiguous = false;
+    let bound = file.innermost_bindings(
+        name,
+        position,
+        work,
+        |binding| {
+            let symbol = file.target_at(binding.name).map(|target| target.symbol);
+            if role == rift_core::ReferenceRole::Type {
+                !symbol.is_some_and(|symbol| symbol.kind == "variable")
+            } else {
+                !symbol.is_some_and(|symbol| matches!(symbol.kind, "interface" | "type_alias"))
             }
-        }
+        },
+        |binding, first| {
+            ambiguous = !first;
+            if first {
+                best = Some(binding);
+            }
+        },
+    )?;
+    if !bound {
+        return None;
     }
     let binding = best?;
     let deferred = modes
