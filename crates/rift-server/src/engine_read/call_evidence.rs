@@ -537,7 +537,7 @@ mod tests {
     fn incoming_engine_group_preserves_the_authored_initializer_caller() {
         // A value initializer's call belongs to the callable that holds it; an arrow function
         // initializer is a callable of its own.
-        for (source, caller) in [
+        for (source, static_owner) in [
             (
                 "function callee() {}\nexport function outer() { const token = callee(); return token; }\nfunction other() {}\n",
                 "/outer",
@@ -547,13 +547,13 @@ mod tests {
                 "/token",
             ),
         ] {
-            assert_initializer_caller(source, caller);
+            assert_initializer_caller(source, static_owner);
         }
     }
 
-    /// The static caller of `callee()` names `caller`, and an engine caller agrees only when
-    /// it names `outer`, the declaration that holds the initializer.
-    fn assert_initializer_caller(source: &str, caller: &str) {
+    /// The static caller of `callee()` ends with `static_owner`, and an engine caller agrees
+    /// only when it names `outer`, the declaration that holds the initializer.
+    fn assert_initializer_caller(source: &str, static_owner: &str) {
         use rift_protocol::read::{TextRange, TraversalDirection};
 
         let directory = tempfile::tempdir().expect("workspace");
@@ -581,8 +581,11 @@ mod tests {
             panic!("expected one static call");
         };
         let initializer = SymbolId(edge.from().as_str().to_owned());
-        assert_eq!(initializer == outer, caller == "/outer");
-        assert!(initializer.as_str().ends_with(caller), "{initializer:?}");
+        assert_eq!(initializer == outer, static_owner == "/outer");
+        assert!(
+            initializer.as_str().ends_with(static_owner),
+            "{initializer:?}"
+        );
         let observed = super::SourceUnitSpan {
             unit: super::SourceUnitId(edge.occurrence().unit().to_string()),
             range: TextRange {
