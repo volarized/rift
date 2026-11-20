@@ -541,6 +541,13 @@ impl WorkspaceSemantics {
         self.static_resolution = resolution;
     }
 
+    /// Leaves the static pass to a later publication of the same sources: this one holds
+    /// no static occurrence and reports unavailable call coverage for every unit.
+    pub(crate) fn defer_static_resolution(&mut self, sources: &[StaticSource<'_>]) {
+        self.static_resolution = crate::static_resolution::deferred(sources);
+        self.static_occurrence_order = Vec::new();
+    }
+
     pub(crate) fn static_occurrences(&self) -> &[StaticOccurrence] {
         &self.static_resolution.occurrences
     }
