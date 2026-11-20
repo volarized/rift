@@ -1063,6 +1063,40 @@ export function refuse() { return plain() }
 }
 
 #[test]
+fn test_this_members_resolve_inside_object_literals_beside_a_declared_shape() {
+    // The method declares its return shape and returns an object literal of that shape:
+    // two members named `ctx` share one qualified name. `this` still belongs to the class
+    // member that holds the literal.
+    let source = "export class Status { ok = true }
+export class Base {
+  _def = 1
+  static shared = 2
+  typed(): { status: Status; ctx: { data: number } } {
+    return { status: new Status(), ctx: { data: this._def } }
+  }
+  static make(): { ctx: { data: number } } { return { ctx: { data: this.shared } } }
+  wrong(): { ctx: { data: number } } {
+    function inner() { return { ctx: { data: this._def } } }
+    return inner()
+  }
+}
+";
+    let (_directory, index) = workspace_with_manifest(&[("main.ts", source)], module_manifest());
+    let reads = |holder: &str, member: &str| {
+        index.edges().edges().any(|edge| {
+            edge.kind() == EdgeKind::Reads
+                && edge.from().as_str().contains(holder)
+                && edge.to().as_str().ends_with(member)
+        })
+    };
+    assert!(reads("/Base/typed", "/Base/_def"));
+    assert!(reads("/Base/make", "/Base/shared"));
+    // A nested function has its own receiver: nothing is read from the class there.
+    assert!(!reads("/Base/wrong", "/Base/_def"));
+    assert!(!reads("/Base/make", "/Base/_def"));
+}
+
+#[test]
 fn test_typescript_members_through_type_parameter_constraints() {
     // A value typed by a type parameter has at least the members its declared constraint
     // names. An unconstrained parameter and a constraint that is no declaration name none,

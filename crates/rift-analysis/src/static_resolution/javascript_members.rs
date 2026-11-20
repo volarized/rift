@@ -586,8 +586,37 @@ impl<'source> File<'source> {
                     MemberMode::Instance
                 });
             }
-            symbol = self.qualified_target(container)?.symbol;
+            let Some(parent) = self.qualified_target(container) else {
+                // The container has no single declaration, as a member of an object
+                // literal beside a declared return type of the same shape. The class
+                // member that holds the position decides.
+                return self.javascript_holding_member_mode(class, position, work);
+            };
+            symbol = parent.symbol;
         }
         Some(MemberMode::Instance)
     }
 }
+
+    /// The mode of the member of `class` whose source holds `position`.
+    fn javascript_holding_member_mode(
+        &self,
+        class: Target<'source>,
+        position: u64,
+        work: &mut Work,
+    ) -> Option<MemberMode> {
+        let mut mode = MemberMode::Instance;
+        for symbol in self.document.facts.symbols() {
+            if !work.charge() {
+                return None;
+            }
+            if symbol.container.as_deref() == Some(class.symbol.qualified_name.as_str())
+                && class.symbol.range.encloses(symbol.range)
+                && symbol.range.contains(position)
+                && symbol.kinds.contains(&SymbolKind::Static)
+            {
+                mode = MemberMode::Static;
+            }
+        }
+        Some(mode)
+    }
