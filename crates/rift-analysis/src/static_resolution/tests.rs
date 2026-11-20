@@ -1,4 +1,160 @@
 #[test]
+fn test_commonjs_function_assignments_resolve_export_and_local_names() {
+    let source = "function leaf() {}\nexports.run = function(value) { leaf(); };\nexports.other = function inner() { inner(); leaf(); };\nmodule.exports.third = function named() { leaf(); };\nfunction hidden(exports) { exports.run(); }\ninner();";
+    for (language, path, other) in [
+        ("javascript", "main.cjs", "other.cjs"),
+        ("typescript", "main.cts", "other.cts"),
+    ] {
+        let result = resolution(
+            language,
+            &[
+                (path, source),
+                (other, "module.exports = function(value) { return 1; };"),
+            ],
+            &[],
+            WORK_MAX,
+        );
+        let pairs = calls(&result, path)
+            .map(|call| {
+                (
+                    call.edge_from
+                        .as_ref()
+                        .map(|id| id.as_str().rsplit('/').next().expect("caller")),
+                    target(call).rsplit('/').next().expect("callee"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pairs,
+            [
+                (Some("run"), "leaf"),
+                (Some("other"), "other"),
+                (Some("other"), "leaf"),
+                (Some("third"), "leaf")
+            ],
+            "{language}"
+        );
+    }
+}
+
+#[test]
+fn test_commonjs_function_assignments_refuse_duplicate_and_shadowed_exports() {
+    let source = "exports.run = function first() {};\nexports.run = function second() {};\nexports.guard = function() {};\nexports.run(); exports.guard();\nfunction shadow(exports) { exports.guard(); }";
+    for (language, path) in [("javascript", "main.cjs"), ("typescript", "main.cts")] {
+        let result = resolution(language, &[(path, source)], &[], WORK_MAX);
+        let targets = calls(&result, path).map(target).collect::<Vec<_>>();
+        assert_eq!(targets.len(), 1, "{language}: {targets:?}");
+        assert!(targets[0].ends_with("/guard"));
+    }
+}
+
+#[test]
+fn test_commonjs_function_assignments_resolve_anonymous_module_values() {
+    for (language, path, other) in [
+        ("javascript", "main.cjs", "other.cjs"),
+        ("typescript", "main.cts", "other.cts"),
+    ] {
+        let result = resolution(
+            language,
+            &[
+                (path, "const run = require('./other.cjs'); run();"),
+                (other, "module.exports = function(value) { return value; };"),
+            ],
+            &[],
+            WORK_MAX,
+        );
+        let targets = calls(&result, path).map(target).collect::<Vec<_>>();
+        assert_eq!(targets.len(), 1, "{language}: {targets:?}");
+        assert!(targets[0].ends_with("/default"));
+    }
+}
+
+#[test]
+fn test_commonjs_function_assignments_do_not_name_inline_callbacks_as_outer_functions() {
+    let source =
+        "function leaf() {} function root() { unknown(function inner() { inner(); }); leaf(); }";
+    for (language, path) in [("javascript", "main.cjs"), ("typescript", "main.cts")] {
+        let result = resolution(language, &[(path, source)], &[], WORK_MAX);
+        let targets = calls(&result, path).map(target).collect::<Vec<_>>();
+        assert_eq!(targets.len(), 1, "{language}: {targets:?}");
+        assert!(targets[0].ends_with("/leaf"));
+    }
+}
+
+#[test]
+fn test_commonjs_function_assignments_refuse_later_export_mutations() {
+    for mutation in [
+        "function change() { exports.run = replacement; }",
+        "function change() { exports /* receiver */ . run = replacement; }",
+        "function change(require) { exports.run = replacement; }",
+        "function change() { module.exports.run = replacement; }",
+        "function change() { module.exports = replacement; }",
+        "function change() { exports[key] = replacement; }",
+        "function change() { exports.run++; }",
+    ] {
+        let source = format!("exports.run = function() {{}}; {mutation} exports.run();");
+        for (language, path) in [("javascript", "main.cjs"), ("typescript", "main.cts")] {
+            let result = resolution(language, &[(path, &source)], &[], WORK_MAX);
+            assert_eq!(calls(&result, path).count(), 0, "{language}: {mutation}");
+        }
+    }
+    for mutation in [
+        "function change(exports) { exports.run = replacement; }",
+        "function change(module) { module.exports.run = replacement; }",
+        "function change() { other.run = replacement; }",
+        "function change() { exports.run.extra = replacement; }",
+    ] {
+        let source = format!("exports.run = function() {{}}; {mutation} exports.run();");
+        for (language, path) in [("javascript", "main.cjs"), ("typescript", "main.cts")] {
+            let result = resolution(language, &[(path, &source)], &[], WORK_MAX);
+            assert_eq!(calls(&result, path).count(), 1, "{language}: {mutation}");
+        }
+    }
+}
+
+#[test]
+fn test_ecmascript_member_comments_keep_authored_access_targets() {
+    let source =
+        "const options = { value: 1 }; function run() { return options /* receiver */ . value; }";
+    for (language, path) in [("javascript", "main.cjs"), ("typescript", "main.cts")] {
+        let result = resolution(language, &[(path, source)], &[], WORK_MAX);
+        assert_eq!(
+            result
+                .occurrences
+                .iter()
+                .filter(|edge| edge.role == ReferenceRole::Read
+                    && target(edge).ends_with("/options/value"))
+                .count(),
+            1,
+            "{language}"
+        );
+    }
+}
+
+#[test]
+fn test_commonjs_function_assignments_distinguish_module_values_from_default_properties() {
+    let source = "const whole = require('./other.cjs'); const member = require('./other.cjs').default; whole(); member();";
+    for (language, path, other) in [
+        ("javascript", "main.cjs", "other.cjs"),
+        ("typescript", "main.cts", "other.cts"),
+    ] {
+        let result = resolution(
+            language,
+            &[
+                (path, source),
+                (other, "exports.default = function inner() {};"),
+            ],
+            &[],
+            WORK_MAX,
+        );
+        let calls = calls(&result, path)
+            .map(|edge| source_of(edge, source))
+            .collect::<Vec<_>>();
+        assert_eq!(calls, ["member()"], "{language}");
+    }
+}
+
+#[test]
 fn test_ecmascript_parameters_shadow_only_their_bound_names() {
     let source = "function leaf() {}\nfunction run(value) { leaf(); }\nfunction shadow(leaf) { leaf(); }\nfunction pattern({ leaf: renamed }, [other], ...rest) { leaf(); renamed(); other(); rest(); }\nfunction duplicate() { function leaf() {} function leaf() {} leaf(); }";
     for (language, path) in [("javascript", "main.js"), ("typescript", "main.ts")] {

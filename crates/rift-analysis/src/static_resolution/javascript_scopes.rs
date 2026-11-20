@@ -11,11 +11,20 @@ use super::{File, Work};
 impl<'source> Scopes<'source> {
     pub(super) fn new(file: &File<'source>, work: &mut Work) -> Option<Self> {
         let captured = FunctionScopes::capture(file.facts, work)?;
+        let value_ranges = crate::EnclosingDefinitions::new(
+            captured
+                .values
+                .iter()
+                .filter(|(value, range)| value == range)
+                .map(|(_, range)| (range.start, range.end, *range))
+                .collect::<Vec<_>>(),
+        );
         let deferred = deferred_scopes(file, work)?;
         let mut classes = Vec::new();
         let mut definitions = Vec::new();
         let mut callables = Vec::new();
         let mut fields = BTreeSet::new();
+        let mut values: BTreeMap<ByteRange, Option<&SyntaxSymbol>> = BTreeMap::new();
         for symbol in file.document.facts.symbols() {
             if !work.charge() {
                 return None;
@@ -26,8 +35,14 @@ impl<'source> Scopes<'source> {
             {
                 classes.push((body.start, body.end, symbol));
             }
-            if let Some(range) = captured.callable(symbol) {
+            if let Some(range) = captured.callable(symbol, &value_ranges) {
                 callables.push((range.start, range.end, symbol));
+                if captured.values.contains_key(&range) {
+                    values
+                        .entry(range)
+                        .and_modify(|owner| *owner = None)
+                        .or_insert(Some(symbol));
+                }
                 if symbol.kind == "field" {
                     fields.insert(range);
                 }
@@ -41,6 +56,7 @@ impl<'source> Scopes<'source> {
             .map(|range| (range.start, range.end, range))
             .collect::<Vec<_>>();
         Some(Self {
+            values,
             classes: crate::EnclosingDefinitions::new(classes),
             deferred,
             definitions: crate::EnclosingDefinitions::new(definitions),
@@ -134,8 +150,19 @@ impl FunctionScopes {
         Some(captured)
     }
 
-    fn callable(&self, symbol: &SyntaxSymbol) -> Option<ByteRange> {
+    fn callable(
+        &self,
+        symbol: &SyntaxSymbol,
+        values: &crate::EnclosingDefinitions<ByteRange>,
+    ) -> Option<ByteRange> {
         if matches!(symbol.kind, "function" | "method") {
+            if symbol.syntax_element_kind == Some("assignment_expression") {
+                let body = symbol.body_range?;
+                return values
+                    .resolve(body.start, body.end)
+                    .copied()
+                    .filter(|range| symbol.item_range.encloses(*range));
+            }
             return Some(symbol.range);
         }
         if !symbol.kinds.contains(&SymbolKind::Callable) {

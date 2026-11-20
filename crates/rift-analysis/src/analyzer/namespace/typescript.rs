@@ -725,11 +725,25 @@ fn declaration_anchors_with_public(
     let source = file.source;
     let mut paths: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut anchors = BTreeMap::new();
+    let conflicts = assignment_name_conflicts(syntax, source);
+    let assignments = syntax
+        .export_bindings()
+        .unwrap_or_default()
+        .iter()
+        .filter(|binding| binding.source.is_none())
+        .filter_map(|binding| Some((binding.range, binding.local?, binding.container.as_deref())))
+        .collect::<BTreeSet<_>>();
     for symbol in syntax.symbols().iter().filter(|symbol| {
         symbol.syntax_element_kind != Some("assignment_expression")
             || symbol.kinds.contains(&SymbolKind::Public)
             || public.contains(&symbol.qualified_name)
+            || symbol.name_range.is_some_and(|name| {
+                assignments.contains(&(symbol.item_range, name, symbol.container.as_deref()))
+            })
     }) {
+        if conflicting_assignment_name(&symbol.qualified_name, &conflicts) {
+            continue;
+        }
         let literal = declared_module_name(symbol, source);
         let Some(mut path) = literal
             .as_ref()
@@ -768,6 +782,65 @@ fn declaration_anchors_with_public(
         anchors.insert(".".to_owned(), identity);
     }
     anchors
+}
+
+fn assignment_name_conflicts<'source>(
+    syntax: &'source SyntaxFacts,
+    source: &str,
+) -> BTreeSet<&'source str> {
+    let lexical = syntax
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.syntax_element_kind != Some("assignment_expression"))
+        .map(|symbol| symbol.qualified_name.as_str())
+        .collect::<BTreeSet<_>>();
+    let assignments = syntax
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.syntax_element_kind == Some("assignment_expression"))
+        .map(|symbol| symbol.qualified_name.as_str())
+        .filter(|name| lexical.contains(name))
+        .collect::<BTreeSet<_>>();
+    let literal = syntax
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.syntax_element_kind == Some("assignment_expression"))
+        .filter(|symbol| assignment_name_is_literal(symbol, source))
+        .map(|symbol| symbol.qualified_name.as_str())
+        .collect::<BTreeSet<_>>();
+    let generated = syntax
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.syntax_element_kind == Some("assignment_expression"))
+        .filter(|symbol| !assignment_name_is_literal(symbol, source))
+        .map(|symbol| symbol.qualified_name.as_str());
+    assignments
+        .into_iter()
+        .chain(generated.filter(|name| literal.contains(name)))
+        .collect()
+}
+
+fn assignment_name_is_literal(symbol: &SyntaxSymbol, source: &str) -> bool {
+    let Some(range) = symbol.name_range else {
+        return false;
+    };
+    let (Ok(start), Ok(end)) = (usize::try_from(range.start), usize::try_from(range.end)) else {
+        return false;
+    };
+    source.get(start..end) == Some(symbol.name.as_str())
+}
+
+fn conflicting_assignment_name(mut name: &str, conflicts: &BTreeSet<&str>) -> bool {
+    // Each step removes a segment from the provider-bounded qualified name.
+    loop {
+        if conflicts.contains(name) {
+            return true;
+        }
+        let Some((parent, _)) = name.rsplit_once('.') else {
+            return false;
+        };
+        name = parent;
+    }
 }
 
 fn defining_name(symbol: &SyntaxSymbol) -> String {

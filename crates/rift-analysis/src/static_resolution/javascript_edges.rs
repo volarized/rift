@@ -44,7 +44,7 @@ impl<'source> Index<'source> {
                         || target.symbol.kinds.contains(&SymbolKind::Type)
                         || target.symbol.kinds.contains(&SymbolKind::Variant)
                 });
-            let occurrence = target
+            let mut occurrence = target
                 .and_then(|target| {
                     self.occurrence(
                         file,
@@ -57,6 +57,14 @@ impl<'source> Index<'source> {
                 .or_else(|| {
                     self.javascript_module_reference(file, reference.target, reference.role, work)
                 });
+            if let Some(occurrence) = &mut occurrence {
+                occurrence.edge_from = self.javascript_assignment_reference_from(
+                    file,
+                    reference.target,
+                    reference.role,
+                    work,
+                );
+            }
             result.record(occurrence);
         }
         for binding in file.facts.bindings() {
@@ -84,6 +92,27 @@ impl<'source> Index<'source> {
             }
         }
         self.javascript_contains(file, work, result);
+    }
+
+    fn javascript_assignment_reference_from(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        role: ReferenceRole,
+        work: &mut Work,
+    ) -> Option<SymbolId> {
+        if !matches!(role, ReferenceRole::Read | ReferenceRole::Write) {
+            return None;
+        }
+        let scopes = self.javascript.scopes.get(file.document.path.as_str())?;
+        let symbol = scopes.definitions.resolve(range.start, range.end)?;
+        let assignment = symbol.syntax_element_kind == Some("assignment_expression");
+        let callable = matches!(symbol.kind, "function" | "method");
+        if assignment && callable {
+            self.javascript_call_from(file, range, work)
+        } else {
+            None
+        }
     }
 
     fn javascript_contains(

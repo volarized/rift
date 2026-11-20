@@ -4,8 +4,8 @@ use rift_error::RiftError;
 use tree_sitter::Node;
 
 use super::{
-    StaticBindingKind, StaticCallee, StaticFactsParts, StaticReexport, StaticReference, binding,
-    call, enclosing, field, identifier, kind,
+    StaticBindingKind, StaticCallee, StaticFactsParts, StaticMember, StaticReexport,
+    StaticReference, binding, call, enclosing, field, identifier, kind,
 };
 use crate::ByteRange;
 use crate::extract::byte_range;
@@ -249,6 +249,7 @@ impl Kinds {
     ) -> Result<(), RiftError> {
         let id = syntax_element.kind_id();
         self.record_reference(syntax_element, facts)?;
+        self.record_member(syntax_element, facts)?;
         self.record_declared_type(syntax_element, facts)?;
         self.record_function(syntax_element, facts)?;
         if id == self.call {
@@ -274,6 +275,33 @@ impl Kinds {
         } else {
             self.record_shadow_or_mutation(syntax_element, facts)?;
         }
+        Ok(())
+    }
+
+    fn record_member(
+        &self,
+        element: Node<'_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let id = element.kind_id();
+        if ![self.member, self.subscript].contains(&id) {
+            return Ok(());
+        }
+        let Some(receiver) = element
+            .child_by_field_id(self.object)
+            .filter(|receiver| !receiver.is_missing())
+        else {
+            return Ok(());
+        };
+        let member = element.child_by_field_id(self.property).filter(|member| {
+            [self.property_identifier, self.private_property].contains(&member.kind_id())
+                && !member.is_missing()
+        });
+        facts.members.push(StaticMember {
+            range: byte_range(element)?,
+            receiver: byte_range(receiver)?,
+            member: member.map(byte_range).transpose()?,
+        });
         Ok(())
     }
 
@@ -945,7 +973,16 @@ impl Kinds {
             self.name
         };
         if let Some(name) = syntax_element.child_by_field_id(field) {
-            self.record_parameter(name, syntax_element, facts)?;
+            if self.named_expression[..2].contains(&syntax_element.kind_id()) {
+                facts.bindings.push(binding(
+                    name,
+                    syntax_element,
+                    byte_range(syntax_element)?.start,
+                    StaticBindingKind::Local,
+                )?);
+            } else {
+                self.record_parameter(name, syntax_element, facts)?;
+            }
         }
         Ok(())
     }

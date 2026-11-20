@@ -5,6 +5,13 @@ use super::{File, Target, Work};
 use rift_syntax::{StaticBindingKind, SyntaxExportKind};
 use std::collections::BTreeMap;
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum ExportSlot<'source> {
+    Default,
+    Named(&'source str),
+    Unknown,
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum ResolvedExport<'source> {
     Declaration {
@@ -63,7 +70,41 @@ impl<'source> Exports<'_, 'source> {
         role: rift_core::ReferenceRole,
         work: &mut Work,
     ) -> Option<ResolvedExport<'source>> {
-        let (name, member) = split_name(name);
+        self.resolve_slot(file, ExportSlot::Named(name), mode, role, work)
+    }
+
+    pub(super) fn resolve_module_value(
+        &self,
+        from: &File<'source>,
+        module: &str,
+        role: rift_core::ReferenceRole,
+        work: &mut Work,
+    ) -> Option<ResolvedExport<'source>> {
+        self.resolve_slot(
+            self.imported(from, module, work)?,
+            ExportSlot::Default,
+            ModuleMode::CommonJs,
+            role,
+            work,
+        )
+    }
+
+    fn resolve_slot(
+        &self,
+        file: &File<'source>,
+        slot: ExportSlot<'source>,
+        mode: ModuleMode,
+        role: rift_core::ReferenceRole,
+        work: &mut Work,
+    ) -> Option<ResolvedExport<'source>> {
+        let (name, member) = match slot {
+            ExportSlot::Named(name) => {
+                let (head, tail) = split_name(name);
+                (ExportSlot::Named(head), tail)
+            }
+            ExportSlot::Default => (ExportSlot::Default, None),
+            ExportSlot::Unknown => return None,
+        };
         let mut pending = vec![(file, name, member)];
         let mut visited = std::collections::BTreeSet::new();
         let mut found: Option<ResolvedExport<'source>> = None;
@@ -79,7 +120,7 @@ impl<'source> Exports<'_, 'source> {
             }
             let (direct, stars) = export_candidates(file, name, mode, role, work)?;
             let Some(export) = direct else {
-                if name != "default" {
+                if mode == ModuleMode::CommonJs || name != ExportSlot::Named("default") {
                     pending.extend(stars.into_iter().filter_map(|module| {
                         Some((self.imported(file, module, work)?, name, member))
                     }));
@@ -94,7 +135,7 @@ impl<'source> Exports<'_, 'source> {
                 }),
                 Export::Reexport { module, name } => {
                     if let Some(imported) = self.imported(file, module, work) {
-                        pending.push((imported, name, member));
+                        pending.push((imported, ExportSlot::Named(name), member));
                     }
                     None
                 }
@@ -102,7 +143,7 @@ impl<'source> Exports<'_, 'source> {
                     let imported = self.imported(file, module, work)?;
                     if let Some(member) = member {
                         let (name, tail) = split_name(member);
-                        pending.push((imported, name, tail));
+                        pending.push((imported, ExportSlot::Named(name), tail));
                         None
                     } else {
                         Some(ResolvedExport::Module(imported.document))
@@ -277,16 +318,13 @@ type ExportCandidates<'source> = (Option<Export<'source>>, Vec<&'source str>);
 
 fn export_candidates<'source>(
     file: &File<'source>,
-    name: &'source str,
+    name: ExportSlot<'source>,
     mode: ModuleMode,
     role: rift_core::ReferenceRole,
     work: &mut Work,
 ) -> Option<ExportCandidates<'source>> {
     let mut found: Option<Export<'source>> = None;
     let mut stars = Vec::new();
-    let (head, _tail) = name
-        .split_once('.')
-        .map_or((name, None), |(head, tail)| (head, Some(tail)));
     for binding in file.document.facts.export_bindings()? {
         if !work.charge() {
             return None;
@@ -302,14 +340,22 @@ fn export_candidates<'source>(
             continue;
         }
         let exported = match binding.kind {
-            SyntaxExportKind::Named | SyntaxExportKind::Namespace => {
-                binding.exported.and_then(|range| file.text(range))
-            }
-            SyntaxExportKind::Default => Some("default"),
+            SyntaxExportKind::Named | SyntaxExportKind::Namespace => binding
+                .exported
+                .and_then(|range| file.text(range))
+                .map(ExportSlot::Named),
+            SyntaxExportKind::Default if mode == ModuleMode::CommonJs => Some(ExportSlot::Default),
+            SyntaxExportKind::Default => Some(ExportSlot::Named("default")),
             SyntaxExportKind::All => None,
         };
-        if exported != Some(head) {
+        if exported != Some(name) {
             continue;
+        }
+        if mode == ModuleMode::CommonJs
+            && role == rift_core::ReferenceRole::Call
+            && !file.javascript_export_is_stable(binding)
+        {
+            return None;
         }
         let target = file.javascript_export_candidate(binding, role, work)?;
         if found
@@ -324,19 +370,121 @@ fn export_candidates<'source>(
 }
 
 impl<'source> Export<'source> {
-    fn key(&self, file: &File<'source>) -> Option<(Option<&'source str>, &'source str)> {
+    fn key(
+        &self,
+        file: &File<'source>,
+    ) -> Option<(
+        Option<&'source str>,
+        &'source str,
+        Option<rift_syntax::ByteRange>,
+    )> {
         match self {
-            Self::Local { name, .. } => Some((None, name)),
-            Self::Declaration(range) => {
-                Some((None, file.target_at(*range)?.symbol.qualified_name.as_str()))
-            }
-            Self::Reexport { module, name } => Some((Some(module), name)),
-            Self::Module { module } => Some((Some(module), "*")),
+            Self::Local { name, .. } => Some((None, name, None)),
+            Self::Declaration(range) => Some((
+                None,
+                file.target_at(*range)?.symbol.qualified_name.as_str(),
+                Some(*range),
+            )),
+            Self::Reexport { module, name } => Some((Some(module), name, None)),
+            Self::Module { module } => Some((Some(module), "*", None)),
         }
     }
 }
 
 impl<'source> File<'source> {
+    pub(super) fn index_javascript_members(&mut self, work: &mut Work) -> Option<()> {
+        if self.facts.members().is_empty() {
+            return Some(());
+        }
+        for member in self.facts.members() {
+            if !work.charge() {
+                return None;
+            }
+            self.members
+                .entry(member.range)
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(member));
+        }
+        for &range in self.facts.assignments() {
+            if !work.charge() {
+                return None;
+            }
+            let Some(member) = self.members.get(&range).copied().flatten() else {
+                continue;
+            };
+            let Some((receiver, slot)) = self.javascript_export_slot(member) else {
+                continue;
+            };
+            if matches!(
+                self.binding(self.text(receiver)?, receiver.start, |_| true, work),
+                super::Binding::Missing
+            ) {
+                self.export_writes
+                    .entry(slot)
+                    .and_modify(|start| {
+                        if *start != Some(range.start) {
+                            *start = None;
+                        }
+                    })
+                    .or_insert(Some(range.start));
+            }
+        }
+        Some(())
+    }
+
+    fn javascript_export_slot(
+        &self,
+        member: &rift_syntax::StaticMember,
+    ) -> Option<(rift_syntax::ByteRange, ExportSlot<'source>)> {
+        let receiver = self.text(member.receiver)?;
+        let name = member.member.and_then(|range| self.text(range));
+        let slot = match receiver {
+            "exports" => name.map_or(ExportSlot::Unknown, ExportSlot::Named),
+            "module" => match name {
+                Some("exports") => ExportSlot::Default,
+                None => ExportSlot::Unknown,
+                _ => return None,
+            },
+            _ => return self.javascript_nested_export_slot(member),
+        };
+        Some((member.receiver, slot))
+    }
+
+    fn javascript_nested_export_slot(
+        &self,
+        member: &rift_syntax::StaticMember,
+    ) -> Option<(rift_syntax::ByteRange, ExportSlot<'source>)> {
+        let parent = self.members.get(&member.receiver).copied().flatten()?;
+        if self.text(parent.receiver)? != "module" {
+            return None;
+        }
+        let name = parent.member.and_then(|range| self.text(range));
+        let slot = match name {
+            Some("exports") => member
+                .member
+                .and_then(|range| self.text(range))
+                .map_or(ExportSlot::Unknown, ExportSlot::Named),
+            None => ExportSlot::Unknown,
+            _ => return None,
+        };
+        Some((parent.receiver, slot))
+    }
+
+    fn javascript_export_is_stable(&self, binding: &rift_syntax::SyntaxExportBinding) -> bool {
+        let slot = match binding.kind {
+            SyntaxExportKind::Default => ExportSlot::Default,
+            SyntaxExportKind::Named => match binding.exported.and_then(|range| self.text(range)) {
+                Some(name) => ExportSlot::Named(name),
+                None => return false,
+            },
+            SyntaxExportKind::All | SyntaxExportKind::Namespace => return true,
+        };
+        [ExportSlot::Unknown, ExportSlot::Default, slot]
+            .iter()
+            .filter_map(|slot| self.export_writes.get(slot))
+            .all(|start| *start == Some(binding.range.start))
+    }
+
     fn javascript_export_role(
         &self,
         binding: &rift_syntax::SyntaxExportBinding,

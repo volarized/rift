@@ -32,6 +32,17 @@ pub struct StaticReference {
     pub role: rift_core::ReferenceRole,
 }
 
+/// One member expression with its original receiver and property spans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticMember {
+    /// Complete member expression.
+    pub range: ByteRange,
+    /// Receiver expression.
+    pub receiver: ByteRange,
+    /// Literal property name; computed properties remain unknown.
+    pub member: Option<ByteRange>,
+}
+
 /// Syntactic form of the callee in a captured call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaticCallee {
@@ -155,6 +166,8 @@ pub struct StaticInherentImpl {
 pub struct StaticFactsParts {
     /// Value accesses and type references.
     pub references: Vec<StaticReference>,
+    /// Receiver and property spans for member expressions.
+    pub members: Vec<StaticMember>,
     /// Declaration names and their explicit named type annotations.
     pub declared_types: Vec<(ByteRange, ByteRange)>,
     /// Runtime function expressions and their enclosing value ranges.
@@ -192,6 +205,12 @@ impl StaticFacts {
     #[must_use]
     pub fn references(&self) -> &[StaticReference] {
         &self.0.references
+    }
+
+    /// Captured member expressions with their original receiver and property spans.
+    #[must_use]
+    pub fn members(&self) -> &[StaticMember] {
+        &self.0.members
     }
     /// Declaration names and their explicit named type annotations.
     #[must_use]
@@ -289,6 +308,7 @@ impl StaticFacts {
     pub(crate) fn retained_bytes(&self) -> usize {
         [
             vector_capacity(&self.0.references),
+            vector_capacity(&self.0.members),
             vector_capacity(&self.0.declared_types),
             vector_capacity(&self.0.function_values),
             vector_capacity(&self.0.function_scopes),
@@ -317,6 +337,7 @@ impl StaticFacts {
     fn validate_counts(&self, limits: &SyntaxLimits) -> Result<(), RiftError> {
         let lengths = [
             self.references().len(),
+            self.members().len(),
             self.declared_types().len(),
             self.function_values().len(),
             self.function_scopes().len(),
@@ -391,6 +412,14 @@ impl StaticFacts {
             .iter()
             .all(|(name, annotation)| valid(*name) && valid(*annotation));
         let assignments = self.assignments().iter().copied().all(valid);
+        let members = self.members().iter().all(|member| {
+            valid(member.range)
+                && valid(member.receiver)
+                && member.range.encloses(member.receiver)
+                && member.member.is_none_or(|name| {
+                    valid(name) && member.range.encloses(name) && member.receiver.end <= name.start
+                })
+        });
         let unsupported = self.unsupported_bindings().iter().copied().all(valid);
         let implementations = self.inherent_impls().iter().all(|row| {
             valid(row.range) && valid(row.type_path) && contains(row.range, row.type_path)
@@ -416,6 +445,7 @@ impl StaticFacts {
             && bindings
             && reexports
             && assignments
+            && members
             && unsupported
             && implementations
             && imports
@@ -616,4 +646,47 @@ fn call(
         callee_range: byte_range(callee)?,
         callee: shape,
     })
+}
+
+#[cfg(test)]
+mod javascript_member_tests {
+    use super::{StaticFacts, StaticFactsParts, StaticMember};
+    use crate::{ByteRange, SyntaxLimits};
+
+    #[test]
+    fn test_javascript_member_restore_checks_original_spans() {
+        let source = "value /* note */ . field";
+        let range = ByteRange { start: 0, end: 24 };
+        let receiver = ByteRange { start: 0, end: 5 };
+        let member = ByteRange { start: 19, end: 24 };
+        let parts = |receiver, member| StaticFactsParts {
+            members: vec![StaticMember {
+                range,
+                receiver,
+                member,
+            }],
+            ..StaticFactsParts::default()
+        };
+        let checked = StaticFacts::from_parts(
+            source,
+            SyntaxLimits::default(),
+            parts(receiver, Some(member)),
+        )
+        .expect("original spans");
+        assert_eq!(checked.members()[0].receiver, receiver);
+        for invalid in [range, ByteRange { start: 24, end: 25 }] {
+            assert!(
+                StaticFacts::from_parts(
+                    source,
+                    SyntaxLimits::default(),
+                    parts(invalid, Some(member))
+                )
+                .is_err()
+            );
+        }
+        let limits = SyntaxLimits::new(100, 1, 10).expect("limits");
+        let mut oversized = parts(receiver, None);
+        oversized.members.push(oversized.members[0]);
+        assert!(StaticFacts::from_parts(source, limits, oversized).is_err());
+    }
 }

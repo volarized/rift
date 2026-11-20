@@ -201,6 +201,8 @@ struct File<'source> {
     callables: EnclosingDefinitions<&'source SyntaxSymbol>,
     assignments: AssignmentTargets<'source>,
     declared_types: BTreeMap<ByteRange, Option<ByteRange>>,
+    members: BTreeMap<ByteRange, Option<&'source rift_syntax::StaticMember>>,
+    export_writes: BTreeMap<javascript_exports::ExportSlot<'source>, Option<u64>>,
 }
 
 #[derive(Default)]
@@ -258,9 +260,12 @@ impl<'source> File<'source> {
             callables: EnclosingDefinitions::new([]),
             assignments: AssignmentTargets::default(),
             declared_types: BTreeMap::new(),
+            members: BTreeMap::new(),
+            export_writes: BTreeMap::new(),
         };
         file.index_bindings(work)?;
         file.index_symbols(work)?;
+        file.index_javascript_members(work)?;
         Some(file)
     }
 

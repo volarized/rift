@@ -21,11 +21,13 @@
 //! - Exports are read from the module's top-level statements: an assignment
 //!   nested in a block or a function marks nothing. A re-export
 //!   (`export { x } from './y'`, `export * from './y'`) names another
-//!   module's declarations, so it marks none here. An anonymous function in a
+//!   module's declarations, so it marks none here. A function in a
 //!   literal property assignment (`exports.run = function () {}`) retains the
 //!   property binding and the original function source. The binding carries no
-//!   `Public` kind without supported module export context. Named function and
-//!   class expressions assigned to an export add no declaration.
+//!   `Public` kind without supported module export context. A named function
+//!   expression keeps its local name inside its own body. An anonymous
+//!   `module.exports` function has the export name `default`. Class expressions
+//!   assigned to an export add no declaration.
 //! - `export` is not a visibility spelling: the `visibility` field carries
 //!   only an authored `accessibility_modifier` (`public`, `private`,
 //!   `protected`), and stays `None` everywhere else.
@@ -390,7 +392,6 @@ pub(crate) struct EcmaScriptKinds {
     equals_token: u16,
     expression_statement: u16,
     assignment_expression: u16,
-    function_expression: u16,
     member_expression: u16,
     object_literal: u16,
     shorthand_property_identifier: u16,
@@ -512,7 +513,6 @@ impl EcmaScriptKinds {
             equals_token: token_id(language, EQUALS_TOKEN),
             expression_statement: kind_id(language, EXPRESSION_STATEMENT_KIND),
             assignment_expression: kind_id(language, ASSIGNMENT_EXPRESSION_KIND),
-            function_expression: kind_id(language, FUNCTION_EXPRESSION_KIND),
             member_expression: kind_id(language, MEMBER_EXPRESSION_KIND),
             object_literal: kind_id(language, OBJECT_KIND),
             shorthand_property_identifier: kind_id(language, SHORTHAND_PROPERTY_IDENTIFIER_KIND),
@@ -785,7 +785,7 @@ impl EcmaScriptKinds {
         }
     }
 
-    /// The original property token and anonymous function assigned to one literal export.
+    /// The original property token and function assigned to one literal export.
     /// This records the physical binding; module and build evidence decide public export.
     fn export_function<'tree>(
         &self,
@@ -796,17 +796,28 @@ impl EcmaScriptKinds {
             return None;
         }
         let left = self.child(syntax_element, EcmaScriptGrammarField::Left)?;
-        if self.export_target(left, text) != Some(ExportTarget::Property) {
-            return None;
-        }
-        let function = self.child(syntax_element, EcmaScriptGrammarField::Right)?;
-        if function.kind_id() != self.function_expression
-            || self.child(function, EcmaScriptGrammarField::Name).is_some()
-        {
+        self.export_target(left, text)?;
+        let function =
+            self.expression_value(self.child(syntax_element, EcmaScriptGrammarField::Right)?);
+        if !self.function_values.contains(&function.kind_id()) {
             return None;
         }
         let property = self.child(left, EcmaScriptGrammarField::Property)?;
         Some((property, function))
+    }
+
+    fn export_function_name<'text>(
+        &self,
+        assignment: Node<'_>,
+        text: &'text str,
+    ) -> Option<&'text str> {
+        let (property, _) = self.export_function(assignment, text)?;
+        let left = self.child(assignment, EcmaScriptGrammarField::Left)?;
+        if self.export_target(left, text) == Some(ExportTarget::Module) {
+            Some(DEFAULT_EXPORT_NAME)
+        } else {
+            text.get(property.byte_range())
+        }
     }
 
     /// The export an assignment's left side addresses; `None` for any other
@@ -1620,8 +1631,8 @@ impl GrammarRules for EcmaScriptRules<'_> {
                 documentation_ranges: Vec::new(),
             }));
         }
-        if let Some((property, function)) = self.kinds.export_function(syntax_element, text) {
-            let Some(name) = text.get(property.byte_range()) else {
+        if let Some((_, function)) = self.kinds.export_function(syntax_element, text) {
+            let Some(name) = self.kinds.export_function_name(syntax_element, text) else {
                 return Ok(None);
             };
             let body = self.kinds.child(function, EcmaScriptGrammarField::Body);
@@ -1722,6 +1733,9 @@ impl GrammarRules for EcmaScriptRules<'_> {
     }
 
     fn container_name(&self, syntax_element: Node<'_>, text: &str) -> Option<String> {
+        if let Some(name) = self.kinds.export_function_name(syntax_element, text) {
+            return Some(name.to_owned());
+        }
         if self.exports.objects.contains(&syntax_element.id()) {
             return Some(DEFAULT_EXPORT_NAME.to_owned());
         }

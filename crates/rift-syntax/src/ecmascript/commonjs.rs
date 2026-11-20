@@ -208,20 +208,24 @@ fn assignment(
         return Ok(None);
     };
     let range = extract::byte_range(syntax_element)?;
-    if target == ExportTarget::Property {
-        let Some((property, _)) = kinds.export_function(syntax_element, source) else {
-            return Ok(None);
-        };
+    if let Some((property, _)) = kinds.export_function(syntax_element, source) {
         let name = extract::byte_range(property)?;
         return Ok(Some(SyntaxExportBinding {
-            kind: SyntaxExportKind::Named,
+            kind: if target == ExportTarget::Property {
+                SyntaxExportKind::Named
+            } else {
+                SyntaxExportKind::Default
+            },
             range,
             local: Some(name),
-            exported: Some(name),
+            exported: (target == ExportTarget::Property).then_some(name),
             source: None,
             container: None,
             type_only: false,
         }));
+    }
+    if target == ExportTarget::Property {
+        return Ok(None);
     }
     let Some(value) = kinds.child(syntax_element, EcmaScriptGrammarField::Right) else {
         return Ok(None);

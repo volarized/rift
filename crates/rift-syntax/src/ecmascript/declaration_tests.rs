@@ -31,6 +31,30 @@ fn javascript(text: &str) -> SyntaxDocument {
 }
 
 #[test]
+fn test_commonjs_function_assignments_keep_names_and_lexical_children() {
+    let source = "exports.run = function(value) { const local = {}; };\nexports.other = function inner() { const local = {}; };\nmodule.exports.third = function named() {};\nmodule.exports = function(value) {};";
+    for document in [javascript(source), typescript(source)] {
+        for (name, token) in [
+            ("run", "run"),
+            ("other", "other"),
+            ("third", "third"),
+            ("default", "exports"),
+        ] {
+            let function = symbol(&document, name);
+            assert_eq!(function.kind, "function");
+            assert_eq!(
+                spelled(source, function.name_range.expect("assignment name")),
+                token
+            );
+            assert!(spelled(source, function.item_range).contains("function"));
+        }
+        for name in ["run.local", "other.local"] {
+            assert_eq!(symbol(&document, name).kind, "variable");
+        }
+    }
+}
+
+#[test]
 fn test_typescript_loop_bindings_keep_each_declaration() {
     let document =
         typescript("for (const [leftName, left] of entries) { for (const key in value) { key; } }");
