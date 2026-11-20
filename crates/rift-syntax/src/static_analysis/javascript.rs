@@ -363,7 +363,7 @@ impl Kinds {
         self.record_declared_type(syntax_element, source, facts)?;
         self.record_type_signature(syntax_element, facts)?;
         self.record_return_type(syntax_element, source, facts)?;
-        self.record_function(syntax_element, facts)?;
+        self.record_function(syntax_element, source, facts)?;
         if id == self.call {
             self.record_call(syntax_element, source, facts)?;
         } else if id == self.new {
@@ -484,6 +484,7 @@ impl Kinds {
     fn record_function(
         &self,
         element: Node<'_>,
+        source: &str,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {
         if element.kind() == "class_static_block" {
@@ -520,7 +521,176 @@ impl Kinds {
         if let Some(context) = self.function_context(value)? {
             facts.function_contexts.push((range, context));
         }
+        self.record_asserted_callback(element, value, source, facts)
+    }
+
+    /// Types the parameters of a callback passed to a member of a value asserted to an
+    /// inline object type: in `(x as { m: (fn: (v: T) => void) => void }).m((v) => ...)`
+    /// the parameter `v` is declared `T`. The asserted type, the member's function type and
+    /// the callback's function type must all be written; positions without a named type, and
+    /// callback parameters with their own annotation, type nothing.
+    fn record_asserted_callback(
+        &self,
+        function: Node<'_>,
+        value: Node<'_>,
+        source: &str,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let Some(shapes) = &self.type_shapes else {
+            return Ok(());
+        };
+        let Some(arguments) = value
+            .parent()
+            .filter(|parent| parent.kind_id() == self.argument_list)
+        else {
+            return Ok(());
+        };
+        let Some(callee) = arguments
+            .parent()
+            .filter(|call| call.kind_id() == self.call)
+            .and_then(|call| call.child_by_field_id(self.callee))
+            .filter(|callee| callee.kind_id() == self.member)
+        else {
+            return Ok(());
+        };
+        let mut cursor = arguments.walk();
+        let Some(index) = arguments
+            .named_children(&mut cursor)
+            .filter(|argument| !argument.is_extra())
+            .position(|argument| argument == value)
+        else {
+            return Ok(());
+        };
+        let member = callee
+            .child_by_field_id(self.property)
+            .and_then(|property| text(property, source));
+        let mut object = callee.child_by_field_id(self.object);
+        // Each step descends within the admitted syntax depth.
+        while let Some(inner) = object.filter(|node| node.kind_id() == self.parenthesized) {
+            object = inner.named_child(0);
+        }
+        let asserted = object
+            .filter(|node| node.kind() == "as_expression")
+            .and_then(|node| node.named_child(1))
+            .map(|written| Self::unparenthesized(written, shapes));
+        let Some((asserted, member)) = asserted
+            .filter(|written| written.kind_id() == shapes.signature_holders[1])
+            .zip(member)
+        else {
+            return Ok(());
+        };
+        let mut cursor = asserted.walk();
+        let signature = asserted
+            .named_children(&mut cursor)
+            .filter(|child| child.kind_id() == shapes.property_signature)
+            .find(|child| {
+                child
+                    .child_by_field_id(self.name)
+                    .and_then(|name| text(name, source))
+                    == Some(member)
+            });
+        let callback = signature
+            .and_then(|signature| self.written_function_type(signature, shapes))
+            .and_then(|member_type| self.function_type_parameter(member_type, index))
+            .and_then(|parameter| self.written_function_type(parameter, shapes));
+        let Some(callback) = callback else {
+            return Ok(());
+        };
+        let own = self.callback_parameters(function);
+        for (position, parameter) in own.into_iter().enumerate() {
+            // A parameter with its own annotation keeps it.
+            let annotated = self
+                .type_field
+                .is_some_and(|field| parameter.child_by_field_id(field).is_some());
+            let parameter = if self.parameter_wrappers.contains(&parameter.kind_id()) {
+                self.pattern
+                    .and_then(|field| parameter.child_by_field_id(field))
+            } else {
+                Some(parameter)
+            };
+            let Some(parameter) =
+                parameter.filter(|parameter| parameter.kind_id() == self.identifier && !annotated)
+            else {
+                continue;
+            };
+            let written = self
+                .function_type_parameter(callback, position)
+                .and_then(|written| {
+                    self.type_field
+                        .and_then(|field| written.child_by_field_id(field))
+                })
+                .and_then(|annotation| annotation.named_child(0))
+                .map(|written| self.nullable_type(written, source))
+                .and_then(|written| self.named_type(written));
+            if let Some(written) = written {
+                facts
+                    .declared_types
+                    .push((byte_range(parameter)?, byte_range(written)?));
+            }
+        }
         Ok(())
+    }
+
+    /// The parameters of a function value: its single unparenthesized parameter, or the
+    /// entries of its parameter list.
+    fn callback_parameters<'tree>(&self, function: Node<'tree>) -> Vec<Node<'tree>> {
+        if let Some(single) = function.child_by_field_id(self.parameter) {
+            return vec![single];
+        }
+        let mut cursor = function.walk();
+        let Some(list) = function
+            .named_children(&mut cursor)
+            .find(|child| child.kind_id() == self.parameters)
+        else {
+            return Vec::new();
+        };
+        let mut cursor = list.walk();
+        list.named_children(&mut cursor)
+            .filter(|child| !child.is_extra())
+            .collect()
+    }
+
+    /// The function type written as the type of `holder` (a member signature or a
+    /// parameter), through parentheses.
+    fn written_function_type<'tree>(
+        &self,
+        holder: Node<'tree>,
+        shapes: &TypeShapeKinds,
+    ) -> Option<Node<'tree>> {
+        let annotation = self
+            .type_field
+            .and_then(|field| holder.child_by_field_id(field))?
+            .named_child(0)?;
+        Some(Self::unparenthesized(annotation, shapes))
+            .filter(|written| written.kind_id() == shapes.signatures[2])
+    }
+
+    /// The parameter at `index` of a written function type.
+    fn function_type_parameter<'tree>(
+        &self,
+        function_type: Node<'tree>,
+        index: usize,
+    ) -> Option<Node<'tree>> {
+        let mut cursor = function_type.walk();
+        let list = function_type
+            .named_children(&mut cursor)
+            .find(|child| child.kind_id() == self.parameters)?;
+        let mut cursor = list.walk();
+        list.named_children(&mut cursor)
+            .filter(|child| !child.is_extra())
+            .nth(index)
+    }
+
+    /// The type a parenthesized type writes.
+    fn unparenthesized<'tree>(mut written: Node<'tree>, shapes: &TypeShapeKinds) -> Node<'tree> {
+        // Each step descends within the admitted syntax depth.
+        while written.kind_id() == shapes.signature_holders[2] {
+            let Some(inner) = written.named_child(0) else {
+                break;
+            };
+            written = inner;
+        }
+        written
     }
 
     /// The written place that can type the function value `value`: the declaration it
@@ -549,6 +719,14 @@ impl Kinds {
                 }),
                 None => None,
             });
+        }
+        let Some(shapes) = &self.type_shapes else {
+            return Ok(None);
+        };
+        if parent.child_by_field_id(self.value) == Some(value)
+            && let Some(name) = parent.child_by_field_id(self.name)
+        {
+            return Ok(Some(StaticFunctionContext::Initializer(byte_range(name)?)));
         }
         if parent.kind_id() == self.arrow && parent.child_by_field_id(shapes.body) == Some(value) {
             return Ok(Some(StaticFunctionContext::Returned(byte_range(parent)?)));
@@ -597,6 +775,10 @@ impl Kinds {
         }
         let annotation = self.nullable_type(annotation, source);
         let owner = self.function_owner(element)?;
+        if let Some((name, written)) = owner.zip(self.element_type(annotation, source)) {
+            facts.element_returns.push((name, byte_range(written)?));
+            return Ok(());
+        }
         if annotation.kind_id() == shapes.signature_holders[1] {
             // An inline object type: each named member types the value under that key.
             let Some(owner) = owner else {
@@ -713,6 +895,44 @@ impl Kinds {
         named.unwrap_or(written)
     }
 
+    /// The named element type an array type writes: `T[]`, `readonly T[]`, `Array<T>` and
+    /// `ReadonlyArray<T>`, with `T` a type name or a generic type's name.
+    fn element_type<'tree>(&self, written: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+        let shapes = self.type_shapes.as_ref()?;
+        let written = if written.kind_id() == shapes.array[1] {
+            written.named_child(0)?
+        } else {
+            written
+        };
+        let element = if written.kind_id() == shapes.array[0] {
+            written.named_child(0)?
+        } else if self.generic == Some(written.kind_id())
+            && matches!(
+                written
+                    .child_by_field_id(self.name)
+                    .and_then(|name| text(name, source)),
+                Some("Array" | "ReadonlyArray")
+            )
+        {
+            let mut cursor = written.walk();
+            let arguments = written
+                .named_children(&mut cursor)
+                .find(|child| child.kind_id() == shapes.array[2])?;
+            let mut cursor = arguments.walk();
+            let mut named = arguments
+                .named_children(&mut cursor)
+                .filter(|child| !child.is_extra());
+            let first = named.next()?;
+            if named.next().is_some() {
+                return None;
+            }
+            first
+        } else {
+            return None;
+        };
+        self.named_type(element)
+    }
+
     /// The name a written type refers to: a type name, or the name of a generic type.
     fn named_type<'tree>(&self, written: Node<'tree>) -> Option<Node<'tree>> {
         let written = if self.generic == Some(written.kind_id()) {
@@ -720,14 +940,6 @@ impl Kinds {
         } else {
             written
         };
-        let Some(shapes) = &self.type_shapes else {
-            return Ok(None);
-        };
-        if parent.child_by_field_id(self.value) == Some(value)
-            && let Some(name) = parent.child_by_field_id(self.name)
-        {
-            return Ok(Some(StaticFunctionContext::Initializer(byte_range(name)?)));
-        }
         (!written.is_missing()
             && (self.type_identifier == Some(written.kind_id())
                 || self.nested_type == Some(written.kind_id())))
@@ -775,10 +987,6 @@ impl Kinds {
                 {
                     facts.bindings.push(binding(
                         name,
-        if let Some((name, written)) = owner.zip(self.element_type(annotation, source)) {
-            facts.element_returns.push((name, byte_range(written)?));
-            return Ok(());
-        }
                         scope,
                         available_from,
                         StaticBindingKind::Shadow,
@@ -895,44 +1103,6 @@ impl Kinds {
             }
         }
         Ok(())
-    /// The named element type an array type writes: `T[]`, `readonly T[]`, `Array<T>` and
-    /// `ReadonlyArray<T>`, with `T` a type name or a generic type's name.
-    fn element_type<'tree>(&self, written: Node<'tree>, source: &str) -> Option<Node<'tree>> {
-        let shapes = self.type_shapes.as_ref()?;
-        let written = if written.kind_id() == shapes.array[1] {
-            written.named_child(0)?
-        } else {
-            written
-        };
-        let element = if written.kind_id() == shapes.array[0] {
-            written.named_child(0)?
-        } else if self.generic == Some(written.kind_id())
-            && matches!(
-                written
-                    .child_by_field_id(self.name)
-                    .and_then(|name| text(name, source)),
-                Some("Array" | "ReadonlyArray")
-            )
-        {
-            let mut cursor = written.walk();
-            let arguments = written
-                .named_children(&mut cursor)
-                .find(|child| child.kind_id() == shapes.array[2])?;
-            let mut cursor = arguments.walk();
-            let mut named = arguments
-                .named_children(&mut cursor)
-                .filter(|child| !child.is_extra());
-            let first = named.next()?;
-            if named.next().is_some() {
-                return None;
-            }
-            first
-        } else {
-            return None;
-        };
-        self.named_type(element)
-    }
-
     }
 
     fn value_reference(&self, element: Node<'_>) -> bool {
@@ -1014,6 +1184,12 @@ impl Kinds {
             annotation = inner;
         }
         annotation = self.nullable_type(annotation, source);
+        if let Some(element) = self.element_type(annotation, source) {
+            facts
+                .element_types
+                .push((byte_range(name)?, byte_range(element)?));
+            return Ok(());
+        }
         if self.generic == Some(annotation.kind_id()) {
             let Some(inner) = annotation.child_by_field_id(self.name) else {
                 return Ok(());
@@ -1184,12 +1360,6 @@ impl Kinds {
             }
             if !is_var && scope.kind_id() == self.scopes[0] {
                 facts.javascript_module_syntax |= facts.bindings[start..].iter().any(|binding| {
-        if let Some(element) = self.element_type(annotation, source) {
-            facts
-                .element_types
-                .push((byte_range(name)?, byte_range(element)?));
-            return Ok(());
-        }
                     let start = usize::try_from(binding.name.start).ok();
                     let end = usize::try_from(binding.name.end).ok();
                     Self::wrapper_name(
@@ -1548,6 +1718,18 @@ impl Kinds {
         let id = syntax_element.kind_id();
         if self.assignment.contains(&id) {
             self.record_mutation(syntax_element, self.left, facts)?;
+            // A plain name given a function written in place stays callable.
+            if id == self.assignment[0]
+                && let Some(left) = syntax_element
+                    .child_by_field_id(self.left)
+                    .filter(|left| left.kind_id() == self.identifier)
+                && syntax_element
+                    .child_by_field_id(self.right)
+                    .and_then(|value| self.function_value(value))
+                    .is_some()
+            {
+                facts.function_writes.push(byte_range(left)?);
+            }
         } else if id == self.update {
             self.record_mutation(syntax_element, self.argument, facts)?;
         } else if id == self.for_in {
@@ -1718,18 +1900,6 @@ impl Kinds {
 
     fn record_named_shadow(
         &self,
-            // A plain name given a function written in place stays callable.
-            if id == self.assignment[0]
-                && let Some(left) = syntax_element
-                    .child_by_field_id(self.left)
-                    .filter(|left| left.kind_id() == self.identifier)
-                && syntax_element
-                    .child_by_field_id(self.right)
-                    .and_then(|value| self.function_value(value))
-                    .is_some()
-            {
-                facts.function_writes.push(byte_range(left)?);
-            }
         syntax_element: Node<'_>,
         facts: &mut StaticFactsParts,
     ) -> Result<(), RiftError> {

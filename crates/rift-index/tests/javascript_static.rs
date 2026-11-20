@@ -2126,3 +2126,44 @@ fn test_this_inside_object_literal_methods_names_the_literal_members() {
         edge.kind() == EdgeKind::Reads && edge.to().as_str().ends_with("/shadow/helper")
     }));
 }
+
+#[test]
+fn test_typescript_callbacks_of_asserted_inline_object_types() {
+    // A callback passed to a member of a value asserted to an inline object type takes
+    // the parameter types the asserted member's function type writes.
+    let source = "export interface Message { type: string; payload: unknown }
+export function listen(connection: unknown) {
+  ;(connection as unknown as {
+    subscribe: (listener: (message: Message) => void) => void
+  }).subscribe((message) => { return message.type })
+}
+export function own(connection: unknown) {
+  ;(connection as { subscribe: (listener: (message: Message) => void) => void }).subscribe(
+    (message: { type: number }) => message.type,
+  )
+}
+export function loose(connection: unknown) {
+  ;(connection as { subscribe: (listener: (message: any) => void) => void }).subscribe(
+    (message) => message.type,
+  )
+}
+";
+    let (_directory, index) = workspace_with_manifest(&[("main.ts", source)], module_manifest());
+    assert!(has_edge(
+        &index,
+        EdgeKind::Reads,
+        "main.ts/listen",
+        "main.ts/Message/type"
+    ));
+    // A parameter with its own annotation and a position without a named type.
+    for caller in ["main.ts/own", "main.ts/loose"] {
+        assert!(
+            !index.edges().edges().any(|edge| {
+                edge.kind() == EdgeKind::Reads
+                    && edge.from().as_str().ends_with(caller)
+                    && edge.to().as_str().ends_with("main.ts/Message/type")
+            }),
+            "{caller}"
+        );
+    }
+}
