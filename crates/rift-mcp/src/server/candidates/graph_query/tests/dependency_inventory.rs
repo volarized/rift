@@ -116,7 +116,11 @@ async fn python_inventory_names_dependency_calls_heritage_references_and_types()
 }
 
 #[cfg(unix)]
-fn recorded_rust_workspace(root: &Path, cache: &Path, missing: bool) -> TestResult {
+pub(in crate::server::candidates::graph_query) fn recorded_rust_workspace(
+    root: &Path,
+    cache: &Path,
+    missing: bool,
+) -> TestResult {
     let package = cache.join("registry/src/index.crates.io-1949cf8c6b5b557f/serde_json-1.0.0");
     std::fs::create_dir_all(package.join("src"))?;
     std::fs::write(

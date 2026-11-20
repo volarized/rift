@@ -190,7 +190,7 @@ impl InventoryRead {
         calls: rift_server::GraphCalls,
         replace: bool,
     ) -> Result<(), RiftError> {
-        self.charge(calls.local.iter().map(|(_, sites)| 1 + sites.len()).sum())?;
+        self.charge(call_records(&calls))?;
         if replace || !self.calls.contains_key(seed) {
             self.calls.insert(seed.clone(), calls);
         } else if let Some(held) = self.calls.get_mut(seed) {
@@ -198,6 +198,18 @@ impl InventoryRead {
         }
         Ok(())
     }
+}
+
+/// Counts named and unnamed targets with their physical call occurrences.
+fn call_records(calls: &rift_server::GraphCalls) -> usize {
+    calls
+        .local
+        .iter()
+        .map(|(_, sites)| sites)
+        .chain(calls.packages.iter().map(|(_, sites)| sites))
+        .fold(0usize, |records, sites| {
+            records.saturating_add(sites.len().saturating_add(1))
+        })
 }
 
 /// Reads the inventory from the captured static facts alone.
@@ -503,17 +515,9 @@ impl RiftMcp {
         walk.local = Some((Arc::clone(engines), roots));
         let mut added = 0usize;
         for (seed, calls) in &mut read.calls {
-            let before = calls
-                .local
-                .iter()
-                .map(|(_, sites)| 1 + sites.len())
-                .sum::<usize>();
+            let before = call_records(calls);
             walk.name_package_calls(calls, true).await?;
-            let after = calls
-                .local
-                .iter()
-                .map(|(_, sites)| 1 + sites.len())
-                .sum::<usize>();
+            let after = call_records(calls);
             added = added
                 .checked_add(after.saturating_sub(before))
                 .ok_or_else(coverage_failure)?;
@@ -719,58 +723,4 @@ impl EngineCoverage {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use rift_protocol::read::{SourceUnitId, SourceUnitSpan, TextRange};
-
-    fn references() -> (SymbolId, Vec<QueryOccurrence>) {
-        let target = SymbolId("rift://symbol/local/rust/test/target".to_owned());
-        let caller = SymbolId("rift://symbol/local/rust/test/caller".to_owned());
-        let occurrences = [10, 30]
-            .into_iter()
-            .map(|start| QueryOccurrence {
-                target: target.clone(),
-                enclosing: Some(caller.clone()),
-                source: SourceUnitSpan {
-                    unit: SourceUnitId("rift://source/project/lib.rs".to_owned()),
-                    range: TextRange {
-                        start,
-                        end: start + 6,
-                    },
-                },
-                kind: EdgeKind::References,
-            })
-            .collect();
-        (target, occurrences)
-    }
-
-    #[test]
-    fn reference_pairs_charge_each_caller_once() {
-        let (target, occurrences) = references();
-        let mut read = InventoryRead {
-            records: GraphLimits::default().triples_max() - 1,
-            ..InventoryRead::default()
-        };
-        read.admit_references(&target, occurrences)
-            .expect("two occurrences of one pair fit one remaining record");
-        assert_eq!(read.local_edges.len(), 1);
-        assert_eq!(read.local.len(), 1);
-        assert_eq!(read.records, GraphLimits::default().triples_max());
-    }
-
-    #[test]
-    fn occurrence_reads_keep_each_reference_range() {
-        let (target, occurrences) = references();
-        let mut read = InventoryRead::default();
-        read.admit_occurrences(&target, occurrences)
-            .expect("physical references");
-        let starts: Vec<_> = read
-            .local
-            .iter()
-            .map(|occurrence| occurrence.source.range.start)
-            .collect();
-        assert_eq!(starts, vec![10, 30]);
-        assert_eq!(read.local_edges.len(), 1);
-        assert_eq!(read.records, 2);
-    }
-}
+mod tests;
