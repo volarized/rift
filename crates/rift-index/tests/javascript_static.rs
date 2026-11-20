@@ -2013,3 +2013,48 @@ exports.Command = Command;
         "command.js/Option/name"
     ));
 }
+
+#[test]
+fn test_commonjs_members_of_a_module_value_assigned_by_name() {
+    // A member read through a whole-module `require` of `module.exports = name`, with
+    // `name` an object declared in that module, is a member of that object. A module that
+    // assigns its value twice names no member.
+    let defaults = "function getAdapter() { return 1 }
+var defaults = { adapter: getAdapter(), transform: function transform() { return 2 } };
+module.exports = defaults;
+";
+    let twice = "var first = { adapter: 1 };
+var second = { adapter: 2 };
+module.exports = first;
+module.exports = second;
+";
+    let main = "var defaults = require('./defaults');
+var twice = require('./twice');
+function use() { return [defaults.adapter, defaults.transform()] }
+function refuse() { return twice.adapter }
+exports.use = use;
+exports.refuse = refuse;
+";
+    let (_directory, index) = workspace(&[
+        ("defaults.js", defaults),
+        ("twice.js", twice),
+        ("main.js", main),
+    ]);
+    assert!(has_edge(
+        &index,
+        EdgeKind::Reads,
+        "main.js/use",
+        "defaults.js/defaults/adapter"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "main.js/use",
+        "defaults.js/defaults/transform"
+    ));
+    assert!(!index.edges().edges().any(|edge| {
+        edge.kind() == EdgeKind::Reads
+            && edge.from().as_str().ends_with("main.js/refuse")
+            && edge.to().as_str().ends_with("/adapter")
+    }));
+}

@@ -564,14 +564,21 @@ impl<'source> Index<'source> {
                 module,
                 export: None,
                 require,
-            } if self.builtin_require(file, require.start, work) => self.javascript_export(
-                file,
-                file.text(module)?,
-                member,
-                ModuleMode::CommonJs,
-                role,
-                work,
-            ),
+            } if self.builtin_require(file, require.start, work) => {
+                let module = file.text(module)?;
+                self.javascript_export(file, module, member, ModuleMode::CommonJs, role, work)
+                    .or_else(|| {
+                        // A member of the module's value: `module.exports = name` with
+                        // `name` an object declared in that module.
+                        let value = super::javascript_exports::Exports {
+                            files: &self.files,
+                            modes: &self.javascript,
+                        }
+                        .resolve_module_value(file, module, role, work)?;
+                        let target = self.javascript_export_value(value, role, work)?;
+                        self.javascript_object_member(target, member, role, work)
+                    })
+            }
             _ => None,
         }
     }
