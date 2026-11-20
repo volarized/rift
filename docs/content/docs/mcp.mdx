@@ -191,9 +191,14 @@ Global edge queries read facts already collected for the selected package or run
 
 ### Edge provider
 
-Every edge carries a [`provider`](/docs/developer/protocol/core#edge-provider) that names
-which analysis produced it: `static`, `engine`, or `lsp`. The edge's `derivation` records how it
-was established, and its optional `producer` names an external producer.
+Read answers merge edges with the same source, exact kind, target, and physical occurrence.
+They omit the [analyses that produced each edge](/docs/developer/protocol/core#edge-provider)
+by default. The edge's `derivation` records how it was established, and optional `producer`
+names an external producer.
+
+`include: { providers: true }` attaches the sorted `providers` set to returned edge terms
+and call steps. `SELECT` projects the edge or call step identity to carry that set. Explicit SPARQL bindings and filters on `:provider` keep their
+selected producer facts.
 
 A query can check for edges from static analysis with `:provider`:
 
