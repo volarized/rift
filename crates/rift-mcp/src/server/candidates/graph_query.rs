@@ -2106,7 +2106,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn graph_inventory_reports_unestablished_captures_with_empty_answers() -> TestResult {
+    async fn graph_ask_refuses_uncovered_edges() -> TestResult {
         let directory = tempfile::tempdir()?;
         crate::server::hermetic_workspace(directory.path(), "")?;
         std::fs::write(directory.path().join("lib.rs"), "fn alpha() {}\n")?;
@@ -2127,23 +2127,15 @@ mod tests {
                 .map_err(|failure| format!("{failure:?}"))?
                 .0
                 .result;
-            let QueryReadResult::Results(answer) = result else {
-                return Err(format!("{query}: {result:?}").into());
-            };
             assert!(
-                matches!(&answer.answer, QueryAnswer::Boolean { value: false })
-                    || matches!(&answer.answer, QueryAnswer::Bindings { bindings, .. }
-                    if bindings.len() == 1 && matches!(&bindings[0]["n"],
-                        rift_protocol::query::RdfTerm::Literal { value, .. } if value == "0")),
-                "{query}: {answer:?}"
-            );
-            assert!(
-                answer.warnings.iter().any(
-                    |warning| matches!(warning, ReadWarning::EdgeCoverageMissing { detail, .. }
-                    if detail.contains("identities: 1;"))
+                matches!(
+                    result,
+                    QueryReadResult::Unavailable(SearchUnavailable::Unavailable {
+                        reason: SymbolUnavailableReason::InsufficientCoverage,
+                        ..
+                    })
                 ),
-                "{:?}",
-                answer.warnings
+                "{query}: {result:?}"
             );
         }
         Ok(())
