@@ -102,6 +102,10 @@ struct TypeShapeKinds {
     signatures: [u16; 4],
     /// Bodies that can hold a signature member, then the parenthesized type wrapper.
     signature_holders: [u16; 3],
+    /// The `get` keyword of an accessor.
+    getter: u16,
+    /// Field holding a callable's declared return type.
+    return_type: u16,
 }
 
 impl TypeShapeKinds {
@@ -120,6 +124,15 @@ impl TypeShapeKinds {
                 id("object_type"),
                 id("parenthesized_type"),
             ],
+            getter: {
+                let id = grammar.id_for_node_kind("get", false);
+                assert_ne!(
+                    id, 0,
+                    "shipped grammar must define accessor keyword: kind=get"
+                );
+                id
+            },
+            return_type: field(grammar, "return_type"),
         }
     }
 }
@@ -674,6 +687,7 @@ impl Kinds {
         } else {
             self.type_field
                 .and_then(|field| element.child_by_field_id(field))
+                .or_else(|| self.getter_return_type(element))
         };
         let Some((name, mut annotation)) = name.zip(annotation) else {
             return Ok(());
@@ -707,6 +721,17 @@ impl Kinds {
                 .push((byte_range(name)?, byte_range(annotation)?));
         }
         Ok(())
+    }
+
+    /// The declared return type of a `get` accessor: the type its property reads as.
+    fn getter_return_type<'tree>(&self, element: Node<'tree>) -> Option<Node<'tree>> {
+        let shapes = self.type_shapes.as_ref()?;
+        let mut cursor = element.walk();
+        element
+            .children(&mut cursor)
+            .any(|child| child.kind_id() == shapes.getter)
+            .then(|| element.child_by_field_id(shapes.return_type))
+            .flatten()
     }
 
     /// Records the type declaration whose own shape is this signature.

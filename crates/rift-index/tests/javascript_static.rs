@@ -850,3 +850,49 @@ export function run() { return inspect() }
     }));
 }
 
+#[test]
+fn test_typescript_members_through_declared_getters_and_structural_aliases() {
+    let source = "export class Request { raw = 1; add(value: number) { return value } }
+export class Context {
+  #req = new Request()
+  get req(): Request { return this.#req }
+  get loose() { return this.#req }
+}
+export type Options = { manifest?: string; nested?: { deep: number } }
+export type Either = Options | Request
+export function conn(c: Context) { c.req.add(1); return c.req.raw }
+export function assets(options: Options) { return [options.manifest, options?.nested] }
+export function refuse(c: Context, either: Either) { return [c.loose.raw, either.manifest, c.req.missing] }
+";
+    let (_directory, index) = workspace_with_manifest(&[("main.ts", source)], module_manifest());
+    assert!(has_edge(&index, EdgeKind::Calls, "/conn", "/Request/add"));
+    assert!(has_edge(&index, EdgeKind::Reads, "/conn", "/Request/raw"));
+    assert!(has_edge(&index, EdgeKind::Reads, "/conn", "/Context/req"));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Reads,
+        "/assets",
+        "/Options/manifest"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Reads,
+        "/assets",
+        "/Options/nested"
+    ));
+    // A getter without a declared return type, a union alias and an absent member name
+    // no declaration.
+    assert!(has_edge(
+        &index,
+        EdgeKind::Reads,
+        "/refuse",
+        "/Context/loose"
+    ));
+    assert!(!index.edges().edges().any(|edge| {
+        edge.kind() == EdgeKind::Reads
+            && edge.from().as_str().ends_with("/refuse")
+            && ["/raw", "/manifest", "/missing"]
+                .iter()
+                .any(|name| edge.to().as_str().ends_with(name))
+    }));
+}

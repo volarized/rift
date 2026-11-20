@@ -111,10 +111,11 @@ impl<'source> Index<'source> {
                 return Some(current);
             }
             let source = self.files.get(current.file.path.as_str())?;
-            let annotation = source
-                .declared_types
-                .get(&current.symbol.name_range?)?
-                .as_ref()?;
+            let Some(annotation) = source.declared_types.get(&current.symbol.name_range?) else {
+                // An alias of a structural type declares its members itself.
+                return (current.symbol.kind == "type_alias").then_some(current);
+            };
+            let annotation = annotation.as_ref()?;
             current = self.javascript_target(source, *annotation, ReferenceRole::Type, work)?;
         }
         None
