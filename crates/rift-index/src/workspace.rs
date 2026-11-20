@@ -3341,6 +3341,37 @@ impl WorkspaceIndex {
         &self.documentation
     }
 
+    /// Builds what the first read of this index builds: the declaration inventory, the
+    /// symbol view, and the documentation layer.
+    ///
+    /// Each is built once and kept, and a refusal one of them meets is kept for the read
+    /// that asks for it. The publication that completes preparation calls this before it
+    /// is published, so its first `search` or `get_symbol` finds them built. The symbol
+    /// view and the documentation layer both read the declaration inventory, so it is
+    /// built first and the two then build side by side on the calling pool.
+    pub fn prepare_reads(&self) {
+        let _ = self
+            .symbol_declarations
+            .get_or_init(|| self.build_symbol_declarations().map(Arc::new));
+        rayon::join(
+            || {
+                let _ = self.symbol_view();
+            },
+            || {
+                let _ = self.documentation_layer();
+            },
+        );
+    }
+
+    /// Whether the declaration inventory, the symbol view, and the documentation layer of
+    /// this index are built.
+    #[must_use]
+    pub fn reads_prepared(&self) -> bool {
+        self.symbol_declarations.get().is_some()
+            && self.symbol_view.get().is_some()
+            && self.documentation_layer.get().is_some()
+    }
+
     /// The documentation layer over this snapshot's collection.
     ///
     /// The first call builds the layer and every later call answers it, so the reads one
@@ -8166,6 +8197,66 @@ mod tests {
                 .discovered_paths_unchanged(&visibility, &|| false)
                 .expect("discovery has not run")
         );
+    }
+
+    #[test]
+    fn prepared_reads_are_the_ones_the_first_read_gets() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let root = directory.path();
+        fs::write(
+            root.join("a.ts"),
+            "/** Leaf. */\nexport function leaf() {}\n",
+        )
+        .expect("leaf");
+        fs::write(
+            root.join("b.ts"),
+            "import { leaf } from './a.js';\nexport function root() { leaf(); }\n",
+        )
+        .expect("root");
+        let build = || {
+            WorkspaceIndex::build_with_languages(
+                root,
+                WorkspaceIndexLimits::default(),
+                &SourceVisibility::default(),
+                &TextFileInclusion::default(),
+                &LanguageFileSelections::default(),
+            )
+            .expect("index")
+        };
+        let lazy = build();
+        assert!(!lazy.reads_prepared());
+        let lazy_view = lazy.symbol_view().expect("symbol view");
+        assert!(!lazy.reads_prepared(), "one read builds what it asks for");
+
+        let prepared = build();
+        prepared.prepare_reads();
+        assert!(prepared.reads_prepared());
+        let view = prepared.symbol_view().expect("prepared symbol view");
+        assert!(Arc::ptr_eq(
+            &view,
+            &prepared.symbol_view().expect("the same view")
+        ));
+        assert_eq!(
+            view.retained_material_bytes(),
+            lazy_view.retained_material_bytes()
+        );
+        assert!(prepared.documentation_layer().is_ok());
+        let leaf = "rift://symbol/local/typescript/.%2Fa.ts/leaf";
+        assert_eq!(
+            prepared
+                .symbols_by_provider_identity(leaf, 2)
+                .expect("prepared declarations")
+                .len(),
+            lazy.symbols_by_provider_identity(leaf, 2)
+                .expect("lazy declarations")
+                .len()
+        );
+        // Preparing again builds nothing more.
+        prepared.prepare_reads();
+        assert!(Arc::ptr_eq(
+            &view,
+            &prepared.symbol_view().expect("the same view")
+        ));
     }
 
     #[test]
