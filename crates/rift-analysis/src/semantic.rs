@@ -528,6 +528,9 @@ impl WorkspaceSemantics {
                 )
             )
         });
+        // Containment and override occurrences live on as edges alone; the publication
+        // keeps the remaining occurrences without the room the others took.
+        resolution.occurrences.shrink_to_fit();
         self.static_occurrence_order = (0..resolution.occurrences.len()).collect();
         self.static_occurrence_order.sort_unstable_by_key(|index| {
             (
