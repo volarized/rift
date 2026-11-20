@@ -857,6 +857,8 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
+    mod dependency_inventory;
+
     #[test]
     fn query_key_names_normalized_text_revision_and_selection() -> TestResult {
         use rift_protocol::read::SearchScope;

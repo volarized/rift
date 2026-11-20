@@ -168,6 +168,20 @@ impl<'read> CapturedCalls<'read> {
         })
     }
 
+    /// Keeps authored external paths beside definition-site answers. Local captured
+    /// calls still require the caller's independent hierarchy or reference evidence.
+    pub(super) fn combine_external(mut self, engine: GraphCalls) -> GraphCalls {
+        self.edges.retain(|edge| {
+            let neighbor = match self.direction {
+                TraversalDirection::Incoming => edge.from(),
+                TraversalDirection::Outgoing => edge.to(),
+            };
+            rift_protocol::identity::SymbolIdentity::parse(neighbor.as_str())
+                .is_ok_and(|identity| !identity.owner().is_local())
+        });
+        self.combine(engine)
+    }
+
     pub(super) fn combine(self, mut engine: GraphCalls) -> GraphCalls {
         if self.edges.is_empty() {
             return engine;
@@ -199,7 +213,8 @@ impl<'read> CapturedCalls<'read> {
             };
             // A static edge to a dependency or standard-library symbol names the spelled
             // public path. An engine that names a dependency declaration at the same call
-            // supplies the defining identity, so its answer stands alone.
+            // supplies the defining identity. Keep both facts without treating their
+            // different names as a disagreement.
             let external = rift_protocol::identity::SymbolIdentity::parse(neighbor.as_str())
                 .is_ok_and(|identity| !identity.owner().is_local());
             if external
@@ -209,6 +224,8 @@ impl<'read> CapturedCalls<'read> {
                     })
                 })
             {
+                engine.edges.push(edge.to_protocol());
+                engine.local.push((neighbor, vec![span]));
                 continue;
             }
             let conflict = comparison.corroborate(

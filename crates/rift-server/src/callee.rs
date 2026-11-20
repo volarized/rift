@@ -76,9 +76,9 @@ impl CalleeRoots {
     /// A TypeScript engine adds the `typescript` package its program resolves when an
     /// accepted install folder establishes its owner.
     ///
-    /// The work is one directory listing, one program lookup and at most one ancestor walk
-    /// per TypeScript engine, and one pass over the context's install folders, which the
-    /// context bounds.
+    /// The work is one directory listing per configured Rust cache and the default cache,
+    /// one program lookup and at most one ancestor walk per TypeScript engine, and one
+    /// pass over the context's bounded install folders.
     #[must_use]
     pub fn read(reads: &ReadService, engines: &EnginePool) -> Self {
         let context: &DependencyContext = reads.dependency_context();
@@ -94,7 +94,7 @@ impl CalleeRoots {
             index_root,
             engine_roots: &engine_roots,
         };
-        let registries = registry_spellings(registry_sources(cargo_home().as_deref()));
+        let registries = engine_registry_sources(engines);
         let mut packages: Vec<PackageRoot> = context
             .install_folders()
             .flat_map(|folder| folder_roots(folder, &registries, spellings))
@@ -368,6 +368,37 @@ fn crates_io_source(root: &Path) -> bool {
             .is_some_and(|hash| {
                 hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
             })
+}
+
+/// Rust engines may select a different Cargo cache in their accepted environment.
+fn engine_registry_sources(engines: &EnginePool) -> Vec<PathBuf> {
+    let mut sources = registry_sources(cargo_home().as_deref());
+    for (_, slot) in engines
+        .served_slots()
+        .filter(|(language, _)| *language == "rust")
+    {
+        if let Some(home) = slot.configuration().environment.get("CARGO_HOME") {
+            let home = Path::new(home);
+            let home = if home.is_absolute() {
+                home.to_path_buf()
+            } else {
+                slot.workspace_root().join(home)
+            };
+            sources.extend(registry_sources(Some(&home)));
+        }
+    }
+    sources.sort();
+    sources.dedup();
+    if sources.len() > REGISTRY_SOURCES_MAX {
+        rift_tracing::warn!(
+            component = "engine",
+            folders = sources.len(),
+            bound = REGISTRY_SOURCES_MAX,
+            "Cargo registry source folders past the bound address no target"
+        );
+        sources.truncate(REGISTRY_SOURCES_MAX);
+    }
+    registry_spellings(sources)
 }
 
 /// Retains the configured and canonical spelling of each bounded registry root.
