@@ -4150,9 +4150,21 @@ impl RiftMcp {
 impl RiftMcp {
     /// Answers one `rift://workspace` read from the current publication.
     async fn read_workspace(&self, uri: &str) -> Result<ReadResourceResult, ErrorData> {
-        let (page, max_results) = resource::workspace_page(uri)?;
+        let resource::WorkspacePageRequest {
+            page,
+            max_results,
+            revision,
+        } = resource::workspace_page(uri)?;
         self.ensure_workspace_root().await?;
         let current = Arc::clone(&read_published(&self.published).await.current);
+        current
+            .reads
+            .accept_revision(revision.as_ref())
+            .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))?;
+        let revision = current
+            .reads
+            .served_revision()
+            .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))?;
         let configuration = current
             .configuration
             .accepted
@@ -4192,6 +4204,7 @@ impl RiftMcp {
             .collect();
         let page = WorkspaceResourcePage {
             configuration_revision: Digest(current.configuration.fingerprint.wire_revision()),
+            revision,
             languages,
             source: page_source,
             warnings: current

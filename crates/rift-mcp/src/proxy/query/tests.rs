@@ -26,6 +26,8 @@ type ReceivedCall = (String, Value);
 #[derive(Clone, Default)]
 struct RecordingUpstream {
     received: Arc<Mutex<Vec<ReceivedCall>>>,
+    /// The revision its pattern search names, as a served project names its own.
+    revision: Option<String>,
 }
 
 impl RecordingUpstream {
@@ -52,14 +54,17 @@ impl rmcp::ServerHandler for RecordingUpstream {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push((request.name.to_string(), arguments));
+        let mut retrieval = json!({
+            "results": [{"hit":{"target":"symbol", "symbol":{
+                "id":"rift://symbol/local/rust/app/beacon", "language":"rust", "name":"beacon", "kind":"function"
+            }}, "path":"lib.rs", "source":"fn beacon() {}", "range":{"start":0,"end":14}, "line":1}],
+            "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 10}
+        });
+        if let Some(revision) = &self.revision {
+            retrieval["revision"] = json!(revision);
+        }
         std::future::ready(match request.name.as_ref() {
-            "search_retrieval" => Ok(CallToolResult::structured(json!({
-                "results": [{"hit":{"target":"symbol", "symbol":{
-                    "id":"rift://symbol/local/rust/app/beacon", "language":"rust", "name":"beacon", "kind":"function"
-                }}, "path":"lib.rs", "source":"fn beacon() {}", "range":{"start":0,"end":14}, "line":1}],
-                "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 10}
-            }))
-            .into()),
+            "search_retrieval" => Ok(CallToolResult::structured(retrieval).into()),
             "search" => Ok(CallToolResult::structured(json!({
                 "answer": {"result":"bindings", "variables":["symbol"], "bindings":[]},
                 "pagination": {"page": 1, "pages": 0, "max_results": 10, "total": 0}
@@ -101,7 +106,17 @@ async fn connect_recording_upstream(
     RecordingUpstream,
     RunningService<RoleServer, RecordingUpstream>,
 )> {
-    let recording = RecordingUpstream::default();
+    connect_upstream(backend, RecordingUpstream::default()).await
+}
+
+/// Connects `backend` to `recording`, as [`connect_recording_upstream`] does.
+async fn connect_upstream(
+    backend: &RiftProxy,
+    recording: RecordingUpstream,
+) -> TestResult<(
+    RecordingUpstream,
+    RunningService<RoleServer, RecordingUpstream>,
+)> {
     let (client_half, server_half) = tokio::io::duplex(64 * 1024);
     let (running, upstream) = tokio::join!(
         Box::pin(().serve(client_half)),
@@ -222,5 +237,77 @@ async fn test_an_unnamed_scope_stays_with_the_primary_project_by_default() -> Te
     assert_eq!(binding_count(answer)?, 0);
     assert_eq!(tools(&local), ["search"]);
     assert!(api.received().is_empty(), "{:?}", api.received());
+    Ok(())
+}
+
+/// #743: a combined query names the revision it read. A later page sent with that revision
+/// pages the retained answer without asking any project again; another revision is refused.
+#[tokio::test]
+async fn test_a_combined_query_pins_later_pages_by_its_revision() -> TestResult {
+    let primary = tempfile::tempdir()?;
+    let extra = tempfile::tempdir()?;
+    std::fs::write(
+        primary.path().join("rift.toml"),
+        "[search]\ndefault_scope = \"all\"\n",
+    )?;
+    let proxy = proxy_with_api(primary.path(), extra.path())?;
+    let revised = |digit: &str| RecordingUpstream {
+        revision: Some(format!("rift://revision/tree/{}", digit.repeat(64))),
+        ..RecordingUpstream::default()
+    };
+    let (local, _local_connection) = connect_upstream(&proxy, revised("a")).await?;
+    let (api, _api_connection) = connect_upstream(&proxy.backends["api"], revised("b")).await?;
+    let paged = |page: u64, revision: Option<&str>| -> TestResult<CallToolRequestParams> {
+        let mut arguments = pattern_search("")?.arguments.unwrap_or_default();
+        arguments.insert("page".to_owned(), json!(page));
+        arguments.insert("max_results".to_owned(), json!(1));
+        if let Some(revision) = revision {
+            arguments.insert("revision".to_owned(), json!(revision));
+        }
+        Ok(CallToolRequestParams::new("search").with_arguments(arguments))
+    };
+    let result = |response: CallToolResponse| -> TestResult<QueryResult> {
+        let CallToolResponse::Complete(answer) = response else {
+            return Err("the query answers a complete result".into());
+        };
+        Ok(serde_json::from_value(
+            answer.structured_content.ok_or("typed query result")?,
+        )?)
+    };
+
+    let first = result(proxy.query_forward(&paged(1, None)?).await??)?;
+    let revision = first
+        .revision
+        .ok_or("a combined answer names its revision")?;
+    let pinned = revision.to_string();
+    assert!(pinned.starts_with("rift://revision/tree/"), "{pinned}");
+    for digit in ["a", "b"] {
+        assert_ne!(pinned, format!("rift://revision/tree/{}", digit.repeat(64)));
+    }
+    let pagination = first.pagination.ok_or("first page pagination")?;
+    assert_eq!((pagination.page, pagination.pages), (1, 2));
+
+    let second = result(proxy.query_forward(&paged(2, Some(&pinned))?).await??)?;
+    assert_eq!(second.revision.as_ref(), Some(&revision));
+    let pagination = second.pagination.ok_or("second page pagination")?;
+    assert_eq!((pagination.page, pagination.pages), (2, 2));
+    assert_ne!(first.answer, second.answer, "pages partition the answer");
+    assert_eq!(
+        tools(&local),
+        ["search_retrieval"],
+        "page 2 reads no project"
+    );
+    assert_eq!(tools(&api), ["search_retrieval"], "page 2 reads no project");
+
+    let other = format!("rift://revision/tree/{}", "c".repeat(64));
+    let refusal = proxy
+        .query_forward(&paged(2, Some(&other))?)
+        .await
+        .expect_err("an unread revision is refused");
+    assert_eq!(
+        refusal.slug().as_str(),
+        "rift.server.read_revision_unserved",
+        "{refusal}"
+    );
     Ok(())
 }

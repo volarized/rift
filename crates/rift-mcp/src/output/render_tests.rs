@@ -2766,7 +2766,7 @@ fn a_syntax_element_kind_holding_a_delimiter_is_quoted() {
 #[test]
 fn a_workspace_value_holding_a_delimiter_is_quoted_and_others_stay_bare() {
     let page: WorkspaceResourcePage = serde_json::from_value(json!({
-        "configuration_revision": "3f9a1c2e",
+        "configuration_revision": "3f9a1c2e", "revision": "rift://revision/tree/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "languages": [{"language": "python", "enabled": true, "execution": false,
             "syntax": false, "include": ["src/a · b/**"], "exclude": ["docs: old/**", "a:b·c/**"]}],
         "source": [

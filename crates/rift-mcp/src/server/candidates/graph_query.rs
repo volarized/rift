@@ -325,6 +325,7 @@ impl RiftMcp {
                     .acquire_semantic_inventory(resolved, required, deadline)
                     .await?))
             } else if query.symbol_selection().is_some()
+                || query.history_selection().is_some()
                 || query.syntax_element_selection().is_some()
                 || !query.reads_base()
             {
@@ -518,6 +519,16 @@ fn project_inventory(
     if let Some(exact) = exact {
         exact.project(dataset)?;
         return Ok(None);
+    }
+    if let Some(selection) = query.history_selection() {
+        input.project_history(
+            reads,
+            selection,
+            dataset,
+            cancellation,
+            deadline.at().into_std(),
+        )?;
+        return Ok(reads_inventory(selection).then_some(InventoryCoverage::Complete));
     }
     if let Some(selection) = query.syntax_element_selection() {
         let coverage = input.project_syntax_elements(
