@@ -2,6 +2,9 @@
 
 mod references;
 
+// Exhausting initializer lookup depth leaves the authored site unresolved.
+const RECEIVER_DEPTH_MAX: usize = 64;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use rift_protocol::read::SymbolKind;
@@ -17,9 +20,16 @@ pub(super) struct Namespaces<'source> {
     types: BTreeMap<Vec<String>, Option<Target<'source>>>,
     methods: BTreeMap<Vec<String>, Vec<Method<'source>>>,
     members: BTreeMap<Vec<String>, Option<Target<'source>>>,
+    fields: BTreeMap<Vec<String>, Option<Target<'source>>>,
+    member_calls: BTreeSet<(&'source str, ByteRange)>,
     field_types: BTreeMap<Vec<String>, Target<'source>>,
+    bounds: BTreeMap<(&'source str, ByteRange), Vec<ByteRange>>,
+    unavailable: BTreeSet<(&'source str, ByteRange)>,
+    return_owners: BTreeMap<(&'source str, ByteRange), Target<'source>>,
+    initializers: BTreeMap<(&'source str, ByteRange), Option<&'source StaticCall>>,
     conditional_modules: BTreeSet<Vec<String>>,
-    modules: BTreeMap<Vec<String>, bool>,
+    inactive_modules: BTreeSet<Vec<String>>,
+    modules: BTreeMap<Vec<String>, Option<Target<'source>>>,
     crate_roots: BTreeMap<String, Option<&'source str>>,
 }
 
@@ -50,20 +60,40 @@ impl<'source> Namespaces<'source> {
         if file.conditional(range, work) {
             return None;
         }
+        self.module(file, range.start, work)?;
+        self.type_target(file, range, work)
+    }
+
+    fn type_target(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        if let Some(target) = file.target_at(range)
+            && structural_owner(target)
+        {
+            return self.available(target).then_some(target);
+        }
+        if file.text(range)? == "Self"
+            && let Some(owner) = self.structural_self(file, range.start, work)
+        {
+            return Some(owner);
+        }
         let parts = path_segments(file.text(range)?, work)?;
         if let [name] = parts.as_slice()
             && let Some(target) = Self::local_type(file, range.start, name, work)
         {
-            return Some(target);
+            return self.available(target).then_some(target);
         }
         let path = self.resolved_path(file, range.start, &parts, work)?;
         self.lookup(file, range.start, &path, Namespace::Type, work)
             .or_else(|| {
-                self.members
-                    .get(&path)
-                    .copied()
-                    .flatten()
-                    .filter(|target| target.symbol.kinds.contains(&SymbolKind::Type))
+                self.members.get(&path).copied().flatten().filter(|target| {
+                    !self.types.contains_key(&path)
+                        && target.symbol.kinds.contains(&SymbolKind::Type)
+                        && self.available(*target)
+                })
             })
     }
 
@@ -103,10 +133,159 @@ impl<'source> Namespaces<'source> {
         {
             namespaces.index_file(file, work)?;
         }
+        namespaces.index_aliases(files, work)?;
         namespaces.index_members(files, work)?;
         namespaces.index_methods(files, work)?;
         namespaces.index_field_types(files, work)?;
+        namespaces.index_bounds(files, work)?;
+        namespaces.index_returns(files, work)?;
         Some(namespaces)
+    }
+
+    fn index_returns(
+        &mut self,
+        files: &BTreeMap<&'source str, File<'source>>,
+        work: &mut Work,
+    ) -> Option<()> {
+        for (&path, file) in files
+            .iter()
+            .filter(|(_, file)| file.document.facts.language().name == "rust")
+        {
+            for call in file.facts.calls() {
+                if !work.charge() {
+                    return None;
+                }
+                if matches!(call.callee, StaticCallee::Member { .. }) {
+                    self.member_calls.insert((path, call.callee_range));
+                }
+                self.initializers
+                    .entry((path, call.range))
+                    .and_modify(|call| *call = None)
+                    .or_insert(Some(call));
+            }
+            for &(name, result) in file.facts.declared_types() {
+                if file.declared_types.get(&name).copied().flatten() != Some(result) {
+                    continue;
+                }
+                if !work.charge() {
+                    return None;
+                }
+                if file.conditional(result, work) {
+                    continue;
+                }
+                let Some(callable) = file.target_at(name).and_then(Target::callable) else {
+                    continue;
+                };
+                let owner = self.edge_type_target(file, result, work).or_else(|| {
+                    if file.text(result)? != "Self" {
+                        return None;
+                    }
+                    file.qualified_target(callable.symbol.container.as_deref()?)
+                        .filter(|target| target.symbol.kind == "trait" && self.available(*target))
+                });
+                if let Some(owner) = owner {
+                    self.return_owners.insert((path, name), owner);
+                }
+            }
+        }
+        Some(())
+    }
+
+    fn index_aliases(
+        &mut self,
+        files: &BTreeMap<&'source str, File<'source>>,
+        work: &mut Work,
+    ) -> Option<()> {
+        let mut declarations = BTreeMap::new();
+        for file in files
+            .values()
+            .filter(|file| file.document.facts.language().name == "rust")
+        {
+            for symbol in file.document.facts.symbols() {
+                if !work.charge() {
+                    return None;
+                }
+                let target = Target {
+                    file: file.document,
+                    symbol,
+                };
+                if symbol.kind == "impl_item" || file.conditional(symbol.item_range, work) {
+                    continue;
+                }
+                let identity = rift_core::symbol_identity(
+                    "rust",
+                    file.document.placement.identity_path(),
+                    &symbol.qualified_name,
+                );
+                declarations
+                    .entry(identity)
+                    .and_modify(|entry| *entry = None)
+                    .or_insert(Some(target));
+            }
+        }
+        for file in files
+            .values()
+            .filter(|file| file.document.facts.language().name == "rust")
+        {
+            for alias in file.document.placement.aliases() {
+                if !work.charge() {
+                    return None;
+                }
+                let Some(target) = declarations.get(&alias.target_identity).copied().flatten()
+                else {
+                    continue;
+                };
+                let path = rift_protocol::identity::SymbolIdentity::parse(alias.identity.as_str())
+                    .ok()?
+                    .qualified_path()
+                    .to_vec();
+                if target.symbol.kinds.contains(&SymbolKind::Type) || target.symbol.kind == "module"
+                {
+                    insert(&mut self.types, path, target);
+                } else {
+                    insert(&mut self.values, path, target);
+                }
+            }
+        }
+        Some(())
+    }
+
+    fn index_bounds(
+        &mut self,
+        files: &BTreeMap<&'source str, File<'source>>,
+        work: &mut Work,
+    ) -> Option<()> {
+        for (&path, file) in files
+            .iter()
+            .filter(|(_, file)| file.document.facts.language().name == "rust")
+        {
+            for &(name, bound) in file.facts.declared_types() {
+                if file
+                    .target_at(name)
+                    .is_some_and(|target| target.symbol.kinds.contains(&SymbolKind::Callable))
+                {
+                    continue;
+                }
+                if file.conditional(name, work) {
+                    continue;
+                }
+                if !work.charge() {
+                    return None;
+                }
+                let Binding::Found(parameter) =
+                    file.binding(file.text(name)?, name.start, is_type_binding, work)
+                else {
+                    continue;
+                };
+                if parameter.kind == StaticBindingKind::RustTypeParameter {
+                    self.bounds
+                        .entry((path, parameter.name))
+                        .or_default()
+                        .push(bound);
+                }
+            }
+        }
+        Some(())
     }
 
     fn index_members(
@@ -122,7 +301,7 @@ impl<'source> Namespaces<'source> {
             if let Some(target) = target {
                 let file = files.get(target.file.path.as_str())?;
                 if let Some(implementation) = inherent_member(file, target.symbol, work)
-                    && let Some(owner) = self.edge_type_target(file, implementation.type_path, work)
+                    && let Some(owner) = self.type_target(file, implementation.type_path, work)
                 {
                     path = owner.admitted_path()?;
                     path.push(target.symbol.name.clone());
@@ -150,7 +329,7 @@ impl<'source> Namespaces<'source> {
                 }
                 let file = files.get(method.target.file.path.as_str())?;
                 let range = method.implementation.type_path;
-                let Some(owner) = self.edge_type_target(file, range, work) else {
+                let Some(owner) = self.type_target(file, range, work) else {
                     continue;
                 };
                 let Some(mut canonical) = owner.admitted_path() else {
@@ -170,12 +349,13 @@ impl<'source> Namespaces<'source> {
         work: &mut Work,
     ) -> Option<()> {
         let mut types = BTreeMap::new();
-        for (path, target) in &self.members {
+        for (path, target) in &self.fields {
             if !work.charge() {
                 return None;
             }
-            let Some(target) = target.filter(|target| target.symbol.kind == "field_declaration")
-            else {
+            let Some(target) = target.filter(|target| {
+                target.symbol.kind == "field_declaration" && self.available(*target)
+            }) else {
                 continue;
             };
             let file = files.get(target.file.path.as_str())?;
@@ -211,8 +391,26 @@ impl<'source> Namespaces<'source> {
                 continue;
             };
             if namespace.base.is_empty() {
-                let depth = symbol.qualified_name.split("::").count();
+                let depth = if structural_owner(target) {
+                    symbol
+                        .container
+                        .as_deref()
+                        .map_or(0, |container| container.split("::").count())
+                        + 1
+                } else {
+                    symbol.qualified_name.split("::").count()
+                };
                 namespace.base = path.get(..path.len().checked_sub(depth)?)?.to_vec();
+            }
+            if file.inactive(symbol.item_range, work) {
+                if symbol.kind == "module" {
+                    self.inactive_modules.insert(path);
+                }
+                continue;
+            }
+            if file.conditional(symbol.item_range, work) {
+                self.unavailable
+                    .insert((file.document.path.as_str(), symbol.item_range));
             }
             if symbol.kind == "impl_item" {
                 continue;
@@ -225,11 +423,7 @@ impl<'source> Namespaces<'source> {
                     namespace.inline.push((symbol, path.clone()));
                 }
                 insert(&mut self.types, path.clone(), target);
-                let public = symbol.visibility.as_deref() == Some("pub");
-                self.modules
-                    .entry(path)
-                    .and_modify(|admitted| *admitted = false)
-                    .or_insert(public);
+                insert(&mut self.modules, path, target);
                 continue;
             }
             self.index_target(file, symbol, path, work);
@@ -251,15 +445,17 @@ impl<'source> Namespaces<'source> {
         path: Vec<String>,
         work: &mut Work,
     ) {
-        if file.conditional(symbol.item_range, work) {
-            return;
-        }
         let target = Target {
             file: file.document,
             symbol,
         };
         if symbol.container.is_some() {
-            insert(&mut self.members, path.clone(), target);
+            let members = if symbol.kind == "field_declaration" {
+                &mut self.fields
+            } else {
+                &mut self.members
+            };
+            insert(members, path.clone(), target);
         }
         if symbol.kind == "variant" {
             insert(&mut self.values, path, target);
@@ -283,15 +479,28 @@ impl<'source> Namespaces<'source> {
         call: &StaticCall,
         work: &mut Work,
     ) -> Option<Target<'source>> {
+        self.call_at_depth(file, call, work, RECEIVER_DEPTH_MAX)
+    }
+
+    fn call_at_depth(
+        &self,
+        file: &File<'source>,
+        call: &StaticCall,
+        work: &mut Work,
+        depth: usize,
+    ) -> Option<Target<'source>> {
+        if depth == 0 {
+            return None;
+        }
         if file.conditional(call.range, work) {
             return None;
         }
+        self.module(file, call.range.start, work)?;
         match call.callee {
             StaticCallee::Direct => self.direct_call(file, call, work),
             StaticCallee::Qualified => self.qualified_call(file, call, work),
             StaticCallee::Member { receiver, member } => {
-                let owner = self.receiver_target(file, receiver, work)?;
-                self.inherent_method(file, call.range.start, owner, file.text(member)?, work)
+                self.receiver_method_at_depth(file, receiver, file.text(member)?, work, depth)
             }
             StaticCallee::Unsupported | StaticCallee::Constructor => None,
         }
@@ -364,6 +573,11 @@ impl<'source> Namespaces<'source> {
     ) -> Option<Target<'source>> {
         let parts = path_segments(file.text(call.callee_range)?, work)?;
         let position = call.range.start;
+        if let ["Self", member] = parts.as_slice()
+            && let Some(owner) = self.structural_self(file, position, work)
+        {
+            return self.inherent_method(file, position, owner, member, work);
+        }
         let path = self.resolved_path(file, position, &parts, work)?;
         if let Some(target) = self.lookup(file, position, &path, Namespace::Value, work) {
             return Some(target);
@@ -387,7 +601,20 @@ impl<'source> Namespaces<'source> {
         member: &str,
         work: &mut Work,
     ) -> Option<Target<'source>> {
-        if !matches!(owner.symbol.kind, "struct" | "enum" | "union_item") {
+        if owner.symbol.kind == "trait" {
+            let mut path = owner.admitted_path()?;
+            path.push(member.to_owned());
+            return self
+                .members
+                .get(&path)
+                .copied()
+                .flatten()
+                .filter(|target| self.available(*target))?
+                .callable();
+        }
+        if !matches!(owner.symbol.kind, "struct" | "enum" | "union_item")
+            && !structural_owner(owner)
+        {
             return None;
         }
         let mut path = owner.admitted_path()?;
@@ -411,6 +638,9 @@ impl<'source> Namespaces<'source> {
             if inherent && trait_impl {
                 continue;
             }
+            if !self.available(method.target) {
+                return None;
+            }
             if !trait_impl && !inherent {
                 selected = None;
                 inherent = true;
@@ -421,8 +651,10 @@ impl<'source> Namespaces<'source> {
             selected = Some(method.target);
         }
         let target = selected?;
-        (self.accessible(file, position, &path, target, work) || target.symbol.visibility.is_none())
-            .then_some(target)
+        (target.symbol.visibility.as_deref() == Some("pub")
+            || self.accessible(file, position, &path, target, work)
+            || target.symbol.visibility.is_none())
+        .then_some(target)
     }
 
     fn lookup(
@@ -437,9 +669,19 @@ impl<'source> Namespaces<'source> {
             Namespace::Type => &self.types,
             Namespace::Value => &self.values,
         };
-        let target = index.get(path).copied().flatten()?;
+        let target = index
+            .get(path)
+            .copied()
+            .flatten()
+            .filter(|target| self.available(*target))?;
         self.accessible(file, position, path, target, work)
             .then_some(target)
+    }
+
+    fn available(&self, target: Target<'source>) -> bool {
+        !self
+            .unavailable
+            .contains(&(target.file.path.as_str(), target.symbol.item_range))
     }
 
     fn accessible(
@@ -458,13 +700,20 @@ impl<'source> Namespaces<'source> {
         };
         for length in 1..=target_namespace.len() {
             let module = &target_namespace[..length];
-            if !work.charge() || self.conditional_modules.contains(module) {
+            if !work.charge() || self.module_unavailable(module) {
                 return false;
             }
-            if self.modules.get(module) == Some(&false)
-                && !source.starts_with(&module[..length - 1])
-            {
-                return false;
+            if let Some(target) = self.modules.get(module) {
+                let Some(target) = target else {
+                    return false;
+                };
+                if !namespace_visible(
+                    source,
+                    &module[..length - 1],
+                    target.symbol.visibility.as_deref(),
+                ) {
+                    return false;
+                }
             }
         }
         let visibility = target.symbol.visibility.as_deref();
@@ -496,6 +745,11 @@ impl<'source> Namespaces<'source> {
     ) -> Option<Vec<String>> {
         let (head, tail) = parts.split_first()?;
         if *head == "Self" {
+            if let Some(owner) = self.structural_self(file, position, work) {
+                let mut path = owner.admitted_path()?;
+                path.extend(tail.iter().map(|part| (*part).to_owned()));
+                return Some(path);
+            }
             let implementation = file
                 .facts
                 .inherent_impls()
@@ -530,6 +784,9 @@ impl<'source> Namespaces<'source> {
         match file.binding(head, position, is_type_binding, work) {
             Binding::Found(binding) => match binding.kind {
                 StaticBindingKind::RustUse { path } => {
+                    if file.conditional(path, work) {
+                        return None;
+                    }
                     let imported = file.use_parts(path, work)?;
                     let imported = imported.iter().map(String::as_str).collect::<Vec<_>>();
                     let mut prefix = self.absolute_path(file, path.start, &imported, work)?;
@@ -554,6 +811,22 @@ impl<'source> Namespaces<'source> {
             }
             Binding::Blocked => None,
         }
+    }
+
+    fn structural_self(
+        &self,
+        file: &File<'source>,
+        position: u64,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let implementation = file
+            .facts
+            .inherent_impls()
+            .iter()
+            .filter(|implementation| work.charge() && implementation.range.contains(position))
+            .min_by_key(|implementation| implementation.range.end - implementation.range.start)?;
+        file.target_at(implementation.type_path)
+            .filter(|target| structural_owner(*target) && self.available(*target))
     }
 
     fn absolute_path(
@@ -640,7 +913,17 @@ impl<'source> Namespaces<'source> {
                 path = inline;
             }
         }
+        for length in 1..=path.len() {
+            if !work.charge() || self.module_unavailable(&path[..length]) {
+                return None;
+            }
+        }
         Some(path)
+    }
+
+    fn module_unavailable(&self, path: &[String]) -> bool {
+        self.conditional_modules.contains(path)
+            || self.inactive_modules.contains(path) && !self.types.contains_key(path)
     }
 }
 
@@ -678,10 +961,15 @@ impl File<'_> {
     }
 
     pub(super) fn conditional(&self, range: ByteRange, work: &mut Work) -> bool {
-        self.facts
-            .conditional_items()
-            .iter()
-            .any(|item| !work.charge() || item.contains(range.start))
+        self.conditions.iter().any(|(item, admitted)| {
+            !work.charge() || item.contains(range.start) && *admitted != Some(true)
+        })
+    }
+
+    pub(super) fn inactive(&self, range: ByteRange, work: &mut Work) -> bool {
+        self.conditions.iter().any(|(item, admitted)| {
+            !work.charge() || item.contains(range.start) && *admitted == Some(false)
+        })
     }
 
     fn in_impl_or_trait(&self, symbol: &SyntaxSymbol, work: &mut Work) -> bool {
@@ -729,6 +1017,10 @@ fn inherent_member<'source>(
     })
 }
 
+fn structural_owner(target: Target<'_>) -> bool {
+    target.symbol.kind == "impl_item" && target.symbol.name.starts_with(['&', '['])
+}
+
 fn insert<T>(index: &mut BTreeMap<Vec<String>, Option<T>>, path: Vec<String>, target: T) {
     index
         .entry(path)
@@ -758,7 +1050,10 @@ fn path_segments<'text>(source: &'text str, work: &mut Work) -> Option<Vec<&'tex
 
 fn is_type_binding(kind: StaticBindingKind) -> bool {
     // Value bindings do not shadow paths in Rust's type namespace.
-    matches!(kind, StaticBindingKind::RustUse { .. })
+    matches!(
+        kind,
+        StaticBindingKind::RustUse { .. } | StaticBindingKind::RustTypeParameter
+    )
 }
 
 fn is_value_binding(kind: StaticBindingKind) -> bool {
@@ -768,5 +1063,17 @@ fn is_value_binding(kind: StaticBindingKind) -> bool {
             | StaticBindingKind::Shadow
             | StaticBindingKind::RustUse { .. }
             | StaticBindingKind::RustReceiver { .. }
+            | StaticBindingKind::RustValue { .. }
     )
+}
+
+fn namespace_visible(source: &[String], namespace: &[String], visibility: Option<&str>) -> bool {
+    match visibility {
+        Some("pub") => true,
+        Some("pub(crate)") => source.first() == namespace.first(),
+        Some("pub(super)") => namespace
+            .split_last()
+            .is_some_and(|(_, parent)| source.starts_with(parent)),
+        _ => source.starts_with(namespace),
+    }
 }

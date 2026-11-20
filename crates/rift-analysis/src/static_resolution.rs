@@ -218,6 +218,7 @@ struct File<'source> {
     python_values: BTreeMap<u64, StaticBindingKind>,
     python_calls: BTreeMap<u64, Vec<&'source StaticCall>>,
     declared_types: BTreeMap<ByteRange, Option<ByteRange>>,
+    conditions: Vec<(ByteRange, Option<bool>)>,
 }
 
 #[derive(Default)]
@@ -264,6 +265,7 @@ impl<'source> File<'source> {
     fn new(
         document: &'source StaticSource<'source>,
         facts: &'source StaticFacts,
+        configuration: Option<&crate::analyzer::namespace::RustConfiguration<'_>>,
         work: &mut Work,
     ) -> Option<Self> {
         let mut file = Self {
@@ -279,7 +281,18 @@ impl<'source> File<'source> {
             python_values: BTreeMap::new(),
             python_calls: BTreeMap::new(),
             declared_types: BTreeMap::new(),
+            conditions: Vec::new(),
         };
+        for item in facts.conditional_items() {
+            if !work.charge() {
+                return None;
+            }
+            file.conditions.push((
+                item.range,
+                file.text(item.attribute)
+                    .and_then(|text| configuration?.attribute(text)),
+            ));
+        }
         file.index_bindings(work)?;
         file.index_symbols(work)?;
         Some(file)
@@ -289,6 +302,9 @@ impl<'source> File<'source> {
         for binding in self.facts.bindings() {
             if !work.charge() {
                 return None;
+            }
+            if self.inactive(binding.name, work) {
+                continue;
             }
             let name = self.text(binding.name)?;
             self.by_name.entry(name).or_default().push(binding);
@@ -336,6 +352,9 @@ impl<'source> File<'source> {
         let mut classes = Vec::new();
         let python = self.document.facts.language().name == "python";
         for symbol in self.document.facts.symbols() {
+            if self.inactive(symbol.item_range, work) {
+                continue;
+            }
             if !work.charge() {
                 return None;
             }
@@ -517,6 +536,7 @@ impl<'source> Index<'source> {
         work: &mut Work,
     ) -> Option<Self> {
         let mut files = BTreeMap::new();
+        let configurations = crate::analyzer::namespace::RustConfigurations::new(namespace);
         let mut unavailable_sources = 0;
         for document in documents {
             if !work.charge() {
@@ -536,7 +556,12 @@ impl<'source> Index<'source> {
                 }
                 EMPTY_STATIC_FACTS.get_or_init(StaticFacts::default)
             };
-            let file = File::new(document, facts, work)?;
+            let file = File::new(
+                document,
+                facts,
+                Some(&configurations.file(document.path.as_str())),
+                work,
+            )?;
             if files.insert(document.path.as_str(), file).is_some() {
                 return None;
             }
@@ -563,6 +588,9 @@ impl<'source> Index<'source> {
 
     fn resolve_file(&self, file: &File<'source>, work: &mut Work, result: &mut StaticResolution) {
         for range in file.facts.unsupported_bindings() {
+            if file.inactive(*range, work) {
+                continue;
+            }
             if !work.charge() {
                 return;
             }
@@ -571,6 +599,9 @@ impl<'source> Index<'source> {
             }
         }
         for call in file.facts.calls() {
+            if file.inactive(call.range, work) {
+                continue;
+            }
             if !work.charge() {
                 return;
             }
@@ -592,6 +623,9 @@ impl<'source> Index<'source> {
             result.record(occurrence);
         }
         for edge in file.facts.heritage_edges() {
+            if file.inactive(edge.from, work) {
+                continue;
+            }
             if !work.charge() {
                 return;
             }
@@ -599,6 +633,9 @@ impl<'source> Index<'source> {
             result.record(occurrence);
         }
         for binding in file.facts.bindings() {
+            if file.inactive(binding.name, work) {
+                continue;
+            }
             if !work.charge() {
                 return;
             }

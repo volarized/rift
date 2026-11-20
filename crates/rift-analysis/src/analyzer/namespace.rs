@@ -502,3 +502,7 @@ pub(crate) fn namespace_paths(
 ) -> Result<BTreeSet<rift_core::ProjectPath>, rift_error::RiftError> {
     rust::namespace_paths(input, documents, contains, selected, files_max)
 }
+
+pub(crate) use rust::configuration::{
+    Configuration as RustConfiguration, Configurations as RustConfigurations,
+};
