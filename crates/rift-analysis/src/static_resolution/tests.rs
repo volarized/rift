@@ -137,6 +137,8 @@ fn test_typescript_declared_receiver_types_resolve_imported_members() {
 use rift_protocol::{identity::SymbolOwner, read::Language};
 use rift_syntax::{SyntaxDocument, SyntaxLimits, SyntaxSource, registry};
 
+use std::fmt::Write as _;
+
 use super::{ReferenceRole, StaticOccurrence, StaticResolution, StaticSource, resolve};
 use crate::analyzer::namespace::{SelectedFile, prepare_context};
 use crate::semantic::PlacedFacts;
@@ -1223,9 +1225,11 @@ fn a_name_bound_in_many_scopes_resolves_to_its_innermost_binding() {
     let functions = 24;
     let mut source = String::from("const e = 0; e;\n");
     for function in 0..functions {
-        source.push_str(&format!(
-            "function f{function}() {{ const e = {function}; e; function inner() {{ e; }} function own() {{ const e = 1; e; }} }}\n"
-        ));
+        writeln!(
+            source,
+            "function f{function}() {{ const e = {function}; e; function inner() {{ e; }} function own() {{ const e = 1; e; }} }}"
+        )
+        .expect("a string accepts formatted text");
     }
     let result = resolution("typescript", &[("main.ts", &source)], &[], 1_000_000);
     assert!(!result.exhausted);
@@ -1254,9 +1258,11 @@ fn many_conditional_items_leave_only_the_inactive_ones_out() {
     // More conditional items than a lookup reads in order: nested and sibling items.
     let mut source = String::from("fn leaf() {}\n");
     for item in 0..24 {
-        source.push_str(&format!(
-            "#[cfg(feature=\"off\")] fn off{item}() {{ leaf(); }}\n#[cfg(feature=\"std\")] mod on{item} {{ pub fn call() {{ crate::leaf(); }} #[cfg(feature=\"off\")] pub fn skip() {{ crate::leaf(); }} }}\n"
-        ));
+        writeln!(
+            source,
+            "#[cfg(feature=\"off\")] fn off{item}() {{ leaf(); }}\n#[cfg(feature=\"std\")] mod on{item} {{ pub fn call() {{ crate::leaf(); }} #[cfg(feature=\"off\")] pub fn skip() {{ crate::leaf(); }} }}"
+        )
+        .expect("a string accepts formatted text");
     }
     source.push_str("fn root() { leaf(); }\n");
     let manifest =
