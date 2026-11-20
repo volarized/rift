@@ -463,9 +463,9 @@ pub(super) fn js_binding<'source>(
         |binding| {
             let symbol = file.target_at(binding.name).map(|target| target.symbol);
             if role == rift_core::ReferenceRole::Type {
-                !symbol.is_some_and(|symbol| symbol.kind == "variable")
+                symbol.is_none_or(|symbol| symbol.kind != "variable")
             } else {
-                !symbol.is_some_and(|symbol| matches!(symbol.kind, "interface" | "type_alias"))
+                symbol.is_none_or(|symbol| !matches!(symbol.kind, "interface" | "type_alias"))
             }
         },
         |binding, first| {

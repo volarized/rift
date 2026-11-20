@@ -206,11 +206,19 @@ impl FileWork {
 }
 
 /// Budget every file's pass may spend whatever it holds.
-const FILE_WORK_FLOOR: usize = 65_536;
+///
+/// A module that only re-exports holds none of the counted elements and still follows
+/// every export chain: the heaviest one measured spent 51,937 charges for 27 re-exports.
+/// The floor stands five times above it.
+const FILE_WORK_FLOOR: usize = 262_144;
 
 /// Budget a file's pass may spend for each call, reference, binding, heritage edge, and
 /// declaration it holds.
-const FILE_WORK_PER_ELEMENT: usize = 256;
+///
+/// Over two large workspaces of 12,646 and 10,024 analyzed files the heaviest file spent
+/// 144 charges per element, and a minified bundle 6. The share stands seven times above
+/// the heaviest: it ends a pass whose lookups run away, not one that is merely large.
+const FILE_WORK_PER_ELEMENT: usize = 1_024;
 
 #[derive(Debug)]
 struct Work {
