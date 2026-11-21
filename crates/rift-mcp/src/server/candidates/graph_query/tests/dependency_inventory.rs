@@ -387,3 +387,28 @@ async fn inventory_reports_engine_targets_static_did_not_name() -> TestResult {
     server.engine_pool().await.shutdown().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn inventory_analyzes_each_captured_stub_once_per_read() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().canonicalize()?;
+    installed_python_workspace(&root)?;
+    observed_python_environment(&root)?;
+    std::fs::write(
+        root.join("app.py"),
+        "def size(values: list[int]) -> int:\n    return len(values) + abs(-1)\n",
+    )?;
+    let server = RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
+    let ids = targets(&server, "references", "engine").await?;
+    for name in ["list", "int", "len", "abs"] {
+        let expected = format!("rift://symbol/stdlib/cpython/python/builtins/{name}");
+        assert!(ids.contains(&expected), "{name}: {ids:?}");
+    }
+    assert_eq!(
+        super::super::installed::runs::count(&root, "vendored://stdlib/builtins.pyi"),
+        1,
+        "every target in one stub is served from one analysis of that stub"
+    );
+    server.engine_pool().await.shutdown().await;
+    Ok(())
+}

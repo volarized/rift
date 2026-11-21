@@ -9,10 +9,7 @@ use rift_protocol::revision::Revision;
 use rift_search::sparql::RevisionIri;
 use rift_server::{CalleePackage, PackageCallee};
 
-use super::{
-    AdjacencyWalk, InstalledTarget, claim_request, coverage_failure, exact_request,
-    selected_release,
-};
+use super::{AdjacencyWalk, claim_request, coverage_failure, exact_request, selected_release};
 
 impl AdjacencyWalk<'_> {
     pub(super) async fn name_package_calls(
@@ -186,7 +183,8 @@ impl AdjacencyWalk<'_> {
         let callees = callees.to_vec();
         let maximum = usize::try_from(self.remaining.bytes_max).unwrap_or(usize::MAX);
         let end = self.deadline.at();
-        let targets = self
+        let mut analyses = std::mem::take(&mut self.installed_analyses);
+        let (targets, analyses) = self
             .server
             .blocking
             .run("capture installed engine targets", move || {
@@ -197,8 +195,7 @@ impl AdjacencyWalk<'_> {
                         targets.push(None);
                         continue;
                     }
-                    let target =
-                        InstalledTarget::capture(callee, &roots, &tree, &configuration).ok();
+                    let target = analyses.target(callee, &roots, &tree, &configuration).ok();
                     let target = target.filter(|target| {
                         !type_target(kind) || target.symbol.kinds.contains(&SymbolKind::Type)
                     });
@@ -216,9 +213,10 @@ impl AdjacencyWalk<'_> {
                         targets.push(None);
                     }
                 }
-                Ok(targets)
+                Ok((targets, analyses))
             })
             .await?;
+        self.installed_analyses = analyses;
         let mut named = Vec::with_capacity(targets.len());
         for target in targets {
             let Some(target) = target else {
