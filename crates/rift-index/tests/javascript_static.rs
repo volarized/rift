@@ -1,6 +1,6 @@
 //! Stored JavaScript and TypeScript edges from captured source.
 
-use rift_core::{SourceVisibility, TextFileInclusion};
+use rift_core::{ProjectPath, SourceVisibility, TextFileInclusion};
 use rift_index::{WorkspaceIndex, WorkspaceIndexLimits};
 use rift_protocol::read::EdgeKind;
 
@@ -552,6 +552,42 @@ export const api = { member: wrap(() => leaf()), method() { return leaf() } };
             "{path}: {found:?}"
         );
     }
+}
+
+#[test]
+fn tsx_callable_variables_keep_recursive_calls_and_closer_shadows() {
+    let source = r#"export const Widget = (depth: number) => {
+  if (depth > 0) return Widget(depth - 1);
+  {
+    const Widget = () => <span className="flex" />;
+    return Widget();
+  }
+};
+export const Shadowed = (Shadowed: () => JSX.Element) => Shadowed();
+"#;
+    let (_directory, index) = workspace_with_manifest(
+        &[
+            ("main.tsx", source),
+            ("styles.css", "@import 'tailwindcss';"),
+        ],
+        r#"{"name":"fixture","version":"1.0.0","type":"module","devDependencies":{"tailwindcss":"4.1.0"}}"#,
+    );
+    let file = index
+        .file(&ProjectPath::new("main.tsx").expect("fixture path"))
+        .expect("indexed TSX source");
+    assert!(
+        file.syntax()
+            .symbols()
+            .iter()
+            .any(|symbol| symbol.kind == "utility" && symbol.name == "flex")
+    );
+    assert_eq!(
+        calls(&index),
+        [
+            ("Widget".to_owned(), "Widget".to_owned()),
+            ("Widget".to_owned(), "Widget/Widget".to_owned()),
+        ]
+    );
 }
 
 #[test]

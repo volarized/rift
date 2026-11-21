@@ -4,9 +4,9 @@ use rift_error::RiftError;
 use tree_sitter::Node;
 
 use super::{
-    StaticBindingKind, StaticCallee, StaticDeclaredReturn, StaticFactsParts, StaticFunctionContext,
-    StaticMember, StaticParameter, StaticReexport, StaticReference, binding, call, enclosing,
-    field, identifier, kind,
+    StaticBinding, StaticBindingKind, StaticCallee, StaticDeclaredReturn, StaticFactsParts,
+    StaticFunctionContext, StaticMember, StaticParameter, StaticReexport, StaticReference, binding,
+    call, enclosing, field, identifier, kind,
 };
 use crate::ByteRange;
 use crate::extract::{Visited, byte_range};
@@ -1604,16 +1604,22 @@ impl Kinds {
         facts
             .bindings
             .push(binding(name, scope, byte_range(syntax_element)?.end, kind)?);
-        if let Some(scope) = syntax_element
+        if let Some(function) = syntax_element
             .child_by_field_id(self.value)
             .and_then(|value| self.function_value(value))
         {
-            facts.bindings.push(binding(
+            let name = byte_range(name)?;
+            let function = byte_range(function)?;
+            // Include the authored name without moving the start of the binding's availability.
+            facts.bindings.push(StaticBinding {
                 name,
-                scope,
-                byte_range(scope)?.start,
-                StaticBindingKind::Local,
-            )?);
+                scope: ByteRange {
+                    start: name.start,
+                    end: function.end,
+                },
+                available_from: function.start,
+                kind: StaticBindingKind::Local,
+            });
         }
         Ok(())
     }

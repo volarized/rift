@@ -51,6 +51,27 @@ fn markdown_parts(facts: &MarkdownFacts) -> MarkdownFactsParts {
 }
 
 #[test]
+fn tsx_callable_variable_restores_its_recursive_and_outer_bindings() {
+    let source = "export const Widget = () => <div />;";
+    let document = parsed(ShippedLanguage::TypeScriptTsx, source);
+    let restored =
+        SyntaxFacts::from_parts(source, SyntaxLimits::default(), parts(document.facts()))
+            .expect("restore the provider's Widget bindings");
+    assert_eq!(&restored, document.facts());
+
+    let bindings = restored.static_facts().expect("TSX facts").bindings();
+    let name = ByteRange { start: 13, end: 19 };
+    let widget = bindings
+        .iter()
+        .filter(|binding| binding.name == name)
+        .map(|binding| (binding.scope, binding.available_from))
+        .collect::<Vec<_>>();
+    assert_eq!(widget.len(), 2);
+    assert!(widget.contains(&(ByteRange { start: 0, end: 36 }, 35)));
+    assert!(widget.contains(&(ByteRange { start: 13, end: 35 }, 22)));
+}
+
+#[test]
 fn rust_module_path_facts_restore_exact_source_and_keep_old_facts_unknown() {
     let source = "#[path = \"client.rs\"]\n\nmod client;\n";
     let document = parsed(ShippedLanguage::Rust, source);
