@@ -161,3 +161,124 @@ fn test_rust_captured_configuration_refuses_invalid_flags_and_moved_metadata() {
         "moving metadata must refuse the old selected build configuration"
     );
 }
+
+/// Items under feature, target and mixed conditions, each calling and reading the same facts.
+const TARGET_SOURCE: &str = "pub struct Item { pub value: usize }\npub fn leaf() -> usize { 1 }\nimpl Item {\n    #[cfg(feature = \"std\")]\n    pub fn by_feature(&self) -> usize { leaf() + self.value }\n    #[cfg(unix)]\n    pub fn by_unix(&self) -> usize { leaf() + self.value }\n    #[cfg(any(unix, windows, target_os = \"wasi\"))]\n    pub fn by_any_target(&self) -> usize { leaf() + self.value }\n    #[cfg(all(feature = \"std\", any(unix, windows)))]\n    pub fn by_feature_and_target(&self) -> usize { leaf() + self.value }\n    #[cfg(not(target_os = \"emscripten\"))]\n    pub fn by_not_target(&self) -> usize { leaf() + self.value }\n    #[cfg(windows)]\n    pub fn by_windows(&self) -> usize { leaf() + self.value }\n}\n";
+
+/// A unix and a windows build configuration, both with the default `std` feature.
+const UNIX: &[&str] = &[
+    "unix",
+    "target_family=\"unix\"",
+    "target_os=\"linux\"",
+    "feature=\"default\"",
+    "feature=\"std\"",
+];
+const WINDOWS: &[&str] = &[
+    "windows",
+    "target_family=\"windows\"",
+    "target_os=\"windows\"",
+    "feature=\"default\"",
+    "feature=\"std\"",
+];
+
+#[test]
+fn test_rust_target_conditions_follow_the_captured_configuration_only() {
+    // #859: `unix`, `windows` and `target_os` predicates are decided by the captured build
+    // configuration, the same way on every host. Without one the target stays unknown:
+    // the declarations keep their identities and no fact inside them is resolved.
+    let package = PackageIdentity {
+        manager: "cargo".into(),
+        registry: "crates.io".into(),
+        name: "fixture".into(),
+        version: "0.1.0".into(),
+    };
+    let owner = package.owner().expect("owner");
+    let origin = ContributionOrigin::new(
+        Some(SourceLocation::Dependency { package }),
+        SourceKind::Authored,
+    )
+    .expect("origin");
+    let language = ShippedLanguage::Rust.language();
+    let manifest = ProjectPath::new("Cargo.toml").expect("manifest path");
+    let path = ProjectPath::new("src/lib.rs").expect("source path");
+    let files = [PackageSource::new(&path, TARGET_SOURCE)];
+    let context = [PackageSource::new(
+        &manifest,
+        "[package]\nname='fixture'\nversion='0.1.0'\n[features]\ndefault=['std']\nstd=[]\n",
+    )];
+    let methods = [
+        "by_feature",
+        "by_unix",
+        "by_any_target",
+        "by_feature_and_target",
+        "by_not_target",
+        "by_windows",
+    ];
+    for (flags, active) in [
+        (None, &["by_feature"][..]),
+        (
+            Some(UNIX),
+            &[
+                "by_feature",
+                "by_unix",
+                "by_any_target",
+                "by_feature_and_target",
+                "by_not_target",
+            ][..],
+        ),
+        (
+            Some(WINDOWS),
+            &[
+                "by_feature",
+                "by_any_target",
+                "by_feature_and_target",
+                "by_not_target",
+                "by_windows",
+            ][..],
+        ),
+    ] {
+        let input = ExactPackageInput::new(
+            &owner,
+            &language,
+            &origin,
+            &files,
+            ExactPackageLimits::new(10, 65_536),
+        )
+        .expect("input")
+        .with_framework_context(&context, &[])
+        .expect("context");
+        let input = match flags {
+            Some(flags) => input
+                .with_rust_configuration(&manifest, flags)
+                .expect("captured flags"),
+            None => input,
+        };
+        let analysis = PackageAnalyzer::analyze(input, 1).expect("analysis");
+        let publication = analysis.publication();
+        for method in methods {
+            assert!(
+                publication
+                    .objects
+                    .iter()
+                    .any(|object| object.name == method && object.id.is_some()),
+                "{flags:?}: {method} keeps its declaration and identity"
+            );
+            for (kind, to) in [
+                (EdgeKind::Calls, "/fixture/leaf"),
+                (EdgeKind::Reads, "/Item/value"),
+            ] {
+                let from = format!("/Item/{method}");
+                let found = publication.edges.iter().any(|edge| {
+                    edge.kinds.contains(&kind)
+                        && edge.from.0.ends_with(&from)
+                        && edge.to.0.ends_with(to)
+                });
+                assert_eq!(
+                    found,
+                    active.contains(&method),
+                    "{flags:?}: {kind:?} {from} -> {to}"
+                );
+            }
+        }
+    }
+}
