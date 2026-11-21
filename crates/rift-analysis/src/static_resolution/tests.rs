@@ -154,6 +154,7 @@ mod python_ancestry;
 mod python_class_rebinding;
 mod python_conditional_methods;
 mod python_decorators;
+mod python_elements;
 mod python_external_bases;
 mod python_imports;
 mod python_joins;

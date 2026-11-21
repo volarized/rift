@@ -2,6 +2,7 @@
 
 mod annotations;
 mod classes;
+mod elements;
 mod overloads;
 mod rebinding;
 mod references;
@@ -114,6 +115,7 @@ impl<'source> Index<'source> {
                 StaticBindingKind::PythonAnnotation { .. }
                     | StaticBindingKind::PythonInstance { .. }
                     | StaticBindingKind::PythonAlias { .. }
+                    | StaticBindingKind::PythonElement { .. }
             ) {
                 return None;
             }
@@ -364,6 +366,12 @@ impl<'source> Index<'source> {
             | StaticBindingKind::PythonFunction { .. } => {
                 file.target_at(binding.name).map(Value::Symbol)
             }
+            StaticBindingKind::PythonElement { iterable } => {
+                file.target_at(binding.name).map(Value::Symbol).or_else(|| {
+                    self.python_element(file, iterable, work)
+                        .map(Value::Instance)
+                })
+            }
             StaticBindingKind::PythonReceiver { class_name } => {
                 let class = file.target_at(class_name)?;
                 let method = file.enclosing_callable(binding.name)?;
@@ -445,6 +453,7 @@ impl<'source> Index<'source> {
                 | StaticBindingKind::PythonAnnotation { .. }
                 | StaticBindingKind::PythonInstance { .. }
                 | StaticBindingKind::PythonAlias { .. }
+                | StaticBindingKind::PythonElement { .. }
                 | StaticBindingKind::PythonFunction { .. } => {
                     return file.target_at(binding.name).map(Value::Symbol);
                 }

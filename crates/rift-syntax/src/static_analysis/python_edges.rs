@@ -539,14 +539,14 @@ impl EdgePythonKinds {
         while let Some(target) = pending.pop() {
             if target.kind_id() == self.identifier {
                 let kind = self.edge_assignment_kind(visited, target)?;
-                let available = if matches!(
-                    kind,
+                let available = match kind {
                     StaticBindingKind::PythonInstance { .. }
-                        | StaticBindingKind::PythonAlias { .. }
-                ) {
-                    byte_range(visited.syntax_element())?.end
-                } else {
-                    byte_range(scope)?.start
+                    | StaticBindingKind::PythonAlias { .. } => {
+                        byte_range(visited.syntax_element())?.end
+                    }
+                    // The loop body reads each element after the iterated value.
+                    StaticBindingKind::PythonElement { iterable } => iterable.end,
+                    _ => byte_range(scope)?.start,
                 };
                 facts
                     .bindings
@@ -586,6 +586,15 @@ impl EdgePythonKinds {
         target: Node<'_>,
     ) -> Result<StaticBindingKind, RiftError> {
         let assignment = visited.syntax_element();
+        if assignment.kind_id() == self.assignment[2]
+            && target.kind_id() == self.identifier
+            && assignment.child_by_field_id(self.left) == Some(target)
+            && let Some(iterable) = assignment.child_by_field_id(self.right)
+        {
+            return Ok(StaticBindingKind::PythonElement {
+                iterable: byte_range(iterable)?,
+            });
+        }
         if assignment.kind_id() != self.assignment[0]
             || assignment.child_by_field_id(self.left) != Some(target)
         {

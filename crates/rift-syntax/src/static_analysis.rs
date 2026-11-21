@@ -125,6 +125,11 @@ pub enum StaticBindingKind {
         /// Authored value path.
         value: ByteRange,
     },
+    /// A Python `for` loop target bound to each element of the iterated value.
+    PythonElement {
+        /// Authored iterated expression.
+        iterable: ByteRange,
+    },
     /// A write to a Python member slot, separate from lexical bindings.
     PythonMemberWrite {
         /// Authored receiver of the assignment target.
@@ -561,6 +566,7 @@ impl StaticBinding {
                 decorator,
             } => valid(annotation) && decorator.is_none_or(&valid),
             StaticBindingKind::PythonAlias { value } => valid(value),
+            StaticBindingKind::PythonElement { iterable } => valid(iterable),
             StaticBindingKind::PythonMemberWrite { receiver } => valid(receiver),
             StaticBindingKind::RustUse { path } => valid(path),
             StaticBindingKind::RustReceiver { type_path } => valid(type_path),

@@ -52,7 +52,7 @@ impl<'source> Index<'source> {
     }
 
     /// The one member of `Optional[X]` or of a `Union` whose other members are `None`.
-    fn python_optional_member(
+    pub(super) fn python_optional_member(
         &self,
         file: &File<'source>,
         annotation: ByteRange,
@@ -82,7 +82,7 @@ impl<'source> Index<'source> {
 }
 
 /// The source range of `slice`, a part of `written`, the text at `range`.
-fn slice_range(range: ByteRange, written: &str, slice: &str) -> Option<ByteRange> {
+pub(super) fn slice_range(range: ByteRange, written: &str, slice: &str) -> Option<ByteRange> {
     let offset = (slice.as_ptr() as usize).checked_sub(written.as_ptr() as usize)?;
     if offset.checked_add(slice.len())? > written.len() {
         return None;
@@ -95,7 +95,7 @@ fn slice_range(range: ByteRange, written: &str, slice: &str) -> Option<ByteRange
 }
 
 /// Comma separated members of a subscript, outside nested brackets and parentheses.
-fn top_level_members(text: &str) -> Vec<&str> {
+pub(super) fn top_level_members(text: &str) -> Vec<&str> {
     let mut members = Vec::new();
     let mut depth = 0_usize;
     let mut start = 0;

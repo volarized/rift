@@ -458,6 +458,7 @@ impl<'source> File<'source> {
                 StaticBindingKind::PythonAnnotation { .. }
                 | StaticBindingKind::PythonFunction { .. }
                 | StaticBindingKind::PythonAlias { .. }
+                | StaticBindingKind::PythonElement { .. }
                 | StaticBindingKind::PythonInstance { .. } => {
                     self.python_values.insert(binding.name.end, binding.kind);
                 }

@@ -569,6 +569,9 @@ impl<'source> Index<'source> {
                 StaticBindingKind::PythonAlias { value } => {
                     work.python_lookup(|work| self.python_name(file, *value, work))?
                 }
+                StaticBindingKind::PythonElement { iterable } => {
+                    Value::Instance(self.python_element(file, *iterable, work)?)
+                }
                 _ => return None,
             };
         }
