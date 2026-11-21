@@ -12,6 +12,7 @@ enum TokenType {
     REGEX_PATTERN,
     FUNCTION_SIGNATURE_AUTOMATIC_SEMICOLON,
     ERROR_RECOVERY,
+    TYPE_MEMBER_GENERIC_SEPARATOR,
 };
 
 static void advance(TSLexer *lexer) { lexer->advance(lexer, false); }
@@ -79,12 +80,13 @@ static bool scan_whitespace_and_comments(TSLexer *lexer, bool *scanned_comment) 
 }
 
 static bool scan_automatic_semicolon(TSLexer *lexer, const bool *valid_symbols, bool *scanned_comment) {
+    bool automatic = valid_symbols[AUTOMATIC_SEMICOLON] || valid_symbols[FUNCTION_SIGNATURE_AUTOMATIC_SEMICOLON];
     lexer->result_symbol = AUTOMATIC_SEMICOLON;
     lexer->mark_end(lexer);
 
     for (;;) {
-        if (lexer->lookahead == 0) {
-            return true;
+        if (lexer->lookahead == 0 || (lexer->lookahead == '}' && !automatic)) {
+            return automatic;
         }
         if (lexer->lookahead == '}') {
             // Automatic semicolon insertion breaks detection of object patterns
@@ -111,6 +113,15 @@ static bool scan_automatic_semicolon(TSLexer *lexer, const bool *valid_symbols, 
     skip(lexer);
 
     if (!scan_whitespace_and_comments(lexer, scanned_comment)) {
+        return false;
+    }
+
+    // A line break before '<' can start a generic signature in an object type.
+    if (lexer->lookahead == '<' && valid_symbols[TYPE_MEMBER_GENERIC_SEPARATOR] && !valid_symbols[LOGICAL_OR]) {
+        lexer->result_symbol = TYPE_MEMBER_GENERIC_SEPARATOR;
+        return true;
+    }
+    if (!automatic) {
         return false;
     }
 
@@ -278,7 +289,8 @@ static inline bool external_scanner_scan(void *payload, TSLexer *lexer, const bo
         }
         return scan_template_chars(lexer);
     }
-    if (valid_symbols[AUTOMATIC_SEMICOLON] || valid_symbols[FUNCTION_SIGNATURE_AUTOMATIC_SEMICOLON]) {
+    if (valid_symbols[AUTOMATIC_SEMICOLON] || valid_symbols[FUNCTION_SIGNATURE_AUTOMATIC_SEMICOLON] ||
+        valid_symbols[TYPE_MEMBER_GENERIC_SEPARATOR]) {
         bool scanned_comment = false;
         bool ret = scan_automatic_semicolon(lexer, valid_symbols, &scanned_comment);
         if (!ret && !scanned_comment && valid_symbols[TERNARY_QMARK] && lexer->lookahead == '?') {

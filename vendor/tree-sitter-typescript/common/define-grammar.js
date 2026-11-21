@@ -7,6 +7,7 @@ module.exports = function defineGrammar(dialect) {
     externals: ($, previous) => previous.concat([
       $._function_signature_automatic_semicolon,
       $.__error_recovery,
+      $._type_member_generic_separator,
     ]),
 
     supertypes: ($, previous) => previous.concat([
@@ -941,7 +942,7 @@ module.exports = function defineGrammar(dialect) {
         optional(seq(
           optional(choice(',', ';')),
           sepBy1(
-            choice(',', $._semicolon),
+            choice(',', $._semicolon, $._type_member_generic_separator),
             choice(
               $.export_statement,
               $.property_signature,

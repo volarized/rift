@@ -478,3 +478,55 @@ fn test_contextual_global_keeps_identifier_ranges_and_ambient_scope() {
         assert!(malformed.has_errors());
     }
 }
+
+#[test]
+fn test_newline_separated_generic_call_signatures_keep_their_spans() {
+    let text = "export type Handler<T> = {\n    (): T\n    <U>(value: U): U\n} & T\n\nexport type Container<T> = {\n    listen: {\n        (value: T): T\n        <U>(value: U): U\n    }\n}\n";
+    let path = ProjectPath::new("index.ts").expect("syntax fixture path");
+    for dialect in [TypeScriptDialect::TypeScript, TypeScriptDialect::Tsx] {
+        let provider = dialect.provider();
+        let document = provider
+            .analyze(SyntaxSource { path: &path, text }, SyntaxLimits::default())
+            .expect("call signature syntax");
+        assert!(!document.has_errors());
+        let signatures = document
+            .syntax_elements()
+            .iter()
+            .filter(|element| element.kind == "call_signature")
+            .map(|element| {
+                let start = usize::try_from(element.range.start).expect("signature start");
+                let end = usize::try_from(element.range.end).expect("signature end");
+                &text[start..end]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            signatures,
+            [
+                "(): T",
+                "<U>(value: U): U",
+                "(value: T): T",
+                "<U>(value: U): U"
+            ]
+        );
+        let malformed = provider
+            .analyze(
+                SyntaxSource {
+                    path: &path,
+                    text: "export type Invalid<T> = { (): T <U>(value: U): U }",
+                },
+                SyntaxLimits::default(),
+            )
+            .expect("same-line call signatures");
+        assert!(malformed.has_errors());
+        let multiline = provider
+            .analyze(
+                SyntaxSource {
+                    path: &path,
+                    text: "type Control<T> = { value: Array<\n T\n> };\nconst comparison = 1\n< 2;\nconst genericValue = <T,>(value: T): T => value;\nconst invoked = genericValue\n<string>('value');",
+                },
+                SyntaxLimits::default(),
+            )
+            .expect("multiline generic types and expressions");
+        assert!(!multiline.has_errors());
+    }
+}

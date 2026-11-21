@@ -10371,6 +10371,10 @@
                               {
                                 "type": "SYMBOL",
                                 "name": "_semicolon"
+                              },
+                              {
+                                "type": "SYMBOL",
+                                "name": "_type_member_generic_separator"
                               }
                             ]
                           },
@@ -11937,6 +11941,10 @@
     {
       "type": "SYMBOL",
       "name": "__error_recovery"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "_type_member_generic_separator"
     }
   ],
   "inline": [

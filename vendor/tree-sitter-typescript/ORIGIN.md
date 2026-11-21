@@ -2,6 +2,8 @@
 
 This crate is based on tree-sitter-typescript 0.21.1 at commit `35a3762218ca481cd85f14f4db11b563bc805c83`. The local patch accepts `global` as a contextual identifier while preserving the `global` block used in ambient declarations. One grammar conflict lets both uses coexist when a brace follows an identifier. Both generated parsers use ABI 14. [Upstream source](https://github.com/tree-sitter/tree-sitter-typescript/tree/35a3762218ca481cd85f14f4db11b563bc805c83)
 
+The local scanner also recognizes a line break before a generic signature when an object type expects another member. Type arguments within a member and less-than expressions continue to use their existing grammar rules.
+
 `LICENSE` covers the TypeScript grammar and `LICENSE.tree-sitter-javascript` covers its JavaScript grammar input. Cargo builds both parsers from the checked-in C sources.
 
 ## Regenerate the parsers
