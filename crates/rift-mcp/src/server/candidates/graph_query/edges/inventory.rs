@@ -552,9 +552,14 @@ impl RiftMcp {
                 .iter()
                 .map(|target| target.target.clone())
                 .collect::<Vec<_>>();
-            let named = walk.name_package_targets(&callees, kind, true).await?;
+            let named = walk
+                .name_package_targets_unreported(&callees, kind, true)
+                .await?;
+            let mut dropped = 0usize;
             for (target, identity) in targets.into_iter().zip(named) {
-                let Some(identity) = identity else {
+                // An engine target the static pass named at the same site keeps that name.
+                let Some(identity) = identity.or_else(|| target.static_target.clone()) else {
+                    dropped = dropped.saturating_add(1);
                     continue;
                 };
                 let edge = target.named(identity);
@@ -577,6 +582,7 @@ impl RiftMcp {
                 }
                 read.edge_facts.push(edge);
             }
+            walk.report_missing_targets(kind, dropped);
         }
         walk.verify_installed().await?;
         read.partial |= walk.acquired.partial;

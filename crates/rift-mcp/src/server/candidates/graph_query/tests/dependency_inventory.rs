@@ -283,3 +283,107 @@ async fn inventory_keeps_named_calls_when_another_engine_target_has_no_source() 
     server.engine_pool().await.shutdown().await;
     Ok(())
 }
+
+/// A Python workspace whose engine places standard-library targets in the bundled stubs,
+/// with no observed runtime to name their release.
+fn unobserved_python_workspace(root: &Path, source: &str) -> TestResult {
+    crate::server::hermetic_workspace(
+        root,
+        "[languages.toml]\nenabled=false\n[languages.python]\nstdlib=false\n[languages.python.lsp]\nembedded='ty'\n[global]\nenabled=false\n",
+    )?;
+    std::fs::write(
+        root.join("pyproject.toml"),
+        "[build-system]\nrequires=['setuptools==80.9.0']\nbuild-backend='setuptools.build_meta'\n[tool.setuptools]\npy-modules=['service']\n",
+    )?;
+    std::fs::write(root.join("service.py"), source)?;
+    Ok(())
+}
+
+fn reference_pairs(
+    result: &rift_protocol::query::QueryResult,
+) -> Result<std::collections::BTreeSet<(String, String)>, Box<dyn std::error::Error + Send + Sync>>
+{
+    let QueryAnswer::Bindings { bindings, .. } = &result.answer else {
+        return Err("bindings".into());
+    };
+    let iri = |row: &std::collections::BTreeMap<String, rift_protocol::query::RdfTerm>,
+               name: &str| match row.get(name) {
+        Some(rift_protocol::query::RdfTerm::Iri { value }) => Some(value.clone()),
+        _ => None,
+    };
+    Ok(bindings
+        .iter()
+        .filter_map(|row| Some((iri(row, "caller")?, iri(row, "target")?)))
+        .collect())
+}
+
+#[tokio::test]
+async fn inventory_names_engine_targets_at_sites_static_named_externally() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().canonicalize()?;
+    unobserved_python_workspace(
+        &root,
+        "def serve(port: int) -> int:\n    return port\n\n\ndef caller() -> int:\n    return serve(8080)\n",
+    )?;
+    let server = RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
+    let result = query(
+        &server,
+        "SELECT ?caller ?target { ?caller :references ?target }".to_owned(),
+    )
+    .await?;
+    assert!(
+        result.warnings.is_empty(),
+        "engine targets at statically named sites count as unnamed: {:?}",
+        result.warnings
+    );
+    let serve = "rift://symbol/local/python/service/serve";
+    let caller = "rift://symbol/local/python/service/caller";
+    let int = "rift://symbol/stdlib/cpython/python/builtins/int";
+    let expected = [(caller, serve), (caller, int), (serve, int)]
+        .into_iter()
+        .map(|(from, to)| (from.to_owned(), to.to_owned()))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(reference_pairs(&result)?, expected);
+    let ids = targets(&server, "references", "engine").await?;
+    assert!(
+        ids.contains(int),
+        "the engine target takes the static name: {ids:?}"
+    );
+    server.engine_pool().await.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn inventory_reports_engine_targets_static_did_not_name() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().canonicalize()?;
+    // `_typeshed` exists only in the bundled stubs: no runtime module the static pass admits.
+    unobserved_python_workspace(
+        &root,
+        "from _typeshed import SupportsRead\n\n\ndef reader() -> SupportsRead[str]:\n    raise NotImplementedError\n",
+    )?;
+    let server = RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
+    let result = query(
+        &server,
+        "SELECT ?caller ?target { ?caller :references ?target }".to_owned(),
+    )
+    .await?;
+    assert!(
+        result.warnings.iter().any(|warning| matches!(
+            warning,
+            ReadWarning::EdgeCoverageMissing { kinds, detail }
+                if kinds == &[rift_protocol::read::EdgeKind::References]
+                    && detail.contains("engine targets for references could not be named")
+        )),
+        "an engine target neither static nor its release names stays unnamed: {:?}",
+        result.warnings
+    );
+    assert!(
+        reference_pairs(&result)?
+            .iter()
+            .all(|(_, target)| !target.contains("_typeshed")),
+        "{result:?}"
+    );
+    server.engine_pool().await.shutdown().await;
+    Ok(())
+}
