@@ -352,6 +352,7 @@ impl<'source> Index<'source> {
         let mut pending = vec![class];
         let mut visited = BTreeSet::new();
         let mut found: Option<Target<'source>> = None;
+        let mut assigned: Option<Target<'source>> = None;
         let mut replaced = false;
         while let Some(class) = pending.pop() {
             if !work.charge() {
@@ -376,19 +377,30 @@ impl<'source> Index<'source> {
                 role,
                 work,
             );
-            if let Some(target) = target {
-                if found.is_some_and(|previous| {
-                    previous.file.path != target.file.path
-                        || previous.symbol.qualified_name != target.symbol.qualified_name
-                }) {
-                    return None;
+            match target {
+                // A member assigned through `this` names the declaration an ancestor
+                // makes when one resolves (D46); otherwise it is the class's own facet.
+                Some(target)
+                    if target.symbol.syntax_element_kind == Some("assignment_expression") =>
+                {
+                    assigned.get_or_insert(target);
+                    if let Some(bases) = self.javascript_bases(class, work) {
+                        pending.extend(bases);
+                    }
                 }
-                found = Some(target);
-            } else {
-                pending.extend(self.javascript_bases(class, work)?);
+                Some(target) => {
+                    if found.is_some_and(|previous| {
+                        previous.file.path != target.file.path
+                            || previous.symbol.qualified_name != target.symbol.qualified_name
+                    }) {
+                        return None;
+                    }
+                    found = Some(target);
+                }
+                None => pending.extend(self.javascript_bases(class, work)?),
             }
         }
-        let found = found?;
+        let found = found.or(assigned)?;
         let Some(tail) = tail else {
             return Some(found);
         };
