@@ -8,9 +8,14 @@ impl<'source> Index<'source> {
     pub(super) fn python_binding_group(
         &self,
         file: &File<'source>,
-        mut bindings: impl Iterator<Item = &'source StaticBinding>,
+        bindings: impl Iterator<Item = &'source StaticBinding>,
         work: &mut Work,
     ) -> Option<&'source StaticBinding> {
+        let bindings = bindings.collect::<Vec<_>>();
+        if let Some(class) = super::rebinding::python_class_rebinding(file, &bindings, work) {
+            return Some(class);
+        }
+        let mut bindings = bindings.into_iter();
         let first = bindings.next()?;
         let Some(second) = bindings.next() else {
             let signature = file.target_at(first.name).is_some_and(|target| {

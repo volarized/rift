@@ -5,6 +5,7 @@ use rift_protocol::read::{EdgeKind, SymbolKind};
 use rift_syntax::ByteRange;
 
 use super::super::{File, Index, StaticOccurrence, StaticResolution, Target, Work};
+use super::Value;
 
 impl<'source> Index<'source> {
     pub(in crate::static_resolution) fn python_references(
@@ -19,6 +20,11 @@ impl<'source> Index<'source> {
             }
             let occurrence = self
                 .edge_python_name(file, reference.target, work)
+                .or_else(|| {
+                    (reference.role == ReferenceRole::Write)
+                        .then(|| self.python_written_module_name(file, reference.target, work))
+                        .flatten()
+                })
                 .and_then(|target| {
                     let mut occurrence = self.occurrence(
                         file,
@@ -67,6 +73,48 @@ impl<'source> Index<'source> {
                 }
             }
         }
+    }
+
+    /// The declaration a write to `module.name` names: the module's own declaration of `name`,
+    /// even when other writes replace its value at runtime.
+    fn python_written_module_name(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let (receiver, member) = file.text(range)?.rsplit_once('.')?;
+        let receiver = ByteRange {
+            start: range.start,
+            end: range.start + u64::try_from(receiver.len()).ok()?,
+        };
+        let Value::Module(name) =
+            work.python_lookup(|work| self.python_name(file, receiver, work))?
+        else {
+            return None;
+        };
+        let module = self.files.get(self.edge_python.path(&name)?)?;
+        let root = ByteRange {
+            start: 0,
+            end: module.document.source.len() as u64,
+        };
+        let mut declaration: Option<Target<'source>> = None;
+        for binding in module.by_name.get(member.trim())? {
+            if !work.charge() {
+                return None;
+            }
+            if binding.scope != root {
+                continue;
+            }
+            let target = module.target_at(binding.name)?;
+            if declaration
+                .is_some_and(|known| known.symbol.qualified_name != target.symbol.qualified_name)
+            {
+                return None;
+            }
+            declaration.get_or_insert(target);
+        }
+        declaration
     }
 
     pub(in crate::static_resolution) fn python_identity(

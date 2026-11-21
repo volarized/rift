@@ -353,6 +353,8 @@ struct File<'source> {
     class_scopes: BTreeSet<ByteRange>,
     assignments: AssignmentTargets<'source>,
     python_values: BTreeMap<u64, StaticBindingKind>,
+    /// Python annotation ranges by start, which can be evaluated after later statements.
+    python_annotations: BTreeMap<u64, u64>,
     python_calls: BTreeMap<u64, Vec<&'source StaticCall>>,
     declared_types: BTreeMap<ByteRange, Option<ByteRange>>,
     conditions: Conditions,
@@ -417,6 +419,7 @@ impl<'source> File<'source> {
             class_scopes: BTreeSet::new(),
             assignments: AssignmentTargets::default(),
             python_values: BTreeMap::new(),
+            python_annotations: BTreeMap::new(),
             python_calls: BTreeMap::new(),
             declared_types: BTreeMap::new(),
             conditions: Conditions::default(),
@@ -459,6 +462,12 @@ impl<'source> File<'source> {
                     self.python_values.insert(binding.name.end, binding.kind);
                 }
                 _ => {}
+            }
+            if let StaticBindingKind::PythonAnnotation { annotation }
+            | StaticBindingKind::PythonFunction { annotation, .. } = binding.kind
+            {
+                self.python_annotations
+                    .insert(annotation.start, annotation.end);
             }
         }
         for (name, bindings) in &self.by_name {
@@ -627,6 +636,14 @@ impl<'source> File<'source> {
             file: self.document,
             symbol,
         })
+    }
+
+    /// Whether `position` lies in a Python parameter, variable or return annotation.
+    fn in_python_annotation(&self, position: u64) -> bool {
+        self.python_annotations
+            .range(..=position)
+            .next_back()
+            .is_some_and(|(_, end)| position < *end)
     }
 
     fn blocked(&self, position: u64, work: &mut Work) -> bool {

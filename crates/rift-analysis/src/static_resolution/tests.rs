@@ -151,6 +151,7 @@ const WORK_MAX: usize = 10_000;
 
 mod python_aliases;
 mod python_ancestry;
+mod python_class_rebinding;
 mod python_decorators;
 mod python_external_bases;
 mod python_imports;
@@ -1068,6 +1069,31 @@ fn calls<'source>(
     result.occurrences.iter().filter(move |occurrence| {
         occurrence.role == ReferenceRole::Call && occurrence.binding.unit().to_string() == unit
     })
+}
+
+/// Every resolved occurrence as (label, source identity, target identity); the label is `call`
+/// for calls, otherwise the edge kind or the role.
+fn labelled(result: &StaticResolution) -> Vec<(String, String, String)> {
+    result
+        .occurrences
+        .iter()
+        .map(|occurrence| {
+            let label = match (occurrence.role, occurrence.edge_kind) {
+                (ReferenceRole::Call, _) => "call".to_owned(),
+                (_, Some(kind)) => format!("{kind:?}"),
+                (role, None) => format!("{role:?}"),
+            };
+            (
+                label,
+                occurrence
+                    .edge_from
+                    .as_ref()
+                    .map(|from| from.as_str().to_owned())
+                    .unwrap_or_default(),
+                target(occurrence).to_owned(),
+            )
+        })
+        .collect()
 }
 
 fn target(occurrence: &StaticOccurrence) -> &str {

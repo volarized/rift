@@ -3,6 +3,7 @@
 mod annotations;
 mod classes;
 mod overloads;
+mod rebinding;
 mod references;
 mod slots;
 
@@ -573,9 +574,9 @@ fn edge_python_binding<'source>(
 
 /// Bindings of one name that cannot have run before a read at `position`.
 ///
-/// In the body of the callable whose scope holds the name, a binding that starts after the read
-/// cannot have run yet unless a loop holds both, or the read sits in a lambda, comprehension or
-/// generator expression.
+/// In the body of the callable whose scope holds the name, and in module code outside callable
+/// bodies and annotations, a binding that starts after the read cannot have run yet unless a
+/// loop holds both, or the read sits in a lambda, comprehension or generator expression.
 fn later_bindings(
     file: &File<'_>,
     bindings: &[&StaticBinding],
@@ -586,8 +587,10 @@ fn later_bindings(
     work: &mut Work,
 ) -> Option<BTreeSet<u64>> {
     let mut later = BTreeSet::new();
-    let ordered = in_body
-        && callable.is_some_and(|callable| callable.symbol.item_range == scope)
+    let module = scope.start == 0 && scope.end == file.document.source.len() as u64;
+    let ordered = ((in_body
+        && callable.is_some_and(|callable| callable.symbol.item_range == scope))
+        || (module && !in_body && !file.in_python_annotation(position)))
         && !file
             .facts
             .expression_scopes()
