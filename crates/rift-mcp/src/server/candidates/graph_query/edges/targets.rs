@@ -67,7 +67,7 @@ impl AdjacencyWalk<'_> {
                 if self.remaining.requests_max == 0 {
                     return Ok(vec![None; callees.len()]);
                 }
-                claim_request(&mut self.remaining)?;
+                claim_request(&mut self.remaining, &mut self.reached)?;
                 let client = self.server.global.client(&self.configuration).await?;
                 let capabilities = client.get_capabilities().await?;
                 !capabilities
@@ -131,7 +131,7 @@ impl AdjacencyWalk<'_> {
                     named.push(None);
                     continue;
                 }
-                claim_request(&mut self.remaining)?;
+                claim_request(&mut self.remaining, &mut self.reached)?;
                 let answer = client
                     .get_symbol(&exact_request(&declaration.id, &declaration.revision))
                     .await?;

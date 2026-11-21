@@ -1547,15 +1547,17 @@ pub enum ReadWarning {
         detail: String,
     },
     /// A file answers nothing from its bytes. Either the index left the claimed file out -
-    /// its bytes are not valid UTF-8, or it crosses a per-file bound - so it answers no
+    /// its bytes are not valid UTF-8, or, for a file the request names through
+    /// `paths.force_include` or a comparison, it crosses a per-file bound - so it answers no
     /// search or lookup, and addressing it directly still refuses `content_unavailable`;
     /// or a comparison against the working tree read the changed file in no working form -
     /// its attributes name a `filter` driver or a UTF-16 `working-tree-encoding` - so it
     /// answers changed with no declarations. Every other file in the workspace stays
     /// available. At most `SOURCE_WARNINGS_MAX` of this warning name a file, in
     /// project-path order; when more files are named, one more carries no `unit` and
-    /// counts the rest. `rift server logs` names each file the index left out, and `paths`
-    /// narrows a comparison onto the others.
+    /// counts the rest. A file a bound left out is outside the indexed set, as a file the
+    /// source policy excludes is, so no other answer names it. `rift server logs` records the
+    /// files the index left out, and `paths` narrows a comparison onto the others.
     SourceUnavailable {
         /// The file the warning names. Absent on the one warning that counts the files
         /// past `SOURCE_WARNINGS_MAX`.
@@ -1579,8 +1581,10 @@ pub enum ReadWarning {
     /// Files past `[providers.syntax] max_file` are held as text the syntax provider does
     /// not parse: their text answers `search`, and none of their declarations were
     /// extracted, so no symbol hit and no `get_symbol` answer comes from them. `files`
-    /// names them in project-path order, at most `SOURCE_WARNINGS_MAX` of them. Raising
-    /// `max_file` parses them.
+    /// names them in project-path order, at most `SOURCE_WARNINGS_MAX` of them. An answer
+    /// carries it only for files the request names through `paths.force_include` or a
+    /// comparison; `rift server logs` records every other such file. Raising `max_file`
+    /// parses them.
     LargeFileUnparsed {
         /// The files held as text alone.
         #[schemars(length(max = 8))]

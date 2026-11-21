@@ -4008,7 +4008,9 @@ impl Tower {
     }
 
     /// A committed file the syntax provider refuses under its depth bound is absent from
-    /// the revision index, so a revision search still answers from the file beside it.
+    /// the revision index, so a revision search still answers from the file beside it. A
+    /// bound left the file out, so the answer carries nothing for it (D37) and the revision
+    /// index keeps the omission.
     #[test]
     fn search_at_a_revision_leaves_out_a_file_past_a_syntax_bound_and_serves_the_rest() -> TestResult
     {
@@ -4049,7 +4051,14 @@ impl Tower {
                     && warning["unit"] == "rift://source/project/deep.rs"
             })
         });
-        assert!(names_deep, "{value:#}");
+        assert!(!names_deep, "{value:#}");
+        let deep_path = rift_core::ProjectPath::new("deep.rs")?;
+        assert!(
+            service
+                .file_warning(&deep_path)
+                .is_some_and(rift_index::WorkspaceIndexWarning::is_left_out_by_bound),
+            "the revision index keeps the omission"
+        );
         let refused: SearchParams = serde_json::from_value(
             json!({"query": "deep_probe", "revision": "rift://revision/git/HEAD"}),
         )?;

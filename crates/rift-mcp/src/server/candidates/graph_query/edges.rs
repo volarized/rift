@@ -489,6 +489,7 @@ impl AcquiredAdjacency {
         mut page: EdgeSearchPage,
         step: AdjacencyStep,
         remaining: &mut EdgeReadLimits,
+        reached: &mut Option<AcquisitionBudget>,
         frontier: &mut BTreeSet<SymbolId>,
     ) -> Result<(), RiftError> {
         let maximum = usize::try_from(remaining.bytes_max).unwrap_or(usize::MAX);
@@ -506,7 +507,7 @@ impl AcquiredAdjacency {
                 .map(|record| &record.id)
                 .chain(group.occurrences.iter().map(|record| &record.id))
                 .collect();
-            charge_records(remaining, records.len())?;
+            charge_records(remaining, reached, records.len())?;
             frontier.extend(group.edges.iter().map(|record| {
                 endpoint((&record.edge.from, &record.edge.to), step.direction).clone()
             }));
@@ -541,7 +542,7 @@ impl RiftMcp {
         let mut frontier = BTreeSet::from([selected.seed.clone()]);
         let mut visited = BTreeSet::new();
         let mut depth = 0u32;
-        while !frontier.is_empty() && selected.depth.is_none_or(|maximum| depth < maximum) {
+        'walk: while !frontier.is_empty() && selected.depth.is_none_or(|maximum| depth < maximum) {
             walk.step = selected.step(depth);
             let mut remote_seeds = Vec::new();
             for seed in std::mem::take(&mut frontier) {
@@ -555,7 +556,10 @@ impl RiftMcp {
                         && walk.acquired.installed.contains_key(&seed))
                 {
                     let mut reached = BTreeSet::new();
-                    walk.local_step(&seed, &mut reached).await?;
+                    let step = walk.local_step(&seed, &mut reached).await;
+                    if walk.spent(step)? {
+                        break 'walk;
+                    }
                     if selected.has_distinct_steps() {
                         walk.neighbors
                             .insert(key, reached.iter().cloned().collect());
@@ -567,15 +571,22 @@ impl RiftMcp {
                     remote_seeds.push(seed);
                 }
             }
-            if !remote_seeds.is_empty()
-                && let Some(unavailable) = walk.remote_steps(&remote_seeds, &mut frontier).await?
-            {
-                return Ok(Err(unavailable));
+            if !remote_seeds.is_empty() {
+                let remote = walk.remote_steps(&remote_seeds, &mut frontier).await;
+                if walk.reached.is_some() {
+                    break 'walk;
+                }
+                if let Some(unavailable) = remote? {
+                    return Ok(Err(unavailable));
+                }
             }
             if !selected.has_distinct_steps() {
                 frontier.retain(|seed| !visited.contains(seed));
             }
             depth = depth.checked_add(1).ok_or_else(coverage_failure)?;
+        }
+        if let Some(budget) = walk.reached {
+            budget.record();
         }
         if walk.local.is_some()
             && !self
@@ -604,6 +615,9 @@ struct AdjacencyWalk<'request> {
     deadline: RequestDeadline,
     configuration: rift_protocol::configuration::GlobalConfiguration,
     remaining: EdgeReadLimits,
+    /// The acquisition budget the walk spent, once one is: the walk then stops and the
+    /// acquired facts stand.
+    reached: Option<AcquisitionBudget>,
     acquired: AcquiredAdjacency,
     remote: Option<RemoteSelection>,
     local: Option<(
@@ -618,6 +632,16 @@ struct AdjacencyWalk<'request> {
 }
 
 impl<'request> AdjacencyWalk<'request> {
+    /// Whether `step` ended because the walk spent an acquisition budget, which stops the
+    /// walk with the facts it acquired; any other failure of the step is returned.
+    fn spent(&self, step: Result<(), RiftError>) -> Result<bool, RiftError> {
+        match step {
+            Ok(()) => Ok(false),
+            Err(_) if self.reached.is_some() => Ok(true),
+            Err(error) => Err(error),
+        }
+    }
+
     fn new(
         server: &'request RiftMcp,
         resolved: &'request ResolvedWorkspace,
@@ -638,6 +662,7 @@ impl<'request> AdjacencyWalk<'request> {
                 records_max: RECORDS_MAX,
                 bytes_max: u64::try_from(limits.literal_bytes_max()).unwrap_or(u64::MAX),
             },
+            reached: None,
             acquired: AcquiredAdjacency::default(),
             remote: None,
             local: None,
@@ -675,7 +700,7 @@ impl<'request> AdjacencyWalk<'request> {
         frontier: &mut BTreeSet<SymbolId>,
     ) -> Result<(), RiftError> {
         self.ensure_local().await?;
-        claim_request(&mut self.remaining)?;
+        claim_request(&mut self.remaining, &mut self.reached)?;
         let direction = self.step.direction;
         match (direction, self.step.kind) {
             (TraversalDirection::Incoming, EdgeKind::References) => {
@@ -730,7 +755,7 @@ impl<'request> AdjacencyWalk<'request> {
         );
         self.edge_static_step(seed, kind, frontier)?;
         for (from, relation, to) in inventory.edges(seed, relation(kind)?, direction) {
-            charge_records(&mut self.remaining, 1)?;
+            charge_records(&mut self.remaining, &mut self.reached, 1)?;
             frontier.insert(match direction {
                 TraversalDirection::Outgoing => to.clone(),
                 TraversalDirection::Incoming => from.clone(),
@@ -779,7 +804,7 @@ impl<'request> AdjacencyWalk<'request> {
                 .cloned(),
         );
         for (from, kind, to) in inventory.edges(seed, SymbolRelation::HasType, direction) {
-            charge_records(&mut self.remaining, 1)?;
+            charge_records(&mut self.remaining, &mut self.reached, 1)?;
             frontier.insert(match direction {
                 TraversalDirection::Outgoing => to.clone(),
                 TraversalDirection::Incoming => from.clone(),
@@ -820,7 +845,7 @@ impl<'request> AdjacencyWalk<'request> {
         self.acquired.edge_facts.extend(references.edges);
         self.acquired.warnings.extend(references.edge_warnings);
         let occurrences = references.occurrences;
-        charge_records(&mut self.remaining, occurrences.len())?;
+        charge_records(&mut self.remaining, &mut self.reached, occurrences.len())?;
         frontier.extend(occurrences.iter().filter_map(|item| item.enclosing.clone()));
         self.acquired.admit_references(seed, occurrences);
         Ok(())
@@ -859,7 +884,7 @@ impl<'request> AdjacencyWalk<'request> {
                 .cloned(),
         );
         if let Some(indices) = inventory.outgoing_references.get(seed) {
-            charge_records(&mut self.remaining, indices.len())?;
+            charge_records(&mut self.remaining, &mut self.reached, indices.len())?;
             for index in indices {
                 let occurrence = inventory.local[*index].clone();
                 frontier.insert(occurrence.target.clone());
@@ -965,7 +990,7 @@ impl<'request> AdjacencyWalk<'request> {
         };
         let relation = relation(kind)?;
         for edge in adjacent.iter().filter(|edge| edge.kind() == kind) {
-            charge_records(&mut self.remaining, 1)?;
+            charge_records(&mut self.remaining, &mut self.reached, 1)?;
             let from = SymbolId(edge.from().as_str().to_owned());
             let to = SymbolId(edge.to().as_str().to_owned());
             frontier.insert(match self.step.direction {
@@ -984,7 +1009,11 @@ impl<'request> AdjacencyWalk<'request> {
         calls: rift_server::GraphCalls,
         frontier: &mut BTreeSet<SymbolId>,
     ) -> Result<(), RiftError> {
-        charge_records(&mut self.remaining, calls.corroboration.len())?;
+        charge_records(
+            &mut self.remaining,
+            &mut self.reached,
+            calls.corroboration.len(),
+        )?;
         for conflict in calls.corroboration.iter().filter(|record| !record.agrees) {
             let engine_target = match &conflict.engine_target {
                 rift_server::CallDestination::Local(target) => target.as_str(),
@@ -1021,9 +1050,9 @@ impl<'request> AdjacencyWalk<'request> {
             );
         }
         self.acquired.edge_facts.extend(calls.edges);
-        charge_records(&mut self.remaining, calls.local.len())?;
+        charge_records(&mut self.remaining, &mut self.reached, calls.local.len())?;
         for (neighbor, ranges) in calls.local {
-            charge_records(&mut self.remaining, ranges.len())?;
+            charge_records(&mut self.remaining, &mut self.reached, ranges.len())?;
             let (caller, target) = match self.step.direction {
                 TraversalDirection::Outgoing => (seed, &neighbor),
                 TraversalDirection::Incoming => (&neighbor, seed),
@@ -1088,7 +1117,7 @@ impl<'request> AdjacencyWalk<'request> {
         let deadline = self.deadline.walk_end(self.resolved.capture_elapsed);
         let mut callers = BTreeMap::<SymbolId, BTreeSet<SymbolId>>::new();
         for seed in seeds {
-            claim_request(&mut self.remaining)?;
+            claim_request(&mut self.remaining, &mut self.reached)?;
             let (engines, roots) = self.local.as_ref().ok_or_else(coverage_failure)?;
             let mut calls = Box::pin(rift_server::graph_calls(
                 reads,
@@ -1105,10 +1134,10 @@ impl<'request> AdjacencyWalk<'request> {
             if !calls.packages.is_empty() {
                 self.name_package_calls(&mut calls, false).await?;
             }
-            charge_records(&mut self.remaining, calls.local.len())?;
+            charge_records(&mut self.remaining, &mut self.reached, calls.local.len())?;
             self.acquired.edge_facts.extend(calls.edges);
             for (target, occurrences) in calls.local {
-                charge_records(&mut self.remaining, occurrences.len())?;
+                charge_records(&mut self.remaining, &mut self.reached, occurrences.len())?;
                 let owner = SymbolIdentity::parse(target.as_str())?;
                 if !owner.owner().is_local() {
                     callers.entry(target).or_default().insert(seed.clone());
@@ -1239,7 +1268,7 @@ impl<'request> AdjacencyWalk<'request> {
             let page = remote
                 .client
                 .edge_pages_with_admission(&request, self.remaining, || {
-                    claim_request(&mut self.remaining)
+                    claim_request(&mut self.remaining, &mut self.reached)
                 })
                 .await?;
             let page = match page {
@@ -1260,8 +1289,13 @@ impl<'request> AdjacencyWalk<'request> {
                     SymbolUnavailableReason::ViewContext,
                 )));
             }
-            self.acquired
-                .admit_remote(page, step, &mut self.remaining, frontier)?;
+            self.acquired.admit_remote(
+                page,
+                step,
+                &mut self.remaining,
+                &mut self.reached,
+                frontier,
+            )?;
             if incoming {
                 Box::pin(self.acquire_local_reverse()).await?;
                 self.admit_local_reverse(seeds, frontier)?;
@@ -1318,11 +1352,54 @@ fn endpoint<'edge>(
     }
 }
 
-fn claim_request(limits: &mut EdgeReadLimits) -> Result<(), RiftError> {
-    limits.requests_max = limits
-        .requests_max
-        .checked_sub(1)
-        .ok_or_else(coverage_failure)?;
+/// An acquisition budget one graph walk spent before it reached every edge it selects.
+///
+/// Reaching one is a steady state of the walk, not a missing fact: the walk stops, the facts
+/// it acquired stand, the answer is evaluated and paged over them, and the walk writes the
+/// budget to the log once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AcquisitionBudget {
+    /// The walk claimed [`REQUESTS_MAX`] edge reads.
+    Requests,
+    /// The walk admitted [`RECORDS_MAX`] edge records.
+    Records,
+}
+
+impl AcquisitionBudget {
+    /// The name and value of the budget, as the log record carries them.
+    const fn bound(self) -> (&'static str, u64) {
+        match self {
+            Self::Requests => ("requests_max", REQUESTS_MAX),
+            Self::Records => ("records_max", RECORDS_MAX),
+        }
+    }
+
+    /// Writes the one record naming the budget the walk spent.
+    fn record(self) {
+        let (bound, value) = self.bound();
+        rift_tracing::warn!(
+            component = "search",
+            operation = "search.graph.acquire",
+            bound = bound,
+            value = value,
+            "a graph walk reached its acquisition budget; the answer holds the acquired facts"
+        );
+    }
+}
+
+/// Claims one edge read, or records that the walk spent its request budget.
+///
+/// The error only unwinds the step that asked; the walk reads `reached` to tell a spent
+/// budget, which stops it with every fact it acquired, from a missing fact, which refuses.
+fn claim_request(
+    limits: &mut EdgeReadLimits,
+    reached: &mut Option<AcquisitionBudget>,
+) -> Result<(), RiftError> {
+    let Some(left) = limits.requests_max.checked_sub(1) else {
+        *reached = Some(AcquisitionBudget::Requests);
+        return Err(coverage_failure());
+    };
+    limits.requests_max = left;
     Ok(())
 }
 
@@ -1417,11 +1494,21 @@ fn exact_domain(context: &rift_dependency::DependencyContext) -> Result<ExactDom
     Ok(domain)
 }
 
-fn charge_records(limits: &mut EdgeReadLimits, count: usize) -> Result<(), RiftError> {
-    limits.records_max = limits
-        .records_max
-        .checked_sub(u64::try_from(count).map_err(|_| coverage_failure())?)
-        .ok_or_else(coverage_failure)?;
+/// Charges `count` edge records, or records that the walk spent its record budget, as
+/// [`claim_request`] does for reads.
+fn charge_records(
+    limits: &mut EdgeReadLimits,
+    reached: &mut Option<AcquisitionBudget>,
+    count: usize,
+) -> Result<(), RiftError> {
+    let left = u64::try_from(count)
+        .ok()
+        .and_then(|count| limits.records_max.checked_sub(count));
+    let Some(left) = left else {
+        *reached = Some(AcquisitionBudget::Records);
+        return Err(coverage_failure());
+    };
+    limits.records_max = left;
     Ok(())
 }
 
@@ -1438,4 +1525,99 @@ pub(super) fn coverage_failure() -> RiftError {
     errors::server::search_coverage_unavailable()
         .operation("graph query adjacency")
         .error()
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::{
+        AcquisitionBudget, EdgeReadLimits, RECORDS_MAX, REQUESTS_MAX, charge_records, claim_request,
+    };
+
+    fn budget() -> EdgeReadLimits {
+        EdgeReadLimits {
+            requests_max: REQUESTS_MAX,
+            records_max: RECORDS_MAX,
+            bytes_max: u64::MAX,
+        }
+    }
+
+    /// D37 (#715): the request budget at its edges. Every claim up to `REQUESTS_MAX` is
+    /// admitted; the one past it records the spent budget for the walk to stop on, rather
+    /// than leaving a refusal the walk cannot tell from a missing fact.
+    #[test]
+    fn reaching_request_budget_keeps_acquisition_available() {
+        let mut limits = budget();
+        let mut reached = None;
+        for claimed in 1..=REQUESTS_MAX {
+            assert!(
+                claim_request(&mut limits, &mut reached).is_ok(),
+                "claim {claimed} of {REQUESTS_MAX}"
+            );
+            assert_eq!(reached, None, "claim {claimed}");
+        }
+        assert_eq!(limits.requests_max, 0);
+        assert!(claim_request(&mut limits, &mut reached).is_err());
+        assert_eq!(reached, Some(AcquisitionBudget::Requests));
+        assert_eq!(limits.requests_max, 0, "a refused claim spends nothing");
+    }
+
+    /// D37 (#715): the record budget at its edges: below and at `RECORDS_MAX` the records are
+    /// admitted, one past it records the spent budget.
+    #[test]
+    fn reaching_record_budget_records_the_spent_budget() {
+        let records = usize::try_from(RECORDS_MAX).expect("fits");
+        for (charged, admitted) in [(records - 1, true), (records, true), (records + 1, false)] {
+            let mut limits = budget();
+            let mut reached = None;
+            assert_eq!(
+                charge_records(&mut limits, &mut reached, charged).is_ok(),
+                admitted,
+                "charged={charged}"
+            );
+            assert_eq!(
+                reached,
+                (!admitted).then_some(AcquisitionBudget::Records),
+                "charged={charged}"
+            );
+        }
+    }
+
+    /// The walk writes one warning record naming the budget it spent and its value.
+    #[test]
+    fn a_spent_budget_writes_one_record_with_its_value() {
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("warn")
+            .install()
+            .expect("recorder");
+        AcquisitionBudget::Requests.record();
+        AcquisitionBudget::Records.record();
+        let records: Vec<(String, u64)> = drain
+            .queued_records()
+            .into_iter()
+            .filter(|record| {
+                record
+                    .message()
+                    .starts_with("a graph walk reached its acquisition budget")
+            })
+            .map(|record| {
+                assert_eq!(record.level(), "warn", "{record:?}");
+                let fields: serde_json::Value =
+                    serde_json::from_str(record.fields()).expect("fields");
+                (
+                    fields["bound"].as_str().expect("bound").to_owned(),
+                    fields["value"]
+                        .as_u64()
+                        .or_else(|| fields["value"].as_str().and_then(|text| text.parse().ok()))
+                        .expect("value"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            records,
+            [
+                ("requests_max".to_owned(), REQUESTS_MAX),
+                ("records_max".to_owned(), RECORDS_MAX)
+            ]
+        );
+    }
 }

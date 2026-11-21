@@ -158,8 +158,12 @@ impl GraphDataset {
     ///
     /// # Errors
     ///
-    /// - `query_answer_limit` when the answer needs more solutions, triples, or term bytes than allowed,
-    ///   or one computed string needs more expression bytes.
+    /// - `query_answer_limit` when one computed string needs more expression bytes than
+    ///   allowed.
+    ///
+    /// An answer that needs more solutions, triples, or term bytes than the bounds allow is
+    /// not refused: it ends at the bound with every solution it holds, the evaluation writes
+    /// the cut to the log once, and the caller pages what it holds.
     /// - `query_deadline_exceeded` when evaluation outlasts the evaluation timeout.
     /// - `query_cancelled` when `cancellation` was cancelled by its holder.
     /// - `query_evaluation_failed` for every other evaluation failure, such as an unknown
@@ -182,8 +186,12 @@ impl GraphDataset {
             self.evaluate_here(query, cancellation, &budget, deadline, &expired)
         })?;
         match outcome {
-            Ok(answer) => Ok(answer),
-            Err(Failure::Refused(error)) => Err(error),
+            Ok((answer, cut)) => {
+                if let Some(cut) = cut {
+                    cut.record();
+                }
+                Ok(answer)
+            }
             Err(Failure::Evaluation(error)) => {
                 Err(evaluation_failure(error, &budget, &expired, limits))
             }
@@ -198,7 +206,7 @@ impl GraphDataset {
         budget: &ExpressionBudget,
         deadline: Deadline,
         expired: &AtomicBool,
-    ) -> Result<GraphAnswer, Failure> {
+    ) -> Result<(GraphAnswer, Option<AnswerCut>), Failure> {
         let evaluator = QueryEvaluator::new().with_cancellation_token(cancellation.0.clone());
         let evaluator = budget.bound(evaluator, query.separators());
         let results = evaluator
@@ -210,17 +218,19 @@ impl GraphDataset {
             deadline,
             expired,
         };
-        let answer = match results {
-            QueryResults::Boolean(value) => GraphAnswer::Boolean(value),
+        let (answer, cut) = match results {
+            QueryResults::Boolean(value) => (GraphAnswer::Boolean(value), None),
             QueryResults::Solutions(solutions) => {
-                GraphAnswer::Solutions(collect_solutions(solutions, &checkpoint, self.limits())?)
+                let (table, cut) = collect_solutions(solutions, &checkpoint, self.limits())?;
+                (GraphAnswer::Solutions(table), cut)
             }
             QueryResults::Graph(triples) => {
-                GraphAnswer::Graph(collect_triples(triples, &checkpoint, self.limits())?)
+                let (graph, cut) = collect_triples(triples, &checkpoint, self.limits())?;
+                (GraphAnswer::Graph(graph), cut)
             }
         };
         checkpoint.observe()?;
-        Ok(answer)
+        Ok((answer, cut))
     }
 }
 
@@ -228,8 +238,6 @@ impl GraphDataset {
 enum Failure {
     /// spareval failed, cancellation included; the cause is decided after the thread joins.
     Evaluation(QueryEvaluationError),
-    /// A bound refused the answer.
-    Refused(RiftError),
 }
 
 /// The checks one evaluation makes between solutions.
@@ -253,11 +261,14 @@ impl Checkpoint<'_> {
 }
 
 /// Collects at most the solution and term byte bounds, observing the checkpoint per solution.
+///
+/// A solution past either bound ends the collection: the answer holds the solutions before
+/// it, and the cut comes back beside it for the caller to record once.
 fn collect_solutions(
     solutions: QuerySolutionIter<'_>,
     checkpoint: &Checkpoint<'_>,
     limits: &GraphLimits,
-) -> Result<SolutionTable, Failure> {
+) -> Result<(SolutionTable, Option<AnswerCut>), Failure> {
     let variables = solutions
         .variables()
         .iter()
@@ -274,7 +285,9 @@ fn collect_solutions(
             .flatten()
             .map(|term| term_bytes(term.as_ref()));
         answer_bytes = row_bytes.fold(answer_bytes, usize::saturating_add);
-        check_answer_bound("solutions", rows.len(), answer_bytes, limits)?;
+        if let Some(cut) = AnswerCut::crossed("solutions", rows.len(), answer_bytes, limits) {
+            return Ok((SolutionTable { variables, rows }, Some(cut)));
+        }
         rows.push(
             solution
                 .values()
@@ -283,15 +296,16 @@ fn collect_solutions(
                 .collect(),
         );
     }
-    Ok(SolutionTable { variables, rows })
+    Ok((SolutionTable { variables, rows }, None))
 }
 
-/// Collects the library's RDF graph without changing its blank node labels.
+/// Collects the library's RDF graph without changing its blank node labels, up to the
+/// triple and term byte bounds, as [`collect_solutions`] does.
 fn collect_triples(
     triples: QueryTripleIter<'_>,
     checkpoint: &Checkpoint<'_>,
     limits: &GraphLimits,
-) -> Result<Vec<Triple>, Failure> {
+) -> Result<(Vec<Triple>, Option<AnswerCut>), Failure> {
     let mut graph = Vec::new();
     let mut answer_bytes = 0_usize;
     for triple in triples {
@@ -301,32 +315,55 @@ fn collect_triples(
             .saturating_add(term_bytes(triple.subject.as_ref().into()))
             .saturating_add(triple.predicate.as_str().len())
             .saturating_add(term_bytes(triple.object.as_ref()));
-        check_answer_bound("triples", graph.len(), answer_bytes, limits)?;
+        if let Some(cut) = AnswerCut::crossed("triples", graph.len(), answer_bytes, limits) {
+            return Ok((graph, Some(cut)));
+        }
         graph.push(triple);
     }
-    Ok(graph)
+    Ok((graph, None))
 }
 
-fn check_answer_bound(
-    kind: &str,
-    count: usize,
-    answer_bytes: usize,
-    limits: &GraphLimits,
-) -> Result<(), Failure> {
-    let crossed = [
-        (kind, count.saturating_add(1), limits.solutions_max()),
-        ("answer bytes", answer_bytes, limits.answer_bytes_max()),
-    ];
-    if let Some((bound, _, limit)) = crossed
-        .into_iter()
-        .find(|(_, required, limit)| required > limit)
-    {
-        let refusal = errors::search::query_answer_limit()
-            .bound(bound)
-            .limit(limit);
-        return Err(Failure::Refused(refusal.error()));
+/// The answer bound one more solution or triple would cross, with the value it bounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AnswerCut {
+    bound: &'static str,
+    limit: usize,
+    held: usize,
+}
+
+impl AnswerCut {
+    /// The bound `count` held rows plus the next one, at `answer_bytes` term bytes, cross.
+    fn crossed(
+        kind: &'static str,
+        count: usize,
+        answer_bytes: usize,
+        limits: &GraphLimits,
+    ) -> Option<Self> {
+        let crossed = [
+            (kind, count.saturating_add(1), limits.solutions_max()),
+            ("answer bytes", answer_bytes, limits.answer_bytes_max()),
+        ];
+        crossed
+            .into_iter()
+            .find(|(_, required, limit)| required > limit)
+            .map(|(bound, _, limit)| Self {
+                bound,
+                limit,
+                held: count,
+            })
     }
-    Ok(())
+
+    /// Writes the one record naming the bound, its value, and the rows the answer holds.
+    fn record(self) {
+        rift_tracing::warn!(
+            component = "search",
+            operation = "search.evaluate",
+            bound = self.bound,
+            limit = self.limit,
+            held = self.held,
+            "a SPARQL answer reached its bound; the answer holds the rows before it"
+        );
+    }
 }
 
 /// The registered refusal one spareval failure maps to.
