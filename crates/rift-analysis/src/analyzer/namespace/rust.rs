@@ -14,6 +14,43 @@ use crate::NamespaceInput;
 pub(super) mod configuration;
 mod macros;
 
+/// The modules the conditional item chains of one file declare, each with whether the
+/// configuration admits its branch: admitted when one declaring branch is, inactive when
+/// every one is not, unknown otherwise.
+pub(crate) fn chain_modules<'a>(
+    source: &'a str,
+    syntax: &SyntaxFacts,
+    configuration: Option<&configuration::Configuration<'_>>,
+) -> BTreeMap<&'a str, Option<bool>> {
+    let mut modules = BTreeMap::new();
+    let Some(limits) = syntax.syntax_limits() else {
+        return modules;
+    };
+    for (range, _, _) in syntax.macro_invocations().unwrap_or_default() {
+        let Some(tokens) = macros::chain::token_texts(source, *range, limits) else {
+            continue;
+        };
+        let Some(chain) = macros::chain::modules(&tokens, limits.syntax_depth_max()) else {
+            continue;
+        };
+        for (name, condition) in chain {
+            let admitted =
+                configuration.and_then(|configuration| configuration.condition(&condition));
+            modules
+                .entry(name)
+                .and_modify(|status| {
+                    *status = match (*status, admitted) {
+                        (Some(true), _) | (_, Some(true)) => Some(true),
+                        (Some(false), Some(false)) => Some(false),
+                        _ => None,
+                    }
+                })
+                .or_insert(admitted);
+        }
+    }
+    modules
+}
+
 /// Establishes the selected library root from captured metadata once per inventory.
 pub(super) fn prepare(
     input: &NamespaceInput<'_>,
@@ -32,7 +69,8 @@ pub(super) fn prepare(
     };
     let mut anchors = BTreeMap::new();
     let mut requested = Vec::new();
-    let mut declaring = BTreeMap::<String, Vec<(String, rift_syntax::ByteRange)>>::new();
+    let configurations = configuration::Configurations::new(input);
+    let mut declaring = BTreeMap::<String, Vec<(String, Declaring)>>::new();
     while let Some((path, namespace, directory, scope, library)) = pending.pop_front() {
         let Some(file) = inventory.get(path.as_str()) else {
             continue;
@@ -44,12 +82,13 @@ pub(super) fn prepare(
         }
         let mut admitted = std::collections::BTreeSet::new();
         let mut exports = Vec::new();
+        let mut conditioned = Vec::new();
         let children = macros::children(
             file,
             &directory,
             &inventory,
             &originals,
-            (scope, &mut admitted, &mut exports),
+            (scope, &mut admitted, &mut exports, &mut conditioned),
             input.syntax(),
             library,
         );
@@ -62,7 +101,14 @@ pub(super) fn prepare(
             declaring
                 .entry(child)
                 .or_default()
-                .push((path.clone(), item));
+                .push((path.clone(), Declaring::Item(item)));
+        }
+        let configuration = configurations.file(path.as_str());
+        for (child, condition) in conditioned {
+            declaring.entry(child).or_default().push((
+                path.clone(),
+                Declaring::Known(configuration.condition(&condition)),
+            ));
         }
         let declared = file_anchors(input, file.syntax, &namespace, &admitted);
         anchors.insert(
@@ -107,7 +153,7 @@ pub(super) fn prepare(
         outside_namespaces: target_paths(input, &inventory, &originals, &assigned),
         ..Default::default()
     };
-    let admitted = module_admission(input, &inventory, &declaring, assigned.len());
+    let admitted = module_admission(&configurations, &inventory, &declaring, assigned.len());
     local_exports(input, selected, &requested, &admitted, &mut prepared);
     prepared
 }
@@ -115,15 +161,14 @@ pub(super) fn prepare(
 /// Whether the configuration admits each module file: its declaring `mod` items and every
 /// ancestor's. A file several alternative items declare is admitted when one of them is;
 /// a file reached only through inactive items is not; anything else unknown stays unknown.
-/// Files no ordinary `mod` item declares (crate roots, macro-produced modules) keep the
-/// admission of their own items.
+/// Files no ordinary `mod` item or conditional item chain declares (crate roots, other
+/// macro-produced modules) keep the admission of their own items.
 fn module_admission(
-    input: &NamespaceInput<'_>,
+    configurations: &configuration::Configurations<'_>,
     inventory: &BTreeMap<&str, &super::SelectedFile<'_>>,
-    declaring: &BTreeMap<String, Vec<(String, rift_syntax::ByteRange)>>,
+    declaring: &BTreeMap<String, Vec<(String, Declaring)>>,
     depth_max: usize,
 ) -> BTreeMap<String, Option<bool>> {
-    let configurations = configuration::Configurations::new(input);
     let mut admitted = BTreeMap::<String, Option<bool>>::new();
     // Each pass settles at least one more module depth; module files bound the passes.
     for _ in 0..=depth_max {
@@ -140,11 +185,14 @@ fn module_admission(
                 } else {
                     Some(true)
                 };
-                let item_status = inventory.get(parent.as_str()).and_then(|file| {
-                    configurations
-                        .file(parent)
-                        .admitted(file.syntax, file.source, *item)
-                });
+                let item_status = match item {
+                    Declaring::Item(item) => inventory.get(parent.as_str()).and_then(|file| {
+                        configurations
+                            .file(parent)
+                            .admitted(file.syntax, file.source, *item)
+                    }),
+                    Declaring::Known(status) => *status,
+                };
                 status = match (status, and(parent_status, item_status)) {
                     (_, Some(true)) | (Some(true), _) => Some(true),
                     (Some(false), Some(false)) => Some(false),
@@ -161,6 +209,13 @@ fn module_admission(
         }
     }
     admitted
+}
+
+/// What declares a module file in its parent: an ordinary `mod` item, whose attributes the
+/// configuration evaluates, or a conditional item chain branch with its evaluated condition.
+enum Declaring {
+    Item(rift_syntax::ByteRange),
+    Known(Option<bool>),
 }
 
 fn and(left: Option<bool>, right: Option<bool>) -> Option<bool> {
@@ -837,11 +892,15 @@ fn local_exports(
             let Some(declarations) = declarations else {
                 break 'passes;
             };
+            let visibility = request
+                .1
+                .4
+                .and_then(|range| macros::text_range(file.source, range));
             let target = export_target(
                 input,
                 declarations,
                 (prepared, &mut export_paths),
-                &modules,
+                (&modules, visibility),
                 request,
                 &mut work,
                 work_max,
@@ -981,7 +1040,7 @@ fn export_target(
     input: &NamespaceInput<'_>,
     declarations: &LocalDeclarations<'_>,
     (prepared, export_paths): (&super::PreparedNamespace, &mut ExportPaths),
-    modules: &Modules<'_, '_>,
+    (modules, visibility): (&Modules<'_, '_>, Option<&str>),
     request: &(Vec<String>, macros::Export),
     work: &mut usize,
     work_max: usize,
@@ -1005,15 +1064,21 @@ fn export_target(
         if export_paths.unparsed.is_some() {
             return None;
         }
-        local_target(input, declarations, modules, &target_path, work, work_max).map(
-            |(file, symbol, target)| {
-                (
-                    target.clone(),
-                    file.path.as_str().to_owned(),
-                    symbol.qualified_name.clone(),
-                )
-            },
+        local_target(
+            input,
+            declarations,
+            modules,
+            (&target_path, namespace, visibility),
+            work,
+            work_max,
         )
+        .map(|(file, symbol, target)| {
+            (
+                target.clone(),
+                file.path.as_str().to_owned(),
+                symbol.qualified_name.clone(),
+            )
+        })
     });
     match local {
         Some(local) => Some(local),
@@ -1207,12 +1272,13 @@ fn local_declarations<'input>(
     Some(declarations)
 }
 
-/// The one public, active declaration `path` names with a source range in its file.
+/// The one active declaration `path` names with a source range in its file, when the
+/// re-export written in `namespace` at `visibility` (`None` for `pub`) may name it.
 fn local_target<'input>(
     input: &NamespaceInput<'_>,
     declarations: &LocalDeclarations<'input>,
     modules: &Modules<'_, '_>,
-    path: &[String],
+    (path, namespace, visibility): (&[String], &[String], Option<&str>),
     work: &mut usize,
     work_max: usize,
 ) -> Option<LocalDeclaration<'input>> {
@@ -1236,8 +1302,57 @@ fn local_target<'input>(
         .source
         .get(usize::try_from(symbol.range.start).ok()?..usize::try_from(symbol.range.end).ok()?)
         .is_some();
-    (admitted == Some(true) && symbol.visibility.as_deref() == Some("pub") && spelled)
+    let (_, module) = path.split_last()?;
+    (admitted == Some(true)
+        && reexport_allowed(symbol.visibility.as_deref(), module, namespace, visibility)
+        && spelled)
         .then_some((*file, *symbol, *identity))
+}
+
+/// Whether a re-export written in `namespace` at `reexport` (`None` for `pub`) may name an
+/// item of `module` declared at `declared`: the re-exporting module sees the item, and the
+/// re-export is visible nowhere the item is not. A public item allows every re-export.
+fn reexport_allowed(
+    declared: Option<&str>,
+    module: &[String],
+    namespace: &[String],
+    reexport: Option<&str>,
+) -> bool {
+    if declared == Some("pub") {
+        return true;
+    }
+    let Some(reexport) = reexport else {
+        return false;
+    };
+    let (Some(item), Some(written)) = (
+        visible_within(declared, module),
+        visible_within(Some(reexport), namespace),
+    ) else {
+        return false;
+    };
+    namespace.starts_with(&item) && written.starts_with(&item)
+}
+
+/// The module whose descendants see an item of `module` declared at `visibility`.
+fn visible_within(visibility: Option<&str>, module: &[String]) -> Option<Vec<String>> {
+    let spelled = visibility.map(|visibility| {
+        visibility
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>()
+    });
+    match spelled.as_deref() {
+        None | Some("pub(self)") => Some(module.to_vec()),
+        Some("pub(crate)") => Some(vec![module.first()?.clone()]),
+        Some("pub(super)") => Some(module.split_last()?.1.to_vec()),
+        Some(spelled) => {
+            let path = spelled.strip_prefix("pub(in")?.strip_suffix(')')?;
+            let segments = path.split("::").map(str::to_owned).collect::<Vec<_>>();
+            let resolved = requested_path(module, &segments)?;
+            // The path names an ancestor of the item's module, or the module itself.
+            module.starts_with(&resolved).then_some(resolved)
+        }
+    }
 }
 
 #[cfg(test)]

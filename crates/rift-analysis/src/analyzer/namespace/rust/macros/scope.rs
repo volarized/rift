@@ -899,10 +899,10 @@ fn compile_error_tokens(mut input: &[&str]) -> bool {
     input.is_empty() && message.starts_with('"') && message.ends_with('"')
 }
 
-fn items(
-    mut input: &[&str],
+pub(super) fn items<'a>(
+    mut input: &[&'a str],
     depth: usize,
-    mut callback: impl FnMut(&[&str]) -> Option<()>,
+    mut callback: impl FnMut(&[&'a str]) -> Option<()>,
 ) -> Option<()> {
     if depth == 0 {
         return None;
@@ -961,7 +961,7 @@ fn constant(mut input: &[&str]) -> Option<bool> {
     Some(consume(&mut input, &[":"]))
 }
 
-fn visibility(input: &mut &[&str]) -> Option<()> {
+pub(super) fn visibility(input: &mut &[&str]) -> Option<()> {
     if consume(input, &["pub"]) && input.first() == Some(&"(") {
         let value = group(input, "(", ")")?;
         if value.is_empty()
