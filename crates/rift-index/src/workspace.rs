@@ -4368,6 +4368,11 @@ impl WorkspaceIndex {
         self.files.get(path).map(AsRef::as_ref)
     }
 
+    /// Every indexed file by canonical project path, each shared with the index.
+    pub fn shared_files(&self) -> impl ExactSizeIterator<Item = (&ProjectPath, &Arc<IndexedFile>)> {
+        self.files.iter()
+    }
+
     /// Parses one selected source path for a read, keeping its complete syntax element table.
     ///
     /// Returns `None` when no provider selects `path`, `Skipped` when a catalog or syntax

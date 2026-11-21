@@ -877,6 +877,13 @@ impl EngineSession {
         Ok(())
     }
 
+    /// Whether the session holds `path` open.
+    #[must_use]
+    pub fn is_open(&self, path: &ProjectPath) -> bool {
+        self.document_uri(path)
+            .is_ok_and(|uri| self.open_documents.contains(&uri))
+    }
+
     /// Closes one previously opened document.
     ///
     /// # Errors

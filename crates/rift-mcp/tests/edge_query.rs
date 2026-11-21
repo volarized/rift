@@ -500,6 +500,121 @@ async fn test_edge_inventory_reads_dropped_mid_write_do_not_spend_the_restart_bu
     Ok(())
 }
 
+/// A `sh` engine serving references and definitions over `lib.rs` and `user.rs`, which answers
+/// a definition only for a document it was told is open, as typescript-language-server does.
+/// The references of `beacon` name its declaration and its call in `user.rs`; a definition
+/// asked inside an open document names `beacon` in `lib.rs`. It appends `open <path>` and
+/// `close <path>` to the file its first argument names for each document notification.
+#[cfg(unix)]
+const OPEN_DOCUMENTS_ENGINE: &str = r#"opened=
+frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
+while IFS= read -r header; do
+  IFS= read -r blank
+  length=$(printf '%s' "$header" | tr -dc 0-9)
+  body=$(dd bs=1 count="$length" 2>/dev/null)
+  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
+  uri=$(printf '%s' "$body" | grep -o '"uri":"[^"]*"' | head -1 | cut -d'"' -f4)
+  case "$body" in
+    *'"method":"initialize"'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true,\"definitionProvider\":true}}}"
+      frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"begin","title":"analysis"}}}'
+      frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"end"}}}' ;;
+    *'"method":"textDocument/didOpen"'*)
+      opened="$opened $uri"
+      echo "open ${uri##*/}" >> "$1" ;;
+    *'"method":"textDocument/didClose"'*)
+      opened=$(printf '%s' "$opened" | sed "s| $uri||")
+      echo "close ${uri##*/}" >> "$1" ;;
+    *'"method":"$/cancelRequest"'*) ;;
+    *'"method":"textDocument/references"'*)
+      base=${uri%/*}
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"uri\":\"$base/lib.rs\",\"range\":{\"start\":{\"line\":0,\"character\":7},\"end\":{\"line\":0,\"character\":13}}},{\"uri\":\"$base/user.rs\",\"range\":{\"start\":{\"line\":0,\"character\":23},\"end\":{\"line\":0,\"character\":29}}}]}" ;;
+    *'"method":"textDocument/definition"'*)
+      base=${uri%/*}
+      case "$opened " in
+        *" $uri "*)
+          frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"uri\":\"$base/lib.rs\",\"range\":{\"start\":{\"line\":0,\"character\":7},\"end\":{\"line\":0,\"character\":13}}}]}" ;;
+        *)
+          frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":null}" ;;
+      esac ;;
+    *'"method":"exit"'*)
+      exit 0 ;;
+    *'"id":'[0-9]*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":null}" ;;
+  esac
+done
+"#;
+
+/// A reference the engine names in a document the read did not open is resolved once the
+/// read opens that document with the index's bytes: the fact names the engine among its
+/// providers, no reference location is dropped, and the engine reads the document's
+/// `didOpen` before its `didClose`.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_edge_reference_locations_in_unopened_documents_are_resolved() -> TestResult {
+    let engine = tempfile::tempdir()?;
+    let script = engine.path().join("engine.sh");
+    let log = engine.path().join("engine.log");
+    std::fs::write(&script, OPEN_DOCUMENTS_ENGINE)?;
+    let configuration = format!(
+        "[languages.rust.lsp]\ncommand = [\"sh\", \"{}\", \"{}\"]\n",
+        script.display(),
+        log.display()
+    );
+    let files = [
+        (
+            "Cargo.toml",
+            "[package]\nname='edge_fixture'\nversion='0.1.0'\nedition='2024'\n[lib]\npath='lib.rs'\n",
+        ),
+        ("lib.rs", "pub fn beacon() {}\npub mod user;\n"),
+        ("user.rs", "pub fn user() { crate::beacon(); }\n"),
+    ];
+    let (_directory, client, task) = served_workspace(&files, Some(configuration)).await?;
+    let beacon = captured_seed(&client, "beacon", "lib.rs").await?;
+    let user = captured_seed(&client, "user", "user.rs").await?;
+    let answer = query_after_population(
+        &client,
+        &QueryParams {
+            query: format!(
+                "SELECT ?s ?p {{ ?s :references <{beacon}> . ?e a :Edge; :from ?s; :to <{beacon}>; \
+                 :kinds :references; :provider ?p }}"
+            ),
+            language: QueryLanguage::Sparql,
+            page: 1,
+            max_results: 100,
+            revision: None,
+        },
+    )
+    .await?;
+    let warnings = answer["warnings"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !warnings
+            .iter()
+            .any(|warning| warning["code"] == "engine_analysis_unavailable"),
+        "no reference location is dropped: {answer}"
+    );
+    let providers: Vec<&str> = workspace_client::query::rows(&answer)?
+        .iter()
+        .filter(|row| workspace_client::query::iri(row, "s").is_ok_and(|from| from == user))
+        .filter_map(|row| workspace_client::query::literal(row, "p").ok())
+        .collect();
+    assert!(
+        providers.contains(&"lsp"),
+        "the reference in user.rs names the engine: {answer}"
+    );
+    client.cancel().await?;
+    task.await?;
+    let recorded = std::fs::read_to_string(&log)?;
+    let lines: Vec<&str> = recorded.lines().collect();
+    let opened = lines.iter().position(|line| *line == "open user.rs");
+    let closed = lines.iter().position(|line| *line == "close user.rs");
+    assert!(
+        opened.is_some_and(|opened| closed.is_some_and(|closed| opened < closed)),
+        "the read opens user.rs before it asks there and closes it after: {lines:?}"
+    );
+    Ok(())
+}
+
 #[path = "../../rift-lsp/tests/live_engine_gate.rs"]
 mod live_engine_gate;
 

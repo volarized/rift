@@ -1559,7 +1559,14 @@ async fn resolve_symbol_references(
     };
     let language = file.syntax().language().clone();
     let target = ReferenceTarget::new(slot.workspace_root(), reads.index().root(), file, symbol)?;
-    let answered = Box::pin(references_on_engine(slot, &target, false, deadline)).await;
+    let sources = DocumentSources::default();
+    let answered = Box::pin(references_on_engine(
+        slot,
+        &target,
+        (false, &sources),
+        deadline,
+    ))
+    .await;
     let (report, unconfirmed) = match answered {
         Ok((report, unconfirmed)) => (report, unconfirmed.then(|| slot.name().to_owned())),
         Err(error) if error.slug() == errors::lsp::engine_capability_absent::SLUG => {
@@ -1718,6 +1725,66 @@ impl ReferenceTarget {
 
 type ReferenceDefinitions = BTreeMap<(String, u32, u32), Vec<Location>>;
 
+/// The indexed files an engine exchange may open by path, each with the index's bytes.
+///
+/// A `textDocument/*` request names an open document: the base protocol guarantees answers
+/// only for documents the client opened, and typescript-language-server answers `null` for
+/// one it was not told about. An exchange that asks about a position in another file opens
+/// that file from here first.
+#[derive(Clone, Debug, Default)]
+pub struct DocumentSources(std::sync::Arc<BTreeMap<ProjectPath, std::sync::Arc<IndexedFile>>>);
+
+impl DocumentSources {
+    /// The files `reads` indexes.
+    #[must_use]
+    pub fn of(reads: &ReadService) -> Self {
+        Self(std::sync::Arc::new(
+            reads
+                .index()
+                .shared_files()
+                .map(|(path, file)| (path.clone(), std::sync::Arc::clone(file)))
+                .collect(),
+        ))
+    }
+
+    fn file(&self, path: &ProjectPath) -> Option<&IndexedFile> {
+        self.0.get(path).map(AsRef::as_ref)
+    }
+}
+
+/// Opens each document of `paths` the session does not hold open and `sources` holds, and
+/// answers the paths it opened, which the caller closes after its requests.
+///
+/// Each opened document is charged against `remaining` as one record.
+async fn open_documents(
+    session: &mut EngineSession,
+    sources: &DocumentSources,
+    paths: BTreeSet<&ProjectPath>,
+    remaining: &mut usize,
+) -> Result<Vec<ProjectPath>, RiftError> {
+    let mut opened = Vec::new();
+    for path in paths {
+        if session.is_open(path) {
+            continue;
+        }
+        let Some(file) = sources.file(path) else {
+            continue;
+        };
+        *remaining = remaining
+            .checked_sub(1)
+            .ok_or_else(graph_reference_coverage)?;
+        session
+            .open(
+                path,
+                &file.syntax().language().name,
+                file.source().to_owned(),
+            )
+            .await?;
+        opened.push(path.clone());
+    }
+    Ok(opened)
+}
+
 fn reference_key(location: &Location) -> (String, u32, u32) {
     (
         location.uri.as_str().to_owned(),
@@ -1729,8 +1796,8 @@ fn reference_key(location: &Location) -> (String, u32, u32) {
 async fn reference_definitions(
     session: &mut EngineSession,
     locations: &[Location],
-    maximum: usize,
-    mut remaining: usize,
+    (maximum, mut remaining): (usize, usize),
+    sources: &DocumentSources,
 ) -> Result<ReferenceDefinitions, RiftError> {
     let mut definitions = BTreeMap::new();
     if !session.capabilities().definitions.definition {
@@ -1746,7 +1813,13 @@ async fn reference_definitions(
     let positions: Vec<_> = positions.into_iter().collect();
     for chunk in positions.chunks(maximum.clamp(1, rift_lsp::correlation::PENDING_REQUESTS_MAX)) {
         let requests: Vec<_> = chunk.iter().map(|(_, position)| position.clone()).collect();
-        let answers = session.definition_batch(&requests).await?;
+        let paths = requests.iter().map(|(path, _)| path).collect();
+        let opened = open_documents(session, sources, paths, &mut remaining).await?;
+        let answers = session.definition_batch(&requests).await;
+        for path in &opened {
+            session.close(path).await?;
+        }
+        let answers = answers?;
         let records = answers.iter().map(Vec::len).sum::<usize>();
         remaining = remaining
             .checked_sub(records)
@@ -1772,10 +1845,11 @@ struct ReferenceReport {
 async fn references_on_engine(
     slot: &EngineSlot,
     target: &ReferenceTarget,
-    resolve_targets: bool,
+    (resolve_targets, sources): (bool, &DocumentSources),
     deadline: Instant,
 ) -> Result<(ReferenceReport, bool), RiftError> {
     let request_path = target.path.clone();
+    let sources = sources.clone();
     let utf8 = target.utf8;
     let utf16 = target.utf16;
     let answer = slot
@@ -1783,6 +1857,7 @@ async fn references_on_engine(
             target.opening(),
             move |session: &mut EngineSession| {
                 let path = request_path.clone();
+                let sources = sources.clone();
                 Box::pin(async move {
                     let encoding = session.capabilities().position_encoding;
                     let position = match encoding {
@@ -1819,8 +1894,11 @@ async fn references_on_engine(
                         reference_definitions(
                             session,
                             &locations,
-                            rift_lsp::correlation::PENDING_REQUESTS_MAX,
-                            TRAVERSAL_SYMBOLS_MAX,
+                            (
+                                rift_lsp::correlation::PENDING_REQUESTS_MAX,
+                                TRAVERSAL_SYMBOLS_MAX,
+                            ),
+                            &sources,
                         )
                         .await?
                     } else {
@@ -2038,6 +2116,7 @@ async fn engine_graph_references(
     let mut found = BTreeMap::new();
     let mut edges = Vec::new();
     let mut edge_warnings = Vec::new();
+    let sources = DocumentSources::of(reads);
     for declaration in declarations {
         let file = declaration.file;
         let slot = engines
@@ -2049,15 +2128,20 @@ async fn engine_graph_references(
             file,
             declaration.symbol,
         )?;
-        let (report, unconfirmed) = Box::pin(references_on_engine(slot, &request, true, deadline))
-            .await
-            .map_err(|error| {
-                if graph_engine_method_missing(&error) {
-                    unavailable()
-                } else {
-                    error
-                }
-            })?;
+        let (report, unconfirmed) = Box::pin(references_on_engine(
+            slot,
+            &request,
+            (true, &sources),
+            deadline,
+        ))
+        .await
+        .map_err(|error| {
+            if graph_engine_method_missing(&error) {
+                unavailable()
+            } else {
+                error
+            }
+        })?;
         if !report.full {
             return Err(unavailable());
         }

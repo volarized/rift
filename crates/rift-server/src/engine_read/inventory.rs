@@ -159,8 +159,9 @@ pub(super) async fn outgoing_calls(
     };
     let mut answer: Option<GraphCalls> = None;
     let mut remaining = super::TRAVERSAL_SYMBOLS_MAX;
+    let sources = super::DocumentSources::default();
     for file in reads.engine_inventory_files(std::slice::from_ref(seed), selection)? {
-        let raw = match file.read(engines, selection, deadline).await {
+        let raw = match file.read(engines, (selection, &sources), deadline).await {
             Ok(raw) => raw,
             Err(error)
                 if super::graph_engine_method_missing(&error)
@@ -302,9 +303,10 @@ impl EngineInventoryFile {
     pub async fn read(
         &self,
         engines: &EnginePool,
-        selection: EngineInventorySelection,
+        (selection, sources): (EngineInventorySelection, &super::DocumentSources),
         deadline: Instant,
     ) -> Result<Option<EngineInventoryAnswer>, RiftError> {
+        let sources = sources.clone();
         let Some(slot) = engines.engine_for(&self.language) else {
             return Ok(None);
         };
@@ -323,9 +325,11 @@ impl EngineInventoryFile {
                     let sites = sites.clone();
                     let target_sites = target_sites.clone();
                     let callers = callers.clone();
+                    let sources = sources.clone();
                     Box::pin(async move {
                         let mut report =
-                            read_positions(session, &path, &positions, selection).await?;
+                            read_positions(session, &path, &positions, (selection, &sources))
+                                .await?;
                         if selection.calls
                             && has_static_calls
                             && session.capabilities().definitions.definition
@@ -474,7 +478,7 @@ async fn read_positions(
     session: &mut EngineSession,
     path: &ProjectPath,
     positions: &[InventoryPosition],
-    selection: EngineInventorySelection,
+    (selection, sources): (EngineInventorySelection, &super::DocumentSources),
 ) -> Result<InventoryReport, RiftError> {
     let encoding = session.capabilities().position_encoding;
     let mut report = InventoryReport {
@@ -526,7 +530,8 @@ async fn read_positions(
         .flat_map(|(_, locations)| locations.iter().cloned())
         .collect();
     report.reference_definitions =
-        super::reference_definitions(session, &locations, maximum, report.remaining).await?;
+        super::reference_definitions(session, &locations, (maximum, report.remaining), sources)
+            .await?;
     report.charge(report.reference_definitions.values().map(Vec::len).sum())?;
     Ok(report)
 }
