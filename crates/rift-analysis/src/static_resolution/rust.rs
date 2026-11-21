@@ -1895,24 +1895,97 @@ fn insert<T>(index: &mut BTreeMap<Vec<String>, Option<T>>, path: Vec<String>, ta
         .or_insert(Some(target));
 }
 
+/// The segments of a written path. Generic arguments (`Holder::<A>::new`, `Holder<A>`) and
+/// a qualified self type without a trait (`<Holder<A>>::new`) name the same declarations
+/// as the plain path; a path through `<T as Trait>` or any other shape gives none.
 fn path_segments<'text>(source: &'text str, work: &mut Work) -> Option<Vec<&'text str>> {
+    let mut rest = source.trim();
     let mut path = Vec::new();
-    for part in source.split("::") {
+    if rest.starts_with('<') {
+        let end = generic_end(rest, work)?;
+        let inner = &rest[1..end];
+        if inner.split_whitespace().any(|word| word == "as") {
+            return None;
+        }
+        path.extend(path_segments(inner, work)?);
+        rest = rest[end + 1..].trim_start();
+        if rest.is_empty() {
+            return Some(path);
+        }
+        rest = rest.strip_prefix("::")?;
+    }
+    let bytes = rest.as_bytes();
+    let mut depth = 0_usize;
+    let mut start = 0;
+    let mut index = 0;
+    while index < bytes.len() {
         if !work.charge() {
             return None;
         }
-        let part = part.trim();
-        let mut characters = part.chars();
-        if !characters
-            .next()
-            .is_some_and(|character| character.is_alphabetic() || character == '_')
-            || !characters.all(|character| character.is_alphanumeric() || character == '_')
-        {
+        match bytes[index] {
+            b'<' => depth = depth.checked_add(1)?,
+            b'>' if index == 0 || bytes[index - 1] != b'-' => depth = depth.checked_sub(1)?,
+            b':' if depth == 0 && bytes.get(index + 1) == Some(&b':') => {
+                push_segment(&mut path, &rest[start..index])?;
+                index += 2;
+                start = index;
+                continue;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    if depth != 0 {
+        return None;
+    }
+    push_segment(&mut path, &rest[start..])?;
+    (!path.is_empty()).then_some(path)
+}
+
+/// Adds one written segment without its generic arguments; a turbofish argument list
+/// (`::<A>`) follows a named segment and adds none.
+fn push_segment<'text>(path: &mut Vec<&'text str>, part: &'text str) -> Option<()> {
+    let part = part.trim();
+    let name = match part.find('<') {
+        Some(0) => {
+            path.last()?;
+            return part.ends_with('>').then_some(());
+        }
+        Some(open) => part.ends_with('>').then(|| part[..open].trim())?,
+        None => part,
+    };
+    let mut characters = name.chars();
+    if !characters
+        .next()
+        .is_some_and(|character| character.is_alphabetic() || character == '_')
+        || !characters.all(|character| character.is_alphanumeric() || character == '_')
+    {
+        return None;
+    }
+    path.push(name);
+    Some(())
+}
+
+/// The byte index of the `>` closing the generic group `text` opens with `<`.
+fn generic_end(text: &str, work: &mut Work) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0_usize;
+    for (index, byte) in bytes.iter().enumerate() {
+        if !work.charge() {
             return None;
         }
-        path.push(part);
+        match byte {
+            b'<' => depth = depth.checked_add(1)?,
+            b'>' if index == 0 || bytes[index - 1] != b'-' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
     }
-    Some(path)
+    None
 }
 
 fn is_type_binding(kind: StaticBindingKind) -> bool {

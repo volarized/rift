@@ -1755,3 +1755,35 @@ fn test_rust_match_arm_guards_keep_calls_and_reads() {
         "/fixture/shadow"
     ));
 }
+
+#[test]
+fn test_rust_paths_with_generic_arguments_name_the_plain_path() {
+    // `Holder::<A>::new()` names the same declaration as `Holder::new()`; a local it
+    // initializes keeps that type for later member calls. A qualified `<Holder<A>>::new()`
+    // and a path from the crate root select the same targets.
+    let source = "pub trait Array { fn size() -> usize; }\npub struct Holder<A: Array> { pub value: Option<A> }\nimpl<A: Array> Holder<A> {\n    pub const EMPTY: usize = 0;\n    pub fn new() -> Self { Holder { value: None } }\n    pub fn grow(&mut self) -> usize { 0 }\n    pub fn fresh() -> usize {\n        let mut v = Holder::<A>::new();\n        v.grow() + Holder::<A>::EMPTY\n    }\n    pub fn qualified() -> usize {\n        let mut v = <Holder<A>>::new();\n        v.grow()\n    }\n    pub fn plain() -> usize {\n        let mut v = Self::new();\n        v.grow()\n    }\n}\npub mod inner { pub struct Other; impl Other { pub fn new() -> Self { Other } } }\npub fn nested<A: Array>() -> usize { let _ = inner::Other::new(); let mut v = crate::Holder::<A>::new(); v.grow() }\n";
+    let (_directory, index) = fixture_index(PLAIN_MANIFEST, &[("src/lib.rs", source)]);
+    for (kind, from, to) in [
+        (EdgeKind::Calls, "/Holder/fresh", "/Holder/new"),
+        (EdgeKind::Calls, "/Holder/fresh", "/Holder/grow"),
+        (EdgeKind::Reads, "/Holder/fresh", "/Holder/grow"),
+        (EdgeKind::Calls, "/Holder/qualified", "/Holder/new"),
+        (EdgeKind::Calls, "/Holder/qualified", "/Holder/grow"),
+        (EdgeKind::Calls, "/Holder/plain", "/Holder/new"),
+        (EdgeKind::Calls, "/Holder/plain", "/Holder/grow"),
+        (EdgeKind::Calls, "/fixture/nested", "/Holder/new"),
+        (EdgeKind::Calls, "/fixture/nested", "/Holder/grow"),
+        (EdgeKind::Calls, "/fixture/nested", "/inner/Other/new"),
+    ] {
+        assert!(
+            has_edge(&index, kind, from, to),
+            "missing {kind:?} {from} -> {to}"
+        );
+    }
+    assert!(!has_edge(
+        &index,
+        EdgeKind::Calls,
+        "/fixture/nested",
+        "/fixture/Holder/new/inner"
+    ));
+}
