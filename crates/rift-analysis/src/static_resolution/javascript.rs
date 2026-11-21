@@ -866,8 +866,12 @@ pub(super) fn js_binding<'source>(
                 // A JavaScript type names a class value; a name bound by `require` can hold one.
                 let required_value =
                     matches!(binding.kind, StaticBindingKind::JavaScriptRequire { .. })
-                        && javascript_source(file.document.path.as_str());
-                required_value || symbol.is_none_or(|symbol| symbol.kind != "variable")
+                        && javascript;
+                // A TypeScript function names no type: an interface of the same name does.
+                required_value
+                    || symbol.is_none_or(|symbol| {
+                        symbol.kind != "variable" && (javascript || symbol.kind != "function")
+                    })
             } else {
                 symbol.is_none_or(|symbol| !matches!(symbol.kind, "interface" | "type_alias"))
             }
@@ -892,5 +896,6 @@ pub(super) fn js_binding<'source>(
         binding.available_from <= position || role == rift_core::ReferenceRole::Type || deferred;
     let written =
         role == rift_core::ReferenceRole::Call && file.javascript_binding_written(binding, work);
+                let javascript = javascript_source(file.document.path.as_str());
     (!ambiguous && available && !written).then_some(binding)
 }

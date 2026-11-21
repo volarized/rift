@@ -2167,3 +2167,25 @@ export function loose(connection: unknown) {
         );
     }
 }
+
+#[test]
+fn test_typescript_types_named_like_a_function_take_the_interface() {
+    // In TypeScript a function and an interface of one name merge: a type written with that
+    // name is the interface, also inside the function itself.
+    let source = "export interface Box<T> { value: T }
+export function Box<T>(value: T): Box<T> { return { value } }
+export function make(): Box<number> { return Box(1) }
+";
+    let (_directory, index) = workspace_with_manifest(&[("main.ts", source)], module_manifest());
+    assert!(has_edge(
+        &index,
+        EdgeKind::HasType,
+        "main.ts/make",
+        "main.ts/Box"
+    ));
+    assert!(index.edges().edges().any(|edge| {
+        edge.kind() == EdgeKind::HasType
+            && edge.from().as_str().ends_with("main.ts/Box")
+            && edge.to().as_str().ends_with("main.ts/Box")
+    }));
+}
