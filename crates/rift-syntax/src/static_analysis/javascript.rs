@@ -12,6 +12,7 @@ use crate::ByteRange;
 use crate::extract::{Visited, byte_range};
 
 mod documentation;
+mod member_callbacks;
 
 pub(super) use documentation::Documentation;
 
@@ -368,6 +369,7 @@ impl Kinds {
         self.record_reference(visited, facts)?;
         self.record_member(syntax_element, facts)?;
         self.record_declared_type(syntax_element, source, facts)?;
+        self.record_member_type_shape(syntax_element, source, facts)?;
         self.record_type_signature(syntax_element, facts)?;
         self.record_return_type(syntax_element, source, facts)?;
         self.record_function(visited, source, facts)?;
@@ -653,7 +655,8 @@ impl Kinds {
         if let Some(context) = self.function_context(value)? {
             facts.function_contexts.push((range, context));
         }
-        self.record_asserted_callback(element, value, source, facts)
+        self.record_asserted_callback(element, value, source, facts)?;
+        self.record_member_callback(element, value, facts)
     }
 
     /// Types the parameters of a callback passed to a member of a value asserted to an
@@ -733,19 +736,7 @@ impl Kinds {
         };
         let own = self.callback_parameters(function);
         for (position, parameter) in own.into_iter().enumerate() {
-            // A parameter with its own annotation keeps it.
-            let annotated = self
-                .type_field
-                .is_some_and(|field| parameter.child_by_field_id(field).is_some());
-            let parameter = if self.parameter_wrappers.contains(&parameter.kind_id()) {
-                self.pattern
-                    .and_then(|field| parameter.child_by_field_id(field))
-            } else {
-                Some(parameter)
-            };
-            let Some(parameter) =
-                parameter.filter(|parameter| parameter.kind_id() == self.identifier && !annotated)
-            else {
+            let Some(parameter) = self.unannotated_callback_parameter(parameter) else {
                 continue;
             };
             let written = self
@@ -764,6 +755,22 @@ impl Kinds {
             }
         }
         Ok(())
+    }
+
+    /// The name of a callback parameter to which a written contextual type can apply.
+    fn unannotated_callback_parameter<'tree>(&self, parameter: Node<'tree>) -> Option<Node<'tree>> {
+        if self
+            .type_field
+            .is_some_and(|field| parameter.child_by_field_id(field).is_some())
+        {
+            return None;
+        }
+        let name = if self.parameter_wrappers.contains(&parameter.kind_id()) {
+            parameter.child_by_field_id(self.pattern?)?
+        } else {
+            parameter
+        };
+        (name.kind_id() == self.identifier).then_some(name)
     }
 
     /// The parameters of a function value: its single unparenthesized parameter, or the

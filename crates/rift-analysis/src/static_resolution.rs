@@ -5,6 +5,7 @@ mod javascript;
 mod javascript_callbacks;
 mod javascript_edges;
 mod javascript_exports;
+mod javascript_member_callbacks;
 mod javascript_members;
 mod javascript_reexports;
 mod javascript_scopes;
