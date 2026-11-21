@@ -1727,3 +1727,31 @@ fn test_rust_reexports_of_crate_visible_items_keep_their_scope() {
         "/control/inner/Local/make"
     ));
 }
+
+#[test]
+fn test_rust_match_arm_guards_keep_calls_and_reads() {
+    // Calls, method calls and field reads in a match arm guard belong to the enclosing
+    // function, as in the arm body. A name the arm pattern binds shadows an outer function
+    // of that name in the guard.
+    let source = "pub enum Kind { Special, Plain }\nimpl Kind { pub fn is_special(&self) -> bool { matches!(self, Kind::Special) } }\npub fn alpha(c: char) -> bool { c.is_ascii_alphabetic() }\npub fn shadow(_: u8) -> bool { false }\npub struct Input { pub pos: usize }\nimpl Input {\n    pub fn guard_call(&self, kind: Kind, c: char) -> bool {\n        match c {\n            'a' if alpha(c) => true,\n            '\\\\' if kind.is_special() && self.pos > 0 => true,\n            _ => false,\n        }\n    }\n    pub fn guard_shadow(&self, value: Option<fn(u8) -> bool>) -> bool {\n        match value {\n            Some(shadow) if shadow(1) => true,\n            _ => false,\n        }\n    }\n    pub fn body_call(&self, kind: Kind, c: char) -> bool {\n        match c {\n            'a' => alpha(c),\n            _ => kind.is_special(),\n        }\n    }\n}\n";
+    let (_directory, index) = fixture_index(PLAIN_MANIFEST, &[("src/lib.rs", source)]);
+    for (kind, from, to) in [
+        (EdgeKind::Calls, "/Input/guard_call", "/fixture/alpha"),
+        (EdgeKind::Calls, "/Input/guard_call", "/Kind/is_special"),
+        (EdgeKind::Reads, "/Input/guard_call", "/Kind/is_special"),
+        (EdgeKind::Reads, "/Input/guard_call", "/Input/pos"),
+        (EdgeKind::Calls, "/Input/body_call", "/fixture/alpha"),
+        (EdgeKind::Calls, "/Input/body_call", "/Kind/is_special"),
+    ] {
+        assert!(
+            has_edge(&index, kind, from, to),
+            "missing {kind:?} {from} -> {to}"
+        );
+    }
+    assert!(!has_edge(
+        &index,
+        EdgeKind::Calls,
+        "/Input/guard_shadow",
+        "/fixture/shadow"
+    ));
+}

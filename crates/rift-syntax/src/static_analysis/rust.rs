@@ -61,6 +61,8 @@ pub(super) struct Kinds {
     alias: u16,
     path: u16,
     pattern: u16,
+    match_pattern: u16,
+    condition: u16,
     named_patterns: [u16; 3],
     shorthand_field: u16,
     value_type: u16,
@@ -133,6 +135,8 @@ pub(super) fn kinds() -> &'static Kinds {
             alias: field("alias"),
             path: field("path"),
             pattern: field("pattern"),
+            match_pattern: id("match_pattern"),
+            condition: field("condition"),
             named_patterns: [
                 id("struct_pattern"),
                 id("tuple_struct_pattern"),
@@ -731,8 +735,12 @@ impl Kinds {
                 )?);
                 continue;
             }
+            // A match arm guard is an expression evaluated with the arm's bindings; it
+            // introduces none of its own names.
             let path = if self.named_patterns.contains(&kind) {
                 element.child_by_field_id(self.value_type)
+            } else if kind == self.match_pattern {
+                element.child_by_field_id(self.condition)
             } else {
                 None
             };
