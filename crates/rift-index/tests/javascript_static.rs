@@ -2446,6 +2446,39 @@ export function annotated(): Usage {
 }
 
 #[test]
+fn test_names_destructured_from_require_read_members_of_the_module_value() {
+    // `const { name } = require(module)` binds what `require(module).name` reads: with
+    // `module.exports = value` and `value` an object declared in that module, the member
+    // of that object. A key the object does not write binds nothing.
+    let symbols = "const keys = {
+  kState: Symbol('state'),
+  make: function make() { return 1 }
+}
+module.exports = keys
+";
+    let main = "const { kState, make, kMissing } = require('./symbols.js')
+function use(server) { return [server[kState], make(), kMissing] }
+module.exports = use
+";
+    let (_directory, index) = workspace(&[("symbols.js", symbols), ("main.js", main)]);
+    for (name, target) in [
+        ("main.js/kState", "symbols.js/keys/kState"),
+        ("main.js/make", "symbols.js/keys/make"),
+    ] {
+        assert!(has_edge(&index, EdgeKind::Imports, name, target), "{name}");
+    }
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "main.js/use",
+        "symbols.js/keys/make"
+    ));
+    assert!(!index.edges().edges().any(|edge| {
+        edge.kind() == EdgeKind::Imports && edge.from().as_str().ends_with("main.js/kMissing")
+    }));
+}
+
+#[test]
 fn test_typescript_types_named_like_a_function_take_the_interface() {
     // In TypeScript a function and an interface of one name merge: a type written with that
     // name is the interface, also inside the function itself.

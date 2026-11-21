@@ -537,14 +537,12 @@ impl<'source> Index<'source> {
             return None;
         }
         if let Some(export) = export {
-            return self.javascript_export(
-                file,
-                file.text(module)?,
-                file.text(export)?,
-                ModuleMode::CommonJs,
-                role,
-                work,
-            );
+            let module = file.text(module)?;
+            let export = file.text(export)?;
+            // `const { name } = require(module)` reads what `require(module).name` reads.
+            return self
+                .javascript_export(file, module, export, ModuleMode::CommonJs, role, work)
+                .or_else(|| self.javascript_module_value_member(file, module, export, role, work));
         }
         let value = super::javascript_exports::Exports {
             files: &self.files,
@@ -624,15 +622,7 @@ impl<'source> Index<'source> {
                 let module = file.text(module)?;
                 self.javascript_export(file, module, member, ModuleMode::CommonJs, role, work)
                     .or_else(|| {
-                        // A member of the module's value: `module.exports = name` with
-                        // `name` an object declared in that module.
-                        let value = super::javascript_exports::Exports {
-                            files: &self.files,
-                            modes: &self.javascript,
-                        }
-                        .resolve_module_value(file, module, role, work)?;
-                        let target = self.javascript_export_value(value, role, work)?;
-                        self.javascript_object_member(target, member, role, work)
+                        self.javascript_module_value_member(file, module, member, role, work)
                     })
             }
             _ => None,
@@ -641,6 +631,25 @@ impl<'source> Index<'source> {
 
     fn javascript_imported_member(
         &self,
+    /// A member of a required module's value: `module.exports = name` with `name` an object
+    /// declared in that module, or `module.exports = { ... }`.
+    fn javascript_module_value_member(
+        &self,
+        file: &File<'source>,
+        module: &'source str,
+        member: &'source str,
+        role: rift_core::ReferenceRole,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let value = super::javascript_exports::Exports {
+            files: &self.files,
+            modes: &self.javascript,
+        }
+        .resolve_module_value(file, module, role, work)?;
+        let target = self.javascript_export_value(value, role, work)?;
+        self.javascript_object_member(target, member, role, work)
+    }
+
         file: &File<'source>,
         binding: &StaticBinding,
         member: &'source str,
@@ -883,6 +892,7 @@ pub(super) fn js_binding<'source>(
             if role == rift_core::ReferenceRole::Type {
                 // A JavaScript type names a class value; a name bound by `require` can hold one.
                 let required_value =
+                let javascript = javascript_source(file.document.path.as_str());
                     matches!(binding.kind, StaticBindingKind::JavaScriptRequire { .. })
                         && javascript;
                 // A TypeScript function names no type: an interface of the same name does.
@@ -896,7 +906,6 @@ pub(super) fn js_binding<'source>(
         },
         |binding, first| {
             ambiguous = !first;
-                let javascript = javascript_source(file.document.path.as_str());
             if first {
                 best = Some(binding);
             }
