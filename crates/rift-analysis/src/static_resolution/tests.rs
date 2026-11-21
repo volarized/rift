@@ -2703,3 +2703,5 @@ fn test_rust_field_and_method_names_keep_exact_access_targets() {
                         .expect("offset"))
     );
 }
+
+mod external;

@@ -1530,7 +1530,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "No lane populates part of the edge coverage the traversal asked for, so the\nwalk had nothing to follow there whatever the graph holds. The warning states that a\nlane is absent; it never states that the seed has no such neighbor. An empty answer\ncarrying it means the walk could not run; an empty answer without it means the walk\nran and the seed has no neighbor under the request.",
+                "description": "Part of the edge coverage the read asked for is missing: no lane populates it, so\nthe walk had nothing to follow there whatever the graph holds, or static analysis\nleft sites whose targets it could not name, such as a dependency or standard-library\nowner it did not find. The warning states that coverage is absent; it never states\nthat the seed has no such neighbor. An empty answer carrying it means the read could\nnot see those edges; an empty answer without it means the read ran and the seed has\nno neighbor under the request.",
                 "properties": {
                   "code": {
                     "const": "edge_coverage_missing",
@@ -4850,7 +4850,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "No lane populates part of the edge coverage the traversal asked for, so the\nwalk had nothing to follow there whatever the graph holds. The warning states that a\nlane is absent; it never states that the seed has no such neighbor. An empty answer\ncarrying it means the walk could not run; an empty answer without it means the walk\nran and the seed has no neighbor under the request.",
+                "description": "Part of the edge coverage the read asked for is missing: no lane populates it, so\nthe walk had nothing to follow there whatever the graph holds, or static analysis\nleft sites whose targets it could not name, such as a dependency or standard-library\nowner it did not find. The warning states that coverage is absent; it never states\nthat the seed has no such neighbor. An empty answer carrying it means the read could\nnot see those edges; an empty answer without it means the read ran and the seed has\nno neighbor under the request.",
                 "properties": {
                   "code": {
                     "const": "edge_coverage_missing",
@@ -7956,7 +7956,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "No lane populates part of the edge coverage the traversal asked for, so the\nwalk had nothing to follow there whatever the graph holds. The warning states that a\nlane is absent; it never states that the seed has no such neighbor. An empty answer\ncarrying it means the walk could not run; an empty answer without it means the walk\nran and the seed has no neighbor under the request.",
+                "description": "Part of the edge coverage the read asked for is missing: no lane populates it, so\nthe walk had nothing to follow there whatever the graph holds, or static analysis\nleft sites whose targets it could not name, such as a dependency or standard-library\nowner it did not find. The warning states that coverage is absent; it never states\nthat the seed has no such neighbor. An empty answer carrying it means the read could\nnot see those edges; an empty answer without it means the read ran and the seed has\nno neighbor under the request.",
                 "properties": {
                   "code": {
                     "const": "edge_coverage_missing",

@@ -31,6 +31,8 @@ pub(super) struct Namespaces<'source> {
     initializers: BTreeMap<(&'source str, ByteRange), Option<&'source StaticCall>>,
     conditional_modules: BTreeSet<Vec<String>>,
     inactive_modules: BTreeSet<Vec<String>>,
+    /// Module path of each selected file.
+    bases: BTreeSet<Vec<String>>,
     modules: BTreeMap<Vec<String>, Option<Target<'source>>>,
     crate_roots: BTreeMap<String, Option<&'source str>>,
     exports: BTreeMap<Vec<String>, Option<Export<'source>>>,
@@ -760,6 +762,7 @@ impl<'source> Namespaces<'source> {
                 .and_modify(|root| *root = None)
                 .or_insert(Some(file.document.path.as_str()));
         }
+        self.bases.insert(namespace.base.clone());
         self.files.insert(file.document.path.as_str(), namespace);
         Some(())
     }
@@ -926,6 +929,103 @@ impl<'source> Namespaces<'source> {
             current = export.target.clone();
         }
         None
+    }
+
+    /// Absolute path of one use declaration when no selected source declares its root.
+    pub(super) fn spelled_use(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+    ) -> Option<Vec<String>> {
+        if file.conditional(range, work) {
+            return None;
+        }
+        let parts = file.use_parts(range, work)?;
+        self.undeclared_root(file, range.start, parts, work)
+    }
+
+    /// Absolute path an authored path spells through the file's use declarations when no
+    /// selected source declares its root.
+    pub(super) fn spelled_path(
+        &self,
+        file: &File<'source>,
+        position: u64,
+        text: &str,
+        value: bool,
+        work: &mut Work,
+    ) -> Option<Vec<String>> {
+        let range = ByteRange {
+            start: position,
+            end: position,
+        };
+        if file.conditional(range, work) {
+            return None;
+        }
+        let text = text.strip_prefix("::").unwrap_or(text);
+        let parts = path_segments(text, work)?;
+        let (head, tail) = parts.split_first()?;
+        let accepts = if value && tail.is_empty() {
+            is_value_binding
+        } else {
+            is_type_binding
+        };
+        let spelled = match file.binding(head, position, accepts, work) {
+            Binding::Found(binding) => {
+                let StaticBindingKind::RustUse { path } = binding.kind else {
+                    return None;
+                };
+                let mut imported = file.use_parts(path, work)?;
+                imported.extend(tail.iter().map(|part| (*part).to_owned()));
+                imported
+            }
+            Binding::Missing => {
+                for imported in file.facts.rust_uses() {
+                    if !work.charge() || imported.glob && imported.scope.contains(position) {
+                        return None;
+                    }
+                }
+                parts.iter().map(|part| (*part).to_owned()).collect()
+            }
+            Binding::Blocked => return None,
+        };
+        self.undeclared_root(file, position, spelled, work)
+    }
+
+    fn undeclared_root(
+        &self,
+        file: &File<'source>,
+        position: u64,
+        path: Vec<String>,
+        work: &mut Work,
+    ) -> Option<Vec<String>> {
+        let head = path.first()?;
+        if matches!(head.as_str(), "crate" | "self" | "super" | "Self") {
+            return None;
+        }
+        let module = self.module(file, position, work)?;
+        for base in [module, module.get(..1)?] {
+            let mut prefix = base.to_vec();
+            prefix.push(head.clone());
+            let from = || prefix.clone()..;
+            let starts = |path: &Vec<String>| path.starts_with(&prefix);
+            if self.modules.contains_key(&prefix)
+                || self.bases.range(from()).next().is_some_and(starts)
+                || self
+                    .types
+                    .range(from())
+                    .next()
+                    .is_some_and(|row| starts(row.0))
+                || self
+                    .values
+                    .range(from())
+                    .next()
+                    .is_some_and(|row| starts(row.0))
+            {
+                return None;
+            }
+        }
+        Some(path)
     }
 
     fn direct_call(

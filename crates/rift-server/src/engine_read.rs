@@ -4,6 +4,7 @@
 mod inventory;
 pub use inventory::{
     EngineInventory, EngineInventoryAnswer, EngineInventoryFile, EngineInventorySelection,
+    PackageEdge,
 };
 
 use std::collections::{BTreeMap, BTreeSet};

@@ -146,9 +146,22 @@ type ExternalTarget<'input> =
 impl StaticResolution {
     fn retained_size<T: get_size2::GetSizeTracker>(&self, mut tracker: T) -> (usize, T) {
         let mut bytes = self
-            .occurrences
+            .external
             .capacity()
-            .saturating_mul(std::mem::size_of::<StaticOccurrence>());
+            .saturating_mul(std::mem::size_of::<
+                crate::static_resolution::ExternalOccurrence,
+            >())
+            .saturating_add(
+                self.external
+                    .iter()
+                    .map(|occurrence| occurrence.target.as_str().len())
+                    .fold(0, usize::saturating_add),
+            );
+        bytes = bytes.saturating_add(
+            self.occurrences
+                .capacity()
+                .saturating_mul(std::mem::size_of::<StaticOccurrence>()),
+        );
         for occurrence in &self.occurrences {
             let (binding, next) =
                 get_size2::GetSize::get_heap_size_with_tracker(&occurrence.binding, tracker);
@@ -517,8 +530,12 @@ impl WorkspaceSemantics {
         let work_max = edges_max.saturating_mul(16);
         let mut resolution =
             crate::static_resolution::resolve(&self.graph, sources, input, work_max);
-        self.edges
-            .add_static(&self.graph, &resolution.occurrences, edges_max);
+        self.edges.add_static(
+            &self.graph,
+            &resolution.occurrences,
+            &resolution.external,
+            edges_max,
+        );
         resolution.occurrences.retain(|occurrence| {
             !matches!(
                 occurrence.edge_kind,
@@ -584,6 +601,16 @@ impl WorkspaceSemantics {
                     occurrence.role,
                 )
             })
+    }
+
+    /// Sites the static pass left without a target, counted per edge kind. A site counts
+    /// when neither a selected source nor a named dependency or standard library
+    /// declares what it spells.
+    #[must_use]
+    pub const fn static_targets_omitted(
+        &self,
+    ) -> &std::collections::BTreeMap<rift_protocol::read::EdgeKind, u64> {
+        &self.static_resolution.omitted
     }
 
     /// Number of captured sources that could not supply static evidence.

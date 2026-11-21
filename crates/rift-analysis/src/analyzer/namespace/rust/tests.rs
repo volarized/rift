@@ -2996,6 +2996,100 @@ fn public_reexports_remain_when_an_external_crate_is_declared() {
     );
 }
 
+/// A package's calls, heritage, and type uses into a dependency and the standard library
+/// are published as edges to the other owner. An admitted dependency publication supplies
+/// the defining identity; without one the edge names the spelled public path.
+#[test]
+fn package_edges_reach_dependency_and_standard_library_owners() {
+    use rift_protocol::read::{EdgeDerivation, EdgeKind};
+    let target = local_alias_analysis(
+        &[
+            ("src/lib.rs", "pub mod ser;\npub use crate::ser::encode;\n"),
+            ("src/ser.rs", "pub trait Serialize {}\npub fn encode() {}\n"),
+        ],
+        "[package]\nname='serde_core'\nversion='1.0.228'\n[lib]\npath='src/lib.rs'\n",
+    );
+    let text = "use serde_core::encode;\npub struct Wrapper;\n\
+                impl serde_core::ser::Serialize for Wrapper {}\n\
+                pub fn run() -> Vec<u8> { encode(); Vec::new() }\n";
+    let manifest = "[package]\nname='serde'\nversion='1.0.228'\n[lib]\npath='src/lib.rs'\n[dependencies]\nserde_core='=1.0.228'\n";
+    let edges = |admitted: bool| {
+        let source = external_alias_analysis(
+            target.publication(),
+            &[("src/lib.rs", text)],
+            manifest,
+            admitted,
+        );
+        source
+            .publication()
+            .edges
+            .iter()
+            .filter(|edge| !edge.to.as_str().contains("/serde/rust/"))
+            .map(|edge| {
+                (
+                    edge.from
+                        .as_str()
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    edge.kinds.clone(),
+                    edge.to.as_str().to_owned(),
+                    edge.derivation,
+                )
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let run = "run".to_owned();
+    let core = "rift://symbol/cargo/crates.io/serde_core/rust/serde_core";
+    let declared = edges(true);
+    for expected in [
+        (
+            run.clone(),
+            vec![EdgeKind::Calls],
+            format!("{core}/ser/encode"),
+            EdgeDerivation::Resolution,
+        ),
+        (
+            run.clone(),
+            vec![EdgeKind::Calls],
+            "rift://symbol/stdlib/rust/rust/alloc/vec/Vec/new".to_owned(),
+            EdgeDerivation::Syntax,
+        ),
+        (
+            "Wrapper".to_owned(),
+            vec![EdgeKind::Implements],
+            format!("{core}/ser/Serialize"),
+            EdgeDerivation::Resolution,
+        ),
+    ] {
+        assert!(
+            declared.contains(&expected),
+            "{expected:?} not in {declared:#?}"
+        );
+    }
+    let spelled = edges(false);
+    for expected in [
+        (
+            run.clone(),
+            vec![EdgeKind::Calls],
+            format!("{core}/encode"),
+            EdgeDerivation::Syntax,
+        ),
+        (
+            "Wrapper".to_owned(),
+            vec![EdgeKind::Implements],
+            format!("{core}/ser/Serialize"),
+            EdgeDerivation::Syntax,
+        ),
+    ] {
+        assert!(
+            spelled.contains(&expected),
+            "{expected:?} not in {spelled:#?}"
+        );
+    }
+}
+
 #[test]
 fn external_public_reexports_without_admitted_target_remain_unresolved() {
     let target = local_alias_analysis(

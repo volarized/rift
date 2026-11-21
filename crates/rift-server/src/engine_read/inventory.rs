@@ -1,7 +1,9 @@
 //! File groups for bounded engine edge inventory reads.
 
 mod calls;
+mod targets;
 mod types;
+pub use targets::PackageEdge;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -50,6 +52,7 @@ pub struct EngineInventoryFile {
     positions: Vec<InventoryPosition>,
     seeds: BTreeSet<SymbolId>,
     call_sites: Vec<InventoryCallSite>,
+    target_sites: Vec<targets::Site>,
     has_static_calls: bool,
 }
 
@@ -127,6 +130,11 @@ impl ReadService {
                     .ok_or_else(graph_call_coverage)?;
                 group.call_sites = inventory_call_sites(self, file, &group.seeds)?;
             }
+            let file = self
+                .index()
+                .file(&group.target.path)
+                .ok_or_else(graph_call_coverage)?;
+            group.target_sites = targets::sites(self, file, &group.seeds, selection)?;
             files.push(group);
         }
         Ok(files)
@@ -212,6 +220,7 @@ fn inventory_file<'group>(
                 positions: Vec::new(),
                 seeds: BTreeSet::new(),
                 call_sites: Vec::new(),
+                target_sites: Vec::new(),
                 has_static_calls: file.syntax().static_facts().is_some(),
             }))
         }
@@ -232,6 +241,7 @@ pub struct EngineInventoryAnswer {
     types: Vec<(SymbolId, Vec<Location>)>,
     heritage: Vec<InventoryHeritage>,
     definitions: Vec<InventoryDefinition>,
+    targets: Vec<targets::Answer>,
     definition_callers: BTreeSet<SymbolId>,
     warnings: Vec<ReadWarning>,
 }
@@ -249,6 +259,8 @@ pub struct EngineInventory {
     pub heritage: Vec<Edge>,
     /// Readiness warnings carried by this file's engine answer.
     pub warnings: Vec<ReadWarning>,
+    /// External reference, type and inheritance targets awaiting package placement.
+    pub packages: Vec<PackageEdge>,
 }
 
 impl EngineInventory {
@@ -297,6 +309,7 @@ impl EngineInventoryFile {
         let positions = self.positions.clone();
         let path = self.target.path.clone();
         let sites = self.call_sites.clone();
+        let target_sites = self.target_sites.clone();
         let callers = self.seeds.clone();
         let has_static_calls = self.has_static_calls;
         let answered = slot
@@ -306,6 +319,7 @@ impl EngineInventoryFile {
                     let positions = positions.clone();
                     let path = path.clone();
                     let sites = sites.clone();
+                    let target_sites = target_sites.clone();
                     let callers = callers.clone();
                     Box::pin(async move {
                         let mut report =
@@ -324,6 +338,14 @@ impl EngineInventoryFile {
                             )
                             .await?;
                         }
+                        targets::read(
+                            session,
+                            &path,
+                            &target_sites,
+                            selection.batch_inputs,
+                            &mut report,
+                        )
+                        .await?;
                         Ok(Some(report))
                     })
                 },
@@ -358,6 +380,7 @@ impl EngineInventoryFile {
             types: report.types,
             heritage: report.heritage,
             definitions: report.definitions,
+            targets: report.targets,
             definition_callers: report.definition_callers,
             warnings,
         }))
@@ -379,6 +402,7 @@ struct InventoryReport {
     types: Vec<(SymbolId, Vec<Location>)>,
     heritage: Vec<InventoryHeritage>,
     definitions: Vec<InventoryDefinition>,
+    targets: Vec<targets::Answer>,
     definition_callers: BTreeSet<SymbolId>,
 }
 
@@ -460,6 +484,7 @@ async fn read_positions(
         types: Vec::new(),
         heritage: Vec::new(),
         definitions: Vec::new(),
+        targets: Vec::new(),
         definition_callers: BTreeSet::new(),
     };
     let maximum = selection
@@ -557,15 +582,39 @@ async fn read_calls(
 }
 
 impl EngineInventoryAnswer {
+    /// Places reference, type and inheritance targets the engine answered outside the
+    /// workspace in their package or runtime sources; their warnings join the answer's.
+    fn place_targets(
+        &mut self,
+        reads: &ReadService,
+        roots: &CalleeRoots,
+    ) -> Result<targets::Resolved, RiftError> {
+        let mut targets = targets::Mapping {
+            reads,
+            roots,
+            workspace: &self.workspace_root,
+            encoding: self.encoding,
+            provider: self.provider,
+        }
+        .resolve(
+            std::mem::take(&mut self.types),
+            std::mem::take(&mut self.heritage),
+            std::mem::take(&mut self.targets),
+        )?;
+        self.warnings.append(&mut targets.warnings);
+        Ok(targets)
+    }
+
     /// Maps returned locations against the captured index on the bounded worker pool.
     ///
     /// # Errors
     /// Returns invalid engine positions or exceeded occurrence bounds.
     pub fn resolve(
-        self,
+        mut self,
         reads: &ReadService,
         roots: &CalleeRoots,
     ) -> Result<EngineInventory, RiftError> {
+        let targets = self.place_targets(reads, roots)?;
         let file = reads
             .index()
             .file(&self.path)
@@ -639,17 +688,18 @@ impl EngineInventoryAnswer {
         let types = reads.inventory_type_edges(
             &self.workspace_root,
             self.encoding,
-            self.types,
+            targets.types,
             self.provider,
         )?;
         let heritage = resolve_heritage(
             reads,
             &self.workspace_root,
             self.encoding,
-            self.heritage,
+            targets.heritage,
             self.provider,
         )?;
         Ok(EngineInventory {
+            packages: targets.packages,
             heritage,
             types,
             calls,
@@ -1102,7 +1152,14 @@ fn resolve_definitions(
             }
         }
     }
-    Ok(calls.into_iter().collect())
+    calls
+        .into_iter()
+        .map(|(seed, answer)| {
+            let identity = CoreSymbolId::new(seed.as_str())?;
+            let captured = CapturedCalls::read(reads, &identity, TraversalDirection::Outgoing);
+            Ok((seed, captured.combine_external(answer)))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1209,11 +1266,11 @@ mod tests {
         let installed = tempfile::tempdir()?;
         std::fs::write(
             directory.path().join("Cargo.toml"),
-            "[package]\nname = 'fixture'\nversion = '0.1.0'\n[lib]\npath = 'lib.rs'\n",
+            "[package]\nname = 'fixture'\nversion = '0.1.0'\n[lib]\npath = 'lib.rs'\n[dependencies]\ndependency = '1'\n",
         )?;
         std::fs::write(
             directory.path().join("lib.rs"),
-            "pub fn caller() { alias(); }\n",
+            "use dependency::alias;\npub fn caller() { alias(); }\n",
         )?;
         let reads = ReadService::build(
             directory.path(),
@@ -1264,33 +1321,57 @@ mod tests {
             panic!("one caller")
         };
         assert!(answer.complete);
-        assert!(answer.local.is_empty());
+        let spelled =
+            SymbolId("rift://symbol/cargo/crates.io/dependency/rust/dependency/alias".to_owned());
+        assert_eq!(
+            answer.local,
+            vec![(spelled.clone(), vec![sites[0].source.clone()])]
+        );
+        assert!(answer.corroboration.is_empty());
+        assert!(
+            answer
+                .edges
+                .iter()
+                .any(|edge| edge.to == spelled && edge.provider == EdgeProvider::Static)
+        );
         let [(target, ranges)] = answer.packages.as_slice() else {
             panic!("one admitted target")
         };
         assert_eq!(target.position(), location.range.start);
         assert_eq!(target.path().as_str(), "src/lib.rs");
         assert_eq!(ranges, &[sites[0].source.clone()]);
+        assert_package_call_replaces_local(calls, &sites[0], &spelled);
+        Ok(())
+    }
+
+    fn assert_package_call_replaces_local(
+        calls: Vec<(SymbolId, GraphCalls)>,
+        site: &InventoryCallSite,
+        spelled: &SymbolId,
+    ) {
         let seed = calls[0].0.clone();
         let merged = calls::merge_calls(
             vec![(
                 seed.clone(),
                 GraphCalls {
-                    local: vec![(seed.clone(), vec![sites[0].source.clone()])],
+                    local: vec![(seed.clone(), vec![site.source.clone()])],
                     complete: true,
                     ..GraphCalls::default()
                 },
             )],
             calls,
-            vec![(seed, sites[0].source.clone(), sites[0].at)],
+            vec![(seed, site.source.clone(), site.at)],
         );
         assert!(
-            merged[0].1.local.is_empty(),
-            "the resolved dependency replaces a conflicting local target"
+            merged[0]
+                .1
+                .local
+                .iter()
+                .all(|(target, _)| target == spelled),
+            "the dependency keeps its static spelling and replaces a conflicting local target"
         );
         assert_eq!(merged[0].1.packages.len(), 1);
         assert!(merged[0].1.complete);
-        Ok(())
     }
 
     #[test]

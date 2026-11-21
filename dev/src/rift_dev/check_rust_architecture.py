@@ -87,6 +87,7 @@ EXPECTED_EDGES = {
     "rift-mcp -> rift-ranking",
     "rift-mcp -> rift-search",
     "rift-mcp -> rift-server",
+    "rift-mcp -> rift-syntax",
     "rift-mcp -> rift-tracing",
     "rift-provider -> rift-core",
     "rift-provider -> rift-error",

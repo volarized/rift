@@ -1626,11 +1626,13 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         detail: String,
     },
-    /// No lane populates part of the edge coverage the traversal asked for, so the
-    /// walk had nothing to follow there whatever the graph holds. The warning states that a
-    /// lane is absent; it never states that the seed has no such neighbor. An empty answer
-    /// carrying it means the walk could not run; an empty answer without it means the walk
-    /// ran and the seed has no neighbor under the request.
+    /// Part of the edge coverage the read asked for is missing: no lane populates it, so
+    /// the walk had nothing to follow there whatever the graph holds, or static analysis
+    /// left sites whose targets it could not name, such as a dependency or standard-library
+    /// owner it did not find. The warning states that coverage is absent; it never states
+    /// that the seed has no such neighbor. An empty answer carrying it means the read could
+    /// not see those edges; an empty answer without it means the read ran and the seed has
+    /// no neighbor under the request.
     EdgeCoverageMissing {
         /// The requested kinds no lane populates, in the request's own order,
         /// deduplicated. Absent when every requested kind has a lane.

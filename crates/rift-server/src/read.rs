@@ -421,6 +421,13 @@ impl ReadService {
         })
     }
 
+    /// Sites static analysis left without a target, counted per edge kind. A whole-inventory
+    /// edge read reports them, since its rows cannot name those targets.
+    #[must_use]
+    pub fn static_targets_omitted(&self) -> &BTreeMap<rift_protocol::read::EdgeKind, u64> {
+        self.index.static_targets_omitted()
+    }
+
     /// Whether a configured engine serves a captured source language.
     #[must_use]
     pub fn uses_edge_engines(&self, engines: &crate::EnginePool) -> bool {

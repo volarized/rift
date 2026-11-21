@@ -27,6 +27,7 @@ use super::installed::InstalledTarget;
 
 mod flows;
 mod inventory;
+mod targets;
 pub(super) use flows::{AcquiredFlows, FlowAcquisition};
 pub(crate) use inventory::EngineInventoryCache;
 use inventory::InventoryRead;
@@ -56,6 +57,7 @@ impl AcquiredAdjacency {
         if self.local_edges.len().saturating_add(read.records) > maximum {
             return Err(coverage_failure());
         }
+        self.admit_package_details(read)?;
         self.partial |= read.partial;
         self.edge_facts.extend(read.edge_facts.iter().cloned());
         self.local.extend(read.local.iter().cloned());
@@ -86,6 +88,23 @@ impl AcquiredAdjacency {
         Ok(())
     }
 
+    fn admit_package_details(&mut self, read: &InventoryRead) -> Result<(), RiftError> {
+        for (identity, target) in &read.installed {
+            if let Some(held) = self.installed.get(identity)
+                && !held.same_capture(target)
+            {
+                return Err(coverage_failure());
+            }
+            self.installed.insert(identity.clone(), Arc::clone(target));
+        }
+        self.named_package_symbols.extend(
+            read.named_package_symbols
+                .iter()
+                .map(|(id, symbol)| (id.clone(), symbol.clone())),
+        );
+        Ok(())
+    }
+
     /// Whether part of a whole inventory is missing while every acquired fact stands.
     pub(super) const fn is_partial(&self) -> bool {
         self.partial
@@ -97,6 +116,20 @@ impl AcquiredAdjacency {
         required: rift_search::sparql::SemanticInventory,
     ) -> Result<(), RiftError> {
         self.incomplete |= !reads.static_edges_complete()?;
+        let omitted = reads.static_targets_omitted();
+        if !omitted.is_empty() {
+            let sites = omitted.values().copied().fold(0, u64::saturating_add);
+            let warning = ReadWarning::EdgeCoverageMissing {
+                kinds: omitted.keys().copied().collect(),
+                detail: format!(
+                    "static analysis left {sites} sites without a target, so edges of these \
+                     kinds may be missing from this answer"
+                ),
+            };
+            if !self.warnings.contains(&warning) {
+                self.warnings.push(warning);
+            }
+        }
         // Captures without identities are left out of the inventory: its rows stand, but an
         // absence or an aggregate over it is no claim the inventory can make.
         self.partial |= !reads.edge_identities_complete();
@@ -623,22 +656,15 @@ impl<'request> AdjacencyWalk<'request> {
             return Ok(());
         }
         let engines = self.server.engine_pool_for(&self.resolved.published).await;
-        let roots = if self.step.kind == EdgeKind::Calls
-            || self
-                .selected
-                .is_some_and(AdjacencySelection::has_distinct_steps)
-        {
-            let reads = Arc::clone(&self.resolved.published.reads);
-            let engines = Arc::clone(&engines);
-            self.server
-                .blocking
-                .run("graph callee package roots", move || {
-                    Ok(rift_server::CalleeRoots::read(&reads, &engines))
-                })
-                .await?
-        } else {
-            rift_server::CalleeRoots::default()
-        };
+        let reads = Arc::clone(&self.resolved.published.reads);
+        let capture = Arc::clone(&engines);
+        let roots = self
+            .server
+            .blocking
+            .run("graph package roots", move || {
+                Ok(rift_server::CalleeRoots::read(&reads, &capture))
+            })
+            .await?;
         self.local = Some((engines, roots));
         Ok(())
     }
@@ -650,10 +676,7 @@ impl<'request> AdjacencyWalk<'request> {
     ) -> Result<(), RiftError> {
         self.ensure_local().await?;
         claim_request(&mut self.remaining)?;
-        let reads = &self.resolved.published.reads;
         let direction = self.step.direction;
-        let (engines, _) = self.local.as_ref().ok_or_else(coverage_failure)?;
-        let deadline = self.deadline.walk_end(self.resolved.capture_elapsed);
         match (direction, self.step.kind) {
             (TraversalDirection::Incoming, EdgeKind::References) => {
                 self.incoming_references(seed, frontier).await?;
@@ -664,31 +687,57 @@ impl<'request> AdjacencyWalk<'request> {
             (_, EdgeKind::HasType) => self.type_step(seed, frontier).await?,
             (_, EdgeKind::Calls) => self.edge_call_step(seed, frontier).await?,
             (_, kind @ (EdgeKind::Extends | EdgeKind::Implements)) => {
-                let (edges, warnings) = Box::pin(rift_server::graph_heritage_edges(
-                    reads, engines, seed, kind, direction, deadline,
-                ))
-                .await?;
-                self.edge_static_step(seed, kind, frontier)?;
-                self.acquired.incomplete |= warnings.iter().any(|warning| {
-                    matches!(warning, ReadWarning::EngineAnalysisUnavailable { .. })
-                });
-                self.acquired.warnings.extend(warnings);
-                charge_records(&mut self.remaining, edges.len())?;
-                for edge in edges {
-                    let neighbor = match direction {
-                        TraversalDirection::Outgoing => edge.to.clone(),
-                        TraversalDirection::Incoming => edge.from.clone(),
-                    };
-                    frontier.insert(neighbor);
-                    self.acquired.local_edges.push((
-                        edge.from.clone(),
-                        relation(kind)?,
-                        edge.to.clone(),
-                    ));
-                    self.acquired.edge_facts.push(edge);
-                }
+                self.heritage_step(seed, kind, frontier).await?;
             }
             (_, kind) => self.edge_static_step(seed, kind, frontier)?,
+        }
+        Ok(())
+    }
+
+    async fn heritage_step(
+        &mut self,
+        seed: &SymbolId,
+        kind: EdgeKind,
+        frontier: &mut BTreeSet<SymbolId>,
+    ) -> Result<(), RiftError> {
+        let direction = self.step.direction;
+        let selected = (direction == TraversalDirection::Outgoing).then_some(seed);
+        let inventory = Box::pin(self.server.inventory_for_kind(
+            self.resolved,
+            kind,
+            selected,
+            None,
+            self.deadline.walk_end(self.resolved.capture_elapsed),
+        ))
+        .await?;
+        self.acquired.admit_package_details(&inventory)?;
+        self.acquired.incomplete |= inventory.partial;
+        self.acquired
+            .warnings
+            .extend(inventory.warnings.iter().cloned());
+        self.acquired.edge_facts.extend(
+            inventory
+                .edge_facts
+                .iter()
+                .filter(|edge| {
+                    edge.kinds.contains(&kind)
+                        && match direction {
+                            TraversalDirection::Outgoing => &edge.from == seed,
+                            TraversalDirection::Incoming => &edge.to == seed,
+                        }
+                })
+                .cloned(),
+        );
+        self.edge_static_step(seed, kind, frontier)?;
+        for (from, relation, to) in inventory.edges(seed, relation(kind)?, direction) {
+            charge_records(&mut self.remaining, 1)?;
+            frontier.insert(match direction {
+                TraversalDirection::Outgoing => to.clone(),
+                TraversalDirection::Incoming => from.clone(),
+            });
+            self.acquired
+                .local_edges
+                .push((from.clone(), *relation, to.clone()));
         }
         Ok(())
     }
@@ -709,6 +758,7 @@ impl<'request> AdjacencyWalk<'request> {
             deadline,
         ))
         .await?;
+        self.acquired.admit_package_details(&inventory)?;
         self.acquired.incomplete |= inventory.partial;
         self.acquired
             .warnings
@@ -796,6 +846,7 @@ impl<'request> AdjacencyWalk<'request> {
             deadline,
         ))
         .await?;
+        self.acquired.admit_package_details(&inventory)?;
         self.acquired.incomplete |= inventory.partial;
         self.acquired
             .warnings
@@ -998,153 +1049,6 @@ impl<'request> AdjacencyWalk<'request> {
         Ok(())
     }
 
-    async fn name_package_calls(
-        &mut self,
-        calls: &mut rift_server::GraphCalls,
-        lookup_details: bool,
-    ) -> Result<(), RiftError> {
-        if calls.packages.is_empty() {
-            return Ok(());
-        }
-        let installed = if let Some(installed) = self.use_installed {
-            installed
-        } else {
-            let installed = if self.configuration.enabled {
-                let client = self.server.global.client(&self.configuration).await?;
-                let capabilities = client.get_capabilities().await?;
-                let operations = rift_cloud_client::GlobalClient::edge_capabilities(&capabilities)?;
-                !operations.iter().any(|operation| {
-                    operation.direction == TraversalDirection::Outgoing
-                        && operation.kinds.contains(&EdgeKind::Calls)
-                        && operation.bounds.is_some()
-                })
-            } else {
-                true
-            };
-            self.use_installed = Some(installed);
-            installed
-        };
-        if installed {
-            return self.capture_installed_calls(calls).await;
-        }
-        self.name_published_calls(calls, lookup_details).await
-    }
-
-    async fn name_published_calls(
-        &mut self,
-        calls: &mut rift_server::GraphCalls,
-        lookup_details: bool,
-    ) -> Result<(), RiftError> {
-        claim_request(&mut self.remaining)?;
-        let callees: Vec<_> = calls
-            .packages
-            .iter()
-            .map(|(callee, _)| callee.clone())
-            .collect();
-        let client = self.server.global.client(&self.configuration).await?;
-        let declarations = crate::global::callee_declarations(&client, &callees, &[]).await?;
-        let dependencies = self.resolved.published.reads.dependency_context();
-        for (callee, occurrences) in std::mem::take(&mut calls.packages) {
-            let declaration = declarations
-                .declaration(&callee)
-                .ok_or_else(coverage_failure)?;
-            let identity = SymbolIdentity::parse(declaration.id.as_str())?;
-            if selected_release(dependencies, identity.owner()).as_ref()
-                != Some(&declaration.revision)
-            {
-                return Err(coverage_failure());
-            }
-            if lookup_details
-                && !self
-                    .acquired
-                    .named_package_symbols
-                    .contains_key(&declaration.id)
-            {
-                claim_request(&mut self.remaining)?;
-                let answer = client
-                    .get_symbol(&exact_request(&declaration.id, &declaration.revision))
-                    .await?;
-                let rift_protocol::symbol_read::GetSymbolResult::Found {
-                    symbol, revision, ..
-                } = answer
-                else {
-                    return Err(coverage_failure());
-                };
-                if revision != declaration.revision {
-                    return Err(coverage_failure());
-                }
-                self.acquired.named_package_symbols.insert(
-                    declaration.id.clone(),
-                    (*symbol, RevisionIri::parse(&revision.to_string())?),
-                );
-            }
-            calls.name_package_call(&callee, declaration.id, occurrences);
-        }
-        Ok(())
-    }
-
-    async fn capture_installed_calls(
-        &mut self,
-        calls: &mut rift_server::GraphCalls,
-    ) -> Result<(), RiftError> {
-        let (_, roots) = self.local.as_ref().ok_or_else(coverage_failure)?;
-        let roots = roots.clone();
-        let tree = self.server.root.clone();
-        let configuration = self
-            .resolved
-            .published
-            .configuration
-            .accepted_for_tool(super::super::super::wire::ErrorPhase::Read)
-            .map_err(|_| coverage_failure())?;
-        let packages = std::mem::take(&mut calls.packages);
-        let maximum = usize::try_from(self.remaining.bytes_max).unwrap_or(usize::MAX);
-        let targets = self
-            .server
-            .blocking
-            .run("capture installed dependency targets", move || {
-                let mut retained = 0usize;
-                let mut targets = Vec::new();
-                for (callee, occurrences) in packages {
-                    let target = InstalledTarget::capture(callee, &roots, &tree, &configuration)?;
-                    retained = retained
-                        .checked_add(target.retained_bytes())
-                        .filter(|size| *size <= maximum)
-                        .ok_or_else(coverage_failure)?;
-                    targets.push((target, occurrences));
-                }
-                Ok(targets)
-            })
-            .await?;
-        for (target, occurrences) in targets {
-            let identity = target.id()?.clone();
-            let owner = SymbolIdentity::parse(identity.as_str())?;
-            if selected_release(
-                self.resolved.published.reads.dependency_context(),
-                owner.owner(),
-            )
-            .as_ref()
-                != Some(&target.revision)
-            {
-                return Err(coverage_failure());
-            }
-            self.remaining.bytes_max = self
-                .remaining
-                .bytes_max
-                .checked_sub(
-                    u64::try_from(target.retained_bytes()).map_err(|_| coverage_failure())?,
-                )
-                .ok_or_else(coverage_failure)?;
-            if let Some(held) = self.acquired.installed.get(&identity)
-                && !held.same_capture(&target)
-            {
-                return Err(coverage_failure());
-            }
-            calls.name_package_call(&target.callee, identity.clone(), occurrences);
-            self.acquired.installed.insert(identity, Arc::new(target));
-        }
-        Ok(())
-    }
-
     async fn verify_installed(&self) -> Result<(), RiftError> {
         if self.acquired.installed.is_empty() {
             return Ok(());
@@ -1181,13 +1085,6 @@ impl<'request> AdjacencyWalk<'request> {
                     .semantic_seeds(maximum)
             })
             .await?;
-        let published_declarations = self.remote.as_ref().is_some_and(|remote| {
-            remote
-                .capabilities
-                .supported_features
-                .iter()
-                .any(|feature| feature == "declarations")
-        });
         let deadline = self.deadline.walk_end(self.resolved.capture_elapsed);
         let mut callers = BTreeMap::<SymbolId, BTreeSet<SymbolId>>::new();
         for seed in seeds {
@@ -1206,11 +1103,7 @@ impl<'request> AdjacencyWalk<'request> {
                 return Err(coverage_failure());
             }
             if !calls.packages.is_empty() {
-                if published_declarations {
-                    self.name_published_calls(&mut calls, false).await?;
-                } else {
-                    self.capture_installed_calls(&mut calls).await?;
-                }
+                self.name_package_calls(&mut calls, false).await?;
             }
             charge_records(&mut self.remaining, calls.local.len())?;
             self.acquired.edge_facts.extend(calls.edges);
@@ -1461,7 +1354,12 @@ fn exact_domain(context: &rift_dependency::DependencyContext) -> Result<ExactDom
                 continue;
             };
             let owner = SymbolOwner::Runtime {
-                runtime: library.runtime().to_owned(),
+                runtime: if library == rift_dependency::StandardLibrary::Rust {
+                    "rust"
+                } else {
+                    library.runtime()
+                }
+                .to_owned(),
             };
             (owner, None)
         } else {

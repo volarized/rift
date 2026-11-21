@@ -15,6 +15,49 @@ pub(super) enum ReceiverOwner<'source> {
 }
 
 impl<'source> Index<'source> {
+    /// The local target of one captured Rust reference.
+    fn rust_reference_occurrence(
+        &self,
+        file: &File<'source>,
+        reference: &rift_syntax::StaticReference,
+        work: &mut Work,
+    ) -> Option<StaticOccurrence> {
+        let target = if reference.role == ReferenceRole::Type {
+            self.rust.edge_type_target(file, reference.target, work)
+        } else {
+            self.rust
+                .access(file, reference.target, work)
+                .filter(|target| {
+                    reference.role != ReferenceRole::Write
+                        || target.symbol.kind == "field_declaration"
+                })
+        };
+        target.and_then(|target| {
+            let mut occurrence = self.occurrence(
+                file,
+                reference.target,
+                reference.target,
+                reference.role,
+                target,
+            )?;
+            if reference.role != ReferenceRole::Type
+                && let Some(caller) = file.enclosing_callable(reference.target)
+            {
+                let source = self.occurrence(
+                    file,
+                    reference.target,
+                    reference.target,
+                    reference.role,
+                    caller,
+                )?;
+                if let rift_provider::NormalizedTarget::Symbol(from) = source.target {
+                    occurrence.edge_from = Some(from);
+                }
+            }
+            Some(occurrence)
+        })
+    }
+
     pub(in crate::static_resolution) fn rust_references(
         &self,
         file: &File<'source>,
@@ -33,40 +76,24 @@ impl<'source> Index<'source> {
             {
                 continue;
             }
-            let target = if reference.role == ReferenceRole::Type {
-                self.rust.edge_type_target(file, reference.target, work)
-            } else {
-                self.rust
-                    .access(file, reference.target, work)
-                    .filter(|target| {
-                        reference.role != ReferenceRole::Write
-                            || target.symbol.kind == "field_declaration"
-                    })
-            };
-            let occurrence = target.and_then(|target| {
-                let mut occurrence = self.occurrence(
-                    file,
-                    reference.target,
-                    reference.target,
-                    reference.role,
-                    target,
-                )?;
-                if reference.role != ReferenceRole::Type
-                    && let Some(caller) = file.enclosing_callable(reference.target)
-                {
-                    let source = self.occurrence(
-                        file,
-                        reference.target,
-                        reference.target,
-                        reference.role,
-                        caller,
-                    )?;
-                    if let rift_provider::NormalizedTarget::Symbol(from) = source.target {
-                        occurrence.edge_from = Some(from);
-                    }
-                }
-                Some(occurrence)
-            });
+            let occurrence = self.rust_reference_occurrence(file, reference, work);
+            if occurrence.is_none()
+                && reference.role == ReferenceRole::Type
+                && let Some(external) =
+                    self.external_type(file, reference.target, work)
+                        .and_then(|target| {
+                            Self::external_occurrence(
+                                file,
+                                reference.target,
+                                reference.target,
+                                reference.role,
+                                target,
+                            )
+                        })
+            {
+                result.external.push(external);
+                continue;
+            }
             result.record(occurrence);
         }
         for symbol in file.document.facts.symbols() {

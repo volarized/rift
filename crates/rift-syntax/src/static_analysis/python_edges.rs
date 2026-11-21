@@ -151,6 +151,7 @@ impl EdgePythonKinds {
             }
         } else if self.definitions.contains(&id) {
             self.edge_definition(visited, facts)?;
+            self.edge_type_parameters(syntax_element, facts)?;
         } else if self.imports.contains(&id) {
             self.edge_import(visited, facts)?;
         } else if self.parameters.contains(&id) {
@@ -203,6 +204,43 @@ impl EdgePythonKinds {
         }
         self.guards.record(visited, source, facts)?;
         self.edge_reference(visited, source, facts)?;
+        Ok(())
+    }
+
+    fn edge_type_parameters(
+        &self,
+        definition: Node<'_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let Some(parameters) = definition.child_by_field_name("type_parameters") else {
+            return Ok(());
+        };
+        let mut cursor = parameters.walk();
+        for parameter in parameters.named_children(&mut cursor) {
+            let mut candidate = Some(parameter);
+            let mut name = None;
+            // A declared name sits below `type`, `constrained_type` or `splat_type` wrappers.
+            for _ in 0..4 {
+                let Some(element) = candidate else {
+                    break;
+                };
+                if element.kind_id() == self.identifier {
+                    name = Some(element);
+                    break;
+                }
+                candidate = element.named_child(0);
+            }
+            if let Some(name) = name {
+                facts.bindings.push(binding(
+                    name,
+                    definition,
+                    byte_range(definition)?.start,
+                    StaticBindingKind::Shadow,
+                )?);
+            } else {
+                facts.unsupported_bindings.push(byte_range(definition)?);
+            }
+        }
         Ok(())
     }
 

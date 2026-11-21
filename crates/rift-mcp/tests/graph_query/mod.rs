@@ -188,9 +188,10 @@ async fn engine_inventory_follows_source_and_configuration_changes() -> TestResu
 #[tokio::test]
 async fn engine_inventory_keeps_inferred_types_and_declared_heritage() -> TestResult {
     let source = "class Parent:\n    pass\n\nclass Child(Parent):\n    pass\n\nclass Grandchild(Child):\n    pass\n\ndef make() -> Child:\n    return Child()\n\nvalue = make()\n";
-    let (_directory, client, _server_task) = served_workspace(
+    let (_directory, client, _server_task) = crate::workspace_client::served_prepared_workspace(
         &[("pyproject.toml", METADATA), ("graph.py", source)],
         Some(CONFIGURATION.to_owned()),
+        super::python_runtime_environment::prepare,
     )
     .await?;
     let _value = identity(&client, "value").await?;
