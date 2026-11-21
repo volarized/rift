@@ -156,6 +156,7 @@ mod python_decorators;
 mod python_external_bases;
 mod python_imports;
 mod python_joins;
+mod python_optional;
 mod python_overloads;
 
 #[test]

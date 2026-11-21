@@ -357,6 +357,18 @@ impl<'source> Index<'source> {
         range: ByteRange,
         work: &mut Work,
     ) -> bool {
+        self.python_typing_name(file, range, "Generic", work)
+    }
+
+    /// Whether the expression at `range` names `expected` of `typing` or `typing_extensions`,
+    /// imported by name or read through the module.
+    pub(super) fn python_typing_name(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        expected: &str,
+        work: &mut Work,
+    ) -> bool {
         let Some(text) = file.text(range) else {
             return false;
         };
@@ -367,8 +379,12 @@ impl<'source> Index<'source> {
         let Some(binding) = edge_python_binding(self, file, name, range.start, work) else {
             return false;
         };
-        let StaticBindingKind::PythonImport { module, export } = binding.kind else {
-            return false;
+        let (module, export) = match binding.kind {
+            StaticBindingKind::PythonImport { module, export } => (module, export),
+            StaticBindingKind::PythonModule { module } if file.text(module) == Some(name) => {
+                (module, None)
+            }
+            _ => return false,
         };
         let Some(module) = file.text(module) else {
             return false;
@@ -378,8 +394,8 @@ impl<'source> Index<'source> {
             return false;
         }
         match export {
-            Some(export) => file.text(export) == Some("Generic") && names.next().is_none(),
-            None => names.next() == Some("Generic") && names.next().is_none(),
+            Some(export) => file.text(export) == Some(expected) && names.next().is_none(),
+            None => names.next() == Some(expected) && names.next().is_none(),
         }
     }
 
