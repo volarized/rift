@@ -241,6 +241,9 @@ pub struct StaticFactsParts {
     /// Rust path calls and the range of their first argument, which selects the
     /// implementation of a `Trait::method(value, ..)` call.
     pub receiver_arguments: Vec<(ByteRange, ByteRange)>,
+    /// Rust calls with a closure argument and the range of every argument in order, which
+    /// relate the closure's parameters to the callee's declared parameters.
+    pub closure_calls: Vec<(ByteRange, Vec<ByteRange>)>,
 }
 
 /// Calls and binding evidence retained after the syntax tree is released.
@@ -334,6 +337,12 @@ impl StaticFacts {
         &self.0.receiver_arguments
     }
 
+    /// Rust calls with a closure argument, with every argument range in order.
+    #[must_use]
+    pub fn closure_calls(&self) -> &[(ByteRange, Vec<ByteRange>)] {
+        &self.0.closure_calls
+    }
+
     /// Rust use paths with their captured group components.
     #[must_use]
     pub fn rust_uses(&self) -> &[StaticRustUse] {
@@ -369,6 +378,7 @@ impl StaticFacts {
             vector_capacity(&self.0.rust_uses),
             vector_capacity(&self.0.conditional_items),
             vector_capacity(&self.0.receiver_arguments),
+            vector_capacity(&self.0.closure_calls),
         ]
         .into_iter()
         .fold(0, usize::saturating_add)
@@ -377,6 +387,13 @@ impl StaticFacts {
                 .rust_uses
                 .iter()
                 .map(|row| vector_capacity(&row.path))
+                .fold(0, usize::saturating_add),
+        )
+        .saturating_add(
+            self.0
+                .closure_calls
+                .iter()
+                .map(|(_, arguments)| vector_capacity(arguments))
                 .fold(0, usize::saturating_add),
         )
     }
@@ -398,6 +415,7 @@ impl StaticFacts {
             self.rust_uses().len(),
             self.conditional_items().len(),
             self.receiver_arguments().len(),
+            self.closure_calls().len(),
         ];
         if lengths
             .into_iter()
@@ -482,6 +500,13 @@ impl StaticFacts {
             .all(|item| valid(item.range) && valid(item.attribute))
             && self.receiver_arguments().iter().all(|(call, argument)| {
                 valid(*call) && valid(*argument) && contains(*call, *argument)
+            })
+            && self.closure_calls().iter().all(|(call, arguments)| {
+                valid(*call)
+                    && arguments.len() <= limits.syntax_elements_max()
+                    && arguments
+                        .iter()
+                        .all(|argument| valid(*argument) && contains(*call, *argument))
             });
         if !(edges
             && references

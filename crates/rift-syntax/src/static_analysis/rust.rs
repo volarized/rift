@@ -343,6 +343,25 @@ impl Kinds {
             self.member(callee)?
         };
         facts.calls.push(call(syntax_element, callee, shape)?);
+        if let Some(arguments) = syntax_element.child_by_field_id(self.arguments) {
+            let mut cursor = arguments.walk();
+            let arguments = arguments
+                .named_children(&mut cursor)
+                .filter(|argument| !argument.is_extra())
+                .collect::<Vec<_>>();
+            if arguments
+                .iter()
+                .any(|argument| argument.kind_id() == self.functions[2])
+            {
+                let ranges = arguments
+                    .iter()
+                    .map(|argument| byte_range(*argument))
+                    .collect::<Result<Vec<_>, _>>()?;
+                facts
+                    .closure_calls
+                    .push((byte_range(syntax_element)?, ranges));
+            }
+        }
         if shape == StaticCallee::Qualified
             && let Some(arguments) = syntax_element.child_by_field_id(self.arguments)
         {

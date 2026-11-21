@@ -1887,3 +1887,30 @@ fn test_rust_type_parameter_paths_follow_their_bounds() {
                 && edge.to().as_str().ends_with("/Other/size"))
     );
 }
+
+#[test]
+fn test_rust_closure_parameters_and_guards_typed_by_a_generic_callee() {
+    // A closure passed to a local generic function takes its parameter type from the
+    // callee's `FnMut(&mut T)` bound, with `T` bound by the callee parameter declared `T`;
+    // a tuple pattern takes the element of a tuple argument. A closure without a bound for
+    // it, or whose `T` is not bound by a known argument, stays unresolved.
+    let source = "use core::ops::{Deref, DerefMut};\npub struct Guard<T, F: FnMut(&mut T)> { value: T, dropfn: F }\nimpl<T, F: FnMut(&mut T)> Deref for Guard<T, F> { type Target = T; fn deref(&self) -> &T { &self.value } }\nimpl<T, F: FnMut(&mut T)> DerefMut for Guard<T, F> { fn deref_mut(&mut self) -> &mut T { &mut self.value } }\nimpl<T, F: FnMut(&mut T)> Drop for Guard<T, F> { fn drop(&mut self) { (self.dropfn)(&mut self.value) } }\npub fn guard<T, F: FnMut(&mut T)>(value: T, dropfn: F) -> Guard<T, F> { Guard { value, dropfn } }\npub fn unbound<T, F>(value: T, f: F) -> T { let _ = f; value }\npub struct Table { pub items: usize }\nimpl Table {\n    pub fn reset(&mut self) { self.items = 0; }\n    pub fn fill(&mut self) { self.items = 1; }\n    pub fn clear(&mut self) {\n        let mut this = guard(self, |this| this.reset());\n        this.fill();\n    }\n    pub fn tuple(&mut self) {\n        let _guard = guard((0, self), |(index, this)| { *index += 1; this.reset() });\n    }\n    pub fn loose(&mut self) {\n        let _ = unbound(self, |this: &mut Table| this.fill());\n        let _ = unbound(0, |this| this);\n        let _ = unbound(self, |this| this.reset());\n    }\n    pub fn direct(&mut self) { let this: &mut Table = self; this.reset(); }\n}\n";
+    let (_directory, index) = fixture_index(PLAIN_MANIFEST, &[("src/lib.rs", source)]);
+    for (kind, from, to) in [
+        (EdgeKind::Calls, "/Table/clear", "/Table/reset"),
+        (EdgeKind::Reads, "/Table/clear", "/Table/reset"),
+        (EdgeKind::Calls, "/Table/tuple", "/Table/reset"),
+        (EdgeKind::Calls, "/Table/direct", "/Table/reset"),
+    ] {
+        assert!(
+            has_edge(&index, kind, from, to),
+            "missing {kind:?} {from} -> {to}"
+        );
+    }
+    // `unbound` declares no `Fn*` bound for its closure parameter, and `0` has no owner.
+    assert!(!index.edges().edges().any(|edge| {
+        edge.from().as_str().ends_with("/Table/loose")
+            && edge.kind() == EdgeKind::Calls
+            && edge.to().as_str().ends_with("/Table/reset")
+    }));
+}
