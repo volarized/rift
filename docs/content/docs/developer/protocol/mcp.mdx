@@ -341,8 +341,9 @@ without pagination. SPARQL `LIMIT` and `OFFSET` bound the result set before pagi
 
 The server bounds statement size, algebra, fact acquisition, and the evaluated answer.
 `[search.query] page_limit` sets the maximum encoded bytes per page, from 1 KiB to 4 MiB.
-An evaluated answer past its solution or byte bound holds the solutions before the bound. It
-pages like any other answer, and `rift server logs` records the bound and its value.
+An evaluated answer past its solution or byte bound holds the solutions before the bound, and
+a graph walk past its acquisition budget answers over the facts it acquired. Both page like any
+other answer, and `rift server logs` records the bound and its value.
 
 A query over the captured inventory - every symbol, call, reference, or usage it holds - answers
 from partly covered facts. This holds for a `SELECT` that joins, projects, filters, binds, orders,

@@ -868,3 +868,82 @@ async fn an_oversized_file_leaves_symbol_enumeration_counts_and_groups_answering
     client.cancel().await?;
     Ok(())
 }
+
+/// `functions` Python functions, each calling the next: `chain_0` calls `chain_1`, and the
+/// last returns a constant.
+fn call_chain(functions: usize) -> TestResult<String> {
+    let mut source = String::new();
+    for index in 0..functions {
+        if index + 1 < functions {
+            let next = index + 1;
+            write!(
+                source,
+                "def chain_{index}() -> int:\n    return chain_{next}()\n\n"
+            )?;
+        } else {
+            write!(source, "def chain_{index}() -> int:\n    return 1\n")?;
+        }
+    }
+    Ok(source)
+}
+
+/// D37 (#715): a transitive walk past the graph acquisition request budget answers the
+/// callees it acquired and pages them instead of refusing. One edge read per function on
+/// the chain: a chain the budget covers answers whole, and one past it answers the
+/// acquired prefix, `LIMIT` and `COUNT` included, with no warning for the budget.
+#[tokio::test]
+async fn a_walk_past_the_request_budget_answers_the_acquired_part() -> TestResult {
+    const REQUESTS_MAX: usize = 64;
+    for (functions, acquired) in [
+        (REQUESTS_MAX, REQUESTS_MAX - 1),
+        (REQUESTS_MAX + 1, REQUESTS_MAX),
+        (REQUESTS_MAX + 16, REQUESTS_MAX),
+    ] {
+        let source = call_chain(functions)?;
+        let (_directory, client, _server_task) = served_workspace(
+            &[("pyproject.toml", METADATA), ("graph.py", &source)],
+            Some(CONFIGURATION.to_owned()),
+        )
+        .await?;
+        let entry = identity(&client, "chain_0").await?;
+        let walk = statement_page(
+            &client,
+            &format!("SELECT DISTINCT ?t {{ <{entry}> :calls+ ?t }}"),
+            10,
+        )
+        .await?;
+        assert_ne!(
+            walk["outcome"], "unavailable",
+            "functions={functions}: {walk}"
+        );
+        assert_eq!(
+            walk["pagination"]["total"],
+            json!(acquired),
+            "functions={functions}: {walk}"
+        );
+        assert_eq!(walk["pagination"]["pages"], json!(acquired.div_ceil(10)));
+        assert!(
+            !warning_codes(&walk).contains("edge_coverage_missing"),
+            "the budget reaches the log, not the answer: {walk}"
+        );
+        let limited = statement_page(
+            &client,
+            &format!("SELECT DISTINCT ?t {{ <{entry}> :calls+ ?t }} LIMIT 5"),
+            10,
+        )
+        .await?;
+        assert_eq!(query::rows(&limited)?.len(), 5, "{limited}");
+        let count = statement_page(
+            &client,
+            &format!("SELECT (COUNT(DISTINCT ?t) AS ?n) {{ <{entry}> :calls+ ?t }}"),
+            10,
+        )
+        .await?;
+        let [row] = query::rows(&count)? else {
+            return Err(format!("expected one count: {count}").into());
+        };
+        assert_eq!(query::literal(row, "n")?, acquired.to_string(), "{count}");
+        client.cancel().await?;
+    }
+    Ok(())
+}

@@ -112,7 +112,7 @@ impl<'request> FlowAcquisition<'request> {
         &mut self,
         request: &FlowAdjacency<Subject>,
     ) -> Result<FlowNeighbors, RiftError> {
-        if self.walk.remaining.requests_max == 0 {
+        if self.walk.remaining.requests_max == 0 || self.walk.reached.is_some() {
             return Ok(FlowNeighbors {
                 neighbors: Vec::new(),
                 coverage: FlowCoverage::RequestLimit,
@@ -124,7 +124,13 @@ impl<'request> FlowAcquisition<'request> {
             HopDirection::Outgoing => TraversalDirection::Outgoing,
         };
         let mut reached = BTreeSet::new();
-        Box::pin(self.walk.local_step(&request.subject, &mut reached)).await?;
+        let step = Box::pin(self.walk.local_step(&request.subject, &mut reached)).await;
+        if self.walk.spent(step)? {
+            return Ok(FlowNeighbors {
+                neighbors: Vec::new(),
+                coverage: FlowCoverage::RequestLimit,
+            });
+        }
         self.walk.acquired.local_edges.clear();
         let mut sites = BTreeMap::<_, BTreeSet<_>>::new();
         for occurrence in std::mem::take(&mut self.walk.acquired.local) {
