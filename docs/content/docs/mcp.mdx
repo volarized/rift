@@ -278,12 +278,10 @@ The result carries `outcome: "found"`, one `symbol`, the `revision` it was read 
 `declarations` in deterministic source order. Each declaration keeps its own origin,
 source address, byte range, and indices into the symbol's signatures, types, and documentation.
 Every declaration of one qualified path, such as two `cfg` variants of one Rust function, is a binding of that one logical symbol. A source-less object can
-be found with no declarations. These runtime reads distinguish a declaration with no
-captured source from a synthetic builtin:
+be found with no declarations. A runtime symbol, such as `readFile` in Node's `fs` module, reads
+the same way, and its `revision` names the runtime release:
 
-<ReadExample name="source-less-runtime" />
-
-<ReadExample name="source-less-builtin" />
+<ReadExample name="runtime-symbol" />
 
 Use the `include` object to select optional projections, such as
 `"include": {"documentation": true, "history": true}`:
@@ -347,7 +345,8 @@ A package or runtime identity names an owner across releases. Discover it with
 If the requested release has no complete coverage, `search` can return an unavailable
 answer. Check `rift server logs` for the release and the coverage details.
 
-Several declaration bindings share one identity. `page` and `max_results` select those bindings
+Several declaration bindings share one identity, such as the `cfg(unix)` and `cfg(windows)`
+declarations of `data_dir` in the `sdk` project. `page` and `max_results` select those bindings
 at the same revision:
 
 <ReadExample name="multi-declaration-full" />
@@ -389,7 +388,7 @@ index of the element around it. Nested declarations have their own facets.
 For a package or runtime symbol, Rift reads the global API at the release `revision`
 names, or at the version the project's dependencies pin when the request names none.
 The declaration's `source.span.unit` names its source unit, such as
-`rift://source/cargo/crates.io/demo/src/lib.rs`.
+`rift://source/cargo/crates.io/itoa/src/lib.rs`.
 
 Send `page` with the same symbol and revision to read later declarations.
 

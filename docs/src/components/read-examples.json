@@ -27,7 +27,7 @@
           }
         ]
       },
-      "revision": "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11",
+      "revision": "rift://revision/tree/da468b1f6aaf5252720697b456b49d5e6c3761855849e4ff1c650ae92267da57",
       "declarations": [
         {
           "origin": {
@@ -44,7 +44,13 @@
           "type_indices": [],
           "documentation_indices": [0]
         }
-      ]
+      ],
+      "pagination": {
+        "page": 1,
+        "pages": 1,
+        "max_results": 10,
+        "total": 1
+      }
     }
   },
   "named-symbol": {
@@ -52,7 +58,7 @@
     "arguments": {
       "id": "rift://symbol/local@sdk/rust/docs_sdk/load_config"
     },
-    "text": "\tpub fn load_config() -> u32\n\tsrc/lib.rs:2 · bytes 25..59\n\trift://symbol/local@sdk/rust/docs_sdk/load_config\n\n\tLoads configuration.\n",
+    "text": "\tpub fn load_config() -> u32\n\tsrc/lib.rs:2 · bytes 25..62\n\trift://symbol/local@sdk/rust/docs_sdk/load_config\n\n\tLoads configuration.\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -75,7 +81,7 @@
           }
         ]
       },
-      "revision": "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11",
+      "revision": "rift://revision/tree/b92ca2f51e237d5b116188b2e2a101c0ca7ec68e277981a84d753a8841e10259",
       "declarations": [
         {
           "origin": {
@@ -85,14 +91,20 @@
           "path": "src/lib.rs",
           "range": {
             "start": 25,
-            "end": 59
+            "end": 62
           },
           "line": 2,
           "signature_indices": [0],
           "type_indices": [],
           "documentation_indices": [0]
         }
-      ]
+      ],
+      "pagination": {
+        "page": 1,
+        "pages": 1,
+        "max_results": 10,
+        "total": 1
+      }
     }
   },
   "missing-symbol": {
@@ -118,31 +130,40 @@
   "global-symbol-documentation": {
     "tool": "get_symbol",
     "arguments": {
-      "id": "rift://symbol/cargo/crates.io/demo/rust/demo/beacon",
+      "id": "rift://symbol/cargo/crates.io/itoa/rust/itoa/Buffer",
+      "revision": "rift://revision/cargo/crates.io/itoa@1.0.18",
       "include": {
         "documentation": true
       }
     },
-    "text": "\tfunction beacon\n\trift://source/cargo/crates.io/demo/src/lib.rs:2 · bytes 26..44\n\trift://symbol/cargo/crates.io/demo/rust/demo/beacon\n\tdependency rift://revision/cargo/crates.io/demo@1.0.0\n\n\tdocumentation:\n\t\trift://source/cargo/crates.io/demo/README.md:1\n\t\t\tguide\nrelease 1.0.0\n",
+    "text": "\tpub struct Buffer\n\trift://source/cargo/crates.io/itoa/src/lib.rs:72 · bytes 2357..2427\n\trift://symbol/cargo/crates.io/itoa/rust/itoa/Buffer\n\tdependency rift://revision/cargo/crates.io/itoa@1.0.18\n\n\tA correctly sized stack allocation for the formatted integer to be written\n\tinto.\n\n\t# Example\n\n\t```\n\tlet mut buffer = itoa::Buffer::new();\n\tlet printed = buffer.format(1234);\n\tassert_eq!(printed, \"1234\");\n\t```\nrelease 1.0.18\n",
     "json": {
       "outcome": "found",
       "symbol": {
-        "id": "rift://symbol/cargo/crates.io/demo/rust/demo/beacon",
+        "id": "rift://symbol/cargo/crates.io/itoa/rust/itoa/Buffer",
         "language": "rust",
-        "name": "beacon",
-        "kind": "function",
+        "name": "Buffer",
+        "kind": "struct",
+        "kinds": ["type", "public"],
         "origin": {
           "location": "dependency",
           "package": {
             "manager": "cargo",
             "registry": "crates.io",
-            "name": "demo",
-            "version": "1.0.0"
+            "name": "itoa",
+            "version": "1.0.18"
           },
           "source_kind": "authored"
-        }
+        },
+        "visibility": "pub",
+        "documentation": [
+          {
+            "format": "markdown",
+            "text": "A correctly sized stack allocation for the formatted integer to be written\ninto.\n\n# Example\n\n```\nlet mut buffer = itoa::Buffer::new();\nlet printed = buffer.format(1234);\nassert_eq!(printed, \"1234\");\n```"
+          }
+        ]
       },
-      "revision": "rift://revision/cargo/crates.io/demo@1.0.0",
+      "revision": "rift://revision/cargo/crates.io/itoa@1.0.18",
       "declarations": [
         {
           "origin": {
@@ -150,84 +171,32 @@
             "package": {
               "manager": "cargo",
               "registry": "crates.io",
-              "name": "demo",
-              "version": "1.0.0"
+              "name": "itoa",
+              "version": "1.0.18"
             },
             "source_kind": "authored"
           },
-          "unit": "rift://source/cargo/crates.io/demo/src/lib.rs",
+          "unit": "rift://source/cargo/crates.io/itoa/src/lib.rs",
           "range": {
-            "start": 26,
-            "end": 44
+            "start": 2357,
+            "end": 2427
           },
-          "line": 2,
+          "line": 72,
           "signature_indices": [],
           "type_indices": [],
-          "documentation_indices": []
+          "documentation_indices": [0]
         }
       ],
       "documentation": {
-        "documentation_revision": "0123abcd",
-        "references": [
-          {
-            "reference": {
-              "identity": "5555555555555555555555555555555555555555555555555555555555555555",
-              "block": "1111111111111111111111111111111111111111111111111111111111111111",
-              "target": "rift://symbol/cargo/crates.io/demo/rust/demo/beacon",
-              "range": {
-                "start": 1,
-                "end": 7
-              },
-              "authored": "beacon",
-              "evidence": "unique_name"
-            },
-            "documentation": {
-              "block": {
-                "identity": "1111111111111111111111111111111111111111111111111111111111111111",
-                "source": {
-                  "source": {
-                    "kind": "package",
-                    "unit": "rift://source/cargo/crates.io/demo/README.md"
-                  }
-                },
-                "content_digest": "2222222222222222222222222222222222222222222222222222222222222222",
-                "range": {
-                  "start": 0,
-                  "end": 40
-                },
-                "line": 1,
-                "kind": "prose"
-              },
-              "source": {
-                "identity": {
-                  "source": {
-                    "kind": "package",
-                    "unit": "rift://source/cargo/crates.io/demo/README.md"
-                  }
-                },
-                "revision": "3333333333333333333333333333333333333333333333333333333333333333",
-                "content_digest": "4444444444444444444444444444444444444444444444444444444444444444",
-                "origin": {
-                  "location": "dependency",
-                  "package": {
-                    "manager": "cargo",
-                    "registry": "crates.io",
-                    "name": "demo",
-                    "version": "1.0.0"
-                  },
-                  "source_kind": "authored"
-                },
-                "format": "markdown",
-                "media_type": "text/markdown",
-                "selection": "package_archive",
-                "byte_length": 40
-              },
-              "documentation_revision": "0123abcd"
-            },
-            "excerpt": "guide"
-          }
-        ],
+        "documentation_revision": "8f3371e3",
+        "references": [],
         "truncated": false
+      },
+      "pagination": {
+        "page": 1,
+        "pages": 1,
+        "max_results": 10,
+        "total": 1
       }
     }
   },
@@ -305,12 +274,12 @@
       }
     }
   },
-  "source-less-runtime": {
+  "runtime-symbol": {
     "tool": "get_symbol",
     "arguments": {
       "id": "rift://symbol/stdlib/node/javascript/fs/readFile"
     },
-    "text": "\tfunction readFile\n\trift://symbol/stdlib/node/javascript/fs/readFile\n\tstdlib rift://revision/stdlib/node@26.11.1\nrelease 26.11.1\n",
+    "text": "\tfunction readFile(path, options, callback)\n\trift://source/stdlib/node/lib/fs.js:422 · bytes 10737..12591\n\trift://symbol/stdlib/node/javascript/fs/readFile\n\tstdlib rift://revision/stdlib/node@26.13.1\n\n\tAsynchronously reads the entire contents of a file.\n\t@param {string | Buffer | URL | number} path\n\t@param {{\n\t  encoding?: string | null;\n\t  flag?: string;\n\t  signal?: AbortSignal;\n\t  } | string} [options]\n\t@param {(\n\t  err?: Error,\n\t  data?: string | Buffer\n\t  ) => any} callback\n\t@returns {void}\nrelease 26.13.1\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -318,159 +287,173 @@
         "language": "javascript",
         "name": "readFile",
         "kind": "function",
+        "kinds": ["value", "callable", "public"],
         "origin": {
           "location": "stdlib",
           "runtime": {
             "runtime": "node",
-            "version": "26.11.1"
+            "version": "26.13.1"
           },
           "source_kind": "authored"
-        }
+        },
+        "signatures": [
+          {
+            "display": "function readFile(path, options, callback)",
+            "language": "javascript"
+          }
+        ],
+        "documentation": [
+          {
+            "format": "markdown",
+            "text": "Asynchronously reads the entire contents of a file.\n@param {string | Buffer | URL | number} path\n@param {{\n  encoding?: string | null;\n  flag?: string;\n  signal?: AbortSignal;\n  } | string} [options]\n@param {(\n  err?: Error,\n  data?: string | Buffer\n  ) => any} callback\n@returns {void}"
+          }
+        ]
       },
-      "revision": "rift://revision/stdlib/node@26.11.1",
-      "declarations": []
-    }
-  },
-  "source-less-builtin": {
-    "tool": "get_symbol",
-    "arguments": {
-      "id": "rift://symbol/stdlib/cpython/python/builtins/len"
-    },
-    "text": "\tfunction len\n\trift://symbol/stdlib/cpython/python/builtins/len\n\tsynthetic\nrelease 3.12.9\n",
-    "json": {
-      "outcome": "found",
-      "symbol": {
-        "id": "rift://symbol/stdlib/cpython/python/builtins/len",
-        "language": "python",
-        "name": "len",
-        "kind": "function",
-        "origin": {
-          "source_kind": "synthetic"
+      "revision": "rift://revision/stdlib/node@26.13.1",
+      "declarations": [
+        {
+          "origin": {
+            "location": "stdlib",
+            "runtime": {
+              "runtime": "node",
+              "version": "26.13.1"
+            },
+            "source_kind": "authored"
+          },
+          "unit": "rift://source/stdlib/node/lib/fs.js",
+          "range": {
+            "start": 10737,
+            "end": 12591
+          },
+          "line": 422,
+          "signature_indices": [0],
+          "type_indices": [],
+          "documentation_indices": [0]
         }
-      },
-      "revision": "rift://revision/stdlib/cpython@3.12.9",
-      "declarations": []
+      ],
+      "pagination": {
+        "page": 1,
+        "pages": 1,
+        "max_results": 10,
+        "total": 1
+      }
     }
   },
   "multi-declaration-full": {
     "tool": "get_symbol",
     "arguments": {
-      "id": "rift://symbol/npm/npmjs.org/prettier/typescript/prettier/format"
+      "id": "rift://symbol/local@sdk/rust/docs_sdk/data_dir"
     },
-    "text": "\tfunction format\n\trift://source/npm/npmjs.org/prettier/index.d.ts:1 · bytes 0..46\n\trift://source/npm/npmjs.org/prettier/index.d.ts:2 · bytes 47..93\n\trift://symbol/npm/npmjs.org/prettier/typescript/prettier/format\n\tdependency rift://revision/npm/npmjs.org/prettier@3.8.5\nrelease 3.8.5\n",
+    "text": "\tpub fn data_dir() -> &'static str\n\tsrc/lib.rs:8 · bytes 118..174\n\tsrc/lib.rs:14 · bytes 233..297\n\trift://symbol/local@sdk/rust/docs_sdk/data_dir\n\n\tDirectory the SDK keeps its data in.\n",
     "json": {
       "outcome": "found",
       "symbol": {
-        "id": "rift://symbol/npm/npmjs.org/prettier/typescript/prettier/format",
-        "language": "typescript",
-        "name": "format",
+        "id": "rift://symbol/local@sdk/rust/docs_sdk/data_dir",
+        "language": "rust",
+        "name": "data_dir",
         "kind": "function",
-        "origin": {
-          "location": "dependency",
-          "package": {
-            "manager": "npm",
-            "registry": "npmjs.org",
-            "name": "prettier",
-            "version": "3.8.5"
-          },
-          "source_kind": "authored"
-        }
+        "kinds": ["value", "callable", "public"],
+        "visibility": "pub",
+        "signatures": [
+          {
+            "display": "pub fn data_dir() -> &'static str",
+            "language": "rust"
+          }
+        ],
+        "documentation": [
+          {
+            "format": "markdown",
+            "text": "Directory the SDK keeps its data in."
+          }
+        ]
       },
-      "revision": "rift://revision/npm/npmjs.org/prettier@3.8.5",
+      "revision": "rift://revision/tree/b92ca2f51e237d5b116188b2e2a101c0ca7ec68e277981a84d753a8841e10259",
       "declarations": [
         {
           "origin": {
-            "location": "dependency",
-            "package": {
-              "manager": "npm",
-              "registry": "npmjs.org",
-              "name": "prettier",
-              "version": "3.8.5"
-            },
+            "location": "project",
             "source_kind": "authored"
           },
-          "unit": "rift://source/npm/npmjs.org/prettier/index.d.ts",
+          "path": "src/lib.rs",
           "range": {
-            "start": 0,
-            "end": 46
+            "start": 118,
+            "end": 174
           },
-          "line": 1,
-          "signature_indices": [],
+          "line": 8,
+          "signature_indices": [0],
           "type_indices": [],
-          "documentation_indices": []
+          "documentation_indices": [0]
         },
         {
           "origin": {
-            "location": "dependency",
-            "package": {
-              "manager": "npm",
-              "registry": "npmjs.org",
-              "name": "prettier",
-              "version": "3.8.5"
-            },
+            "location": "project",
             "source_kind": "authored"
           },
-          "unit": "rift://source/npm/npmjs.org/prettier/index.d.ts",
+          "path": "src/lib.rs",
           "range": {
-            "start": 47,
-            "end": 93
+            "start": 233,
+            "end": 297
           },
-          "line": 2,
-          "signature_indices": [],
+          "line": 14,
+          "signature_indices": [0],
           "type_indices": [],
-          "documentation_indices": []
+          "documentation_indices": [0]
         }
-      ]
+      ],
+      "pagination": {
+        "page": 1,
+        "pages": 1,
+        "max_results": 10,
+        "total": 2
+      }
     }
   },
   "multi-declaration-first": {
     "tool": "get_symbol",
     "arguments": {
-      "id": "rift://symbol/npm/npmjs.org/prettier/typescript/prettier/format",
+      "id": "rift://symbol/local@sdk/rust/docs_sdk/data_dir",
       "page": 1,
       "max_results": 1
     },
-    "text": "\tfunction format\n\trift://source/npm/npmjs.org/prettier/index.d.ts:1 · bytes 0..46\n\trift://symbol/npm/npmjs.org/prettier/typescript/prettier/format\n\tdependency rift://revision/npm/npmjs.org/prettier@3.8.5\n\tpage 1/2, total 2 results\nrelease 3.8.5\n",
+    "text": "\tpub fn data_dir() -> &'static str\n\tsrc/lib.rs:8 · bytes 118..174\n\trift://symbol/local@sdk/rust/docs_sdk/data_dir\n\n\tDirectory the SDK keeps its data in.\n\tpage 1/2, total 2 results\n",
     "json": {
       "outcome": "found",
       "symbol": {
-        "id": "rift://symbol/npm/npmjs.org/prettier/typescript/prettier/format",
-        "language": "typescript",
-        "name": "format",
+        "id": "rift://symbol/local@sdk/rust/docs_sdk/data_dir",
+        "language": "rust",
+        "name": "data_dir",
         "kind": "function",
-        "origin": {
-          "location": "dependency",
-          "package": {
-            "manager": "npm",
-            "registry": "npmjs.org",
-            "name": "prettier",
-            "version": "3.8.5"
-          },
-          "source_kind": "authored"
-        }
+        "kinds": ["value", "callable", "public"],
+        "visibility": "pub",
+        "signatures": [
+          {
+            "display": "pub fn data_dir() -> &'static str",
+            "language": "rust"
+          }
+        ],
+        "documentation": [
+          {
+            "format": "markdown",
+            "text": "Directory the SDK keeps its data in."
+          }
+        ]
       },
-      "revision": "rift://revision/npm/npmjs.org/prettier@3.8.5",
+      "revision": "rift://revision/tree/b92ca2f51e237d5b116188b2e2a101c0ca7ec68e277981a84d753a8841e10259",
       "declarations": [
         {
           "origin": {
-            "location": "dependency",
-            "package": {
-              "manager": "npm",
-              "registry": "npmjs.org",
-              "name": "prettier",
-              "version": "3.8.5"
-            },
+            "location": "project",
             "source_kind": "authored"
           },
-          "unit": "rift://source/npm/npmjs.org/prettier/index.d.ts",
+          "path": "src/lib.rs",
           "range": {
-            "start": 0,
-            "end": 46
+            "start": 118,
+            "end": 174
           },
-          "line": 1,
-          "signature_indices": [],
+          "line": 8,
+          "signature_indices": [0],
           "type_indices": [],
-          "documentation_indices": []
+          "documentation_indices": [0]
         }
       ],
       "pagination": {
@@ -484,52 +467,50 @@
   "multi-declaration-next": {
     "tool": "get_symbol",
     "arguments": {
-      "id": "rift://symbol/npm/npmjs.org/prettier/typescript/prettier/format",
+      "id": "rift://symbol/local@sdk/rust/docs_sdk/data_dir",
       "page": 2,
       "max_results": 1,
-      "revision": "rift://revision/npm/npmjs.org/prettier@3.8.5"
+      "revision": "rift://revision/tree/b92ca2f51e237d5b116188b2e2a101c0ca7ec68e277981a84d753a8841e10259"
     },
-    "text": "\tfunction format\n\trift://source/npm/npmjs.org/prettier/index.d.ts:2 · bytes 47..93\n\trift://symbol/npm/npmjs.org/prettier/typescript/prettier/format\n\tdependency rift://revision/npm/npmjs.org/prettier@3.8.5\n\tpage 2/2, total 2 results\nrelease 3.8.5\n",
+    "text": "\tpub fn data_dir() -> &'static str\n\tsrc/lib.rs:14 · bytes 233..297\n\trift://symbol/local@sdk/rust/docs_sdk/data_dir\n\n\tDirectory the SDK keeps its data in.\n\tpage 2/2, total 2 results\n",
     "json": {
       "outcome": "found",
       "symbol": {
-        "id": "rift://symbol/npm/npmjs.org/prettier/typescript/prettier/format",
-        "language": "typescript",
-        "name": "format",
+        "id": "rift://symbol/local@sdk/rust/docs_sdk/data_dir",
+        "language": "rust",
+        "name": "data_dir",
         "kind": "function",
-        "origin": {
-          "location": "dependency",
-          "package": {
-            "manager": "npm",
-            "registry": "npmjs.org",
-            "name": "prettier",
-            "version": "3.8.5"
-          },
-          "source_kind": "authored"
-        }
+        "kinds": ["value", "callable", "public"],
+        "visibility": "pub",
+        "signatures": [
+          {
+            "display": "pub fn data_dir() -> &'static str",
+            "language": "rust"
+          }
+        ],
+        "documentation": [
+          {
+            "format": "markdown",
+            "text": "Directory the SDK keeps its data in."
+          }
+        ]
       },
-      "revision": "rift://revision/npm/npmjs.org/prettier@3.8.5",
+      "revision": "rift://revision/tree/b92ca2f51e237d5b116188b2e2a101c0ca7ec68e277981a84d753a8841e10259",
       "declarations": [
         {
           "origin": {
-            "location": "dependency",
-            "package": {
-              "manager": "npm",
-              "registry": "npmjs.org",
-              "name": "prettier",
-              "version": "3.8.5"
-            },
+            "location": "project",
             "source_kind": "authored"
           },
-          "unit": "rift://source/npm/npmjs.org/prettier/index.d.ts",
+          "path": "src/lib.rs",
           "range": {
-            "start": 47,
-            "end": 93
+            "start": 233,
+            "end": 297
           },
-          "line": 2,
-          "signature_indices": [],
+          "line": 14,
+          "signature_indices": [0],
           "type_indices": [],
-          "documentation_indices": []
+          "documentation_indices": [0]
         }
       ],
       "pagination": {
@@ -1047,7 +1028,13 @@
           ]
         }
       ],
-      "revision": "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11"
+      "revision": "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11",
+      "pagination": {
+        "page": 1,
+        "pages": 1,
+        "max_results": 10,
+        "total": 1
+      }
     }
   }
 }
