@@ -576,51 +576,98 @@ fn validate_module_path(
     Ok(())
 }
 
-/// Checks every resolved container precedes and encloses its declaration, within the
-/// depth bound.
+/// Syntax element kind of a member declared by assigning to a property of its owner.
+const ASSIGNED_MEMBER_KIND: &str = "assignment_expression";
+
+/// Checks every resolved container names a declaration of the file, within the depth bound.
 ///
-/// A container names a qualified name; its declaration is the latest earlier one spelling
-/// that name. A qualified name never nests inside a declaration of itself, so an earlier
-/// declaration of the name enclosing the child is always the latest one.
+/// A container names a qualified name. A nested declaration's container is the latest
+/// earlier declaration spelling that name that encloses the child. It need not be the
+/// latest earlier one: a member assigned through `this` inside a method of the same name is
+/// another facet of that member, and it sits inside the method without enclosing the
+/// method's later declarations. A member declared by an assignment (`Owner.name = value`,
+/// `Owner.prototype.name = value`) names its owner by binding, not by nesting: when no
+/// earlier declaration of its container encloses it, its container is the one declaration
+/// of that name not itself declared by an assignment, before or after it in the file.
 fn validate_symbol_parents(
     symbols: &[&SyntaxSymbol],
     limits: SyntaxLimits,
     positions: &BTreeMap<&str, Vec<usize>>,
 ) -> Result<(), RiftError> {
+    let parents = (0..symbols.len())
+        .map(|position| symbol_parent(symbols, limits, positions, position))
+        .collect::<Result<Vec<_>, _>>()?;
+    // Zero marks a depth not computed yet; every computed depth is at least one.
     let mut depths = vec![0_usize; symbols.len()];
-    for (position, symbol) in symbols.iter().enumerate() {
-        let depth = match symbol.container.as_deref() {
-            None => 1,
-            Some(container) => {
-                retained_name(container, limits)?;
-                match positions.get(container) {
-                    None => {
-                        if container.chars().any(char::is_control) {
-                            return errors::syntax::facts_name_invalid().fail();
-                        }
-                        1
-                    }
-                    Some(declared) => {
-                        let parent = declared
-                            .iter()
-                            .rev()
-                            .copied()
-                            .find(|parent| *parent < position)
-                            .filter(|parent| contains(symbols[*parent].range, symbol.range))
-                            .ok_or_else(|| errors::syntax::facts_reference_invalid().error())?;
-                        depths[parent]
-                            .checked_add(1)
-                            .ok_or_else(|| errors::syntax::facts_depth_exceeded().error())?
-                    }
-                }
+    let mut chain = Vec::new();
+    for position in 0..symbols.len() {
+        chain.clear();
+        let mut current = Some(position);
+        let mut base = 0_usize;
+        while let Some(symbol) = current {
+            if depths[symbol] != 0 {
+                base = depths[symbol];
+                break;
             }
-        };
-        if depth > limits.syntax_depth_max() {
-            return Err(errors::syntax::facts_depth_exceeded().error());
+            // A chain longer than the bound exceeds it whatever its base, so a cycle of
+            // owners ends here too.
+            if chain.len() >= limits.syntax_depth_max() {
+                return Err(errors::syntax::facts_depth_exceeded().error());
+            }
+            chain.push(symbol);
+            current = parents[symbol];
         }
-        depths[position] = depth;
+        for &symbol in chain.iter().rev() {
+            base = base
+                .checked_add(1)
+                .ok_or_else(|| errors::syntax::facts_depth_exceeded().error())?;
+            if base > limits.syntax_depth_max() {
+                return Err(errors::syntax::facts_depth_exceeded().error());
+            }
+            depths[symbol] = base;
+        }
     }
     Ok(())
+}
+
+/// The declaration `symbols[position]` names as its container; `None` for a top-level
+/// symbol or a container the file does not declare.
+fn symbol_parent(
+    symbols: &[&SyntaxSymbol],
+    limits: SyntaxLimits,
+    positions: &BTreeMap<&str, Vec<usize>>,
+    position: usize,
+) -> Result<Option<usize>, RiftError> {
+    let symbol = symbols[position];
+    let Some(container) = symbol.container.as_deref() else {
+        return Ok(None);
+    };
+    retained_name(container, limits)?;
+    let Some(declared) = positions.get(container) else {
+        if container.chars().any(char::is_control) {
+            return errors::syntax::facts_name_invalid().fail();
+        }
+        return Ok(None);
+    };
+    let earlier = &declared[..declared.partition_point(|parent| *parent < position)];
+    let enclosing = earlier
+        .iter()
+        .rev()
+        .copied()
+        .find(|parent| contains(symbols[*parent].range, symbol.range));
+    if let Some(parent) = enclosing {
+        return Ok(Some(parent));
+    }
+    if symbol.syntax_element_kind != Some(ASSIGNED_MEMBER_KIND) {
+        return errors::syntax::facts_reference_invalid().fail();
+    }
+    let mut owners = declared.iter().copied().filter(|&parent| {
+        parent != position && symbols[parent].syntax_element_kind != Some(ASSIGNED_MEMBER_KIND)
+    });
+    match (owners.next(), owners.next()) {
+        (Some(owner), None) => Ok(Some(owner)),
+        _ => errors::syntax::facts_reference_invalid().fail(),
+    }
 }
 
 pub(crate) fn validate_markdown(
