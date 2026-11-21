@@ -222,7 +222,7 @@ pub(crate) fn syntax_element_depth(document: &SyntaxDocument, index: usize) -> u
     depth
 }
 
-fn line_starts(text: &str) -> Vec<usize> {
+pub(crate) fn line_starts(text: &str) -> Vec<usize> {
     let mut starts = vec![0];
     let mut position = 0;
     for line in lines_inclusive(text) {
@@ -238,7 +238,7 @@ fn line_starts(text: &str) -> Vec<usize> {
     clippy::cast_possible_truncation,
     reason = "captured ranges originate in the same in-memory source"
 )]
-fn included_range(text: &str, range: crate::ByteRange, lines: &[usize]) -> Range {
+pub(crate) fn included_range(text: &str, range: crate::ByteRange, lines: &[usize]) -> Range {
     assert!(
         range.end <= text.len() as u64,
         "captured range must fit original source: range={range:?}"

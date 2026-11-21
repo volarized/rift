@@ -61,6 +61,9 @@ pub(super) struct Kinds {
     alias: u16,
     path: u16,
     pattern: u16,
+    match_pattern: u16,
+    condition: u16,
+    type_arguments: u16,
     named_patterns: [u16; 3],
     shorthand_field: u16,
     value_type: u16,
@@ -133,6 +136,9 @@ pub(super) fn kinds() -> &'static Kinds {
             alias: field("alias"),
             path: field("path"),
             pattern: field("pattern"),
+            match_pattern: id("match_pattern"),
+            condition: field("condition"),
+            type_arguments: field("type_arguments"),
             named_patterns: [
                 id("struct_pattern"),
                 id("tuple_struct_pattern"),
@@ -185,6 +191,17 @@ impl Kinds {
             self.record_import(visited, facts, budget)?;
         } else if id == self.self_parameter {
             self.record_receiver(visited, facts)?;
+        } else if id == self.parameter
+            && syntax_element
+                .child_by_field_id(self.pattern)
+                .is_some_and(|pattern| pattern.kind_id() == self.self_value)
+        {
+            if syntax_element
+                .child_by_field_id(self.value_type)
+                .is_some_and(|value_type| self.self_receiver_type(value_type, source))
+            {
+                self.record_receiver(visited, facts)?;
+            }
         } else if id == self.let_declaration || id == self.parameter {
             self.record_value(visited, facts)?;
         } else if id == self.identifier
@@ -326,6 +343,25 @@ impl Kinds {
             self.member(callee)?
         };
         facts.calls.push(call(syntax_element, callee, shape)?);
+        if let Some(arguments) = syntax_element.child_by_field_id(self.arguments) {
+            let mut cursor = arguments.walk();
+            let arguments = arguments
+                .named_children(&mut cursor)
+                .filter(|argument| !argument.is_extra())
+                .collect::<Vec<_>>();
+            if arguments
+                .iter()
+                .any(|argument| argument.kind_id() == self.functions[2])
+            {
+                let ranges = arguments
+                    .iter()
+                    .map(|argument| byte_range(*argument))
+                    .collect::<Result<Vec<_>, _>>()?;
+                facts
+                    .closure_calls
+                    .push((byte_range(syntax_element)?, ranges));
+            }
+        }
         if shape == StaticCallee::Qualified
             && let Some(arguments) = syntax_element.child_by_field_id(self.arguments)
         {
@@ -356,6 +392,7 @@ impl Kinds {
                         self.self_value,
                         self.field_expression,
                         self.call,
+                        self.struct_expression,
                     ]
                     .contains(&syntax_element.kind_id()))
                 .then_some(syntax_element)
@@ -475,6 +512,49 @@ impl Kinds {
             )?);
         }
         Ok(())
+    }
+
+    /// Whether a typed `self` parameter's type is a receiver of the implementation type:
+    /// `Self`, a reference to a receiver, or one of the standard receiver wrappers `Box`,
+    /// `Rc`, `Arc` and `Pin` around one. Any other type is not the implementation type.
+    fn self_receiver_type(&self, mut element: Node<'_>, source: &str) -> bool {
+        // Each step removes one wrapper from the bounded syntax tree.
+        loop {
+            if element.kind_id() == self.reference_type {
+                let Some(inner) = element.child_by_field_id(self.value_type) else {
+                    return false;
+                };
+                element = inner;
+                continue;
+            }
+            if element.kind_id() == self.type_identifier {
+                return element.utf8_text(source.as_bytes()) == Ok("Self");
+            }
+            if element.kind_id() != self.generic_type {
+                return false;
+            }
+            let Some(name) = element
+                .child_by_field_id(self.value_type)
+                .and_then(|name| name.utf8_text(source.as_bytes()).ok())
+            else {
+                return false;
+            };
+            let name = name.rsplit("::").next().unwrap_or(name).trim();
+            if !["Box", "Rc", "Arc", "Pin"].contains(&name) {
+                return false;
+            }
+            let Some(arguments) = element.child_by_field_id(self.type_arguments) else {
+                return false;
+            };
+            let mut cursor = arguments.walk();
+            let mut types = arguments
+                .named_children(&mut cursor)
+                .filter(|child| !child.is_extra());
+            let (Some(inner), None) = (types.next(), types.next()) else {
+                return false;
+            };
+            element = inner;
+        }
     }
 
     fn record_bounds(
@@ -731,8 +811,12 @@ impl Kinds {
                 )?);
                 continue;
             }
+            // A match arm guard is an expression evaluated with the arm's bindings; it
+            // introduces none of its own names.
             let path = if self.named_patterns.contains(&kind) {
                 element.child_by_field_id(self.value_type)
+            } else if kind == self.match_pattern {
+                element.child_by_field_id(self.condition)
             } else {
                 None
             };

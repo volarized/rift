@@ -152,7 +152,8 @@ impl<'source> Namespaces<'source> {
         work: &mut Work,
     ) -> Option<Self> {
         let mut namespaces = Self::default();
-        let alternatives = unadmitted_alternatives(files, work)?;
+        let mut alternatives = unadmitted_alternatives(files, work)?;
+        alternatives.extend(unadmitted_chain_modules(files, work)?);
         for file in files
             .values()
             .filter(|file| file.document.facts.language().name == "rust")
@@ -218,7 +219,22 @@ impl<'source> Namespaces<'source> {
                 path.push(file.text(binding.name)?.to_owned());
                 let parts = file.use_parts(imported.range, work)?;
                 let parts = parts.iter().map(String::as_str).collect::<Vec<_>>();
-                let target = if matches!(parts.first(), Some(&"std" | &"core" | &"alloc")) {
+                // A first segment naming no item of the module starts at a dependency
+                // crate, as `std`, `core` and `alloc` do (the extern prelude).
+                let external = parts.first().is_some_and(|head| {
+                    matches!(*head, "std" | "core" | "alloc")
+                        || (!matches!(*head, "crate" | "self" | "super") && parts.len() > 1 && {
+                            let mut local = module.clone();
+                            local.push((*head).to_owned());
+                            !self.types.contains_key(&local)
+                                && !self.values.contains_key(&local)
+                                && matches!(
+                                    file.binding(head, imported.range.start, is_type_binding, work),
+                                    Binding::Missing
+                                )
+                        })
+                });
+                let target = if external {
                     parts.iter().map(|part| (*part).to_owned()).collect()
                 } else {
                     let Some(target) = self.absolute_path(file, imported.range.start, &parts, work)
@@ -1105,6 +1121,13 @@ impl<'source> Namespaces<'source> {
         {
             return self.inherent_method(file, position, owner, member, work);
         }
+        if let [parameter, member] = parts.as_slice()
+            && let Binding::Found(binding) =
+                file.binding(parameter, position, is_type_binding, work)
+            && binding.kind == StaticBindingKind::RustTypeParameter
+        {
+            return self.bound_member(file, position, binding, member, work);
+        }
         let path = self.resolved_path(file, position, &parts, work)?;
         if let Some(target) = self.lookup(file, position, &path, Namespace::Value, work) {
             return Some(target);
@@ -1300,7 +1323,17 @@ impl<'source> Namespaces<'source> {
         namespace: Namespace,
         work: &mut Work,
     ) -> Option<Target<'source>> {
-        if let Some(export) = self.exports.get(path) {
+        let index = match namespace {
+            Namespace::Type => &self.types,
+            Namespace::Value => &self.values,
+        };
+        // A `use` binding of a module names its target there. Without a declaration or an
+        // alias at the path, a visible binding (a private import of an ancestor module, too)
+        // is followed to its target; a cycle of bindings resolves nothing.
+        let mut path = std::borrow::Cow::Borrowed(path);
+        let mut followed = BTreeSet::new();
+        let mut binding_module = None;
+        while let Some(export) = self.exports.get(path.as_ref()) {
             let export = export.as_ref()?;
             if !namespace_visible(
                 self.module(file, position, work)?,
@@ -1309,18 +1342,34 @@ impl<'source> Namespaces<'source> {
             ) {
                 return None;
             }
+            if index.contains_key(path.as_ref()) {
+                break;
+            }
+            if !work.charge() || !followed.insert(path.to_vec()) {
+                return None;
+            }
+            binding_module = Some(&export.module);
+            path = std::borrow::Cow::Owned(export.target.clone());
         }
-        let index = match namespace {
-            Namespace::Type => &self.types,
-            Namespace::Value => &self.values,
-        };
         let target = index
-            .get(path)
+            .get(path.as_ref())
             .copied()
             .flatten()
             .filter(|target| self.available(*target))?;
-        self.accessible(file, position, path, target, work)
-            .then_some(target)
+        // Through a binding, the item needs to be visible where the last binding names it;
+        // the modules on its own path need not be visible from the source, but each must be
+        // admitted.
+        match binding_module {
+            Some(module) => {
+                let (_, declared) = path.split_last()?;
+                ((1..=declared.len()).all(|length| !self.module_unavailable(&declared[..length]))
+                    && namespace_visible(module, declared, target.symbol.visibility.as_deref()))
+                .then_some(target)
+            }
+            None => self
+                .accessible(file, position, &path, target, work)
+                .then_some(target),
+        }
     }
 
     fn available(&self, target: Target<'source>) -> bool {
@@ -1789,6 +1838,91 @@ fn unadmitted_alternatives<'source>(
     Some(unadmitted)
 }
 
+/// Files of modules a conditional item chain declares whose branch the configuration does
+/// not admit or leaves unknown. They keep their declarations and contribute no resolved
+/// facts or endpoints, as an unadmitted `#[path]` alternative does. A module an ordinary
+/// `mod` item also declares keeps that item's admission.
+fn unadmitted_chain_modules<'source>(
+    files: &BTreeMap<&'source str, File<'source>>,
+    work: &mut Work,
+) -> Option<BTreeSet<&'source str>> {
+    let mut unadmitted = BTreeSet::new();
+    if files.values().all(|file| file.chain_modules.is_empty()) {
+        return Some(unadmitted);
+    }
+    let mut bases = BTreeMap::<&'source str, Vec<String>>::new();
+    let mut declared = BTreeSet::<Vec<String>>::new();
+    for (&path, file) in files
+        .iter()
+        .filter(|(_, file)| file.document.facts.language().name == "rust")
+    {
+        for symbol in file.document.facts.symbols() {
+            if !work.charge() {
+                return None;
+            }
+            let target = Target {
+                file: file.document,
+                symbol,
+            };
+            let Some(qualified) = target.admitted_path() else {
+                continue;
+            };
+            if !bases.contains_key(path)
+                && let Some(base) = declaring_module(target, &qualified)
+            {
+                bases.insert(path, base);
+            }
+            if symbol.kind == "module" && symbol.body_range.is_none() {
+                declared.insert(qualified);
+            }
+        }
+    }
+    for (&parent, file) in files {
+        for (&name, &admitted) in &file.chain_modules {
+            if admitted == Some(true) {
+                continue;
+            }
+            let directories = [
+                parent.strip_suffix("/mod.rs"),
+                parent.strip_suffix(".rs"),
+                Some(
+                    parent
+                        .rsplit_once('/')
+                        .map_or("", |(directory, _)| directory),
+                ),
+            ];
+            for directory in directories.into_iter().flatten() {
+                let stem = if directory.is_empty() {
+                    name.to_owned()
+                } else {
+                    format!("{directory}/{name}")
+                };
+                for candidate in [format!("{stem}.rs"), format!("{stem}/mod.rs")] {
+                    if !work.charge() {
+                        return None;
+                    }
+                    let Some((&path, base)) = bases.get_key_value(candidate.as_str()) else {
+                        continue;
+                    };
+                    let Some((last, module)) = base.split_last() else {
+                        continue;
+                    };
+                    if last != name
+                        || declared.contains(base)
+                        || bases
+                            .get(parent)
+                            .is_some_and(|parent| parent.as_slice() != module)
+                    {
+                        continue;
+                    }
+                    unadmitted.insert(path);
+                }
+            }
+        }
+    }
+    Some(unadmitted)
+}
+
 /// The final segment of a written trait path, without generic arguments.
 fn trait_name(written: &str) -> Option<&str> {
     let path = written.split('<').next()?.trim();
@@ -1916,24 +2050,97 @@ fn insert<T>(index: &mut BTreeMap<Vec<String>, Option<T>>, path: Vec<String>, ta
         .or_insert(Some(target));
 }
 
+/// The segments of a written path. Generic arguments (`Holder::<A>::new`, `Holder<A>`) and
+/// a qualified self type without a trait (`<Holder<A>>::new`) name the same declarations
+/// as the plain path; a path through `<T as Trait>` or any other shape gives none.
 fn path_segments<'text>(source: &'text str, work: &mut Work) -> Option<Vec<&'text str>> {
+    let mut rest = source.trim();
     let mut path = Vec::new();
-    for part in source.split("::") {
+    if rest.starts_with('<') {
+        let end = generic_end(rest, work)?;
+        let inner = &rest[1..end];
+        if inner.split_whitespace().any(|word| word == "as") {
+            return None;
+        }
+        path.extend(path_segments(inner, work)?);
+        rest = rest[end + 1..].trim_start();
+        if rest.is_empty() {
+            return Some(path);
+        }
+        rest = rest.strip_prefix("::")?;
+    }
+    let bytes = rest.as_bytes();
+    let mut depth = 0_usize;
+    let mut start = 0;
+    let mut index = 0;
+    while index < bytes.len() {
         if !work.charge() {
             return None;
         }
-        let part = part.trim();
-        let mut characters = part.chars();
-        if !characters
-            .next()
-            .is_some_and(|character| character.is_alphabetic() || character == '_')
-            || !characters.all(|character| character.is_alphanumeric() || character == '_')
-        {
+        match bytes[index] {
+            b'<' => depth = depth.checked_add(1)?,
+            b'>' if index == 0 || bytes[index - 1] != b'-' => depth = depth.checked_sub(1)?,
+            b':' if depth == 0 && bytes.get(index + 1) == Some(&b':') => {
+                push_segment(&mut path, &rest[start..index])?;
+                index += 2;
+                start = index;
+                continue;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    if depth != 0 {
+        return None;
+    }
+    push_segment(&mut path, &rest[start..])?;
+    (!path.is_empty()).then_some(path)
+}
+
+/// Adds one written segment without its generic arguments; a turbofish argument list
+/// (`::<A>`) follows a named segment and adds none.
+fn push_segment<'text>(path: &mut Vec<&'text str>, part: &'text str) -> Option<()> {
+    let part = part.trim();
+    let name = match part.find('<') {
+        Some(0) => {
+            path.last()?;
+            return part.ends_with('>').then_some(());
+        }
+        Some(open) => part.ends_with('>').then(|| part[..open].trim())?,
+        None => part,
+    };
+    let mut characters = name.chars();
+    if !characters
+        .next()
+        .is_some_and(|character| character.is_alphabetic() || character == '_')
+        || !characters.all(|character| character.is_alphanumeric() || character == '_')
+    {
+        return None;
+    }
+    path.push(name);
+    Some(())
+}
+
+/// The byte index of the `>` closing the generic group `text` opens with `<`.
+fn generic_end(text: &str, work: &mut Work) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0_usize;
+    for (index, byte) in bytes.iter().enumerate() {
+        if !work.charge() {
             return None;
         }
-        path.push(part);
+        match byte {
+            b'<' => depth = depth.checked_add(1)?,
+            b'>' if index == 0 || bytes[index - 1] != b'-' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
     }
-    Some(path)
+    None
 }
 
 fn is_type_binding(kind: StaticBindingKind) -> bool {

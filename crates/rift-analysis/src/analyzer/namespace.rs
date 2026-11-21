@@ -510,6 +510,7 @@ pub(crate) fn namespace_paths(
     rust::namespace_paths(input, documents, contains, selected, files_max)
 }
 
+pub(crate) use rust::chain_modules as rust_chain_modules;
 pub(crate) use rust::configuration::{
     Configuration as RustConfiguration, Configurations as RustConfigurations,
 };
