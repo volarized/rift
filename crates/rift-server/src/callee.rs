@@ -417,6 +417,7 @@ impl CalleePackage {
 /// declaration at its position.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PackageCallee {
+    provider: rift_protocol::read::EdgeProvider,
     caller: CoreSymbolId,
     package: CalleePackage,
     path: ProjectPath,
@@ -442,6 +443,12 @@ pub struct CalleeDeclaration {
 }
 
 impl PackageCallee {
+    /// Which analysis produced this call.
+    #[must_use]
+    pub const fn edge_provider(&self) -> rift_protocol::read::EdgeProvider {
+        self.provider
+    }
+
     /// The original document addressed by this engine result, when observed.
     #[must_use]
     pub fn document(&self) -> Option<&Uri> {
@@ -565,6 +572,7 @@ impl PackageCallee {
 /// One callee's file and name as the engine named them.
 #[derive(Clone, Copy)]
 pub(crate) struct NamedCallee<'call> {
+    pub(crate) provider: rift_protocol::read::EdgeProvider,
     pub(crate) uri: &'call Uri,
     pub(crate) name: &'call str,
     pub(crate) position: Position,
@@ -596,6 +604,7 @@ pub(crate) fn callee_file(
 ) -> Result<CalleeFile, RiftError> {
     let held = |package: CalleePackage, path: ProjectPath| {
         CalleeFile::Package(PackageCallee {
+            provider: call.provider,
             caller: caller.clone(),
             package,
             path,
@@ -1036,6 +1045,7 @@ mod tests {
 
     fn callee(package: CalleePackage, path: &str) -> PackageCallee {
         PackageCallee {
+            provider: rift_protocol::read::EdgeProvider::Engine,
             caller: CoreSymbolId::new("rift://symbol/python/app.py/hello").expect("caller id"),
             package,
             path: ProjectPath::new(path).expect("callee path"),
@@ -1355,6 +1365,7 @@ mod tests {
 
     fn call(uri: &Uri) -> NamedCallee<'_> {
         NamedCallee {
+            provider: rift_protocol::read::EdgeProvider::Lsp,
             uri,
             name: "greet",
             position: Position {

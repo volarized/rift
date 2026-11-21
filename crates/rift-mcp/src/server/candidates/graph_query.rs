@@ -3,6 +3,8 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use sha2::{Digest as _, Sha256};
+
 use rift_error::{RiftError, errors};
 use rift_protocol::query::{
     QueryAnswer, QueryConfiguration, QueryParams, QueryReadResult, QueryResult,
@@ -13,6 +15,7 @@ use rift_protocol::symbol_read::{CapturedView, SymbolUnavailableReason};
 use rift_search::sparql::{
     AdjacencySelection, GraphDataset, GraphLimits, GraphQuery, QueryCancellation, SemanticInventory,
 };
+use rift_server::InventoryCoverage;
 
 use super::{RiftMcp, read_failure};
 use crate::output::{Json, QueryDisplay, QueryOutput, ToolFailure};
@@ -20,10 +23,13 @@ use crate::output::{Json, QueryDisplay, QueryOutput, ToolFailure};
 mod edges;
 mod exact;
 mod installed;
+#[cfg(test)]
+mod inventory_tests;
 pub(crate) mod retrieval;
 
 use super::super::RequestDeadline;
 use edges::AcquiredAdjacency;
+pub(crate) use edges::EngineInventoryCache;
 
 /// Settings and presentation retained with one query execution.
 pub(crate) struct QueryPageOptions<'a> {
@@ -87,6 +93,20 @@ impl RiftMcp {
         // Every read of the query's retrieval requests comes after this line, so each
         // one meets the scope the accepted workspace selects.
         let query = query.with_default_scope(&default_scope);
+        let key = query_key(&query, params.language, &revision, resolved.published.epoch)
+            .map_err(read_failure)?;
+        let configuration = resolved
+            .published
+            .configuration
+            .search_configuration()
+            .query;
+        if params.revision.as_ref() == Some(&revision)
+            && let Some(output) = self
+                .retained_query_page(key, paging, revision.clone(), configuration, deadline)
+                .await?
+        {
+            return Ok(output);
+        }
         let graph = match Box::pin(self.prepare_graph(resolved, &query, limits, deadline)).await? {
             Ok(graph) => graph,
             Err(unavailable) => return Ok(Json(QueryReadResult::Unavailable(unavailable).into())),
@@ -97,7 +117,7 @@ impl RiftMcp {
         tokio::time::timeout_at(
             deadline.at(),
             self.blocking.run("graph query", move || {
-                graph.evaluate(&query, deadline, &cancellation, &views, paging)
+                graph.evaluate(&query, deadline, &cancellation, &views, paging, key)
             }),
         )
         .await
@@ -108,6 +128,45 @@ impl RiftMcp {
             }
             Json(output)
         })
+        .map_err(read_failure)
+    }
+
+    async fn retained_query_page(
+        &self,
+        key: [u8; 32],
+        paging: (u64, u64),
+        revision: rift_protocol::revision::Revision,
+        configuration: QueryConfiguration,
+        deadline: RequestDeadline,
+    ) -> Result<Option<Json<QueryOutput>>, ToolFailure> {
+        let views = Arc::clone(&self.local_views);
+        tokio::time::timeout_at(
+            deadline.at(),
+            self.blocking.run("retained query page", move || {
+                let Some((view, bytes)) = views.get().and_then(|views| views.query(&key)) else {
+                    return Ok(None);
+                };
+                let (answer, warnings, display): (QueryAnswer, Vec<ReadWarning>, QueryDisplay) =
+                    serde_json::from_slice(&bytes).map_err(encoding_failure)?;
+                let mut output = query_page(
+                    &view,
+                    &answer,
+                    QueryPageOptions {
+                        configuration: &configuration,
+                        page: paging.0,
+                        max_results: paging.1,
+                        warnings,
+                        display,
+                    },
+                )?;
+                if let QueryReadResult::Results(answer) = &mut output.result {
+                    answer.revision = Some(revision);
+                }
+                Ok(Some(Json(output)))
+            }),
+        )
+        .await
+        .map_err(|_| read_failure(deadline_failure(deadline.budget())))?
         .map_err(read_failure)
     }
 
@@ -184,6 +243,9 @@ impl RiftMcp {
             .query;
         let reads = Arc::clone(&resolved.published.reads);
         let mut warnings = acquired.take_warnings();
+        if local_semantics.is_some() {
+            warnings.extend(reads.edge_identity_warning());
+        }
         warnings.extend(resolved.stale);
         if let Some(exact) = &mut exact {
             warnings.extend(exact.take_warnings());
@@ -265,9 +327,10 @@ impl RiftMcp {
                     .await
             } else if let Some(required) = local_semantics {
                 Ok(Ok(self
-                    .acquire_semantic_inventory(resolved, required, limits, deadline)
+                    .acquire_semantic_inventory(resolved, required, deadline)
                     .await?))
             } else if query.symbol_selection().is_some()
+                || query.history_selection().is_some()
                 || query.syntax_element_selection().is_some()
                 || !query.reads_base()
             {
@@ -327,7 +390,7 @@ fn project_retrievals(
         };
         let (flows, partial) = flows.finish(limit, warnings);
         if partial {
-            if flows.paths.is_empty() || !query.projects_flow_rows() {
+            if flows.paths.is_empty() || !query.admits_partial_rows() {
                 return Ok(ProjectedRetrievals::Unavailable);
             }
             coverage = ProjectedRetrievals::Partial;
@@ -373,25 +436,130 @@ fn project_local_endpoints(
 }
 
 fn project_semantic_inventory(
+    reads: &rift_server::ReadService,
     input: &rift_server::LocalSymbolViewInput,
     acquired: &AcquiredAdjacency,
     required: SemanticInventory,
     dataset: &mut rift_search::sparql::GraphDatasetBuilder,
     cancellation: &QueryCancellation,
-    deadline: std::time::Instant,
-) -> Result<(), RiftError> {
-    input.project_symbols(
-        rift_search::sparql::SymbolSelection::All,
-        dataset,
-        cancellation,
-        deadline,
-    )?;
+    deadline: RequestDeadline,
+) -> Result<InventoryCoverage, RiftError> {
+    let coverage = if required.symbols {
+        input.project_symbols(
+            rift_search::sparql::SymbolSelection::All,
+            dataset,
+            cancellation,
+            deadline.at().into_std(),
+        )?
+    } else {
+        InventoryCoverage::Complete
+    };
+    acquired.project_captured_inventory(dataset, input, reads, cancellation, deadline)?;
     acquired.project_local(
         dataset,
         input,
-        required.edges || required.references || required.calls,
+        rift_search::sparql::SemanticEdges {
+            relations: required.edges.relations
+                || required.adjacency.references
+                || required.adjacency.calls,
+            ..required.edges
+        },
         required.occurrences,
+    )?;
+    Ok(if acquired.is_partial() {
+        InventoryCoverage::Partial
+    } else {
+        coverage
+    })
+}
+
+/// Whether a symbol selection reads the captured inventory rather than one identity.
+const fn reads_inventory(selection: rift_search::sparql::SymbolSelection<'_>) -> bool {
+    !matches!(
+        selection,
+        rift_search::sparql::SymbolSelection::Identified(_)
     )
+}
+
+/// What a projection that reads the captured inventory, or one exact selection, reads from.
+#[derive(Clone, Copy)]
+struct InventoryProjection<'read> {
+    query: &'read GraphQuery,
+    input: &'read rift_server::LocalSymbolViewInput,
+    reads: &'read rift_server::ReadService,
+    acquired: &'read AcquiredAdjacency,
+    local_semantics: Option<SemanticInventory>,
+    exact: Option<&'read exact::ExactFacts>,
+}
+
+/// Projects the local facts a query without an adjacency selection reads. Returns the
+/// inventory's coverage when the projection read the captured inventory rather than one
+/// exact selection or identity.
+fn project_inventory(
+    projection: InventoryProjection<'_>,
+    dataset: &mut rift_search::sparql::GraphDatasetBuilder,
+    cancellation: &QueryCancellation,
+    deadline: RequestDeadline,
+) -> Result<Option<InventoryCoverage>, RiftError> {
+    let InventoryProjection {
+        query,
+        input,
+        reads,
+        acquired,
+        local_semantics,
+        exact,
+    } = projection;
+    if let Some(required) = local_semantics {
+        return project_semantic_inventory(
+            reads,
+            input,
+            acquired,
+            required,
+            dataset,
+            cancellation,
+            deadline,
+        )
+        .map(Some);
+    }
+    if let Some(exact) = exact {
+        exact.project(dataset)?;
+        return Ok(None);
+    }
+    if let Some(selection) = query.history_selection() {
+        input.project_history(
+            reads,
+            selection,
+            dataset,
+            cancellation,
+            deadline.at().into_std(),
+        )?;
+        return Ok(reads_inventory(selection).then_some(InventoryCoverage::Complete));
+    }
+    if let Some(selection) = query.syntax_element_selection() {
+        let coverage = input.project_syntax_elements(
+            reads,
+            selection,
+            dataset,
+            cancellation,
+            deadline.at().into_std(),
+        )?;
+        return Ok(reads_inventory(selection.symbols).then_some(coverage));
+    }
+    if let Some(selection) = query.symbol_selection() {
+        let coverage =
+            input.project_symbols(selection, dataset, cancellation, deadline.at().into_std())?;
+        return Ok(reads_inventory(selection).then_some(coverage));
+    }
+    Ok(None)
+}
+
+/// Whether an answer claims an absence: no rows, no triples, or a false `ASK`.
+fn claims_absence(answer: &QueryAnswer) -> bool {
+    match answer {
+        QueryAnswer::Bindings { bindings, .. } => bindings.is_empty(),
+        QueryAnswer::Graph { triples } => triples.is_empty(),
+        QueryAnswer::Boolean { value } => !value,
+    }
 }
 
 fn constrain_provider_expiry<'view>(
@@ -421,6 +589,7 @@ impl AcquiredGraph {
         cancellation: &QueryCancellation,
         views: &std::sync::OnceLock<rift_server::LocalSymbolViews>,
         paging: (u64, u64),
+        key: [u8; 32],
     ) -> Result<QueryOutput, RiftError> {
         let Self {
             limits,
@@ -433,11 +602,18 @@ impl AcquiredGraph {
             configuration,
             mut warnings,
         } = self;
-        if acquired.is_incomplete() && !query.admits_partial_witness() {
-            return Ok(incomplete_flows(warnings).into());
+        if acquired.is_incomplete() {
+            warnings.push(ReadWarning::EdgeCoverageMissing {
+                kinds: Vec::new(),
+                detail: "the selected edge read is incomplete, so edges outside its captured and engine coverage are missing from this answer".to_owned(),
+            });
+            if !query.admits_partial_rows() && !query.admits_partial_witness() {
+                return Ok(insufficient_coverage(warnings).into());
+            }
         }
         let input = reads.local_search_view_input(true)?;
         let mut dataset = GraphDataset::builder(limits);
+        let mut inventory = InventoryCoverage::Complete;
         if let Some(selected) = &selected {
             if let Err(error) = acquired.project(&mut dataset, selected, &input) {
                 if lacks_coverage(&error) {
@@ -456,36 +632,38 @@ impl AcquiredGraph {
                 cancellation,
                 deadline.at().into_std(),
             )?;
-        } else if let Some(required) = local_semantics {
-            project_semantic_inventory(
-                &input,
-                &acquired,
-                required,
+        } else {
+            let inventory_read = project_inventory(
+                InventoryProjection {
+                    query,
+                    input: &input,
+                    reads: &reads,
+                    acquired: &acquired,
+                    local_semantics,
+                    exact: exact.as_ref(),
+                },
                 &mut dataset,
                 cancellation,
-                deadline.at().into_std(),
+                deadline,
             )?;
-        } else if let Some(exact) = &exact {
-            exact.project(&mut dataset)?;
-        } else if let Some(selection) = query.syntax_element_selection() {
-            input.project_syntax_elements(
-                &reads,
-                selection,
-                &mut dataset,
-                cancellation,
-                deadline.at().into_std(),
-            )?;
-        } else if let Some(selection) = query.symbol_selection() {
-            input.project_symbols(
-                selection,
-                &mut dataset,
-                cancellation,
-                deadline.at().into_std(),
-            )?;
+            if let Some(read) = inventory_read {
+                inventory = read;
+                for warning in input.warnings()? {
+                    if !warnings.contains(&warning) {
+                        warnings.push(warning);
+                    }
+                }
+            }
         }
         let coverage = project_retrievals(query, &mut retrieved, &mut dataset, &mut warnings)?;
         if coverage == ProjectedRetrievals::Unavailable {
-            return Ok(incomplete_flows(warnings).into());
+            return Ok(insufficient_coverage(warnings).into());
+        }
+        let partial = acquired.leaves_facts_out()
+            || coverage == ProjectedRetrievals::Partial
+            || inventory == InventoryCoverage::Partial;
+        if partial && !query.admits_partial_rows() && !query.admits_partial_witness() {
+            return Ok(insufficient_coverage(warnings).into());
         }
         if query.names_local_graph() {
             if selected.is_some() {
@@ -496,15 +674,16 @@ impl AcquiredGraph {
         let Some(answer) =
             evaluate_acquired_query(&dataset.build(), query, cancellation, &acquired)?
         else {
-            return Ok(query_unavailable(SymbolUnavailableReason::InsufficientCoverage).into());
+            return Ok(insufficient_coverage(warnings).into());
         };
-        if coverage == ProjectedRetrievals::Partial
-            && matches!(&answer, QueryAnswer::Bindings { bindings, .. } if bindings.is_empty())
-        {
-            return Ok(incomplete_flows(warnings).into());
+        // Over partial coverage an empty answer would claim an absence the missing facts may
+        // contradict, so it refuses with the warnings that name what is missing.
+        if partial && claims_absence(&answer) {
+            return Ok(insufficient_coverage(warnings).into());
         }
         let views = views.get().ok_or_else(retention_failure)?;
         let retention = QueryRetention {
+            key,
             answer: &answer,
             configuration: &configuration,
             paging,
@@ -518,6 +697,7 @@ impl AcquiredGraph {
 }
 
 struct QueryRetention<'answer> {
+    key: [u8; 32],
     answer: &'answer QueryAnswer,
     configuration: &'answer QueryConfiguration,
     paging: (u64, u64),
@@ -534,15 +714,20 @@ impl QueryRetention<'_> {
         input: rift_server::LocalSymbolViewInput,
         cancellation: &QueryCancellation,
     ) -> Result<QueryOutput, RiftError> {
+        let bytes = serde_json::to_vec(&(self.answer, &self.warnings, &self.display))
+            .map_err(encoding_failure)?;
+        let expires = self
+            .provider_views()
+            .map(crate::proxy::captured_expiry)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .min();
+        let input = input.with_query(self.key, bytes, expires);
         let mut response = None;
-        views.capture_with(input, |view| {
+        let limits = rift_server::RetainedViewLimits::from(self.configuration);
+        views.capture_with(input, limits, |view| {
             let mut view = view.clone();
-            let provider_views = self.acquired.remote_view().into_iter().chain(
-                self.retrieved
-                    .iter()
-                    .filter_map(|entry| entry.result.view.as_ref()),
-            );
-            if !constrain_provider_expiry(&mut view, provider_views)? {
+            if !constrain_provider_expiry(&mut view, self.provider_views())? {
                 response = Some(query_unavailable(SymbolUnavailableReason::ViewExpired).into());
                 return Ok(false);
             }
@@ -560,10 +745,36 @@ impl QueryRetention<'_> {
                     display: self.display,
                 },
             )?);
-            Ok(false)
+            Ok(true)
         })?;
         response.ok_or_else(retention_failure)
     }
+
+    fn provider_views(&self) -> impl Iterator<Item = &CapturedView> {
+        self.acquired.remote_view().into_iter().chain(
+            self.retrieved
+                .iter()
+                .filter_map(|entry| entry.result.view.as_ref()),
+        )
+    }
+}
+
+fn query_key(
+    query: &GraphQuery,
+    language: rift_protocol::query::QueryLanguage,
+    revision: &rift_protocol::revision::Revision,
+    epoch: u64,
+) -> Result<[u8; 32], RiftError> {
+    let selected = query
+        .retrieval_requests()
+        .iter()
+        .map(|selection| &selection.request)
+        .collect::<Vec<_>>();
+    // Publication movement invalidates dependency and configuration selections even
+    // when a git commit remains the served revision.
+    let bytes = serde_json::to_vec(&(query.normalized_text(), language, revision, epoch, selected))
+        .map_err(encoding_failure)?;
+    Ok(Sha256::digest(bytes).into())
 }
 
 fn evaluate_acquired_query(
@@ -573,10 +784,10 @@ fn evaluate_acquired_query(
     acquired: &AcquiredAdjacency,
 ) -> Result<Option<QueryAnswer>, RiftError> {
     let answer: QueryAnswer = dataset.evaluate(query, cancellation)?.into();
-    Ok(
-        (!acquired.is_incomplete() || matches!(answer, QueryAnswer::Boolean { value: true }))
-            .then_some(answer),
-    )
+    Ok((!acquired.is_incomplete()
+        || matches!(answer, QueryAnswer::Boolean { value: true })
+        || (query.admits_partial_rows() && !claims_absence(&answer)))
+    .then_some(answer))
 }
 
 /// Selects one fixed-size answer page within the accepted response byte bound.
@@ -665,7 +876,7 @@ fn query_unavailable(reason: SymbolUnavailableReason) -> QueryReadResult {
     QueryReadResult::Unavailable(unavailable(reason))
 }
 
-fn incomplete_flows(warnings: Vec<ReadWarning>) -> QueryReadResult {
+fn insufficient_coverage(warnings: Vec<ReadWarning>) -> QueryReadResult {
     QueryReadResult::Unavailable(SearchUnavailable::Unavailable {
         reason: SymbolUnavailableReason::InsufficientCoverage,
         view: None,
@@ -681,8 +892,100 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
+    #[test]
+    fn query_key_names_normalized_text_revision_and_selection() -> TestResult {
+        use rift_protocol::read::SearchScope;
+        use rift_protocol::revision::Revision;
+        let limits = GraphLimits::default();
+        let revision = Revision::tree(&"a".repeat(64))?;
+        let statement = "SELECT ?hit { SERVICE :search { ?hit :query 'beacon' } }";
+        let original =
+            GraphQuery::parse(statement, &limits)?.with_default_scope(&SearchScope::Local);
+        let spaced = GraphQuery::parse(&format!("  {statement}\n# page"), &limits)?
+            .with_default_scope(&SearchScope::Local);
+        let key = query_key(&original, QueryLanguage::Sparql, &revision, 1)?;
+        assert_eq!(
+            key,
+            query_key(&spaced, QueryLanguage::Sparql, &revision, 1)?
+        );
+        let global = original.clone().with_default_scope(&SearchScope::Global);
+        assert_ne!(
+            key,
+            query_key(&global, QueryLanguage::Sparql, &revision, 1)?
+        );
+        assert_ne!(
+            key,
+            query_key(&original, QueryLanguage::Sparql, &revision, 2)?
+        );
+        let moved = Revision::tree(&"b".repeat(64))?;
+        assert_ne!(key, query_key(&original, QueryLanguage::Sparql, &moved, 1)?);
+        let package = |name| {
+            GraphQuery::parse(
+                &format!(
+                    "SELECT ?hit {{ SERVICE :search {{ ?hit :query 'beacon'; :scope 'global'; :packages '[{{\"manager\":\"cargo\",\"registry\":\"crates.io\",\"name\":\"{name}\"}}]'^^rdf:JSON }} }}"
+                ),
+                &limits,
+            )
+        };
+        let serde = package("serde")?;
+        let tokio = package("tokio")?;
+        assert_ne!(
+            query_key(&serde, QueryLanguage::Sparql, &revision, 1)?,
+            query_key(&tokio, QueryLanguage::Sparql, &revision, 1)?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn occurrence_inventory_does_not_project_unrequested_symbols_and_edges() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        crate::server::hermetic_workspace(directory.path(), "")?;
+        std::fs::write(
+            directory.path().join("entry.ts"),
+            "interface Value {}\ntype Alias = Value;\nconst unused = { first: 1, second: 2, third: 3 };\n",
+        )?;
+        let root = directory.path().canonicalize()?;
+        let server =
+            RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
+        let limits = GraphLimits::builder().triples_max(16).build()?;
+        let query = GraphQuery::parse(
+            "SELECT (COUNT(*) AS ?n) { ?target :usages ?usage }",
+            &limits,
+        )?;
+        let deadline = server.request_deadline().await;
+        let resolved = server
+            .published_workspace(super::super::super::wire::ErrorPhase::Read, deadline)
+            .await
+            .map_err(|failure| format!("{failure:?}"))?;
+        let revision = resolved.published.reads.served_revision()?;
+        let epoch = resolved.published.epoch;
+        let key = query_key(&query, QueryLanguage::Sparql, &revision, epoch)?;
+        let graph = server
+            .prepare_graph(resolved, &query, limits, deadline)
+            .await
+            .map_err(|failure| format!("{failure:?}"))?
+            .map_err(|reason| format!("{reason:?}"))?;
+        let output = graph.evaluate(
+            &query,
+            deadline,
+            &QueryCancellation::new(),
+            &server.local_views,
+            (1, 10),
+            key,
+        )?;
+        assert!(
+            matches!(&output.result, QueryReadResult::Results(result)
+                if matches!(&result.answer, QueryAnswer::Bindings { bindings, .. }
+                    if matches!(&bindings[0]["n"], rift_protocol::query::RdfTerm::Literal { value, .. } if value == "1"))),
+            "{:?}",
+            output.result
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn query_pages_select_bindings_at_the_requested_revision() -> TestResult {
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let directory = tempfile::tempdir()?;
         crate::server::hermetic_workspace(directory.path(), "")?;
         std::fs::write(
@@ -716,11 +1019,58 @@ mod tests {
             };
             assert_eq!(answer.pagination, Some(Pagination::new(page, 1, 2)));
             params.revision = answer.revision.clone();
+            if page == 1 {
+                params.query = format!("  {}\n# page", params.query);
+            }
             let QueryAnswer::Bindings { bindings, .. } = answer.answer else {
                 return Err("bindings".into());
             };
             assert_eq!(bindings.len(), usize::from(page <= 2));
         }
+        let evaluations = drain
+            .queued_records()
+            .iter()
+            .filter(|record| {
+                record.message() == "worker admitted"
+                    && serde_json::from_str::<Value>(record.fields())
+                        .is_ok_and(|fields| fields["work"] == "graph query")
+            })
+            .count();
+        assert_eq!(evaluations, 1, "later pages read the retained answer");
+        let previous_revision = params.revision.take();
+        std::fs::write(
+            root.join("lib.rs"),
+            "pub fn alpha() {}\npub fn beta() {}\npub fn gamma() {}\n",
+        )?;
+        server.validation.observe_whole_workspace()?;
+        params.page = 1;
+        let QueryReadResult::Results(answer) = server
+            .graph_query(params.clone())
+            .await
+            .map_err(|error| format!("{error:?}"))?
+            .0
+            .result
+        else {
+            return Err("query result".into());
+        };
+        assert_ne!(answer.revision, previous_revision);
+        assert_eq!(answer.pagination, Some(Pagination::new(1, 1, 3)));
+        params.revision = answer.revision;
+        params.page = 2;
+        server
+            .graph_query(params)
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        let evaluations = drain
+            .queued_records()
+            .iter()
+            .filter(|record| {
+                record.message() == "worker admitted"
+                    && serde_json::from_str::<Value>(record.fields())
+                        .is_ok_and(|fields| fields["work"] == "graph query")
+            })
+            .count();
+        assert_eq!(evaluations, 1, "a moved revision evaluates once");
         Ok(())
     }
 
@@ -750,6 +1100,84 @@ mod tests {
             assert_eq!(answer.pagination, Some(Pagination::new(request.page, 1, 2)));
             request.revision = answer.revision.clone();
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn distinct_queries_past_the_view_bound_release_and_evaluate_again() -> TestResult {
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let directory = tempfile::tempdir()?;
+        crate::server::hermetic_workspace(
+            directory.path(),
+            "[search.query]\nretained_views = 2\n",
+        )?;
+        std::fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let root = directory.path().canonicalize()?;
+        let server =
+            RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
+        let query = |first: u64| QueryParams {
+            query: format!(
+                "SELECT ?value {{ VALUES ?value {{ {first} {} }} }} ORDER BY ?value",
+                first + 1
+            ),
+            max_results: 1,
+            ..Default::default()
+        };
+        let read = |request: QueryParams| {
+            let server = server.clone();
+            async move {
+                let output = server
+                    .graph_query(request)
+                    .await
+                    .map_err(|error| format!("{error:?}"))?
+                    .0;
+                match output.result {
+                    QueryReadResult::Results(answer) => Ok::<_, String>(answer),
+                    QueryReadResult::Unavailable(unavailable) => Err(format!("{unavailable:?}")),
+                }
+            }
+        };
+        let mut evaluations = move || {
+            drain
+                .queued_records()
+                .iter()
+                .filter(|record| {
+                    record.message() == "worker admitted"
+                        && serde_json::from_str::<Value>(record.fields())
+                            .is_ok_and(|fields| fields["work"] == "graph query")
+                })
+                .count()
+        };
+        let first = read(query(0)).await?;
+        for distinct in 1..=5 {
+            let answer = read(query(distinct * 10)).await?;
+            assert_eq!(answer.pagination, Some(Pagination::new(1, 1, 2)));
+        }
+        assert_eq!(
+            evaluations(),
+            6,
+            "every distinct query past the bound is answered"
+        );
+        let mut released = query(0);
+        released.page = 2;
+        released.revision = first.revision.clone();
+        let answer = read(released).await?;
+        assert_eq!(answer.pagination, Some(Pagination::new(2, 1, 2)));
+        assert_eq!(
+            evaluations(),
+            1,
+            "a later page of a released view evaluates the query again"
+        );
+        let mut retained = query(50);
+        retained.page = 2;
+        retained.revision = first.revision;
+        let answer = read(retained).await?;
+        assert_eq!(answer.pagination, Some(Pagination::new(2, 1, 2)));
+        assert_eq!(
+            evaluations(),
+            0,
+            "a retained view still answers its later page"
+        );
         Ok(())
     }
 
@@ -1048,7 +1476,7 @@ mod tests {
                     let result = json!({
                         "groups": [{"seed":seed,"complete":true,"edges":[{
                             "id": format!("{number:064x}"),
-                            "edge":{"from":seed,"to":next,"kind":facet,"kinds":[facet],"derivation":"resolution"}
+                            "edge":{"from":seed,"to":next,"kind":facet,"kinds":[facet],"provider": "static", "derivation":"resolution"}
                         }]}],
                         "symbols":[seed_symbol,next_symbol],
                         "sources":sources,
@@ -1099,7 +1527,7 @@ mod tests {
                     "groups": [{"seed":seed,"complete":true,"edges":[{
                         "id": format!("{id:064x}"),
                         "edge":{"from":caller,"to":seed,"kind":"calls",
-                            "kinds":["calls"],"derivation":"resolution"}
+                            "kinds":["calls"],"provider": "static", "derivation":"resolution"}
                     }]}],
                     "symbols":[symbol(seed),symbol(caller)],
                     "analyzer_revision":"analyzer-v1","corpus_revision":"corpus-v1",
@@ -1246,24 +1674,38 @@ mod tests {
             root.join("invalid-directory/unestablished.py"),
             "def might_call(): pass\n",
         )?;
-        let incomplete = RiftMcp::build_settled(&root, limits).await?;
-        let response = incomplete
+        let partial = RiftMcp::build_settled(&root, limits).await?;
+        let response = partial
             .graph_query(query)
             .await
             .map_err(|failure| format!("{failure:?}"))?
             .0
             .result;
-        assert!(
-            matches!(
-                response,
-                QueryReadResult::Unavailable(SearchUnavailable::Unavailable {
-                    reason: SymbolUnavailableReason::InsufficientCoverage,
-                    ..
-                })
-            ),
-            "{response:?}"
-        );
+        assert_identified_incoming_callers(response)?;
         service.abort();
+        Ok(())
+    }
+
+    fn assert_identified_incoming_callers(response: QueryReadResult) -> TestResult {
+        let QueryReadResult::Results(answer) = response else {
+            return Err(format!("identified callers remain available: {response:?}").into());
+        };
+        let expected = ["rift://symbol/local/python/app/hello", PACKAGE_BRIDGE];
+        assert!(
+            matches!(&answer.answer, QueryAnswer::Bindings { bindings, .. }
+        if bindings.len() == expected.len() && bindings.iter().all(|row|
+            matches!(&row["caller"], rift_protocol::query::RdfTerm::Iri { value }
+                if expected.contains(&value.as_str())))),
+            "{answer:?}"
+        );
+        assert!(
+            answer.warnings.iter().any(
+                |warning| matches!(warning, ReadWarning::EdgeCoverageMissing { detail, .. }
+            if detail.contains("identities"))
+            ),
+            "{:?}",
+            answer.warnings
+        );
         Ok(())
     }
 
@@ -1324,9 +1766,10 @@ mod tests {
             )
             .into());
         };
+        let view = result.view.as_ref().ok_or("captured view")?;
         assert_eq!(
-            result.view.as_ref().map(|view| view.expires_at.as_str()),
-            Some(expires.as_str())
+            view.expires_at.parse::<jiff::Timestamp>()?,
+            expires.parse::<jiff::Timestamp>()?
         );
         let QueryAnswer::Bindings { bindings, .. } = result.answer else {
             return Err("expected call bindings".into());
@@ -1372,7 +1815,8 @@ mod tests {
         let server =
             RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
         let statement = format!(
-            "SELECT ?source ?unit ?start ?end {{ <{ROOT}> :calls ?target . \
+            "SELECT ?source ?unit ?start ?end ?provider {{ <{ROOT}> :calls ?target . \
+             ?edge a :Edge; :from <{ROOT}>; :to ?target; :provider ?provider . \
              ?syntax_element :of ?target; :index 0; :source ?source; :range [ :unit ?unit; :start ?start; :end ?end ] }}"
         );
         let response = server
@@ -1400,6 +1844,7 @@ mod tests {
             row["unit"]["value"],
             "rift://source/cargo/crates.io/demo/src/a.rs"
         );
+        assert_eq!(row["provider"]["value"], "static");
         assert_eq!(row["start"]["value"], "10");
         assert_eq!(row["end"]["value"], "29");
 
@@ -1766,7 +2211,7 @@ mod tests {
         Ok(())
     }
 
-    async fn static_endpoint(
+    pub(super) async fn static_endpoint(
         server: &RiftMcp,
         name: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {

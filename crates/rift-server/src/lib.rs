@@ -25,8 +25,10 @@ pub use configuration::{
 };
 pub use engine::{EnginePool, EngineSlot, LspProcessKey};
 pub use engine_read::{
-    CallCorroboration, CallDestination, CallProvider, EngineReferences, GraphCalls,
-    GraphReferences, graph_calls, graph_heritage_edges, graph_references, installed_graph_calls,
+    CallCorroboration, CallDestination, CallProvider, EngineInventory, EngineInventoryAnswer,
+    EngineInventoryFile, EngineInventorySelection, EngineReferences, GraphCalls, GraphReferences,
+    captured_graph_calls, captured_graph_references, graph_calls, graph_heritage_edges,
+    graph_heritage_inventory, graph_references, graph_type_uses, installed_graph_calls,
     outgoing_reference_edges, resolve_engine_references, uses_engine_references,
 };
 pub use history::{FillCounts, FillProgress, StoredHistory};
@@ -35,8 +37,8 @@ pub use history_fill::{
     release_version,
 };
 pub use read::{
-    LocalSymbolViewInput, LocalSymbolViews, ReadService, ReadServiceBuild, accept_page,
-    accepted_limit, accepted_max_results, wire_digest,
+    InventoryCoverage, LocalSymbolViewInput, LocalSymbolViews, ReadService, ReadServiceBuild,
+    RetainedViewLimits, accept_page, accepted_limit, accepted_max_results, wire_digest,
 };
 pub use recommendations::{
     LspRecommendation, LspRecommendationBatch, LspRecommendationInputs, LspRecommendationStatus,

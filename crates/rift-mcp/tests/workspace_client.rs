@@ -476,7 +476,7 @@ fn failure_head(line: &str) -> TestResult<(ErrorCode, RetryDirective)> {
 #[path = "query/mod.rs"]
 pub(crate) mod query;
 
-/// Selects one original declaration before a canonical read or engine walk.
+/// Selects one symbol from captured declarations before a canonical read or engine walk.
 pub(crate) async fn captured_seed(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     name: &str,
@@ -499,9 +499,10 @@ pub(crate) async fn captured_seed(
     let row = selected
         .next()
         .ok_or_else(|| format!("original declaration {name} at {path}: {answer}"))?;
+    let symbol = query::iri(row, "symbol")?;
     assert!(
-        selected.next().is_none(),
-        "one original declaration {name} at {path}: {answer}"
+        selected.all(|row| query::iri(row, "symbol").is_ok_and(|identity| identity == symbol)),
+        "one symbol {name} at {path}: {answer}"
     );
     assert!(
         !query::literal(row, "kind")?.is_empty(),

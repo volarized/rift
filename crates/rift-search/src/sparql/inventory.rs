@@ -15,15 +15,59 @@ pub struct OccurrenceSelection {
     pub enclosing: bool,
 }
 
+/// Required type definitions and inheritance from semantic providers.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TypeSelection {
+    /// The query can inspect inferred type definitions.
+    pub definitions: bool,
+    /// The query can inspect class inheritance.
+    pub extends: bool,
+    /// The query can inspect interface implementations.
+    pub implements: bool,
+}
+
+/// Resolved adjacency needed by a query over the selected domain.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SemanticAdjacency {
+    /// The query can inspect call edges.
+    pub calls: bool,
+    /// The query can inspect type uses resolved at captured type positions.
+    pub type_uses: bool,
+    /// The query can inspect caller-to-target reference edges.
+    pub references: bool,
+    /// Inheritance and implementation operations selected by the query.
+    pub heritage: SemanticHeritage,
+}
+
+/// Heritage kinds whose configured engine can add to captured facts.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SemanticHeritage {
+    /// The query can inspect inheritance edges.
+    pub extends: bool,
+    /// The query can inspect implementation edges.
+    pub implements: bool,
+}
+
+/// Edge facts selected by a query.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SemanticEdges {
+    /// The query can inspect direct edges between symbols.
+    pub relations: bool,
+    /// The query can inspect original edge records and their analysis.
+    pub metadata: bool,
+}
+
 /// The semantic and physical facts needed from a complete selected domain.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SemanticInventory {
-    /// The query can inspect captured edge kinds.
-    pub edges: bool,
-    /// The query can inspect call edges.
-    pub calls: bool,
-    /// The query can inspect caller-to-target reference edges.
-    pub references: bool,
+    /// The query can inspect complete captured symbol metadata.
+    pub symbols: bool,
+    /// Edge facts the query can inspect.
+    pub edges: SemanticEdges,
+    /// Resolved edge kinds the query can inspect.
+    pub adjacency: SemanticAdjacency,
+    /// Embedded graph patterns require complete provider adjacency.
+    pub complete_adjacency: bool,
     /// The query can inspect physical occurrences.
     pub occurrences: Option<OccurrenceSelection>,
 }
@@ -33,12 +77,18 @@ impl GraphQuery {
     /// can inspect is a symbol, an established edge, or a physical reference.
     #[must_use]
     pub fn semantic_inventory(&self) -> Option<SemanticInventory> {
-        self.admission().semantics.filter(|requirements| {
-            requirements.edges
-                || requirements.calls
-                || requirements.references
-                || requirements.occurrences.is_some()
-        })
+        self.admission()
+            .semantics
+            .map(|mut requirements| {
+                requirements.complete_adjacency = self.admission().embedded_patterns > 0;
+                requirements
+            })
+            .filter(|requirements| {
+                requirements.edges.relations
+                    || requirements.adjacency.calls
+                    || requirements.adjacency.references
+                    || requirements.occurrences.is_some()
+            })
     }
 }
 
@@ -51,20 +101,41 @@ impl SemanticInventory {
             let subject = &pattern.subject;
             let name = predicate.as_str().strip_prefix(VOCABULARY_NAMESPACE);
             match name {
-                Some("name" | "revision") => {}
-                Some("calls") => self.calls = true,
-                Some("references") => self.references = true,
+                Some("name" | "revision") => self.symbols = true,
+                Some("provider" | "from" | "to" | "kinds" | "derivation")
+                    if edge(patterns, subject) =>
+                {
+                    self.edges.metadata = true;
+                }
+                None if class(pattern) == Some("Edge") => self.edges.metadata = true,
+                Some("calls") => self.adjacency.calls = true,
+                Some("references") => self.adjacency.references = true,
+                Some("hasType") => {
+                    self.edges.relations = true;
+                    self.adjacency.type_uses = true;
+                }
+                Some("extends") => {
+                    self.edges.relations = true;
+                    self.adjacency.heritage.extends = true;
+                }
+                Some("implements") => {
+                    self.edges.relations = true;
+                    self.adjacency.heritage.implements = true;
+                }
                 Some(
-                    "imports" | "aliases" | "extends" | "implements" | "declares" | "reads"
-                    | "writes" | "hasType" | "contains" | "overrides",
-                ) => self.edges = true,
+                    "imports" | "aliases" | "declares" | "contains" | "overrides" | "reads"
+                    | "writes",
+                ) => self.edges.relations = true,
                 Some("usages") => {
                     self.occurrences.get_or_insert_default();
                 }
                 Some("kind" | "language")
                     if patterns.iter().any(|other| {
                         other.subject == *subject && class(other) == Some("Symbol")
-                    }) => {}
+                    }) =>
+                {
+                    self.symbols = true;
+                }
                 Some("source" | "of" | "kind" | "range") if occurrence(patterns, subject) => {
                     let usage = self.occurrences.get_or_insert_default();
                     usage.source |= name == Some("source");
@@ -79,7 +150,7 @@ impl SemanticInventory {
                 {
                     self.occurrences.get_or_insert_default();
                 }
-                None if class(pattern) == Some("Symbol") => {}
+                None if class(pattern) == Some("Symbol") => self.symbols = true,
                 None if class(pattern) == Some("Occurrence") => {
                     self.occurrences.get_or_insert_default();
                 }
@@ -95,12 +166,24 @@ impl SemanticInventory {
             match path {
                 PropertyPathExpression::Link(predicate) => {
                     match predicate.as_str().strip_prefix(VOCABULARY_NAMESPACE) {
-                        Some("calls") => self.calls = true,
-                        Some("references") => self.references = true,
+                        Some("calls") => self.adjacency.calls = true,
+                        Some("references") => self.adjacency.references = true,
+                        Some("hasType") => {
+                            self.edges.relations = true;
+                            self.adjacency.type_uses = true;
+                        }
+                        Some("extends") => {
+                            self.edges.relations = true;
+                            self.adjacency.heritage.extends = true;
+                        }
+                        Some("implements") => {
+                            self.edges.relations = true;
+                            self.adjacency.heritage.implements = true;
+                        }
                         Some(
-                            "imports" | "aliases" | "extends" | "implements" | "declares" | "reads"
-                            | "writes" | "hasType" | "contains" | "overrides",
-                        ) => self.edges = true,
+                            "imports" | "aliases" | "declares" | "contains" | "overrides" | "reads"
+                            | "writes",
+                        ) => self.edges.relations = true,
                         Some("usages") => {
                             self.occurrences.get_or_insert_default();
                         }
@@ -119,6 +202,12 @@ impl SemanticInventory {
         }
         Some(())
     }
+}
+
+fn edge(patterns: &[TriplePattern], term: &TermPattern) -> bool {
+    patterns
+        .iter()
+        .any(|pattern| pattern.subject == *term && class(pattern) == Some("Edge"))
 }
 
 fn occurrence(patterns: &[TriplePattern], term: &TermPattern) -> bool {

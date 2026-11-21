@@ -175,7 +175,7 @@ fn producer_edge_without_extensions_serializes_without_the_field() {
         "kind": "call",
         "kinds": ["calls"],
         "to": "rift://symbol/pypi/pypi.org/click/python/click/core/echo",
-        "derivation": "resolution",
+        "provider": "static", "derivation": "resolution",
     });
     let edge: ProducerEdge = serde_json::from_value(wire.clone()).expect("deserialize");
     assert!(edge.extensions.is_empty());

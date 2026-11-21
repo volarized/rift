@@ -459,7 +459,7 @@ impl EdgePythonKinds {
         let range = byte_range(element)?;
         if annotation {
             facts.references.push(StaticReference {
-                range,
+                target: range,
                 role: ReferenceRole::Type,
             });
         } else if id == self.attribute {
@@ -487,13 +487,13 @@ impl EdgePythonKinds {
             }
             if !written || assignment.is_some_and(|parent| parent.kind_id() == self.augmented) {
                 facts.references.push(StaticReference {
-                    range,
+                    target: range,
                     role: ReferenceRole::Read,
                 });
             }
             if written {
                 facts.references.push(StaticReference {
-                    range,
+                    target: range,
                     role: ReferenceRole::Write,
                 });
             }

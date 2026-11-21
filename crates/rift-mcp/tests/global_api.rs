@@ -34,6 +34,10 @@ use tokio::{net::TcpListener, sync::Mutex, task::JoinHandle};
 /// The package the fixture collection holds, as `manager`, `name`, and `version`.
 pub(crate) const COLLECTED: (&str, &str, &str) = ("cargo", "demo", "1.0.0");
 
+/// The oldest release of [`COLLECTED`] whose history the fixture answers: the one that
+/// introduced each collected declaration.
+pub(crate) const INTRODUCING_RELEASE: &str = "rift://revision/cargo/crates.io/demo@0.9.0";
+
 /// The source unit every collected declaration lives in.
 pub(crate) const COLLECTED_UNIT: &str = "rift://source/cargo/crates.io/demo/src/lib.rs";
 
@@ -671,7 +675,29 @@ fn symbols(fixture: SymbolFixture, request: &Value) -> Value {
     };
     let hit = collected_hit(fixture, declaration, false);
     let binding = json!({"origin":hit["symbol"]["origin"],"unit":hit["unit"],"range":hit["range"],"line":hit["line"],"signature_indices":[],"type_indices":[],"documentation_indices":[]});
-    json!({"outcome":"found", "symbol":hit["symbol"], "declarations":[binding],"revision":release_revision(id)})
+    let mut found = json!({"outcome":"found", "symbol":hit["symbol"], "declarations":[binding],"revision":release_revision(id)});
+    if request["include"]["history"] == json!(true) {
+        found["history"] = release_history(id);
+    }
+    found
+}
+
+/// The release history of a collected `demo` symbol `id`: [`COLLECTED`] changed its body,
+/// and [`INTRODUCING_RELEASE`], the oldest release the fixture collected, introduced it.
+fn release_history(id: &str) -> Value {
+    let (manager, name, version) = COLLECTED;
+    json!({
+        "symbol": id,
+        "edges": [
+            {
+                "edge": "changed_in_release",
+                "revision": format!("rift://revision/{manager}/crates.io/{name}@{version}"),
+                "change": "body_changed"
+            },
+            {"edge": "introduced_in_release", "revision": INTRODUCING_RELEASE}
+        ],
+        "complete": true
+    })
 }
 
 /// The release revision the global API answers a package or runtime symbol `id` at: the one

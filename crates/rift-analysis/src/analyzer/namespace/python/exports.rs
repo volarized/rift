@@ -24,9 +24,22 @@ struct PythonReexport<'source> {
 
 fn established_module(
     file: &SelectedFile<'_>,
+    captured: &BTreeMap<&str, PackageSource<'_>>,
     prepared: &PreparedNamespace,
 ) -> Option<Vec<String>> {
-    if file.syntax.language() != &ShippedLanguage::Python.language() {
+    let syntax = file.syntax;
+    if syntax.language() != &ShippedLanguage::Python.language() {
+        return None;
+    }
+    // Selection pairs each file's syntax facts with the bytes they were parsed from, and
+    // the provider recorded the digest of those bytes. Membership by path, the byte
+    // length, and that recorded digest identify the captured source; comparing or
+    // hashing the content again ran over every selected file on every index pass.
+    if syntax.source_digest().is_none()
+        || captured
+            .get(file.path.as_str())
+            .is_none_or(|source| source.text().len() != file.source.len())
+    {
         return None;
     }
     let identity = prepared.anchors.get(file.path.as_str())?.get(".")?;
@@ -192,14 +205,14 @@ fn export(
 pub(in crate::analyzer::namespace) fn prepare(
     input: &NamespaceInput<'_>,
     selected: &[SelectedFile<'_>],
-    _captured: &BTreeMap<&str, PackageSource<'_>>,
+    captured: &BTreeMap<&str, PackageSource<'_>>,
     _roots: &[PackageImportRoot],
     prepared: &mut PreparedNamespace,
 ) {
     let mut modules = BTreeMap::new();
     let mut imports = Vec::new();
     for file in selected {
-        let Some(module) = established_module(file, prepared) else {
+        let Some(module) = established_module(file, captured, prepared) else {
             continue;
         };
         imports.extend(requests(file, &module, &mut prepared.unresolved_exports));

@@ -1,4 +1,5 @@
 mod graph_query;
+pub(crate) use graph_query::EngineInventoryCache;
 pub(crate) use graph_query::{QueryPageOptions, query_page, retrieval::collect_retrieval};
 mod symbol;
 use std::sync::{Arc, Mutex};
@@ -17,7 +18,10 @@ use serde::{Deserialize, Serialize};
 use super::{ReadAnswer, RiftMcp, ToolFailure, wire};
 
 const BYTES_MAX: usize = crate::global::candidates::CANDIDATE_BYTES_MAX;
-const SLOTS_MAX: usize = 256;
+// The default `[search.query] retained_views`, the rows' initial capacity.
+const SLOTS_DEFAULT: usize = 256;
+// The largest `[search.query] retained_views`, `QUERY_RETAINED_VIEWS_MAX`; a test pins it.
+const RELEASED_KEYS_MAX: usize = 4096;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -35,6 +39,9 @@ pub(crate) struct SearchCandidateResponse {
     pub(crate) root: String,
     pub(crate) owner: rift_protocol::identity::SymbolOwner,
     pub(crate) view: CapturedView,
+    /// The revision the captured candidates read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) revision: Option<rift_protocol::revision::Revision>,
     pub(crate) inputs: SearchCandidateInputs,
     pub(crate) ranking: rift_protocol::configuration::RankingConfiguration,
     pub(crate) results_max: usize,
@@ -49,9 +56,12 @@ pub(crate) enum SearchCandidateResult {
     Unavailable(rift_protocol::search_read::SearchUnavailable),
 }
 
+/// Captured candidate answers in least-recent-use order, oldest first.
 #[derive(Debug)]
 pub(crate) struct CandidateResponses {
     bytes: Mutex<Vec<SavedCandidateBytes>>,
+    /// Views whose rows were released to admit newer ones; locked after `bytes` only.
+    released: Mutex<std::collections::BTreeSet<String>>,
 }
 
 #[derive(Debug)]
@@ -64,7 +74,8 @@ struct SavedCandidateBytes {
 impl Default for CandidateResponses {
     fn default() -> Self {
         Self {
-            bytes: Mutex::new(Vec::with_capacity(SLOTS_MAX)),
+            bytes: Mutex::new(Vec::with_capacity(SLOTS_DEFAULT)),
+            released: Mutex::default(),
         }
     }
 }
@@ -150,20 +161,16 @@ impl RiftMcp {
         let normalized = crate::proxy::normalized_params(params);
         let selected = match params.view.as_ref() {
             Some(view) => {
-                let rows = self
-                    .candidate_responses
-                    .bytes
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let Some(row) = rows.iter().find(|row| row.id == view.as_str()) else {
-                    return Ok(Some(unavailable(
-                        SymbolUnavailableReason::ViewContext,
-                        None,
-                    )));
+                let read = self.candidate_responses.read_used(view.as_str(), |row| {
+                    serde_json::from_slice::<SavedResponse>(&row.bytes)
+                        .map(|saved| (saved, row.expires))
+                });
+                let Some(read) = read else {
+                    let reason = self.candidate_responses.missing_reason(view.as_str());
+                    return Ok(Some(unavailable(reason, None)));
                 };
-                let saved: SavedResponse =
-                    serde_json::from_slice(&row.bytes).map_err(transport_failure)?;
-                if row.expires <= SystemTime::now() {
+                let (saved, expires) = read.map_err(transport_failure)?;
+                if expires <= SystemTime::now() {
                     return Ok(Some(unavailable(
                         SymbolUnavailableReason::ViewExpired,
                         Some(saved.response.view),
@@ -206,6 +213,7 @@ impl RiftMcp {
             root: captured.root,
             owner: Some(captured.owner),
             view: captured.view.clone(),
+            revision: captured.revision,
             inputs: captured.inputs,
         }];
         pools.extend(captured.global);
@@ -337,19 +345,7 @@ impl RiftMcp {
             .get()
             .ok_or_else(|| unavailable("retained read material is unavailable"))?;
         if let Some(view) = &requested.view {
-            let response = self.saved_candidates(&requested.params, view)?;
-            let accepted = views
-                .captured_view(
-                    view.id.as_str(),
-                    std::path::Path::new(&response.root),
-                    &response.owner,
-                )
-                .map_err(read_failure)?
-                .map_err(|reason| unavailable(&format!("{reason:?}")))?;
-            if &accepted != view {
-                return Err(unavailable("captured view context does not match"));
-            }
-            return Ok(SearchCandidateResult::Captured(Box::new(response)));
+            return self.held_candidates(views, &requested.params, view, SystemTime::now());
         }
         validate_candidate_query(&requested.params)?;
         let (resolved, ranking, references, deadline) =
@@ -393,26 +389,33 @@ impl RiftMcp {
             .ok_or_else(|| unavailable("project root is not UTF-8"))?
             .to_owned();
         let owner = material.owner().clone();
+        let revision = resolved
+            .published
+            .reads
+            .served_revision()
+            .map_err(read_failure)?;
         let mut response = None;
+        let limits = rift_server::RetainedViewLimits::from(&configuration.query);
         views
-            .capture_with(material, |view| {
+            .capture_with(material, limits, |view| {
                 let answer = SearchCandidateResponse {
                     root,
                     owner,
                     view: view.clone(),
+                    revision: Some(revision.clone()),
                     inputs,
                     ranking: configuration.ranking,
                     results_max,
                     global,
                 };
-                self.save_candidates(requested.params, answer.clone())?;
+                self.save_candidates(requested.params, answer.clone(), limits.views_max())?;
                 response = Some(answer);
                 Ok(true)
             })
             .map_err(read_failure)?;
         response
             .map(|response| SearchCandidateResult::Captured(Box::new(response)))
-            .ok_or_else(|| unavailable("retained read material exceeds the byte or view bound"))
+            .ok_or_else(|| unavailable("retained read material exceeds the byte bound"))
     }
 
     async fn package_candidate_pool(
@@ -470,38 +473,86 @@ impl RiftMcp {
         &self,
         params: SearchParams,
         response: SearchCandidateResponse,
+        views_max: usize,
     ) -> Result<(), RiftError> {
         let id = response.view.id.as_str().to_owned();
         let expires = crate::proxy::captured_expiry(&response.view)?;
         let encoded = crate::proxy::encode_bounded(&SavedResponse { params, response }, BYTES_MAX)
             .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
-        self.candidate_responses.save_bytes(id, expires, encoded)
+        self.candidate_responses
+            .save_bytes(id, expires, encoded, views_max)
+    }
+
+    /// Answers the candidates `view` retained as of `now`, or the typed reason a `search`
+    /// page naming that view answers: `view_expired` once the view expired, else
+    /// `view_context`.
+    fn held_candidates(
+        &self,
+        views: &rift_server::LocalSymbolViews,
+        params: &SearchParams,
+        view: &CapturedView,
+        now: SystemTime,
+    ) -> Result<SearchCandidateResult, ToolFailure> {
+        use rift_protocol::symbol_read::SymbolUnavailableReason;
+        let refused = |reason| {
+            SearchCandidateResult::Unavailable(
+                rift_protocol::search_read::SearchUnavailable::Unavailable {
+                    reason,
+                    view: Some(view.clone()),
+                    warnings: Vec::new(),
+                },
+            )
+        };
+        let response = match self.saved_candidates(params, view, now)? {
+            Ok(response) => response,
+            Err(reason) => return Ok(refused(reason)),
+        };
+        let accepted = views.captured_view_at(
+            &view.id,
+            std::path::Path::new(&response.root),
+            &response.owner,
+            now,
+        );
+        match accepted {
+            Ok(accepted) if &accepted == view => {
+                Ok(SearchCandidateResult::Captured(Box::new(response)))
+            }
+            Ok(_) => Ok(refused(SymbolUnavailableReason::ViewContext)),
+            Err(reason) => Ok(refused(reason)),
+        }
     }
 
     fn saved_candidates(
         &self,
         params: &SearchParams,
         view: &CapturedView,
-    ) -> Result<SearchCandidateResponse, ToolFailure> {
-        let saved = self
-            .candidate_responses
-            .bytes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let bytes = saved
-            .iter()
-            .find(|row| row.id == view.id.as_str())
-            .ok_or_else(|| unavailable("captured candidates are unavailable"))?;
-        let saved: SavedResponse =
-            serde_json::from_slice(&bytes.bytes).map_err(transport_failure)?;
+        now: SystemTime,
+    ) -> Result<
+        Result<SearchCandidateResponse, rift_protocol::symbol_read::SymbolUnavailableReason>,
+        ToolFailure,
+    > {
+        use rift_protocol::symbol_read::SymbolUnavailableReason;
+        let held = self.candidate_responses.read_used(view.id.as_str(), |row| {
+            serde_json::from_slice::<SavedResponse>(&row.bytes).map(|saved| (saved, row.expires))
+        });
+        let Some(held) = held else {
+            let expired = crate::proxy::captured_expiry(view).map_err(read_failure)? <= now;
+            return Ok(Err(if expired {
+                SymbolUnavailableReason::ViewExpired
+            } else {
+                self.candidate_responses.missing_reason(view.id.as_str())
+            }));
+        };
+        let (saved, expires) = held.map_err(transport_failure)?;
+        if expires <= now {
+            return Ok(Err(SymbolUnavailableReason::ViewExpired));
+        }
         if crate::proxy::normalized_params(&saved.params) != crate::proxy::normalized_params(params)
             || &saved.response.view != view
         {
-            return Err(unavailable(
-                "captured candidate request context does not match",
-            ));
+            return Ok(Err(SymbolUnavailableReason::ViewContext));
         }
-        Ok(saved.response)
+        Ok(Ok(saved.response))
     }
 }
 
@@ -652,13 +703,21 @@ mod captured_search_startup_tests {
             .captured_view(captured.view.id.as_str(), &server.root, &captured.owner)?
             .map_err(|reason| format!("{reason:?}"))?;
         assert_eq!(selected, captured.view);
+        let now = std::time::SystemTime::now();
         let continued = server
-            .saved_candidates(&params, &selected)
-            .map_err(|failure| format!("{failure:?}"))?;
+            .saved_candidates(&params, &selected, now)
+            .map_err(|failure| format!("{failure:?}"))?
+            .map_err(|reason| format!("{reason:?}"))?;
         assert_eq!(continued.view, selected);
         let mut changed = params;
         changed.query = Some("beacon".to_owned());
-        assert!(server.saved_candidates(&changed, &selected).is_err());
+        assert_eq!(
+            server
+                .saved_candidates(&changed, &selected, now)
+                .map_err(|failure| format!("{failure:?}"))?
+                .err(),
+            Some(rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext)
+        );
         Ok(())
     }
 
@@ -743,69 +802,142 @@ mod captured_search_startup_tests {
 }
 
 impl CandidateResponses {
+    /// Saves one captured answer, releasing least recently used rows past either bound.
+    ///
+    /// Refuses only a duplicate view or an answer whose own bytes exceed `BYTES_MAX`;
+    /// a released row's later continuation answers `view_expired`. Each release scans the
+    /// rows once, at most `views_max` of them.
     fn save_bytes(
         &self,
         id: String,
         expires: SystemTime,
         encoded: Vec<u8>,
+        views_max: usize,
     ) -> Result<(), RiftError> {
         let mut saved = self
             .bytes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         saved.retain(|row| row.expires > SystemTime::now());
-        let retained = saved.iter().fold(
-            saved
-                .capacity()
-                .checked_mul(std::mem::size_of::<SavedCandidateBytes>())
-                .and_then(|bytes| bytes.checked_add(id.capacity()))
-                .and_then(|bytes| bytes.checked_add(encoded.capacity())),
-            |sum, row| {
-                sum.and_then(|bytes| bytes.checked_add(row.id.capacity()))
-                    .and_then(|bytes| bytes.checked_add(row.bytes.capacity()))
-            },
-        );
-        if saved.len() >= SLOTS_MAX
-            || retained.is_none_or(|bytes| bytes > BYTES_MAX)
-            || saved.iter().any(|row| row.id == id)
-        {
-            let stored_bytes = saved
-                .iter()
-                .try_fold(0usize, |sum, row| sum.checked_add(row.bytes.len()));
-            let stored_capacity = saved
-                .iter()
-                .try_fold(0usize, |sum, row| sum.checked_add(row.bytes.capacity()));
-            rift_tracing::warn!(
-                component = "mcp",
-                operation = "search_candidates",
-                rows = saved.len(),
-                views_max = SLOTS_MAX,
-                ?retained,
-                bytes_max = BYTES_MAX,
-                ?stored_bytes,
-                ?stored_capacity,
-                incoming_bytes = encoded.len(),
-                incoming_capacity = encoded.capacity(),
-                duplicate = saved.iter().any(|row| row.id == id),
-                "captured candidates exceed the byte or view bound"
-            );
+        let duplicate = saved.iter().any(|row| row.id == id);
+        let incoming = id.capacity().saturating_add(encoded.capacity());
+        let alone = retained_candidate_bytes(&saved[..0], saved.capacity(), incoming);
+        if duplicate || alone.is_none_or(|bytes| bytes > BYTES_MAX) {
+            refuse_candidates(&saved, &encoded, alone, views_max, duplicate);
             return Err(errors::server::read_unavailable()
                 .operation("search_candidates")
-                .detail("captured candidates exceed the byte or view bound")
+                .detail("captured candidates exceed the byte bound or repeat a retained view")
                 .error());
+        }
+        let mut released = Vec::new();
+        while !saved.is_empty()
+            && (saved.len() >= views_max
+                || retained_candidate_bytes(&saved, saved.capacity(), incoming)
+                    .is_none_or(|bytes| bytes > BYTES_MAX))
+        {
+            released.push(saved.remove(0).id);
         }
         saved.push(SavedCandidateBytes {
             id,
             expires,
             bytes: encoded,
         });
+        drop(saved);
+        self.release(released);
         Ok(())
     }
+
+    /// Records released view ids so a later continuation names its view expired.
+    fn release(&self, released: Vec<String>) {
+        if released.is_empty() {
+            return;
+        }
+        let mut keys = self
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        keys.extend(released);
+        while keys.len() > RELEASED_KEYS_MAX {
+            keys.pop_first();
+        }
+    }
+
+    /// Reads one row through `read` and marks it the most recently used.
+    ///
+    /// `read` runs while the rows are locked and must not call this store.
+    fn read_used<T>(&self, id: &str, read: impl FnOnce(&SavedCandidateBytes) -> T) -> Option<T> {
+        let mut saved = self
+            .bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let position = saved.iter().position(|row| row.id == id)?;
+        let row = saved.remove(position);
+        let answer = read(&row);
+        saved.push(row);
+        Some(answer)
+    }
+
+    /// Why no row answers `id`: released to admit newer rows, or never retained here.
+    fn missing_reason(&self, id: &str) -> rift_protocol::symbol_read::SymbolUnavailableReason {
+        use rift_protocol::symbol_read::SymbolUnavailableReason;
+        let released = self
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(id);
+        if released {
+            SymbolUnavailableReason::ViewExpired
+        } else {
+            SymbolUnavailableReason::ViewContext
+        }
+    }
+}
+
+/// Bytes `rows` and an incoming row of `incoming` bytes charge, with the table at
+/// `capacity` rows.
+fn retained_candidate_bytes(
+    rows: &[SavedCandidateBytes],
+    capacity: usize,
+    incoming: usize,
+) -> Option<usize> {
+    rows.iter().fold(
+        capacity
+            .checked_mul(std::mem::size_of::<SavedCandidateBytes>())
+            .and_then(|bytes| bytes.checked_add(incoming)),
+        |sum, row| {
+            sum.and_then(|bytes| bytes.checked_add(row.id.capacity()))
+                .and_then(|bytes| bytes.checked_add(row.bytes.capacity()))
+        },
+    )
+}
+
+fn refuse_candidates(
+    saved: &[SavedCandidateBytes],
+    encoded: &[u8],
+    retained: Option<usize>,
+    views_max: usize,
+    duplicate: bool,
+) {
+    let stored_bytes = saved
+        .iter()
+        .try_fold(0usize, |sum, row| sum.checked_add(row.bytes.len()));
+    rift_tracing::warn!(
+        component = "mcp",
+        operation = "search_candidates",
+        rows = saved.len(),
+        views_max,
+        ?retained,
+        bytes_max = BYTES_MAX,
+        ?stored_bytes,
+        incoming_bytes = encoded.len(),
+        duplicate,
+        "captured candidates exceed the byte bound or repeat a retained view"
+    );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BYTES_MAX, CandidateResponses, RiftMcp, SLOTS_MAX, SearchCandidateResult};
+    use super::{BYTES_MAX, CandidateResponses, RiftMcp, SLOTS_DEFAULT, SearchCandidateResult};
     use rmcp::model::CallToolRequestParams;
     use std::time::{Duration, SystemTime};
 
@@ -993,8 +1125,95 @@ mod tests {
         Ok(())
     }
 
+    /// #766: a continued candidate read names why its view is gone, as `search` pages do.
+    #[tokio::test]
+    async fn released_candidate_views_answer_typed_reasons() -> TestResult {
+        use rift_protocol::symbol_read::SymbolUnavailableReason;
+        let (_directory, assembled) = super::super::tests::starting_fixture().await?;
+        let initial = crate::validation::discover_initial_workspace(&assembled.context)
+            .await?
+            .ok_or("initial discovery was cancelled")?;
+        crate::validation::prepare_initial_workspace_from(&assembled.context, initial).await?;
+        let SearchCandidateResult::Captured(captured) = assembled
+            .server
+            .search_candidates_request(request()?)
+            .await?
+        else {
+            return Err("ready publication must capture candidates".into());
+        };
+        let views = assembled.server.local_views.get().ok_or("local views")?;
+        let params: super::SearchParams = serde_json::from_value(serde_json::json!({
+            "query": "beacon", "scope": "local", "target": "symbol"
+        }))?;
+        let reason = |answer: SearchCandidateResult| match answer {
+            SearchCandidateResult::Unavailable(
+                rift_protocol::search_read::SearchUnavailable::Unavailable { reason, view, .. },
+            ) => Ok((reason, view)),
+            SearchCandidateResult::Captured(_) => Err("a gone view must not answer candidates"),
+        };
+        let now = SystemTime::now();
+        let held = assembled
+            .server
+            .held_candidates(views, &params, &captured.view, now)
+            .map_err(|failure| format!("{failure:?}"))?;
+        assert!(matches!(held, SearchCandidateResult::Captured(_)));
+        let later = now + Duration::from_mins(16);
+        assert_eq!(
+            reason(
+                assembled
+                    .server
+                    .held_candidates(views, &params, &captured.view, later)
+                    .map_err(|failure| format!("{failure:?}"))?
+            )?,
+            (
+                SymbolUnavailableReason::ViewExpired,
+                Some(captured.view.clone())
+            )
+        );
+        let mut changed = params.clone();
+        changed.query = Some("other".to_owned());
+        assert_eq!(
+            reason(
+                assembled
+                    .server
+                    .held_candidates(views, &changed, &captured.view, now)
+                    .map_err(|failure| format!("{failure:?}"))?
+            )?
+            .0,
+            SymbolUnavailableReason::ViewContext
+        );
+        let mut unknown = captured.view.clone();
+        unknown.id = rift_protocol::symbol_read::CapturedViewId::parse("unknown.view")?;
+        let arguments = serde_json::json!({"params": params, "view": unknown});
+        let answer = assembled
+            .server
+            .search_candidates_request(
+                CallToolRequestParams::new("search_candidates")
+                    .with_arguments(serde_json::from_value(arguments)?),
+            )
+            .await
+            .map_err(|failure| format!("{failure:?}"))?;
+        let value = serde_json::to_value(&answer)?;
+        assert_eq!(value["outcome"], "unavailable", "{value}");
+        assert_eq!(value["reason"], "view_context", "{value}");
+        let mut expired = unknown;
+        expired.expires_at = "2000-01-01T00:00:00Z".to_owned();
+        assert_eq!(
+            reason(
+                assembled
+                    .server
+                    .held_candidates(views, &params, &expired, now)
+                    .map_err(|failure| format!("{failure:?}"))?
+            )?
+            .0,
+            SymbolUnavailableReason::ViewExpired
+        );
+        Ok(())
+    }
+
     #[test]
-    fn aggregate_capacity_refusal_preserves_original_candidate() -> TestResult {
+    fn aggregate_capacity_releases_the_least_recently_used_candidate() -> TestResult {
+        use rift_protocol::symbol_read::SymbolUnavailableReason;
         let responses = CandidateResponses::default();
         let id = String::from("first");
         let table_bytes = responses
@@ -1005,12 +1224,47 @@ mod tests {
             * std::mem::size_of::<super::SavedCandidateBytes>();
         let mut bytes = Vec::with_capacity(BYTES_MAX - table_bytes - id.capacity());
         bytes.push(7);
-        let capacity = bytes.capacity();
         let expires = SystemTime::now() + Duration::from_secs(60);
-        responses.save_bytes(id, expires, bytes)?;
+        responses.save_bytes(id, expires, bytes, SLOTS_DEFAULT)?;
+        responses.save_bytes(String::from("next"), expires, vec![8], SLOTS_DEFAULT)?;
+        let saved = responses
+            .bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].id, "next");
+        assert_eq!(saved[0].bytes, [8]);
+        drop(saved);
+        assert_eq!(
+            responses.missing_reason("first"),
+            SymbolUnavailableReason::ViewExpired
+        );
+        assert_eq!(
+            responses.missing_reason("never"),
+            SymbolUnavailableReason::ViewContext
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn candidate_bounds_follow_the_retained_view_bounds() {
+        let defaults = rift_protocol::query::QueryConfiguration::default();
+        assert_eq!(u64::try_from(SLOTS_DEFAULT), Ok(defaults.retained_views));
+        assert_eq!(
+            u64::try_from(super::RELEASED_KEYS_MAX),
+            Ok(rift_protocol::query::QUERY_RETAINED_VIEWS_MAX)
+        );
+    }
+
+    #[test]
+    fn oversized_candidate_refusal_preserves_retained_candidates() -> TestResult {
+        let responses = CandidateResponses::default();
+        let expires = SystemTime::now() + Duration::from_secs(60);
+        responses.save_bytes(String::from("first"), expires, vec![7], SLOTS_DEFAULT)?;
+        let oversized = Vec::with_capacity(BYTES_MAX);
         assert!(
             responses
-                .save_bytes(String::from("next"), expires, vec![8])
+                .save_bytes(String::from("oversized"), expires, oversized, SLOTS_DEFAULT)
                 .is_err()
         );
         let saved = responses
@@ -1020,7 +1274,6 @@ mod tests {
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].id, "first");
         assert_eq!(saved[0].bytes, [7]);
-        assert_eq!(saved[0].bytes.capacity(), capacity);
         assert_eq!(saved[0].expires, expires);
         Ok(())
     }
@@ -1038,35 +1291,53 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_slots_and_expiry_preserve_advertised_candidates() -> TestResult {
+    fn duplicate_slots_and_expiry_release_the_least_recently_used_candidate() -> TestResult {
         let responses = CandidateResponses::default();
         let expires = SystemTime::now() + Duration::from_secs(60);
-        responses.save_bytes(String::from("expired"), SystemTime::UNIX_EPOCH, vec![0])?;
-        for serial in 0..SLOTS_MAX {
-            responses.save_bytes(format!("view-{serial}"), expires, vec![1])?;
+        responses.save_bytes(
+            String::from("expired"),
+            SystemTime::UNIX_EPOCH,
+            vec![0],
+            SLOTS_DEFAULT,
+        )?;
+        for serial in 0..SLOTS_DEFAULT {
+            responses.save_bytes(format!("view-{serial}"), expires, vec![1], SLOTS_DEFAULT)?;
         }
         assert!(
             responses
-                .save_bytes(String::from("view-0"), expires, vec![2])
-                .is_err()
+                .save_bytes(String::from("view-0"), expires, vec![2], SLOTS_DEFAULT)
+                .is_err(),
+            "a retained view is never saved twice"
         );
-        assert!(
-            responses
-                .save_bytes(String::from("overflow"), expires, vec![3])
-                .is_err()
+        assert_eq!(
+            responses.read_used("view-0", |row| row.bytes.clone()),
+            Some(vec![1]),
+            "reading the oldest row makes it the most recently used"
         );
+        responses.save_bytes(String::from("overflow"), expires, vec![3], SLOTS_DEFAULT)?;
         let saved = responses
             .bytes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert_eq!(saved.len(), SLOTS_MAX);
-        assert_eq!(saved[0].id, "view-0");
-        assert_eq!(saved[0].bytes, [1]);
-        assert!(saved.iter().all(|row| row.expires == expires));
+        assert_eq!(saved.len(), SLOTS_DEFAULT);
         assert!(
             saved
                 .iter()
-                .all(|row| row.id != "expired" && row.id != "overflow")
+                .all(|row| row.id != "expired" && row.id != "view-1")
+        );
+        assert!(saved.iter().any(|row| row.id == "view-0"));
+        assert_eq!(saved.last().map(|row| row.id.as_str()), Some("overflow"));
+        drop(saved);
+        responses.save_bytes(String::from("narrow"), expires, vec![4], 2)?;
+        let saved = responses
+            .bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ids: Vec<_> = saved.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["overflow", "narrow"],
+            "a lowered bound releases down to it"
         );
         Ok(())
     }

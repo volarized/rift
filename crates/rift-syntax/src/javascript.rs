@@ -244,7 +244,10 @@ mod tests {
                 ("answer", true),
                 ("helper", true),
                 ("hidden", false),
-                ("start", true),
+                ("default", true),
+                ("default.answer", true),
+                ("default.run", true),
+                ("default.start", true),
             ]
         );
     }
@@ -307,7 +310,10 @@ mod tests {
                 ("helper", true),
                 ("start", true),
                 ("hidden", false),
-                ("stop", true),
+                ("default", true),
+                ("default.helper", true),
+                ("default.run", true),
+                ("default.stop", true),
             ]
         );
 
@@ -346,7 +352,14 @@ mod tests {
         assert_eq!(public_facts(&document), [("create", true)]);
 
         let document = analyze("function helper() {}\nmodule.exports = exports = { helper };\n");
-        assert_eq!(public_facts(&document), [("helper", true)]);
+        assert_eq!(
+            public_facts(&document),
+            [
+                ("helper", true),
+                ("default", true),
+                ("default.helper", true)
+            ]
+        );
     }
 
     /// An assignment marks nothing when its value is a function or class

@@ -1,6 +1,8 @@
 //! Workspace and map resources published by the server.
 
+use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
 use rift_protocol::map::WorkspaceMap;
+use rift_protocol::revision::Revision;
 use rift_protocol::workspace::WorkspaceResourcePage;
 use rmcp::ErrorData;
 use rmcp::model::{ReadResourceResult, Resource, ResourceContents, ResourceTemplate};
@@ -12,9 +14,23 @@ pub(crate) const MAP_URI: &str = "rift://map";
 /// The first workspace resource page.
 pub(crate) const WORKSPACE_URI: &str = "rift://workspace";
 /// The template a client expands to reach one workspace resource page.
-pub(crate) const WORKSPACE_TEMPLATE: &str = "rift://workspace{?page,max_results}";
+pub(crate) const WORKSPACE_TEMPLATE: &str = "rift://workspace{?page,max_results,revision}";
 /// The query prefix selecting one workspace resource page.
 const WORKSPACE_QUERY_PREFIX: &str = "rift://workspace?";
+/// Characters a revision IRI escapes as a workspace query value.
+const QUERY_VALUE: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'&')
+    .add(b'+')
+    .add(b'<')
+    .add(b'=')
+    .add(b'>')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}');
 /// The media type of the JSON content of a resource read, and of every listed resource.
 const RESOURCE_MEDIA_TYPE: &str = "application/json";
 /// The media type of the compact text content of a resource read.
@@ -47,7 +63,8 @@ pub(crate) fn declared_templates() -> Vec<ResourceTemplate> {
         ResourceTemplate::new(WORKSPACE_TEMPLATE, "workspace-page")
             .with_title("Workspace page")
             .with_description(
-                "One page of the workspace resource, selected by 1-based `page` and `max_results`.",
+                "One page of the workspace resource, selected by 1-based `page` and \
+                 `max_results`, at the `revision` an earlier page named.",
             )
             .with_mime_type(RESOURCE_MEDIA_TYPE),
     ]
@@ -59,12 +76,33 @@ pub(crate) fn is_workspace_uri(uri: &str) -> bool {
     uri == WORKSPACE_URI || uri.starts_with(WORKSPACE_QUERY_PREFIX)
 }
 
-/// The requested page and result count of one workspace resource read.
-pub(crate) fn workspace_page(uri: &str) -> Result<(u64, u64), ErrorData> {
+/// The page, result count, and pinned revision one workspace resource read requests.
+#[derive(Debug, PartialEq)]
+pub(crate) struct WorkspacePageRequest {
+    pub(crate) page: u64,
+    pub(crate) max_results: u64,
+    pub(crate) revision: Option<Revision>,
+}
+
+/// The URI of one workspace resource page at `revision`.
+pub(crate) fn workspace_page_uri(page: u64, max_results: u64, revision: &Revision) -> String {
+    format!(
+        "{WORKSPACE_QUERY_PREFIX}page={page}&max_results={max_results}&revision={}",
+        utf8_percent_encode(&revision.to_string(), QUERY_VALUE)
+    )
+}
+
+/// The requested page, result count, and revision of one workspace resource read.
+pub(crate) fn workspace_page(uri: &str) -> Result<WorkspacePageRequest, ErrorData> {
     let mut page = rift_protocol::read::PAGE_DEFAULT;
     let mut max_results = rift_protocol::read::MAX_RESULTS_DEFAULT;
+    let mut revision = None;
     if uri == WORKSPACE_URI {
-        return Ok((page, max_results));
+        return Ok(WorkspacePageRequest {
+            page,
+            max_results,
+            revision,
+        });
     }
     let query = uri.strip_prefix(WORKSPACE_QUERY_PREFIX).ok_or_else(|| {
         ErrorData::resource_not_found(format!("no resource is published at {uri:?}"), None)
@@ -80,6 +118,16 @@ pub(crate) fn workspace_page(uri: &str) -> Result<(u64, u64), ErrorData> {
                 None,
             ));
         }
+        if field == "revision" {
+            let value = percent_decode_str(value).decode_utf8().map_err(|_| {
+                ErrorData::invalid_params("revision must be a UTF-8 revision IRI", None)
+            })?;
+            revision = Some(
+                Revision::parse(&value)
+                    .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?,
+            );
+            continue;
+        }
         let value = value.parse::<u64>().map_err(|_| {
             ErrorData::invalid_params("page and max_results must be positive integers", None)
         })?;
@@ -88,7 +136,7 @@ pub(crate) fn workspace_page(uri: &str) -> Result<(u64, u64), ErrorData> {
             "max_results" => max_results = value,
             _ => {
                 return Err(ErrorData::invalid_params(
-                    "expected page or max_results",
+                    "expected page, max_results, or revision",
                     None,
                 ));
             }
@@ -101,7 +149,11 @@ pub(crate) fn workspace_page(uri: &str) -> Result<(u64, u64), ErrorData> {
         rift_protocol::workspace::WORKSPACE_SOURCE_UNITS_MAX as u64,
     )
     .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
-    Ok((page, max_results))
+    Ok(WorkspacePageRequest {
+        page,
+        max_results,
+        revision,
+    })
 }
 
 /// The typed answer one workspace resource read returns.
@@ -141,6 +193,7 @@ mod tests {
         MAP_URI, WORKSPACE_TEMPLATE, WORKSPACE_URI, declared_resources, declared_templates,
         is_workspace_uri, map_answer, rendered_workspace, workspace_page,
     };
+    use super::{Revision, WorkspacePageRequest, workspace_page_uri};
     use crate::output::resource_text;
     use rift_protocol::map::WorkspaceMap;
     use rift_protocol::read::{Digest, Pagination};
@@ -179,6 +232,7 @@ mod tests {
     fn sample_workspace_page() -> WorkspaceResourcePage {
         WorkspaceResourcePage {
             configuration_revision: Digest("3f9a1c2e".to_owned()),
+            revision: Revision::tree(&"a".repeat(64)).expect("tree revision"),
             languages: Vec::new(),
             source: Vec::new(),
             warnings: Vec::new(),
@@ -189,7 +243,7 @@ mod tests {
     #[test]
     fn workspace_bare_uri_selects_the_first_page() {
         let page = workspace_page(WORKSPACE_URI).expect("bare workspace URI is published");
-        assert_eq!(page, (1, 10));
+        assert_eq!((page.page, page.max_results, page.revision), (1, 10, None));
         assert!(is_workspace_uri(WORKSPACE_URI));
     }
 
@@ -198,7 +252,7 @@ mod tests {
         let uri = "rift://workspace?page=17";
 
         let page = workspace_page(uri).expect("workspace page URI is published");
-        assert_eq!(page, (17, 10));
+        assert_eq!((page.page, page.max_results), (17, 10));
         assert!(is_workspace_uri(uri));
     }
 
@@ -215,6 +269,46 @@ mod tests {
             let refusal = workspace_page(uri).expect_err("invalid page must be refused");
             assert_eq!(refusal.code, rmcp::model::ErrorCode::INVALID_PARAMS);
             assert!(refusal.message.contains("page"), "{refusal:?}");
+        }
+    }
+
+    /// #743: a page names the revision later pages pin, escaped or as written.
+    #[test]
+    fn workspace_query_pins_a_revision() {
+        let revision = Revision::parse("rift://revision/cargo/crates.io/demo@1.0.0+build")
+            .expect("release revision");
+        let uri = workspace_page_uri(2, 5, &revision);
+        assert_eq!(
+            uri,
+            "rift://workspace?page=2&max_results=5&revision=rift://revision/cargo/crates.io/demo@1.0.0%2Bbuild"
+        );
+        let selected = workspace_page(&uri).expect("pinned page URI is published");
+        assert_eq!(
+            selected,
+            WorkspacePageRequest {
+                page: 2,
+                max_results: 5,
+                revision: Some(revision),
+            }
+        );
+        let tree = format!("rift%3A%2F%2Frevision%2Ftree%2F{}", "b".repeat(64));
+        let selected = workspace_page(&format!("rift://workspace?revision={tree}"))
+            .expect("an escaped revision is accepted");
+        assert_eq!(
+            selected.revision,
+            Some(Revision::tree(&"b".repeat(64)).expect("tree revision"))
+        );
+        for uri in [
+            "rift://workspace?revision=main",
+            "rift://workspace?revision=%FF",
+            "rift://workspace?revision=rift://revision/tree/1&revision=rift://revision/tree/1",
+        ] {
+            let refusal = workspace_page(uri).expect_err("an invalid revision is refused");
+            assert_eq!(
+                refusal.code,
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                "{uri}"
+            );
         }
     }
 
@@ -260,7 +354,7 @@ mod tests {
 
         assert_eq!(
             contents(&rendered, uri).0,
-            "workspace · page 2/4, total 40 results\nnext · rift://workspace?page=3&max_results=10\n"
+            "workspace · page 2/4, total 40 results\nnext · rift://workspace?page=3&max_results=10&revision=rift://revision/tree/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
         );
     }
 

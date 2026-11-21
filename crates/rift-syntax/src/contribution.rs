@@ -5,7 +5,7 @@ use rift_core::{
     Contribution, ContributionKey, ContributionOrigin, ContributionReference, ExactKind,
     PortableSymbolFacts, ProjectPath, ProviderId, ProviderRevision, ProviderSymbolId,
     SourceApplicability, SourceKind, SourceLocation, SourceRange, SourceRevision, SourceUnitId,
-    SymbolId, TreeRevision, declaration_address, encode_path, symbol_identity,
+    SymbolId, TreeRevision, declaration_address, encode_path,
 };
 use rift_error::RiftError;
 use rift_provider::{ProviderPublication, PublicationLimits};
@@ -143,6 +143,12 @@ impl DocumentPlacement {
     pub fn with_aliases(mut self, aliases: Vec<PlacedAlias>) -> Self {
         self.aliases = aliases;
         self
+    }
+
+    /// The explicit aliases declared by this source unit.
+    #[must_use]
+    pub fn aliases(&self) -> &[PlacedAlias] {
+        &self.aliases
     }
 
     /// Number of additional export alias declarations.
@@ -319,12 +325,16 @@ impl SyntaxPublicationBuilder {
         additions: &mut Vec<Contribution>,
     ) -> Result<(), RiftError> {
         let language_segment = syntax.language().identity_segment();
+        let mut ordinals = BTreeMap::<&str, usize>::new();
         for alias in &placement.aliases {
-            let identity = symbol_identity(
+            let ordinal = ordinals.entry(&alias.qualified_name).or_default();
+            let identity = declaration_address(
                 &language_segment,
                 placement.identity_path(),
                 &alias.qualified_name,
+                *ordinal,
             );
+            *ordinal += 1;
             let provider_symbol = ProviderSymbolId::for_symbol(&identity)?;
             let target = ContributionReference::new(
                 self.provider.clone(),
@@ -554,7 +564,7 @@ mod tests {
                 .expect("portable facts")
                 .container_reference()
                 .map(|reference| reference.symbol().as_str()),
-            Some("rift://symbol/rust/src/lib.rs/Beacon")
+            Some("rift://symbol/rust/src/lib.rs/Beacon#1")
         );
         assert_eq!(
             run.facts().expect("portable facts").visibility_spelling(),
@@ -792,7 +802,7 @@ mod tests {
                 .expect("portable facts")
                 .container_reference()
                 .map(|reference| reference.symbol().as_str()),
-            Some("rift://symbol/rust/cargo/tokio@1.53.1/src/lib.rs/Runtime")
+            Some("rift://symbol/rust/cargo/tokio@1.53.1/src/lib.rs/Runtime#1")
         );
     }
 }

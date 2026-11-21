@@ -17,25 +17,24 @@ impl<'source> Index<'source> {
             if !work.charge() {
                 return;
             }
-            let occurrence =
-                self.edge_python_name(file, reference.range, work)
-                    .and_then(|target| {
-                        let mut occurrence = self.occurrence(
-                            file,
-                            reference.range,
-                            reference.range,
-                            reference.role,
-                            target,
-                        )?;
-                        // An annotation belongs to its declaration. Accesses belong to the enclosing callable.
-                        if reference.role != ReferenceRole::Type
-                            && let Some(caller) = file.enclosing_callable(reference.range)
-                        {
-                            occurrence.edge_from =
-                                self.python_identity(file, reference.range, caller);
-                        }
-                        Some(occurrence)
-                    });
+            let occurrence = self
+                .edge_python_name(file, reference.target, work)
+                .and_then(|target| {
+                    let mut occurrence = self.occurrence(
+                        file,
+                        reference.target,
+                        reference.target,
+                        reference.role,
+                        target,
+                    )?;
+                    // An annotation belongs to its declaration. Accesses belong to the enclosing callable.
+                    if reference.role != ReferenceRole::Type
+                        && let Some(caller) = file.enclosing_callable(reference.target)
+                    {
+                        occurrence.edge_from = self.python_identity(file, reference.target, caller);
+                    }
+                    Some(occurrence)
+                });
             result.record(occurrence);
         }
         for symbol in file.document.facts.symbols() {

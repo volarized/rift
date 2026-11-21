@@ -40,7 +40,7 @@ fn edge(from: &str, producer: Option<FactProducer>) -> Edge {
         "kind": "calls",
         "kinds": ["calls"],
         "to": ECHO,
-        "derivation": "resolution",
+        "provider": "static", "derivation": "resolution",
     }))
     .expect("edge");
     edge.producer = producer;

@@ -28,7 +28,11 @@ fn test_python_overloads_select_the_implementation_and_its_return_receiver() {
     let implementation = calls(&result, "main.py")
         .find(|edge| source_of(edge, source) == "build(1)")
         .expect("implementation call");
-    let range = implementation.target_binding.range();
+    let range = implementation
+        .target_binding
+        .as_ref()
+        .expect("implementation binding")
+        .range();
     let start = usize::try_from(range.start()).expect("implementation start");
     let end = usize::try_from(range.end()).expect("implementation end");
     assert_eq!(

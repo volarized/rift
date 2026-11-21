@@ -82,7 +82,7 @@ struct Hop {
     start: String,
     /// Identity of the symbol the hop reaches.
     reached: String,
-    /// The head line of the symbol: `↳ probably called, referenced`.
+    /// The head line of the symbol: `↳ probably called, referenced [static]`.
     head: String,
     /// Whether every kind phrase ends in ` by`, so the declaration line starts with `by `.
     by: bool,
@@ -179,6 +179,7 @@ fn hops_of(hit: &Value, at: &str) -> Result<Vec<Hop>, String> {
                 phrase.truncate(phrase.len() - BY_ENDING.len());
             }
         }
+        let provider = text("/edge/provider")?;
         let produced = match (
             text_at(hop, "/edge/producer/name"),
             text_at(hop, "/edge/producer/revision"),
@@ -190,7 +191,10 @@ fn hops_of(hit: &Value, at: &str) -> Result<Vec<Hop>, String> {
         hops.push(Hop {
             start,
             reached,
-            head: format!("{BRANCH} {guess}{}{produced}", phrases.join(", ")),
+            head: format!(
+                "{BRANCH} {guess}{} [{provider}]{produced}",
+                phrases.join(", ")
+            ),
             by,
         });
     }

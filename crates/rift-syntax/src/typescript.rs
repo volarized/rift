@@ -170,7 +170,7 @@ mod tests {
 
     /// Method and property signatures declare inside an interface or a class
     /// body, qualified by it, and a bodyless callable renders its own text as
-    /// its signature. A type literal's members declare nothing.
+    /// its signature. Type literal members keep the enclosing declaration.
     #[test]
     fn test_member_signatures_declare_inside_interface_and_class_bodies() {
         let text = "interface Array<T> {\n  length: number;\n  \
@@ -234,6 +234,8 @@ mod tests {
                     "function",
                     Some("function open(options: { flags: string; mode(): number }): void")
                 ),
+                ("open.flags", "property", None),
+                ("open.mode", "method", Some("mode(): number")),
             ]
         );
     }
@@ -368,7 +370,12 @@ mod tests {
         );
         assert_eq!(
             public("function parse(): void {}\nfunction hidden(): void {}\nexport = { parse };\n"),
-            [("parse".to_owned(), true), ("hidden".to_owned(), false)]
+            [
+                ("parse".to_owned(), true),
+                ("hidden".to_owned(), false),
+                ("default".to_owned(), true),
+                ("default.parse".to_owned(), true)
+            ]
         );
         assert_eq!(
             public("function helper(): void {}\nexport as namespace helper;\n"),

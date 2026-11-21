@@ -818,7 +818,7 @@ class Corpus:
             )
         anchor = (
             {
-                "bun": "rift://symbol/local/rust/bun_bundler/defines/TEST",
+                "bun": "rift://symbol/local/rust/bun_bundler/defines/const_default_define_value/TEST",
                 "fastapi": "rift://symbol/local/python/fastapi/routing/APIRouter",
             }.get(self.pin.name)
             if minimum == SYMBOL_COUNT
@@ -1175,7 +1175,7 @@ class Corpus:
         require(bool(canonical), "symbol pool has no established canonical identities")
         anchor = min(canonical)
         if self.pin.name == "bun":
-            anchor = "rift://symbol/local/rust/bun_bundler/defines/TEST"
+            anchor = "rift://symbol/local/rust/bun_bundler/defines/const_default_define_value/TEST"
             require(
                 anchor in canonical,
                 "Bun lost its established Rust TEST identity",
@@ -1640,7 +1640,7 @@ class Corpus:
     async def require_linked_reads(self, client: Client) -> None:
         anchors = {
             "bun": (
-                "rift://symbol/local/rust/bun_bundler/defines/TEST",
+                "rift://symbol/local/rust/bun_bundler/defines/const_default_define_value/TEST",
                 "src/bundler/defines.rs",
             ),
             "nextjs": (
@@ -1850,7 +1850,7 @@ class Corpus:
                     and answer.get("reason") == "insufficient_coverage",
                     "incomplete lexical ranking reported a complete answer",
                 )
-                anchor = "rift://symbol/local/rust/bun_bundler/defines/TEST"
+                anchor = "rift://symbol/local/rust/bun_bundler/defines/const_default_define_value/TEST"
                 captured = await client.call(
                     "search",
                     {"query": f"SELECT ?name {{ <{anchor}> a :Symbol; :name ?name }}"},

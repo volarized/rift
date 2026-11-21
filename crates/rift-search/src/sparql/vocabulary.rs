@@ -14,6 +14,8 @@ pub const VOCABULARY_NAMESPACE: &str = "urn:rift:vocabulary:";
 /// One class a graph resource is typed with through `rdf:type`.
 #[derive(Clone, Copy, Debug, Eq, Hash, IntoStaticStr, PartialEq, VariantArray)]
 pub enum VocabularyClass {
+    /// One directed edge between symbols.
+    Edge,
     /// A logical, timeless unit of code.
     Symbol,
     /// A physical part of a symbol, addressed by its content.
@@ -32,11 +34,17 @@ pub enum VocabularyClass {
 #[derive(Clone, Copy, Debug, Eq, Hash, IntoStaticStr, PartialEq, VariantArray)]
 #[strum(serialize_all = "camelCase")]
 pub enum VocabularyProperty {
+    /// The analysis that produced an edge.
+    Provider,
+    /// The symbol an edge starts at.
+    From,
+    /// The symbol an edge points at.
+    To,
     /// The name of a symbol, as written in source.
     Name,
     /// The selected revision of a symbol.
     Revision,
-    /// The declaration or syntax kind.
+    /// The declaration, syntax, occurrence, or edge kind.
     Kind,
     /// The language identity segment.
     Language,
@@ -70,9 +78,9 @@ pub enum VocabularyProperty {
     Extends,
     /// The source fulfils the target's interface.
     Implements,
-    /// The source contains the target declaration.
+    /// The source contains the target within its scope.
     Contains,
-    /// The source overrides the target member.
+    /// The source replaces the target inherited from a supertype.
     Overrides,
     /// The source declares the target.
     Declares,
@@ -135,6 +143,7 @@ pub struct PropertyDefinition {
     pub description: &'static str,
 }
 
+const EDGE: VocabularyResource = VocabularyResource::Class(VocabularyClass::Edge);
 const SYMBOL: VocabularyResource = VocabularyResource::Class(VocabularyClass::Symbol);
 const SYNTAX_ELEMENT: VocabularyResource =
     VocabularyResource::Class(VocabularyClass::SyntaxElement);
@@ -154,6 +163,7 @@ impl VocabularyClass {
     #[must_use]
     pub const fn description(self) -> &'static str {
         match self {
+            Self::Edge => "One directed edge between symbols, with its provider and derivation.",
             Self::Symbol => {
                 "A logical, timeless unit of code: `rift://symbol/<owner>/<language>/<qualified path>`. Several declarations of one path are several facets of one symbol."
             }
@@ -194,6 +204,13 @@ impl VocabularyProperty {
         use VocabularyResource::{Range, Statement};
         use VocabularyValue::{Integer, OneOf, Resource, String};
         let (subjects, object, description): (&'static [VocabularyResource], _, _) = match self {
+            Self::Provider => (
+                &[EDGE],
+                String,
+                "The analysis that produced the edge: `static`, `engine`, or `lsp`.",
+            ),
+            Self::From => (&[EDGE], Resource(SYMBOL), "The symbol the edge starts at."),
+            Self::To => (&[EDGE], Resource(SYMBOL), "The symbol the edge points at."),
             Self::Name => (
                 &[SYMBOL],
                 String,
@@ -205,9 +222,9 @@ impl VocabularyProperty {
                 "The revision at which the server read the symbol's facts.",
             ),
             Self::Kind => (
-                &[SYMBOL, SYNTAX_ELEMENT, OCCURRENCE],
+                &[SYMBOL, SYNTAX_ELEMENT, OCCURRENCE, EDGE],
                 String,
-                "The declaration kind of a symbol, or the syntax kind of a syntax element, as its language's provider names it.",
+                "The kind of the symbol, syntax element, occurrence, or edge, as its provider names it.",
             ),
             Self::Language => (
                 &[SYMBOL, SYNTAX_ELEMENT],
@@ -284,12 +301,12 @@ impl VocabularyProperty {
             Self::Contains => (
                 &[SYMBOL],
                 Resource(SYMBOL),
-                "The source contains the target declaration.",
+                "The source contains the target within its scope.",
             ),
             Self::Overrides => (
                 &[SYMBOL],
                 Resource(SYMBOL),
-                "The source overrides the target member.",
+                "The source replaces the target inherited from a supertype.",
             ),
             Self::Declares => (
                 &[SYMBOL],

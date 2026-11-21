@@ -21,6 +21,7 @@ const SYNTAX_ELEMENT_PAGES_MAX: usize = 64;
 pub(super) struct ExactFacts {
     revision: RevisionIri,
     symbol: Option<Box<Symbol>>,
+    history: Option<rift_protocol::read::SymbolHistory>,
     kinds: Vec<SyntaxElement>,
     source: bool,
     warnings: Vec<ReadWarning>,
@@ -43,6 +44,12 @@ impl ExactFacts {
             language: &symbol.language,
             revision: &self.revision,
         })?;
+        if let Some(history) = &self.history {
+            if !history.complete {
+                return Err(coverage_failure());
+            }
+            dataset.insert_history(history)?;
+        }
         for syntax_element in &self.kinds {
             dataset.insert_declared_syntax_element(id, syntax_element, self.source)?;
         }
@@ -60,6 +67,7 @@ impl RiftMcp {
         let facets = query.syntax_element_selection();
         let selection = facets
             .map(|selected| selected.symbols)
+            .or_else(|| query.history_selection())
             .or_else(|| query.symbol_selection());
         let Some(SymbolSelection::Identified(id)) = selection else {
             return Ok(Ok(None));
@@ -78,24 +86,31 @@ impl RiftMcp {
             )));
         };
         let id = SymbolId(id.to_owned());
-        let answer = self
-            .global
-            .exact_symbol(&configuration, &exact_request(&id, &revision))
-            .await?;
+        let mut request = exact_request(&id, &revision);
+        request.include.history = query.history_selection().is_some();
+        let answer = self.global.exact_symbol(&configuration, &request).await?;
         if answer.revision().is_some_and(|answer| answer != &revision) {
             return Ok(Err(unavailable(SymbolUnavailableReason::ViewContext)));
         }
         let mut result = ExactFacts {
             revision: RevisionIri::parse(&revision.to_string())?,
             symbol: None,
+            history: None,
             kinds: Vec::new(),
             source: facets.is_some_and(|selected| selected.source),
             warnings: Vec::new(),
         };
         match answer {
             GetSymbolResult::Found {
-                symbol, warnings, ..
+                symbol,
+                history,
+                warnings,
+                ..
             } => {
+                if request.include.history && history.is_none() {
+                    return Err(coverage_failure());
+                }
+                result.history = history;
                 result.symbol = Some(symbol);
                 result.warnings = warnings;
             }

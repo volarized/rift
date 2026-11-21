@@ -12,7 +12,7 @@ use rift_protocol::workspace::{
 use super::facts::{Facts, quoted_value, wire_name};
 use super::layout::{self, Sections};
 use crate::output::text::{TextError, TextWriter};
-use crate::resource::WORKSPACE_URI;
+use crate::resource::workspace_page_uri;
 
 /// Levels that put `include` and `exclude` lines under their language.
 const PATTERN_DEPTH: usize = 1;
@@ -23,6 +23,7 @@ pub(super) fn answer(out: &mut TextWriter, page: &WorkspaceResourcePage) -> Resu
         languages,
         source,
         pagination,
+        revision,
         ..
     } = page;
     let mut header = Facts::default();
@@ -54,8 +55,8 @@ pub(super) fn answer(out: &mut TextWriter, page: &WorkspaceResourcePage) -> Resu
         out.raw_line(
             0,
             &format!(
-                "next · {WORKSPACE_URI}?page={next}&max_results={}",
-                pagination.max_results
+                "next · {}",
+                workspace_page_uri(next, pagination.max_results, revision)
             ),
         )?;
     }

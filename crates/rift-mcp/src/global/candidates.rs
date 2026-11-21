@@ -28,6 +28,9 @@ pub(crate) struct SearchCandidatePool {
     pub(crate) backend: String,
     pub(crate) root: String,
     pub(crate) view: CapturedView,
+    /// The revision a project pool was captured at; absent for package candidates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) revision: Option<rift_protocol::revision::Revision>,
     pub(crate) inputs: SearchCandidateInputs,
 }
 
@@ -70,6 +73,7 @@ pub(crate) fn package_candidate_pool(
         owner: None,
         root,
         view,
+        revision: None,
         inputs: rift_server::SearchCandidateInputs {
             precise: vec![rift_server::SearchCandidateInput {
                 kind: RankingInputKind::Lexical,
@@ -221,6 +225,7 @@ mod tests {
                     .expect("view"),
                 expires_at: "2026-10-11T01:00:00Z".to_owned(),
             },
+            revision: None,
             inputs: SearchCandidateInputs {
                 precise: vec![SearchCandidateInput {
                     kind: RankingInputKind::Identifier,

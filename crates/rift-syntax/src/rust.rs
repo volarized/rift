@@ -45,6 +45,10 @@ enum RustSymbolKind {
     Union,
     /// Associated type a trait declares.
     AssociatedType,
+    /// Implementation of a named type.
+    Impl,
+    /// A local binding whose value is a closure.
+    Closure,
 }
 
 impl RustSymbolKind {
@@ -64,13 +68,15 @@ impl RustSymbolKind {
             Self::Field => "field_declaration",
             Self::Union => "union_item",
             Self::AssociatedType => "associated_type",
+            Self::Impl => "impl_item",
+            Self::Closure => "let_declaration",
         }
     }
 
     /// Portable kinds for this kind, before visibility adds `Public`.
     fn kinds(self) -> Vec<SymbolKind> {
         match self {
-            Self::Function => vec![SymbolKind::Value, SymbolKind::Callable],
+            Self::Function | Self::Closure => vec![SymbolKind::Value, SymbolKind::Callable],
             Self::Struct | Self::Enum | Self::Union => vec![SymbolKind::Type],
             Self::Trait => vec![
                 SymbolKind::Type,
@@ -78,6 +84,7 @@ impl RustSymbolKind {
                 SymbolKind::MemberContainer,
             ],
             Self::Field => vec![SymbolKind::Value, SymbolKind::Member],
+            Self::Impl => vec![SymbolKind::MemberContainer],
             Self::AssociatedType => vec![SymbolKind::Type, SymbolKind::Member],
             Self::TypeAlias => vec![SymbolKind::Type, SymbolKind::Alias],
             Self::Module => vec![SymbolKind::Namespace, SymbolKind::Module],
@@ -97,9 +104,12 @@ impl RustSymbolKind {
             | Self::Trait
             | Self::Module
             | Self::Variant
-            | Self::Union => Some(RustGrammarField::Body),
+            | Self::Union
+            | Self::Impl => Some(RustGrammarField::Body),
             Self::Constant | Self::Static => Some(RustGrammarField::Value),
-            Self::TypeAlias | Self::Macro | Self::Field | Self::AssociatedType => None,
+            Self::TypeAlias | Self::Macro | Self::Field | Self::AssociatedType | Self::Closure => {
+                None
+            }
         }
     }
 }
@@ -112,6 +122,10 @@ impl RustSymbolKind {
 /// arbitrary kind string is fallible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, VariantArray)]
 enum RustGrammarSyntaxKind {
+    /// `let_declaration` binding.
+    LetDeclaration,
+    /// `closure_expression` value.
+    ClosureExpression,
     /// `const_item` declaration.
     ConstItem,
     /// `enum_item` declaration.
@@ -158,6 +172,8 @@ impl RustGrammarSyntaxKind {
     /// Returns grammar spelling from tree-sitter-rust `node-types.json`.
     const fn as_str(self) -> &'static str {
         match self {
+            Self::LetDeclaration => "let_declaration",
+            Self::ClosureExpression => "closure_expression",
             Self::ConstItem => "const_item",
             Self::EnumItem => "enum_item",
             Self::EnumVariant => "enum_variant",
@@ -190,6 +206,8 @@ impl RustGrammarSyntaxKind {
 
     const fn symbol_kind(self) -> Option<RustSymbolKind> {
         match self {
+            Self::LetDeclaration => Some(RustSymbolKind::Closure),
+            Self::ImplItem => Some(RustSymbolKind::Impl),
             Self::FunctionItem | Self::FunctionSignatureItem => Some(RustSymbolKind::Function),
             Self::StructItem => Some(RustSymbolKind::Struct),
             Self::EnumItem => Some(RustSymbolKind::Enum),
@@ -203,7 +221,7 @@ impl RustGrammarSyntaxKind {
             Self::FieldDeclaration => Some(RustSymbolKind::Field),
             Self::UnionItem => Some(RustSymbolKind::Union),
             Self::AssociatedType => Some(RustSymbolKind::AssociatedType),
-            Self::ImplItem
+            Self::ClosureExpression
             | Self::VisibilityModifier
             | Self::DeclarationList
             | Self::FieldDeclarationList
@@ -239,6 +257,8 @@ enum RustGrammarField {
     Value,
     /// `trait` field on an `impl_item` that implements a trait.
     Trait,
+    /// `pattern` field on a local binding.
+    Pattern,
 }
 
 impl RustGrammarField {
@@ -249,6 +269,7 @@ impl RustGrammarField {
             Self::Body => "body",
             Self::Value => "value",
             Self::Trait => "trait",
+            Self::Pattern => "pattern",
         }
     }
 }
@@ -406,7 +427,7 @@ impl SyntaxProvider for RustSyntaxProvider {
         let tree = parser
             .parse(parsed.as_ref(), None)
             .ok_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())?;
-        let mut capture = crate::static_analysis::Capture::for_rust(source.text);
+        let mut capture = crate::static_analysis::Capture::for_rust(source.text, limits);
         let rules = RustGrammarRules {
             traits: file_traits(tree.root_node(), source.text),
         };
@@ -582,6 +603,19 @@ impl GrammarRules for RustGrammarRules {
     fn name_range(&self, syntax_element: Node<'_>) -> Result<Option<crate::ByteRange>, RiftError> {
         syntax_element
             .child_by_field_name(RustGrammarField::Name.as_str())
+            .or_else(|| {
+                (RustGrammarSyntaxKind::from_kind(syntax_element.kind())
+                    == Some(RustGrammarSyntaxKind::LetDeclaration))
+                .then(|| syntax_element.child_by_field_name(RustGrammarField::Pattern.as_str()))
+                .flatten()
+            })
+            .or_else(|| {
+                (RustGrammarSyntaxKind::from_kind(syntax_element.kind())
+                    == Some(RustGrammarSyntaxKind::ImplItem))
+                .then(|| syntax_element.child_by_field_name(RustGrammarField::Type.as_str()))
+                .flatten()
+                .map(implemented_type)
+            })
             .map(extract::byte_range)
             .transpose()
     }
@@ -637,10 +671,10 @@ impl GrammarRules for RustGrammarRules {
                 let name = syntax_element.child_by_field_name(RustGrammarField::Name.as_str())?;
                 text.get(name.byte_range()).map(Into::into)
             }
+            RustGrammarSyntaxKind::LetDeclaration => declaration_name(syntax_element, text),
             RustGrammarSyntaxKind::ImplItem => {
                 let item = syntax_element.child_by_field_name(RustGrammarField::Type.as_str())?;
-                text.get(implemented_type(item).byte_range())
-                    .map(|value| value.split_whitespace().collect::<String>())
+                implemented_type_name(item, text)
             }
             _ => None,
         }
@@ -687,7 +721,36 @@ fn rust_parser() -> Result<Parser, RiftError> {
 }
 
 fn declaration_name(syntax_element: Node<'_>, text: &str) -> Option<String> {
-    let name = syntax_element.child_by_field_name(RustGrammarField::Name.as_str())?;
+    if syntax_element.kind() == RustGrammarSyntaxKind::ImplItem.as_str() {
+        return implemented_type_name(
+            syntax_element.child_by_field_name(RustGrammarField::Type.as_str())?,
+            text,
+        );
+    }
+    if RustGrammarSyntaxKind::from_kind(syntax_element.kind())
+        == Some(RustGrammarSyntaxKind::LetDeclaration)
+    {
+        let value = syntax_element.child_by_field_name(RustGrammarField::Value.as_str())?;
+        if RustGrammarSyntaxKind::from_kind(value.kind())
+            != Some(RustGrammarSyntaxKind::ClosureExpression)
+        {
+            return None;
+        }
+        let name = syntax_element.child_by_field_name(RustGrammarField::Pattern.as_str())?;
+        return text
+            .get(name.byte_range())
+            .filter(|name| *name != "_" && name.chars().all(|c| c.is_alphanumeric() || c == '_'))
+            .map(str::to_owned);
+    }
+    let name = syntax_element
+        .child_by_field_name(RustGrammarField::Name.as_str())
+        .or_else(|| {
+            (RustGrammarSyntaxKind::from_kind(syntax_element.kind())
+                == Some(RustGrammarSyntaxKind::ImplItem))
+            .then(|| syntax_element.child_by_field_name(RustGrammarField::Type.as_str()))
+            .flatten()
+            .map(implemented_type)
+        })?;
     text.get(name.byte_range()).map(Into::into)
 }
 
@@ -709,6 +772,71 @@ fn implemented_type(syntax_element: Node<'_>) -> Node<'_> {
     syntax_element
         .child_by_field_name(RustGrammarField::Type.as_str())
         .unwrap_or(syntax_element)
+}
+
+/// References retain mutability and slices retain their element type. Lifetimes
+/// and generic arguments do not change the declaration's logical owner name.
+fn implemented_type_name(element: Node<'_>, text: &str) -> Option<String> {
+    enum Part<'tree> {
+        Type(Node<'tree>),
+        ArrayEnd(Option<Node<'tree>>),
+    }
+    static KINDS: OnceLock<([u16; 4], [u16; 3])> = OnceLock::new();
+    let (kinds, fields) = KINDS.get_or_init(|| {
+        let grammar = rust_grammar();
+        (
+            [
+                "generic_type",
+                "reference_type",
+                "mutable_specifier",
+                "array_type",
+            ]
+            .map(|kind| grammar.id_for_node_kind(kind, true)),
+            ["type", "length", "element"].map(|field| {
+                grammar
+                    .field_id_for_name(field)
+                    .expect("pinned type field")
+                    .get()
+            }),
+        )
+    });
+    let mut pending = vec![Part::Type(element)];
+    let mut name = String::new();
+    // Each part visits one type child or closes it, bounded by syntax depth.
+    while let Some(part) = pending.pop() {
+        match part {
+            Part::ArrayEnd(length) => {
+                if let Some(length) = length {
+                    name.push(';');
+                    name.extend(text.get(length.byte_range())?.split_whitespace());
+                }
+                name.push(']');
+            }
+            Part::Type(element) => match element.kind_id() {
+                kind if kind == kinds[0] => {
+                    pending.push(Part::Type(element.child_by_field_id(fields[0])?));
+                }
+                kind if kind == kinds[1] => {
+                    name.push('&');
+                    let mut cursor = element.walk();
+                    if element
+                        .named_children(&mut cursor)
+                        .any(|child| child.kind_id() == kinds[2])
+                    {
+                        name.push_str("mut ");
+                    }
+                    pending.push(Part::Type(element.child_by_field_id(fields[0])?));
+                }
+                kind if kind == kinds[3] => {
+                    name.push('[');
+                    pending.push(Part::ArrayEnd(element.child_by_field_id(fields[1])));
+                    pending.push(Part::Type(element.child_by_field_id(fields[2])?));
+                }
+                _ => name.extend(text.get(element.byte_range())?.split_whitespace()),
+            },
+        }
+    }
+    Some(name)
 }
 
 /// The attribute that exports a `macro_rules!` macro from its crate.
@@ -840,6 +968,13 @@ fn body_range(
     syntax_element: Node<'_>,
     kind: RustSymbolKind,
 ) -> Result<Option<ByteRange>, RiftError> {
+    if kind == RustSymbolKind::Closure {
+        return syntax_element
+            .child_by_field_name(RustGrammarField::Value.as_str())
+            .and_then(|value| value.child_by_field_name(RustGrammarField::Body.as_str()))
+            .map(extract::byte_range)
+            .transpose();
+    }
     let Some(field) = kind.body_field() else {
         return Ok(None);
     };
@@ -945,13 +1080,16 @@ mod tests {
             .iter()
             .map(|symbol| symbol.qualified_name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(names, ["café", "café::Item", "café::Item::load"]);
+        assert_eq!(
+            names,
+            ["café", "café::Item", "café::Item", "café::Item::load"]
+        );
         assert_eq!(document.symbols()[0].visibility.as_deref(), Some("pub"));
         assert_eq!(
             document.symbols()[1].visibility.as_deref(),
             Some("pub(crate)")
         );
-        assert_eq!(document.symbols()[2].visibility.as_deref(), Some("private"));
+        assert_eq!(document.symbols()[3].visibility.as_deref(), Some("private"));
         assert_eq!(document.path(), &path());
         assert_eq!(document.language().name, "rust");
         let load = text.find("load").expect("fixture contains method") as u64;
@@ -1078,7 +1216,10 @@ mod tests {
             .iter()
             .map(|symbol| symbol.container.as_deref())
             .collect::<Vec<_>>();
-        assert_eq!(containers, [None, Some("café"), Some("café::Item")]);
+        assert_eq!(
+            containers,
+            [None, Some("café"), Some("café"), Some("café::Item")]
+        );
     }
 
     /// The qualified name the index holds for a method of a generic `impl`
@@ -1104,7 +1245,9 @@ mod tests {
                 "Holder",
                 "Holder::store",
                 "Plain",
+                "Holder",
                 "Holder::run",
+                "Plain",
                 "Plain::run"
             ]
         );
@@ -1115,7 +1258,15 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             containers,
-            [None, Some("Holder"), None, Some("Holder"), Some("Plain")]
+            [
+                None,
+                Some("Holder"),
+                None,
+                None,
+                Some("Holder"),
+                None,
+                Some("Plain")
+            ]
         );
     }
 
@@ -1271,16 +1422,24 @@ mod tests {
             names,
             [
                 "Plain",
+                "Plain",
                 "Plain::default",
+                "Plain",
                 "Plain::clone",
+                "Plain",
                 "Measure",
                 "Measure::size",
                 "call",
                 "old",
                 "closure",
+                "closure::f",
             ]
         );
-        let call = &document.symbols()[5];
+        let call = document
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == "call")
+            .expect("call declaration");
         assert_eq!(
             call.signatures[0].display,
             "pub fn call<F: [const] FnOnce() -> u8>(f: F) -> u8"

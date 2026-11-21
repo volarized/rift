@@ -12,8 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Maximum requests awaiting a response at once. The session is
-/// request-scoped and sequential; pending entries above one exist only for
-/// requests a caller cancelled mid-read.
+/// request-scoped, with bounded batches and responses left by cancelled reads.
 pub const PENDING_REQUESTS_MAX: usize = 32;
 
 /// The JSON-RPC protocol version every envelope carries.
@@ -47,6 +46,11 @@ impl Correlation {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Requests that still await a response, including cancelled reads.
+    pub(crate) fn pending_count(&self) -> usize {
+        self.pending.len()
     }
 
     /// Allocates the id for one outgoing request and marks it pending.

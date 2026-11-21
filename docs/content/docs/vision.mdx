@@ -189,6 +189,13 @@ the project becomes the declaration whose calls Rift requests.
 <VersionBadge version="planned" inline /> The global index will support traversal within and
 between OSS packages.
 
+#### Edge sources
+
+Each edge names the analysis that produced it through its
+[`provider`](/docs/developer/protocol/core#edge-provider) field. Static analysis captured
+into the index is `static`, an embedded language engine such as ty is `engine`, and a language
+server reached through LSP is `lsp`. [Edge queries](/docs/mcp#edge-provider) can filter by this field.
+
 ### Documentation
 
 <VersionBadge version="v0.0.44" />

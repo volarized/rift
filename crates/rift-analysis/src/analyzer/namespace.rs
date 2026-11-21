@@ -12,7 +12,7 @@ use crate::{ExactPackageInput, NamespaceInput, PackageImportRoot, PackageImportR
 mod errors;
 pub(crate) mod python;
 mod rust;
-mod typescript;
+pub(crate) mod typescript;
 
 use self::errors::retain_valid_declarations;
 
@@ -57,11 +57,20 @@ pub(crate) struct PreparedNamespace {
 }
 
 pub(crate) fn placed_aliases(
-    prepared: &PreparedNamespace,
+    input: &NamespaceInput<'_>,
+    prepared: &mut PreparedNamespace,
     selected: &[SelectedFile<'_>],
     placements: &[&rift_syntax::DocumentPlacement],
+    aliases_max: usize,
     invalid: impl Fn() -> rift_error::RiftError,
 ) -> Result<BTreeMap<String, Vec<rift_syntax::PlacedAlias>>, rift_error::RiftError> {
+    crate::static_resolution::prepare_javascript_reexports(
+        input,
+        prepared,
+        selected,
+        placements,
+        aliases_max,
+    );
     let positions = selected
         .iter()
         .enumerate()
@@ -196,13 +205,15 @@ fn prepare_documents(
         if !document || language.dialect.is_some() {
             continue;
         }
-        let Some(source) = captured
-            .get(file.path.as_str())
-            .filter(|source| source.text() == file.source)
-        else {
-            continue;
-        };
-        if file.syntax.source_digest() != Some(&source.source_digest()) {
+        // Selection pairs each file's syntax facts with the bytes they were parsed from, and
+        // the provider recorded the digest of those bytes. Membership by path, the byte
+        // length, and that recorded digest identify the captured source; comparing or
+        // hashing the content again ran over every document on every index pass.
+        if file.syntax.source_digest().is_none()
+            || captured
+                .get(file.path.as_str())
+                .is_none_or(|source| source.text().len() != file.source.len())
+        {
             continue;
         }
         let anchors = file
@@ -491,3 +502,7 @@ pub(crate) fn namespace_paths(
 ) -> Result<BTreeSet<rift_core::ProjectPath>, rift_error::RiftError> {
     rust::namespace_paths(input, documents, contains, selected, files_max)
 }
+
+pub(crate) use rust::configuration::{
+    Configuration as RustConfiguration, Configurations as RustConfigurations,
+};

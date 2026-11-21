@@ -150,7 +150,7 @@ impl Render for QueryOutput {
                 crate::output::log_warnings(&result.warnings);
                 result
                     .warnings
-                    .retain(|warning| query_warning_detail(warning).is_some());
+                    .retain(|warning| query_warning_text(warning).is_some());
             }
             QueryReadResult::Unavailable(SearchUnavailable::Unavailable {
                 reason,
@@ -159,7 +159,7 @@ impl Render for QueryOutput {
             }) => {
                 crate::output::log_warnings(warnings);
                 warnings.retain(|warning| {
-                    query_warning_detail(warning).is_some()
+                    query_warning_text(warning).is_some()
                         || super::unavailable::reports(*reason, warning)
                 });
             }
@@ -474,7 +474,7 @@ fn other_fields(
 }
 
 fn write_query_warnings(out: &mut TextWriter, warnings: &[ReadWarning]) -> Result<(), TextError> {
-    for detail in warnings.iter().filter_map(query_warning_detail) {
+    for detail in warnings.iter().filter_map(query_warning_text) {
         out.raw_line(0, &format!("warning · {detail}"))?;
     }
     if warnings
@@ -489,12 +489,21 @@ fn write_query_warnings(out: &mut TextWriter, warnings: &[ReadWarning]) -> Resul
     Ok(())
 }
 
-fn query_warning_detail(warning: &ReadWarning) -> Option<&str> {
+/// The text of a warning a query answer carries: the coverage and discovery conditions that
+/// name what is missing from it. Every other warning is logged and left out of the answer.
+fn query_warning_text(warning: &ReadWarning) -> Option<String> {
     match warning {
         ReadWarning::EdgeCoverageMissing { detail, .. }
         | ReadWarning::TraversalTruncated { detail, .. }
         | ReadWarning::EngineAnalysisUnavailable { detail, .. }
-        | ReadWarning::EngineReadinessUnconfirmed { detail, .. } => Some(detail),
+        | ReadWarning::EngineReadinessUnconfirmed { detail, .. }
+        | ReadWarning::CalleesDropped { detail, .. }
+        | ReadWarning::SourceUnavailable { detail, .. }
+        | ReadWarning::LargeFileUnparsed { detail, .. } => Some(detail.clone()),
+        ReadWarning::FrameworkContextUnresolved { unit, detail, .. } => Some(
+            unit.project_path()
+                .map_or_else(|| detail.clone(), |path| format!("{path}: {detail}")),
+        ),
         _ => None,
     }
 }

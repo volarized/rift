@@ -38,7 +38,7 @@ fn tsx() -> Value {
 #[test]
 fn one_workspace_page_renders_languages_and_source() {
     let page = page_of(json!({
-        "configuration_revision": "3f9a1c2e",
+        "configuration_revision": "3f9a1c2e", "revision": "rift://revision/tree/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "languages": [tsx()],
         "source": [{"path": "src/view.tsx", "digest": "8a4d20bc", "language": "typescript:tsx"}],
         "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 10}
@@ -60,7 +60,7 @@ fn one_workspace_page_renders_languages_and_source() {
 #[test]
 fn several_workspace_pages_name_the_page_in_the_header() {
     let page = page_of(json!({
-        "configuration_revision": "3f9a1c2e",
+        "configuration_revision": "3f9a1c2e", "revision": "rift://revision/tree/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "languages": [{"language": "python", "enabled": false, "execution": false, "syntax": false}],
         "source": [{"path": "src/view.tsx", "digest": "8a4d20bc"}],
         "pagination": {"page": 1, "pages": 3, "max_results": 10, "total": 30}
@@ -73,7 +73,7 @@ fn several_workspace_pages_name_the_page_in_the_header() {
             "\tpython · disabled",
             "source:",
             "\tsrc/view.tsx",
-            "next · rift://workspace?page=2&max_results=10",
+            "next · rift://workspace?page=2&max_results=10&revision=rift://revision/tree/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ],
     );
 }
@@ -81,7 +81,7 @@ fn several_workspace_pages_name_the_page_in_the_header() {
 #[test]
 fn a_page_past_the_end_names_itself_and_holds_no_source() {
     let page = page_of(json!({
-        "configuration_revision": "3f9a1c2e",
+        "configuration_revision": "3f9a1c2e", "revision": "rift://revision/tree/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "languages": [], "source": [],
         "pagination": {"page": 4, "pages": 3, "max_results": 10, "total": 30}
     }));
@@ -97,7 +97,7 @@ fn a_page_past_the_end_names_itself_and_holds_no_source() {
 #[test]
 fn an_empty_workspace_with_one_page_is_its_header_alone() {
     let page = page_of(json!({
-        "configuration_revision": "3f9a1c2e",
+        "configuration_revision": "3f9a1c2e", "revision": "rift://revision/tree/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "languages": [], "source": [],
         "pagination": {"page": 1, "pages": 0, "max_results": 10, "total": 0}
     }));
@@ -117,7 +117,7 @@ fn a_language_writes_each_capability_and_every_lsp_state() {
         })
         .collect();
     let page = page_of(json!({
-        "configuration_revision": "3f9a1c2e",
+        "configuration_revision": "3f9a1c2e", "revision": "rift://revision/tree/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "languages": languages, "source": [],
         "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 10}
     }));
@@ -138,7 +138,7 @@ fn a_language_writes_each_capability_and_every_lsp_state() {
 #[test]
 fn patterns_join_by_comma_and_an_empty_list_writes_no_line() {
     let page = page_of(json!({
-        "configuration_revision": "3f9a1c2e",
+        "configuration_revision": "3f9a1c2e", "revision": "rift://revision/tree/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "languages": [
             {"language": "rust", "enabled": true, "include": ["a/**", "b/**"],
              "execution": false, "syntax": true},
@@ -164,7 +164,7 @@ fn patterns_join_by_comma_and_an_empty_list_writes_no_line() {
 #[test]
 fn warnings_leave_workspace_resource_text_unchanged() {
     let page = page_of(json!({
-        "configuration_revision": "3f9a1c2e",
+        "configuration_revision": "3f9a1c2e", "revision": "rift://revision/tree/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "languages": [],
         "source": [
             {"path": "a.rs", "digest": "00000001", "language": "rust"},
@@ -181,7 +181,7 @@ fn warnings_leave_workspace_resource_text_unchanged() {
             "source:",
             "\ta.rs · rust",
             "\tnotes.txt",
-            "next · rift://workspace?page=2&max_results=10",
+            "next · rift://workspace?page=2&max_results=10&revision=rift://revision/tree/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ],
     );
 }

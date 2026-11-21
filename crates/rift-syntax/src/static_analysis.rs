@@ -9,7 +9,7 @@ pub use heritage_edges::HeritageEdge;
 use rift_error::{RiftError, errors};
 use tree_sitter::{Language, Node};
 
-use crate::extract::byte_range;
+use crate::extract::{Visited, byte_range};
 use crate::{ByteRange, SyntaxLimits};
 
 /// One authored call expression and its supported callee shape.
@@ -23,6 +23,15 @@ pub struct StaticCall {
     pub callee: StaticCallee,
 }
 
+/// One authored value access or type reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticReference {
+    /// Name or member expression naming the target.
+    pub target: ByteRange,
+    /// The source operation on that target.
+    pub role: rift_core::ReferenceRole,
+}
+
 /// Syntactic form of the callee in a captured call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaticCallee {
@@ -30,6 +39,8 @@ pub enum StaticCallee {
     Direct,
     /// Language-qualified path.
     Qualified,
+    /// Explicit constructor invocation.
+    Constructor,
     /// Named member on a simple receiver.
     Member {
         /// Receiver expression.
@@ -39,15 +50,6 @@ pub enum StaticCallee {
     },
     /// Computed or otherwise unsupported callee.
     Unsupported,
-}
-
-/// One authored use of a name or member.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StaticReference {
-    /// Authored name or member path.
-    pub range: ByteRange,
-    /// Access or type use at that range.
-    pub role: rift_core::ReferenceRole,
 }
 
 /// One name binding and the source interval in which it takes precedence.
@@ -159,6 +161,13 @@ pub enum StaticBindingKind {
         /// Authored type or constructor path.
         type_path: ByteRange,
     },
+    /// Rust type parameter whose declared bounds remain in its lexical scope.
+    RustTypeParameter,
+    /// Local Rust value whose initializer can establish its declared return owner.
+    RustValue {
+        /// Authored initializer expression.
+        initializer: ByteRange,
+    },
 }
 
 /// One named export forwarded directly from another module.
@@ -172,7 +181,20 @@ pub struct StaticReexport {
     pub export: ByteRange,
 }
 
-/// One inherent Rust implementation and the type its methods belong to.
+/// One Rust use path, including its enclosing groups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticRustUse {
+    /// Leaf path or wildcard range.
+    pub range: ByteRange,
+    /// Each group prefix followed by the leaf path.
+    pub path: Vec<ByteRange>,
+    /// Scope where the import applies.
+    pub scope: ByteRange,
+    /// Whether the path imports every visible member.
+    pub glob: bool,
+}
+
+/// One Rust implementation and the type its methods belong to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StaticInherentImpl {
     /// Authored implementation range.
@@ -181,15 +203,32 @@ pub struct StaticInherentImpl {
     pub type_path: ByteRange,
 }
 
+/// One Rust configuration attribute and the item whose presence it controls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticConditionalItem {
+    /// Item or enclosing body controlled by the attribute.
+    pub range: ByteRange,
+    /// Authored configuration attribute, including its delimiters.
+    pub attribute: ByteRange,
+}
+
 /// Collections retained by static syntax capture.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StaticFactsParts {
+    /// Value accesses and type references.
+    pub references: Vec<StaticReference>,
+    /// Declaration names and their explicit named type annotations.
+    pub declared_types: Vec<(ByteRange, ByteRange)>,
+    /// Runtime function expressions and their enclosing value ranges.
+    pub function_values: Vec<(ByteRange, ByteRange)>,
+    /// Function expressions that establish their own receiver.
+    pub function_scopes: Vec<ByteRange>,
+    /// Static class initialization blocks.
+    pub static_blocks: Vec<ByteRange>,
     /// Class and implementation headers.
     pub heritage_edges: Vec<HeritageEdge>,
     /// Authored calls.
     pub calls: Vec<StaticCall>,
-    /// Authored member accesses and type uses.
-    pub references: Vec<StaticReference>,
     /// Lexical bindings.
     pub bindings: Vec<StaticBinding>,
     /// Explicit re-exports.
@@ -198,10 +237,12 @@ pub struct StaticFactsParts {
     pub assignments: Vec<ByteRange>,
     /// Scopes with unsupported binding shapes.
     pub unsupported_bindings: Vec<ByteRange>,
-    /// Authored Rust inherent implementations.
+    /// Rust use paths.
+    pub rust_uses: Vec<StaticRustUse>,
+    /// Authored Rust implementations.
     pub inherent_impls: Vec<StaticInherentImpl>,
-    /// Items whose admission depends on unresolved Rust configuration.
-    pub conditional_items: Vec<ByteRange>,
+    /// Items whose admission depends on Rust configuration.
+    pub conditional_items: Vec<StaticConditionalItem>,
     /// Python loop statements, whose bodies run again after their later statements.
     pub loops: Vec<ByteRange>,
     /// Python lambda, comprehension and generator expression scopes, whose bodies can run
@@ -214,6 +255,35 @@ pub struct StaticFactsParts {
 pub struct StaticFacts(StaticFactsParts);
 
 impl StaticFacts {
+    /// Captured value accesses and type references.
+    #[must_use]
+    pub fn references(&self) -> &[StaticReference] {
+        &self.0.references
+    }
+    /// Declaration names and their explicit named type annotations.
+    #[must_use]
+    pub fn declared_types(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.declared_types
+    }
+
+    /// Runtime function expressions and their enclosing value ranges.
+    #[must_use]
+    pub fn function_values(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.function_values
+    }
+
+    /// Function expressions that establish their own receiver.
+    #[must_use]
+    pub fn function_scopes(&self) -> &[ByteRange] {
+        &self.0.function_scopes
+    }
+
+    /// Static class initialization blocks.
+    #[must_use]
+    pub fn static_blocks(&self) -> &[ByteRange] {
+        &self.0.static_blocks
+    }
+
     /// Captured class and implementation edges.
     #[must_use]
     pub fn heritage_edges(&self) -> &[HeritageEdge] {
@@ -241,12 +311,6 @@ impl StaticFacts {
         &self.0.calls
     }
 
-    /// Captured member accesses and type uses.
-    #[must_use]
-    pub fn references(&self) -> &[StaticReference] {
-        &self.0.references
-    }
-
     /// Captured lexical bindings.
     #[must_use]
     pub fn bindings(&self) -> &[StaticBinding] {
@@ -271,7 +335,13 @@ impl StaticFacts {
         &self.0.unsupported_bindings
     }
 
-    /// Rust inherent implementation headers.
+    /// Rust use paths with their captured group components.
+    #[must_use]
+    pub fn rust_uses(&self) -> &[StaticRustUse] {
+        &self.0.rust_uses
+    }
+
+    /// Rust implementation headers.
     #[must_use]
     pub fn inherent_impls(&self) -> &[StaticInherentImpl] {
         &self.0.inherent_impls
@@ -279,7 +349,7 @@ impl StaticFacts {
 
     /// Authored Rust items requiring configuration evidence.
     #[must_use]
-    pub fn conditional_items(&self) -> &[ByteRange] {
+    pub fn conditional_items(&self) -> &[StaticConditionalItem] {
         &self.0.conditional_items
     }
 
@@ -297,32 +367,49 @@ impl StaticFacts {
 
     pub(crate) fn retained_bytes(&self) -> usize {
         [
+            vector_capacity(&self.0.references),
+            vector_capacity(&self.0.declared_types),
+            vector_capacity(&self.0.function_values),
+            vector_capacity(&self.0.function_scopes),
+            vector_capacity(&self.0.static_blocks),
             vector_capacity(&self.0.heritage_edges),
             vector_capacity(&self.0.calls),
-            vector_capacity(&self.0.references),
             vector_capacity(&self.0.bindings),
             vector_capacity(&self.0.reexports),
             vector_capacity(&self.0.assignments),
             vector_capacity(&self.0.unsupported_bindings),
             vector_capacity(&self.0.inherent_impls),
+            vector_capacity(&self.0.rust_uses),
             vector_capacity(&self.0.conditional_items),
             vector_capacity(&self.0.loops),
             vector_capacity(&self.0.expression_scopes),
         ]
         .into_iter()
         .fold(0, usize::saturating_add)
+        .saturating_add(
+            self.0
+                .rust_uses
+                .iter()
+                .map(|row| vector_capacity(&row.path))
+                .fold(0, usize::saturating_add),
+        )
     }
 
-    pub(crate) fn validate(&self, source: &str, limits: SyntaxLimits) -> Result<(), RiftError> {
+    fn validate_counts(&self, limits: &SyntaxLimits) -> Result<(), RiftError> {
         let lengths = [
+            self.references().len(),
+            self.declared_types().len(),
+            self.function_values().len(),
+            self.function_scopes().len(),
+            self.static_blocks().len(),
             self.heritage_edges().len(),
             self.calls().len(),
-            self.references().len(),
             self.bindings().len(),
             self.reexports().len(),
             self.assignments().len(),
             self.unsupported_bindings().len(),
             self.inherent_impls().len(),
+            self.rust_uses().len(),
             self.conditional_items().len(),
             self.loops().len(),
             self.expression_scopes().len(),
@@ -333,6 +420,18 @@ impl StaticFacts {
         {
             return errors::syntax::facts_count_exceeded().fail();
         }
+        let components = self
+            .rust_uses()
+            .iter()
+            .try_fold(0_usize, |count, row| count.checked_add(row.path.len()));
+        if components.is_none_or(|count| count > limits.syntax_elements_max()) {
+            return errors::syntax::facts_count_exceeded().fail();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate(&self, source: &str, limits: SyntaxLimits) -> Result<(), RiftError> {
+        self.validate_counts(&limits)?;
         let valid = |range: ByteRange| {
             let start = usize::try_from(range.start).ok();
             let end = usize::try_from(range.end).ok();
@@ -351,7 +450,7 @@ impl StaticFacts {
         });
         let calls = self.calls().iter().all(|call| call.valid(valid));
         let references = self.references().iter().all(|reference| {
-            valid(reference.range)
+            valid(reference.target)
                 && matches!(
                     reference.role,
                     rift_core::ReferenceRole::Read
@@ -359,31 +458,59 @@ impl StaticFacts {
                         | rift_core::ReferenceRole::Type
                 )
         });
+        let functions = self
+            .function_values()
+            .iter()
+            .all(|(range, value)| valid(*range) && valid(*value) && contains(*value, *range))
+            && self.function_scopes().iter().copied().all(valid)
+            && self.static_blocks().iter().copied().all(valid);
         let bindings = self.bindings().iter().all(|binding| binding.valid(valid));
         let reexports = self
             .reexports()
             .iter()
             .all(|row| valid(row.name) && valid(row.module) && valid(row.export));
+        let declared_types = self
+            .declared_types()
+            .iter()
+            .all(|(name, annotation)| valid(*name) && valid(*annotation));
         let assignments = self.assignments().iter().copied().all(valid);
         let unsupported = self.unsupported_bindings().iter().copied().all(valid);
         let implementations = self.inherent_impls().iter().all(|row| {
             valid(row.range) && valid(row.type_path) && contains(row.range, row.type_path)
         });
-        let conditional = self.conditional_items().iter().copied().all(valid);
         let flow = self
             .loops()
             .iter()
             .chain(self.expression_scopes())
             .copied()
             .all(valid);
+        let imports = self.rust_uses().iter().all(|row| {
+            valid(row.range)
+                && valid(row.scope)
+                && row.scope.encloses(row.range)
+                && !row.path.is_empty()
+                && row.path.len() <= limits.syntax_depth_max()
+                && row
+                    .path
+                    .iter()
+                    .copied()
+                    .all(|range| valid(range) && row.scope.encloses(range))
+        });
+        let conditional = self
+            .conditional_items()
+            .iter()
+            .all(|item| valid(item.range) && valid(item.attribute));
         if !(edges
-            && calls
             && references
+            && declared_types
+            && functions
+            && calls
             && bindings
             && reexports
             && assignments
             && unsupported
             && implementations
+            && imports
             && conditional
             && flow)
         {
@@ -398,7 +525,10 @@ impl StaticCall {
         let inside = |range| valid(range) && contains(self.callee_range, range);
         let member = match self.callee {
             StaticCallee::Member { receiver, member } => inside(receiver) && inside(member),
-            StaticCallee::Direct | StaticCallee::Qualified | StaticCallee::Unsupported => true,
+            StaticCallee::Direct
+            | StaticCallee::Qualified
+            | StaticCallee::Constructor
+            | StaticCallee::Unsupported => true,
         };
         valid(self.range)
             && inside(self.callee_range)
@@ -434,10 +564,12 @@ impl StaticBinding {
             StaticBindingKind::PythonMemberWrite { receiver } => valid(receiver),
             StaticBindingKind::RustUse { path } => valid(path),
             StaticBindingKind::RustReceiver { type_path } => valid(type_path),
+            StaticBindingKind::RustValue { initializer } => valid(initializer),
             StaticBindingKind::Local
             | StaticBindingKind::Shadow
             | StaticBindingKind::PythonGlobal
-            | StaticBindingKind::PythonNonlocal => true,
+            | StaticBindingKind::PythonNonlocal
+            | StaticBindingKind::RustTypeParameter => true,
         };
         valid(self.name)
             && valid(self.scope)
@@ -459,7 +591,7 @@ fn vector_capacity<T>(items: &Vec<T>) -> usize {
 enum Grammar {
     Python(&'static python_edges::EdgePythonKinds),
     JavaScript(&'static javascript::Kinds),
-    Rust(&'static rust::Kinds),
+    Rust(&'static rust::Kinds, rift_core::LoopBudget),
 }
 
 pub(crate) struct Capture<'source> {
@@ -500,9 +632,12 @@ impl<'source> Capture<'source> {
         }
     }
 
-    pub(crate) fn for_rust(source: &'source str) -> Self {
+    pub(crate) fn for_rust(source: &'source str, limits: SyntaxLimits) -> Self {
         Self {
-            grammar: Grammar::Rust(rust::kinds()),
+            grammar: Grammar::Rust(
+                rust::kinds(),
+                rift_core::LoopBudget::new(limits.syntax_elements_max()),
+            ),
             edge_heritage: heritage_edges::edge_rust_kinds(),
             source,
             facts: StaticFacts::default(),
@@ -518,12 +653,12 @@ impl<'source> Capture<'source> {
             return Ok(());
         }
         self.edge_heritage.record_edge(visited, &mut self.facts.0)?;
-        match self.grammar {
+        match &mut self.grammar {
             Grammar::Python(kinds) => kinds.record_edge(visited, self.source, &mut self.facts.0),
-            Grammar::JavaScript(kinds) => {
-                kinds.record(syntax_element, self.source, &mut self.facts.0)
+            Grammar::JavaScript(kinds) => kinds.record(visited, self.source, &mut self.facts.0),
+            Grammar::Rust(kinds, budget) => {
+                kinds.record(visited, self.source, &mut self.facts.0, budget)
             }
-            Grammar::Rust(kinds) => kinds.record(syntax_element, self.source, &mut self.facts.0),
         }
     }
 
@@ -552,11 +687,18 @@ fn identifier(syntax_element: Node<'_>, id: u16) -> Option<Node<'_>> {
     (syntax_element.kind_id() == id && !syntax_element.is_missing()).then_some(syntax_element)
 }
 
-fn enclosing<'tree>(syntax_element: Node<'tree>, kinds: &[u16]) -> Option<Node<'tree>> {
-    let mut parent = syntax_element.parent();
+/// The nearest ancestor of one of `kinds`, read from the parents the walk recorded.
+///
+/// `Node::parent` searches again from the root on every call, so a capture rule that
+/// asks it for every syntax element costs the tree's width and depth each time.
+fn enclosing<'walk, 'tree>(
+    visited: Visited<'walk, 'tree>,
+    kinds: &[u16],
+) -> Option<Visited<'walk, 'tree>> {
+    let mut parent = visited.parent();
     // Capture runs after the shared syntax walk has admitted each syntax element's depth.
     while let Some(candidate) = parent {
-        if kinds.contains(&candidate.kind_id()) {
+        if kinds.contains(&candidate.syntax_element().kind_id()) {
             return Some(candidate);
         }
         parent = candidate.parent();

@@ -477,17 +477,30 @@ fn package_sibling_link_resolves_with_exact_source_unit() {
 
 #[test]
 fn aggregate_block_limit_omits_source_and_keeps_later_source() {
-    let block_count = DOCUMENTATION_BLOCKS_MAX as usize / 2 + 1;
+    let configuration = DocumentationConfiguration {
+        max_blocks: 4,
+        ..DocumentationConfiguration::default()
+    };
+    let limits = DocumentationLimits::from_configuration(&configuration).expect("accepted limits");
+    let block_count = configuration.max_blocks as usize / 2 + 1;
     let large = "entry.\n\n".repeat(block_count);
-    let sources = DocumentationSourceSet::new(vec![
-        input("a.txt", &large),
-        input("b.txt", &large),
-        input("z.txt", "kept.\n"),
-    ])
+    let sources = DocumentationSourceSet::with_limits(
+        vec![
+            input("a.txt", &large),
+            input("b.txt", &large),
+            input("z.txt", "kept.\n"),
+        ],
+        &limits,
+    )
     .expect("bounded source set");
 
     let collection = collect_documentation(&sources, &[]).expect("bounded collection");
     let index = collection.index();
+    assert_eq!(
+        index.blocks.len(),
+        4,
+        "the aggregate fixture admits four blocks"
+    );
     assert_eq!(index.coverage.selected, 3);
     assert_eq!(index.coverage.parsed, 2);
     assert_eq!(index.coverage.omitted, 1);

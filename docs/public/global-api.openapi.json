@@ -1297,6 +1297,7 @@
                                   "contains"
                                 ],
                                 "to": "rift://symbol/pypi/pypi.org/idna/python/idna/codec/Codec/decode",
+                                "provider": "static",
                                 "derivation": "resolution",
                                 "producer": {
                                   "name": "canonical-containment",
@@ -1313,6 +1314,7 @@
                                   "contains"
                                 ],
                                 "to": "rift://symbol/pypi/pypi.org/idna/python/idna/codec/Codec/encode",
+                                "provider": "static",
                                 "derivation": "resolution",
                                 "producer": {
                                   "name": "canonical-containment",
@@ -1665,7 +1667,7 @@
       "post": {
         "operationId": "get_symbol",
         "summary": "Read one logical symbol.",
-        "description": "Reads one exact logical symbol obtained from discovery or another read. The caller selects declarations with `page` and `max_results`, and pins later pages with `revision`.",
+        "description": "Reads one exact logical symbol obtained from discovery or another read. The caller selects declarations with `page` and `max_results`, and pins later pages with `revision`. A `found` answer to a request whose `include.history` is `true` **MUST** carry `history`: the collected releases of the symbol's owner that introduced, changed, or removed its declaration, as `introduced_in_release`, `changed_in_release`, and `removed_in_release` edges, newest release first. The server answers `unavailable` with reason `insufficient_coverage` when it cannot establish that history.",
         "security": [
           {},
           {
@@ -5544,7 +5546,7 @@
           "edge",
           "direction"
         ],
-        "description": "One auditable step in a search traversal. `edge` retains its occurrence and\nderivation; `direction` records how the walk followed it."
+        "description": "One auditable step in a search traversal. `edge` retains its occurrence, provider, and\nderivation; `direction` records how the walk followed it."
       },
       "TraversalDirection": {
         "description": "Which edge direction a search traversal walks from each visited symbol. A language\nengine supplies the edges of both: its references for `incoming`, its call hierarchy for\n`outgoing`.",
@@ -5648,6 +5650,10 @@
             "description": "Exact physical occurrence when this edge was read from source, independent of\nwhether the provider supplied a source syntax element.",
             "$ref": "#/components/schemas/SourceUnitSpan"
           },
+          "provider": {
+            "$ref": "#/components/schemas/EdgeProvider",
+            "description": "Which analysis produced this edge."
+          },
           "derivation": {
             "$ref": "#/components/schemas/EdgeDerivation",
             "description": "How this edge was established."
@@ -5674,6 +5680,7 @@
           "kind",
           "kinds",
           "to",
+          "provider",
           "derivation"
         ],
         "description": "One directed edge between two symbols. Its occurrence is where it was read from, and its\nderivation is how much the provider knew when it was read."
@@ -5969,7 +5976,7 @@
           },
           "history": {
             "type": "boolean",
-            "description": "Attaches the symbol's version-control timeline."
+            "description": "Attaches the symbol's timeline: the commits that touched a project symbol, or the\ncollected releases that introduced, changed, or removed a package or runtime symbol."
           }
         },
         "description": "The optional `get_symbol` projections the caller opts into. An omitted member is `false`.",
@@ -6859,7 +6866,7 @@
               "code",
               "detail"
             ],
-            "description": "A language engine serves the seed's language, and this read carries none of its\nedges: the engine answered about bytes the served revision does not carry, answered\nmore than the walk's symbol bound holds, or was still analyzing when\n`[server] readiness_timeout` was spent. The indexed edges stand; whatever\nthe engine resolves on top of them is missing. The warning states that an engine's\nanalysis is absent from this answer; it never states that the seed has no such\nneighbor. An engine still analyzing keeps loading, and a later read, served from a\nrevision the engine has caught up with or sent once it reads ready, carries the\nengine's edges again."
+            "description": "A language engine serves the seed's language, and this read carries none of its\nedges: the engine answered about bytes the served revision does not carry, answered\nmore than the walk's symbol bound holds, was still analyzing when\n`[server] readiness_timeout` was spent, or a whole-inventory query selected more\ndeclarations than the engine requests one query sends. The indexed edges stand; whatever\nthe engine resolves on top of them is missing. The warning states that an engine's\nanalysis is absent from this answer; it never states that the seed has no such\nneighbor. An engine still analyzing keeps loading, and a later read, served from a\nrevision the engine has caught up with or sent once it reads ready, carries the\nengine's edges again."
           },
           {
             "type": "object",
@@ -7541,11 +7548,11 @@
             "items": {
               "$ref": "#/components/schemas/HistoryEdge"
             },
-            "description": "The commit edges newest first, then the `co_changes` edges, most shared commits\nfirst."
+            "description": "The commit edges newest first, then the `co_changes` edges, most shared commits\nfirst. A package or runtime symbol's release edges come newest release first."
           },
           "complete": {
             "type": "boolean",
-            "description": "Whether the history reached the repository's first commit. `false` when the\n`max_revisions` bound, a shallow clone's boundary, or the oldest selected release\nended it first, or while the history store has not yet analyzed the served\nrevision, so commits older than the listed ones may have touched the symbol."
+            "description": "Whether the history reached the repository's first commit, or for a package or\nruntime symbol the oldest collected release of its owner. `false` when the\n`max_revisions` bound, a shallow clone's boundary, or the oldest selected release\nended it first, or while the history store has not yet analyzed the served\nrevision, so commits older than the listed ones may have touched the symbol."
           },
           "co_changes_truncated": {
             "description": "The co-change edges the co-change bounds left out. Absent when they left out none.",
@@ -7557,7 +7564,7 @@
           "edges",
           "complete"
         ],
-        "description": "One symbol's history as edges from the symbol to the commits that touched it and to the\nsymbols changed beside it. The history follows first parents from the served revision,\nor the selected releases in version order, through the commits the history store holds,\nand follows the declaration's file across a rename that kept its bytes. It is bounded by\n`[providers.history] max_revisions` and by a shallow clone's boundary."
+        "description": "One symbol's history as edges from the symbol to the points that touched it. A project\nsymbol's history names commits and the symbols changed beside it: it follows first\nparents from the served revision, or the selected releases in version order, through the\ncommits the history store holds, and follows the declaration's file across a rename that\nkept its bytes. It is bounded by `[providers.history] max_revisions` and by a shallow\nclone's boundary. A package or runtime symbol's history names the collected releases of\nits owner that introduced, changed, or removed its declaration, and carries only release\nedges."
       },
       "HistoryEdge": {
         "oneOf": [
@@ -7672,9 +7679,71 @@
               "commits"
             ],
             "description": "The symbol and `symbol` changed in the same commits, counted over the commits the\nhistory lists."
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "edge": {
+                "type": "string",
+                "const": "introduced_in_release"
+              },
+              "revision": {
+                "$ref": "#/components/schemas/Revision",
+                "description": "The release, as a release revision of the symbol's owner."
+              }
+            },
+            "required": [
+              "edge",
+              "revision"
+            ],
+            "description": "The release brought the symbol into existence: it is the oldest collected release of\nthe symbol's owner that declares the symbol."
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "edge": {
+                "type": "string",
+                "const": "changed_in_release"
+              },
+              "revision": {
+                "$ref": "#/components/schemas/Revision",
+                "description": "The release, as a release revision of the symbol's owner."
+              },
+              "change": {
+                "$ref": "#/components/schemas/HistoryChange",
+                "description": "Which part of the declaration the release changed."
+              }
+            },
+            "required": [
+              "edge",
+              "revision",
+              "change"
+            ],
+            "description": "The release changed the symbol's declaration from the collected release before it."
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "edge": {
+                "type": "string",
+                "const": "removed_in_release"
+              },
+              "revision": {
+                "$ref": "#/components/schemas/Revision",
+                "description": "The release, as a release revision of the symbol's owner."
+              }
+            },
+            "required": [
+              "edge",
+              "revision"
+            ],
+            "description": "The release deleted the symbol's declaration: the collected release before it\ndeclares the symbol, and this release does not."
           }
         ],
-        "description": "One edge from a symbol in its history. Every commit edge names the commit as a\n`rift://revision/git/<commit>` revision."
+        "description": "One edge from a symbol in its history. Every commit edge names the commit as a\n`rift://revision/git/<commit>` revision. Every release edge names the release as a\n`rift://revision/<manager>/<registry>/<name>@<version>` or\n`rift://revision/stdlib/<runtime>@<version>` revision of the symbol's owner."
       },
       "HistoryCommit": {
         "type": "object",
@@ -7712,7 +7781,7 @@
         "description": "One commit a history edge names, with where the symbol's declaration lived in it."
       },
       "HistoryChange": {
-        "description": "Which part of a declaration a `changed_in` commit changed.",
+        "description": "Which part of a declaration a `changed_in` commit or a `changed_in_release` release\nchanged.",
         "type": "string",
         "enum": [
           "signature_changed",
@@ -9082,6 +9151,20 @@
           "syntax"
         ],
         "description": "One facet: a declaration with its location, source, and syntax structure."
+      },
+      "EdgeProvider": {
+        "description": "Which analysis produced an edge.",
+        "type": "string",
+        "enum": [
+          "static",
+          "engine",
+          "lsp"
+        ],
+        "x-enum-descriptions": [
+          "Static analysis captured into the index.",
+          "A language engine embedded in Rift, such as ty.",
+          "A language server reached through LSP."
+        ]
       }
     },
     "headers": {

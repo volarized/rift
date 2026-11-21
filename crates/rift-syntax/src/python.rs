@@ -1453,6 +1453,25 @@ mod tests {
     }
 
     #[test]
+    fn test_assignment_declarations_keep_their_name_ranges() {
+        let source = "value = make()\nclass Widget:\n    retries = 2\n";
+        let document = analyze(source);
+        for name in ["value", "Widget.retries"] {
+            let declaration = symbol(&document, name);
+            let range = declaration
+                .name_range
+                .expect("an assignment has a name token");
+            assert_eq!(
+                source.get(
+                    usize::try_from(range.start).expect("name start")
+                        ..usize::try_from(range.end).expect("name end")
+                ),
+                Some(declaration.name.as_str())
+            );
+        }
+    }
+
+    #[test]
     fn test_module_level_attribute_targets_declare_nothing() {
         let document = analyze("a, b = 1, 2\nself.count = 3\n");
         let names = document

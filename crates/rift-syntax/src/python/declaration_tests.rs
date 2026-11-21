@@ -475,7 +475,7 @@ fn test_python_member_accesses_keep_assignment_roles() {
         .references()
         .iter()
         .filter(|reference| reference.role != ReferenceRole::Type)
-        .map(|reference| (spelled(text, reference.range), reference.role))
+        .map(|reference| (spelled(text, reference.target), reference.role))
         .collect::<Vec<_>>();
     assert_eq!(
         accesses,
