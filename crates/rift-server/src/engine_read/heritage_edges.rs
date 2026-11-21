@@ -312,6 +312,11 @@ pub(super) fn edge_impl_header(
     let start = index.byte_offset(encoding, range.start)? as u64;
     let end = index.byte_offset(encoding, range.end)? as u64;
     let unit = rift_syntax::DocumentPlacement::project_path(path)?;
+    // An engine can name the implementing type of an `impl` header where the stored edge
+    // occurs at the trait: both lie in the header of the same `impl` item.
+    let header = file
+        .enclosing_symbol(start, end)
+        .filter(|symbol| symbol.kind == "impl_item");
     for edge in reads
         .edges()
         .incoming(target)
@@ -319,7 +324,11 @@ pub(super) fn edge_impl_header(
         .filter(|edge| edge.kind() == kind && edge.occurrence().unit() == unit.unit())
     {
         let occurrence = edge.occurrence().range();
-        if start <= occurrence.start() && occurrence.end() <= end {
+        let same_header = header.is_some_and(|header| {
+            file.enclosing_symbol(occurrence.start(), occurrence.end())
+                .is_some_and(|owner| std::ptr::eq(owner, header))
+        });
+        if same_header || (start <= occurrence.start() && occurrence.end() <= end) {
             let mut edge = edge.to_protocol();
             edge.provider = provider;
             edge.derivation = EdgeDerivation::Resolution;
