@@ -217,7 +217,22 @@ impl<'source> Namespaces<'source> {
                 path.push(file.text(binding.name)?.to_owned());
                 let parts = file.use_parts(imported.range, work)?;
                 let parts = parts.iter().map(String::as_str).collect::<Vec<_>>();
-                let target = if matches!(parts.first(), Some(&"std" | &"core" | &"alloc")) {
+                // A first segment naming no item of the module starts at a dependency
+                // crate, as `std`, `core` and `alloc` do (the extern prelude).
+                let external = parts.first().is_some_and(|head| {
+                    matches!(*head, "std" | "core" | "alloc")
+                        || (!matches!(*head, "crate" | "self" | "super") && parts.len() > 1 && {
+                            let mut local = module.clone();
+                            local.push((*head).to_owned());
+                            !self.types.contains_key(&local)
+                                && !self.values.contains_key(&local)
+                                && matches!(
+                                    file.binding(head, imported.range.start, is_type_binding, work),
+                                    Binding::Missing
+                                )
+                        })
+                });
+                let target = if external {
                     parts.iter().map(|part| (*part).to_owned()).collect()
                 } else {
                     let Some(target) = self.absolute_path(file, imported.range.start, &parts, work)

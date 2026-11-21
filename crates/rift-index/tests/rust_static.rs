@@ -1936,3 +1936,52 @@ fn test_rust_optional_dependencies_are_implicit_features() {
         );
     }
 }
+
+#[test]
+fn test_rust_reexports_of_dependency_items_keep_the_written_module() {
+    // A `use` path whose first segment names no item of its module starts at a dependency
+    // crate. A re-export chain ending at such a path keeps the written local module as the
+    // import; a name the module does not bind imports nothing, and a local relative path
+    // still names the local item.
+    let alloc = "pub(crate) use self::inner::{Allocator, Thing};\nmod inner {\n    mod local { pub struct Thing; }\n    pub(crate) use extra::alloc::Allocator;\n    pub(crate) use local::Thing;\n}\n";
+    let (_directory, index) = fixture_index(
+        PLAIN_MANIFEST,
+        &[
+            (
+                "src/lib.rs",
+                "mod alloc;\nmod map;\nmod other;\nmod local;\n",
+            ),
+            ("src/alloc.rs", alloc),
+            (
+                "src/map.rs",
+                "use crate::alloc::Allocator;\npub fn run() {}\n",
+            ),
+            (
+                "src/other.rs",
+                "use crate::alloc::Missing;\npub fn run() {}\n",
+            ),
+            (
+                "src/local.rs",
+                "use crate::alloc::Thing;\npub fn run(_: Thing) {}\n",
+            ),
+        ],
+    );
+    assert!(has_edge(
+        &index,
+        EdgeKind::Imports,
+        "/fixture/map",
+        "/fixture/alloc"
+    ));
+    assert!(!has_edge(
+        &index,
+        EdgeKind::Imports,
+        "/fixture/other",
+        "/fixture/alloc"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Imports,
+        "/fixture/local",
+        "/alloc/inner/local/Thing"
+    ));
+}
