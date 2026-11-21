@@ -4792,6 +4792,7 @@ dependencies = [
  "rift-provider",
  "rift-ranking",
  "rift-syntax",
+ "rift-tracing",
  "schemars 1.2.3",
  "semver",
  "serde",
