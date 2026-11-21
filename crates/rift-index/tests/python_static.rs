@@ -353,3 +353,72 @@ fn test_python_reads_before_a_later_rebinding_store_member_facts() {
     }
     assert!(index.edges().is_complete());
 }
+
+#[test]
+fn test_python_rebound_classes_optional_receivers_and_conditional_methods_store_facts() {
+    let connection = "def wrap(cls): return cls\nclass Base:\n    def connect(self) -> int: return 1\nclass Secure(Base):\n    def connect(self) -> int: return 2\nSecure = wrap(Secure)\n";
+    let socks = "from .connection import Secure\nclass Tunnel(Secure):\n    def connect(self) -> int: return super().connect()\ndef build() -> int: return Secure().connect()\n";
+    let patch = "import pkg.connection\nclass Replacement:\n    pass\ndef inject() -> None:\n    pkg.connection.Base = Replacement\n";
+    let optional = "import typing as t\nclass Item:\n    def read(self) -> int: return 1\ndef use(item: t.Optional[Item]) -> int:\n    return item.read() if item is not None else 0\n";
+    let conditional = "import sys\nclass Conn:\n    def close(self) -> None: pass\n    if sys.version_info < (3, 99):\n        def tunnel(self) -> None:\n            self.close()\n";
+    let (_directory, index) = build(&[
+        ("pkg/__init__.py", ""),
+        ("pkg/connection.py", connection),
+        ("pkg/socks.py", socks),
+        ("pkg/patch.py", patch),
+        ("pkg/optional.py", optional),
+        ("pkg/conditional.py", conditional),
+    ]);
+    for (source, kind, from, to, spelling) in [
+        (
+            socks,
+            "extends",
+            "pkg/socks/Tunnel",
+            "pkg/connection/Secure",
+            "Secure",
+        ),
+        (
+            socks,
+            "calls",
+            "pkg/socks/Tunnel/connect",
+            "pkg/connection/Secure/connect",
+            "super().connect()",
+        ),
+        (
+            socks,
+            "calls",
+            "pkg/socks/build",
+            "pkg/connection/Secure/connect",
+            "Secure().connect()",
+        ),
+        (
+            patch,
+            "writes",
+            "pkg/patch/inject",
+            "pkg/connection/Base",
+            "pkg.connection.Base",
+        ),
+        (
+            optional,
+            "calls",
+            "pkg/optional/use",
+            "pkg/optional/Item/read",
+            "item.read()",
+        ),
+        (
+            conditional,
+            "calls",
+            "pkg/conditional/Conn/tunnel",
+            "pkg/conditional/Conn/close",
+            "self.close()",
+        ),
+    ] {
+        assert_eq!(
+            stored(&index, source, kind, from, to).as_deref(),
+            Some(spelling),
+            "{kind} {from} -> {to}: {:?}",
+            index.edges()
+        );
+    }
+    assert!(index.edges().is_complete());
+}
