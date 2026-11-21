@@ -364,10 +364,10 @@ mod tests {
     #[test]
     fn value_body_errors_keep_the_declaration_they_initialize() {
         for (extension, text, expected) in [
-            // The grammar reads `global` as a keyword, so its use is an error in the body.
+            // The missing member of the optional chain is inside the function body.
             (
                 "ts",
-                "export const inspect = () => {\n  const global = globalThis as any\n  return global?.process\n}\nexport function run() { return inspect() }\n",
+                "export const inspect = () => {\n  const global = globalThis as any\n  return global?.\n}\nexport function run() { return inspect() }\n",
                 &[][..],
             ),
             (
