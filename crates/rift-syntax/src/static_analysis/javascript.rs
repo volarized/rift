@@ -363,6 +363,7 @@ impl Kinds {
         self.record_documented_function(syntax_element, source, documentation, facts)?;
         self.record_object_member(visited, facts)?;
         self.record_returned_object(visited, facts)?;
+        self.record_spread_value(syntax_element, facts)?;
         self.record_module_syntax(visited, source, facts);
         self.record_reference(visited, facts)?;
         self.record_member(syntax_element, facts)?;
@@ -392,6 +393,48 @@ impl Kinds {
             self.record_reexport(visited, source, facts)?;
         } else {
             self.record_shadow_or_mutation(visited, facts)?;
+        }
+        Ok(())
+    }
+
+    /// Records a declared name whose initializer is an object literal that ends in a spread
+    /// of a name: `const o = { a: 1, ...base }`. The members the spread value has are the
+    /// last ones written, so they are the members of `o` that value declares.
+    fn record_spread_value(
+        &self,
+        element: Node<'_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        if element.kind_id() != self.variable {
+            return Ok(());
+        }
+        let Some(name) = element
+            .child_by_field_id(self.name)
+            .filter(|name| name.kind_id() == self.identifier)
+        else {
+            return Ok(());
+        };
+        let mut value = element.child_by_field_id(self.value);
+        // Each step descends within the admitted syntax depth.
+        while let Some(inner) = value.filter(|node| node.kind_id() == self.parenthesized) {
+            value = inner.named_child(0);
+        }
+        let Some(object) = value.filter(|node| node.kind_id() == self.object_literal[0]) else {
+            return Ok(());
+        };
+        let mut cursor = object.walk();
+        let last = object
+            .named_children(&mut cursor)
+            .filter(|child| !child.is_extra())
+            .last();
+        let spread = last
+            .filter(|child| child.kind() == "spread_element")
+            .and_then(|child| child.named_child(0))
+            .filter(|argument| argument.kind_id() == self.identifier && !argument.is_missing());
+        if let Some(spread) = spread {
+            facts
+                .spread_values
+                .push((byte_range(name)?, byte_range(spread)?));
         }
         Ok(())
     }
@@ -960,7 +1003,44 @@ impl Kinds {
 
     /// The one type a union writes besides `null` and `undefined`, or the written type
     /// itself: `T | undefined` and `(T | null)` are written as `T`.
-    fn nullable_type<'tree>(&self, mut written: Node<'tree>, source: &str) -> Node<'tree> {
+    ///
+    /// `Partial<T>`, `Readonly<T>` and `Required<T>` keep every member name of `T`, so
+    /// they are written as `T` too. No other utility type is.
+    fn nullable_type<'tree>(&self, written: Node<'tree>, source: &str) -> Node<'tree> {
+        let mut written = self.nullable_member(written, source);
+        // Each argument lies inside the written type the syntax walk has admitted.
+        while let Some(inner) = self.projected_argument(written, source) {
+            written = self.nullable_member(inner, source);
+        }
+        written
+    }
+
+    /// The single type argument of `Partial<T>`, `Readonly<T>` or `Required<T>`.
+    fn projected_argument<'tree>(&self, written: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+        let shapes = self.type_shapes.as_ref()?;
+        if self.generic != Some(written.kind_id())
+            || !matches!(
+                written
+                    .child_by_field_id(self.name)
+                    .and_then(|name| text(name, source)),
+                Some("Partial" | "Readonly" | "Required")
+            )
+        {
+            return None;
+        }
+        let mut cursor = written.walk();
+        let arguments = written
+            .named_children(&mut cursor)
+            .find(|child| child.kind_id() == shapes.array[2])?;
+        let mut cursor = arguments.walk();
+        let mut named = arguments
+            .named_children(&mut cursor)
+            .filter(|child| !child.is_extra());
+        let first = named.next()?;
+        named.next().is_none().then_some(first)
+    }
+
+    fn nullable_member<'tree>(&self, mut written: Node<'tree>, source: &str) -> Node<'tree> {
         let Some(shapes) = &self.type_shapes else {
             return written;
         };

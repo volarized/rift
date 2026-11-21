@@ -225,7 +225,8 @@ impl<'source> Index<'source> {
             return self.javascript_receiver_member(file, position, receiver, member, role, work);
         }
         // A receiver with a declared type keeps it when the binding is assigned again: the
-        // call is refused only for a callee named by the binding itself.
+        // call is refused only for a callee named by the binding itself. So does a
+        // TypeScript binding typed by the spread its initializer ends in.
         let binding =
             js_binding(file, &self.javascript, receiver, position, role, work).or_else(|| {
                 (role == rift_core::ReferenceRole::Call)
@@ -246,6 +247,8 @@ impl<'source> Index<'source> {
                             .copied()
                             .flatten()
                             .is_some()
+                            || (file.spread_values.contains_key(&binding.name)
+                                && !javascript_source(file.document.path.as_str()))
                     })
             });
         match binding {
@@ -576,6 +579,24 @@ impl<'source> Index<'source> {
         {
             return self.javascript_class_member(owner, member, MemberMode::Instance, role, work);
         }
+        // A member the last spread value of an object literal declares is that value's
+        // member (D35); members it does not declare stay the literal's own.
+        if role != rift_core::ReferenceRole::Type
+            && binding.kind == StaticBindingKind::Local
+            && let Some(target) =
+                self.javascript_spread_owner(file, binding, work)
+                    .and_then(|owner| {
+                        self.javascript_class_member(
+                            owner,
+                            member,
+                            MemberMode::Instance,
+                            role,
+                            work,
+                        )
+                    })
+        {
+            return Some(target);
+        }
         match binding.kind {
             StaticBindingKind::JavaScriptEdgeNamespace { module } => self.javascript_export(
                 file,
@@ -628,6 +649,41 @@ impl<'source> Index<'source> {
                     })
             }
             _ => None,
+        }
+    }
+
+    /// The declared type of the name an object literal initializer spreads last, when that
+    /// literal initializes `binding`: the spread name's written type or the type its place
+    /// as a callback parameter gives it. In TypeScript a `let` keeps the type of its
+    /// initializer through later writes; in JavaScript a binding written again has none.
+    fn javascript_spread_owner(
+        &self,
+        file: &File<'source>,
+        binding: &StaticBinding,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let spread = *file.spread_values.get(&binding.name)?;
+        if javascript_source(file.document.path.as_str())
+            && file.javascript_binding_written(binding, work)
+        {
+            return None;
+        }
+        let spread_binding = js_binding(
+            file,
+            &self.javascript,
+            file.text(spread)?,
+            spread.start,
+            rift_core::ReferenceRole::Read,
+            work,
+        )?;
+        match file
+            .declared_types
+            .get(&spread_binding.name)
+            .copied()
+            .flatten()
+        {
+            Some(annotation) => self.javascript_declared_type(file, annotation, work),
+            None => self.javascript_callback_parameter(file, spread_binding, work),
         }
     }
 

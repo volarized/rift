@@ -2594,3 +2594,177 @@ export function make(): Box<number> { return Box(1) }
             && edge.to().as_str().ends_with("main.ts/Box")
     }));
 }
+
+#[test]
+fn test_typescript_utility_projections_read_as_their_type() {
+    // `Partial<T>`, `Readonly<T>` and `Required<T>` keep every member name of `T`, so
+    // members read through them are the members of `T`. No other utility type does.
+    let source = "export interface Options { name: string; run(): number }
+export function projected(p: Partial<Options>, r: Readonly<Options>, q: Required<Options> | undefined) {
+  return [p.name, r.run(), q?.name]
+}
+export function picked(k: Pick<Options, 'name'>, n: NonNullable<Options>) {
+  return [k.name, n.name]
+}
+";
+    let (_directory, index) = workspace_with_manifest(&[("main.ts", source)], module_manifest());
+    assert!(has_edge(
+        &index,
+        EdgeKind::Reads,
+        "main.ts/projected",
+        "main.ts/Options/name"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "main.ts/projected",
+        "main.ts/Options/run"
+    ));
+    assert!(!has_edge(
+        &index,
+        EdgeKind::Reads,
+        "main.ts/picked",
+        "main.ts/Options/name"
+    ));
+}
+
+#[test]
+fn test_object_literals_ending_in_a_typed_spread_take_its_members() {
+    // An object literal whose last element spreads a name of type `T` has the members `T`
+    // declares from `T`. In TypeScript a `let` keeps the type of its initializer through
+    // later writes; in JavaScript a binding written again keeps nothing.
+    let source = "export interface Options { name: string; version?: number; run?: () => number }
+export function spreadLast(base: Options) {
+  const o = { version: 0, run: () => 1, ...base }
+  return [o.name, o.version, o.run?.()]
+}
+export function writtenAgain(base: Options, next: Partial<Options>) {
+  let o = { version: 0, ...base }
+  o = { ...o, ...next }
+  return o.name
+}
+export function spreadFirst(base: Options) {
+  const o = { ...base, version: 1 }
+  return o.name
+}
+type Impl = <T>(init: () => T, options: Options) => () => void
+export const impl: Impl = (init, baseOptions) => () => {
+  let options = { version: 0, run: () => 2, ...baseOptions }
+  const setItem = () => [options.name, options.version, options.run?.()]
+  options = { ...options, name: 'x' }
+  return setItem
+}
+";
+    let script = "class Options { constructor() { this.name = 'a' } }
+/** @param {Options} base */
+function kept(base) {
+  const o = { ...base }
+  return o.name
+}
+/** @param {Options} base */
+function written(base, other) {
+  let o = { ...base }
+  o = other
+  return o.name
+}
+module.exports = { kept, written, Options }
+";
+    let (_directory, index) = workspace_with_manifest(
+        &[("main.ts", source), ("script.cjs", script)],
+        module_manifest(),
+    );
+    for (kind, from, to) in [
+        (
+            EdgeKind::Reads,
+            "main.ts/spreadLast",
+            "main.ts/Options/name",
+        ),
+        (
+            EdgeKind::Reads,
+            "main.ts/spreadLast",
+            "main.ts/Options/version",
+        ),
+        (EdgeKind::Calls, "main.ts/spreadLast", "main.ts/Options/run"),
+        (
+            EdgeKind::Reads,
+            "main.ts/writtenAgain",
+            "main.ts/Options/name",
+        ),
+        (
+            EdgeKind::Reads,
+            "main.ts/impl/setItem",
+            "main.ts/Options/name",
+        ),
+        (
+            EdgeKind::Calls,
+            "main.ts/impl/setItem",
+            "main.ts/Options/run",
+        ),
+    ] {
+        assert!(has_edge(&index, kind, from, to), "{from} {to}");
+    }
+    assert!(has_edge(
+        &index,
+        EdgeKind::Reads,
+        "script.cjs/kept",
+        "script.cjs/Options/name"
+    ));
+    // A spread followed by other members, and a JavaScript binding written again.
+    assert!(!has_edge(
+        &index,
+        EdgeKind::Reads,
+        "main.ts/spreadFirst",
+        "main.ts/Options/name"
+    ));
+    assert!(!index.edges().edges().any(|edge| {
+        edge.kind() == EdgeKind::Reads
+            && edge.from().as_str().ends_with("script.cjs/written")
+            && edge.to().as_str().ends_with("/name")
+    }));
+}
+
+#[test]
+fn test_commonjs_symbol_keyed_export_writes_name_no_export() {
+    // A computed key on `module.exports` or `exports` names no export when it is a `const`
+    // of the same file bound to a `Symbol(..)` value. Any other computed key still leaves
+    // every export unresolved for calls.
+    let parser = "const kInternals = Symbol('internals')
+function run() { return 1 }
+function Parser() {}
+module.exports = Parser
+module.exports.run = run
+module.exports[kInternals] = { run }
+exports[kInternals] = run
+";
+    let other = "const kName = 'run'
+function run() { return 1 }
+function Other() {}
+module.exports = Other
+module.exports.run = run
+module.exports[kName] = run
+";
+    let main = "const Parser = require('./parser.js')
+const Other = require('./other.js')
+function build() {
+  return [new Parser(), Parser.run(), new Other(), Other.run()]
+}
+module.exports = build
+";
+    let (_directory, index) = workspace(&[
+        ("parser.js", parser),
+        ("other.js", other),
+        ("main.js", main),
+    ]);
+    for to in ["parser.js/Parser", "parser.js/run"] {
+        assert!(
+            has_edge(&index, EdgeKind::Calls, "main.js/build", to),
+            "{to}"
+        );
+    }
+    for to in ["other.js/Other", "other.js/run"] {
+        assert!(
+            !has_edge(&index, EdgeKind::Calls, "main.js/build", to),
+            "{to}"
+        );
+    }
+}
