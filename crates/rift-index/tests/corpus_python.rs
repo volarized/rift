@@ -253,3 +253,92 @@ fn test_attrs_static_collection_floors() -> Result<(), Box<dyn std::error::Error
         ],
     })
 }
+
+#[test]
+#[ignore = "requires jinja2 3.1.6 in RIFT_CORPUS_JINJA2"]
+fn test_jinja2_static_collection_floors() -> Result<(), Box<dyn std::error::Error>> {
+    check(&Package {
+        variable: "RIFT_CORPUS_JINJA2",
+        version_file: "src/jinja2/__init__.py",
+        version_line: "__version__ = \"3.1.6\"",
+        include: "src/jinja2/**/*.py",
+        files: 25,
+        declarations: &[
+            ("class", 160),
+            ("function", 215),
+            ("method", 560),
+            ("module", 25),
+            ("variable", 1702),
+        ],
+        edges: &[
+            (EdgeKind::Aliases, 31),
+            (EdgeKind::Calls, 1072),
+            (EdgeKind::Contains, 2314),
+            (EdgeKind::Extends, 108),
+            (EdgeKind::HasType, 804),
+            (EdgeKind::Imports, 192),
+            (EdgeKind::Overrides, 75),
+            (EdgeKind::Reads, 1834),
+            (EdgeKind::Writes, 300),
+        ],
+    })
+}
+
+#[test]
+#[ignore = "requires marshmallow 4.4.0 in RIFT_CORPUS_MARSHMALLOW"]
+fn test_marshmallow_static_collection_floors() -> Result<(), Box<dyn std::error::Error>> {
+    check(&Package {
+        variable: "RIFT_CORPUS_MARSHMALLOW",
+        version_file: "pyproject.toml",
+        version_line: "version = \"4.4.0\"",
+        include: "src/marshmallow/**/*.py",
+        files: 14,
+        declarations: &[
+            ("class", 65),
+            ("function", 33),
+            ("method", 207),
+            ("module", 14),
+            ("variable", 578),
+        ],
+        edges: &[
+            (EdgeKind::Calls, 208),
+            (EdgeKind::Contains, 794),
+            (EdgeKind::Extends, 48),
+            (EdgeKind::HasType, 210),
+            (EdgeKind::Imports, 55),
+            (EdgeKind::Overrides, 94),
+            (EdgeKind::Reads, 415),
+            (EdgeKind::Writes, 157),
+        ],
+    })
+}
+
+#[test]
+#[ignore = "requires urllib3 2.8.0 in RIFT_CORPUS_URLLIB3"]
+fn test_urllib3_static_collection_floors() -> Result<(), Box<dyn std::error::Error>> {
+    check(&Package {
+        variable: "RIFT_CORPUS_URLLIB3",
+        version_file: "CHANGES.rst",
+        version_line: "2.8.0 (",
+        include: "src/urllib3/**/*.py",
+        files: 35,
+        declarations: &[
+            ("class", 104),
+            ("function", 113),
+            ("method", 400),
+            ("module", 35),
+            ("variable", 1525),
+        ],
+        edges: &[
+            (EdgeKind::Aliases, 3),
+            (EdgeKind::Calls, 435),
+            (EdgeKind::Contains, 1685),
+            (EdgeKind::Extends, 59),
+            (EdgeKind::HasType, 315),
+            (EdgeKind::Imports, 250),
+            (EdgeKind::Overrides, 67),
+            (EdgeKind::Reads, 766),
+            (EdgeKind::Writes, 367),
+        ],
+    })
+}
