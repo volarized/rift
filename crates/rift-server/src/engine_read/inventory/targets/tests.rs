@@ -302,3 +302,110 @@ fn local_type_sites_keep_definition_answers_in_the_type_inventory() -> TestResul
     assert_eq!(edges[0].provider, EdgeProvider::Lsp);
     Ok(())
 }
+
+/// The installed `greeting` distribution under `root/installed`.
+fn installed_greeting(root: &Path) -> Result<(TreeRoot, CalleeRoots), Box<dyn std::error::Error>> {
+    let installed = TreeRoot::new(&root.join("installed"))?;
+    let package = rift_core::PackageIdentity {
+        manager: "pypi".to_owned(),
+        registry: "pypi.org".to_owned(),
+        name: "greeting".to_owned(),
+        version: "1.0.0".to_owned(),
+    };
+    let roots = CalleeRoots::from_packages(vec![PackageRoot::new(installed.clone(), package)]);
+    Ok((installed, roots))
+}
+
+#[test]
+fn engine_targets_at_statically_named_sites_take_the_static_name_of_their_owner() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().canonicalize()?;
+    std::fs::create_dir(root.join("installed"))?;
+    std::fs::write(root.join("installed/core.py"), "class Foreign: pass\n")?;
+    std::fs::write(
+        root.join("service.py"),
+        "from _typeshed import SupportsRead\n\n\ndef serve(port: int) -> SupportsRead[str]:\n    raise NotImplementedError\n",
+    )?;
+    let reads = fixture(&root)?;
+    let path = ProjectPath::new("service.py")?;
+    let file = reads.index().file(&path).ok_or("file")?;
+    let seeds = reads
+        .local_search_view_input(true)?
+        .inventory_seeds()?
+        .0
+        .into_iter()
+        .collect();
+    let found = sites(&reads, file, &seeds, selection())?;
+    let site = |name: &str| {
+        found
+            .iter()
+            .find(|site| site.name == name && site.caller.as_str().ends_with("/serve"))
+            .cloned()
+            .ok_or(format!("site {name}"))
+    };
+    let stub = |path: &str| -> Result<Location, Box<dyn std::error::Error>> {
+        Ok(Location {
+            uri: format!("vendored://stdlib/{path}").parse()?,
+            range: lsp_types::Range::new(Position::new(3, 6), Position::new(3, 9)),
+        })
+    };
+    let (installed, roots) = installed_greeting(&root)?;
+    let foreign = Location {
+        uri: installed.document_uri(&ProjectPath::new("core.py")?)?,
+        range: lsp_types::Range::new(Position::new(0, 6), Position::new(0, 13)),
+    };
+    let mapping = Mapping {
+        reads: &reads,
+        roots: &roots,
+        workspace: &root,
+        encoding: PositionEncoding::Utf16,
+        provider: EdgeProvider::Engine,
+    };
+    let (int_site, read_site) = (site("int")?, site("SupportsRead")?);
+    let (int_name, read_name) = (int_site.source.range.start, read_site.source.range.start);
+    let resolved = mapping.resolve(
+        Vec::new(),
+        Vec::new(),
+        vec![
+            Answer {
+                site: int_site,
+                locations: vec![stub("builtins.pyi")?, foreign],
+            },
+            Answer {
+                site: read_site,
+                locations: vec![stub("_typeshed/__init__.pyi")?],
+            },
+        ],
+    )?;
+    let int = "rift://symbol/stdlib/cpython/python/builtins/int";
+    let mut named = resolved
+        .packages
+        .iter()
+        .map(|edge| {
+            (
+                edge.source.as_ref().map(|source| source.range.start),
+                edge.target.path().as_str(),
+                edge.kind,
+                edge.static_target.as_ref().map(SymbolId::as_str),
+            )
+        })
+        .collect::<Vec<_>>();
+    named.sort();
+    // Another owner's declaration at the same site keeps no static name.
+    let mut expected = [
+        (read_name, "_typeshed/__init__.pyi", None),
+        (int_name, "builtins.pyi", Some(int)),
+        (int_name, "core.py", None),
+    ]
+    .into_iter()
+    .flat_map(|(start, path, target)| {
+        [EdgeKind::HasType, EdgeKind::References].map(|kind| (Some(start), path, kind, target))
+    })
+    .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(
+        named, expected,
+        "only targets inside the owner the static pass named take its name"
+    );
+    Ok(())
+}
