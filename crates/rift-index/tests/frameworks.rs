@@ -293,3 +293,72 @@ fn workspace_tailwind_lockfile_pin_changes_resolved_major_version() {
         .expect("legacy evidence rescan");
     assert!(utility(&configured, "view.html", "flex"));
 }
+
+#[test]
+fn tailwind_workspace_publishes_assigned_members_and_ordinary_syntax_for_refused_interpretation() {
+    let directory = tempfile::tempdir().expect("workspace directory");
+    let root = directory.path();
+    write(
+        root,
+        "package.json",
+        "{\"devDependencies\":{\"tailwindcss\":\"4.1.0\"}}",
+    );
+    write(root, "theme.css", "@import 'tailwindcss';");
+    write(
+        root,
+        "page.jsx",
+        "export default function Page() {\n  return <p className=\"flex\" />;\n}\n\nPage.getInitialProps = () => ({ prop: true });\n",
+    );
+    // An export inside a `declare global` block names `global` as its container, which
+    // the file declares as no symbol, so the Tailwind interpretation of this file fails
+    // validation.
+    write(
+        root,
+        "types.d.ts",
+        "declare global {\n  export namespace JSX {\n    interface Intrinsic {}\n  }\n}\nexport {};\n",
+    );
+    write(root, "other.js", "export function other() {}\n");
+    let index = build(root, &WorkspaceConfiguration::default());
+
+    assert!(utility(&index, "page.jsx", "flex"));
+    let page = index
+        .file(&ProjectPath::new("page.jsx").expect("source path"))
+        .expect("indexed page");
+    assert!(
+        page.syntax()
+            .symbols()
+            .iter()
+            .any(|symbol| symbol.qualified_name == "Page.getInitialProps"
+                && symbol.container.as_deref() == Some("Page")),
+        "a member assigned after its owner keeps the owner as container"
+    );
+
+    let types = ProjectPath::new("types.d.ts").expect("source path");
+    let refused = index
+        .file(&types)
+        .expect("ordinary syntax of the refused file");
+    assert!(
+        refused
+            .syntax()
+            .symbols()
+            .iter()
+            .any(|symbol| symbol.qualified_name == "global.JSX")
+    );
+    assert!(index.warnings().iter().any(|warning| matches!(
+        warning,
+        WorkspaceIndexWarning::FrameworkContextUnresolved {
+            path,
+            framework: SyntaxFramework::Tailwind,
+            detail,
+        } if path == &types && detail.contains("failed validation")
+    )));
+    assert!(
+        index
+            .file(&ProjectPath::new("other.js").expect("source path"))
+            .expect("indexed other file")
+            .syntax()
+            .symbols()
+            .iter()
+            .any(|symbol| symbol.name == "other")
+    );
+}

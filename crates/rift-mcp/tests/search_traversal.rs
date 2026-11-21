@@ -723,7 +723,10 @@ async fn live_walk(
             client,
             tool_request(
                 "search_retrieval",
-                &json!({"traversal": {"seed": seed, "direction": direction, "kinds": kinds}}),
+                &json!({
+                    "traversal": {"seed": seed, "direction": direction, "kinds": kinds},
+                    "include": {"providers": true},
+                }),
             ),
         )
         .await?;
@@ -758,12 +761,20 @@ fn direct_incoming(hit: &Value, seed: &str) -> TestResult<Value> {
     Ok(hop["edge"].clone())
 }
 
+/// Whether a merged edge, read with `include.providers`, names `provider` among its
+/// producers (D29: the singular `provider` field left the wire).
+fn provided_by(edge: &Value, provider: &str) -> bool {
+    edge["providers"]
+        .as_array()
+        .is_some_and(|providers| providers.iter().any(|name| name == provider))
+}
+
 /// Each incoming neighbor is a reference the language server resolved.
 fn assert_direct_incoming(answer: &Value, seed: &str) -> TestResult {
     for hit in results(answer) {
         let edge = direct_incoming(&hit, seed)?;
         assert_eq!(edge["kinds"], json!(["references"]), "{hit}");
-        assert_eq!(edge["provider"], json!("lsp"), "{hit}");
+        assert!(provided_by(&edge, "lsp"), "{hit}");
         eprintln!("live incoming edge: {edge}");
     }
     Ok(())
@@ -780,14 +791,17 @@ async fn assert_static_incoming(
         client,
         tool_request(
             "search_retrieval",
-            &json!({"traversal": {"seed": seed, "direction": "incoming"}}),
+            &json!({
+                "traversal": {"seed": seed, "direction": "incoming"},
+                "include": {"providers": true},
+            }),
         ),
     )
     .await?;
     let mut reached = Vec::new();
     for hit in results(&answer) {
         let edge = direct_incoming(&hit, seed)?;
-        assert_eq!(edge["provider"], json!("static"), "{hit}");
+        assert!(provided_by(&edge, "static"), "{hit}");
         let name = hit["hit"]["symbol"]["name"].as_str().unwrap_or_default();
         let kind = edge["kind"].as_str().unwrap_or_default();
         assert_eq!(edge["kinds"], json!([kind]), "{hit}");

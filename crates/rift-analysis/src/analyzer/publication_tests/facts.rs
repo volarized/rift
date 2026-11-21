@@ -1,8 +1,8 @@
 //! A publication states which fact kinds it covers, and its facts agree with that coverage.
 
 use rift_protocol::index::PackageOccurrence;
+use rift_protocol::index::StoredEdge;
 use rift_protocol::producer::{FactCoverage, FactKind, FactProducer};
-use rift_protocol::read::Edge;
 use serde_json::json;
 
 use super::publication;
@@ -34,8 +34,8 @@ fn occurrence(publication: &PackagePublication, start: u64, end: u64) -> Package
     }
 }
 
-fn edge(from: &str, producer: Option<FactProducer>) -> Edge {
-    let mut edge: Edge = serde_json::from_value(json!({
+fn edge(from: &str, producer: Option<FactProducer>) -> StoredEdge {
+    let mut edge: StoredEdge = serde_json::from_value(json!({
         "from": from,
         "kind": "calls",
         "kinds": ["calls"],

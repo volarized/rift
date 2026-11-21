@@ -216,6 +216,7 @@ impl GrepRequest {
         let query =
             format!("SELECT {projection} {{ SERVICE :search {{ {selection} }} }} ORDER BY ?index");
         let mut arguments = serde_json::to_value(QueryParams {
+            include: rift_protocol::query::QueryInclude::default(),
             query,
             language: QueryLanguage::Sparql,
             max_results: limit.unwrap_or(rift_protocol::read::MAX_RESULTS_DEFAULT),

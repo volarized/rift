@@ -53,10 +53,14 @@ language and defaults to `sparql`.
 A query over the captured inventory answers from partly covered facts, and `warnings`
 name the files, languages, or engines left out. A query whose answer needs every fact - an empty
 result, a false `ASK`, a count, a negation, an `OPTIONAL` - answers `unavailable` with
-`insufficient_coverage` instead.
+`insufficient_coverage` instead. A bound never makes an answer unavailable: a file a bound
+left out of the index is outside the indexed set, and a producer or acquisition bound ends
+the answer with the rows it reached; the server logs the bound, and `warnings` carry
+nothing for it.
 
 Parameters:
 
+- `include` - Attaches the sorted analyses that produced each returned edge.
 - `query` (required) - Query text in `language`.
 - `language` - The language of `query`.
 - `page` - The 1-based page to read.

@@ -1297,7 +1297,6 @@
                                   "contains"
                                 ],
                                 "to": "rift://symbol/pypi/pypi.org/idna/python/idna/codec/Codec/decode",
-                                "provider": "static",
                                 "derivation": "resolution",
                                 "producer": {
                                   "name": "canonical-containment",
@@ -1314,7 +1313,6 @@
                                   "contains"
                                 ],
                                 "to": "rift://symbol/pypi/pypi.org/idna/python/idna/codec/Codec/encode",
-                                "provider": "static",
                                 "derivation": "resolution",
                                 "producer": {
                                   "name": "canonical-containment",
@@ -4072,15 +4070,8 @@
             "maxItems": 16
           },
           "include": {
-            "description": "Optional fields to include. An omitted member is `false`.",
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-              "source": {
-                "description": "Attaches the declaration's source to each hit.",
-                "type": "boolean"
-              }
-            }
+            "$ref": "#/components/schemas/EdgeInclude",
+            "description": "Optional fields to include. An omitted member is `false`."
           },
           "packages": {
             "description": "Selected exact package versions. Omitted or empty, use the newest collected stable version of each package, or its newest prerelease when no stable version is collected.",
@@ -5546,7 +5537,7 @@
           "edge",
           "direction"
         ],
-        "description": "One auditable step in a search traversal. `edge` retains its occurrence, provider, and\nderivation; `direction` records how the walk followed it."
+        "description": "One auditable step in a search traversal. `edge` retains its occurrence, requested providers, and\nderivation; `direction` records how the walk followed it."
       },
       "TraversalDirection": {
         "description": "Which edge direction a search traversal walks from each visited symbol. A language\nengine supplies the edges of both: its references for `incoming`, its call hierarchy for\n`outgoing`.",
@@ -5650,9 +5641,13 @@
             "description": "Exact physical occurrence when this edge was read from source, independent of\nwhether the provider supplied a source syntax element.",
             "$ref": "#/components/schemas/SourceUnitSpan"
           },
-          "provider": {
-            "$ref": "#/components/schemas/EdgeProvider",
-            "description": "Which analysis produced this edge."
+          "providers": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "$ref": "#/components/schemas/EdgeProvider"
+            },
+            "description": "Sorted analyses that produced this edge, present when `include.providers` is `true`."
           },
           "derivation": {
             "$ref": "#/components/schemas/EdgeDerivation",
@@ -5680,7 +5675,6 @@
           "kind",
           "kinds",
           "to",
-          "provider",
           "derivation"
         ],
         "description": "One directed edge between two symbols. Its occurrence is where it was read from, and its\nderivation is how much the provider knew when it was read."
@@ -6669,7 +6663,7 @@
               "code",
               "detail"
             ],
-            "description": "A file answers nothing from its bytes. Either the index left the claimed file out -\nits bytes are not valid UTF-8, or it crosses a per-file bound - so it answers no\nsearch or lookup, and addressing it directly still refuses `content_unavailable`;\nor a comparison against the working tree read the changed file in no working form -\nits attributes name a `filter` driver or a UTF-16 `working-tree-encoding` - so it\nanswers changed with no declarations. Every other file in the workspace stays\navailable. At most `SOURCE_WARNINGS_MAX` of this warning name a file, in\nproject-path order; when more files are named, one more carries no `unit` and\ncounts the rest. `rift server logs` names each file the index left out, and `paths`\nnarrows a comparison onto the others."
+            "description": "A file answers nothing from its bytes. Either the index left the claimed file out -\nits bytes are not valid UTF-8, or, for a file the request names through\n`paths.force_include` or a comparison, it crosses a per-file bound - so it answers no\nsearch or lookup, and addressing it directly still refuses `content_unavailable`;\nor a comparison against the working tree read the changed file in no working form -\nits attributes name a `filter` driver or a UTF-16 `working-tree-encoding` - so it\nanswers changed with no declarations. Every other file in the workspace stays\navailable. At most `SOURCE_WARNINGS_MAX` of this warning name a file, in\nproject-path order; when more files are named, one more carries no `unit` and\ncounts the rest. A file a bound left out is outside the indexed set, as a file the\nsource policy excludes is, so no other answer names it. `rift server logs` records the\nfiles the index left out, and `paths` narrows a comparison onto the others."
           },
           {
             "type": "object",
@@ -6725,7 +6719,7 @@
               "files",
               "detail"
             ],
-            "description": "Files past `[providers.syntax] max_file` are held as text the syntax provider does\nnot parse: their text answers `search`, and none of their declarations were\nextracted, so no symbol hit and no `get_symbol` answer comes from them. `files`\nnames them in project-path order, at most `SOURCE_WARNINGS_MAX` of them. Raising\n`max_file` parses them."
+            "description": "Files past `[providers.syntax] max_file` are held as text the syntax provider does\nnot parse: their text answers `search`, and none of their declarations were\nextracted, so no symbol hit and no `get_symbol` answer comes from them. `files`\nnames them in project-path order, at most `SOURCE_WARNINGS_MAX` of them. An answer\ncarries it only for files the request names through `paths.force_include` or a\ncomparison; `rift server logs` records every other such file. Raising `max_file`\nparses them."
           },
           {
             "type": "object",
@@ -8742,7 +8736,7 @@
           },
           "text": {
             "type": "string",
-            "description": "Selected text, absent when source is unavailable or unrequested."
+            "description": "Exact UTF-8 text of the selected source unit, absent when unavailable or unrequested."
           }
         },
         "required": [
@@ -8865,14 +8859,14 @@
             "items": {
               "$ref": "#/components/schemas/EdgeRecord"
             },
-            "description": "Original records, preserving parallel edges, evidence and occurrences."
+            "description": "Merged records, preserving distinct kinds and physical occurrences. Producer rows of the same edge consume one slot."
           },
           "occurrences": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/EdgeOccurrence"
             },
-            "description": "Physical usages, including recursive and file-level locations without a caller symbol.\nPage limits count distinct original record identities across edges and usages.\nMultiple projections of one original record consume one slot; independent records\nconsume separate slots even when their payloads or locations are equal."
+            "description": "Physical usages, including recursive and file-level locations without a caller symbol.\nPage limits count distinct merged edges and physical usages across their record identities.\nMultiple projections of one original record consume one slot; independent records\nconsume separate slots even when their payloads or locations are equal."
           },
           "complete": {
             "type": "boolean",
@@ -8884,18 +8878,22 @@
           "edges",
           "complete"
         ],
-        "description": "Original edge records for one requested subject on this page."
+        "description": "Merged edge records for one requested subject on this page."
       },
       "EdgeInclude": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
+          "providers": {
+            "type": "boolean",
+            "description": "Attaches the sorted analyses that produced each merged edge."
+          },
           "source": {
             "type": "boolean",
-            "description": "Attaches the exact UTF-8 bytes of the selected source units."
+            "description": "Attaches source text to the selected records."
           }
         },
-        "description": "The optional projections of records in an edge page. An omitted member is `false`.",
+        "description": "The optional projections of read records. An omitted member is `false`.",
         "examples": [
           {
             "source": true
@@ -8942,14 +8940,14 @@
           "id",
           "edge"
         ],
-        "description": "One original edge record, independent of equal endpoint or evidence payloads."
+        "description": "One edge merged by source, exact kind, target and physical occurrence."
       },
       "EdgeRecordId": {
         "type": "string",
         "minLength": 64,
         "maxLength": 64,
         "pattern": "^[0-9a-f]{64}$",
-        "description": "Opaque full identity of one original edge record within its selected publication."
+        "description": "Opaque full identity of one merged edge or physical usage within its selected publication."
       },
       "EdgeSearchPage": {
         "type": "object",
@@ -9156,14 +9154,14 @@
         "description": "Which analysis produced an edge.",
         "type": "string",
         "enum": [
-          "static",
           "engine",
-          "lsp"
+          "lsp",
+          "static"
         ],
         "x-enum-descriptions": [
-          "Static analysis captured into the index.",
           "A language engine embedded in Rift, such as ty.",
-          "A language server reached through LSP."
+          "A language server reached through LSP.",
+          "Static analysis captured into the index."
         ]
       }
     },

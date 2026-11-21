@@ -204,7 +204,22 @@ fn query_term(term: &serde_json::Value) -> Result<String, String> {
     let quoted = || serde_json::to_string(value).map_err(|error| error.to_string());
     match term["type"].as_str() {
         Some("iri") => Ok(query_iri(value)),
-        Some("blank_node") => Ok(format!("_:{}", &value[..value.ceil_char_boundary(12)])),
+        Some("blank_node") => {
+            let mut display = format!("_:{}", &value[..value.ceil_char_boundary(12)]);
+            if let Some(providers) = term["providers"]
+                .as_array()
+                .filter(|values| !values.is_empty())
+            {
+                let providers = providers
+                    .iter()
+                    .map(|value| value.as_str().ok_or("query provider"))
+                    .collect::<Result<Vec<_>, _>>()?;
+                display.push_str(" (providers: ");
+                display.push_str(&providers.join(", "));
+                display.push(')');
+            }
+            Ok(display)
+        }
         Some("language_literal") => Ok(format!(
             "{}@{}",
             quoted()?,
@@ -335,6 +350,23 @@ mod tests {
         let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
         result.structured_content = Some(structured);
         result
+    }
+
+    #[test]
+    fn query_provider_sets_are_present_in_text_only_when_projected() {
+        let answer = json!({
+            "answer": {"result": "bindings", "variables": ["edge"], "bindings": [{
+                "edge": {"type": "blank_node", "value": "edge", "providers": ["engine", "lsp", "static"]}
+            }]},
+            "pagination": {"page": 1, "pages": 1, "max_results": 10, "total": 1}
+        });
+        let included = result_of(
+            "?edge\n_:edge (providers: engine, lsp, static)\n",
+            answer.clone(),
+        );
+        assert_eq!(text_states(SEARCH_TOOL, &included), Ok(()));
+        let missing = result_of("?edge\n_:edge\n", answer);
+        assert!(text_states(SEARCH_TOOL, &missing).is_err());
     }
 
     #[test]

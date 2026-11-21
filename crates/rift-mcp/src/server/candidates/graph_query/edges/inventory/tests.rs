@@ -112,11 +112,12 @@ async fn package_calls_spend_inventory_records_before_naming()
 
 #[test]
 fn repeated_reference_provider_records_cannot_exceed_the_inventory_bound() {
-    use rift_protocol::read::{Edge, EdgeDerivation, EdgeProvider, ExactKind, Extensions};
+    use rift_protocol::index::StoredEdge;
+    use rift_protocol::read::{EdgeDerivation, EdgeProvider, ExactKind, Extensions};
     let (target, occurrences) = references();
     let edges = occurrences
         .iter()
-        .map(|occurrence| Edge {
+        .map(|occurrence| StoredEdge {
             from: occurrence.enclosing.clone().expect("caller"),
             to: target.clone(),
             kind: ExactKind("references".to_owned()),

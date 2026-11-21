@@ -41,7 +41,7 @@ pub(super) struct InventoryRead {
         ),
     >,
     pub(super) local_edges: Vec<(SymbolId, SymbolRelation, SymbolId)>,
-    pub(super) edge_facts: Vec<rift_protocol::read::Edge>,
+    pub(super) edge_facts: Vec<rift_protocol::index::StoredEdge>,
     outgoing_edges: BTreeMap<SymbolId, Vec<usize>>,
     incoming_edges: BTreeMap<SymbolId, Vec<usize>>,
     pub(super) warnings: Vec<ReadWarning>,

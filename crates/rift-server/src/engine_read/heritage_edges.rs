@@ -1,5 +1,6 @@
 //! Inheritance edges from advertised LSP operations.
 
+use rift_protocol::index::StoredEdge;
 use std::collections::BTreeSet;
 
 use lsp_types::{Location, Range};
@@ -7,7 +8,7 @@ use rift_core::{ProjectPath, SymbolId as CoreSymbolId};
 use rift_error::{RiftError, errors};
 use rift_lsp::{EngineSession, LineIndex, PositionEncoding, TreeRoot};
 use rift_protocol::read::{
-    Edge, EdgeDerivation, EdgeKind, EdgeProvider, ExactKind, Extensions, ReadWarning, SymbolId,
+    EdgeDerivation, EdgeKind, EdgeProvider, ExactKind, Extensions, ReadWarning, SymbolId,
     TraversalDirection,
 };
 use tokio::time::Instant;
@@ -39,7 +40,7 @@ pub async fn graph_heritage_inventory(
     kinds: &[EdgeKind],
     requests_max: usize,
     deadline: Instant,
-) -> Result<(Vec<Edge>, Vec<ReadWarning>), RiftError> {
+) -> Result<(Vec<StoredEdge>, Vec<ReadWarning>), RiftError> {
     if kinds
         .iter()
         .any(|kind| !matches!(kind, EdgeKind::Extends | EdgeKind::Implements))
@@ -101,7 +102,7 @@ pub async fn graph_heritage_edges(
     kind: EdgeKind,
     direction: TraversalDirection,
     deadline: Instant,
-) -> Result<(Vec<Edge>, Vec<ReadWarning>), RiftError> {
+) -> Result<(Vec<StoredEdge>, Vec<ReadWarning>), RiftError> {
     let identity = CoreSymbolId::new(seed.as_str())?;
     let Some(declaration) = super::edge_declarations(reads, &identity)?
         .into_iter()
@@ -178,7 +179,7 @@ fn edge_locations(
     seed: &SymbolId,
     (kind, direction): (EdgeKind, TraversalDirection),
     report: EdgeEngineReport,
-) -> Result<Vec<Edge>, RiftError> {
+) -> Result<Vec<StoredEdge>, RiftError> {
     let identity = CoreSymbolId::new(seed.as_str())?;
     let roots = [
         TreeRoot::new(slot.workspace_root())?,
@@ -240,8 +241,8 @@ pub(super) fn edge_protocol(
     to: SymbolId,
     kind: EdgeKind,
     provider: EdgeProvider,
-) -> Edge {
-    Edge {
+) -> StoredEdge {
+    StoredEdge {
         producer: None,
         from,
         to,
@@ -263,7 +264,7 @@ pub(super) fn edge_implementation(
     (range, encoding): (Range, PositionEncoding),
     neighbor: Option<SymbolId>,
     provider: EdgeProvider,
-    edges: &mut Vec<Edge>,
+    edges: &mut Vec<StoredEdge>,
 ) -> Result<(), RiftError> {
     let before = edges.len();
     edge_impl_header(
@@ -303,7 +304,7 @@ pub(super) fn edge_impl_header(
     (range, encoding): (Range, PositionEncoding),
     kind: EdgeKind,
     provider: EdgeProvider,
-    edges: &mut Vec<Edge>,
+    edges: &mut Vec<StoredEdge>,
 ) -> Result<(), RiftError> {
     let Some(file) = reads.index().file(path) else {
         return Ok(());

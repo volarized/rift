@@ -232,7 +232,10 @@ async fn native_http_stored_context_refuses_wrong_targets_revisions_and_duplicat
 fn request() -> PackageSearchRequest {
     let mut value = search_request();
     value.target = Some(PackageSearchRequestTarget::Documentation);
-    value.include = Some(crate::PackageSearchRequestInclude { source: Some(true) });
+    value.include = Some(crate::PackageSearchRequestInclude {
+        source: Some(true),
+        providers: None,
+    });
     value
 }
 

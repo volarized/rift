@@ -6,6 +6,7 @@ pub use inventory::{
     EngineInventory, EngineInventoryAnswer, EngineInventoryFile, EngineInventorySelection,
     PackageEdge,
 };
+use rift_protocol::index::StoredEdge;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -19,7 +20,7 @@ use rift_lsp::session::EngineSession;
 use rift_lsp::uri::TreeRoot;
 use rift_protocol::edge_read::QueryOccurrence;
 use rift_protocol::read::{
-    Edge, EdgeDerivation, EdgeKind, EdgeProvider, ExactKind, Extensions, GraphHop, HopDirection,
+    EdgeDerivation, EdgeKind, EdgeProvider, ExactKind, Extensions, GraphHop, HopDirection,
     Language, ReadWarning, SearchParams, SearchParamsTarget, SearchTraversal, SourceUnitId,
     SourceUnitSpan, Symbol, SymbolId, TextRange, TraversalDirection,
 };
@@ -594,7 +595,7 @@ fn callee_hops(
 /// The outgoing edge from `from` to the declaration `to` it calls.
 fn call_hop(from: &SymbolId, to: SymbolId, provider: EdgeProvider) -> GraphHop {
     GraphHop {
-        edge: graph_edge(from, to, EdgeKind::Calls, None, provider),
+        edge: graph_edge(from, to, EdgeKind::Calls, None, provider).into(),
         direction: HopDirection::Outgoing,
     }
 }
@@ -1013,7 +1014,7 @@ pub struct GraphCalls {
     /// Canonical neighbors in the current tree.
     pub local: Vec<(SymbolId, Vec<SourceUnitSpan>)>,
     /// Original edges with their analysis and physical occurrences.
-    pub edges: Vec<Edge>,
+    pub edges: Vec<StoredEdge>,
     /// Outgoing targets in admitted dependency sources, awaiting exact identity resolution.
     pub packages: Vec<(PackageCallee, Vec<SourceUnitSpan>)>,
     /// Whether static capture or a configured engine covered the requested direction.
@@ -1107,8 +1108,8 @@ fn graph_edge(
     kind: EdgeKind,
     occurrence: Option<SourceUnitSpan>,
     provider: EdgeProvider,
-) -> Edge {
-    Edge {
+) -> StoredEdge {
+    StoredEdge {
         from: from.clone(),
         to,
         kind: ExactKind(kind.as_ref().to_owned()),
@@ -1932,7 +1933,7 @@ pub struct GraphReferences {
     /// Captured physical usages.
     pub occurrences: Vec<QueryOccurrence>,
     /// Reference edges with their analysis and physical occurrences.
-    pub edges: Vec<Edge>,
+    pub edges: Vec<StoredEdge>,
     /// Whether a configured provider covered the request.
     pub complete: bool,
     /// Typed warnings from the engine edge read.
@@ -2558,7 +2559,7 @@ fn edge_enclosing_symbol(
         .map(|id| SymbolId(id.as_str().to_owned())))
 }
 
-fn reference_edges(occurrences: &[QueryOccurrence], provider: EdgeProvider) -> Vec<Edge> {
+fn reference_edges(occurrences: &[QueryOccurrence], provider: EdgeProvider) -> Vec<StoredEdge> {
     occurrences
         .iter()
         .filter_map(|occurrence| {
@@ -2574,7 +2575,7 @@ fn reference_edges(occurrences: &[QueryOccurrence], provider: EdgeProvider) -> V
 }
 
 /// One reference edge's target, physical occurrence, and analysis.
-fn reference_edge_key(edge: &Edge) -> (SymbolId, Option<(String, u64, u64)>, EdgeProvider) {
+fn reference_edge_key(edge: &StoredEdge) -> (SymbolId, Option<(String, u64, u64)>, EdgeProvider) {
     (
         edge.to.clone(),
         edge.occurrence.as_ref().map(|span| {
@@ -2630,7 +2631,8 @@ fn map_references(
                 EdgeKind::References,
                 None,
                 provider,
-            ),
+            )
+            .into(),
             direction: HopDirection::Incoming,
         })
         .collect())

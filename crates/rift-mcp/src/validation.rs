@@ -6733,16 +6733,22 @@ pub(crate) mod tests {
         let params = serde_json::from_value(serde_json::json!({"name": "beacon"}))?;
         let answer = published.reads.get_symbol(&params)?;
         assert!(answer.hits.is_empty());
+        // D37: a file a bound left out is outside the indexed set, so the answer carries
+        // nothing for it while the publication keeps the omission it captured.
         assert!(
-            answer.warnings.iter().any(|warning| matches!(
+            !answer.warnings.iter().any(|warning| matches!(
                 warning,
-                rift_protocol::read::ReadWarning::SourceUnavailable { unit: Some(unit), detail }
-                    if unit.0 == "rift://source/project/lib.rs"
-                        && detail.contains("lib.rs")
-                        && detail.contains("byte limit of 60")
+                rift_protocol::read::ReadWarning::SourceUnavailable { .. }
             )),
-            "the late event must retain file identity and byte-limit warning: {:?}",
+            "{:?}",
             answer.warnings
+        );
+        let retained = published.reads.file_warning(&path);
+        assert!(
+            retained.is_some_and(|warning| warning.is_left_out_by_bound()
+                && warning.path() == &path
+                && warning.reason().contains("byte limit of 60")),
+            "the late event must retain file identity and byte-limit omission: {retained:?}"
         );
 
         fs::write(&absolute, "pub fn changed() {}\n")?;
@@ -8305,11 +8311,18 @@ pub(crate) mod tests {
                 .contains_key(&rift_core::ProjectPath::new("large.rs")?)
         );
         let params = serde_json::from_value(serde_json::json!({"name": "beacon"}))?;
+        let large = rift_core::ProjectPath::new("large.rs")?;
+        // D37: the publication keeps the omission a bound made; the answer carries nothing
+        // for it, as for a file the source policy excludes.
         let answer = published.reads.get_symbol(&params)?;
         assert!(
-            !answer.warnings.is_empty(),
-            "the new refused file must be reported"
+            published
+                .reads
+                .file_warning(&large)
+                .is_some_and(rift_index::WorkspaceIndexWarning::is_left_out_by_bound),
+            "the new refused file must be retained"
         );
+        assert!(answer.warnings.is_empty(), "{:?}", answer.warnings);
         let repeated = RebuildRequest {
             previous: Some(published),
             ..RebuildRequest::initial(2)
@@ -8323,7 +8336,8 @@ pub(crate) mod tests {
             return Err("a repeated full capture must retain the refused file".into());
         };
         assert!(!published.visible_refused.is_empty());
-        assert!(!published.reads.get_symbol(&params)?.warnings.is_empty());
+        assert!(published.reads.file_warning(&large).is_some());
+        assert!(published.reads.get_symbol(&params)?.warnings.is_empty());
         fs::remove_file(directory.path().join("large.rs"))?;
         let repaired = RebuildRequest {
             previous: Some(published),
@@ -8338,6 +8352,7 @@ pub(crate) mod tests {
             return Err("removing the refused file must publish the repaired tree".into());
         };
         assert!(published.visible_refused.is_empty());
+        assert!(published.reads.file_warning(&large).is_none());
         assert!(published.reads.get_symbol(&params)?.warnings.is_empty());
         Ok(())
     }

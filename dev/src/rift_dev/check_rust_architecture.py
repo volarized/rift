@@ -62,6 +62,7 @@ EXPECTED_EDGES = {
     "rift-analysis -> rift-provider",
     "rift-analysis -> rift-ranking",
     "rift-analysis -> rift-syntax",
+    "rift-analysis -> rift-tracing",
     "rift-index -> rift-analysis",
     "rift-index -> rift-core",
     "rift-index -> rift-history",

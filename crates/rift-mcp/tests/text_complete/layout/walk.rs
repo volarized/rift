@@ -82,7 +82,7 @@ struct Hop {
     start: String,
     /// Identity of the symbol the hop reaches.
     reached: String,
-    /// The head line of the symbol: `↳ probably called, referenced [static]`.
+    /// The head line of the symbol: `↳ probably called, referenced (providers: static)`.
     head: String,
     /// Whether every kind phrase ends in ` by`, so the declaration line starts with `by `.
     by: bool,
@@ -179,7 +179,19 @@ fn hops_of(hit: &Value, at: &str) -> Result<Vec<Hop>, String> {
                 phrase.truncate(phrase.len() - BY_ENDING.len());
             }
         }
-        let provider = text("/edge/provider")?;
+        let providers = hop
+            .pointer("/edge/providers")
+            .and_then(serde_json::Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .filter(|values| !values.is_empty())
+            .map(|values| format!(" (providers: {values})"))
+            .unwrap_or_default();
         let produced = match (
             text_at(hop, "/edge/producer/name"),
             text_at(hop, "/edge/producer/revision"),
@@ -192,7 +204,7 @@ fn hops_of(hit: &Value, at: &str) -> Result<Vec<Hop>, String> {
             start,
             reached,
             head: format!(
-                "{BRANCH} {guess}{} [{provider}]{produced}",
+                "{BRANCH} {guess}{}{providers}{produced}",
                 phrases.join(", ")
             ),
             by,

@@ -101,6 +101,7 @@ async fn refused_search(client: &RunningService<RoleClient, ()>) -> TestResult<T
 /// Confirms the accepted configuration serves the workspace declaration through search.
 async fn served_search(client: &RunningService<RoleClient, ()>) -> TestResult {
     let query = QueryParams {
+        include: rift_protocol::query::QueryInclude::default(),
         query: BEACON_QUERY.to_owned(),
         language: QueryLanguage::Sparql,
         ..Default::default()

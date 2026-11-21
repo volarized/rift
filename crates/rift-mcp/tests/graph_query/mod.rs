@@ -58,6 +58,7 @@ async fn statement(
     query_after_population(
         client,
         &QueryParams {
+            include: rift_protocol::query::QueryInclude::default(),
             max_results: 2,
             query: text.into(),
             language: QueryLanguage::Sparql,
@@ -368,6 +369,7 @@ async fn graph_paths_and_physical_usages_select_exact_pages() -> TestResult {
     let first = statement(&client, format!("SELECT ?u ?start ?source {{ <{leaf}> :usages ?u . ?u :range/:start ?start; :source ?source }} ORDER BY ?start")).await?;
     assert_eq!(first["pagination"]["pages"], 2);
     let parameters = QueryParams {
+        include: rift_protocol::query::QueryInclude::default(),
         query: format!(
             "SELECT ?u ?start ?source {{ <{leaf}> :usages ?u . ?u :range/:start ?start; :source ?source }} ORDER BY ?start"
         ),
@@ -450,7 +452,8 @@ async fn static_edge_provider_filters_captured_calls() -> TestResult {
     )
     .await?;
     assert_eq!(
-        raw["results"][0]["traversal_path"][0]["edge"]["provider"], "static",
+        raw["results"][0]["traversal_path"][0]["edge"].get("providers"),
+        None,
         "{raw}"
     );
     let answer = statement(&client, format!("ASK {{ <{seed}> :calls ?target . ?target :name 'perform' . ?edge a :Edge; :from <{seed}>; :to ?target; :kinds :calls; :provider 'static' }}")).await?;
@@ -459,6 +462,29 @@ async fn static_edge_provider_filters_captured_calls() -> TestResult {
         json!({"result":"boolean", "value":true}),
         "{answer}"
     );
+    let text = format!(
+        "SELECT ?edge {{ <{seed}> :calls ?target . ?edge a :Edge; :from <{seed}>; :to ?target; :kinds :calls }}"
+    );
+    let mut revision = None;
+    for included in [false, true, false] {
+        let request = rift_protocol::query::QueryParams {
+            query: text.clone(),
+            include: rift_protocol::query::QueryInclude {
+                providers: included,
+            },
+            revision: revision.clone(),
+            ..Default::default()
+        };
+        let answer = crate::workspace_client::query_after_population(&client, &request).await?;
+        let rows = query::rows(&answer)?;
+        assert_eq!(rows.len(), 1, "{answer}");
+        assert_eq!(
+            rows[0]["edge"].get("providers"),
+            included.then(|| json!(["static"])).as_ref()
+        );
+        assert_eq!(answer["pagination"]["total"], 1);
+        revision = Some(serde_json::from_value(answer["revision"].clone())?);
+    }
     client.cancel().await?;
     task.await?;
     Ok(())
@@ -744,5 +770,207 @@ async fn a_left_out_file_makes_the_symbol_inventory_partial_but_answered() -> Te
         "{witness}"
     );
     client.cancel().await?;
+    Ok(())
+}
+
+/// `def <name>() -> int:` padded with a comment to exactly `bytes` bytes.
+fn python_source_of(name: &str, bytes: usize) -> String {
+    let mut source = format!("def {name}() -> int:\n    return 1\n#");
+    assert!(source.len() < bytes, "fixture too small: {bytes}");
+    source.push_str(&"x".repeat(bytes - source.len() - 1));
+    source.push('\n');
+    source
+}
+
+/// One page of `max_results` rows of `text`.
+async fn statement_page(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    text: &str,
+    max_results: u64,
+) -> TestResult<Value> {
+    query_after_population(
+        client,
+        &QueryParams {
+            max_results,
+            query: text.to_owned(),
+            language: QueryLanguage::Sparql,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// D37 (#717): a file past `[providers.syntax] max_file` is left out of the indexed set the
+/// way a file the source policy excludes is. Plain symbol enumeration, `LIMIT`, `COUNT`,
+/// `GROUP BY` and an absence all answer over the symbols the index holds, and no answer
+/// carries a warning for the left-out file. Sources below and at the bound answer.
+#[tokio::test]
+async fn an_oversized_file_leaves_symbol_enumeration_counts_and_groups_answering() -> TestResult {
+    let bound = SOURCE.len() + 64;
+    let configuration = format!("[providers.syntax]\nmax_file = \"{bound}b\"\n");
+    let at = python_source_of("at_bound", bound);
+    let above = python_source_of("above_bound", bound + 1);
+    let (_directory, client, _server_task) = served_workspace(
+        &[
+            ("pyproject.toml", METADATA),
+            ("graph.py", SOURCE),
+            ("at.py", &at),
+            ("above.py", &above),
+        ],
+        Some(configuration),
+    )
+    .await?;
+    let omission = ["source_unavailable", "large_file_unparsed"];
+    let enumeration = statement_page(
+        &client,
+        "SELECT ?name WHERE { ?s a :Symbol; :name ?name } ORDER BY ?name",
+        100,
+    )
+    .await?;
+    let names = query::rows(&enumeration)?
+        .iter()
+        .map(|row| query::literal(row, "name"))
+        .collect::<TestResult<BTreeSet<&str>>>()?;
+    assert!(
+        names.contains("at_bound") && names.contains("graph_leaf"),
+        "{enumeration}"
+    );
+    assert!(!names.contains("above_bound"), "{enumeration}");
+    let total = enumeration["pagination"]["total"]
+        .as_u64()
+        .ok_or("pagination total")?;
+    assert_eq!(total, u64::try_from(names.len())?, "{enumeration}");
+    let mut answers = vec![enumeration.clone()];
+
+    let limited = statement_page(
+        &client,
+        "SELECT ?s ?name WHERE { ?s a :Symbol; :name ?name } LIMIT 3",
+        10,
+    )
+    .await?;
+    assert_eq!(query::rows(&limited)?.len(), 3, "{limited}");
+    answers.push(limited);
+
+    let count = statement_page(
+        &client,
+        "SELECT (COUNT(*) AS ?n) WHERE { ?s a :Symbol }",
+        10,
+    )
+    .await?;
+    let [row] = query::rows(&count)? else {
+        return Err(format!("expected one count: {count}").into());
+    };
+    assert_eq!(query::literal(row, "n")?, total.to_string(), "{count}");
+    answers.push(count);
+
+    let grouped = statement_page(
+        &client,
+        "SELECT ?kind (COUNT(*) AS ?n) WHERE { ?s a :Symbol; :kind ?kind } GROUP BY ?kind",
+        100,
+    )
+    .await?;
+    let grouped_total = query::rows(&grouped)?
+        .iter()
+        .map(|row| query::literal(row, "n").map(|value| value.parse::<u64>().unwrap_or(0)))
+        .sum::<TestResult<u64>>()?;
+    assert_eq!(grouped_total, total, "{grouped}");
+    answers.push(grouped);
+
+    let absent = statement_page(&client, "ASK { ?s a :Symbol; :name 'above_bound' }", 10).await?;
+    assert_eq!(
+        absent["answer"],
+        json!({"result":"boolean", "value":false}),
+        "{absent}"
+    );
+    answers.push(absent);
+
+    for answer in &answers {
+        assert_ne!(answer["outcome"], "unavailable", "{answer}");
+        let codes = warning_codes(answer);
+        assert!(
+            omission.iter().all(|code| !codes.contains(code)),
+            "no answer carries the left-out file: {answer}"
+        );
+    }
+    client.cancel().await?;
+    Ok(())
+}
+
+/// `functions` Python functions, each calling the next: `chain_0` calls `chain_1`, and the
+/// last returns a constant.
+fn call_chain(functions: usize) -> TestResult<String> {
+    let mut source = String::new();
+    for index in 0..functions {
+        if index + 1 < functions {
+            let next = index + 1;
+            write!(
+                source,
+                "def chain_{index}() -> int:\n    return chain_{next}()\n\n"
+            )?;
+        } else {
+            write!(source, "def chain_{index}() -> int:\n    return 1\n")?;
+        }
+    }
+    Ok(source)
+}
+
+/// D37 (#715): a transitive walk past the graph acquisition request budget answers the
+/// callees it acquired and pages them instead of refusing. One edge read per function on
+/// the chain: a chain the budget covers answers whole, and one past it answers the
+/// acquired prefix, `LIMIT` and `COUNT` included, with no warning for the budget.
+#[tokio::test]
+async fn a_walk_past_the_request_budget_answers_the_acquired_part() -> TestResult {
+    const REQUESTS_MAX: usize = 64;
+    for (functions, acquired) in [
+        (REQUESTS_MAX, REQUESTS_MAX - 1),
+        (REQUESTS_MAX + 1, REQUESTS_MAX),
+        (REQUESTS_MAX + 16, REQUESTS_MAX),
+    ] {
+        let source = call_chain(functions)?;
+        let (_directory, client, _server_task) = served_workspace(
+            &[("pyproject.toml", METADATA), ("graph.py", &source)],
+            Some(CONFIGURATION.to_owned()),
+        )
+        .await?;
+        let entry = identity(&client, "chain_0").await?;
+        let walk = statement_page(
+            &client,
+            &format!("SELECT DISTINCT ?t {{ <{entry}> :calls+ ?t }}"),
+            10,
+        )
+        .await?;
+        assert_ne!(
+            walk["outcome"], "unavailable",
+            "functions={functions}: {walk}"
+        );
+        assert_eq!(
+            walk["pagination"]["total"],
+            json!(acquired),
+            "functions={functions}: {walk}"
+        );
+        assert_eq!(walk["pagination"]["pages"], json!(acquired.div_ceil(10)));
+        assert!(
+            !warning_codes(&walk).contains("edge_coverage_missing"),
+            "the budget reaches the log, not the answer: {walk}"
+        );
+        let limited = statement_page(
+            &client,
+            &format!("SELECT DISTINCT ?t {{ <{entry}> :calls+ ?t }} LIMIT 5"),
+            10,
+        )
+        .await?;
+        assert_eq!(query::rows(&limited)?.len(), 5, "{limited}");
+        let count = statement_page(
+            &client,
+            &format!("SELECT (COUNT(DISTINCT ?t) AS ?n) {{ <{entry}> :calls+ ?t }}"),
+            10,
+        )
+        .await?;
+        let [row] = query::rows(&count)? else {
+            return Err(format!("expected one count: {count}").into());
+        };
+        assert_eq!(query::literal(row, "n")?, acquired.to_string(), "{count}");
+        client.cancel().await?;
+    }
     Ok(())
 }

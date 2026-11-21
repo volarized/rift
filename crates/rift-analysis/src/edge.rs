@@ -60,8 +60,8 @@ impl Edge {
 
     /// Projects this resolved reference with its physical occurrence.
     #[must_use]
-    pub fn to_protocol(&self) -> rift_protocol::read::Edge {
-        rift_protocol::read::Edge {
+    pub fn to_protocol(&self) -> rift_protocol::index::StoredEdge {
+        rift_protocol::index::StoredEdge {
             producer: None,
             from: rift_protocol::read::SymbolId(self.from.as_str().to_owned()),
             to: rift_protocol::read::SymbolId(self.to.as_str().to_owned()),

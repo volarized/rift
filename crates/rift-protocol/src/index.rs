@@ -20,11 +20,13 @@ pub use artifact::{
     python_identifier_is_valid,
 };
 
+pub use crate::stored_edge::StoredEdge;
+
 use crate::documentation::DocumentationIndex;
 use crate::identity::SymbolOwner;
 use crate::producer::{FactCoverage, FactKind, FactProducer};
 use crate::read::{
-    Digest, Edge, EdgeKind, Language, ProjectPath, SourceUnitId, Symbol, SymbolId, SymbolOrigin,
+    Digest, EdgeKind, Language, ProjectPath, SourceUnitId, Symbol, SymbolId, SymbolOrigin,
     TextRange,
 };
 use crate::revision::Revision;
@@ -107,7 +109,7 @@ pub struct PackagePublication {
     pub declarations: Vec<PackageSymbol>,
     /// Normalized edges, preserving their source occurrences and derivation. An
     /// edge an external producer wrote names it in `producer`.
-    pub edges: Vec<Edge>,
+    pub edges: Vec<StoredEdge>,
     /// Places a unit's source names a symbol, in unit, range, symbol, and producer order. Absent when
     /// no producer covered occurrences.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
