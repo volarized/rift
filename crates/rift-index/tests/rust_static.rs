@@ -1563,3 +1563,436 @@ fn test_rust_tuple_struct_constructors_are_calls() {
         edge.kind() == EdgeKind::Calls && edge.from().as_str().ends_with("/fixture/value")
     }));
 }
+
+/// The conditional item chain macro as the cfg-if crate defines it, copied into a crate.
+const CONDITIONAL_CHAIN_MACRO: &str = "// Copied from the cfg-if crate.\n#[allow(unused_macro_rules)]\nmacro_rules! cfg_if {\n    ($(\n        if #[cfg($($meta:meta),*)] { $($it:item)* }\n    ) else * else {\n        $($it2:item)*\n    }) => {\n        cfg_if! {\n            @__items\n            () ;\n            $( ( ($($meta),*) ($($it)*) ), )*\n            ( () ($($it2)*) ),\n        }\n    };\n    (\n        if #[cfg($($i_met:meta),*)] { $($i_it:item)* }\n        $(\n            else if #[cfg($($e_met:meta),*)] { $($e_it:item)* }\n        )*\n    ) => {\n        cfg_if! {\n            @__items\n            () ;\n            ( ($($i_met),*) ($($i_it)*) ),\n            $( ( ($($e_met),*) ($($e_it)*) ), )*\n            ( () () ),\n        }\n    };\n    (@__items ($($not:meta,)*) ; ) => {};\n    (@__items ($($not:meta,)*) ; ( ($($m:meta),*) ($($it:item)*) ), $($rest:tt)*) => {\n        cfg_if! { @__apply cfg(all($($m,)* not(any($($not),*)))), $($it)* }\n        cfg_if! { @__items ($($not,)* $($m,)*) ; $($rest)* }\n    };\n    (@__apply $m:meta, $($it:item)*) => {\n        $(#[$m] $it)*\n    };\n}\n";
+
+#[test]
+fn test_rust_modules_declared_by_a_conditional_chain_keep_identities() {
+    // `mod` items in the branches of a local conditional item chain declare modules: every
+    // file keeps its identities, and only the branch the configuration selects contributes
+    // resolved facts. An unknown condition admits no branch after it; an invocation of a
+    // macro that is not defined locally declares nothing.
+    let manifest = "[package]\nname='fixture'\nversion='0.1.0'\n[features]\nalt=[]\n";
+    let library =
+        "#[macro_use]\nmod macros;\nmod group;\nmod chain;\nmod other;\npub fn run() -> u8 { 0 }\n";
+    let group = "cfg_if! {\n    if #[cfg(feature = \"alt\")] {\n        mod alt;\n        use alt as imp;\n    } else {\n        mod base;\n        use base as imp;\n    }\n}\n";
+    let chain = "cfg_if! {\n    if #[cfg(custom)] {\n        mod first;\n    } else if #[cfg(feature = \"alt\")] {\n        mod second;\n    } else {\n        mod third;\n    }\n}\n";
+    let other = "undefined! {\n    if #[cfg(feature = \"alt\")] {\n        mod absent;\n    }\n}\npub fn plain() -> u8 { 1 }\n";
+    let module =
+        "pub struct Item { pub value: u8 }\npub fn read() -> u8 { Item { value: 1 }.value }\n";
+    let files = [
+        ("src/lib.rs", library),
+        ("src/macros.rs", CONDITIONAL_CHAIN_MACRO),
+        ("src/group/mod.rs", group),
+        ("src/group/alt.rs", module),
+        ("src/group/base.rs", module),
+        ("src/chain/mod.rs", chain),
+        ("src/chain/first.rs", module),
+        ("src/chain/second.rs", module),
+        ("src/chain/third.rs", module),
+        ("src/other.rs", other),
+    ];
+    let (_directory, index) = fixture_index(manifest, &files);
+    let view = index.symbol_view().expect("symbols");
+    for record in view.normalized_graph().records() {
+        assert!(record.identity().is_some(), "missing identity: {record:?}");
+    }
+    let language = view
+        .files()
+        .next()
+        .expect("file")
+        .syntax()
+        .language()
+        .clone();
+    assert!(
+        index
+            .identity_coverage_complete(&language)
+            .expect("coverage")
+    );
+    for (file, _) in files
+        .iter()
+        .filter(|(path, _)| path.contains("/group/") || path.contains("/chain/"))
+    {
+        let declared = view
+            .files()
+            .find(|candidate| candidate.path().as_str() == *file)
+            .expect("module file");
+        let symbols = declared.syntax().symbols();
+        assert!(
+            (0..symbols.len())
+                .all(|position| view.symbol_identity_at(declared.path(), position).is_some()),
+            "{file} declarations lack identities"
+        );
+    }
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "/fixture/group/base/read",
+        "/fixture/group/base/Item"
+    ));
+    for edge in index.edges().edges() {
+        let unit = edge.occurrence().unit().to_string();
+        assert!(
+            !unit.ends_with("group/alt.rs") && !unit.contains("src/chain/"),
+            "fact from a branch the configuration does not select: {edge:?}"
+        );
+        assert!(
+            !edge.to().as_str().contains("/group/alt/") && !edge.to().as_str().contains("/chain/"),
+            "endpoint in a branch the configuration does not select: {edge:?}"
+        );
+    }
+}
+
+#[test]
+fn test_rust_reexports_of_crate_visible_items_keep_their_scope() {
+    // A re-export of a `pub(crate)` or `pub(super)` item, at a visibility the item allows,
+    // is followed wherever the re-exported name is visible, through nested use trees too.
+    // A path from outside the re-export's own visibility stays unresolved.
+    let control = "mod inner;\nmod tag;\npub(crate) use self::{inner::Helper, tag::{Open, Tag}};\npub(super) use self::inner::Shared;\npub(in crate::control) use self::inner::Local;\npub(crate) mod user;\n";
+    let tag = "pub(crate) struct Tag(pub(super) u8);\nimpl Tag {\n    pub(crate) fn full(hash: u64) -> Tag { Tag(hash as u8) }\n    pub(crate) fn special(self) -> bool { self.0 == 0 }\n}\npub struct Open(pub u8);\nimpl Open {\n    pub fn full(hash: u64) -> Open { Open(hash as u8) }\n    pub fn special(self) -> bool { self.0 == 0 }\n}\n";
+    let inner = "pub(crate) struct Helper;\nimpl Helper { pub(crate) fn make() -> u8 { 1 } }\npub(crate) struct Shared;\nimpl Shared { pub(crate) fn make() -> u8 { 2 } }\npub(super) struct Local;\nimpl Local { pub(super) fn make() -> u8 { 3 } }\n";
+    let user = "use super::Local;\npub(crate) fn local() -> u8 { Local::make() }\n";
+    let consumer = "use crate::control::{Helper, Open, Shared, Tag};\npub(crate) fn crate_visible(hash: u64, old: Tag) -> bool { Tag::full(hash); old.special() }\npub fn public(hash: u64, old: Open) -> bool { Open::full(hash); old.special() }\npub(crate) fn nested() -> u8 { Helper::make() + Shared::make() + crate::control::user::local() }\npub(crate) fn refused() -> u8 { crate::control::Local::make() }\n";
+    let (_directory, index) = fixture_index(
+        PLAIN_MANIFEST,
+        &[
+            ("src/lib.rs", "mod consumer;\nmod control;\n"),
+            ("src/control/mod.rs", control),
+            ("src/control/tag.rs", tag),
+            ("src/control/inner.rs", inner),
+            ("src/control/user.rs", user),
+            ("src/consumer.rs", consumer),
+        ],
+    );
+    for (kind, from, to) in [
+        (
+            EdgeKind::Aliases,
+            "/fixture/control/Tag",
+            "/control/tag/Tag",
+        ),
+        (
+            EdgeKind::Aliases,
+            "/fixture/control/Helper",
+            "/control/inner/Helper",
+        ),
+        (
+            EdgeKind::Aliases,
+            "/fixture/control/Shared",
+            "/control/inner/Shared",
+        ),
+        (
+            EdgeKind::Calls,
+            "/consumer/crate_visible",
+            "/control/tag/Tag/full",
+        ),
+        (
+            EdgeKind::Calls,
+            "/consumer/crate_visible",
+            "/control/tag/Tag/special",
+        ),
+        (
+            EdgeKind::Reads,
+            "/consumer/crate_visible",
+            "/control/tag/Tag/special",
+        ),
+        (
+            EdgeKind::Calls,
+            "/consumer/public",
+            "/control/tag/Open/full",
+        ),
+        (
+            EdgeKind::Calls,
+            "/consumer/nested",
+            "/control/inner/Helper/make",
+        ),
+        (
+            EdgeKind::Calls,
+            "/consumer/nested",
+            "/control/inner/Shared/make",
+        ),
+        (
+            EdgeKind::Calls,
+            "/control/user/local",
+            "/control/inner/Local/make",
+        ),
+    ] {
+        assert!(
+            has_edge(&index, kind, from, to),
+            "missing {kind:?} {from} -> {to}"
+        );
+    }
+    assert!(
+        index
+            .edges()
+            .edges()
+            .any(|edge| edge.kind() == EdgeKind::Imports
+                && edge.from().as_str().contains("consumer")
+                && edge.to().as_str().ends_with("/control/tag/Tag")),
+        "missing import of the re-exported Tag"
+    );
+    assert!(!has_edge(
+        &index,
+        EdgeKind::Calls,
+        "/consumer/refused",
+        "/control/inner/Local/make"
+    ));
+}
+
+#[test]
+fn test_rust_match_arm_guards_keep_calls_and_reads() {
+    // Calls, method calls and field reads in a match arm guard belong to the enclosing
+    // function, as in the arm body. A name the arm pattern binds shadows an outer function
+    // of that name in the guard.
+    let source = "pub enum Kind { Special, Plain }\nimpl Kind { pub fn is_special(&self) -> bool { matches!(self, Kind::Special) } }\npub fn alpha(c: char) -> bool { c.is_ascii_alphabetic() }\npub fn shadow(_: u8) -> bool { false }\npub struct Input { pub pos: usize }\nimpl Input {\n    pub fn guard_call(&self, kind: Kind, c: char) -> bool {\n        match c {\n            'a' if alpha(c) => true,\n            '\\\\' if kind.is_special() && self.pos > 0 => true,\n            _ => false,\n        }\n    }\n    pub fn guard_shadow(&self, value: Option<fn(u8) -> bool>) -> bool {\n        match value {\n            Some(shadow) if shadow(1) => true,\n            _ => false,\n        }\n    }\n    pub fn body_call(&self, kind: Kind, c: char) -> bool {\n        match c {\n            'a' => alpha(c),\n            _ => kind.is_special(),\n        }\n    }\n}\n";
+    let (_directory, index) = fixture_index(PLAIN_MANIFEST, &[("src/lib.rs", source)]);
+    for (kind, from, to) in [
+        (EdgeKind::Calls, "/Input/guard_call", "/fixture/alpha"),
+        (EdgeKind::Calls, "/Input/guard_call", "/Kind/is_special"),
+        (EdgeKind::Reads, "/Input/guard_call", "/Kind/is_special"),
+        (EdgeKind::Reads, "/Input/guard_call", "/Input/pos"),
+        (EdgeKind::Calls, "/Input/body_call", "/fixture/alpha"),
+        (EdgeKind::Calls, "/Input/body_call", "/Kind/is_special"),
+    ] {
+        assert!(
+            has_edge(&index, kind, from, to),
+            "missing {kind:?} {from} -> {to}"
+        );
+    }
+    assert!(!has_edge(
+        &index,
+        EdgeKind::Calls,
+        "/Input/guard_shadow",
+        "/fixture/shadow"
+    ));
+}
+
+#[test]
+fn test_rust_paths_with_generic_arguments_name_the_plain_path() {
+    // `Holder::<A>::new()` names the same declaration as `Holder::new()`; a local it
+    // initializes keeps that type for later member calls. A qualified `<Holder<A>>::new()`
+    // and a path from the crate root select the same targets.
+    let source = "pub trait Array { fn size() -> usize; }\npub struct Holder<A: Array> { pub value: Option<A> }\nimpl<A: Array> Holder<A> {\n    pub const EMPTY: usize = 0;\n    pub fn new() -> Self { Holder { value: None } }\n    pub fn grow(&mut self) -> usize { 0 }\n    pub fn fresh() -> usize {\n        let mut v = Holder::<A>::new();\n        v.grow() + Holder::<A>::EMPTY\n    }\n    pub fn qualified() -> usize {\n        let mut v = <Holder<A>>::new();\n        v.grow()\n    }\n    pub fn plain() -> usize {\n        let mut v = Self::new();\n        v.grow()\n    }\n}\npub mod inner { pub struct Other; impl Other { pub fn new() -> Self { Other } } }\npub fn nested<A: Array>() -> usize { let _ = inner::Other::new(); let mut v = crate::Holder::<A>::new(); v.grow() }\n";
+    let (_directory, index) = fixture_index(PLAIN_MANIFEST, &[("src/lib.rs", source)]);
+    for (kind, from, to) in [
+        (EdgeKind::Calls, "/Holder/fresh", "/Holder/new"),
+        (EdgeKind::Calls, "/Holder/fresh", "/Holder/grow"),
+        (EdgeKind::Reads, "/Holder/fresh", "/Holder/grow"),
+        (EdgeKind::Calls, "/Holder/qualified", "/Holder/new"),
+        (EdgeKind::Calls, "/Holder/qualified", "/Holder/grow"),
+        (EdgeKind::Calls, "/Holder/plain", "/Holder/new"),
+        (EdgeKind::Calls, "/Holder/plain", "/Holder/grow"),
+        (EdgeKind::Calls, "/fixture/nested", "/Holder/new"),
+        (EdgeKind::Calls, "/fixture/nested", "/Holder/grow"),
+        (EdgeKind::Calls, "/fixture/nested", "/inner/Other/new"),
+    ] {
+        assert!(
+            has_edge(&index, kind, from, to),
+            "missing {kind:?} {from} -> {to}"
+        );
+    }
+    assert!(!has_edge(
+        &index,
+        EdgeKind::Calls,
+        "/fixture/nested",
+        "/fixture/Holder/new/inner"
+    ));
+}
+
+#[test]
+fn test_rust_derived_clones_keep_the_receiver_type() {
+    // `value.clone()` returns the receiver's type (`T` when it implements `Clone`, else the
+    // reference `&T`), so a local it initializes keeps the type's members. A local `clone`
+    // method takes precedence with its declared return. A struct expression is a value of
+    // its struct.
+    let source = "#[derive(Clone, Debug)]\npub struct Input { pub pos: usize }\nimpl Input {\n    pub fn step(&mut self) -> Option<char> { self.pos += 1; None }\n    pub fn cloned(&self) -> Option<char> { let mut copy = self.clone(); copy.step() }\n    pub fn argument(input: &Input) -> Option<char> { let mut copy = input.clone(); copy.step() }\n}\npub struct Plain { pub pos: usize }\nimpl Plain {\n    pub fn step(&self) -> usize { self.pos }\n    pub fn cloned(&self) -> usize { let mut copy = self.clone(); copy.step() }\n}\npub struct Other;\npub struct Custom;\nimpl Custom { pub fn clone(&self) -> Other { Other } }\nimpl Other { pub fn step(&self) -> usize { 0 } }\npub fn custom(value: &Custom) -> usize { let copy = value.clone(); copy.step() }\npub fn built() -> usize { Input { pos: 1 }.pos + Plain { pos: 2 }.step() }\n";
+    let (_directory, index) = fixture_index(PLAIN_MANIFEST, &[("src/lib.rs", source)]);
+    for (kind, from, to) in [
+        (EdgeKind::Calls, "/Input/cloned", "/Input/step"),
+        (EdgeKind::Reads, "/Input/cloned", "/Input/step"),
+        (EdgeKind::Calls, "/Input/argument", "/Input/step"),
+        (EdgeKind::Calls, "/Plain/cloned", "/Plain/step"),
+        (EdgeKind::Calls, "/fixture/custom", "/Other/step"),
+        (EdgeKind::Reads, "/fixture/built", "/Input/pos"),
+        (EdgeKind::Calls, "/fixture/built", "/Plain/step"),
+    ] {
+        assert!(
+            has_edge(&index, kind, from, to),
+            "missing {kind:?} {from} -> {to}"
+        );
+    }
+    assert!(!index.edges().edges().any(|edge| {
+        edge.from().as_str().ends_with("/fixture/custom")
+            && edge.kind() == EdgeKind::Calls
+            && edge.to().as_str().ends_with("/step")
+            && !edge.to().as_str().ends_with("/Other/step")
+    }));
+}
+
+#[test]
+fn test_rust_typed_self_receivers_reach_the_implementation_type() {
+    // `self: Box<Self>` and `self: Pin<&mut Self>` receivers are the implementation type's
+    // values; a receiver typed by another type stays unresolved.
+    let source = "use std::pin::Pin;\npub struct Slice { pub len: usize }\npub struct Other;\nimpl Other { pub fn into_entries(self: Box<Self>) -> usize { 0 } }\nimpl Slice {\n    pub fn into_entries(self: Box<Self>) -> usize { self.len }\n    pub fn into_keys(self: Box<Self>) -> usize { self.into_entries() }\n    pub fn pinned(self: Pin<&mut Self>) -> usize { self.len }\n    pub fn shared(&self) -> usize { self.len }\n}\npub struct Wrapper(pub Slice);\nimpl Slice { pub fn wrapped(self: Wrapper) -> usize { self.len } }\n";
+    let (_directory, index) = fixture_index(PLAIN_MANIFEST, &[("src/lib.rs", source)]);
+    for (kind, from, to) in [
+        (EdgeKind::Calls, "/Slice/into_keys", "/Slice/into_entries"),
+        (EdgeKind::Reads, "/Slice/into_keys", "/Slice/into_entries"),
+        (EdgeKind::Reads, "/Slice/into_entries", "/Slice/len"),
+        (EdgeKind::Reads, "/Slice/pinned", "/Slice/len"),
+        (EdgeKind::Reads, "/Slice/shared", "/Slice/len"),
+    ] {
+        assert!(
+            has_edge(&index, kind, from, to),
+            "missing {kind:?} {from} -> {to}"
+        );
+    }
+    assert!(!index.edges().edges().any(|edge| {
+        matches!(edge.kind(), EdgeKind::Calls | EdgeKind::Reads)
+            && (edge.to().as_str().ends_with("/Other/into_entries")
+                || (edge.from().as_str().ends_with("/Slice/wrapped")
+                    && edge.to().as_str().ends_with("/Slice/len")))
+    }));
+}
+
+#[test]
+fn test_rust_paths_through_private_imports_of_a_parent_module() {
+    // `use super::Bucket` names what the parent module imported as `Bucket`; the import is
+    // private to the parent and its descendants, so a path from elsewhere stays unresolved.
+    // A cycle of private imports resolves nothing.
+    let source = "mod inner { pub struct Bucket { pub value: u8 } }\npub mod map {\n    use crate::inner::Bucket;\n    pub mod iter {\n        use super::Bucket;\n        pub fn new() -> u8 { Bucket { value: 1 }.value }\n    }\n}\npub mod other {\n    pub fn outside() -> u8 { crate::map::Bucket { value: 2 }.value }\n}\npub mod first { use crate::second::Loop; pub fn run() -> u8 { Loop { value: 3 }.value } }\npub mod second { use crate::first::Loop; }\n";
+    let (_directory, index) = fixture_index(PLAIN_MANIFEST, &[("src/lib.rs", source)]);
+    for (kind, from, to) in [
+        (EdgeKind::Calls, "/map/iter/new", "/inner/Bucket"),
+        (EdgeKind::Reads, "/map/iter/new", "/inner/Bucket/value"),
+    ] {
+        assert!(
+            has_edge(&index, kind, from, to),
+            "missing {kind:?} {from} -> {to}"
+        );
+    }
+    assert!(!index.edges().edges().any(|edge| {
+        (edge.from().as_str().ends_with("/other/outside")
+            || edge.from().as_str().ends_with("/first/run"))
+            && matches!(edge.kind(), EdgeKind::Calls | EdgeKind::Reads)
+    }));
+}
+
+#[test]
+fn test_rust_type_parameter_paths_follow_their_bounds() {
+    // `A::size()` names the associated function of the trait bounding `A`, inline or in a
+    // where clause, never a same-name function of another trait.
+    let source = "pub trait Array { fn size() -> usize; }\npub trait Other { fn size() -> usize; }\npub struct Holder<A: Array> { pub value: Option<A> }\nimpl<A: Array> Holder<A> {\n    pub fn capacity() -> usize { A::size() }\n}\npub fn generic<T: Array>() -> usize { T::size() }\npub fn bounded<T>() -> usize where T: Array { T::size() }\n";
+    let (_directory, index) = fixture_index(PLAIN_MANIFEST, &[("src/lib.rs", source)]);
+    for from in ["/Holder/capacity", "/fixture/generic", "/fixture/bounded"] {
+        assert!(
+            has_edge(&index, EdgeKind::Calls, from, "/Array/size"),
+            "missing {from} -> Array.size"
+        );
+    }
+    assert!(
+        !index
+            .edges()
+            .edges()
+            .any(|edge| edge.kind() == EdgeKind::Calls
+                && edge.to().as_str().ends_with("/Other/size"))
+    );
+}
+
+#[test]
+fn test_rust_closure_parameters_and_guards_typed_by_a_generic_callee() {
+    // A closure passed to a local generic function takes its parameter type from the
+    // callee's `FnMut(&mut T)` bound, with `T` bound by the callee parameter declared `T`;
+    // a tuple pattern takes the element of a tuple argument. A closure without a bound for
+    // it, or whose `T` is not bound by a known argument, stays unresolved.
+    let source = "use core::ops::{Deref, DerefMut};\npub struct Guard<T, F: FnMut(&mut T)> { value: T, dropfn: F }\nimpl<T, F: FnMut(&mut T)> Deref for Guard<T, F> { type Target = T; fn deref(&self) -> &T { &self.value } }\nimpl<T, F: FnMut(&mut T)> DerefMut for Guard<T, F> { fn deref_mut(&mut self) -> &mut T { &mut self.value } }\nimpl<T, F: FnMut(&mut T)> Drop for Guard<T, F> { fn drop(&mut self) { (self.dropfn)(&mut self.value) } }\npub fn guard<T, F: FnMut(&mut T)>(value: T, dropfn: F) -> Guard<T, F> { Guard { value, dropfn } }\npub fn unbound<T, F>(value: T, f: F) -> T { let _ = f; value }\npub struct Table { pub items: usize }\nimpl Table {\n    pub fn reset(&mut self) { self.items = 0; }\n    pub fn fill(&mut self) { self.items = 1; }\n    pub fn clear(&mut self) {\n        let mut this = guard(self, |this| this.reset());\n        this.fill();\n    }\n    pub fn tuple(&mut self) {\n        let _guard = guard((0, self), |(index, this)| { *index += 1; this.reset() });\n    }\n    pub fn loose(&mut self) {\n        let _ = unbound(self, |this: &mut Table| this.fill());\n        let _ = unbound(0, |this| this);\n        let _ = unbound(self, |this| this.reset());\n    }\n    pub fn direct(&mut self) { let this: &mut Table = self; this.reset(); }\n}\n";
+    let (_directory, index) = fixture_index(PLAIN_MANIFEST, &[("src/lib.rs", source)]);
+    for (kind, from, to) in [
+        (EdgeKind::Calls, "/Table/clear", "/Table/reset"),
+        (EdgeKind::Reads, "/Table/clear", "/Table/reset"),
+        (EdgeKind::Calls, "/Table/tuple", "/Table/reset"),
+        (EdgeKind::Calls, "/Table/direct", "/Table/reset"),
+    ] {
+        assert!(
+            has_edge(&index, kind, from, to),
+            "missing {kind:?} {from} -> {to}"
+        );
+    }
+    // `unbound` declares no `Fn*` bound for its closure parameter, and `0` has no owner.
+    assert!(!index.edges().edges().any(|edge| {
+        edge.from().as_str().ends_with("/Table/loose")
+            && edge.kind() == EdgeKind::Calls
+            && edge.to().as_str().ends_with("/Table/reset")
+    }));
+}
+
+#[test]
+fn test_rust_optional_dependencies_are_implicit_features() {
+    // An optional dependency is a feature of its name unless a feature names it with
+    // `dep:`. Default features enabling it select the items under it; an optional
+    // dependency only `dep:` names declares no feature, so its condition stays unknown.
+    let manifest = "[package]\nname='fixture'\nversion='0.1.0'\n[dependencies]\nextra = { version = '1', optional = true }\nrenamed = { package = 'other', version = '1', optional = true }\nexplicit = { version = '1', optional = true }\nrequired = '1'\n[target.'cfg(unix)'.dependencies]\nplatform = { version = '1', optional = true }\n[features]\ndefault = ['extra', 'platform']\nuses_dep = ['dep:explicit']\n";
+    let source = "#[cfg(feature = \"extra\")]\npub fn enabled() -> u8 { 1 }\n#[cfg(not(feature = \"extra\"))]\npub fn enabled() -> u8 { 2 }\n#[cfg(feature = \"platform\")]\npub fn targeted() -> u8 { 3 }\n#[cfg(feature = \"renamed\")]\npub fn renamed() -> u8 { 4 }\n#[cfg(not(feature = \"renamed\"))]\npub fn renamed() -> u8 { 5 }\n#[cfg(feature = \"explicit\")]\npub fn hidden() -> u8 { 6 }\n#[cfg(feature = \"required\")]\npub fn plain() -> u8 { 7 }\npub fn run() -> u8 { enabled() + targeted() + renamed() + hidden() + plain() }\n";
+    let (_directory, index) = fixture_index(manifest, &[("src/lib.rs", source)]);
+    for to in ["/fixture/enabled", "/fixture/targeted", "/fixture/renamed"] {
+        assert!(
+            has_edge(&index, EdgeKind::Calls, "/fixture/run", to),
+            "missing run -> {to}"
+        );
+    }
+    for to in ["/fixture/hidden", "/fixture/plain"] {
+        assert!(
+            !has_edge(&index, EdgeKind::Calls, "/fixture/run", to),
+            "unknown condition resolved: run -> {to}"
+        );
+    }
+}
+
+#[test]
+fn test_rust_reexports_of_dependency_items_keep_the_written_module() {
+    // A `use` path whose first segment names no item of its module starts at a dependency
+    // crate. A re-export chain ending at such a path keeps the written local module as the
+    // import; a name the module does not bind imports nothing, and a local relative path
+    // still names the local item.
+    let alloc = "pub(crate) use self::inner::{Allocator, Thing};\nmod inner {\n    mod local { pub struct Thing; }\n    pub(crate) use extra::alloc::Allocator;\n    pub(crate) use local::Thing;\n}\n";
+    let (_directory, index) = fixture_index(
+        PLAIN_MANIFEST,
+        &[
+            (
+                "src/lib.rs",
+                "mod alloc;\nmod map;\nmod other;\nmod local;\n",
+            ),
+            ("src/alloc.rs", alloc),
+            (
+                "src/map.rs",
+                "use crate::alloc::Allocator;\npub fn run() {}\n",
+            ),
+            (
+                "src/other.rs",
+                "use crate::alloc::Missing;\npub fn run() {}\n",
+            ),
+            (
+                "src/local.rs",
+                "use crate::alloc::Thing;\npub fn run(_: Thing) {}\n",
+            ),
+        ],
+    );
+    assert!(has_edge(
+        &index,
+        EdgeKind::Imports,
+        "/fixture/map",
+        "/fixture/alloc"
+    ));
+    assert!(!has_edge(
+        &index,
+        EdgeKind::Imports,
+        "/fixture/other",
+        "/fixture/alloc"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Imports,
+        "/fixture/local",
+        "/alloc/inner/local/Thing"
+    ));
+}

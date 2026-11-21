@@ -1,5 +1,6 @@
 //! Checks captured item-repetition macros without expanding source.
 
+pub(crate) mod chain;
 mod scope;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -70,6 +71,8 @@ impl Scope {
 
 type Inventory<'a> = BTreeMap<&'a str, &'a SelectedFile<'a>>;
 type Child = (String, Vec<String>, Scope);
+/// A module file a conditional item chain declares, with the condition of its branch.
+pub(super) type Conditioned<'a> = (String, Vec<&'a str>);
 
 pub(super) fn text_range(source: &str, range: ByteRange) -> Option<&str> {
     source.get(usize::try_from(range.start).ok()?..usize::try_from(range.end).ok()?)
@@ -972,11 +975,12 @@ pub(super) fn children<'a>(
         Scope,
         &mut std::collections::BTreeSet<ByteRange>,
         &mut Vec<Export>,
+        &mut Vec<Conditioned<'a>>,
     ),
     limits: rift_syntax::SyntaxLimits,
     library: bool,
 ) -> Vec<Child> {
-    let (mut scope, admitted, exports) = scope;
+    let (mut scope, admitted, exports, conditioned) = scope;
     let context = Context {
         inventory,
         originals,
@@ -1038,6 +1042,12 @@ pub(super) fn children<'a>(
                     {
                         children.extend(literal);
                     }
+                    if let Some(name) = name
+                        && let Some(tokens) = tokens.as_ref()
+                    {
+                        let declared = (&mut children, &mut *conditioned);
+                        context.chain_children((*range, name, directory), &scope, tokens, declared);
+                    }
                     scope.clear();
                     continue;
                 }
@@ -1074,6 +1084,61 @@ pub(super) fn children<'a>(
 }
 
 impl Context<'_> {
+    /// Adds the module files of a conditional item chain invocation to `children`, and
+    /// each with its branch condition to `conditioned`.
+    fn chain_children<'a>(
+        &self,
+        (invocation, name, directory): (ByteRange, &str, &str),
+        scope: &Scope,
+        tokens: &scope::Tokens<'a>,
+        (children, conditioned): (&mut Vec<Child>, &mut Vec<Conditioned<'a>>),
+    ) {
+        let Some(modules) = self.chain(invocation, name, scope, tokens) else {
+            return;
+        };
+        let mut incomplete = scope.clone();
+        incomplete.clear();
+        for (module, condition) in modules {
+            if let Some(path) = child_path(module, directory, self.inventory) {
+                children.push((path.clone(), vec![module.to_owned()], incomplete.clone()));
+                conditioned.push((path, condition));
+            }
+        }
+    }
+
+    /// The modules of an invocation of `name` when its definition in scope is the
+    /// conditional item chain, each with the condition of its branch.
+    fn chain<'a>(
+        &self,
+        invocation: ByteRange,
+        name: &str,
+        scope: &Scope,
+        tokens: &scope::Tokens<'a>,
+    ) -> Option<Vec<(&'a str, Vec<&'a str>)>> {
+        let (path, range) = scope.definition(name)?;
+        let defining = self.inventory.get(path.as_str())?;
+        let limits = defining.syntax.syntax_limits()?;
+        let mut symbols = defining
+            .syntax
+            .symbols()
+            .iter()
+            .filter(|symbol| symbol.name == name && symbol.kind == "macro");
+        let symbol = symbols.next()?;
+        if symbols.next().is_some()
+            || symbol.item_range != *range
+            || symbol.syntax_element_kind != Some("macro_definition")
+            || self.originals.get(path.as_str()).copied() != Some(defining.source)
+            || defining.syntax.has_errors()
+        {
+            return None;
+        }
+        let definition = chain::token_texts(defining.source, *range, limits)?;
+        if !chain::is_definition(&definition, name, limits) {
+            return None;
+        }
+        chain::modules(&tokens.range(invocation)?, self.depth_max)
+    }
+
     fn item(
         &self,
         file: &SelectedFile<'_>,
