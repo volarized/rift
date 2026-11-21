@@ -52,6 +52,14 @@ impl InventoryEntries {
         if !read.installed.is_empty() || !read.named_package_symbols.is_empty() {
             return;
         }
+        // Let the next read observe engine progress before this request's deadline.
+        if read
+            .warnings
+            .iter()
+            .any(|warning| matches!(warning, ReadWarning::EngineAnalysisUnavailable { .. }))
+        {
+            return;
+        }
         let maximum = GraphLimits::default().triples_max();
         let charged = read.records.saturating_add(1);
         if charged > maximum {
@@ -70,13 +78,10 @@ impl InventoryEntries {
             self.reads.remove(0);
         }
         let provisional = read.partial
-            || read.warnings.iter().any(|warning| {
-                matches!(
-                    warning,
-                    ReadWarning::EngineAnalysisUnavailable { .. }
-                        | ReadWarning::EngineReadinessUnconfirmed { .. }
-                )
-            });
+            || read
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, ReadWarning::EngineReadinessUnconfirmed { .. }));
         self.reads.push(SavedInventory {
             selection,
             read,
@@ -119,6 +124,32 @@ mod tests {
             &read
         ));
         assert!(entries.get(selection(), end).is_none());
+    }
+
+    #[test]
+    fn unavailable_inventory_is_retried_on_the_same_publication() {
+        let now = Instant::now();
+        let end = now + std::time::Duration::from_secs(1);
+        let unavailable = Arc::new(InventoryRead {
+            warnings: vec![ReadWarning::EngineAnalysisUnavailable {
+                language: None,
+                detail: "the engine was still analyzing".to_owned(),
+            }],
+            partial: true,
+            ..InventoryRead::default()
+        });
+        let mut entries = InventoryEntries::default();
+        entries.remember(selection(), unavailable, end);
+        assert!(entries.get(selection(), now).is_none());
+
+        let ready = Arc::new(InventoryRead::default());
+        entries.remember(selection(), Arc::clone(&ready), end);
+        assert!(Arc::ptr_eq(
+            &entries
+                .get(selection(), end)
+                .expect("retained ready answer"),
+            &ready
+        ));
     }
 
     #[test]
