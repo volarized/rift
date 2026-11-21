@@ -436,7 +436,7 @@ fn test_tsx_fixture_breaks_through_the_plain_typescript_grammar() {
 #[test]
 fn test_contextual_global_keeps_identifier_ranges_and_ambient_scope() {
     let path = ProjectPath::new("index.ts").expect("syntax fixture path");
-    let text = "export {};\nfunction pass(global = true) { return global; }\nconst global = true;\npass(global);\nfunction make() { const global = class {}; class Child extends global {} }\ndeclare global { interface Ambient {} }\n";
+    let text = "export {};\nfunction pass(global = true) { return global; }\nconst global = true;\npass(global);\nfunction inspect() { const global = globalThis as any; return global?.process }\nfunction make() { const global = class {}; class Child extends global {} }\ndeclare global { interface Ambient {} }\n";
     for dialect in [TypeScriptDialect::TypeScript, TypeScriptDialect::Tsx] {
         let provider = dialect.provider();
         let document = provider
@@ -446,6 +446,7 @@ fn test_contextual_global_keeps_identifier_ranges_and_ambient_scope() {
         for (prefix, occurrence) in [
             ("", "global = true)"),
             ("return ", "return global;"),
+            ("return ", "return global?.process"),
             ("const ", "const global = true;"),
             ("pass(", "pass(global);"),
             ("extends ", "extends global {}"),
