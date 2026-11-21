@@ -897,6 +897,7 @@ fn validate_export_bindings(
             .or_default()
             .push(symbol.range);
     }
+    let mut global_exports = None;
     let mut previous = None;
     for binding in bindings {
         range(source, binding.range)?;
@@ -921,7 +922,26 @@ fn validate_export_bindings(
                 .get(container.as_str())
                 .is_some_and(|ranges| ranges.iter().any(|range| contains(*range, binding.range)))
             {
-                return errors::syntax::facts_reference_invalid().fail();
+                if container != crate::ecmascript::GLOBAL_AUGMENTATION_NAME
+                    || parts.language.name != "typescript"
+                {
+                    return errors::syntax::facts_reference_invalid().fail();
+                }
+                let ranges = match &mut global_exports {
+                    Some(ranges) => ranges,
+                    empty @ None => {
+                        let dialect = match parts.language.dialect.as_deref() {
+                            Some("tsx") => crate::TypeScriptDialect::Tsx,
+                            _ => crate::TypeScriptDialect::TypeScript,
+                        };
+                        empty.insert(crate::ecmascript::global_export_ranges(
+                            dialect, source, limits,
+                        )?)
+                    }
+                };
+                if !ranges.contains(&binding.range) {
+                    return errors::syntax::facts_reference_invalid().fail();
+                }
             }
         }
         let form_valid = match binding.kind {

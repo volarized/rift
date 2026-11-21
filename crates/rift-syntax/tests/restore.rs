@@ -51,6 +51,27 @@ fn markdown_parts(facts: &MarkdownFacts) -> MarkdownFactsParts {
 }
 
 #[test]
+fn tsx_callable_variable_restores_its_recursive_and_outer_bindings() {
+    let source = "export const Widget = () => <div />;";
+    let document = parsed(ShippedLanguage::TypeScriptTsx, source);
+    let restored =
+        SyntaxFacts::from_parts(source, SyntaxLimits::default(), parts(document.facts()))
+            .expect("restore the provider's Widget bindings");
+    assert_eq!(&restored, document.facts());
+
+    let bindings = restored.static_facts().expect("TSX facts").bindings();
+    let name = ByteRange { start: 13, end: 19 };
+    let widget = bindings
+        .iter()
+        .filter(|binding| binding.name == name)
+        .map(|binding| (binding.scope, binding.available_from))
+        .collect::<Vec<_>>();
+    assert_eq!(widget.len(), 2);
+    assert!(widget.contains(&(ByteRange { start: 0, end: 36 }, 35)));
+    assert!(widget.contains(&(ByteRange { start: 13, end: 35 }, 22)));
+}
+
+#[test]
 fn rust_module_path_facts_restore_exact_source_and_keep_old_facts_unknown() {
     let source = "#[path = \"client.rs\"]\n\nmod client;\n";
     let document = parsed(ShippedLanguage::Rust, source);
@@ -1146,6 +1167,70 @@ fn retained_namespace_export_bindings_resolve_original_container_facts() {
             .as_str(),
         "rift.syntax.facts_reference_invalid"
     );
+}
+
+#[test]
+fn typescript_global_augmentation_exports_restore_under_their_written_scope() {
+    let text = "export interface ModuleApi { enabled: boolean; }\ndeclare global {\n    export interface AppState { payload: Payload; }\n    export interface Payload { ready: boolean; }\n}\n";
+    for language in [ShippedLanguage::TypeScript, ShippedLanguage::TypeScriptTsx] {
+        let document = parsed(language, text);
+        assert!(!document.has_errors());
+        let original = document.facts();
+        assert_eq!(
+            original
+                .symbols()
+                .iter()
+                .map(|symbol| symbol.qualified_name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "ModuleApi",
+                "ModuleApi.enabled",
+                "global.AppState",
+                "global.AppState.payload",
+                "global.Payload",
+                "global.Payload.ready",
+            ]
+        );
+        let bindings = original.export_bindings().expect("recorded exports");
+        assert_eq!(
+            bindings
+                .iter()
+                .map(|binding| binding.container.as_deref())
+                .collect::<Vec<_>>(),
+            [None, Some("global"), Some("global")]
+        );
+        let restored = SyntaxFacts::from_parts(text, SyntaxLimits::default(), parts(original))
+            .expect("global augmentation contains both export statements");
+        assert_eq!(&restored, original);
+        let payload_start = text.find("Payload;").expect("written type");
+        let payload_type = ByteRange {
+            start: u64::try_from(payload_start).expect("type start"),
+            end: u64::try_from(payload_start + "Payload".len()).expect("type end"),
+        };
+        assert!(
+            restored
+                .static_facts()
+                .expect("static syntax")
+                .references()
+                .iter()
+                .any(|reference| {
+                    reference.role == rift_core::ReferenceRole::Type
+                        && reference.target == payload_type
+                })
+        );
+
+        for (binding_index, container) in [(0, "global"), (1, "ModuleApi")] {
+            let mut invalid = parts(original);
+            invalid.export_bindings.as_mut().expect("exports")[binding_index].container =
+                Some(container.to_owned());
+            assert_eq!(
+                SyntaxFacts::from_parts(text, SyntaxLimits::default(), invalid)
+                    .expect_err("an unrelated scope cannot own the export")
+                    .slug(),
+                errors::syntax::facts_reference_invalid::SLUG
+            );
+        }
+    }
 }
 
 #[test]

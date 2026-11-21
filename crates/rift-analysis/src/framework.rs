@@ -11,6 +11,10 @@ use rift_syntax::{AngularTemplate, ByteRange, SyntaxDocument, SyntaxLimits, Synt
 
 use crate::{PackageSource, PathMatcher};
 
+#[cfg(test)]
+#[path = "framework_tests.rs"]
+mod tests;
+
 /// Framework interpretation for one source under its own package or component.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ResolvedFramework {
@@ -37,8 +41,8 @@ impl ResolvedFramework {
     ///
     /// The caller retains the source whose digest admitted this context. Ordinary syntax
     /// and every original range remain unchanged when interpretation is unavailable. An
-    /// interpretation whose syntax facts fail their checks is not applied: the ordinary
-    /// syntax is returned with one warning, and the log names the file and the reason.
+    /// interpretation whose syntax facts fail their checks returns the ordinary syntax
+    /// with one warning. [`FrameworkContext::apply_for_publication`] records the refusal.
     ///
     /// # Errors
     /// Returns source witness, range, parser, or aggregate syntax-bound failures.
@@ -48,19 +52,23 @@ impl ResolvedFramework {
         limits: SyntaxLimits,
         document: SyntaxDocument,
     ) -> Result<(SyntaxDocument, Vec<ReadWarning>, u64), RiftError> {
+        self.apply_with_refusal(source, limits, document, |_| {})
+    }
+
+    fn apply_with_refusal(
+        &self,
+        source: SyntaxSource<'_>,
+        limits: SyntaxLimits,
+        document: SyntaxDocument,
+        report: impl FnOnce(&RiftError),
+    ) -> Result<(SyntaxDocument, Vec<ReadWarning>, u64), RiftError> {
         let mut calls = 0;
         let mut warnings = Vec::new();
         match self.interpret(source, limits, &document, &mut calls, &mut warnings) {
             Ok(Some(interpreted)) => Ok((interpreted, warnings, calls)),
             Ok(None) => Ok((document, warnings, calls)),
             Err(error) if facts_refused(&error) => {
-                rift_tracing::warn!(
-                    component = "index",
-                    operation = "index.parse",
-                    path = source.path.as_str(),
-                    reason = %error,
-                    "framework interpretation left out of a file: its syntax facts failed their checks"
-                );
+                report(&error);
                 let framework = if self.angular || !self.templates.is_empty() {
                     SyntaxFramework::Angular
                 } else {
@@ -414,7 +422,7 @@ impl FrameworkContext {
         self.provider_calls
     }
 
-    /// Applies resolved interpretation to original source bytes after ordinary syntax.
+    /// Applies framework interpretation after ordinary syntax, preserving any read warning.
     ///
     /// # Errors
     ///
@@ -424,6 +432,40 @@ impl FrameworkContext {
         source: SyntaxSource<'_>,
         limits: SyntaxLimits,
         document: SyntaxDocument,
+    ) -> Result<(SyntaxDocument, Vec<ReadWarning>, u64), RiftError> {
+        self.apply_with_refusal(source, limits, document, |_| {})
+    }
+
+    /// Applies framework interpretation and records any syntax facts refused at publication.
+    ///
+    /// Call once for each source in the publication. Reads return the warning through
+    /// [`Self::apply`] without emitting a second publication event.
+    ///
+    /// # Errors
+    /// Returns source witness, range, parser, or aggregate syntax-bound failures.
+    pub fn apply_for_publication(
+        &self,
+        source: SyntaxSource<'_>,
+        limits: SyntaxLimits,
+        document: SyntaxDocument,
+    ) -> Result<(SyntaxDocument, Vec<ReadWarning>, u64), RiftError> {
+        self.apply_with_refusal(source, limits, document, |error| {
+            rift_tracing::warn!(
+                component = "index",
+                operation = "index.parse",
+                path = source.path.as_str(),
+                reason = %error,
+                "framework interpretation left out of a file: its syntax facts failed their checks"
+            );
+        })
+    }
+
+    fn apply_with_refusal(
+        &self,
+        source: SyntaxSource<'_>,
+        limits: SyntaxLimits,
+        document: SyntaxDocument,
+        report: impl FnOnce(&RiftError),
     ) -> Result<(SyntaxDocument, Vec<ReadWarning>, u64), RiftError> {
         let Some(context) = self.for_path(source.path) else {
             return Ok((document, Vec::new(), 0));
@@ -444,7 +486,7 @@ impl FrameworkContext {
                 0,
             ));
         }
-        context.apply(source, limits, document)
+        context.apply_with_refusal(source, limits, document, report)
     }
 
     fn warn(&mut self, path: &ProjectPath, framework: SyntaxFramework, detail: &str) {

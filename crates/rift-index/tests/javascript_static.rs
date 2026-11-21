@@ -1,6 +1,6 @@
 //! Stored JavaScript and TypeScript edges from captured source.
 
-use rift_core::{SourceVisibility, TextFileInclusion};
+use rift_core::{ProjectPath, SourceVisibility, TextFileInclusion};
 use rift_index::{WorkspaceIndex, WorkspaceIndexLimits};
 use rift_protocol::read::EdgeKind;
 
@@ -392,6 +392,70 @@ fn module_manifest() -> &'static str {
 }
 
 #[test]
+fn test_typescript_contextual_global_names_store_symbols_and_method_edges() {
+    let source = "export interface Arguments { value: number }\nexport class Instance {\n    boolean(keys: string | string[]): Instance { return this }\n    global(globals: string | string[], global?: boolean): Instance { return this.boolean(globals) }\n    check(f: (argv: Arguments) => number, global = true): Instance { return this.boolean(global ? 'x' : 'y') }\n    middleware(callback: () => void): Instance { return this.global('y') }\n}\n";
+    for (path, language) in [("main.ts", "typescript"), ("main.tsx", "typescript:tsx")] {
+        let (_directory, index) = workspace_with_manifest(&[(path, source)], module_manifest());
+        let language = rift_protocol::read::Language::from_identity_segment(language)
+            .expect("fixture language");
+        assert!(
+            index
+                .identity_coverage_complete(&language)
+                .expect("identity coverage"),
+            "{path}"
+        );
+        assert!(index.edges().is_complete());
+        for (kind, from, to) in [
+            (EdgeKind::Contains, "/Instance", "/Instance/global"),
+            (EdgeKind::Contains, "/Instance", "/Instance/check"),
+            (EdgeKind::Calls, "/Instance/global", "/Instance/boolean"),
+            (EdgeKind::Calls, "/Instance/check", "/Instance/boolean"),
+            (EdgeKind::Calls, "/Instance/middleware", "/Instance/global"),
+            (EdgeKind::HasType, "/Instance/check", "/Arguments"),
+        ] {
+            assert!(
+                has_edge(&index, kind, from, to),
+                "{path}: {kind:?} {from} to {to}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_typescript_newline_separated_generic_signatures_store_identities() {
+    let source = "export type Handler<T> = {\n    (): T\n    <U>(value: U): U\n} & T\n\nexport type Container<T> = {\n    listen: {\n        (value: T): T\n        <U>(value: U): U\n    }\n}\n";
+    for (path, language) in [("main.ts", "typescript"), ("main.tsx", "typescript:tsx")] {
+        let (_directory, index) = workspace_with_manifest(&[(path, source)], module_manifest());
+        let language = rift_protocol::read::Language::from_identity_segment(language)
+            .expect("fixture language");
+        assert!(
+            index
+                .identity_coverage_complete(&language)
+                .expect("identity coverage"),
+            "{path}"
+        );
+        let view = index.symbol_view().expect("symbol identities");
+        for name in ["/Handler", "/Container", "/Container/listen"] {
+            assert!(
+                view.normalized_graph().records().iter().any(|record| {
+                    record
+                        .identity()
+                        .is_some_and(|id| id.as_str().ends_with(name))
+                }),
+                "{path}: {name}"
+            );
+        }
+        assert!(has_edge(
+            &index,
+            EdgeKind::Contains,
+            "/Container",
+            "/Container/listen"
+        ));
+        assert!(index.edges().is_complete());
+    }
+}
+
+#[test]
 fn test_typescript_variance_annotations_keep_identity_heritage_and_members() {
     let source = "export interface Base<T> { base: T }
 export interface Mid<out T = unknown, in U = string> extends Base<T> { value: T; run(input: U): T }
@@ -552,6 +616,42 @@ export const api = { member: wrap(() => leaf()), method() { return leaf() } };
             "{path}: {found:?}"
         );
     }
+}
+
+#[test]
+fn tsx_callable_variables_keep_recursive_calls_and_closer_shadows() {
+    let source = r#"export const Widget = (depth: number) => {
+  if (depth > 0) return Widget(depth - 1);
+  {
+    const Widget = () => <span className="flex" />;
+    return Widget();
+  }
+};
+export const Shadowed = (Shadowed: () => JSX.Element) => Shadowed();
+"#;
+    let (_directory, index) = workspace_with_manifest(
+        &[
+            ("main.tsx", source),
+            ("styles.css", "@import 'tailwindcss';"),
+        ],
+        r#"{"name":"fixture","version":"1.0.0","type":"module","devDependencies":{"tailwindcss":"4.1.0"}}"#,
+    );
+    let file = index
+        .file(&ProjectPath::new("main.tsx").expect("fixture path"))
+        .expect("indexed TSX source");
+    assert!(
+        file.syntax()
+            .symbols()
+            .iter()
+            .any(|symbol| symbol.kind == "utility" && symbol.name == "flex")
+    );
+    assert_eq!(
+        calls(&index),
+        [
+            ("Widget".to_owned(), "Widget".to_owned()),
+            ("Widget".to_owned(), "Widget/Widget".to_owned()),
+        ]
+    );
 }
 
 #[test]

@@ -14,6 +14,9 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 /// A compiled-size bound far above every pattern this suite runs.
 const SIZE_LIMIT: usize = 1 << 20;
 
+/// Per-end byte budget for the vendored generator outputs. Authored files stay whole.
+const GENERATED_WINDOW_BYTES: usize = 64 * 1024;
+
 /// The patterns the dialect comparison of the text-search evaluation ran against
 /// ripgrep 15.1.0: anchors, trailing whitespace, classes beside line ends, and a
 /// carriage return.
@@ -66,15 +69,17 @@ fn pattern(source: &str) -> TestResult<Pattern> {
     Ok(Pattern::parse(source, SIZE_LIMIT)?)
 }
 
-fn whole_file(pattern: &Pattern, text: &str) -> Vec<Range<usize>> {
-    pattern.matches(text, 0..text.len()).collect()
+fn whole_file(pattern: &Pattern, text: &str, start: usize) -> Vec<Range<usize>> {
+    pattern
+        .matches(text, 0..text.len())
+        .map(|range| start + range.start..start + range.end)
+        .collect()
 }
 
 /// ripgrep's default reading: each line alone, its `\n` removed and any `\r` kept, the
 /// matches offset back into the file.
-fn line_by_line(oracle: &regex::Regex, text: &str) -> Vec<Range<usize>> {
+fn line_by_line(oracle: &regex::Regex, text: &str, mut start: usize) -> Vec<Range<usize>> {
     let mut found = Vec::new();
-    let mut start = 0;
     for line in text.split_inclusive('\n') {
         let body = line.strip_suffix('\n').unwrap_or(line);
         found.extend(
@@ -93,7 +98,7 @@ fn the_crlf_fixture_answers_the_files_ripgrep_lists() -> TestResult {
         let pattern = pattern(source)?;
         let listed: Vec<&str> = CRLF_FIXTURE
             .iter()
-            .filter(|(_, text)| !whole_file(&pattern, text).is_empty())
+            .filter(|(_, text)| !whole_file(&pattern, text, 0).is_empty())
             .map(|(name, _)| *name)
             .collect();
         assert_eq!(listed, expected, "pattern {source:?}");
@@ -108,8 +113,8 @@ fn the_crlf_fixture_answers_ripgrep_offsets_line_by_line() -> TestResult {
         let oracle = regex::Regex::new(source)?;
         for (name, text) in CRLF_FIXTURE {
             assert_eq!(
-                whole_file(&pattern, text),
-                line_by_line(&oracle, text),
+                whole_file(&pattern, text, 0),
+                line_by_line(&oracle, text, 0),
                 "pattern {source:?} over {name}"
             );
         }
@@ -159,6 +164,63 @@ fn line_ending_forms(text: &str) -> [String; 2] {
     [lf, crlf]
 }
 
+fn is_generated_parser_source(path: &Path) -> bool {
+    let Some((parent, name)) = path.parent().zip(path.file_name()) else {
+        return false;
+    };
+    (parent == Path::new("vendor/tree-sitter-typescript/typescript/src")
+        || parent == Path::new("vendor/tree-sitter-typescript/tsx/src"))
+        && matches!(
+            name.to_str(),
+            Some("parser.c" | "grammar.json" | "node-types.json")
+        )
+}
+
+/// Head and tail windows retain whole UTF-8 lines and never join unrelated text.
+fn generated_windows(text: &str, budget: usize) -> (Range<usize>, Option<Range<usize>>) {
+    if text.len() <= 2 * budget {
+        return (0..text.len(), None);
+    }
+    let bytes = text.as_bytes();
+    let head_end = bytes[..budget]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let tail_floor = bytes.len() - budget;
+    let tail_start = bytes[tail_floor - 1..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|index| tail_floor + index);
+    (0..head_end, tail_start.map(|start| start..bytes.len()))
+}
+
+/// The window's first byte in the full file after each line-ending conversion.
+fn line_ending_offsets(prefix: &str) -> [usize; 2] {
+    debug_assert!(prefix.is_empty() || prefix.ends_with('\n'));
+    let mut offsets = [prefix.len(); 2];
+    for line in prefix.split_terminator('\n') {
+        if line.ends_with('\r') {
+            offsets[0] -= 1;
+        } else {
+            offsets[1] += 1;
+        }
+    }
+    offsets
+}
+
+#[test]
+fn generated_windows_keep_whole_lines_and_absolute_offsets() {
+    let text = "é\r\nplain\nlong ignored line\r\nlast";
+    let (head, tail) = generated_windows(text, 8);
+    assert_eq!(&text[head], "é\r\n");
+    let tail = tail.expect("the suffix starts after a complete line");
+    let [lf, crlf] = line_ending_offsets(&text[..tail.start]);
+    let [full_lf, full_crlf] = line_ending_forms(text);
+    assert_eq!(&text[tail], "last");
+    assert_eq!(&full_lf[lf..], "last");
+    assert_eq!(&full_crlf[crlf..], "last");
+}
+
 #[test]
 fn this_repository_answers_ripgrep_offsets_line_by_line() -> TestResult {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
@@ -172,33 +234,42 @@ fn this_repository_answers_ripgrep_offsets_line_by_line() -> TestResult {
         "the walk reaches the repository: {} files",
         files.len()
     );
-    let forms: Vec<(&PathBuf, [String; 2])> = files
+    let forms: Vec<_> = files
         .iter()
-        .map(|(path, text)| (path, line_ending_forms(text)))
+        .flat_map(|(path, text)| {
+            let relative = path.strip_prefix(root).unwrap_or(path);
+            let (head, tail) = if is_generated_parser_source(relative) {
+                generated_windows(text, GENERATED_WINDOW_BYTES)
+            } else {
+                (0..text.len(), None)
+            };
+            std::iter::once(head).chain(tail).map(move |range| {
+                let offsets = line_ending_offsets(&text[..range.start]);
+                (path, offsets, line_ending_forms(&text[range]))
+            })
+        })
         .collect();
     for source in DIALECT_PATTERNS {
         let pattern = pattern(source)?;
         let oracle = regex::Regex::new(source)?;
-        let mut matched_lf_files = 0_usize;
-        for (path, [lf, crlf]) in &forms {
-            let found = whole_file(&pattern, lf);
-            assert_eq!(
-                found,
-                line_by_line(&oracle, lf),
-                "pattern {source:?} over {} with LF line ends",
-                path.display()
-            );
-            assert_eq!(
-                whole_file(&pattern, crlf),
-                line_by_line(&oracle, crlf),
-                "pattern {source:?} over {} with CRLF line ends",
-                path.display()
-            );
-            matched_lf_files += usize::from(!found.is_empty());
+        let mut matched_lf_windows = 0_usize;
+        for (path, [lf_start, crlf_start], [lf, crlf]) in &forms {
+            for (ending, text, start) in [("LF", lf, *lf_start), ("CRLF", crlf, *crlf_start)] {
+                let found = whole_file(&pattern, text, start);
+                assert_eq!(
+                    found,
+                    line_by_line(&oracle, text, start),
+                    "pattern {source:?} over {} at byte {start} with {ending} line ends",
+                    path.display()
+                );
+                if ending == "LF" && !found.is_empty() {
+                    matched_lf_windows += 1;
+                }
+            }
         }
         if ANCHORED_IN_THIS_REPOSITORY.contains(&source) {
             assert!(
-                matched_lf_files > 0,
+                matched_lf_windows > 0,
                 "pattern {source:?} matches a line of this repository"
             );
         }

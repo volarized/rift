@@ -1544,7 +1544,7 @@ impl IndexContents {
             let result = analyze_source(&path, file.source(), &absolute, provider, limits)
                 .and_then(|document| {
                     context
-                        .apply(
+                        .apply_for_publication(
                             SyntaxSource {
                                 path: &path,
                                 text: file.source(),
@@ -14810,7 +14810,17 @@ mod tests {
         let source = root.join("src/lib.rs");
         let text = root.join("notes.txt");
         fs::write(root.join("refused.rs"), [0xff, 0]).expect("refused source");
-        advance_capture_clock(&root, &[source.clone(), text, root.join("refused.rs")]);
+        // Discovery retains directory metadata, including the root changed by creating `.rift`.
+        advance_capture_clock(
+            &root,
+            &[
+                root.clone(),
+                root.join("src"),
+                source.clone(),
+                text,
+                root.join("refused.rs"),
+            ],
+        );
         let (first, last) = captured_after(&root, &LastCapture::default());
         if selection_needs_discovery(&root, &last) {
             return;

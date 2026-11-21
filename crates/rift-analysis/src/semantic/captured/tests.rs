@@ -59,6 +59,65 @@ fn static_project(
 }
 
 #[test]
+fn unsupported_rust_use_keeps_independent_static_calls() {
+    let rust = source_file(
+        "src/lib.rs",
+        "pub use ::dependency::Thing as Foreign; fn leaf() {} pub fn run() { leaf(); }",
+    );
+    let typescript = source_file(
+        "main.ts",
+        "function leaf() {} export function run() { leaf(); }",
+    );
+    let files = [&rust, &typescript];
+    let sources = files.map(|file| PackageSource::new(file.path(), file.source()));
+    let manifest = ProjectPath::new("Cargo.toml").expect("manifest path");
+    let metadata = [PackageSource::new(
+        &manifest,
+        "[package]\nname='fixture'\nversion='0.1.0'\nedition='2024'\n",
+    )];
+    let language = Language::from_identity_segment("typescript").expect("TypeScript language");
+    let input = NamespaceInput::project(
+        &SymbolOwner::Local,
+        &language,
+        &sources,
+        &metadata,
+        &[],
+        ExactPackageLimits::new(16, 32_768),
+    )
+    .expect("captured context");
+    let view = WorkspaceSemantics::build_captured_project_facts(input, &files, 64, 256, 7, None)
+        .expect("captured static semantics")
+        .semantics;
+
+    let calls = view
+        .static_occurrences()
+        .iter()
+        .filter(|occurrence| occurrence.role == rift_core::ReferenceRole::Call)
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    for file in files {
+        let call = calls
+            .iter()
+            .find(|call| call.binding.unit().key().as_str() == file.path().as_str())
+            .expect("the file contributes its static call");
+        let target = call.target_binding.as_ref().expect("local callee");
+        assert_eq!(call.binding.unit(), target.unit());
+        assert!(view.static_edge_calls_complete(
+            call.binding.unit(),
+            Some(rift_syntax::ByteRange {
+                start: call.binding.range().start(),
+                end: call.binding.range().end(),
+            }),
+        ));
+    }
+    assert_eq!(
+        view.static_targets_omitted()
+            .get(&rift_protocol::read::EdgeKind::Imports),
+        Some(&1)
+    );
+}
+
+#[test]
 fn static_call_targets_follow_edits_and_held_views_keep_original_occurrences() {
     let original = source_file(
         "main.mjs",

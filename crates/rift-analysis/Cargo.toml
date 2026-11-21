@@ -48,5 +48,6 @@ zip = { workspace = true, optional = true }
 
 [dev-dependencies]
 jsonschema.workspace = true
+rift-tracing = { workspace = true, features = ["fixtures"] }
 schemars.workspace = true
 tempfile.workspace = true

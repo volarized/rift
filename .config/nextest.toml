@@ -15,6 +15,7 @@ leak-timeout = { period = "200ms", result = "fail" }
 [test-groups]
 live = { max-threads = 1 }
 election = { max-threads = 1 }
+wide-syntax = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = 'binary(/^live_/) or test(/^live_/)'
@@ -75,6 +76,15 @@ default-filter = "not binary(/^live_/) and not binary(/^corpus_/) and not test(/
 global-timeout = "480s"
 fail-fast = false
 failure-output = "immediate-final"
+
+# The wide syntax cases compare process CPU time. On native Windows Arm64,
+# run them early and one at a time so they can overlap the rest of the suite.
+[[profile.ci.overrides]]
+platform = { host = "aarch64-pc-windows-msvc", target = "aarch64-pc-windows-msvc" }
+filter = 'binary(=wide_syntax_element_extraction)'
+threads-required = 1
+test-group = 'wide-syntax'
+priority = 10
 
 [profile.ci.junit]
 path = "junit.xml"

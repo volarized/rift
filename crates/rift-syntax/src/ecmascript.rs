@@ -165,6 +165,8 @@ const MODULE_KIND: &str = "module";
 const FUNCTION_SIGNATURE_KIND: &str = "function_signature";
 /// TypeScript `declare` wrapper around an ambient declaration.
 const AMBIENT_DECLARATION_KIND: &str = "ambient_declaration";
+/// Qualification of declarations in an authored augmentation of the global scope.
+pub(crate) const GLOBAL_AUGMENTATION_NAME: &str = "global";
 /// Grammar spelling of a TypeScript callable type.
 const FUNCTION_TYPE_KIND: &str = "function_type";
 /// Grammar spelling of a TypeScript type annotation.
@@ -665,6 +667,14 @@ impl EcmaScriptKinds {
         kinds.declaration_type = Some(field_id(language, "type"));
         kinds.type_tokens = vec![token_id(language, "type"), token_id(language, "typeof")];
         kinds
+    }
+
+    fn is_global_augmentation(&self, syntax_element: Node<'_>) -> bool {
+        self.global_namespace == Some(syntax_element.kind_id())
+            || (self.ambient_declaration == Some(syntax_element.kind_id())
+                && self
+                    .global_token
+                    .is_some_and(|token| EcmaScriptRules::has_token(syntax_element, &[token])))
     }
 
     /// Whether `syntax element` is a member signature outside an interface or class
@@ -1794,14 +1804,8 @@ impl GrammarRules for EcmaScriptRules<'_> {
     }
 
     fn child_qualification(&self, syntax_element: Node<'_>, text: &str, parent: &str) -> String {
-        let global = self.kinds.global_namespace == Some(syntax_element.kind_id())
-            || (self.kinds.ambient_declaration == Some(syntax_element.kind_id())
-                && self
-                    .kinds
-                    .global_token
-                    .is_some_and(|token| Self::has_token(syntax_element, &[token])));
-        if global {
-            return "global".to_owned();
+        if self.kinds.is_global_augmentation(syntax_element) {
+            return GLOBAL_AUGMENTATION_NAME.to_owned();
         }
         self.container_name(syntax_element, text).map_or_else(
             || parent.to_owned(),
@@ -1857,6 +1861,49 @@ impl GrammarRules for EcmaScriptRules<'_> {
     fn qualification_separator(&self) -> &'static str {
         "."
     }
+}
+
+/// Reads the export statements whose owner is an authored global augmentation.
+/// The global scope has no retained declaration to stand in for the source witness.
+pub(crate) fn global_export_ranges(
+    dialect: crate::TypeScriptDialect,
+    source: &str,
+    limits: SyntaxLimits,
+) -> Result<BTreeSet<ByteRange>, RiftError> {
+    let grammar = dialect.grammar();
+    let kinds = dialect.kinds();
+    let mut parser = Parser::new();
+    parser
+        .set_language(&grammar)
+        .map_err(|_| errors::syntax::facts_kind_invalid().error())?;
+    let (tree, _) = recovery::parse(&mut parser, source)
+        .ok_or_else(|| errors::syntax::facts_structure_invalid().error())?;
+    let root = tree.root_node();
+    let mut ranges = BTreeSet::new();
+    let mut pending = vec![(root, 0_usize, false, false)];
+    let mut cursor = root.walk();
+    let mut visited = 0;
+    while let Some((syntax_element, depth, parent_is_global, parent_is_global_body)) = pending.pop()
+    {
+        visited += 1;
+        if depth > limits.syntax_depth_max() {
+            return errors::syntax::facts_depth_exceeded().fail();
+        }
+        if visited + pending.len() + syntax_element.named_child_count()
+            > limits.syntax_elements_max()
+        {
+            return errors::syntax::facts_count_exceeded().fail();
+        }
+        if parent_is_global_body && syntax_element.kind_id() == kinds.export_statement {
+            ranges.insert(extract::byte_range(syntax_element)?);
+        }
+        let global = kinds.is_global_augmentation(syntax_element);
+        let global_body = parent_is_global && syntax_element.kind() == "statement_block";
+        extract::push_named_children(&mut pending, &mut cursor, syntax_element, |child| {
+            (child, depth + 1, global, global_body)
+        });
+    }
+    Ok(ranges)
 }
 
 /// One `/** ... */` comment's written text: the delimiters, each line's
