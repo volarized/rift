@@ -45,6 +45,41 @@ struct Manifest {
     package: Option<toml::Table>,
     #[serde(default)]
     features: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    dependencies: toml::Table,
+    #[serde(default)]
+    target: toml::Table,
+}
+
+impl Manifest {
+    /// Declared features plus the implicit feature of each optional dependency that no
+    /// feature names with `dep:`, as Cargo defines them.
+    fn declared_features(self) -> BTreeMap<String, Vec<String>> {
+        let mut features = self.features;
+        let targets = self
+            .target
+            .values()
+            .filter_map(|target| target.get("dependencies")?.as_table());
+        let optional = std::iter::once(&self.dependencies)
+            .chain(targets)
+            .flat_map(|dependencies| dependencies.iter())
+            .filter(|(_, dependency)| {
+                dependency
+                    .get("optional")
+                    .and_then(toml::Value::as_bool)
+                    .unwrap_or(false)
+            })
+            .map(|(name, _)| name.clone())
+            .collect::<BTreeSet<_>>();
+        for name in optional {
+            let explicit = format!("dep:{name}");
+            if features.values().flatten().any(|value| *value == explicit) {
+                continue;
+            }
+            features.entry(name).or_insert_with(|| vec![explicit]);
+        }
+        features
+    }
 }
 
 struct Features {
@@ -101,7 +136,7 @@ impl<'input> Configurations<'input> {
             {
                 continue;
             }
-            let features = metadata.map(|metadata| Features::new(metadata.features));
+            let features = metadata.map(|metadata| Features::new(metadata.declared_features()));
             manifests
                 .entry(parent)
                 .and_modify(|features| *features = None)

@@ -1914,3 +1914,25 @@ fn test_rust_closure_parameters_and_guards_typed_by_a_generic_callee() {
             && edge.to().as_str().ends_with("/Table/reset")
     }));
 }
+
+#[test]
+fn test_rust_optional_dependencies_are_implicit_features() {
+    // An optional dependency is a feature of its name unless a feature names it with
+    // `dep:`. Default features enabling it select the items under it; an optional
+    // dependency only `dep:` names declares no feature, so its condition stays unknown.
+    let manifest = "[package]\nname='fixture'\nversion='0.1.0'\n[dependencies]\nextra = { version = '1', optional = true }\nrenamed = { package = 'other', version = '1', optional = true }\nexplicit = { version = '1', optional = true }\nrequired = '1'\n[target.'cfg(unix)'.dependencies]\nplatform = { version = '1', optional = true }\n[features]\ndefault = ['extra', 'platform']\nuses_dep = ['dep:explicit']\n";
+    let source = "#[cfg(feature = \"extra\")]\npub fn enabled() -> u8 { 1 }\n#[cfg(not(feature = \"extra\"))]\npub fn enabled() -> u8 { 2 }\n#[cfg(feature = \"platform\")]\npub fn targeted() -> u8 { 3 }\n#[cfg(feature = \"renamed\")]\npub fn renamed() -> u8 { 4 }\n#[cfg(not(feature = \"renamed\"))]\npub fn renamed() -> u8 { 5 }\n#[cfg(feature = \"explicit\")]\npub fn hidden() -> u8 { 6 }\n#[cfg(feature = \"required\")]\npub fn plain() -> u8 { 7 }\npub fn run() -> u8 { enabled() + targeted() + renamed() + hidden() + plain() }\n";
+    let (_directory, index) = fixture_index(manifest, &[("src/lib.rs", source)]);
+    for to in ["/fixture/enabled", "/fixture/targeted", "/fixture/renamed"] {
+        assert!(
+            has_edge(&index, EdgeKind::Calls, "/fixture/run", to),
+            "missing run -> {to}"
+        );
+    }
+    for to in ["/fixture/hidden", "/fixture/plain"] {
+        assert!(
+            !has_edge(&index, EdgeKind::Calls, "/fixture/run", to),
+            "unknown condition resolved: run -> {to}"
+        );
+    }
+}
