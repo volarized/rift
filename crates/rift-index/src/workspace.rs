@@ -1544,7 +1544,7 @@ impl IndexContents {
             let result = analyze_source(&path, file.source(), &absolute, provider, limits)
                 .and_then(|document| {
                     context
-                        .apply(
+                        .apply_for_publication(
                             SyntaxSource {
                                 path: &path,
                                 text: file.source(),

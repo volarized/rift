@@ -229,7 +229,7 @@ fn analyzed_file(
     }
     let facts = if context.for_path(file.path()).is_some() {
         let document = source.parse_document()?;
-        let (document, found, calls) = context.apply(
+        let (document, found, calls) = context.apply_for_publication(
             rift_syntax::SyntaxSource {
                 path: file.path(),
                 text: file.text(),
