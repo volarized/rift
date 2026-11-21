@@ -47,6 +47,9 @@ pub(super) struct EdgePythonKinds {
     guards: guards::TypeGuards,
     return_type: u16,
     loops: [u16; 2],
+    /// Compound statements and clauses a class body may define methods under.
+    conditional: [u16; 6],
+    block: u16,
 }
 
 pub(super) fn edge_python_kinds() -> &'static EdgePythonKinds {
@@ -112,6 +115,15 @@ pub(super) fn edge_python_kinds() -> &'static EdgePythonKinds {
             guards: guards::TypeGuards::new(&grammar),
             return_type: field("return_type"),
             loops: [id("for_statement"), id("while_statement")],
+            conditional: [
+                id("if_statement"),
+                id("elif_clause"),
+                id("else_clause"),
+                id("try_statement"),
+                id("except_clause"),
+                id("finally_clause"),
+            ],
+            block: id("block"),
         }
     })
 }
@@ -427,7 +439,15 @@ impl EdgePythonKinds {
             }
             parent = parent.parent()?;
         }
-        let class = parent.parent()?.syntax_element();
+        // A method defined under `if`, `try` and their clauses still belongs to the class body.
+        let mut owner = parent.parent()?;
+        while self.conditional.contains(&owner.syntax_element().kind_id()) {
+            owner = owner.parent()?;
+            if owner.syntax_element().kind_id() == self.block {
+                owner = owner.parent()?;
+            }
+        }
+        let class = owner.syntax_element();
         (class.kind_id() == self.definitions[1])
             .then(|| class.child_by_field_id(self.name.get()))
             .flatten()
@@ -557,14 +577,14 @@ impl EdgePythonKinds {
         while let Some(target) = pending.pop() {
             if target.kind_id() == self.identifier {
                 let kind = self.edge_assignment_kind(visited, target)?;
-                let available = if matches!(
-                    kind,
+                let available = match kind {
                     StaticBindingKind::PythonInstance { .. }
-                        | StaticBindingKind::PythonAlias { .. }
-                ) {
-                    byte_range(visited.syntax_element())?.end
-                } else {
-                    byte_range(scope)?.start
+                    | StaticBindingKind::PythonAlias { .. } => {
+                        byte_range(visited.syntax_element())?.end
+                    }
+                    // The loop body reads each element after the iterated value.
+                    StaticBindingKind::PythonElement { iterable } => iterable.end,
+                    _ => byte_range(scope)?.start,
                 };
                 facts
                     .bindings
@@ -604,6 +624,15 @@ impl EdgePythonKinds {
         target: Node<'_>,
     ) -> Result<StaticBindingKind, RiftError> {
         let assignment = visited.syntax_element();
+        if assignment.kind_id() == self.assignment[2]
+            && target.kind_id() == self.identifier
+            && assignment.child_by_field_id(self.left) == Some(target)
+            && let Some(iterable) = assignment.child_by_field_id(self.right)
+        {
+            return Ok(StaticBindingKind::PythonElement {
+                iterable: byte_range(iterable)?,
+            });
+        }
         if assignment.kind_id() != self.assignment[0]
             || assignment.child_by_field_id(self.left) != Some(target)
         {

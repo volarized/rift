@@ -6,7 +6,7 @@ use rift_protocol::read::SymbolKind;
 
 use super::super::{File, Index, Target, Work};
 use super::{Value, edge_python_binding};
-use rift_syntax::{ByteRange, StaticBindingKind};
+use rift_syntax::{ByteRange, StaticBinding, StaticBindingKind};
 
 /// Classes the Python `builtins` module provides, which a module may name without binding.
 const BUILTIN_CLASSES: [&str; 96] = [
@@ -357,6 +357,18 @@ impl<'source> Index<'source> {
         range: ByteRange,
         work: &mut Work,
     ) -> bool {
+        self.python_typing_name(file, range, "Generic", work)
+    }
+
+    /// Whether the expression at `range` names `expected` of `typing` or `typing_extensions`,
+    /// imported by name or read through the module.
+    pub(super) fn python_typing_name(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        expected: &str,
+        work: &mut Work,
+    ) -> bool {
         let Some(text) = file.text(range) else {
             return false;
         };
@@ -367,8 +379,12 @@ impl<'source> Index<'source> {
         let Some(binding) = edge_python_binding(self, file, name, range.start, work) else {
             return false;
         };
-        let StaticBindingKind::PythonImport { module, export } = binding.kind else {
-            return false;
+        let (module, export) = match binding.kind {
+            StaticBindingKind::PythonImport { module, export } => (module, export),
+            StaticBindingKind::PythonModule { module } if file.text(module) == Some(name) => {
+                (module, None)
+            }
+            _ => return false,
         };
         let Some(module) = file.text(module) else {
             return false;
@@ -378,8 +394,8 @@ impl<'source> Index<'source> {
             return false;
         }
         match export {
-            Some(export) => file.text(export) == Some("Generic") && names.next().is_none(),
-            None => names.next() == Some("Generic") && names.next().is_none(),
+            Some(export) => file.text(export) == Some(expected) && names.next().is_none(),
+            None => names.next() == Some(expected) && names.next().is_none(),
         }
     }
 
@@ -553,6 +569,9 @@ impl<'source> Index<'source> {
                 StaticBindingKind::PythonAlias { value } => {
                     work.python_lookup(|work| self.python_name(file, *value, work))?
                 }
+                StaticBindingKind::PythonElement { iterable } => {
+                    Value::Instance(self.python_element(file, *iterable, work)?)
+                }
                 _ => return None,
             };
         }
@@ -656,15 +675,19 @@ impl<'source> Index<'source> {
     ) -> Option<Target<'source>> {
         let file = self.files.get(class.file.path.as_str())?;
         let target = file.qualified_target(&format!("{}.{name}", class.symbol.qualified_name))?;
-        if !target.symbol.kinds.contains(&SymbolKind::Callable) {
-            return Some(target);
-        }
         let bindings = file
             .by_name
-            .get(name)?
-            .iter()
+            .get(name)
+            .into_iter()
+            .flatten()
             .copied()
             .filter(|binding| binding.scope == class.symbol.item_range);
+        if !target.symbol.kinds.contains(&SymbolKind::Callable) {
+            // An instance write through `self` before the property goes through its setter;
+            // the class body declares only the property, so the slot is the property.
+            return Some(python_property_slot(file, target, bindings, work).unwrap_or(target));
+        }
+        file.by_name.get(name)?;
         // Getter, setter and deleter facets of one property are one member slot.
         let mut property = true;
         for binding in bindings.clone() {
@@ -707,6 +730,30 @@ impl<'source> Index<'source> {
         }
         None
     }
+}
+
+/// The first property facet of `target` when every binding the class body holds for the
+/// name is a facet of that property.
+fn python_property_slot<'source>(
+    file: &File<'source>,
+    target: Target<'source>,
+    bindings: impl Iterator<Item = &'source StaticBinding>,
+    work: &mut Work,
+) -> Option<Target<'source>> {
+    let mut first = None;
+    for binding in bindings {
+        if !work.charge() {
+            return None;
+        }
+        let facet = file.target_at(binding.name)?;
+        if !facet.symbol.kinds.contains(&SymbolKind::Property)
+            || facet.symbol.qualified_name != target.symbol.qualified_name
+        {
+            return None;
+        }
+        first.get_or_insert(facet);
+    }
+    first
 }
 
 fn merge_order<'source>(

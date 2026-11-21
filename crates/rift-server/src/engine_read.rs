@@ -1232,7 +1232,12 @@ pub async fn graph_calls(
     };
     if direction == TraversalDirection::Outgoing {
         Ok(Box::pin(call_evidence::confirm_reference_sites(
-            reads, engines, seed, answer, deadline,
+            reads,
+            engines,
+            seed,
+            answer,
+            &mut call_evidence::TargetReferences::default(),
+            deadline,
         ))
         .await)
     } else {
