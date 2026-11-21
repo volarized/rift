@@ -253,6 +253,9 @@ pub struct StaticFactsParts {
     /// Python lambda, comprehension and generator expression scopes, whose bodies can run
     /// after later statements of the enclosing scope.
     pub expression_scopes: Vec<ByteRange>,
+    /// Rust calls with a closure argument and the range of every argument in order, which
+    /// relate the closure's parameters to the callee's declared parameters.
+    pub closure_calls: Vec<(ByteRange, Vec<ByteRange>)>,
 }
 
 /// Calls and binding evidence retained after the syntax tree is released.
@@ -346,6 +349,12 @@ impl StaticFacts {
         &self.0.receiver_arguments
     }
 
+    /// Rust calls with a closure argument, with every argument range in order.
+    #[must_use]
+    pub fn closure_calls(&self) -> &[(ByteRange, Vec<ByteRange>)] {
+        &self.0.closure_calls
+    }
+
     /// Rust use paths with their captured group components.
     #[must_use]
     pub fn rust_uses(&self) -> &[StaticRustUse] {
@@ -395,6 +404,7 @@ impl StaticFacts {
             vector_capacity(&self.0.receiver_arguments),
             vector_capacity(&self.0.loops),
             vector_capacity(&self.0.expression_scopes),
+            vector_capacity(&self.0.closure_calls),
         ]
         .into_iter()
         .fold(0, usize::saturating_add)
@@ -403,6 +413,13 @@ impl StaticFacts {
                 .rust_uses
                 .iter()
                 .map(|row| vector_capacity(&row.path))
+                .fold(0, usize::saturating_add),
+        )
+        .saturating_add(
+            self.0
+                .closure_calls
+                .iter()
+                .map(|(_, arguments)| vector_capacity(arguments))
                 .fold(0, usize::saturating_add),
         )
     }
@@ -426,6 +443,7 @@ impl StaticFacts {
             self.receiver_arguments().len(),
             self.loops().len(),
             self.expression_scopes().len(),
+            self.closure_calls().len(),
         ];
         if lengths
             .into_iter()
@@ -441,6 +459,38 @@ impl StaticFacts {
             return errors::syntax::facts_count_exceeded().fail();
         }
         Ok(())
+    }
+
+    /// Rust `use` rows, configuration items, path-call receiver arguments and closure calls.
+    fn rust_rows_valid(&self, valid: &impl Fn(ByteRange) -> bool, limits: SyntaxLimits) -> bool {
+        let imports = self.rust_uses().iter().all(|row| {
+            valid(row.range)
+                && row.visibility.is_none_or(valid)
+                && valid(row.scope)
+                && row.scope.encloses(row.range)
+                && !row.path.is_empty()
+                && row.path.len() <= limits.syntax_depth_max()
+                && row
+                    .path
+                    .iter()
+                    .copied()
+                    .all(|range| valid(range) && row.scope.encloses(range))
+        });
+        let conditional = self
+            .conditional_items()
+            .iter()
+            .all(|item| valid(item.range) && valid(item.attribute))
+            && self.receiver_arguments().iter().all(|(call, argument)| {
+                valid(*call) && valid(*argument) && contains(*call, *argument)
+            })
+            && self.closure_calls().iter().all(|(call, arguments)| {
+                valid(*call)
+                    && arguments.len() <= limits.syntax_elements_max()
+                    && arguments
+                        .iter()
+                        .all(|argument| valid(*argument) && contains(*call, *argument))
+            });
+        imports && conditional
     }
 
     pub(crate) fn validate(&self, source: &str, limits: SyntaxLimits) -> Result<(), RiftError> {
@@ -491,26 +541,7 @@ impl StaticFacts {
         let implementations = self.inherent_impls().iter().all(|row| {
             valid(row.range) && valid(row.type_path) && contains(row.range, row.type_path)
         });
-        let imports = self.rust_uses().iter().all(|row| {
-            valid(row.range)
-                && row.visibility.is_none_or(valid)
-                && valid(row.scope)
-                && row.scope.encloses(row.range)
-                && !row.path.is_empty()
-                && row.path.len() <= limits.syntax_depth_max()
-                && row
-                    .path
-                    .iter()
-                    .copied()
-                    .all(|range| valid(range) && row.scope.encloses(range))
-        });
-        let conditional = self
-            .conditional_items()
-            .iter()
-            .all(|item| valid(item.range) && valid(item.attribute))
-            && self.receiver_arguments().iter().all(|(call, argument)| {
-                valid(*call) && valid(*argument) && contains(*call, *argument)
-            });
+        let rust = self.rust_rows_valid(&valid, limits);
         let flow = self
             .loops()
             .iter()
@@ -527,8 +558,7 @@ impl StaticFacts {
             && assignments
             && unsupported
             && implementations
-            && imports
-            && conditional
+            && rust
             && flow)
         {
             return errors::syntax::facts_range_invalid().fail();

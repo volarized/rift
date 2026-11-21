@@ -3300,6 +3300,93 @@ fn library_and_binary_with_parse_errors_keep_the_shared_module_library_identity(
 }
 
 #[test]
+fn ordinary_restricted_reexports_keep_non_public_bindings() {
+    // #828: crate-scoped aliases keep their source and never become public aliases.
+    for visibility in ["pub(crate)", "pub(super)", "pub(in crate)"] {
+        let bridge = format!("{visibility} use crate::ser::Serialize;");
+        let sources = [
+            ("src/lib.rs", "mod ser; pub mod bridge;"),
+            ("src/bridge.rs", bridge.as_str()),
+            ("src/ser.rs", "pub trait Serialize {}"),
+        ];
+        let analysis = local_alias_analysis(&sources, LOCAL_ALIAS_MANIFEST);
+        let publication = analysis.publication();
+        let declaration = publication
+            .declarations
+            .iter()
+            .find(|declaration| {
+                declaration
+                    .symbol
+                    .as_str()
+                    .ends_with("/serde_core/bridge/Serialize")
+            })
+            .expect("restricted alias identity");
+        let identity = SymbolIdentity::parse(declaration.symbol.as_str()).expect("identity");
+        assert_eq!(identity.owner(), &publication.owner);
+        let unit = publication
+            .units
+            .iter()
+            .find(|unit| unit.unit == declaration.unit)
+            .expect("authored unit");
+        assert_eq!(unit.path.0, "src/bridge.rs");
+        assert_eq!(declaration.source, bridge);
+        assert!(declaration.source_complete);
+        assert_eq!(
+            unit.source.get(
+                usize::try_from(declaration.range.start).expect("start")
+                    ..usize::try_from(declaration.range.end).expect("end")
+            ),
+            Some(bridge.as_str())
+        );
+        assert!(
+            publication
+                .edges
+                .iter()
+                .any(|edge| edge.from == declaration.symbol
+                    && edge.kind.0 == rift_protocol::read::EdgeKind::Aliases.as_ref()
+                    && edge.to.as_str().ends_with("/serde_core/ser/Serialize"))
+        );
+        assert!(
+            !declaration.public,
+            "restricted alias became public: {visibility}"
+        );
+        let object = publication
+            .objects
+            .iter()
+            .find(|object| object.id.as_ref() == Some(&declaration.symbol))
+            .expect("alias object");
+        assert!(
+            object
+                .kinds
+                .contains(&rift_protocol::read::SymbolKind::Alias)
+        );
+        assert!(
+            !object
+                .kinds
+                .contains(&rift_protocol::read::SymbolKind::Public)
+        );
+        let graph = analysis.semantics.graph();
+        let record = graph
+            .records()
+            .iter()
+            .find(|record| {
+                record
+                    .identity()
+                    .is_some_and(|id| id.as_str() == declaration.symbol.as_str())
+            })
+            .expect("alias record");
+        assert!(
+            record
+                .contributions()
+                .iter()
+                .filter_map(|key| graph.contribution(key))
+                .filter_map(|contribution| contribution.facts())
+                .any(|facts| facts.visibility_spelling() == Some(visibility))
+        );
+    }
+}
+
+#[test]
 fn partial_library_extraction_keeps_original_source_and_incomplete_coverage() {
     let text = "pub mod a;\n}\n";
     let analysis = local_alias_analysis(
@@ -3408,91 +3495,4 @@ fn export_paths_answer_and_charge_what_a_scan_in_order_does() {
         }
     }
     assert_eq!(indexed.first(&exports, &paths[2]), (None, 5));
-}
-
-#[test]
-fn ordinary_restricted_reexports_keep_non_public_bindings() {
-    // #828: crate-scoped aliases keep their source and never become public aliases.
-    for visibility in ["pub(crate)", "pub(super)", "pub(in crate)"] {
-        let bridge = format!("{visibility} use crate::ser::Serialize;");
-        let sources = [
-            ("src/lib.rs", "mod ser; pub mod bridge;"),
-            ("src/bridge.rs", bridge.as_str()),
-            ("src/ser.rs", "pub trait Serialize {}"),
-        ];
-        let analysis = local_alias_analysis(&sources, LOCAL_ALIAS_MANIFEST);
-        let publication = analysis.publication();
-        let declaration = publication
-            .declarations
-            .iter()
-            .find(|declaration| {
-                declaration
-                    .symbol
-                    .as_str()
-                    .ends_with("/serde_core/bridge/Serialize")
-            })
-            .expect("restricted alias identity");
-        let identity = SymbolIdentity::parse(declaration.symbol.as_str()).expect("identity");
-        assert_eq!(identity.owner(), &publication.owner);
-        let unit = publication
-            .units
-            .iter()
-            .find(|unit| unit.unit == declaration.unit)
-            .expect("authored unit");
-        assert_eq!(unit.path.0, "src/bridge.rs");
-        assert_eq!(declaration.source, bridge);
-        assert!(declaration.source_complete);
-        assert_eq!(
-            unit.source.get(
-                usize::try_from(declaration.range.start).expect("start")
-                    ..usize::try_from(declaration.range.end).expect("end")
-            ),
-            Some(bridge.as_str())
-        );
-        assert!(
-            publication
-                .edges
-                .iter()
-                .any(|edge| edge.from == declaration.symbol
-                    && edge.kind.0 == rift_protocol::read::EdgeKind::Aliases.as_ref()
-                    && edge.to.as_str().ends_with("/serde_core/ser/Serialize"))
-        );
-        assert!(
-            !declaration.public,
-            "restricted alias became public: {visibility}"
-        );
-        let object = publication
-            .objects
-            .iter()
-            .find(|object| object.id.as_ref() == Some(&declaration.symbol))
-            .expect("alias object");
-        assert!(
-            object
-                .kinds
-                .contains(&rift_protocol::read::SymbolKind::Alias)
-        );
-        assert!(
-            !object
-                .kinds
-                .contains(&rift_protocol::read::SymbolKind::Public)
-        );
-        let graph = analysis.semantics.graph();
-        let record = graph
-            .records()
-            .iter()
-            .find(|record| {
-                record
-                    .identity()
-                    .is_some_and(|id| id.as_str() == declaration.symbol.as_str())
-            })
-            .expect("alias record");
-        assert!(
-            record
-                .contributions()
-                .iter()
-                .filter_map(|key| graph.contribution(key))
-                .filter_map(|contribution| contribution.facts())
-                .any(|facts| facts.visibility_spelling() == Some(visibility))
-        );
-    }
 }

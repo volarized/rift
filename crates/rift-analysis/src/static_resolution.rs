@@ -356,6 +356,8 @@ struct File<'source> {
     python_calls: BTreeMap<u64, Vec<&'source StaticCall>>,
     declared_types: BTreeMap<ByteRange, Option<ByteRange>>,
     conditions: Conditions,
+    /// Rust modules this file's conditional item chains declare, with their admission.
+    chain_modules: BTreeMap<&'source str, Option<bool>>,
 }
 
 #[derive(Default)]
@@ -420,7 +422,15 @@ impl<'source> File<'source> {
             python_calls: BTreeMap::new(),
             declared_types: BTreeMap::new(),
             conditions: Conditions::default(),
+            chain_modules: BTreeMap::new(),
         };
+        if document.facts.language().name == "rust" {
+            file.chain_modules = crate::analyzer::namespace::rust_chain_modules(
+                document.source,
+                document.facts,
+                configuration,
+            );
+        }
         let mut conditions = Vec::new();
         for item in facts.conditional_items() {
             if !work.charge() {
