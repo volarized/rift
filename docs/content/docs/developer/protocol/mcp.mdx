@@ -394,11 +394,9 @@ repeated definitions, overloads, and `cfg` variants of one symbol together.
 
 `outcome` distinguishes `found`, `missing`, and `unavailable`. `found` contains one
 `symbol` and its declaration bindings, including an empty declaration list for a source-less
-object:
+object. A runtime symbol's answer names the runtime release it read as `revision`:
 
-<ReadExample name="source-less-runtime" />
-
-<ReadExample name="source-less-builtin" />
+<ReadExample name="runtime-symbol" />
 
 `missing` means the exact selection was searched completely; `symbol_not_found`
 names the requested identity and up to three actual structural alternatives. An incomplete
@@ -429,7 +427,8 @@ member, `source` included, as an invalid request. A declaration's source is read
 `max_results` defaults to 10 and accepts 1 through 10000. `page` selects declarations at the
 revision the answer names. The server refuses a tree revision once the index serves another tree.
 Each binding retains `origin`, exactly one of `path` and `unit`, `range`, `line`, and indices
-into the symbol's signatures, types, and documentation.
+into the symbol's signatures, types, and documentation. These calls read `data_dir`, which the
+`sdk` project declares once under `cfg(unix)` and once under `cfg(windows)`:
 
 <ReadExample name="multi-declaration-full" />
 
@@ -484,8 +483,8 @@ A `local@name` owner selects an extra project accepted by the connection:
 <ReadExample name="named-symbol" />
 
 A package or runtime identity names its owner across releases, as
-`rift://symbol/cargo/crates.io/demo/rust/demo/beacon`, and `revision` selects the release to read,
-as `rift://revision/cargo/crates.io/demo@1.0.0`. Discover these identities through
+`rift://symbol/cargo/crates.io/itoa/rust/itoa/Buffer`, and `revision` selects the release to read,
+as `rift://revision/cargo/crates.io/itoa@1.0.18`. Discover these identities through
 `SERVICE :search` using `:scope "global"` and `:packages`. When the request omits
 `revision`, the server reads a package at the version the workspace's dependencies pin, and otherwise
 the newest release the global index collected. The answer **MUST** carry the release it read as
@@ -830,8 +829,8 @@ refuses every revision read.
 
 `:packages` in `SERVICE :search` names package versions beside those in the
 workspace's manifests and lockfiles, at most 64 entries. Each entry is a
-[`RequestedPackage`](/docs/developer/protocol/reference) carrying `manager`, `name`, and an
-optional exact `version`. The server applies the list to this read's dependency context alone:
+[`RequestedPackage`](/docs/developer/protocol/reference) carrying `manager`, `registry`, `name`,
+and an optional exact `version`. The server applies the list to this read's dependency context alone:
 
 - an entry naming a package the context holds replaces every entry for that package, a `path`
   or `git` entry included
@@ -844,24 +843,25 @@ answers from the nearest collected release under `package_substituted`. A packag
 collected release answers `package_absent`, or `package_requirement_absent` for an entry without
 `version`.
 
-This search reads Tokio 1.47.1 beside the project, in place of the version the workspace's
+This search reads Tokio 1.54.1 beside the project, in place of the version the workspace's
 `Cargo.lock` pins:
 
-**Request:**
-
-```json
-{
-  "query": "spawn_blocking",
-  "scope": "all",
-  "target": "symbol",
-  "max_results": 10,
-  "packages": [{ "manager": "cargo", "name": "tokio", "version": "1.47.1" }]
+```sparql
+SELECT ?symbol ?name {
+  SERVICE :search {
+    ?hit :query "spawn_blocking"; :target "symbol"; :scope "all";
+         :packages '[{"manager":"cargo","registry":"crates.io","name":"tokio","version":"1.54.1"}]'^^rdf:JSON;
+         :symbol ?symbol; :index ?index .
+    ?symbol :name ?name
+  }
 }
+ORDER BY ?index
+LIMIT 10
 ```
 
-The server refuses `packages` as `invalid_request` naming the field beside the `local` scope,
-since a project read consults no package, and beside a git `revision`, since package facts are
-served for the current tree alone. A list past 64 entries, and an entry whose `manager`, `name`,
+The server refuses `:packages` as `invalid_request` naming the field `packages` beside the `local`
+scope, since a project read consults no package, and beside a git revision, since package facts
+are served for the current tree alone. A list past 64 entries, and an entry whose `manager`, `name`,
 or `version` is empty or longer than its schema allows, refuse the same way before anything
 reaches the global API. A service that selects no `:scope` reads `local` unless
 [`[search] default_scope`](/docs/developer/configuration#search) names another.

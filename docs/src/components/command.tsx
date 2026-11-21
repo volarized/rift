@@ -14,10 +14,13 @@ import { cn } from "@/lib/utils";
 export function Command({
   children,
   prompt = "$",
+  copyLabel = "Copy command",
   className,
 }: {
   children: string;
   prompt?: string;
+  /** Accessible name of the copy button: what it copies. */
+  copyLabel?: string;
   className?: string;
 }) {
   const [copied, setCopied] = useState(false);
@@ -39,7 +42,7 @@ export function Command({
       <Button
         variant="ghost"
         size="icon-xs"
-        aria-label={copied ? "Copied" : "Copy command"}
+        aria-label={copied ? "Copied" : copyLabel}
         onClick={() => {
           void navigator.clipboard.writeText(children).then(() => {
             setCopied(true);
