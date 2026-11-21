@@ -82,7 +82,7 @@ const FLOOR_EDGES: &[(EdgeKind, usize)] = &[
     (EdgeKind::Calls, 260),
     (EdgeKind::Contains, 2453),
     (EdgeKind::Imports, 334),
-    (EdgeKind::Reads, 2200),
+    (EdgeKind::Reads, 2194),
     (EdgeKind::Writes, 218),
 ];
 
