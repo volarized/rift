@@ -506,8 +506,11 @@ impl<'source> Index<'source> {
         {
             return;
         }
-        // A constructor is invoked through `super`, never inherited and replaced.
-        if symbol.name == "constructor" {
+        // A constructor is invoked through `super`, never inherited and replaced. A member
+        // assigned through `this` writes the inherited member; it declares no override.
+        if symbol.name == "constructor"
+            || symbol.syntax_element_kind == Some("assignment_expression")
+        {
             return;
         }
         let Some(from) = self.javascript_identity(Target {

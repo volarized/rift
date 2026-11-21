@@ -444,6 +444,15 @@ impl<'source> Index<'source> {
             return self
                 .javascript_class_receiver(file, position, work)
                 .is_some_and(|(owner, _)| same(owner));
+            // A function or an object literal written in place through `this` declares
+            // another facet of the member (D38): the call still targets the member. Writes
+            // through other receivers keep the refusal.
+            if property == member
+                && receiver.trim() == "this"
+                && file.function_writes.contains(&start)
+            {
+                continue;
+            }
         }
         let name = receiver
             .strip_suffix(".prototype")
@@ -631,7 +640,10 @@ impl<'source> File<'source> {
                 });
             }
         }
-        found
+        found.or(assigned)
+        // A member assigned through `this` is another facet of a declared member (D38); it
+        // stands for the member only when nothing declares it.
+        let mut assigned: Option<Target<'source>> = None;
     }
 
     fn javascript_member_mode(
@@ -641,6 +653,13 @@ impl<'source> File<'source> {
         definitions: &crate::EnclosingDefinitions<&'source rift_syntax::SyntaxSymbol>,
         work: &mut Work,
     ) -> Option<MemberMode> {
+            if symbol.syntax_element_kind == Some("assignment_expression") {
+                assigned.get_or_insert(Target {
+                    file: self.document,
+                    symbol,
+                });
+                continue;
+            }
         let mut symbol = *definitions.resolve(position, position.checked_add(1)?)?;
         while let Some(container) = symbol.container.as_deref() {
             if !work.charge()

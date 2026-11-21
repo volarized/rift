@@ -738,7 +738,7 @@ fn declaration_anchors_with_public(
         .iter()
         .filter(|symbol| {
             symbol.syntax_element_kind != Some("assignment_expression")
-                || (symbol.kind == "method" && symbol.container.is_some())
+                || member_assignment(symbol)
                 || symbol.kinds.contains(&SymbolKind::Public)
                 || public.contains(&symbol.qualified_name)
                 || symbol.name_range.is_some_and(|name| {
@@ -803,10 +803,15 @@ fn assignment_name_conflicts<'source>(
         .filter(|symbol| symbol.syntax_element_kind != Some("assignment_expression"))
         .map(|symbol| symbol.qualified_name.as_str())
         .collect::<BTreeSet<_>>();
+    // A member assigned to a class or a constructor function is another facet of a
+    // same-named member (D38), never a conflict.
     let assignments = syntax
         .symbols()
         .iter()
-        .filter(|symbol| symbol.syntax_element_kind == Some("assignment_expression"))
+        .filter(|symbol| {
+            symbol.syntax_element_kind == Some("assignment_expression")
+                && !member_assignment(symbol)
+        })
         .map(|symbol| symbol.qualified_name.as_str())
         .filter(|name| lexical.contains(name))
         .collect::<BTreeSet<_>>();
@@ -827,6 +832,12 @@ fn assignment_name_conflicts<'source>(
         .into_iter()
         .chain(generated.filter(|name| literal.contains(name)))
         .collect()
+}
+
+/// Whether an assignment declares a member of the declaration it belongs to: a method
+/// or a field assigned to a class, a constructor function or its prototype.
+fn member_assignment(symbol: &SyntaxSymbol) -> bool {
+    matches!(symbol.kind, "method" | "property") && symbol.container.is_some()
 }
 
 fn assignment_name_is_literal(symbol: &SyntaxSymbol, source: &str) -> bool {

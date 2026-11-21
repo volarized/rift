@@ -309,7 +309,7 @@ pub struct StaticFactsParts {
     pub reexports: Vec<StaticReexport>,
     /// Assignment targets.
     pub assignments: Vec<ByteRange>,
-    /// Plain name targets of assignments whose value is a function written in place.
+    /// Name and member targets of assignments whose value is a function written in place.
     pub function_writes: Vec<ByteRange>,
     /// Declaration names whose written type is an array, with the named element type.
     pub element_types: Vec<(ByteRange, ByteRange)>,
@@ -463,7 +463,7 @@ impl StaticFacts {
         &self.0.assignments
     }
 
-    /// Plain name targets of assignments whose value is a function written in place.
+    /// Name and member targets of assignments whose value is a function written in place.
     #[must_use]
     pub fn function_writes(&self) -> &[ByteRange] {
         &self.0.function_writes

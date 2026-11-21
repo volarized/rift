@@ -72,6 +72,11 @@ impl<'source> Callbacks<'source> {
     pub(super) fn index(facts: &'source StaticFacts, work: &mut Work) -> Option<Self> {
         let mut callbacks = Self::default();
         let mut owners = BTreeMap::<ByteRange, Option<ByteRange>>::new();
+    /// Whether the declaration `name` is written with one function type.
+    pub(super) fn has_function_type(&self, name: ByteRange) -> bool {
+        self.function_types.get(&name).is_some_and(Option::is_some)
+    }
+
         for parameter in facts.parameters() {
             if !work.charge() {
                 return None;

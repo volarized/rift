@@ -1759,15 +1759,15 @@ impl Kinds {
         let id = syntax_element.kind_id();
         if self.assignment.contains(&id) {
             self.record_mutation(syntax_element, self.left, facts)?;
-            // A plain name given a function written in place stays callable.
+            // A name or a member given a function written in place stays callable, and a
+            // member given an object literal written in place is declared by it (D38).
             if id == self.assignment[0]
                 && let Some(left) = syntax_element
                     .child_by_field_id(self.left)
-                    .filter(|left| left.kind_id() == self.identifier)
-                && syntax_element
-                    .child_by_field_id(self.right)
-                    .and_then(|value| self.function_value(value))
-                    .is_some()
+                    .filter(|left| [self.identifier, self.member].contains(&left.kind_id()))
+                && let Some(value) = syntax_element.child_by_field_id(self.right)
+                && (self.function_value(value).is_some()
+                    || (left.kind_id() == self.member && value.kind_id() == self.object_literal[0]))
             {
                 facts.function_writes.push(byte_range(left)?);
             }

@@ -369,6 +369,15 @@ impl<'source> Index<'source> {
         let Some(file) = self.files.get(target.file.path.as_str()) else {
             return false;
         };
+        // A declaration written with a function type, `run: () => number`, is callable.
+        if !constructs
+            && target
+                .symbol
+                .name_range
+                .is_some_and(|name| file.callbacks.has_function_type(name))
+        {
+            return true;
+        }
         let Some(annotation) = target
             .symbol
             .name_range
@@ -887,6 +896,7 @@ pub(super) fn js_binding<'source>(
         return None;
     }
     let binding = best?;
+                let javascript = javascript_source(file.document.path.as_str());
     let deferred = modes
         .scopes
         .get(file.document.path.as_str())
@@ -896,6 +906,5 @@ pub(super) fn js_binding<'source>(
         binding.available_from <= position || role == rift_core::ReferenceRole::Type || deferred;
     let written =
         role == rift_core::ReferenceRole::Call && file.javascript_binding_written(binding, work);
-                let javascript = javascript_source(file.document.path.as_str());
     (!ambiguous && available && !written).then_some(binding)
 }

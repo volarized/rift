@@ -355,6 +355,27 @@ impl Conditions {
     }
 }
 
+/// The facet that stands for a member declared several times (D38): one declaration
+/// beside members assigned to its class (`on: Handler` and `this.on = ...`), or members
+/// assigned only. Any other repetition, such as overloads, stays ambiguous.
+fn member_facet<'source>(candidates: &[&'source SyntaxSymbol]) -> Option<&'source SyntaxSymbol> {
+    let assigned =
+        |symbol: &&SyntaxSymbol| symbol.syntax_element_kind == Some("assignment_expression");
+    if !candidates.iter().any(assigned)
+        || !candidates
+            .iter()
+            .all(|symbol| matches!(symbol.kind, "method" | "property"))
+    {
+        return None;
+    }
+    let mut declared = candidates.iter().filter(|symbol| !assigned(symbol));
+    match (declared.next(), declared.next()) {
+        (Some(symbol), None) => Some(*symbol),
+        (None, _) => candidates.first().copied(),
+        (Some(_), Some(_)) => None,
+    }
+}
+
 struct File<'source> {
     document: &'source StaticSource<'source>,
     facts: &'source StaticFacts,
@@ -720,10 +741,9 @@ impl<'source> File<'source> {
                 return None;
             }
             *selected
+        } else if language != "python" && candidates.len() != 1 {
+            member_facet(candidates)?
         } else {
-            if language != "python" && candidates.len() != 1 {
-                return None;
-            }
             *candidates.first()?
         };
         Some(Target {

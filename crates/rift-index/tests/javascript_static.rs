@@ -2169,6 +2169,110 @@ export function loose(connection: unknown) {
 }
 
 #[test]
+fn test_this_assignments_declare_members_and_join_existing_facets() {
+    // `this.name = value` in a constructor or method declares member `name` of the class;
+    // a same-named field is another facet of that member. Members of an object literal
+    // assigned that way are members of the member. A same-named local stays a local.
+    let source = "function leaf() { return 1 }
+export class Item {
+  run!: () => number
+  constructor() {
+    this.run = () => leaf()
+    this.options = { verbose: true, write: function write() { return 2 } }
+  }
+  reset() { this.count = 0; const count = 1; return count }
+}
+export function use(item: Item) { return [item.run(), item.options.write(), item.count] }
+";
+    let (_directory, index) = workspace_with_manifest(&[("main.ts", source)], module_manifest());
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "main.ts/use",
+        "main.ts/Item/run"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "main.ts/Item/run",
+        "main.ts/leaf"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "main.ts/use",
+        "main.ts/Item/options/write"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Reads,
+        "main.ts/use",
+        "main.ts/Item/count"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Contains,
+        "main.ts/Item",
+        "main.ts/Item/options"
+    ));
+    // A subclass assigning an inherited member through `this` overrides nothing.
+    let derived = "export class Base { router: number = 1 }
+export class Derived extends Base { constructor() { super(); this.router = 2 } }
+";
+    let (_directory, derived) = workspace_with_manifest(&[("main.ts", derived)], module_manifest());
+    assert!(
+        !derived
+            .edges()
+            .edges()
+            .any(|edge| edge.kind() == EdgeKind::Overrides)
+    );
+    // The local `count` is no member.
+    assert!(!index.edges().edges().any(|edge| {
+        edge.kind() == EdgeKind::Reads
+            && edge.from().as_str().ends_with("main.ts/use")
+            && edge.to().as_str().ends_with("main.ts/Item/reset/count")
+    }));
+    let script = "function Manager() {}
+function Axios(config) {
+  this.defaults = config;
+  this.interceptors = { request: new Manager(), response: new Manager() };
+}
+Axios.prototype.request = function request(config) { return this.defaults };
+module.exports = Axios;
+";
+    let (_directory, index) = workspace(&[("Axios.js", script)]);
+    let view = index.symbol_view().expect("view");
+    let identities = view
+        .normalized_graph()
+        .records()
+        .iter()
+        .filter_map(|record| {
+            record
+                .identity()
+                .map(|identity| identity.as_str().to_owned())
+        })
+        .collect::<Vec<_>>();
+    for name in [
+        "Axios.js/Axios/request",
+        "Axios.js/Axios/interceptors",
+        "Axios.js/Axios/interceptors/request",
+        "Axios.js/Axios/defaults",
+    ] {
+        assert!(
+            identities.iter().any(|identity| identity.ends_with(name)),
+            "{name}: {identities:?}"
+        );
+    }
+    let language =
+        rift_protocol::read::Language::from_identity_segment("javascript").expect("language");
+    assert!(
+        index
+            .identity_coverage_complete(&language)
+            .expect("identity coverage")
+    );
+}
+
+#[test]
 fn test_typescript_types_named_like_a_function_take_the_interface() {
     // In TypeScript a function and an interface of one name merge: a type written with that
     // name is the interface, also inside the function itself.

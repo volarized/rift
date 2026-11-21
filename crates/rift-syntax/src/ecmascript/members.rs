@@ -100,6 +100,8 @@ struct MemberFunction<'walk, 'tree> {
     name: Node<'tree>,
     value: Node<'tree>,
     prototype: bool,
+    /// `this.name = value` inside a class method or a constructor function (D38).
+    this_member: bool,
 }
 
 fn member_function<'walk, 'tree>(
@@ -118,6 +120,19 @@ fn member_function<'walk, 'tree>(
         return None;
     }
     let object = kinds.child(left, EcmaScriptGrammarField::Object)?;
+    if object.kind() == "this" {
+        // Any value declares the member; a function value makes it a method.
+        let value = kinds.expression_value(kinds.child(assignment, EcmaScriptGrammarField::Right)?);
+        return Some(MemberFunction {
+            visited,
+            assignment,
+            receiver: object,
+            name,
+            value,
+            prototype: false,
+            this_member: true,
+        });
+    }
     let prototype = object.kind_id() == kinds.member_expression;
     let receiver = if prototype {
         let property = kinds.child(object, EcmaScriptGrammarField::Property)?;
@@ -146,7 +161,56 @@ fn member_function<'walk, 'tree>(
             name,
             value,
             prototype,
+            this_member: false,
         })
+}
+
+/// The declaration `this` names at a `this.name = value` assignment: the class whose
+/// method or constructor holds it, or the function declaration that holds it. Arrow
+/// functions keep the surrounding `this`; any other function binds its own, and then the
+/// assignment declares nothing.
+fn this_owner(
+    function: MemberFunction<'_, '_>,
+    symbols: &BTreeMap<ByteRange, Option<usize>>,
+) -> Option<usize> {
+    let mut ancestor = function.visited.parent();
+    // The shared walk has admitted the source depth before this lookup.
+    while let Some(visited) = ancestor {
+        let element = visited.syntax_element();
+        // An arrow function keeps the surrounding `this`, so the walk passes it.
+        match element.kind() {
+            "method_definition" => {
+                let class = visited
+                    .parent()
+                    .filter(|body| body.syntax_element().kind() == "class_body")?
+                    .parent()?
+                    .syntax_element();
+                let name = class.child_by_field_name("name")?;
+                return symbols
+                    .get(&extract::byte_range(name).ok()?)
+                    .copied()
+                    .flatten();
+            }
+            "function_declaration" => {
+                let name = element.child_by_field_name("name")?;
+                return symbols
+                    .get(&extract::byte_range(name).ok()?)
+                    .copied()
+                    .flatten();
+            }
+            "function_expression"
+            | "function"
+            | "generator_function"
+            | "generator_function_declaration"
+            | "class_static_block"
+            | "program" => {
+                return None;
+            }
+            _ => {}
+        }
+        ancestor = visited.parent();
+    }
+    None
 }
 
 pub(super) fn record<'tree>(
@@ -177,10 +241,16 @@ pub(super) fn record<'tree>(
     // declarations in a callable's source interval, at most once per admitted ancestor depth.
     for function in functions {
         let assignment = function.assignment;
-        let Some(owner) = bindings.owner(function, source) else {
+        let owner = if function.this_member {
+            this_owner(function, &bindings.symbols)
+        } else {
+            bindings.owner(function, source)
+        };
+        let Some(owner) = owner else {
             continue;
         };
-        if (function.prototype && !matches!(symbols[owner].kind, "function" | "class"))
+        if ((function.prototype || function.this_member)
+            && !matches!(symbols[owner].kind, "function" | "class"))
             || !matches!(symbols[owner].kind, "function" | "class" | "variable")
             || !declarations.unique(owner, symbols)
         {
@@ -196,7 +266,9 @@ pub(super) fn record<'tree>(
             source,
             function,
             name,
-            !function.prototype && matches!(symbols[owner].kind, "function" | "class"),
+            !function.prototype
+                && !function.this_member
+                && matches!(symbols[owner].kind, "function" | "class"),
         )?;
         let parent = qualification(rules, function.visited, source, &containers);
         declarations
@@ -397,12 +469,29 @@ fn method_declaration(
     name: &str,
     static_member: bool,
 ) -> Result<Declaration, RiftError> {
-    let body_range = function
-        .value
-        .child_by_field_name("body")
-        .map(extract::byte_range)
-        .transpose()?;
-    let mut kinds = EcmaScriptSymbolKind::Method.kinds();
+    // A function value declares a method; any other value a field, whose body is the
+    // object literal it holds.
+    let callable = rules
+        .kinds
+        .function_values
+        .contains(&function.value.kind_id());
+    let symbol_kind = if callable {
+        EcmaScriptSymbolKind::Method
+    } else {
+        EcmaScriptSymbolKind::Field
+    };
+    let body_range = if callable {
+        function
+            .value
+            .child_by_field_name("body")
+            .map(extract::byte_range)
+            .transpose()?
+    } else if function.value.kind_id() == rules.kinds.object_literal {
+        Some(extract::byte_range(function.value)?)
+    } else {
+        None
+    };
+    let mut kinds = symbol_kind.kinds();
     if static_member {
         kinds.push(SymbolKind::Static);
     }
@@ -410,7 +499,7 @@ fn method_declaration(
         rules.attached_jsdoc(statement(function, rules), source)?;
     Ok(Declaration {
         name: name.to_owned(),
-        kind: EcmaScriptSymbolKind::Method.word(),
+        kind: symbol_kind.word(),
         kinds,
         visibility: None,
         body_range,
