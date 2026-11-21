@@ -31,9 +31,16 @@ pub enum QueryLanguage {
     {
         "query": "ASK { ?symbol a :Symbol; :name 'ReadService' }",
         "language": "sparql"
+    },
+    {
+        "query": "SELECT ?edge { ?caller :calls ?callee . ?edge a :Edge; :from ?caller; :to ?callee }",
+        "include": { "providers": true }
     }
 ]))]
 pub struct QueryParams {
+    /// Attaches the sorted analyses that produced each returned edge.
+    #[serde(default, skip_serializing_if = "QueryInclude::is_empty")]
+    pub include: QueryInclude,
     /// Query text in `language`. A SPARQL query uses `SERVICE :search` for text and regex
     /// retrieval and `SERVICE :flows` for call paths around ranked symbols.
     pub query: String,
@@ -53,6 +60,25 @@ pub struct QueryParams {
     pub revision: Option<crate::revision::Revision>,
 }
 
+/// Optional projections of a query answer. An omitted member is `false`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+#[schemars(example = serde_json::json!({"providers": true}))]
+pub struct QueryInclude {
+    /// Attaches `providers` to merged edge terms and call steps. Explicit SPARQL
+    /// selections and filters on `:provider` retain the stored producer facts.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub providers: bool,
+}
+
+impl QueryInclude {
+    /// Whether the caller requested no projection.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        !self.providers
+    }
+}
+
 /// Most answer rows in one query page.
 pub const QUERY_MAX_RESULTS: u64 = 1000;
 fn default_page() -> u64 {
@@ -65,6 +91,7 @@ impl Default for QueryParams {
     fn default() -> Self {
         Self {
             query: String::new(),
+            include: QueryInclude::default(),
             language: QueryLanguage::default(),
             page: default_page(),
             max_results: default_max_results(),

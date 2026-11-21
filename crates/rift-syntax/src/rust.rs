@@ -763,25 +763,49 @@ const INNER_ATTRIBUTE_ITEM_KIND: &str = "inner_attribute_item";
 
 /// The type an `impl` block implements, without the generic arguments the
 /// block applies to it: methods of `impl<T> Holder<T>` qualify through
-/// `Holder`, the name the `struct` itself declares. A self type the grammar
-/// does not spell as a `generic_type` is already its own name.
-fn implemented_type(syntax_element: Node<'_>) -> Node<'_> {
-    if syntax_element.kind() != GENERIC_TYPE_KIND {
-        return syntax_element;
+/// `Holder`, the name the `struct` itself declares. Grouping parentheses keep
+/// the wrapped type's owner, while a comma keeps a tuple distinct.
+pub(crate) fn implemented_type(mut element: Node<'_>) -> Node<'_> {
+    // Each step removes one type wrapper from the admitted syntax tree.
+    loop {
+        if element.kind() == GENERIC_TYPE_KIND {
+            let Some(inner) = element.child_by_field_name(RustGrammarField::Type.as_str()) else {
+                return element;
+            };
+            element = inner;
+        } else if element.kind() == "tuple_type" {
+            let mut cursor = element.walk();
+            if element
+                .children(&mut cursor)
+                .any(|child| child.kind() == ",")
+            {
+                return element;
+            }
+            let mut children = element
+                .named_children(&mut cursor)
+                .filter(|child| !child.is_extra());
+            let Some(inner) = children.next() else {
+                return element;
+            };
+            if children.next().is_some() {
+                return element;
+            }
+            element = inner;
+        } else {
+            return element;
+        }
     }
-    syntax_element
-        .child_by_field_name(RustGrammarField::Type.as_str())
-        .unwrap_or(syntax_element)
 }
 
-/// References retain mutability and slices retain their element type. Lifetimes
-/// and generic arguments do not change the declaration's logical owner name.
+/// Structural owners retain reference mutability, array lengths and tuple element order.
+/// Lifetimes and generic arguments do not change the declaration's logical owner name.
 fn implemented_type_name(element: Node<'_>, text: &str) -> Option<String> {
     enum Part<'tree> {
         Type(Node<'tree>),
         ArrayEnd(Option<Node<'tree>>),
+        Token(&'static str),
     }
-    static KINDS: OnceLock<([u16; 4], [u16; 3])> = OnceLock::new();
+    static KINDS: OnceLock<([u16; 5], [u16; 3])> = OnceLock::new();
     let (kinds, fields) = KINDS.get_or_init(|| {
         let grammar = rust_grammar();
         (
@@ -790,6 +814,7 @@ fn implemented_type_name(element: Node<'_>, text: &str) -> Option<String> {
                 "reference_type",
                 "mutable_specifier",
                 "array_type",
+                "tuple_type",
             ]
             .map(|kind| grammar.id_for_node_kind(kind, true)),
             ["type", "length", "element"].map(|field| {
@@ -805,6 +830,7 @@ fn implemented_type_name(element: Node<'_>, text: &str) -> Option<String> {
     // Each part visits one type child or closes it, bounded by syntax depth.
     while let Some(part) = pending.pop() {
         match part {
+            Part::Token(token) => name.push_str(token),
             Part::ArrayEnd(length) => {
                 if let Some(length) = length {
                     name.push(';');
@@ -812,28 +838,49 @@ fn implemented_type_name(element: Node<'_>, text: &str) -> Option<String> {
                 }
                 name.push(']');
             }
-            Part::Type(element) => match element.kind_id() {
-                kind if kind == kinds[0] => {
-                    pending.push(Part::Type(element.child_by_field_id(fields[0])?));
-                }
-                kind if kind == kinds[1] => {
-                    name.push('&');
-                    let mut cursor = element.walk();
-                    if element
-                        .named_children(&mut cursor)
-                        .any(|child| child.kind_id() == kinds[2])
-                    {
-                        name.push_str("mut ");
+            Part::Type(element) => {
+                let element = implemented_type(element);
+                match element.kind_id() {
+                    kind if kind == kinds[0] => {
+                        pending.push(Part::Type(element.child_by_field_id(fields[0])?));
                     }
-                    pending.push(Part::Type(element.child_by_field_id(fields[0])?));
+                    kind if kind == kinds[1] => {
+                        name.push('&');
+                        let mut cursor = element.walk();
+                        if element
+                            .named_children(&mut cursor)
+                            .any(|child| child.kind_id() == kinds[2])
+                        {
+                            name.push_str("mut ");
+                        }
+                        pending.push(Part::Type(element.child_by_field_id(fields[0])?));
+                    }
+                    kind if kind == kinds[3] => {
+                        name.push('[');
+                        pending.push(Part::ArrayEnd(element.child_by_field_id(fields[1])));
+                        pending.push(Part::Type(element.child_by_field_id(fields[2])?));
+                    }
+                    kind if kind == kinds[4] => {
+                        let mut cursor = element.walk();
+                        let elements = element
+                            .named_children(&mut cursor)
+                            .filter(|child| !child.is_extra())
+                            .collect::<Vec<_>>();
+                        name.push('(');
+                        pending.push(Part::Token(")"));
+                        if elements.len() == 1 {
+                            pending.push(Part::Token(","));
+                        }
+                        for index in (0..elements.len()).rev() {
+                            pending.push(Part::Type(elements[index]));
+                            if index != 0 {
+                                pending.push(Part::Token(","));
+                            }
+                        }
+                    }
+                    _ => name.extend(text.get(element.byte_range())?.split_whitespace()),
                 }
-                kind if kind == kinds[3] => {
-                    name.push('[');
-                    pending.push(Part::ArrayEnd(element.child_by_field_id(fields[1])));
-                    pending.push(Part::Type(element.child_by_field_id(fields[2])?));
-                }
-                _ => name.extend(text.get(element.byte_range())?.split_whitespace()),
-            },
+            }
         }
     }
     Some(name)

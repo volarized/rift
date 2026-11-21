@@ -47,6 +47,11 @@ impl InventoryEntries {
         read: Arc<InventoryRead>,
         end: Instant,
     ) {
+        // Installed bytes and engine positions belong to this request's capture.
+        // Reread external targets on the next request rather than retain unverified files.
+        if !read.installed.is_empty() || !read.named_package_symbols.is_empty() {
+            return;
+        }
         let maximum = GraphLimits::default().triples_max();
         let charged = read.records.saturating_add(1);
         if charged > maximum {

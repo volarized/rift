@@ -82,3 +82,6 @@ pub use vocabulary::{
     PropertyDefinition, VOCABULARY_NAMESPACE, VocabularyClass, VocabularyProperty,
     VocabularyResource, VocabularyValue,
 };
+
+mod projection;
+pub use projection::QueryAnswerProjection;

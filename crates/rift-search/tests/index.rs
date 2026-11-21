@@ -1034,8 +1034,11 @@ async fn a_full_pass_embeds_a_declaration_the_store_already_holds() -> TestResul
     Ok(())
 }
 
+/// D37: `max_vectors` is a steady state. A pass that embedded every admitted declaration is
+/// ready, the declarations past the bound rank by text alone, and the cut is a warning record
+/// in the log, never a wait an answer reports.
 #[tokio::test]
-async fn a_build_stopping_at_the_vector_bound_reports_preparing() -> TestResult {
+async fn a_build_stopping_at_the_vector_bound_is_ready_and_logs_the_cut() -> TestResult {
     let root = workspace()?;
     let bounded = SearchIndexLimits::builder(lexical_limits())
         .batch_declarations(2)
@@ -1044,16 +1047,143 @@ async fn a_build_stopping_at_the_vector_bound_reports_preparing() -> TestResult 
         .build();
     let index = prepared(root.path(), bounded).await?;
     let fixture = two()?;
+    let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+        .capture("warn")
+        .install()?;
     whole_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
     assert_eq!(
         index.pass_readiness(),
-        VectorReadiness::Preparing {
-            prepared: 1,
-            total: 2
-        },
-        "stopping at the bound is reported, not swallowed"
+        VectorReadiness::Ready,
+        "a corpus above the bound completes over the admitted declarations"
     );
     assert_eq!(stored(root.path(), "model").await?.len(), 1);
+    let ranking = ranked(&index, "load", 10).await?;
+    assert_eq!(
+        ranking.readiness(),
+        VectorReadiness::Ready,
+        "the read reports no wait, so no answer carries a warning for the cut"
+    );
+    let cuts = vector_cut_records(&mut drain)?;
+    assert_eq!(
+        cuts,
+        [serde_json::json!({"max_vectors": 1, "described": 2, "admitted": 1, "left_out": 1})]
+    );
+    Ok(())
+}
+
+/// A numeric log field, which the record stores as its rendered text.
+fn number(field: &serde_json::Value) -> u64 {
+    field
+        .as_u64()
+        .or_else(|| field.as_str().and_then(|text| text.parse().ok()))
+        .unwrap_or_else(|| panic!("a numeric field: {field}"))
+}
+
+/// The warning records naming a `max_vectors` cut, each reduced to its counts.
+fn vector_cut_records(drain: &mut rift_tracing::LogDrain) -> Fallible<Vec<serde_json::Value>> {
+    let mut cuts = Vec::new();
+    for record in drain.queued_records() {
+        if record.message() != "declarations past max_vectors rank by text alone" {
+            continue;
+        }
+        assert_eq!(record.level(), "warn", "{record:?}");
+        let fields: serde_json::Value = serde_json::from_str(record.fields())?;
+        assert_eq!(fields["bound"], "search.vector.max_vectors", "{fields}");
+        cuts.push(serde_json::json!({
+            "max_vectors": number(&fields["max_vectors"]),
+            "described": number(&fields["described"]),
+            "admitted": number(&fields["admitted"]),
+            "left_out": number(&fields["left_out"]),
+        }));
+    }
+    Ok(cuts)
+}
+
+/// `count` symbol documents, each with the declaration it was described from.
+struct ManyFixture {
+    documents: Vec<IndexDocument>,
+    names: Vec<String>,
+}
+
+impl ManyFixture {
+    fn of(count: usize) -> Fallible<Self> {
+        let names: Vec<String> = (0..count).map(|index| format!("load_{index}")).collect();
+        let documents = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                symbol(
+                    &format!("unit{index}"),
+                    &format!("src/unit{index}.rs"),
+                    name,
+                    name,
+                )
+            })
+            .collect::<Fallible<Vec<_>>>()?;
+        Ok(Self { documents, names })
+    }
+
+    fn declarations(&self) -> Vec<Declaration<'_>> {
+        self.names
+            .iter()
+            .map(|name| Declaration::new("fn", name).source(name))
+            .collect()
+    }
+}
+
+/// The vector bound at its edges: below and at it every declaration is admitted and nothing is
+/// logged; above it the pass admits `max_vectors`, is ready, and logs one record however many
+/// declarations it left out.
+#[tokio::test]
+async fn the_vector_bound_admits_up_to_its_value_and_logs_one_record_above_it() -> TestResult {
+    for (count, max_vectors, expected) in [
+        (2_usize, 3_u64, None),
+        (3, 3, None),
+        (4, 3, Some((3_u64, 1_u64))),
+        (40, 3, Some((3, 37))),
+    ] {
+        let root = workspace()?;
+        let bounded = SearchIndexLimits::builder(lexical_limits())
+            .batch_declarations(8)
+            .max_tokens(16)
+            .max_vectors(max_vectors)
+            .build();
+        let index = prepared(root.path(), bounded).await?;
+        let fixture = ManyFixture::of(count)?;
+        let declarations = fixture.declarations();
+        let units = described(&fixture.documents, &declarations);
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("warn")
+            .install()?;
+        whole_pass(&index, &fixture.documents, &units, REVISION).await?;
+        assert_eq!(
+            index.pass_readiness(),
+            VectorReadiness::Ready,
+            "described={count} max_vectors={max_vectors}"
+        );
+        let admitted = expected.map_or(Ok(count), |(admitted, _)| usize::try_from(admitted))?;
+        assert_eq!(stored(root.path(), "model").await?.len(), admitted);
+        let cuts = vector_cut_records(&mut drain)?;
+        let wanted: Vec<serde_json::Value> = expected
+            .map(|(admitted, left_out)| {
+                serde_json::json!({
+                    "max_vectors": max_vectors,
+                    "described": count,
+                    "admitted": admitted,
+                    "left_out": left_out,
+                })
+            })
+            .into_iter()
+            .collect();
+        assert_eq!(cuts, wanted, "described={count} max_vectors={max_vectors}");
+
+        incremental_pass(&index, &fixture.documents, &units, "rev-two").await?;
+        assert_eq!(
+            vector_cut_records(&mut drain)?.len(),
+            wanted.len(),
+            "each publication's pass logs the cut once: described={count}"
+        );
+    }
     Ok(())
 }
 

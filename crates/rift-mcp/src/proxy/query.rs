@@ -21,7 +21,9 @@ use rmcp::model::{CallToolRequestParams, CallToolResponse};
 
 use super::{RiftProxy, identity};
 use crate::output::{QueryDisplay, QueryOutput};
-use crate::server::candidates::{QueryPageOptions, collect_retrieval, query_page};
+use crate::server::candidates::{
+    QueryPageOptions, bound_combined_rows, collect_retrieval, query_page,
+};
 use crate::validation::ConfigurationState;
 
 const QUERY_WORKERS: usize = 2;
@@ -273,7 +275,7 @@ impl RiftProxy {
             let key = answer_key(&query, params.language, requested)?;
             if let Some((view, bytes)) = self.query_routes.retained(&key, SystemTime::now()) {
                 return self
-                    .retained_page(view, bytes, paging, requested.clone())
+                    .retained_page(view, bytes, (paging, params.include), requested.clone())
                     .await;
             }
         }
@@ -282,18 +284,7 @@ impl RiftProxy {
             Err(response) => return Ok(*response),
         };
         let revision = combined_revision(selected.iter().map(|result| result.revision.as_ref()))?;
-        if let Some(requested) = &params.revision
-            && revision.as_ref() != Some(requested)
-        {
-            return errors::server::read_revision_unserved()
-                .revision(requested.to_string())
-                .served(
-                    revision
-                        .as_ref()
-                        .map_or_else(|| "no revision".to_owned(), ToString::to_string),
-                )
-                .fail();
-        }
+        served_revision(params.revision.as_ref(), revision.as_ref())?;
         let key = revision
             .as_ref()
             .map(|revision| answer_key(&query, params.language, revision))
@@ -317,7 +308,9 @@ impl RiftProxy {
                         }
                     }
                 }
-                let answer: QueryAnswer = dataset.build().evaluate(&query, &cancellation)?.into();
+                let dataset = dataset.build();
+                let mut answer: QueryAnswer = dataset.evaluate(&query, &cancellation)?.into();
+                dataset.annotate_providers(&mut answer)?;
                 let view = proxy_view(selected.iter().filter_map(|result| result.view.as_ref()))?;
                 if cancellation.is_cancelled() {
                     return errors::search::query_cancelled().fail();
@@ -339,6 +332,7 @@ impl RiftProxy {
                     &view,
                     &answer,
                     QueryPageOptions {
+                        include: params.include,
                         configuration: &configuration,
                         page: params.page,
                         max_results: params.max_results,
@@ -378,7 +372,7 @@ impl RiftProxy {
                 })
                 .await
             };
-            let result = match producer {
+            let mut result = match producer {
                 Ok(Ok(result)) => result,
                 Ok(Err(reason)) => {
                     return Ok(Err(Box::new(render(QueryReadResult::Unavailable(reason)))));
@@ -386,6 +380,9 @@ impl RiftProxy {
                 Err(ProducerFailure::Forwarded(response)) => return Ok(Err(response)),
                 Err(ProducerFailure::Internal(error)) => return Err(error),
             };
+            // Each service's rows are already within the solution bound; the services
+            // together share the byte bound, and a cut keeps the rows that fit.
+            bound_combined_rows(&mut result, 0, bytes_left, limits, request)?;
             let bytes = super::encode_bounded(&result, bytes_left)
                 .map_err(|_| query_failure("combined retrieval exceeds its byte bound"))?;
             bytes_left -= bytes.len();
@@ -399,7 +396,7 @@ impl RiftProxy {
         &self,
         view: CapturedView,
         bytes: Arc<[u8]>,
-        paging: (u64, u64),
+        (paging, include): ((u64, u64), rift_protocol::query::QueryInclude),
         revision: Revision,
     ) -> Result<Response, RiftError> {
         let root = Arc::clone(&self.root);
@@ -415,6 +412,7 @@ impl RiftProxy {
                     &view,
                     &answer,
                     QueryPageOptions {
+                        include,
                         configuration: &configuration,
                         page: paging.0,
                         max_results: paging.1,
@@ -459,14 +457,11 @@ impl RiftProxy {
                 Ok(result) => result,
                 Err(reason) => return Ok(Err(reason)),
             };
+            let stopped =
+                bound_combined_rows(&mut result, results.len(), bytes_left, limits, request)?;
             let bytes = super::encode_bounded(&result, bytes_left)
                 .map_err(|_| query_failure("combined patterns exceed their byte bound"))?;
             bytes_left -= bytes.len();
-            if result.results.len().saturating_add(results.len()) > limits.solutions_max() {
-                return Ok(Err(unavailable_read(
-                    SymbolUnavailableReason::InsufficientCoverage,
-                )));
-            }
             results.append(&mut result.results);
             for warning in result.warnings {
                 if !warnings.contains(&warning) {
@@ -475,6 +470,9 @@ impl RiftProxy {
             }
             views.extend(result.view);
             revisions.push(result.revision);
+            if stopped {
+                break;
+            }
         }
         crate::global::order_search_hits(&mut results, request.order);
         let limit = if request.max_results.is_some() || request.page != 1 {
@@ -719,6 +717,22 @@ impl Drop for CancelQuery {
     fn drop(&mut self) {
         self.0.cancel();
     }
+}
+
+/// Refuses a later page whose requested revision is not the one the producers serve.
+fn served_revision(
+    requested: Option<&Revision>,
+    revision: Option<&Revision>,
+) -> Result<(), RiftError> {
+    if let Some(requested) = requested
+        && revision != Some(requested)
+    {
+        return errors::server::read_revision_unserved()
+            .revision(requested.to_string())
+            .served(revision.map_or_else(|| "no revision".to_owned(), ToString::to_string))
+            .fail();
+    }
+    Ok(())
 }
 
 #[cfg(test)]

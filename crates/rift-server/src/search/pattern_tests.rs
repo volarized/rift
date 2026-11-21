@@ -848,10 +848,11 @@ fn large_tree() -> TestResult<TempDir> {
     Ok(directory)
 }
 
-/// Under `split`, a file past the parse bound answers a pattern from its held text, and
-/// every answer names it as unparsed.
+/// Under `split`, a file past the parse bound answers a pattern from its held text. A bound
+/// left its declarations out, so no answer names it (D37); a request that names the file
+/// itself still gets the `large_file_unparsed` warning that says why it holds no declaration.
 #[test]
-fn split_verifies_unparsed_text_and_names_it_on_every_answer() -> TestResult {
+fn split_verifies_unparsed_text_and_names_it_only_where_selected() -> TestResult {
     let directory = large_tree()?;
     let service = service_under(directory.path(), LargeFileStrategy::Split)?;
     let result = service.search(
@@ -863,13 +864,30 @@ fn split_verifies_unparsed_text_and_names_it_on_every_answer() -> TestResult {
         .map(|(path, ..)| path)
         .collect();
     assert_eq!(paths, ["huge.rs", "wide.rs"]);
-    let unparsed: Vec<&ReadWarning> = result
-        .warnings
-        .iter()
-        .filter(|warning| matches!(warning, ReadWarning::LargeFileUnparsed { .. }))
-        .collect();
-    let [ReadWarning::LargeFileUnparsed { files, detail }] = unparsed.as_slice() else {
-        return Err(format!("one warning names the unparsed file: {:?}", result.warnings).into());
+    let omitted = |warning: &ReadWarning| {
+        matches!(
+            warning,
+            ReadWarning::LargeFileUnparsed { .. } | ReadWarning::SourceUnavailable { .. }
+        )
+    };
+    assert!(
+        !result.warnings.iter().any(omitted),
+        "{:?}",
+        result.warnings
+    );
+    let symbol = service.get_symbol(&serde_json::from_value(json!({"name": "HUGE"}))?)?;
+    assert!(
+        symbol.hits.is_empty(),
+        "no declaration of huge.rs was extracted"
+    );
+    assert!(
+        !symbol.warnings.iter().any(omitted),
+        "{:?}",
+        symbol.warnings
+    );
+    let selected = crate::read::source_warnings(service.index().warnings());
+    let [ReadWarning::LargeFileUnparsed { files, detail }] = selected.as_slice() else {
+        return Err(format!("one warning names the unparsed file: {selected:?}").into());
     };
     assert_eq!(
         files,
@@ -878,19 +896,6 @@ fn split_verifies_unparsed_text_and_names_it_on_every_answer() -> TestResult {
         )]
     );
     assert!(detail.contains("max_file"), "{detail}");
-    let symbol = service.get_symbol(&serde_json::from_value(json!({"name": "HUGE"}))?)?;
-    assert!(
-        symbol.hits.is_empty(),
-        "no declaration of huge.rs was extracted"
-    );
-    assert!(
-        symbol
-            .warnings
-            .iter()
-            .any(|warning| matches!(warning, ReadWarning::LargeFileUnparsed { .. })),
-        "{:?}",
-        symbol.warnings
-    );
     Ok(())
 }
 

@@ -5,6 +5,13 @@ use super::{File, Target, Work};
 use rift_syntax::{StaticBindingKind, SyntaxExportKind};
 use std::collections::BTreeMap;
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum ExportSlot<'source> {
+    Default,
+    Named(&'source str),
+    Unknown,
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum ResolvedExport<'source> {
     Declaration {
@@ -63,7 +70,41 @@ impl<'source> Exports<'_, 'source> {
         role: rift_core::ReferenceRole,
         work: &mut Work,
     ) -> Option<ResolvedExport<'source>> {
-        let (name, member) = split_name(name);
+        self.resolve_slot(file, ExportSlot::Named(name), mode, role, work)
+    }
+
+    pub(super) fn resolve_module_value(
+        &self,
+        from: &File<'source>,
+        module: &str,
+        role: rift_core::ReferenceRole,
+        work: &mut Work,
+    ) -> Option<ResolvedExport<'source>> {
+        self.resolve_slot(
+            self.imported(from, module, work)?,
+            ExportSlot::Default,
+            ModuleMode::CommonJs,
+            role,
+            work,
+        )
+    }
+
+    fn resolve_slot(
+        &self,
+        file: &File<'source>,
+        slot: ExportSlot<'source>,
+        mode: ModuleMode,
+        role: rift_core::ReferenceRole,
+        work: &mut Work,
+    ) -> Option<ResolvedExport<'source>> {
+        let (name, member) = match slot {
+            ExportSlot::Named(name) => {
+                let (head, tail) = split_name(name);
+                (ExportSlot::Named(head), tail)
+            }
+            ExportSlot::Default => (ExportSlot::Default, None),
+            ExportSlot::Unknown => return None,
+        };
         let mut pending = vec![(file, name, member)];
         let mut visited = std::collections::BTreeSet::new();
         let mut found: Option<ResolvedExport<'source>> = None;
@@ -79,7 +120,7 @@ impl<'source> Exports<'_, 'source> {
             }
             let (direct, stars) = export_candidates(file, name, mode, role, work)?;
             let Some(export) = direct else {
-                if name != "default" {
+                if mode == ModuleMode::CommonJs || name != ExportSlot::Named("default") {
                     pending.extend(stars.into_iter().filter_map(|module| {
                         Some((self.imported(file, module, work)?, name, member))
                     }));
@@ -94,7 +135,7 @@ impl<'source> Exports<'_, 'source> {
                 }),
                 Export::Reexport { module, name } => {
                     if let Some(imported) = self.imported(file, module, work) {
-                        pending.push((imported, name, member));
+                        pending.push((imported, ExportSlot::Named(name), member));
                     }
                     None
                 }
@@ -102,7 +143,7 @@ impl<'source> Exports<'_, 'source> {
                     let imported = self.imported(file, module, work)?;
                     if let Some(member) = member {
                         let (name, tail) = split_name(member);
-                        pending.push((imported, name, tail));
+                        pending.push((imported, ExportSlot::Named(name), tail));
                         None
                     } else {
                         Some(ResolvedExport::Module(imported.document))
@@ -128,7 +169,7 @@ impl<'source> Exports<'_, 'source> {
                 actual == ModuleMode::CommonJs
                     || super::javascript::typescript_commonjs(file.document.path.as_str())
             }
-            ModuleMode::Unknown => false,
+            ModuleMode::Unknown | ModuleMode::NodeDefault => false,
         }
     }
 
@@ -154,6 +195,28 @@ impl<'source> Exports<'_, 'source> {
             StaticBindingKind::JavaScriptEdgeNamespace { module } => Some(Export::Module {
                 module: file.text(module)?,
             }),
+            // A required name exported again is a reexport of that module's export.
+            StaticBindingKind::JavaScriptRequire {
+                require,
+                module,
+                export,
+            } if super::javascript::builtin_commonjs_name(
+                file,
+                self.modes,
+                "require",
+                require.start,
+                work,
+            ) =>
+            {
+                let module = file.text(module)?;
+                Some(match export {
+                    Some(export) => Export::Reexport {
+                        module,
+                        name: file.text(export)?,
+                    },
+                    None => Export::Module { module },
+                })
+            }
             _ => None,
         }
     }
@@ -221,6 +284,23 @@ pub(super) fn module_file<'index, 'source>(
     files: &'index BTreeMap<&'source str, File<'source>>,
     path: &str,
 ) -> Option<&'index File<'source>> {
+    if let Some(directory) = path.strip_suffix('/') {
+        // A directory specifier names only the directory's index module.
+        let mut found = None;
+        for name in ["index.ts", "index.tsx", "index.js"] {
+            let candidate = if directory.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{directory}/{name}")
+            };
+            if let Some(file) = files.get(candidate.as_str())
+                && found.replace(file).is_some()
+            {
+                return None;
+            }
+        }
+        return found;
+    }
     if let Some(file) = files.get(path).filter(|file| {
         matches!(
             file.document.facts.language().name.as_str(),
@@ -277,16 +357,13 @@ type ExportCandidates<'source> = (Option<Export<'source>>, Vec<&'source str>);
 
 fn export_candidates<'source>(
     file: &File<'source>,
-    name: &'source str,
+    name: ExportSlot<'source>,
     mode: ModuleMode,
     role: rift_core::ReferenceRole,
     work: &mut Work,
 ) -> Option<ExportCandidates<'source>> {
     let mut found: Option<Export<'source>> = None;
     let mut stars = Vec::new();
-    let (head, _tail) = name
-        .split_once('.')
-        .map_or((name, None), |(head, tail)| (head, Some(tail)));
     for binding in file.document.facts.export_bindings()? {
         if !work.charge() {
             return None;
@@ -302,41 +379,265 @@ fn export_candidates<'source>(
             continue;
         }
         let exported = match binding.kind {
-            SyntaxExportKind::Named | SyntaxExportKind::Namespace => {
-                binding.exported.and_then(|range| file.text(range))
-            }
-            SyntaxExportKind::Default => Some("default"),
+            SyntaxExportKind::Named | SyntaxExportKind::Namespace => binding
+                .exported
+                .and_then(|range| file.text(range))
+                .map(ExportSlot::Named),
+            SyntaxExportKind::Default if mode == ModuleMode::CommonJs => Some(ExportSlot::Default),
+            SyntaxExportKind::Default => Some(ExportSlot::Named("default")),
             SyntaxExportKind::All => None,
         };
-        if exported != Some(head) {
+        if exported != Some(name) {
             continue;
         }
-        let target = file.javascript_export_candidate(binding, role, work)?;
-        if found
-            .as_ref()
-            .is_some_and(|previous| previous.key(file) != target.key(file))
+        if mode == ModuleMode::CommonJs
+            && role == rift_core::ReferenceRole::Call
+            && !file.javascript_export_is_stable(binding)
         {
             return None;
         }
-        found = Some(target);
+        let target = file.javascript_export_candidate(binding, role, work)?;
+        found = Some(match found {
+            Some(previous) => previous.merge(target, file)?,
+            None => target,
+        });
     }
     Some((found, stars))
 }
 
 impl<'source> Export<'source> {
-    fn key(&self, file: &File<'source>) -> Option<(Option<&'source str>, &'source str)> {
+    fn merge(self, incoming: Self, file: &File<'source>) -> Option<Self> {
+        if self.key(file)? == incoming.key(file)? {
+            return Some(incoming);
+        }
+        let (Self::Declaration(previous), Self::Declaration(next)) = (&self, &incoming) else {
+            return None;
+        };
+        let previous = file.target_at(*previous)?.symbol;
+        let next = file.target_at(*next)?.symbol;
+        if previous.qualified_name != next.qualified_name
+            || [previous, next].iter().any(|symbol| {
+                symbol.kind != "function"
+                    || symbol.syntax_element_kind == Some("assignment_expression")
+            })
+            || (previous.body_range.is_some() && next.body_range.is_some())
+        {
+            return None;
+        }
+        // Retain the implementation so any later second body remains ambiguous.
+        Some(if previous.body_range.is_some() {
+            self
+        } else {
+            incoming
+        })
+    }
+
+    fn key(
+        &self,
+        file: &File<'source>,
+    ) -> Option<(
+        Option<&'source str>,
+        &'source str,
+        Option<rift_syntax::ByteRange>,
+    )> {
         match self {
-            Self::Local { name, .. } => Some((None, name)),
-            Self::Declaration(range) => {
-                Some((None, file.target_at(*range)?.symbol.qualified_name.as_str()))
-            }
-            Self::Reexport { module, name } => Some((Some(module), name)),
-            Self::Module { module } => Some((Some(module), "*")),
+            Self::Local { name, .. } => Some((None, name, None)),
+            Self::Declaration(range) => Some((
+                None,
+                file.target_at(*range)?.symbol.qualified_name.as_str(),
+                Some(*range),
+            )),
+            Self::Reexport { module, name } => Some((Some(module), name, None)),
+            Self::Module { module } => Some((Some(module), "*", None)),
         }
     }
 }
 
 impl<'source> File<'source> {
+    pub(super) fn index_javascript_members(&mut self, work: &mut Work) -> Option<()> {
+        if self.facts.members().is_empty() {
+            return Some(());
+        }
+        for member in self.facts.members() {
+            if !work.charge() {
+                return None;
+            }
+            self.members
+                .entry(member.range)
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(member));
+        }
+        for &range in self.facts.assignments() {
+            if !work.charge() {
+                return None;
+            }
+            if self.text(range)?.contains('\\') {
+                self.unknown_member_writes.insert(None);
+            }
+            let Some(member) = self.members.get(&range).copied().flatten() else {
+                continue;
+            };
+            self.index_javascript_object_write(member, work);
+            let Some((receiver, slot)) = self.javascript_export_slot(member) else {
+                continue;
+            };
+            // A key bound to a `Symbol(..)` value of this file names no export (D41).
+            if slot == ExportSlot::Unknown && self.javascript_symbol_key(member, work) {
+                continue;
+            }
+            if matches!(
+                self.binding(self.text(receiver)?, receiver.start, |_| true, work),
+                super::Binding::Missing
+            ) {
+                self.export_writes
+                    .entry(slot)
+                    .and_modify(|start| {
+                        if *start != Some(range.start) {
+                            *start = None;
+                        }
+                    })
+                    .or_insert(Some(range.start));
+            }
+        }
+        Some(())
+    }
+
+    fn javascript_export_slot(
+        &self,
+        member: &rift_syntax::StaticMember,
+    ) -> Option<(rift_syntax::ByteRange, ExportSlot<'source>)> {
+        let receiver = self.text(member.receiver)?;
+        let name = member.member.and_then(|range| self.text(range));
+        let slot = match receiver {
+            "exports" => name.map_or(ExportSlot::Unknown, ExportSlot::Named),
+            "module" => match name {
+                Some("exports") => ExportSlot::Default,
+                None => ExportSlot::Unknown,
+                _ => return None,
+            },
+            _ => return self.javascript_nested_export_slot(member),
+        };
+        Some((member.receiver, slot))
+    }
+
+    /// Whether `member` is `exports[key]` or `module.exports[key]` with `key` a `const`
+    /// of this file bound to a `Symbol(..)` value: such a key is no export name. Only a
+    /// `const` declaring that one name counts.
+    fn javascript_symbol_key(&self, member: &rift_syntax::StaticMember, work: &mut Work) -> bool {
+        if member.member.is_some()
+            || !matches!(
+                self.text(member.receiver),
+                Some("exports" | "module.exports")
+            )
+        {
+            return false;
+        }
+        let key = self
+            .text(rift_syntax::ByteRange {
+                start: member.receiver.end,
+                end: member.range.end,
+            })
+            .map(str::trim)
+            .and_then(|key| key.strip_prefix('['))
+            .and_then(|key| key.strip_suffix(']'))
+            .map(str::trim);
+        let Some(key) = key.filter(|key| {
+            !key.is_empty()
+                && key
+                    .chars()
+                    .all(|character| character.is_alphanumeric() || matches!(character, '_' | '$'))
+        }) else {
+            return false;
+        };
+        let super::Binding::Found(binding) = self.binding(key, member.range.start, |_| true, work)
+        else {
+            return false;
+        };
+        self.target_at(binding.name).is_some_and(|target| {
+            target.symbol.kind == "variable"
+                && self
+                    .text(rift_syntax::ByteRange {
+                        start: 0,
+                        end: target.symbol.item_range.start,
+                    })
+                    .is_some_and(|before| before.trim_end().ends_with("const"))
+                && target
+                    .symbol
+                    .body_range
+                    .and_then(|range| self.text(range))
+                    .is_some_and(|value| value.trim_start().starts_with("Symbol("))
+        })
+    }
+
+    fn javascript_nested_export_slot(
+        &self,
+        member: &rift_syntax::StaticMember,
+    ) -> Option<(rift_syntax::ByteRange, ExportSlot<'source>)> {
+        let parent = self.members.get(&member.receiver).copied().flatten()?;
+        if self.text(parent.receiver)? != "module" {
+            return None;
+        }
+        let name = parent.member.and_then(|range| self.text(range));
+        let slot = match name {
+            Some("exports") => member
+                .member
+                .and_then(|range| self.text(range))
+                .map_or(ExportSlot::Unknown, ExportSlot::Named),
+            None => ExportSlot::Unknown,
+            _ => return None,
+        };
+        Some((parent.receiver, slot))
+    }
+
+    fn javascript_export_is_stable(&self, binding: &rift_syntax::SyntaxExportBinding) -> bool {
+        if self.unknown_member_writes.contains(&None) {
+            return false;
+        }
+        let slot = match binding.kind {
+            SyntaxExportKind::Default => ExportSlot::Default,
+            SyntaxExportKind::Named => match binding.exported.and_then(|range| self.text(range)) {
+                Some(name) => ExportSlot::Named(name),
+                None => return false,
+            },
+            SyntaxExportKind::All | SyntaxExportKind::Namespace => return true,
+        };
+        let replaced = |slot: &ExportSlot<'_>| {
+            self.export_writes
+                .get(slot)
+                .is_some_and(|start| *start != Some(binding.range.start))
+        };
+        if replaced(&ExportSlot::Unknown) || replaced(&slot) {
+            return false;
+        }
+        // `module.exports = value` followed by `module.exports.name = ...` at the top
+        // level adds `name` to that value: the earlier write does not replace the later.
+        !replaced(&ExportSlot::Default)
+            || (slot != ExportSlot::Default
+                && binding.container.is_none()
+                && self
+                    .export_writes
+                    .get(&ExportSlot::Default)
+                    .is_some_and(|start| {
+                        start.is_some_and(|start| {
+                            start < binding.range.start && self.top_level_default_export(start)
+                        })
+                    }))
+    }
+
+    /// Whether a default export binding outside every declaration starts at `start`.
+    fn top_level_default_export(&self, start: u64) -> bool {
+        self.document
+            .facts
+            .export_bindings()
+            .unwrap_or_default()
+            .iter()
+            .any(|binding| {
+                binding.kind == SyntaxExportKind::Default
+                    && binding.container.is_none()
+                    && binding.range.start == start
+            })
+    }
+
     fn javascript_export_role(
         &self,
         binding: &rift_syntax::SyntaxExportBinding,
@@ -348,7 +649,8 @@ impl<'source> File<'source> {
         let declaration = binding.local.and_then(|local| self.target_at(local));
         match declaration.map(|target| target.symbol.kind) {
             Some("interface" | "type_alias") => role == rift_core::ReferenceRole::Type,
-            Some("variable") => role != rift_core::ReferenceRole::Type,
+            // A value declaration is never a type; an interface of the same name is.
+            Some("variable" | "function") => role != rift_core::ReferenceRole::Type,
             _ => true,
         }
     }
@@ -381,7 +683,7 @@ impl<'source> File<'source> {
                 || shorthand
                 || self.blocked(local.start, work)
                 || role == rift_core::ReferenceRole::Call
-                    && self.javascript_reassigned(local_name, None)) =>
+                    && self.javascript_local_written(local, local_name, work)) =>
             {
                 Some(Export::Declaration(local))
             }
@@ -389,6 +691,26 @@ impl<'source> File<'source> {
                 name: local_name,
                 position: local.start,
             }),
+        }
+    }
+}
+
+impl File<'_> {
+    /// Whether the exported local declaration `local` is written with a value that may not
+    /// be callable. A name without its own binding falls back to any write of the name.
+    fn javascript_local_written(
+        &self,
+        local: rift_syntax::ByteRange,
+        name: &str,
+        work: &mut Work,
+    ) -> bool {
+        match self
+            .by_name
+            .get(name)
+            .and_then(|bindings| bindings.iter().find(|binding| binding.name == local))
+        {
+            Some(binding) => self.javascript_binding_written(binding, work),
+            None => self.javascript_reassigned(name, None),
         }
     }
 }
@@ -405,7 +727,7 @@ fn matches_export_form(source: &str, mode: ModuleMode) -> bool {
         ModuleMode::CommonJs => {
             source.starts_with("module.exports") || source.starts_with("exports.")
         }
-        ModuleMode::Unknown => false,
+        ModuleMode::Unknown | ModuleMode::NodeDefault => false,
     }
 }
 
@@ -417,15 +739,18 @@ pub(super) fn literal_contents(source: &str) -> Option<&str> {
     source.strip_prefix(quote)?.strip_suffix(quote)
 }
 
+/// The project path a relative specifier names from `from`. A specifier ending in `/`,
+/// and `.` or `..` alone, names a directory: the path then ends in `/`.
 pub(super) fn relative_path(from: &str, module: &str, work: &mut Work) -> Option<String> {
-    let relative = module.starts_with("./") || module.starts_with("../");
-    if !relative || module.contains(['\\', '?', '#', '%']) {
+    let directory = module.ends_with('/') || matches!(module, "." | "..");
+    let relative = module.starts_with("./") || module.starts_with("../") || directory;
+    if !relative || module.contains(['\\', '?', '#', '%']) || module.starts_with('/') {
         return None;
     }
     let mut segments = from
         .rsplit_once('/')
         .map_or_else(Vec::new, |(directory, _)| directory.split('/').collect());
-    for segment in module.split('/') {
+    for segment in module.strip_suffix('/').unwrap_or(module).split('/') {
         if !work.charge() {
             return None;
         }
@@ -438,5 +763,9 @@ pub(super) fn relative_path(from: &str, module: &str, work: &mut Work) -> Option
             name => segments.push(name),
         }
     }
-    Some(segments.join("/"))
+    let mut path = segments.join("/");
+    if directory {
+        path.push('/');
+    }
+    Some(path)
 }

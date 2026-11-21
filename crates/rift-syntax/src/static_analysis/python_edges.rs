@@ -46,6 +46,10 @@ pub(super) struct EdgePythonKinds {
     right: u16,
     guards: guards::TypeGuards,
     return_type: u16,
+    loops: [u16; 2],
+    /// Compound statements and clauses a class body may define methods under.
+    conditional: [u16; 6],
+    block: u16,
 }
 
 pub(super) fn edge_python_kinds() -> &'static EdgePythonKinds {
@@ -110,6 +114,16 @@ pub(super) fn edge_python_kinds() -> &'static EdgePythonKinds {
             right: field("right"),
             guards: guards::TypeGuards::new(&grammar),
             return_type: field("return_type"),
+            loops: [id("for_statement"), id("while_statement")],
+            conditional: [
+                id("if_statement"),
+                id("elif_clause"),
+                id("else_clause"),
+                id("try_statement"),
+                id("except_clause"),
+                id("finally_clause"),
+            ],
+            block: id("block"),
         }
     })
 }
@@ -123,14 +137,33 @@ impl EdgePythonKinds {
     ) -> Result<(), RiftError> {
         let syntax_element = visited.syntax_element();
         let id = syntax_element.kind_id();
+        if self.loops.contains(&id) {
+            facts.loops.push(byte_range(syntax_element)?);
+        } else if self.scopes[3..].contains(&id) {
+            facts.expression_scopes.push(byte_range(syntax_element)?);
+        }
         if id == self.call {
             if let Some(callee) = syntax_element.child_by_field_id(self.function) {
                 facts
                     .calls
                     .push(call(syntax_element, callee, self.edge_callee(callee)?)?);
             }
+        } else if id == self.decorator {
+            // A decorator written without arguments is called with the decorated definition.
+            if let Some(expression) = syntax_element
+                .named_children(&mut syntax_element.walk())
+                .find(|element| !element.is_extra())
+                .filter(|expression| {
+                    [self.identifier, self.attribute].contains(&expression.kind_id())
+                })
+            {
+                facts
+                    .calls
+                    .push(call(expression, expression, self.edge_callee(expression)?)?);
+            }
         } else if self.definitions.contains(&id) {
             self.edge_definition(visited, facts)?;
+            self.edge_type_parameters(syntax_element, facts)?;
         } else if self.imports.contains(&id) {
             self.edge_import(visited, facts)?;
         } else if self.parameters.contains(&id) {
@@ -166,9 +199,60 @@ impl EdgePythonKinds {
             && let Some(scope) = edge_enclosing(visited, &self.scopes)
         {
             facts.unsupported_bindings.push(byte_range(scope)?);
+            if let Some(module) = visited
+                .parent()
+                .and_then(|parent| parent.syntax_element().child_by_field_id(self.module))
+            {
+                facts.bindings.push(binding(
+                    syntax_element,
+                    scope,
+                    byte_range(scope)?.start,
+                    StaticBindingKind::PythonImport {
+                        module: byte_range(module)?,
+                        export: None,
+                    },
+                )?);
+            }
         }
         self.guards.record(visited, source, facts)?;
         self.edge_reference(visited, source, facts)?;
+        Ok(())
+    }
+
+    fn edge_type_parameters(
+        &self,
+        definition: Node<'_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let Some(parameters) = definition.child_by_field_name("type_parameters") else {
+            return Ok(());
+        };
+        let mut cursor = parameters.walk();
+        for parameter in parameters.named_children(&mut cursor) {
+            let mut candidate = Some(parameter);
+            let mut name = None;
+            // A declared name sits below `type`, `constrained_type` or `splat_type` wrappers.
+            for _ in 0..4 {
+                let Some(element) = candidate else {
+                    break;
+                };
+                if element.kind_id() == self.identifier {
+                    name = Some(element);
+                    break;
+                }
+                candidate = element.named_child(0);
+            }
+            if let Some(name) = name {
+                facts.bindings.push(binding(
+                    name,
+                    definition,
+                    byte_range(definition)?.start,
+                    StaticBindingKind::Shadow,
+                )?);
+            } else {
+                facts.unsupported_bindings.push(byte_range(definition)?);
+            }
+        }
         Ok(())
     }
 
@@ -207,6 +291,10 @@ impl EdgePythonKinds {
                 Some(annotation) if syntax_element.kind_id() == self.definitions[0] => {
                     StaticBindingKind::PythonFunction {
                         annotation: byte_range(annotation)?,
+                        decorator: self
+                            .edge_function_decorator(visited)
+                            .map(byte_range)
+                            .transpose()?,
                     }
                 }
                 _ => StaticBindingKind::Local,
@@ -216,6 +304,20 @@ impl EdgePythonKinds {
                 .push(binding(name, scope, byte_range(scope)?.start, kind)?);
         }
         Ok(())
+    }
+
+    fn edge_function_decorator<'tree>(&self, visited: Visited<'_, 'tree>) -> Option<Node<'tree>> {
+        let decorated = visited.parent()?.syntax_element();
+        if decorated.kind_id() != self.decorated {
+            return None;
+        }
+        let mut cursor = decorated.walk();
+        let mut decorators = decorated
+            .named_children(&mut cursor)
+            .filter(|element| element.kind_id() == self.decorator);
+        let expression = decorators.next()?.named_child(0)?;
+        (decorators.next().is_none() && expression.kind_id() == self.identifier)
+            .then_some(expression)
     }
 
     fn edge_import(
@@ -337,7 +439,15 @@ impl EdgePythonKinds {
             }
             parent = parent.parent()?;
         }
-        let class = parent.parent()?.syntax_element();
+        // A method defined under `if`, `try` and their clauses still belongs to the class body.
+        let mut owner = parent.parent()?;
+        while self.conditional.contains(&owner.syntax_element().kind_id()) {
+            owner = owner.parent()?;
+            if owner.syntax_element().kind_id() == self.block {
+                owner = owner.parent()?;
+            }
+        }
+        let class = owner.syntax_element();
         (class.kind_id() == self.definitions[1])
             .then(|| class.child_by_field_id(self.name.get()))
             .flatten()
@@ -467,20 +577,33 @@ impl EdgePythonKinds {
         while let Some(target) = pending.pop() {
             if target.kind_id() == self.identifier {
                 let kind = self.edge_assignment_kind(visited, target)?;
-                let available = if matches!(
-                    kind,
+                let available = match kind {
                     StaticBindingKind::PythonInstance { .. }
-                        | StaticBindingKind::PythonAlias { .. }
-                ) {
-                    byte_range(visited.syntax_element())?.end
-                } else {
-                    byte_range(scope)?.start
+                    | StaticBindingKind::PythonAlias { .. } => {
+                        byte_range(visited.syntax_element())?.end
+                    }
+                    // The loop body reads each element after the iterated value.
+                    StaticBindingKind::PythonElement { iterable } => iterable.end,
+                    _ => byte_range(scope)?.start,
                 };
                 facts
                     .bindings
                     .push(binding(target, scope, available, kind)?);
             } else if target.kind_id() == self.attribute {
                 facts.assignments.push(byte_range(target)?);
+                if let Some((receiver, member)) = target
+                    .child_by_field_id(self.object)
+                    .zip(target.child_by_field_id(self.member))
+                {
+                    facts.bindings.push(binding(
+                        member,
+                        scope,
+                        byte_range(visited.syntax_element())?.end,
+                        StaticBindingKind::PythonMemberWrite {
+                            receiver: byte_range(receiver)?,
+                        },
+                    )?);
+                }
                 let kind = self.edge_assignment_kind(visited, target)?;
                 if kind != StaticBindingKind::Shadow {
                     facts
@@ -501,6 +624,15 @@ impl EdgePythonKinds {
         target: Node<'_>,
     ) -> Result<StaticBindingKind, RiftError> {
         let assignment = visited.syntax_element();
+        if assignment.kind_id() == self.assignment[2]
+            && target.kind_id() == self.identifier
+            && assignment.child_by_field_id(self.left) == Some(target)
+            && let Some(iterable) = assignment.child_by_field_id(self.right)
+        {
+            return Ok(StaticBindingKind::PythonElement {
+                iterable: byte_range(iterable)?,
+            });
+        }
         if assignment.kind_id() != self.assignment[0]
             || assignment.child_by_field_id(self.left) != Some(target)
         {

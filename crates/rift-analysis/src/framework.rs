@@ -36,7 +36,9 @@ impl ResolvedFramework {
     /// Applies the retained interpretation to a captured source under its syntax bounds.
     ///
     /// The caller retains the source whose digest admitted this context. Ordinary syntax
-    /// and every original range remain unchanged when interpretation is unavailable.
+    /// and every original range remain unchanged when interpretation is unavailable. An
+    /// interpretation whose syntax facts fail their checks is not applied: the ordinary
+    /// syntax is returned with one warning, and the log names the file and the reason.
     ///
     /// # Errors
     /// Returns source witness, range, parser, or aggregate syntax-bound failures.
@@ -44,22 +46,67 @@ impl ResolvedFramework {
         &self,
         source: SyntaxSource<'_>,
         limits: SyntaxLimits,
-        mut document: SyntaxDocument,
+        document: SyntaxDocument,
     ) -> Result<(SyntaxDocument, Vec<ReadWarning>, u64), RiftError> {
         let mut calls = 0;
+        let mut warnings = Vec::new();
+        match self.interpret(source, limits, &document, &mut calls, &mut warnings) {
+            Ok(Some(interpreted)) => Ok((interpreted, warnings, calls)),
+            Ok(None) => Ok((document, warnings, calls)),
+            Err(error) if facts_refused(&error) => {
+                rift_tracing::warn!(
+                    component = "index",
+                    operation = "index.parse",
+                    path = source.path.as_str(),
+                    reason = %error,
+                    "framework interpretation left out of a file: its syntax facts failed their checks"
+                );
+                let framework = if self.angular || !self.templates.is_empty() {
+                    SyntaxFramework::Angular
+                } else {
+                    SyntaxFramework::Tailwind
+                };
+                Ok((
+                    document,
+                    vec![warning(
+                        source.path,
+                        framework,
+                        "Framework interpretation failed validation; original source is retained.",
+                    )],
+                    calls,
+                ))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The interpreted document, or `None` when no interpretation applies to `original`.
+    fn interpret(
+        &self,
+        source: SyntaxSource<'_>,
+        limits: SyntaxLimits,
+        original: &SyntaxDocument,
+        calls: &mut u64,
+        warnings: &mut Vec<ReadWarning>,
+    ) -> Result<Option<SyntaxDocument>, RiftError> {
+        let mut interpreted: Option<SyntaxDocument> = None;
         if self.angular
-            && document.language() != &rift_syntax::ShippedLanguage::HtmlAngular.language()
+            && original.language() != &rift_syntax::ShippedLanguage::HtmlAngular.language()
         {
-            document = rift_syntax::ShippedLanguage::HtmlAngular
-                .definition()
-                .syntax_provider()
-                .analyze(source, limits)?;
-            calls += 1;
+            interpreted = Some(
+                rift_syntax::ShippedLanguage::HtmlAngular
+                    .definition()
+                    .syntax_provider()
+                    .analyze(source, limits)?,
+            );
+            *calls += 1;
         }
         if !self.templates.is_empty() {
-            document =
-                rift_syntax::append_angular_templates(source, limits, &document, &self.templates)?;
-            calls += u64::try_from(
+            let current = interpreted.as_ref().unwrap_or(original);
+            let appended =
+                rift_syntax::append_angular_templates(source, limits, current, &self.templates)?;
+            interpreted = Some(appended);
+            *calls += u64::try_from(
                 self.templates
                     .iter()
                     .filter(|range| range.start < range.end)
@@ -67,13 +114,13 @@ impl ResolvedFramework {
             )
             .unwrap_or(u64::MAX);
         }
-        let mut warnings = Vec::new();
         if let Some(version) = self.tailwind {
             let major = match version {
                 TailwindVersion::V3 => 3,
                 TailwindVersion::V4 => 4,
             };
-            let facts = rift_syntax::tailwind_symbols(source, &document, major, limits)?;
+            let current = interpreted.as_ref().unwrap_or(original);
+            let facts = rift_syntax::tailwind_symbols(source, current, major, limits)?;
             if !facts.unresolved.is_empty() {
                 warnings.push(warning(
                     source.path,
@@ -81,11 +128,31 @@ impl ResolvedFramework {
                     "Dynamic class expressions are retained without Tailwind interpretation.",
                 ));
             }
-            document =
-                rift_syntax::append_framework_symbols(source, limits, &document, facts.symbols)?;
+            let appended =
+                rift_syntax::append_framework_symbols(source, limits, current, facts.symbols)?;
+            interpreted = Some(appended);
         }
-        Ok((document, warnings, calls))
+        Ok(interpreted)
     }
+}
+
+/// Whether `error` is a check of interpreted syntax facts refusing them, which leaves the
+/// ordinary syntax in place, rather than a source, parser, or syntax bound failure.
+fn facts_refused(error: &RiftError) -> bool {
+    use rift_error::errors::syntax;
+    let slug = error.slug();
+    [
+        syntax::facts_count_exceeded::SLUG,
+        syntax::facts_depth_exceeded::SLUG,
+        syntax::facts_kind_invalid::SLUG,
+        syntax::facts_name_invalid::SLUG,
+        syntax::facts_order_invalid::SLUG,
+        syntax::facts_range_invalid::SLUG,
+        syntax::facts_reference_invalid::SLUG,
+        syntax::facts_structure_invalid::SLUG,
+        syntax::facts_text_exceeded::SLUG,
+    ]
+    .contains(&slug)
 }
 
 impl get_size2::GetSize for ResolvedFramework {

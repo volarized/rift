@@ -73,7 +73,7 @@ impl WorkspaceIndex {
             identity_complete: !self
                 .warnings
                 .iter()
-                .any(super::WorkspaceIndexWarning::leaves_declarations_out),
+                .any(super::WorkspaceIndexWarning::leaves_inventory_partial),
             retained_bytes: 0,
         };
         view.retained_bytes = retained_size::measure(&view);

@@ -2,7 +2,11 @@
 
 mod annotations;
 mod classes;
+mod elements;
+mod overloads;
+mod rebinding;
 mod references;
+mod slots;
 
 pub(super) use classes::ClassOrders;
 
@@ -58,7 +62,7 @@ impl EdgePythonModules {
 enum Value<'source> {
     Symbol(Target<'source>),
     Instance(Target<'source>),
-    // An inherited declaration retains the subclass assignment for later receiver lookup.
+    // A member retains its declaration separately from its receiver value.
     Member {
         declaration: Target<'source>,
         assigned: Target<'source>,
@@ -82,9 +86,99 @@ impl<'source> Index<'source> {
             }
             _ => self.edge_python_name(file, call.callee_range, work)?,
         };
-        (target.symbol.kinds.contains(&SymbolKind::Callable)
-            || target.symbol.kinds.contains(&SymbolKind::Constructible))
-        .then_some(target)
+        self.python_callable_alias(target, work)
+    }
+
+    /// A local name bound more than once in one callable scope, by assignments that all
+    /// produce an instance of the same class, holds that instance wherever it is read: in
+    /// every branch and on every loop iteration. Returns the earliest available binding.
+    fn python_receiver_join(
+        &self,
+        file: &File<'source>,
+        scope: ByteRange,
+        candidates: impl Iterator<Item = &'source StaticBinding>,
+        work: &mut Work,
+    ) -> Option<&'source StaticBinding> {
+        let module = scope.start == 0 && scope.end == file.document.source.len() as u64;
+        if module || file.class_scopes.contains(&scope) {
+            return None;
+        }
+        let mut agreed = None;
+        let mut selected: Option<&StaticBinding> = None;
+        let mut count = 0_usize;
+        for binding in candidates {
+            if !work.charge() {
+                return None;
+            }
+            if !matches!(
+                binding.kind,
+                StaticBindingKind::PythonAnnotation { .. }
+                    | StaticBindingKind::PythonInstance { .. }
+                    | StaticBindingKind::PythonAlias { .. }
+                    | StaticBindingKind::PythonElement { .. }
+            ) {
+                return None;
+            }
+            let value = work.python_lookup(|work| {
+                let value = self.binding_value(file, binding, work)?;
+                self.python_receiver(value, work)
+            })?;
+            let Value::Instance(class) = value else {
+                return None;
+            };
+            let class = (
+                class.file.path.as_str(),
+                class.symbol.qualified_name.as_str(),
+            );
+            if agreed.is_some_and(|agreed| agreed != class) {
+                return None;
+            }
+            agreed = Some(class);
+            count += 1;
+            if selected.is_none_or(|earliest| binding.available_from < earliest.available_from) {
+                selected = Some(binding);
+            }
+        }
+        (count > 1).then_some(selected?)
+    }
+
+    /// A class base names a class, directly or through unchanged aliases; other values stay
+    /// unresolved.
+    pub(super) fn edge_python_base(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let target = self.edge_python_name(file, range, work)?;
+        self.python_callable_alias(target, work)
+            .filter(|target| target.symbol.kinds.contains(&SymbolKind::Constructible))
+    }
+
+    /// Follows unchanged variable aliases (`alias = target`) to the callable or class they name.
+    fn python_callable_alias(
+        &self,
+        mut target: Target<'source>,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let mut visited = BTreeSet::new();
+        loop {
+            if target.symbol.kinds.contains(&SymbolKind::Callable)
+                || target.symbol.kinds.contains(&SymbolKind::Constructible)
+            {
+                return Some(target);
+            }
+            let name = target.symbol.name_range?;
+            if !work.charge() || !visited.insert((target.file.path.as_str(), name.start)) {
+                return None;
+            }
+            let file = self.files.get(target.file.path.as_str())?;
+            let StaticBindingKind::PythonAlias { value } = *file.python_values.get(&name.end)?
+            else {
+                return None;
+            };
+            target = self.edge_python_name(file, value, work)?;
+        }
     }
 
     fn python_super_member(
@@ -109,8 +203,13 @@ impl<'source> Index<'source> {
                 continue;
             }
             if let StaticBindingKind::PythonReceiver { class_name } = binding.kind {
-                let selected =
-                    edge_python_binding(file, file.text(binding.name)?, call.range.start, work)?;
+                let selected = edge_python_binding(
+                    self,
+                    file,
+                    file.text(binding.name)?,
+                    call.range.start,
+                    work,
+                )?;
                 if selected != binding {
                     return None;
                 }
@@ -156,11 +255,7 @@ impl<'source> Index<'source> {
                     Some(file) => self.export_value(file, member, work)?,
                     None => self.module_value(&format!("{name}.{member}"))?,
                 },
-                Value::Symbol(target)
-                | Value::Instance(target)
-                | Value::Member {
-                    assigned: target, ..
-                } => self.python_member_value(target, member, work)?,
+                value => self.python_member_value(value, member, work)?,
             };
         }
         Some(value)
@@ -196,7 +291,7 @@ impl<'source> Index<'source> {
         }
         let mut names = file.text(range)?.splitn(2, '.').map(str::trim);
         let name = names.next()?;
-        let binding = edge_python_binding(file, name, range.start, work)?;
+        let binding = edge_python_binding(self, file, name, range.start, work)?;
         let value = self.binding_value(file, binding, work)?;
         Some((value, names.next().unwrap_or("")))
     }
@@ -240,16 +335,6 @@ impl<'source> Index<'source> {
         }
     }
 
-    fn python_value_receiver(&self, value: Value<'source>) -> Option<Target<'source>> {
-        match value {
-            Value::Instance(class)
-            | Value::Member {
-                assigned: class, ..
-            } => Some(class),
-            value => self.value_target(value),
-        }
-    }
-
     fn binding_value(
         &self,
         file: &File<'source>,
@@ -281,8 +366,20 @@ impl<'source> Index<'source> {
             | StaticBindingKind::PythonFunction { .. } => {
                 file.target_at(binding.name).map(Value::Symbol)
             }
+            StaticBindingKind::PythonElement { iterable } => {
+                file.target_at(binding.name).map(Value::Symbol).or_else(|| {
+                    self.python_element(file, iterable, work)
+                        .map(Value::Instance)
+                })
+            }
             StaticBindingKind::PythonReceiver { class_name } => {
-                file.target_at(class_name).map(Value::Symbol)
+                let class = file.target_at(class_name)?;
+                let method = file.enclosing_callable(binding.name)?;
+                Some(if method.symbol.kinds.contains(&SymbolKind::Static) {
+                    Value::Symbol(class)
+                } else {
+                    Value::Instance(class)
+                })
             }
             StaticBindingKind::PythonImport { module, export } => {
                 let name = EdgePythonModules::name(file, file.text(module)?)?;
@@ -333,11 +430,21 @@ impl<'source> Index<'source> {
             let Some(bindings) = file.by_name.get(name) else {
                 return self.module_value(&format!("{module}.{name}"));
             };
-            let mut root = bindings.iter().filter(|binding| {
+            let root = bindings.iter().copied().filter(|binding| {
                 binding.scope.start == 0 && binding.scope.end == file.document.source.len() as u64
             });
-            let binding = root.next()?;
-            if root.next().is_some() {
+            let binding = self.python_binding_group(file, root, work)?;
+            let callable = file.target_at(binding.name).is_some_and(|target| {
+                target.symbol.kinds.contains(&SymbolKind::Callable)
+                    || target.symbol.kinds.contains(&SymbolKind::Constructible)
+            });
+            if (callable
+                || matches!(
+                    binding.kind,
+                    StaticBindingKind::PythonImport { .. } | StaticBindingKind::PythonModule { .. }
+                ))
+                && !self.python_module_slot_available(file, name, work)
+            {
                 return None;
             }
             match binding.kind {
@@ -346,6 +453,7 @@ impl<'source> Index<'source> {
                 | StaticBindingKind::PythonAnnotation { .. }
                 | StaticBindingKind::PythonInstance { .. }
                 | StaticBindingKind::PythonAlias { .. }
+                | StaticBindingKind::PythonElement { .. }
                 | StaticBindingKind::PythonFunction { .. } => {
                     return file.target_at(binding.name).map(Value::Symbol);
                 }
@@ -354,10 +462,15 @@ impl<'source> Index<'source> {
                     let Some(export) = export else {
                         return self.module_value(&module);
                     };
-                    name = file.text(export)?;
+                    let exported = file.text(export)?;
                     let Some(path) = self.edge_python.path(&module) else {
-                        return self.module_value(&format!("{module}.{name}"));
+                        return self.module_value(&format!("{module}.{exported}"));
                     };
+                    if path == file.document.path.as_str() && exported == name {
+                        // A package importing a name from itself binds its submodule.
+                        return self.module_value(&format!("{module}.{exported}"));
+                    }
+                    name = exported;
                     file = self.files.get(path)?;
                 }
                 StaticBindingKind::PythonModule { module } => {
@@ -377,6 +490,7 @@ fn is_super(text: &str) -> bool {
 }
 
 fn edge_python_binding<'source>(
+    index: &Index<'source>,
     file: &File<'source>,
     name: &str,
     position: u64,
@@ -385,17 +499,16 @@ fn edge_python_binding<'source>(
     if file.blocked(position, work) {
         return None;
     }
-    let in_body = file
-        .enclosing_callable(ByteRange {
-            start: position,
-            end: position.saturating_add(1),
-        })
-        .is_some_and(|callable| {
-            callable
-                .symbol
-                .body_range
-                .is_some_and(|body| body.contains(position))
-        });
+    let callable = file.enclosing_callable(ByteRange {
+        start: position,
+        end: position.saturating_add(1),
+    });
+    let in_body = callable.is_some_and(|callable| {
+        callable
+            .symbol
+            .body_range
+            .is_some_and(|body| body.contains(position))
+    });
     let bindings = file.by_name.get(name)?;
     let module = ByteRange {
         start: 0,
@@ -425,8 +538,7 @@ fn edge_python_binding<'source>(
         }
         let scope = best?;
         let mut declaration = None;
-        let mut selected = None;
-        let mut ambiguous = false;
+        let mut selected = false;
         for &binding in bindings {
             if !work.charge() {
                 return None;
@@ -438,26 +550,78 @@ fn edge_python_binding<'source>(
                 StaticBindingKind::PythonGlobal => declaration = Some(true),
                 StaticBindingKind::PythonNonlocal => declaration = Some(false),
                 _ => {
-                    ambiguous |= selected.is_some();
-                    selected = Some(binding);
+                    selected = true;
                 }
             }
         }
         if let Some(is_global) = declaration {
-            if selected.is_some() || global || (nonlocal && is_global) {
+            if selected || global || (nonlocal && is_global) {
                 return None;
             }
             excluded.insert(scope);
             global = is_global;
             nonlocal = !is_global;
         } else {
-            let selected =
-                selected.filter(|binding| !ambiguous && binding.available_from <= position)?;
+            let later = later_bindings(file, bindings, scope, position, callable, in_body, work)?;
+            let candidates = bindings
+                .iter()
+                .copied()
+                .filter(|binding| binding.scope == scope && !later.contains(&binding.name.start));
+            let selected = match index.python_binding_group(file, candidates.clone(), work) {
+                Some(selected) => selected,
+                None => index.python_receiver_join(file, scope, candidates, work)?,
+            };
+            if selected.available_from > position {
+                return None;
+            }
             return file
                 .python_guard_available(selected, position, work)
                 .then_some(selected);
         }
     }
+}
+
+/// Bindings of one name that cannot have run before a read at `position`.
+///
+/// In the body of the callable whose scope holds the name, and in module code outside callable
+/// bodies and annotations, a binding that starts after the read cannot have run yet unless a
+/// loop holds both, or the read sits in a lambda, comprehension or generator expression.
+fn later_bindings(
+    file: &File<'_>,
+    bindings: &[&StaticBinding],
+    scope: ByteRange,
+    position: u64,
+    callable: Option<Target<'_>>,
+    in_body: bool,
+    work: &mut Work,
+) -> Option<BTreeSet<u64>> {
+    let mut later = BTreeSet::new();
+    let module = scope.start == 0 && scope.end == file.document.source.len() as u64;
+    let ordered = ((in_body
+        && callable.is_some_and(|callable| callable.symbol.item_range == scope))
+        || (module && !in_body && !file.in_python_annotation(position)))
+        && !file
+            .facts
+            .expression_scopes()
+            .iter()
+            .any(|range| range.contains(position));
+    if !ordered {
+        return Some(later);
+    }
+    for &binding in bindings {
+        if !work.charge() {
+            return None;
+        }
+        let repeated = file
+            .facts
+            .loops()
+            .iter()
+            .any(|range| range.contains(position) && range.contains(binding.name.start));
+        if binding.scope == scope && binding.available_from > position && !repeated {
+            later.insert(binding.name.start);
+        }
+    }
+    Some(later)
 }
 
 impl File<'_> {

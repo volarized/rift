@@ -331,3 +331,214 @@ fn captured_object_inventory_stays_complete_beside_an_unresolved_framework() {
             .expect("coverage")
     );
 }
+
+/// `pub fn <name>() {}` padded with a line comment to exactly `bytes` bytes.
+fn rust_source_of(name: &str, bytes: usize) -> String {
+    let mut source = format!("pub fn {name}() {{}}\n//");
+    assert!(
+        source.len() < bytes,
+        "the fixture must fit its byte count: source={} bytes={bytes}",
+        source.len()
+    );
+    source.push_str(&"x".repeat(bytes - source.len() - 1));
+    source.push('\n');
+    source
+}
+
+fn build_with(root: &std::path::Path, limits: WorkspaceIndexLimits) -> WorkspaceIndex {
+    WorkspaceIndex::build(
+        root,
+        limits,
+        &SourceVisibility::default(),
+        &TextFileInclusion::default(),
+    )
+    .expect("index")
+}
+
+/// D37: a file a bound left out is outside the indexed set, as a file the source policy
+/// excludes is. A source below and at `[providers.syntax] max_file` is parsed; one byte
+/// above it is left out, and the captured inventory stays complete over what the index
+/// holds, so enumerations, counts and absences answer rather than refuse.
+#[test]
+fn a_file_past_the_syntax_bound_leaves_the_object_inventory_complete() {
+    const BOUND: usize = 96;
+    let root = tempfile::tempdir().expect("workspace");
+    fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname='beacon'\nversion='1.0.0'\n[lib]\npath='lib.rs'\n",
+    )
+    .expect("captured metadata");
+    let mut below = "mod above;\nmod at;\n".to_owned();
+    below.push_str(&rust_source_of("below_bound", BOUND - 1 - below.len()));
+    fs::write(root.path().join("lib.rs"), below).expect("below");
+    fs::write(root.path().join("at.rs"), rust_source_of("at_bound", BOUND)).expect("at");
+    fs::write(
+        root.path().join("above.rs"),
+        rust_source_of("above_bound", BOUND + 1),
+    )
+    .expect("above");
+    let limits = WorkspaceIndexLimits::default()
+        .with_syntax(rift_syntax::SyntaxLimits::new(BOUND, 250_000, 256).expect("bounds"));
+    let index = build_with(root.path(), limits);
+    let left_out: Vec<&str> = index
+        .warnings()
+        .iter()
+        .map(|warning| warning.path().as_str())
+        .collect();
+    assert_eq!(left_out, ["above.rs"], "{:?}", index.warnings());
+    assert!(index.warnings()[0].is_left_out_by_bound());
+    assert!(!index.warnings()[0].leaves_inventory_partial());
+    let view = index.symbol_view().expect("view");
+    assert!(view.objects_complete());
+    let language = index
+        .file(&rift_core::ProjectPath::new("at.rs").expect("path"))
+        .expect("the source at the bound is parsed")
+        .syntax()
+        .language()
+        .clone();
+    assert!(view.identity_coverage_complete(&language));
+    assert!(
+        index
+            .identity_coverage_complete(&language)
+            .expect("coverage")
+    );
+    for (name, held) in [
+        ("below_bound", true),
+        ("at_bound", true),
+        ("above_bound", false),
+    ] {
+        assert_eq!(
+            !index.symbols(name, 1).expect("lookup").is_empty(),
+            held,
+            "{name}"
+        );
+    }
+}
+
+/// D37: a file past the per-file byte bound of `[source]` is left out the same way.
+#[test]
+fn a_file_past_the_source_byte_bound_leaves_the_object_inventory_complete() {
+    const BOUND: usize = 96;
+    let root = tempfile::tempdir().expect("workspace");
+    fs::write(root.path().join("at.rs"), rust_source_of("at_bound", BOUND)).expect("at");
+    fs::write(
+        root.path().join("above.rs"),
+        rust_source_of("above_bound", BOUND + 1),
+    )
+    .expect("above");
+    let limits = WorkspaceIndexLimits {
+        file_bytes_max: BOUND,
+        ..WorkspaceIndexLimits::default()
+    };
+    let index = build_with(root.path(), limits);
+    assert!(
+        matches!(
+            index.warnings(),
+            [super::super::WorkspaceIndexWarning::FileTooLarge { path, .. }]
+                if path.as_str() == "above.rs"
+        ),
+        "{:?}",
+        index.warnings()
+    );
+    assert!(index.symbol_view().expect("view").objects_complete());
+    assert!(!index.symbols("at_bound", 1).expect("lookup").is_empty());
+}
+
+/// A numeric log field, which the record stores as its rendered text.
+fn number(field: &serde_json::Value) -> u64 {
+    field
+        .as_u64()
+        .or_else(|| field.as_str().and_then(|text| text.parse().ok()))
+        .unwrap_or_else(|| panic!("a numeric field: {field}"))
+}
+
+/// The warning records one build writes for the files a bound left out, by message.
+fn omission_records(drain: &mut rift_tracing::LogDrain) -> Vec<serde_json::Value> {
+    drain
+        .queued_records()
+        .into_iter()
+        .filter(|record| {
+            [
+                "file left out of the index",
+                "file held unparsed in the index",
+                "more files left out of the index or held unparsed than one build names",
+            ]
+            .contains(&record.message())
+        })
+        .map(|record| {
+            assert_eq!(record.level(), "warn", "{record:?}");
+            let mut fields: serde_json::Value =
+                serde_json::from_str(record.fields()).expect("fields");
+            fields["message"] = serde_json::Value::from(record.message());
+            fields
+        })
+        .collect()
+}
+
+/// D37: the log names each file a bound left out once per build, with its bound and measured
+/// value, up to a fixed number of records; past them one record counts the rest, so the log
+/// volume stays bounded whatever the number of oversized files.
+#[test]
+fn a_build_names_the_files_a_bound_left_out_up_to_a_bound_and_counts_the_rest() {
+    const BOUND: usize = 96;
+    let named_max = usize::try_from(super::super::OMITTED_FILE_RECORDS_MAX).expect("fits");
+    for (oversized, expected_named, expected_counted) in [
+        (1_usize, 1_usize, None),
+        (named_max, named_max, None),
+        (named_max + 1, named_max, Some(1_u64)),
+        (named_max + 40, named_max, Some(40)),
+    ] {
+        let root = tempfile::tempdir().expect("workspace");
+        fs::write(root.path().join("kept.rs"), "pub fn kept() {}\n").expect("kept");
+        for index in 0..oversized {
+            fs::write(
+                root.path().join(format!("wide_{index:03}.rs")),
+                rust_source_of(&format!("wide_{index}"), BOUND + 1),
+            )
+            .expect("oversized");
+        }
+        let limits = WorkspaceIndexLimits {
+            file_bytes_max: BOUND,
+            ..WorkspaceIndexLimits::default()
+        };
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("warn")
+            .install()
+            .expect("recorder");
+        let index = build_with(root.path(), limits);
+        assert_eq!(index.warnings().len(), oversized);
+        assert!(index.symbol_view().expect("view").objects_complete());
+        let records = omission_records(&mut drain);
+        let named: Vec<&serde_json::Value> = records
+            .iter()
+            .filter(|record| record["message"] == "file left out of the index")
+            .collect();
+        assert_eq!(named.len(), expected_named, "oversized={oversized}");
+        let paths: BTreeMap<&str, usize> =
+            named.iter().fold(BTreeMap::new(), |mut seen, record| {
+                *seen
+                    .entry(record["path"].as_str().expect("path"))
+                    .or_default() += 1;
+                seen
+            });
+        assert!(
+            paths.values().all(|count| *count == 1),
+            "each file is named once per build: {paths:?}"
+        );
+        let reason = named[0]["reason"].as_str().expect("reason");
+        assert!(
+            reason.contains(&BOUND.to_string()) && reason.contains(&(BOUND + 1).to_string()),
+            "the record carries the bound and the measured value: {reason}"
+        );
+        let counted: Vec<u64> = records
+            .iter()
+            .filter(|record| {
+                record["message"]
+                    == "more files left out of the index or held unparsed than one build names"
+            })
+            .map(|record| number(&record["counted"]))
+            .collect();
+        assert_eq!(counted, expected_counted.into_iter().collect::<Vec<_>>());
+        assert!(records.len() <= named_max + 1, "oversized={oversized}");
+    }
+}

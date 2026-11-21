@@ -11,20 +11,25 @@ use crate::NamespaceInput;
 pub(super) enum ModuleMode {
     Esm,
     CommonJs,
+    NodeDefault,
     Unknown,
 }
 
 /// Module-mode declarations captured from the nearest package manifest.
 pub(super) struct PackageModes<'source> {
     modes: BTreeMap<String, ModuleMode>,
+    module_syntax: std::collections::BTreeSet<&'source str>,
     pub(super) owner: rift_protocol::identity::SymbolOwner,
     pub(super) scopes: BTreeMap<&'source str, Scopes<'source>>,
 }
 
 pub(super) struct Scopes<'source> {
+    pub(super) values: BTreeMap<rift_syntax::ByteRange, Option<&'source rift_syntax::SyntaxSymbol>>,
     pub(super) classes: crate::EnclosingDefinitions<&'source rift_syntax::SyntaxSymbol>,
     pub(super) definitions: crate::EnclosingDefinitions<&'source rift_syntax::SyntaxSymbol>,
     pub(super) callables: crate::EnclosingDefinitions<&'source rift_syntax::SyntaxSymbol>,
+    /// Every arrow function and function expression, named or not.
+    pub(super) function_values: crate::EnclosingDefinitions<rift_syntax::ByteRange>,
     pub(super) functions: crate::EnclosingDefinitions<rift_syntax::ByteRange>,
     pub(super) blocks: crate::EnclosingDefinitions<rift_syntax::ByteRange>,
     pub(super) deferred: crate::EnclosingDefinitions<rift_syntax::ByteRange>,
@@ -52,16 +57,21 @@ impl<'source> PackageModes<'source> {
             modes.entry(directory.to_owned()).or_insert(mode);
         }
         let mut scopes = BTreeMap::new();
+        let mut module_syntax = std::collections::BTreeSet::new();
         for file in files.values().filter(|file| {
             matches!(
                 file.document.facts.language().name.as_str(),
                 "javascript" | "typescript"
             )
         }) {
+            if file.facts.has_javascript_module_syntax() {
+                module_syntax.insert(file.document.path.as_str());
+            }
             scopes.insert(file.document.path.as_str(), Scopes::new(file, work)?);
         }
         Some(Self {
             modes,
+            module_syntax,
             owner: namespace.owner().clone(),
             scopes,
         })
@@ -80,6 +90,13 @@ impl<'source> PackageModes<'source> {
                 return ModuleMode::Unknown;
             }
             if let Some(&mode) = self.modes.get(directory) {
+                if mode == ModuleMode::NodeDefault {
+                    return if self.module_syntax.contains(path) {
+                        ModuleMode::Esm
+                    } else {
+                        ModuleMode::CommonJs
+                    };
+                }
                 return mode;
             }
             if directory.is_empty() {
@@ -88,6 +105,17 @@ impl<'source> PackageModes<'source> {
             directory = directory.rsplit_once('/').map_or("", |(parent, _)| parent);
         }
     }
+}
+
+/// Whether the file is JavaScript source, whose types documentation comments write.
+pub(super) fn javascript_source(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .is_some_and(|extension| {
+            ["js", "cjs", "mjs", "jsx"]
+                .iter()
+                .any(|known| extension.eq_ignore_ascii_case(known))
+        })
 }
 
 pub(super) fn typescript_commonjs(path: &str) -> bool {
@@ -104,11 +132,23 @@ fn manifest_directory(path: &str) -> Option<&str> {
     }
 }
 
+/// Whether `new` can construct the target: in JavaScript every function written with the
+/// `function` keyword is a constructor; an arrow function, a method and a generator are not.
+fn javascript_constructor_function(target: Target<'_>) -> bool {
+    javascript_source(target.file.path.as_str())
+        && target.symbol.kind == "function"
+        && matches!(
+            target.symbol.syntax_element_kind,
+            Some("function_declaration" | "function_expression" | "assignment_expression")
+        )
+}
+
 fn package_mode(text: &str) -> ModuleMode {
     match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(text) {
         Ok(manifest) => match manifest.get("type") {
             Some(value) if value.as_str() == Some("module") => ModuleMode::Esm,
             Some(value) if value.as_str() == Some("commonjs") => ModuleMode::CommonJs,
+            None => ModuleMode::NodeDefault,
             _ => ModuleMode::Unknown,
         },
         Err(_) => ModuleMode::Unknown,
@@ -139,31 +179,82 @@ impl<'source> Index<'source> {
         role: rift_core::ReferenceRole,
         work: &mut Work,
     ) -> Option<Target<'source>> {
-        let name = file.text(range)?.trim();
-        if let Some((receiver, member)) = name.split_once('.') {
-            let receiver = receiver.trim();
-            if matches!(receiver, "this" | "super") {
-                return self.javascript_receiver_member(
+        if let Some(member) = file.members.get(&range) {
+            let member = (*member)?;
+            let name = file.text(member.member?)?;
+            if role != rift_core::ReferenceRole::Type && file.callbacks.is_call(member.receiver) {
+                let owner = self.javascript_call_result(file, member.receiver, work)?;
+                return self.javascript_class_member(owner, name, MemberMode::Instance, role, work);
+            }
+            if !file.members.contains_key(&member.receiver) {
+                return self.javascript_named_member(
                     file,
+                    file.text(member.receiver)?,
+                    name,
                     range.start,
-                    receiver,
-                    member,
                     role,
                     work,
                 );
             }
-            let binding = js_binding(
+        }
+        let name = file.text(range)?.trim();
+        if let Some((receiver, member)) = name.split_once('.') {
+            return self.javascript_named_member(
                 file,
-                &self.javascript,
                 receiver.trim(),
+                member.trim(),
                 range.start,
                 role,
                 work,
-            )?;
-            return self.javascript_member(file, binding, member.trim(), role, work);
+            );
         }
         let binding = js_binding(file, &self.javascript, name, range.start, role, work)?;
         self.javascript_binding_target(file, binding, role, work)
+    }
+
+    fn javascript_named_member(
+        &self,
+        file: &File<'source>,
+        receiver: &str,
+        member: &'source str,
+        position: u64,
+        role: rift_core::ReferenceRole,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        if matches!(receiver, "this" | "super") {
+            return self.javascript_receiver_member(file, position, receiver, member, role, work);
+        }
+        // A receiver with a declared type keeps it when the binding is assigned again: the
+        // call is refused only for a callee named by the binding itself. So does a
+        // TypeScript binding typed by the spread its initializer ends in.
+        let binding =
+            js_binding(file, &self.javascript, receiver, position, role, work).or_else(|| {
+                (role == rift_core::ReferenceRole::Call)
+                    .then(|| {
+                        js_binding(
+                            file,
+                            &self.javascript,
+                            receiver,
+                            position,
+                            rift_core::ReferenceRole::Read,
+                            work,
+                        )
+                    })
+                    .flatten()
+                    .filter(|binding| {
+                        file.declared_types
+                            .get(&binding.name)
+                            .copied()
+                            .flatten()
+                            .is_some()
+                            || (file.spread_values.contains_key(&binding.name)
+                                && !javascript_source(file.document.path.as_str()))
+                    })
+            });
+        match binding {
+            Some(binding) => self.javascript_member(file, binding, member, role, work),
+            None => self.javascript_commonjs_member(file, receiver, member, position, role, work),
+        }
     }
 
     pub(super) fn javascript_call(
@@ -179,35 +270,25 @@ impl<'source> Index<'source> {
             return self.javascript_super_constructor(file, call.range.start, work);
         }
         let target = match call.callee {
+            StaticCallee::Member { receiver, member } if file.callbacks.is_call(receiver) => {
+                let owner = self.javascript_call_result(file, receiver, work)?;
+                self.javascript_class_member(
+                    owner,
+                    file.text(member)?,
+                    MemberMode::Instance,
+                    rift_core::ReferenceRole::Call,
+                    work,
+                )?
+            }
             StaticCallee::Member { receiver, member } if !file.text(receiver)?.contains('.') => {
-                let receiver = file.text(receiver)?;
-                let member = file.text(member)?;
-                if matches!(receiver, "this" | "super") {
-                    self.javascript_receiver_member(
-                        file,
-                        call.range.start,
-                        receiver,
-                        member,
-                        rift_core::ReferenceRole::Call,
-                        work,
-                    )?
-                } else {
-                    let binding = js_binding(
-                        file,
-                        &self.javascript,
-                        receiver,
-                        call.range.start,
-                        rift_core::ReferenceRole::Call,
-                        work,
-                    )?;
-                    self.javascript_member(
-                        file,
-                        binding,
-                        member,
-                        rift_core::ReferenceRole::Call,
-                        work,
-                    )?
-                }
+                self.javascript_named_member(
+                    file,
+                    file.text(receiver)?,
+                    file.text(member)?,
+                    call.range.start,
+                    rift_core::ReferenceRole::Call,
+                    work,
+                )?
             }
             _ => self.javascript_target(
                 file,
@@ -221,10 +302,139 @@ impl<'source> Index<'source> {
                 || target
                     .symbol
                     .kinds
-                    .contains(&rift_protocol::read::SymbolKind::Constructible))
+                    .contains(&rift_protocol::read::SymbolKind::Constructible)
+                || javascript_constructor_function(target)
+                || self.javascript_declared_signature(target, true, work))
             .then_some(target);
         }
-        target.callable()
+        target
+            .callable()
+            .or_else(|| {
+                self.javascript_declared_signature(target, false, work)
+                    .then_some(target)
+            })
+            .or_else(|| {
+                self.javascript_callable_result(target, work)
+                    .then_some(target)
+            })
+            .or_else(|| {
+                self.javascript_shorthand_callable(target, work)
+                    .then_some(target)
+            })
+    }
+
+    /// Whether a shorthand object member (`{ verify }`) holds a callable value: the name it
+    /// is written with resolves, in the member's own file, to a callable declaration. The
+    /// call targets the member itself.
+    fn javascript_shorthand_callable(&self, target: Target<'source>, work: &mut Work) -> bool {
+        if target.symbol.syntax_element_kind != Some("shorthand_property_identifier") {
+            return false;
+        }
+        let Some((file, name)) = self
+            .files
+            .get(target.file.path.as_str())
+            .zip(target.symbol.name_range)
+        else {
+            return false;
+        };
+        work.javascript_lookup(|work| {
+            let binding = js_binding(
+                file,
+                &self.javascript,
+                file.text(name)?,
+                name.start,
+                rift_core::ReferenceRole::Call,
+                work,
+            )?;
+            let value = self.javascript_binding_target(
+                file,
+                binding,
+                rift_core::ReferenceRole::Call,
+                work,
+            )?;
+            value.callable().map(|_| ())
+        })
+        .is_some()
+    }
+
+    /// Whether the binding's declared type states that its value can be called or constructed.
+    ///
+    /// The annotation must name, through at most `DECLARED_TYPE_DEPTH_MAX` aliases, a type
+    /// declaration whose own shape is the signature: a function or constructor type alias,
+    /// or an interface with a call or construct signature. The call then targets the
+    /// binding itself; no function body is chosen for it.
+    fn javascript_declared_signature(
+        &self,
+        target: Target<'source>,
+        constructs: bool,
+        work: &mut Work,
+    ) -> bool {
+        let Some(file) = self.files.get(target.file.path.as_str()) else {
+            return false;
+        };
+        // A declaration written with a function type, `run: () => number`, is callable.
+        if !constructs
+            && target
+                .symbol
+                .name_range
+                .is_some_and(|name| file.callbacks.has_function_type(name))
+        {
+            return true;
+        }
+        let Some(annotation) = target
+            .symbol
+            .name_range
+            .and_then(|name| file.declared_types.get(&name).copied().flatten())
+        else {
+            return false;
+        };
+        self.javascript_written_signature(file, annotation, constructs, work)
+    }
+
+    /// Whether the written type `annotation` names, through at most
+    /// `DECLARED_TYPE_DEPTH_MAX` aliases, a type whose own shape is a call or construct
+    /// signature, or the global `Function` type.
+    pub(super) fn javascript_written_signature<'index>(
+        &'index self,
+        mut file: &'index File<'source>,
+        mut annotation: rift_syntax::ByteRange,
+        constructs: bool,
+        work: &mut Work,
+    ) -> bool {
+        let declared = |file: &File<'source>, name: rift_syntax::ByteRange| {
+            file.declared_types.get(&name).copied().flatten()
+        };
+        for _ in 0..super::javascript_members::DECLARED_TYPE_DEPTH_MAX {
+            if !work.charge() {
+                return false;
+            }
+            let Some(named) =
+                self.javascript_target(file, annotation, rift_core::ReferenceRole::Type, work)
+            else {
+                // The global `Function` type, which no declaration of the workspace takes,
+                // is callable and constructs nothing.
+                return !constructs && file.text(annotation) == Some("Function");
+            };
+            let Some((owner, name)) = self
+                .files
+                .get(named.file.path.as_str())
+                .zip(named.symbol.name_range)
+            else {
+                return false;
+            };
+            if owner.type_signatures.contains(&(name, constructs)) {
+                return true;
+            }
+            if named.symbol.kind != "type_alias" {
+                return false;
+            }
+            let Some(next) = declared(owner, name) else {
+                return false;
+            };
+            file = owner;
+            annotation = next;
+        }
+        false
     }
 
     pub(super) fn javascript_import(
@@ -235,6 +445,19 @@ impl<'source> Index<'source> {
     ) -> Option<Target<'source>> {
         if file.blocked(binding.name.start, work) {
             return None;
+        }
+        if let StaticBindingKind::JavaScriptRequire { export, .. } = binding.kind {
+            export?;
+            return self
+                .javascript_require_value(file, binding, rift_core::ReferenceRole::Type, work)
+                .or_else(|| {
+                    self.javascript_require_value(
+                        file,
+                        binding,
+                        rift_core::ReferenceRole::Read,
+                        work,
+                    )
+                });
         }
         self.javascript_binding_target(file, binding, rift_core::ReferenceRole::Type, work)
             .or_else(|| {
@@ -250,9 +473,15 @@ impl<'source> Index<'source> {
         work: &mut Work,
     ) -> Option<Target<'source>> {
         match binding.kind {
-            StaticBindingKind::Local | StaticBindingKind::JavaScriptInstance { .. } => {
-                file.target_at(binding.name)
-            }
+            StaticBindingKind::Local => file.target_at(binding.name).or_else(|| {
+                let scopes = self.javascript.scopes.get(file.document.path.as_str())?;
+                let symbol = scopes.values.get(&binding.scope).copied().flatten()?;
+                Some(Target {
+                    file: file.document,
+                    symbol,
+                })
+            }),
+            StaticBindingKind::JavaScriptInstance { .. } => file.target_at(binding.name),
             StaticBindingKind::JavaScriptImport { module, export } => {
                 let name = match export {
                     Some(range) => file.text(range)?,
@@ -263,20 +492,69 @@ impl<'source> Index<'source> {
                 }
                 self.javascript_export(file, file.text(module)?, name, ModuleMode::Esm, role, work)
             }
-            StaticBindingKind::JavaScriptRequire {
-                module,
-                export: Some(export),
-                require,
-            } if self.builtin_require(file, require.start, work) => self.javascript_export(
-                file,
-                file.text(module)?,
-                file.text(export)?,
-                ModuleMode::CommonJs,
-                role,
-                work,
-            ),
+            StaticBindingKind::JavaScriptRequire { .. }
+                if matches!(
+                    role,
+                    rift_core::ReferenceRole::Read | rift_core::ReferenceRole::Write
+                ) =>
+            {
+                file.target_at(binding.name)
+            }
+            StaticBindingKind::JavaScriptRequire { .. } => {
+                self.javascript_require_value(file, binding, role, work)
+            }
+            StaticBindingKind::JavaScriptTypeImport { module, export }
+                if role == rift_core::ReferenceRole::Type =>
+            {
+                let mode = match self.javascript.mode(file.document.path.as_str(), work) {
+                    ModuleMode::CommonJs => ModuleMode::CommonJs,
+                    _ => ModuleMode::Esm,
+                };
+                self.javascript_export(
+                    file,
+                    file.text(module)?,
+                    file.text(export)?,
+                    mode,
+                    role,
+                    work,
+                )
+            }
             _ => None,
         }
+    }
+
+    fn javascript_require_value(
+        &self,
+        file: &File<'source>,
+        binding: &StaticBinding,
+        role: rift_core::ReferenceRole,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let StaticBindingKind::JavaScriptRequire {
+            module,
+            export,
+            require,
+        } = binding.kind
+        else {
+            return None;
+        };
+        if !self.builtin_require(file, require.start, work) {
+            return None;
+        }
+        if let Some(export) = export {
+            let module = file.text(module)?;
+            let export = file.text(export)?;
+            // `const { name } = require(module)` reads what `require(module).name` reads.
+            return self
+                .javascript_export(file, module, export, ModuleMode::CommonJs, role, work)
+                .or_else(|| self.javascript_module_value_member(file, module, export, role, work));
+        }
+        let value = super::javascript_exports::Exports {
+            files: &self.files,
+            modes: &self.javascript,
+        }
+        .resolve_module_value(file, file.text(module)?, role, work)?;
+        self.javascript_export_value(value, role, work)
     }
 
     fn javascript_member(
@@ -292,6 +570,32 @@ impl<'source> Index<'source> {
         {
             let owner = self.javascript_declared_type(file, annotation, work)?;
             return self.javascript_class_member(owner, member, MemberMode::Instance, role, work);
+        }
+        if role != rift_core::ReferenceRole::Type
+            && binding.kind == StaticBindingKind::Shadow
+            && let Some(owner) = self
+                .javascript_callback_parameter(file, binding, work)
+                .or_else(|| self.javascript_destructured_name(file, binding, work))
+        {
+            return self.javascript_class_member(owner, member, MemberMode::Instance, role, work);
+        }
+        // A member the last spread value of an object literal declares is that value's
+        // member (D35); members it does not declare stay the literal's own.
+        if role != rift_core::ReferenceRole::Type
+            && binding.kind == StaticBindingKind::Local
+            && let Some(target) =
+                self.javascript_spread_owner(file, binding, work)
+                    .and_then(|owner| {
+                        self.javascript_class_member(
+                            owner,
+                            member,
+                            MemberMode::Instance,
+                            role,
+                            work,
+                        )
+                    })
+        {
+            return Some(target);
         }
         match binding.kind {
             StaticBindingKind::JavaScriptEdgeNamespace { module } => self.javascript_export(
@@ -314,24 +618,92 @@ impl<'source> Index<'source> {
             StaticBindingKind::JavaScriptImport { .. } => {
                 self.javascript_imported_member(file, binding, member, role, work)
             }
-            StaticBindingKind::Local => {
-                let target = self.javascript_binding_target(file, binding, role, work)?;
-                self.javascript_object_member(target, member, role, work)
-            }
+            StaticBindingKind::Local => self
+                .javascript_binding_target(file, binding, role, work)
+                .and_then(|target| self.javascript_object_member(target, member, role, work))
+                .or_else(|| {
+                    if role == rift_core::ReferenceRole::Type {
+                        return None;
+                    }
+                    self.javascript_destructured_name(file, binding, work)
+                        .and_then(|owner| {
+                            self.javascript_class_member(
+                                owner,
+                                member,
+                                MemberMode::Instance,
+                                role,
+                                work,
+                            )
+                        })
+                        .or_else(|| self.javascript_returned_member(file, binding, member, work))
+                }),
             StaticBindingKind::JavaScriptRequire {
                 module,
                 export: None,
                 require,
-            } if self.builtin_require(file, require.start, work) => self.javascript_export(
-                file,
-                file.text(module)?,
-                member,
-                ModuleMode::CommonJs,
-                role,
-                work,
-            ),
+            } if self.builtin_require(file, require.start, work) => {
+                let module = file.text(module)?;
+                self.javascript_export(file, module, member, ModuleMode::CommonJs, role, work)
+                    .or_else(|| {
+                        self.javascript_module_value_member(file, module, member, role, work)
+                    })
+            }
             _ => None,
         }
+    }
+
+    /// The declared type of the name an object literal initializer spreads last, when that
+    /// literal initializes `binding`: the spread name's written type or the type its place
+    /// as a callback parameter gives it. In TypeScript a `let` keeps the type of its
+    /// initializer through later writes; in JavaScript a binding written again has none.
+    fn javascript_spread_owner(
+        &self,
+        file: &File<'source>,
+        binding: &StaticBinding,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let spread = *file.spread_values.get(&binding.name)?;
+        if javascript_source(file.document.path.as_str())
+            && file.javascript_binding_written(binding, work)
+        {
+            return None;
+        }
+        let spread_binding = js_binding(
+            file,
+            &self.javascript,
+            file.text(spread)?,
+            spread.start,
+            rift_core::ReferenceRole::Read,
+            work,
+        )?;
+        match file
+            .declared_types
+            .get(&spread_binding.name)
+            .copied()
+            .flatten()
+        {
+            Some(annotation) => self.javascript_declared_type(file, annotation, work),
+            None => self.javascript_callback_parameter(file, spread_binding, work),
+        }
+    }
+
+    /// A member of a required module's value: `module.exports = name` with `name` an object
+    /// declared in that module, or `module.exports = { ... }`.
+    fn javascript_module_value_member(
+        &self,
+        file: &File<'source>,
+        module: &'source str,
+        member: &'source str,
+        role: rift_core::ReferenceRole,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let value = super::javascript_exports::Exports {
+            files: &self.files,
+            modes: &self.javascript,
+        }
+        .resolve_module_value(file, module, role, work)?;
+        let target = self.javascript_export_value(value, role, work)?;
+        self.javascript_object_member(target, member, role, work)
     }
 
     fn javascript_imported_member(
@@ -368,15 +740,48 @@ impl<'source> Index<'source> {
         }
     }
 
-    fn builtin_require(&self, file: &File<'source>, position: u64, work: &mut Work) -> bool {
-        (self.javascript.mode(file.document.path.as_str(), work) == ModuleMode::CommonJs
-            || typescript_commonjs(file.document.path.as_str()))
-            && !file.blocked(position, work)
-            && matches!(
-                file.binding("require", position, |_| true, work),
-                Binding::Missing
-            )
-            && !file.javascript_reassigned("require", None)
+    pub(super) fn builtin_require(
+        &self,
+        file: &File<'source>,
+        position: u64,
+        work: &mut Work,
+    ) -> bool {
+        self.builtin_commonjs_name(file, "require", position, work)
+    }
+
+    fn builtin_commonjs_name(
+        &self,
+        file: &File<'source>,
+        name: &str,
+        position: u64,
+        work: &mut Work,
+    ) -> bool {
+        builtin_commonjs_name(file, &self.javascript, name, position, work)
+    }
+
+    fn javascript_commonjs_member(
+        &self,
+        file: &File<'source>,
+        receiver: &str,
+        member: &'source str,
+        position: u64,
+        role: rift_core::ReferenceRole,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let name = match receiver {
+            "exports" => member,
+            "module" => member.strip_prefix("exports.")?,
+            _ => return None,
+        };
+        if !self.builtin_commonjs_name(file, receiver, position, work) {
+            return None;
+        }
+        let export = super::javascript_exports::Exports {
+            files: &self.files,
+            modes: &self.javascript,
+        }
+        .resolve_file(file, name, ModuleMode::CommonJs, role, work)?;
+        self.javascript_export_value(export, role, work)
     }
 
     pub(super) fn edge_javascript_module(&self, path: &str) -> Option<&File<'source>> {
@@ -435,10 +840,86 @@ impl File<'_> {
     }
 }
 
+impl File<'_> {
+    /// Whether an assignment writes `binding` with a value that may not be callable: a write
+    /// of its name inside its scope that no inner binding of the same name takes, whose
+    /// value is not a function written in place. A write whose binding is ambiguous counts.
+    pub(super) fn javascript_binding_written(
+        &self,
+        binding: &StaticBinding,
+        work: &mut Work,
+    ) -> bool {
+        let Some(name) = self.text(binding.name) else {
+            return true;
+        };
+        let Some(writes) = self.assignments.name_writes.get(name) else {
+            return false;
+        };
+        let bindings = self.by_name.get(name).map_or(&[][..], Vec::as_slice);
+        writes.iter().any(|&start| {
+            // A function written in place keeps the binding callable (D35).
+            if !binding.scope.contains(start) || self.function_writes.contains(&start) {
+                return false;
+            }
+            // The innermost scope holding the write decides which binding it writes.
+            let mut innermost: Option<rift_syntax::ByteRange> = None;
+            let mut takes = false;
+            for candidate in bindings {
+                if !work.charge() {
+                    return true;
+                }
+                if !candidate.scope.contains(start) {
+                    continue;
+                }
+                match innermost {
+                    Some(scope) if scope == candidate.scope => {
+                        takes |= candidate.name == binding.name;
+                    }
+                    Some(scope) if !scope.encloses(candidate.scope) => {}
+                    _ => {
+                        innermost = Some(candidate.scope);
+                        takes = candidate.name == binding.name;
+                    }
+                }
+            }
+            takes
+        })
+    }
+}
+
+impl File<'_> {
+    /// Whether an assignment inside the scope of `binding` writes its name again. A
+    /// write to an inner binding of the same name counts too: the check only refuses.
+    pub(super) fn javascript_binding_reassigned(&self, binding: &StaticBinding) -> bool {
+        self.text(binding.name)
+            .and_then(|name| self.assignments.name_writes.get(name))
+            .is_some_and(|writes| writes.iter().any(|&start| binding.scope.contains(start)))
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum MemberMode {
     Instance,
     Static,
+}
+
+/// Whether `name` at `position` is the `CommonJS` builtin: the file runs as `CommonJS` and
+/// no binding in scope takes the name.
+pub(super) fn builtin_commonjs_name<'source>(
+    file: &File<'source>,
+    modes: &PackageModes<'source>,
+    name: &str,
+    position: u64,
+    work: &mut Work,
+) -> bool {
+    (modes.mode(file.document.path.as_str(), work) == ModuleMode::CommonJs
+        || typescript_commonjs(file.document.path.as_str()))
+        && !file.blocked(position, work)
+        && matches!(
+            file.binding(name, position, |_| true, work),
+            Binding::Missing
+        )
+        && !file.javascript_reassigned(name, None)
 }
 
 pub(super) fn js_binding<'source>(
@@ -449,9 +930,7 @@ pub(super) fn js_binding<'source>(
     role: rift_core::ReferenceRole,
     work: &mut Work,
 ) -> Option<&'source StaticBinding> {
-    if file.blocked(position, work)
-        || (role == rift_core::ReferenceRole::Call && file.javascript_reassigned(name, None))
-    {
+    if file.blocked(position, work) {
         return None;
     }
     let mut best: Option<&StaticBinding> = None;
@@ -461,9 +940,24 @@ pub(super) fn js_binding<'source>(
         position,
         work,
         |binding| {
+            // A type a documentation comment imports names no value.
+            if role != rift_core::ReferenceRole::Type
+                && matches!(binding.kind, StaticBindingKind::JavaScriptTypeImport { .. })
+            {
+                return false;
+            }
             let symbol = file.target_at(binding.name).map(|target| target.symbol);
             if role == rift_core::ReferenceRole::Type {
-                symbol.is_none_or(|symbol| symbol.kind != "variable")
+                let javascript = javascript_source(file.document.path.as_str());
+                // A JavaScript type names a class value; a name bound by `require` can hold one.
+                let required_value =
+                    matches!(binding.kind, StaticBindingKind::JavaScriptRequire { .. })
+                        && javascript;
+                // A TypeScript function names no type: an interface of the same name does.
+                required_value
+                    || symbol.is_none_or(|symbol| {
+                        symbol.kind != "variable" && (javascript || symbol.kind != "function")
+                    })
             } else {
                 symbol.is_none_or(|symbol| !matches!(symbol.kind, "interface" | "type_alias"))
             }
@@ -486,5 +980,7 @@ pub(super) fn js_binding<'source>(
         .is_some_and(|function| !function.encloses(binding.name));
     let available =
         binding.available_from <= position || role == rift_core::ReferenceRole::Type || deferred;
-    (!ambiguous && available).then_some(binding)
+    let written =
+        role == rift_core::ReferenceRole::Call && file.javascript_binding_written(binding, work);
+    (!ambiguous && available && !written).then_some(binding)
 }

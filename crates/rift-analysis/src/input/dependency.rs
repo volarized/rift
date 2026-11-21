@@ -179,6 +179,36 @@ impl<'input> PackageDependency<'input> {
         ))
     }
 
+    /// Follows `aliases` edges of the admitted publication from `identity` to the identity
+    /// that declares it. A cycle or an exceeded bound answers the last identity reached.
+    pub(crate) fn defining(
+        self,
+        mut identity: rift_core::SymbolId,
+        work: &mut usize,
+        work_max: usize,
+    ) -> rift_core::SymbolId {
+        let mut visited = std::collections::BTreeSet::new();
+        while visited.insert(identity.clone()) {
+            let mut next = None;
+            for edge in &self.publication.edges {
+                if charge(work, 1, work_max).is_none() {
+                    return identity;
+                }
+                if edge.from.0 == identity.as_str()
+                    && edge.kinds.contains(&rift_protocol::read::EdgeKind::Aliases)
+                {
+                    next = rift_core::SymbolId::new(edge.to.0.as_str()).ok();
+                    break;
+                }
+            }
+            match next {
+                Some(next) => identity = next,
+                None => break,
+            }
+        }
+        identity
+    }
+
     /// Checks one requested target against admitted identity and original source.
     ///
     /// Every visited row and compared source byte spends the caller's work bound.

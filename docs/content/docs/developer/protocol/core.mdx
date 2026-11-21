@@ -101,10 +101,15 @@ that physical source address.
 
 ## Edge provider
 
-Every `Edge` carries `provider`: `static` for static analysis
-captured into the index, `engine` for a language engine embedded in Rift, or `lsp` for a
-language server reached through LSP. Its `derivation` records resolution, syntax, or heuristic
-analysis; its optional `producer` names the external producer. Package edges carry the same fields.
+Stored edges retain one row per analysis: `static` for static analysis captured into the
+index, `engine` for a language engine embedded in Rift, or `lsp` for a language server reached
+through LSP. Read answers merge rows with the same `from`, `kind`, `to`, and `occurrence`.
+Their `derivation` records resolution, syntax, or heuristic analysis; optional `producer` names
+an external producer.
+
+Read edges omit analyses by default. `include: { providers: true }` attaches the sorted
+`providers` set, for example `["engine", "lsp", "static"]`.
+SPARQL keeps `:provider` for explicit selections and filters over the stored facts.
 
 ## History facts
 

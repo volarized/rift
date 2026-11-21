@@ -1,4 +1,503 @@
 #[test]
+fn test_typescript_export_overloads_keep_one_checked_callable() {
+    let source = "function leaf() {} export function run(value: string): void; export function run(value: number): void; export function run(value: unknown) { leaf(); }";
+    let document = syntax("jobs.ts", source);
+    assert_eq!(
+        document
+            .facts()
+            .symbols()
+            .iter()
+            .filter(|symbol| symbol.name == "run")
+            .count(),
+        3
+    );
+    let result = resolution(
+        "typescript",
+        &[
+            (
+                "main.ts",
+                "import { run } from './jobs.js'; export function root() { run(1); }",
+            ),
+            ("jobs.ts", source),
+        ],
+        &[],
+        WORK_MAX,
+    );
+    let imported = calls(&result, "main.ts").collect::<Vec<_>>();
+    assert_eq!(imported.len(), 1, "{result:?}");
+    assert!(target(imported[0]).ends_with(".%2Fjobs.ts/run"));
+    assert!(
+        imported[0]
+            .edge_from
+            .as_ref()
+            .expect("caller")
+            .as_str()
+            .ends_with(".%2Fmain.ts/root")
+    );
+    assert_eq!(calls(&result, "jobs.ts").count(), 1);
+}
+
+#[test]
+fn test_ecmascript_exported_duplicate_bodies_stay_ambiguous() {
+    for (language, main, jobs) in [
+        ("javascript", "main.mjs", "jobs.mjs"),
+        ("typescript", "main.ts", "jobs.ts"),
+    ] {
+        let source =
+            format!("import {{ run }} from './{jobs}'; export function root() {{ run(); }}");
+        let result = resolution(
+            language,
+            &[
+                (main, &source),
+                (jobs, "export function run() {} export function run() {}"),
+            ],
+            &[],
+            WORK_MAX,
+        );
+        assert_eq!(calls(&result, main).count(), 0, "{language}: {result:?}");
+        if language == "typescript" {
+            let result = resolution(
+                language,
+                &[
+                    (main, &source),
+                    (
+                        jobs,
+                        "export function run() {} export function run(value: string): void; export function run() {}",
+                    ),
+                ],
+                &[],
+                WORK_MAX,
+            );
+            assert_eq!(calls(&result, main).count(), 0, "{result:?}");
+        }
+    }
+}
+
+#[test]
+fn test_commonjs_local_object_members_resolve_only_stable_callables() {
+    for (change, expected) in [
+        ("", 2),
+        ("object.run = other;", 1),
+        ("object[key] = other;", 1),
+        ("object = other;", 1),
+        ("[object] = values;", 1),
+        ("ob\\u006aect = other;", 1),
+        ("object.r\\u0075n = other;", 1),
+        ("object.run = function() {};", 1),
+        ("function change(object) { object.run = other; }", 2),
+        ("other.run = unknown;", 2),
+    ] {
+        for initializer in ["{}", "Object.create(null)"] {
+            let source = format!(
+                "function leaf() {{}} var object = {initializer}; object /* assignment */ . run = function() {{ leaf(); }}; {change} object /* call */ . run();"
+            );
+            for (language, path) in [("javascript", "main.cjs"), ("typescript", "main.cts")] {
+                let result = resolution(language, &[(path, &source)], &[], WORK_MAX);
+                assert_eq!(
+                    calls(&result, path).count(),
+                    expected,
+                    "{language}: {source}: {result:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_commonjs_local_object_members_resolve_only_their_receiver_binding() {
+    for source in [
+        "var res = {}; res.clear = function clear() { const opts = { expires: 1 }; return opts.expires; }; res.set = function() { const opts = {}; opts.expires = 2; return opts; }; module.exports = res;",
+        "function root(receiver) { receiver.clear = function() { const opts = { expires: 1 }; return opts.expires; }; receiver.set = function() { const opts = {}; opts.expires = 2; }; }",
+    ] {
+        for (language, path) in [("javascript", "main.cjs"), ("typescript", "main.cts")] {
+            let result = resolution(language, &[(path, source)], &[], WORK_MAX);
+            let accesses = result
+                .occurrences
+                .iter()
+                .filter(|edge| {
+                    matches!(edge.role, ReferenceRole::Read | ReferenceRole::Write)
+                        && target(edge).ends_with("/expires")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(accesses.len(), 1, "{language}: {source}: {accesses:?}");
+            assert_eq!(accesses[0].role, ReferenceRole::Read);
+            assert_eq!(source_of(accesses[0], source), "opts.expires");
+        }
+    }
+}
+
+#[test]
+fn test_commonjs_prototype_methods_supply_callers_and_containment() {
+    let source = "function leaf() {} function View() {} View.prototype.render = function render() { leaf(); render(); }; function Other() {} Other.prototype.lookup = function() { leaf(); };";
+    for (language, path) in [("javascript", "main.cjs"), ("typescript", "main.cts")] {
+        let result = resolution(language, &[(path, source)], &[], WORK_MAX);
+        let body_calls = calls(&result, path).collect::<Vec<_>>();
+        assert_eq!(body_calls.len(), 3, "{language}: {result:?}");
+        assert!(
+            body_calls[0]
+                .edge_from
+                .as_ref()
+                .expect("method caller")
+                .as_str()
+                .ends_with("/View/render")
+        );
+        assert!(target(body_calls[1]).ends_with("/View/render"));
+        assert!(
+            body_calls[2]
+                .edge_from
+                .as_ref()
+                .expect("method caller")
+                .as_str()
+                .ends_with("/Other/lookup")
+        );
+        let contains = result
+            .occurrences
+            .iter()
+            .filter(|edge| {
+                edge.edge_kind == Some(rift_protocol::read::EdgeKind::Contains)
+                    && target(edge).ends_with("/View/render")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(contains.len(), 1);
+        assert!(
+            contains[0]
+                .edge_from
+                .as_ref()
+                .expect("constructor owner")
+                .as_str()
+                .ends_with("/View")
+        );
+    }
+}
+
+#[test]
+fn test_commonjs_module_require_imports_keep_file_and_lexical_binding_facts() {
+    let source = "var other = require('./other.cjs'); var path = require('node:path'); function use() { return other; } function usePath() { return path; } module.exports = other;";
+    for (language, path, other) in [
+        ("javascript", "main.cjs", "other.cjs"),
+        ("typescript", "main.cts", "other.cts"),
+    ] {
+        let document = syntax(path, source);
+        let facts = document.facts().static_facts().expect("static facts");
+        let binding = facts
+            .bindings()
+            .iter()
+            .find(|binding| {
+                &source[usize::try_from(binding.name.start).expect("start")
+                    ..usize::try_from(binding.name.end).expect("end")]
+                    == "other"
+            })
+            .expect("local binding");
+        assert!(matches!(
+            binding.kind,
+            rift_syntax::StaticBindingKind::JavaScriptRequire { export: None, .. }
+        ));
+        let result = resolution(
+            language,
+            &[
+                (path, source),
+                (other, "var app = { value: 1 }; module.exports = app;"),
+            ],
+            &[],
+            WORK_MAX,
+        );
+        let imports = result
+            .occurrences
+            .iter()
+            .filter(|edge| {
+                edge.role == ReferenceRole::Import && edge.binding.unit().key().as_str() == path
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(imports.len(), 1, "{language}: {imports:?}");
+        assert!(imports[0].target_binding.is_none(), "file import");
+        assert!(target(imports[0]).contains("other."));
+        assert!(
+            result
+                .occurrences
+                .iter()
+                .any(|edge| edge.role == ReferenceRole::Read && target(edge).ends_with("/path")),
+            "{language}: local external require binding"
+        );
+        assert_eq!(
+            result
+                .occurrences
+                .iter()
+                .filter(|edge| edge.role == ReferenceRole::Read && target(edge).ends_with("/other"))
+                .count(),
+            2,
+            "{language}"
+        );
+    }
+}
+
+#[test]
+fn test_commonjs_module_require_imports_obey_package_default_and_module_syntax() {
+    let require = "var other = require('./other.js'); function use() { return other; }";
+    let metadata = [("package.json", r#"{"name":"fixture","version":"1.0.0"}"#)];
+    for (prefix, expected) in [
+        ("", 1),
+        ("async function nested() { await task; }", 1),
+        ("const nested = async () => { await task; };", 1),
+        ("{ let module; }", 1),
+        ("var module;", 1),
+        ("void import('./side.js');", 1),
+        ("export {};", 0),
+        ("import './side.js';", 0),
+        ("const url = import.meta.url;", 0),
+        ("await task;", 0),
+        ("for await (const item of items) {}", 0),
+        ("const module = {};", 0),
+        ("let __filename;", 0),
+        ("class __dirname {}", 0),
+        ("const { module } = wrapper;", 0),
+    ] {
+        let source = format!("{prefix}\n{require}");
+        let result = resolution(
+            "javascript",
+            &[("main.js", &source), ("other.js", "module.exports = {};")],
+            &metadata,
+            WORK_MAX,
+        );
+        assert_eq!(
+            result
+                .occurrences
+                .iter()
+                .filter(|edge| edge.role == ReferenceRole::Import)
+                .count(),
+            expected,
+            "{prefix}: {result:?}"
+        );
+    }
+    for prefix in [
+        "function use(require) {",
+        "function use(require, require) {",
+        "function use() { const require = loader;",
+        "function use() { require = loader;",
+    ] {
+        let source = format!("{prefix} var other = require('./other.js'); return other; }}");
+        let result = resolution(
+            "javascript",
+            &[("main.js", &source), ("other.js", "module.exports = {};")],
+            &metadata,
+            WORK_MAX,
+        );
+        assert!(
+            !result
+                .occurrences
+                .iter()
+                .any(|edge| edge.role == ReferenceRole::Import),
+            "{prefix}"
+        );
+    }
+}
+
+#[test]
+fn test_commonjs_module_require_imports_refuse_ambiguous_file_candidates() {
+    for (language, path) in [("javascript", "main.cjs"), ("typescript", "main.cts")] {
+        let result = resolution(
+            language,
+            &[
+                (
+                    path,
+                    "var other = require('./other'); function use() { return other; }",
+                ),
+                ("other.js", "module.exports = {};"),
+                ("other.ts", "module.exports = {};"),
+            ],
+            &[],
+            WORK_MAX,
+        );
+        assert!(
+            !result
+                .occurrences
+                .iter()
+                .any(|edge| edge.role == ReferenceRole::Import)
+        );
+    }
+}
+
+#[test]
+fn test_commonjs_function_assignments_resolve_export_and_local_names() {
+    let source = "function leaf() {}\nexports.run = function(value) { leaf(); };\nexports.other = function inner() { inner(); leaf(); };\nmodule.exports.third = function named() { leaf(); };\nfunction hidden(exports) { exports.run(); }\ninner();";
+    for (language, path, other) in [
+        ("javascript", "main.cjs", "other.cjs"),
+        ("typescript", "main.cts", "other.cts"),
+    ] {
+        let result = resolution(
+            language,
+            &[
+                (path, source),
+                (other, "module.exports = function(value) { return 1; };"),
+            ],
+            &[],
+            WORK_MAX,
+        );
+        let pairs = calls(&result, path)
+            .map(|call| {
+                (
+                    call.edge_from
+                        .as_ref()
+                        .map(|id| id.as_str().rsplit('/').next().expect("caller")),
+                    target(call).rsplit('/').next().expect("callee"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pairs,
+            [
+                (Some("run"), "leaf"),
+                (Some("other"), "other"),
+                (Some("other"), "leaf"),
+                (Some("third"), "leaf")
+            ],
+            "{language}"
+        );
+    }
+}
+
+#[test]
+fn test_commonjs_function_assignments_refuse_duplicate_and_shadowed_exports() {
+    let source = "exports.run = function first() {};\nexports.run = function second() {};\nexports.guard = function() {};\nexports.run(); exports.guard();\nfunction shadow(exports) { exports.guard(); }";
+    for (language, path) in [("javascript", "main.cjs"), ("typescript", "main.cts")] {
+        let result = resolution(language, &[(path, source)], &[], WORK_MAX);
+        let targets = calls(&result, path).map(target).collect::<Vec<_>>();
+        assert_eq!(targets.len(), 1, "{language}: {targets:?}");
+        assert!(targets[0].ends_with("/guard"));
+    }
+}
+
+#[test]
+fn test_commonjs_function_assignments_resolve_anonymous_module_values() {
+    for (language, path, other) in [
+        ("javascript", "main.cjs", "other.cjs"),
+        ("typescript", "main.cts", "other.cts"),
+    ] {
+        let result = resolution(
+            language,
+            &[
+                (path, "const run = require('./other.cjs'); run();"),
+                (other, "module.exports = function(value) { return value; };"),
+            ],
+            &[],
+            WORK_MAX,
+        );
+        let targets = calls(&result, path).map(target).collect::<Vec<_>>();
+        assert_eq!(targets.len(), 1, "{language}: {targets:?}");
+        assert!(targets[0].ends_with("/default"));
+    }
+}
+
+#[test]
+fn test_commonjs_function_assignments_do_not_name_inline_callbacks_as_outer_functions() {
+    let source =
+        "function leaf() {} function root() { unknown(function inner() { inner(); }); leaf(); }";
+    for (language, path) in [("javascript", "main.cjs"), ("typescript", "main.cts")] {
+        let result = resolution(language, &[(path, source)], &[], WORK_MAX);
+        let targets = calls(&result, path).map(target).collect::<Vec<_>>();
+        assert_eq!(targets.len(), 1, "{language}: {targets:?}");
+        assert!(targets[0].ends_with("/leaf"));
+    }
+}
+
+#[test]
+fn test_commonjs_function_assignments_refuse_later_export_mutations() {
+    for mutation in [
+        "function change() { exports.run = replacement; }",
+        "function change() { exports /* receiver */ . run = replacement; }",
+        "function change(require) { exports.run = replacement; }",
+        "function change() { module.exports.run = replacement; }",
+        "function change() { module.exports = replacement; }",
+        "function change() { exports[key] = replacement; }",
+        "function change() { exports.run++; }",
+        "function change() { exp\\u006frts.run = replacement; }",
+        "function change() { exports.r\\u0075n = replacement; }",
+    ] {
+        let source = format!("exports.run = function() {{}}; {mutation} exports.run();");
+        for (language, path) in [("javascript", "main.cjs"), ("typescript", "main.cts")] {
+            let result = resolution(language, &[(path, &source)], &[], WORK_MAX);
+            assert_eq!(calls(&result, path).count(), 0, "{language}: {mutation}");
+        }
+    }
+    for mutation in [
+        "function change(exports) { exports.run = replacement; }",
+        "function change(module) { module.exports.run = replacement; }",
+        "function change() { other.run = replacement; }",
+        "function change() { exports.run.extra = replacement; }",
+    ] {
+        let source = format!("exports.run = function() {{}}; {mutation} exports.run();");
+        for (language, path) in [("javascript", "main.cjs"), ("typescript", "main.cts")] {
+            let result = resolution(language, &[(path, &source)], &[], WORK_MAX);
+            assert_eq!(calls(&result, path).count(), 1, "{language}: {mutation}");
+        }
+    }
+}
+
+#[test]
+fn test_ecmascript_member_comments_keep_authored_access_targets() {
+    let source =
+        "const options = { value: 1 }; function run() { return options /* receiver */ . value; }";
+    for (language, path) in [("javascript", "main.cjs"), ("typescript", "main.cts")] {
+        let result = resolution(language, &[(path, source)], &[], WORK_MAX);
+        assert_eq!(
+            result
+                .occurrences
+                .iter()
+                .filter(|edge| edge.role == ReferenceRole::Read
+                    && target(edge).ends_with("/options/value"))
+                .count(),
+            1,
+            "{language}"
+        );
+    }
+}
+
+#[test]
+fn test_commonjs_function_assignments_distinguish_module_values_from_default_properties() {
+    let source = "const whole = require('./other.cjs'); const member = require('./other.cjs').default; whole(); member();";
+    for (language, path, other) in [
+        ("javascript", "main.cjs", "other.cjs"),
+        ("typescript", "main.cts", "other.cts"),
+    ] {
+        let result = resolution(
+            language,
+            &[
+                (path, source),
+                (other, "exports.default = function inner() {};"),
+            ],
+            &[],
+            WORK_MAX,
+        );
+        let calls = calls(&result, path)
+            .map(|edge| source_of(edge, source))
+            .collect::<Vec<_>>();
+        assert_eq!(calls, ["member()"], "{language}");
+    }
+}
+
+#[test]
+fn test_ecmascript_parameters_shadow_only_their_bound_names() {
+    let source = "function leaf() {}\nfunction run(value) { leaf(); }\nfunction shadow(leaf) { leaf(); }\nfunction pattern({ leaf: renamed }, [other], ...rest) { leaf(); renamed(); other(); rest(); }\nfunction duplicate() { function leaf() {} function leaf() {} leaf(); }";
+    for (language, path) in [("javascript", "main.js"), ("typescript", "main.ts")] {
+        let document = syntax(path, source);
+        assert!(
+            document
+                .facts()
+                .static_facts()
+                .expect("static facts")
+                .unsupported_bindings()
+                .is_empty()
+        );
+        let result = resolution(language, &[(path, source)], &[], WORK_MAX);
+        let resolved = calls(&result, path).collect::<Vec<_>>();
+        assert_eq!(resolved.len(), 2, "{language}: {resolved:?}");
+        for call in resolved {
+            assert!(target(call).ends_with("/leaf"));
+            assert_eq!(source_of(call, source), "leaf()");
+        }
+    }
+}
+
+#[test]
 fn test_typescript_declared_interface_calls_survive_unrelated_member_writes() {
     let source = "interface Task { run(): void; } function root(input: Task, other) { other.run = () => {}; input.run(); }";
     let result = resolution("typescript", &[("main.ts", source)], &[], WORK_MAX);
@@ -148,6 +647,185 @@ use rift_provider::NormalizedTarget;
 use rift_syntax::DocumentPlacement;
 
 const WORK_MAX: usize = 10_000;
+
+mod python_aliases;
+mod python_ancestry;
+mod python_class_rebinding;
+mod python_conditional_methods;
+mod python_decorators;
+mod python_elements;
+mod python_external_bases;
+mod python_imports;
+mod python_joins;
+mod python_optional;
+mod python_overloads;
+mod python_property_writes;
+
+#[test]
+fn test_python_property_returns_resolve_instance_members_and_aliases() {
+    let source = "class Item:\n    def read(self): pass\nclass Owner:\n    @property\n    def item(self) -> Item: return Item()\n    def use(self): return self.item.read()\nclass Child(Owner):\n    def use(self): return self.item.read()\ndef typed(owner: Owner):\n    owner.item.read()\n    alias = owner.item\n    alias.read()\ndef constructed(): return Owner().item.read()\n";
+    let result = resolution("python", &[("main.py", source)], &[], WORK_MAX);
+    let reads = calls(&result, "main.py")
+        .filter(|edge| target(edge) == "rift://symbol/local/python/main/Item/read")
+        .map(|edge| {
+            (
+                source_of(edge, source),
+                edge.edge_from.as_ref().expect("caller").as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reads,
+        [
+            (
+                "self.item.read()",
+                "rift://symbol/local/python/main/Owner/use"
+            ),
+            (
+                "self.item.read()",
+                "rift://symbol/local/python/main/Child/use"
+            ),
+            ("owner.item.read()", "rift://symbol/local/python/main/typed"),
+            ("alias.read()", "rift://symbol/local/python/main/typed"),
+            (
+                "Owner().item.read()",
+                "rift://symbol/local/python/main/constructed"
+            ),
+        ],
+        "{result:?}"
+    );
+    assert!(
+        result.occurrences.iter().any(|edge| {
+            edge.role == ReferenceRole::Read
+                && edge.edge_kind.is_none()
+                && source_of(edge, source) == "self.item"
+                && target(edge) == "rift://symbol/local/python/main/Owner/item"
+        }),
+        "{result:?}"
+    );
+    assert!(
+        result.occurrences.iter().any(|edge| {
+            edge.role == ReferenceRole::Type
+                && source_of(edge, source) == "Item"
+                && target(edge) == "rift://symbol/local/python/main/Item"
+        }),
+        "{result:?}"
+    );
+    assert!(!result.exhausted);
+}
+
+#[test]
+fn test_python_property_returns_refuse_shadowing_in_decorated_classes() {
+    let source = "class Item:\n    def read(self): pass\n@decorate\nclass Owner:\n    @property\n    def item(self) -> Item: pass\n    from missing import item\ndef use(owner: Owner): return owner.item.read()\n";
+    let result = resolution("python", &[("main.py", source)], &[], WORK_MAX);
+    assert!(
+        calls(&result, "main.py")
+            .all(|edge| target(edge) != "rift://symbol/local/python/main/Item/read"),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn test_python_property_returns_follow_imported_receiver_annotations() {
+    let result = resolution(
+        "python",
+        &[
+            (
+                "models.py",
+                "class Item:\n    def read(self): pass\nclass Owner:\n    @property\n    def item(self) -> Item: pass\n",
+            ),
+            (
+                "main.py",
+                "from models import Owner\ndef use(owner: Owner): return owner.item.read()\n",
+            ),
+        ],
+        &[],
+        WORK_MAX,
+    );
+    assert_eq!(
+        calls(&result, "main.py").map(target).collect::<Vec<_>>(),
+        ["rift://symbol/local/python/models/Item/read"],
+        "{result:?}"
+    );
+}
+
+#[test]
+fn test_python_property_returns_refuse_descriptors_shadowing_and_ambiguity() {
+    let prefix = "class Item:\n    def read(self): pass\nclass Other: pass\n";
+    let cases = [
+        "class Owner:\n    @property\n    def item(self) -> Item: pass\n    @classmethod\n    def use(cls): return cls.item.read()\ndef use():\n    Owner.item.read()\n    alias = Owner\n    alias.item.read()\n",
+        "property = unknown\nclass Owner:\n    @property\n    def item(self) -> Item: pass\ndef use(owner: Owner): return owner.item.read()\n",
+        "class Owner:\n    @other.property\n    def item(self) -> Item: pass\ndef use(owner: Owner): return owner.item.read()\n",
+        "class Owner:\n    @property\n    @decorate\n    def item(self) -> Item: pass\ndef use(owner: Owner): return owner.item.read()\n",
+        "class Owner:\n    @property\n    def item(self) -> Item | Other: pass\ndef use(owner: Owner): return owner.item.read()\n",
+        "class Owner:\n    @property\n    def item(self) -> Item: pass\n    @property\n    def item(self) -> Other: pass\ndef use(owner: Owner): return owner.item.read()\n",
+        "class Owner:\n    def item(self) -> Item: pass\ndef use(owner: Owner): return owner.item.read()\n",
+        "class Owner:\n    @property\n    def item(self) -> Item: pass\ndef use(owner: Owner):\n    owner = unknown\n    return owner.item.read()\n",
+        "def outer(property):\n    class Owner:\n        @property\n        def item(self) -> Item: pass\n    def use(owner: Owner): return owner.item.read()\n",
+        "class Owner:\n    @property\n    def item(self) -> Item: pass\n    item = unknown\ndef use(owner: Owner): return owner.item.read()\n",
+    ];
+    for case in cases {
+        let source = format!("{prefix}{case}");
+        let result = resolution("python", &[("main.py", &source)], &[], WORK_MAX);
+        assert!(
+            calls(&result, "main.py")
+                .all(|edge| { target(edge) != "rift://symbol/local/python/main/Item/read" }),
+            "{source}\n{result:?}"
+        );
+        assert!(!result.exhausted);
+    }
+}
+
+#[test]
+fn test_python_wildcard_imports_keep_modules_without_resolving_exports() {
+    let source = "from .leaf import *\ndef use(): return leaf()\n";
+    let result = resolution(
+        "python",
+        &[
+            ("pkg/__init__.py", source),
+            ("pkg/leaf.py", "value = 1\ndef leaf(): pass\n"),
+        ],
+        &[],
+        WORK_MAX,
+    );
+    let imports = result
+        .occurrences
+        .iter()
+        .filter(|edge| edge.role == ReferenceRole::Import)
+        .collect::<Vec<_>>();
+    assert_eq!(imports.len(), 1, "{result:?}");
+    assert_eq!(source_of(imports[0], source), "*");
+    assert_eq!(target(imports[0]), "rift://symbol/local/python/pkg/leaf");
+    assert_eq!(
+        imports[0]
+            .edge_from
+            .as_ref()
+            .map(rift_core::SymbolId::as_str),
+        Some("rift://symbol/local/python/pkg")
+    );
+    assert_eq!(calls(&result, "pkg/__init__.py").count(), 0);
+}
+
+#[test]
+fn test_python_wildcard_imports_refuse_unknown_and_ambiguous_modules() {
+    let result = resolution(
+        "python",
+        &[
+            ("main.py", "from missing import *\nfrom pkg.leaf import *\n"),
+            ("pkg/leaf.py", "value = 1\n"),
+            ("pkg/leaf/__init__.py", "value = 2\n"),
+        ],
+        &[],
+        WORK_MAX,
+    );
+    assert!(
+        result
+            .occurrences
+            .iter()
+            .all(|edge| edge.role != ReferenceRole::Import),
+        "{result:?}"
+    );
+}
 
 #[test]
 fn test_typescript_named_value_imports_keep_import_edges() {
@@ -894,6 +1572,31 @@ fn calls<'source>(
     result.occurrences.iter().filter(move |occurrence| {
         occurrence.role == ReferenceRole::Call && occurrence.binding.unit().to_string() == unit
     })
+}
+
+/// Every resolved occurrence as (label, source identity, target identity); the label is `call`
+/// for calls, otherwise the edge kind or the role.
+fn labelled(result: &StaticResolution) -> Vec<(String, String, String)> {
+    result
+        .occurrences
+        .iter()
+        .map(|occurrence| {
+            let label = match (occurrence.role, occurrence.edge_kind) {
+                (ReferenceRole::Call, _) => "call".to_owned(),
+                (_, Some(kind)) => format!("{kind:?}"),
+                (role, None) => format!("{role:?}"),
+            };
+            (
+                label,
+                occurrence
+                    .edge_from
+                    .as_ref()
+                    .map(|from| from.as_str().to_owned())
+                    .unwrap_or_default(),
+                target(occurrence).to_owned(),
+            )
+        })
+        .collect()
 }
 
 fn target(occurrence: &StaticOccurrence) -> &str {
@@ -2529,3 +3232,5 @@ fn test_rust_field_and_method_names_keep_exact_access_targets() {
                         .expect("offset"))
     );
 }
+
+mod external;

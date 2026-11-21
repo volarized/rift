@@ -1420,7 +1420,7 @@ struct Records {
     units: Vec<PackageSourceUnit>,
     objects: Vec<Symbol>,
     declarations: Vec<PackageSymbol>,
-    edges: Vec<rift_protocol::read::Edge>,
+    edges: Vec<rift_protocol::index::StoredEdge>,
     occurrences: Vec<PackageOccurrence>,
     occurrence_languages: BTreeSet<String>,
     documents: Vec<PackageDocument>,
@@ -1723,7 +1723,7 @@ impl Records {
                 }
             }
             let kind = edge_kind(edge.kind());
-            self.edges.push(rift_protocol::read::Edge {
+            self.edges.push(rift_protocol::index::StoredEdge {
                 producer: None,
                 from: SymbolId::parse(from.as_str()).map_err(|_| {
                     errors::analysis::package_provider_failed()
@@ -3133,10 +3133,9 @@ mod tests {
         }
     }
 
-    /// A module exporting through `module.exports` and `exports.name` assignments exports
-    /// the declarations they name, the members of an exported class other than a `#`
-    /// private element, and a method written in the exported object. The provider declares
-    /// nothing for an `exports.name = function` assignment, so it adds no record.
+    /// Export assignments retain their named declarations, exported class members other
+    /// than private fields, and exported object methods. An additional captured function
+    /// assignment remains in the declaration inventory without changing this public set.
     #[test]
     fn test_a_module_exports_assignment_exports_the_declarations_it_names() {
         let source = "function helper() {}\n\
@@ -3170,6 +3169,7 @@ mod tests {
                 ("default.Runner", true),
                 ("default.helper", true),
                 ("default.start", true),
+                ("extra", false),
                 ("helper", true),
                 ("internal", false),
                 ("load", true),

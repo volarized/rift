@@ -128,7 +128,7 @@ async fn assert_unestablished_capture(server: &RiftMcp) -> TestResult {
         matches!(&broken, QueryReadResult::Results(answer)
         if matches!(&answer.answer, QueryAnswer::Bindings { bindings, .. }
             if bindings.len() == 1 && matches!(bindings[0].get("s"), Some(RdfTerm::BlankNode { .. })))),
-        "the variance interface has no identity: {broken:?}"
+        "the unreadable declaration has no identity: {broken:?}"
     );
     Ok(())
 }
@@ -142,7 +142,8 @@ async fn fixture() -> TestResult<(tempfile::TempDir, RiftMcp)> {
     )?;
     std::fs::write(
         directory.path().join("broken.ts"),
-        "export interface Broken<out T> { value: T; }\n",
+        // A declaration whose own value is unreadable keeps no identity.
+        "export const Broken = { value: (globalThis as any)?.value ?? }\n",
     )?;
     std::fs::write(
         directory.path().join("helper.ts"),

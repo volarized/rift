@@ -161,7 +161,9 @@ mod tests {
                 kind: ExactKind("calls".to_owned()),
                 kinds: vec![EdgeKind::Calls],
                 occurrence: None,
-                provider: rift_protocol::read::EdgeProvider::Static,
+                providers: std::collections::BTreeSet::from([
+                    rift_protocol::read::EdgeProvider::Static,
+                ]),
                 derivation: EdgeDerivation::Syntax,
                 confidence: None,
                 extensions: Extensions::default(),

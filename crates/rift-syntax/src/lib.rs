@@ -52,7 +52,8 @@ pub use python::PythonSyntaxProvider;
 pub use rust::{RustQuery, RustQueryCapture, RustSyntaxProvider};
 pub use static_analysis::{
     HeritageEdge, StaticBinding, StaticBindingKind, StaticCall, StaticCallee,
-    StaticConditionalItem, StaticFacts, StaticFactsParts, StaticInherentImpl, StaticReexport,
+    StaticConditionalItem, StaticDeclaredReturn, StaticFacts, StaticFactsParts,
+    StaticFunctionContext, StaticInherentImpl, StaticMember, StaticParameter, StaticReexport,
     StaticReference, StaticRustUse,
 };
 pub use toml::TomlSyntaxProvider;

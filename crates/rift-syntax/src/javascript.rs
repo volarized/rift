@@ -362,9 +362,7 @@ mod tests {
         );
     }
 
-    /// An assignment marks nothing when its value is a function or class
-    /// expression, a member access, or an object behind a property export,
-    /// when its target is no export, or when a block holds it.
+    /// Captured property functions stay non-public without checked export context.
     #[test]
     fn test_an_export_assignment_marks_nothing_it_does_not_name() {
         let document = analyze(
@@ -376,6 +374,7 @@ mod tests {
                 ("helper", false),
                 ("config", false),
                 ("config.load", false),
+                ("extra", false),
                 ("load", false),
             ]
         );
@@ -797,11 +796,10 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_property_and_named_function_assignments_remain_unassociated() {
+    fn dynamic_property_and_non_export_assignments_remain_unassociated() {
         for source in [
             "exports[key] = function () {};",
             "other.open = function () {};",
-            "exports.open = function inner() {};",
             "exports.open = factory();",
         ] {
             let document = analyze(source);

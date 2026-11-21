@@ -1299,11 +1299,10 @@ async fn outgoing_walks_over_scripted_engines_match_the_served_schemas() -> Test
     Ok(())
 }
 
-/// A global API with declaration lookups but missing edge coverage returns
-/// typed unavailability in the advertised search result schema.
+/// A named runtime call remains schema-valid beside a warning for missing edge coverage.
 #[cfg(unix)]
 #[tokio::test]
-async fn a_package_walk_with_missing_edge_coverage_matches_the_served_schema() -> TestResult {
+async fn a_runtime_walk_with_captured_sources_matches_the_served_schema() -> TestResult {
     let global = GlobalFixture::start_with(global_api::FixtureOptions {
         python_collection: true,
         ..global_api::FixtureOptions::default()
@@ -1341,9 +1340,19 @@ async fn a_package_walk_with_missing_edge_coverage_matches_the_served_schema() -
         &structured,
         "an outgoing walk naming package callees",
     );
-    assert_eq!(structured["outcome"], "unavailable", "{structured}");
+    let rows = workspace_client::query::rows(&structured)?;
+    assert_eq!(rows.len(), 1, "{structured}");
     assert_eq!(
-        structured["reason"], "insufficient_coverage",
+        workspace_client::query::iri(&rows[0], "symbol")?,
+        "rift://symbol/stdlib/cpython/python/builtins/len",
+        "{structured}"
+    );
+    assert!(
+        structured["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .all(|warning| warning["code"] != "edge_coverage_missing"),
         "{structured}"
     );
     client.cancel().await?;

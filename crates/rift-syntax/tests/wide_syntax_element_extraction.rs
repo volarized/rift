@@ -322,6 +322,37 @@ fn a_declaration_after_many_attached_doc_lines_attaches_in_linear_time() {
 }
 
 #[test]
+fn ecmascript_assigned_methods_attach_doc_runs_in_linear_time() {
+    for provider in registry::providers().filter(|provider| {
+        matches!(
+            provider.language().name.as_str(),
+            "javascript" | "typescript"
+        )
+    }) {
+        let prefix = "const owner = {};\n";
+        let build = |count| {
+            format!(
+                "{prefix}{}owner.run = function() {{}};\n",
+                "/** Method. */\n".repeat(count)
+            )
+        };
+        let (document, lines) = analyze_linearly(provider, build, ATTACHED_DOC_LINES_MIN);
+        let method = document
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == "run")
+            .expect("assigned method");
+        assert_eq!(method.kind, "method");
+        assert_eq!(
+            method.range.start,
+            u64::try_from(prefix.len()).expect("prefix")
+        );
+        assert_eq!(method.documentation_ranges.len(), lines);
+        assert_eq!(method.documentation[0].text.lines().count(), lines);
+    }
+}
+
+#[test]
 fn many_headings_analyze_in_linear_time() {
     let provider = MarkdownSyntaxProvider::default();
     let build = |count| "# h\n".repeat(count);

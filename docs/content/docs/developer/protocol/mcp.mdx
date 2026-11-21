@@ -147,7 +147,12 @@ Requesting `:source` and `:score` projects the corresponding producer payload. S
 require those input values as stored facts on every result.
 
 `:max_results` and `:page` select a producer page. Outer `LIMIT` and `OFFSET` apply to the
-SPARQL result after evaluation. Missing producer coverage can make the query unavailable.
+SPARQL result after evaluation. Missing producer coverage can make the query unavailable; a
+producer bound does not. When a producer stops at one of its bounds (`results_truncated`,
+`lexical_ranking_truncated`, `pattern_matches_truncated`, `query_narrowed`, `change_truncated`),
+or the server reaches the solution, byte, or page bound of the producer pages it reads, the
+query evaluates over the rows the producer returned and pages them, with `pagination.total`
+counting those rows. `rift server logs` records the bound; the answer carries no warning for it.
 A package answered from the nearest collected release under `package_substituted` is covered.
 A global API read that fails answers `unavailable` with reason `read_failed`, and
 `rift server logs` names its `failure_class`.
@@ -169,8 +174,9 @@ ORDER BY ?path ?start
 
 Matching runs line by line. `(?i)` selects case-insensitive matching. Existing pattern length,
 compiled size, candidate rows, verified text size, and matches-per-file bounds remain in
-effect. Invalid patterns refuse with the registered field error. Incomplete pattern coverage
-cannot be evaluated as a complete graph, boolean, aggregate, or binding result.
+effect. Invalid patterns refuse with the registered field error. A pattern index that is still
+preparing cannot be evaluated as a complete graph, boolean, aggregate, or binding result; the
+matches a bound kept answer as the producer returned them.
 
 ### References and calls [#search-traversal]
 
@@ -335,6 +341,9 @@ without pagination. SPARQL `LIMIT` and `OFFSET` bound the result set before pagi
 
 The server bounds statement size, algebra, fact acquisition, and the evaluated answer.
 `[search.query] page_limit` sets the maximum encoded bytes per page, from 1 KiB to 4 MiB.
+An evaluated answer past its solution or byte bound holds the solutions before the bound, and
+a graph walk past its acquisition budget answers over the facts it acquired. Both page like any
+other answer, and `rift server logs` records the bound and its value.
 
 A query over the captured inventory - every symbol, call, reference, or usage it holds - answers
 from partly covered facts. This holds for a `SELECT` that joins, projects, filters, binds, orders,
@@ -342,7 +351,11 @@ or slices, and for an `ASK` that finds a witness; every row such an answer retur
 
 The answer's warnings name what is missing:
 
-- `source_unavailable` or `large_file_unparsed` - a file left out of the index
+- `source_unavailable` - a file left out of the index although no bound excluded it: bytes that
+  are not valid UTF-8, a NUL byte, or a refused declaration. A file a bound left out - past the
+  per-file byte bound, past `[providers.syntax]` `max_file`, or past the declarations the index
+  holds - is outside the indexed set, as a file the source policy excludes is: no answer names
+  it, and `rift server logs` records it
 - `framework_context_unresolved` - a framework whose context is unresolved; the file's ordinary
   declarations still answer
 - `engine_analysis_unavailable` - a language whose engine analysis is missing; the captured static
@@ -624,8 +637,10 @@ provider's own facts disagree.
 A `source_unavailable` record names a file the index left out - bytes that are not valid UTF-8,
 a file past its per-file bound, or a syntax tree the provider refused - so it answers no search or
 lookup while every other file stays available. A read logs at most eight omitted files in
-project-path order, followed by a `source_unavailable` summary if more files were omitted.
-The index build logs each omission.
+project-path order, followed by a `source_unavailable` summary if more files were omitted; a
+file a bound left out is not among them. The index build records each omission with its bound
+and measured value, one record per file for the first 64 files one build reads, then one record
+per publication counting the rest.
 
 Text search can produce these diagnostics:
 
@@ -641,7 +656,9 @@ Text search can produce these diagnostics:
   declaration such a file holds still answers.
 - `large_file_unparsed` - files past `[providers.syntax] max_file` are held as text the syntax
   provider does not parse: their text answers `search`, and none of their declarations answers a
-  symbol hit or `get_symbol`. `files` names them, at most eight, in project-path order.
+  symbol hit or `get_symbol`. `files` names them, at most eight, in project-path order. An
+  answer carries it only for files the request names in `paths.force_include` or a
+  comparison; the index build records every other such file in the log.
 - `lockfile_excluded` - a lockfile the request's `paths.include` selects is left out of search
   under the `[search.text]` key `excluded_lockfiles`. `rift://map` still carries the versions it
   pins, and naming the file in `paths.force_include` searches it for one request.

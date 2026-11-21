@@ -191,10 +191,12 @@ between OSS packages.
 
 #### Edge sources
 
-Each edge names the analysis that produced it through its
-[`provider`](/docs/developer/protocol/core#edge-provider) field. Static analysis captured
-into the index is `static`, an embedded language engine such as ty is `engine`, and a language
-server reached through LSP is `lsp`. [Edge queries](/docs/mcp#edge-provider) can filter by this field.
+Static analysis captured into the index is `static`, an embedded language engine such as ty
+is `engine`, and a language server reached through LSP is `lsp`. Rift retains those analyses
+in storage and merges their equal edges in read answers. The requested
+[`providers`](/docs/developer/protocol/core#edge-provider) set names the analyses that found
+an edge; answers omit it by default. [Edge queries](/docs/mcp#edge-provider) can filter the
+stored facts by `:provider`.
 
 ### Documentation
 

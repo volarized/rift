@@ -514,10 +514,28 @@ pub(crate) async fn callee_declarations(
     callees: &[PackageCallee],
     _served: &[WirePackageIdentity],
 ) -> Result<CalleeDeclarations, RiftError> {
+    let mut requests = u64::try_from(
+        declaration_requests(callees)
+            .len()
+            .saturating_add(callees.len()),
+    )
+    .unwrap_or(u64::MAX);
+    callee_declarations_bounded(client, callees, &mut requests).await
+}
+
+/// Names every position the accepted HTTP request budget can verify; other positions stay unnamed.
+pub(crate) async fn callee_declarations_bounded(
+    client: &GlobalClient,
+    callees: &[PackageCallee],
+    requests: &mut u64,
+) -> Result<CalleeDeclarations, RiftError> {
     use rift_protocol::source_read::DeclarationPositionResult;
     let mut named = HashMap::new();
     let mut verified = HashMap::new();
     for request in declaration_requests(callees) {
+        if !claim_declaration_request(requests) {
+            break;
+        }
         let answer = client.find_declarations(&request).await?;
         let encoding = match request.position_encoding {
             rift_protocol::source_read::PositionEncoding::Utf8 => {
@@ -538,7 +556,9 @@ pub(crate) async fn callee_declarations(
             else {
                 continue;
             };
-            if !captured_callee_source(client, callees, &position, &id, &mut verified).await? {
+            if !captured_callee_source(client, callees, &position, &id, &mut verified, requests)
+                .await?
+            {
                 continue;
             }
             let key = CalleePosition {
@@ -565,6 +585,7 @@ async fn captured_callee_source(
     position: &rift_protocol::source_read::SourcePosition,
     id: &SymbolId,
     verified: &mut HashMap<String, bool>,
+    requests: &mut u64,
 ) -> Result<bool, RiftError> {
     for callee in callees {
         let Some(held) = callee.captured_source() else {
@@ -599,6 +620,9 @@ async fn captured_callee_source(
             revision: Some(release.clone()),
             ..rift_protocol::read::FacetsParams::of(id.clone())
         };
+        if !claim_declaration_request(requests) {
+            return Ok(false);
+        }
         let answer = client.facets(&request).await?;
         let matched =
             answer.revision == release && declared_kinds_match(&answer, id, &position.unit, held);
@@ -606,6 +630,14 @@ async fn captured_callee_source(
         return Ok(matched);
     }
     Ok(true)
+}
+
+fn claim_declaration_request(requests: &mut u64) -> bool {
+    let Some(remaining) = requests.checked_sub(1) else {
+        return false;
+    };
+    *requests = remaining;
+    true
 }
 
 /// Whether the first page of `answer` lists the facets of `id` with an item syntax element in `unit`, and
@@ -941,8 +973,12 @@ fn search_request(
                 .map(|candidate| candidate.text().to_owned())
                 .collect(),
         ),
-        include: includes_source(params)
-            .then_some(PackageSearchRequestInclude { source: Some(true) }),
+        include: (includes_source(params) || params.include.providers).then_some(
+            PackageSearchRequestInclude {
+                source: includes_source(params).then_some(true),
+                providers: params.include.providers.then_some(true),
+            },
+        ),
         packages: Some(packages.to_vec()),
         phase: Some(match phase {
             QueryPhase::Precise => PackageSearchRequestPhase::Precise,
@@ -1791,7 +1827,7 @@ mod tests {
     fn search_request_preserves_query_members_and_phase() {
         let params: rift_protocol::read::SearchParams = serde_json::from_value(serde_json::json!({
             "query": "load config",
-            "include": {"source": true}
+            "include": {"source": true, "providers": true}
         }))
         .expect("search fixture is valid");
         let query = ParsedQuery::parse("load config").expect("query fixture is valid");
@@ -1811,7 +1847,10 @@ mod tests {
         );
         assert_eq!(
             broad.include,
-            Some(rift_cloud_client::PackageSearchRequestInclude { source: Some(true) })
+            Some(rift_cloud_client::PackageSearchRequestInclude {
+                source: Some(true),
+                providers: Some(true)
+            })
         );
     }
 

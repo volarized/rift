@@ -3141,7 +3141,10 @@ async fn test_fixture_enforces_active_server_bounds() {
 
     let (server, client) = operation_client(OperationFixture::TightSourceBound).await;
     let mut request = search_request();
-    request.include = Some(crate::PackageSearchRequestInclude { source: Some(true) });
+    request.include = Some(crate::PackageSearchRequestInclude {
+        source: Some(true),
+        providers: None,
+    });
     assert_registered_field(
         &(client.search_packages(&request, 20, 1).await).expect_err("registered refusal"),
         "rift.client.response_invalid",

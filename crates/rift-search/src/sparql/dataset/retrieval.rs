@@ -10,25 +10,49 @@ use crate::sparql::{RetrievalSelection, VOCABULARY_NAMESPACE, retrieval::RDF_JSO
 
 impl GraphDatasetBuilder {
     /// Adds one edge with its analysis and physical occurrence.
-    /// An original record identity keeps equal records separate; local edges carry none.
+    /// Analyses of the same endpoints, kind and occurrence share one identity.
+    /// The first row supplies evidence; each analysis retains its `:provider` fact.
     ///
     /// # Errors
     /// Refuses an edge that exceeds the dataset bounds or fails its RDF projection.
     pub fn insert_edge(
         &mut self,
         edge: &rift_protocol::read::Edge,
-        record: Option<&rift_protocol::edge_read::EdgeRecordId>,
+        _record: Option<&rift_protocol::edge_read::EdgeRecordId>,
     ) -> Result<(), RiftError> {
-        let fields = serde_json::to_value(edge).map_err(|_| projection_failure())?;
-        let encoded = fields.to_string();
-        let key = record.map_or("", rift_protocol::edge_read::EdgeRecordId::as_str);
-        let id = content_blank_node(&["edge", key, &encoded]);
-        let mut triples = vec![Triple::new(
+        let identity = serde_json::to_string(&(&edge.from, &edge.kind, &edge.to, &edge.occurrence))
+            .map_err(|_| projection_failure())?;
+        let id = content_blank_node(&["edge", &identity]);
+        let class = Triple::new(
             id.clone(),
             rdf::TYPE,
             super::super::vocabulary::VocabularyClass::Edge.iri(),
-        )];
-        project_fields(id.into(), fields, &mut triples, self.limits.triples_max())?;
+        );
+        let mut triples = Vec::new();
+        if !self
+            .dataset
+            .contains(class.as_ref().in_graph(oxrdf::GraphNameRef::DefaultGraph))
+        {
+            let mut fields = serde_json::to_value(edge).map_err(|_| projection_failure())?;
+            fields
+                .as_object_mut()
+                .ok_or_else(projection_failure)?
+                .remove("providers");
+            triples.push(class);
+            project_fields(
+                id.clone().into(),
+                fields,
+                &mut triples,
+                self.limits.triples_max(),
+            )?;
+        }
+        for provider in &edge.providers {
+            triples.push(Triple::new(
+                id.clone(),
+                vocabulary("provider"),
+                Literal::from(provider.as_ref()),
+            ));
+        }
         self.insert_triples(triples, oxrdf::GraphNameRef::DefaultGraph)
     }
 
