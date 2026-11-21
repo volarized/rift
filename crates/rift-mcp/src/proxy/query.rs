@@ -21,7 +21,9 @@ use rmcp::model::{CallToolRequestParams, CallToolResponse};
 
 use super::{RiftProxy, identity};
 use crate::output::{QueryDisplay, QueryOutput};
-use crate::server::candidates::{QueryPageOptions, collect_retrieval, query_page};
+use crate::server::candidates::{
+    QueryPageOptions, bound_combined_rows, collect_retrieval, query_page,
+};
 use crate::validation::ConfigurationState;
 
 const QUERY_WORKERS: usize = 2;
@@ -378,7 +380,7 @@ impl RiftProxy {
                 })
                 .await
             };
-            let result = match producer {
+            let mut result = match producer {
                 Ok(Ok(result)) => result,
                 Ok(Err(reason)) => {
                     return Ok(Err(Box::new(render(QueryReadResult::Unavailable(reason)))));
@@ -386,6 +388,9 @@ impl RiftProxy {
                 Err(ProducerFailure::Forwarded(response)) => return Ok(Err(response)),
                 Err(ProducerFailure::Internal(error)) => return Err(error),
             };
+            // Each service's rows are already within the solution bound; the services
+            // together share the byte bound, and a cut keeps the rows that fit.
+            bound_combined_rows(&mut result, 0, bytes_left, limits, request)?;
             let bytes = super::encode_bounded(&result, bytes_left)
                 .map_err(|_| query_failure("combined retrieval exceeds its byte bound"))?;
             bytes_left -= bytes.len();
@@ -459,14 +464,11 @@ impl RiftProxy {
                 Ok(result) => result,
                 Err(reason) => return Ok(Err(reason)),
             };
+            let stopped =
+                bound_combined_rows(&mut result, results.len(), bytes_left, limits, request)?;
             let bytes = super::encode_bounded(&result, bytes_left)
                 .map_err(|_| query_failure("combined patterns exceed their byte bound"))?;
             bytes_left -= bytes.len();
-            if result.results.len().saturating_add(results.len()) > limits.solutions_max() {
-                return Ok(Err(unavailable_read(
-                    SymbolUnavailableReason::InsufficientCoverage,
-                )));
-            }
             results.append(&mut result.results);
             for warning in result.warnings {
                 if !warnings.contains(&warning) {
@@ -475,6 +477,9 @@ impl RiftProxy {
             }
             views.extend(result.view);
             revisions.push(result.revision);
+            if stopped {
+                break;
+            }
         }
         crate::global::order_search_hits(&mut results, request.order);
         let limit = if request.max_results.is_some() || request.page != 1 {

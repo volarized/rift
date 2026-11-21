@@ -2387,8 +2387,9 @@ impl RiftMcp {
     /// A query over the captured inventory answers from partly covered facts, and `warnings`
     /// name the files, languages, or engines left out. A query whose answer needs every fact - an empty
     /// result, a false `ASK`, a count, a negation, an `OPTIONAL` - answers `unavailable` with
-    /// `insufficient_coverage` instead. A file a bound left out of the index is outside the
-    /// indexed set: the server logs it, and `warnings` carry nothing for it.
+    /// `insufficient_coverage` instead. A bound never makes an answer unavailable: a file a bound
+    /// left out of the index is outside the indexed set, and a producer bound ends the answer
+    /// with the rows it reached; the server logs the bound, and `warnings` carry nothing for it.
     #[tool(name = "search")]
     async fn search_query(
         &self,
@@ -12034,6 +12035,14 @@ done
         Ok(())
     }
 
+    /// One `:paths` selection of the lexical bound case, with the rows it may answer.
+    struct LexicalCase<'case> {
+        terms: &'case str,
+        selector: &'case str,
+        selected: fn(&str) -> bool,
+        rows: Option<usize>,
+    }
+
     #[tokio::test]
     async fn literal_search_paths_bound_lexical_matches_before_graph_evaluation() -> TestResult {
         use rift_protocol::query::{QueryLanguage, QueryParams};
@@ -12083,28 +12092,65 @@ done
             assert_eq!(rows.len(), 1, "{answer}");
             assert_eq!(rows[0]["path"]["value"], path, "{answer}");
         }
+        // D37 (#713): a lexical ranking cut at `max_matches` is a producer bound, so the
+        // graph evaluates over the rows the producer returned and the answer carries no
+        // warning for the cut.
         let crowded = r#":paths '{"include":["src/crowded.rs"]}'^^rdf:JSON;"#;
-        for (terms, selector) in [
-            ("beacon", ""),
-            (
-                "beacon",
-                r#":paths '{"include":["witness.rs"]}'^^rdf:JSON;"#,
-            ),
-            ("beacon", crowded),
-            ("beacon lantern", crowded),
-        ] {
+        let cases = [
+            LexicalCase {
+                terms: "beacon",
+                selector: "",
+                selected: |_| true,
+                rows: Some(6),
+            },
+            LexicalCase {
+                terms: "beacon",
+                selector: r#":paths '{"include":["witness.rs"]}'^^rdf:JSON;"#,
+                selected: |path| path.ends_with("witness.rs"),
+                rows: None,
+            },
+            LexicalCase {
+                terms: "beacon",
+                selector: crowded,
+                selected: |path| path == "src/crowded.rs",
+                rows: Some(3),
+            },
+            LexicalCase {
+                terms: "beacon lantern",
+                selector: crowded,
+                selected: |path| path == "src/crowded.rs",
+                rows: None,
+            },
+        ];
+        for LexicalCase {
+            terms,
+            selector,
+            selected,
+            rows: rows_expected,
+        } in cases
+        {
             let answer = serde_json::to_value(query(terms, selector).await?.0)?;
-            assert_eq!(answer["outcome"], "unavailable", "{answer}");
-            assert_eq!(answer["reason"], "insufficient_coverage", "{answer}");
+            assert_ne!(answer["outcome"], "unavailable", "{answer}");
             assert!(
                 answer["warnings"]
                     .as_array()
-                    .is_some_and(|warnings| warnings.contains(&json!({
-                        "code": "lexical_ranking_truncated",
-                        "matches_max": 2
-                    }))),
+                    .is_none_or(|warnings| !warnings
+                        .iter()
+                        .any(|warning| warning["code"] == "lexical_ranking_truncated")),
                 "{answer}"
             );
+            let rows = answer["answer"]["bindings"]
+                .as_array()
+                .ok_or_else(|| format!("bindings expected: {answer}"))?;
+            assert!(!rows.is_empty(), "{answer}");
+            assert!(
+                rows.iter()
+                    .all(|row| row["path"]["value"].as_str().is_some_and(selected)),
+                "{answer}"
+            );
+            if let Some(expected) = rows_expected {
+                assert_eq!(rows.len(), expected, "{answer}");
+            }
         }
         Ok(())
     }
