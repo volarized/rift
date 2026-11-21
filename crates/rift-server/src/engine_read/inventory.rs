@@ -159,8 +159,9 @@ pub(super) async fn outgoing_calls(
     };
     let mut answer: Option<GraphCalls> = None;
     let mut remaining = super::TRAVERSAL_SYMBOLS_MAX;
+    let sources = super::DocumentSources::default();
     for file in reads.engine_inventory_files(std::slice::from_ref(seed), selection)? {
-        let raw = match file.read(engines, selection, deadline).await {
+        let raw = match file.read(engines, (selection, &sources), deadline).await {
             Ok(raw) => raw,
             Err(error)
                 if super::graph_engine_method_missing(&error)
@@ -302,9 +303,10 @@ impl EngineInventoryFile {
     pub async fn read(
         &self,
         engines: &EnginePool,
-        selection: EngineInventorySelection,
+        (selection, sources): (EngineInventorySelection, &super::DocumentSources),
         deadline: Instant,
     ) -> Result<Option<EngineInventoryAnswer>, RiftError> {
+        let sources = sources.clone();
         let Some(slot) = engines.engine_for(&self.language) else {
             return Ok(None);
         };
@@ -323,9 +325,11 @@ impl EngineInventoryFile {
                     let sites = sites.clone();
                     let target_sites = target_sites.clone();
                     let callers = callers.clone();
+                    let sources = sources.clone();
                     Box::pin(async move {
                         let mut report =
-                            read_positions(session, &path, &positions, selection).await?;
+                            read_positions(session, &path, &positions, (selection, &sources))
+                                .await?;
                         if selection.calls
                             && has_static_calls
                             && session.capabilities().definitions.definition
@@ -474,7 +478,7 @@ async fn read_positions(
     session: &mut EngineSession,
     path: &ProjectPath,
     positions: &[InventoryPosition],
-    selection: EngineInventorySelection,
+    (selection, sources): (EngineInventorySelection, &super::DocumentSources),
 ) -> Result<InventoryReport, RiftError> {
     let encoding = session.capabilities().position_encoding;
     let mut report = InventoryReport {
@@ -526,7 +530,8 @@ async fn read_positions(
         .flat_map(|(_, locations)| locations.iter().cloned())
         .collect();
     report.reference_definitions =
-        super::reference_definitions(session, &locations, maximum, report.remaining).await?;
+        super::reference_definitions(session, &locations, (maximum, report.remaining), sources)
+            .await?;
     report.charge(report.reference_definitions.values().map(Vec::len).sum())?;
     Ok(report)
 }
@@ -1429,6 +1434,74 @@ mod tests {
         );
         assert_eq!(&edges[0].from, direct);
         assert_eq!(&edges[0].to, parent);
+        Ok(())
+    }
+
+    /// rust-analyzer answers `textDocument/implementation` on a trait with the implementing
+    /// type of each `impl` header, not with the trait the stored edge occurs at.
+    #[test]
+    fn implementation_answers_naming_the_implementing_type_confirm_the_stored_edge()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        std::fs::write(
+            directory.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\npath = \"lib.rs\"\n",
+        )?;
+        let source = "pub trait Shape {\n    fn area(&self) -> f64;\n}\npub struct Square;\npub struct Circle;\nimpl Shape for Square {\n    fn area(&self) -> f64 {\n        1.0\n    }\n}\nimpl Shape for Circle {\n    fn area(&self) -> f64 {\n        3.0\n    }\n}\n";
+        std::fs::write(directory.path().join("lib.rs"), source)?;
+        let reads = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let (seeds, _) = reads.local_search_view_input(true)?.inventory_seeds()?;
+        let seed = |name: &str| {
+            seeds
+                .iter()
+                .find(|seed| seed.as_str().ends_with(name))
+                .cloned()
+                .ok_or_else(|| format!("seed {name}"))
+        };
+        let shape = seed("/Shape")?;
+        let path = ProjectPath::new("lib.rs")?;
+        let uri = rift_lsp::TreeRoot::new(directory.path())?.document_uri(&path)?;
+        // `impl Shape for Square {`: the implementing type starts at column 15.
+        let heritage = [5, 10]
+            .into_iter()
+            .map(|line| InventoryHeritage {
+                seed: shape.clone(),
+                kind: EdgeKind::Implements,
+                direction: TraversalDirection::Incoming,
+                location: Location {
+                    uri: uri.clone(),
+                    range: lsp_types::Range {
+                        start: Position::new(line, 15),
+                        end: Position::new(line, 21),
+                    },
+                },
+            })
+            .collect();
+        let edges = resolve_heritage(
+            &reads,
+            directory.path(),
+            PositionEncoding::Utf8,
+            heritage,
+            EdgeProvider::Lsp,
+        )?;
+        let pairs: Vec<_> = edges
+            .iter()
+            .map(|edge| (edge.from.clone(), edge.to.clone(), edge.provider))
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                (seed("/Square")?, shape.clone(), EdgeProvider::Lsp),
+                (seed("/Circle")?, shape, EdgeProvider::Lsp),
+            ],
+            "each impl header confirms its own stored edge: {edges:?}"
+        );
         Ok(())
     }
 }

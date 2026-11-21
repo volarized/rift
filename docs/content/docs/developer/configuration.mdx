@@ -928,10 +928,17 @@ to `"1m"` and takes `"1s"` to `"10m"`. `settle_delay` defaults to `"500ms"` and 
 `"1m"`. `output_limit` defaults to `"4kb"` and takes `"1kb"` to
 `"8mb"`; Rift still reports the full size, so you can tell a truncated log from a short one.
 
+`request_timeout` measures engine silence, not the age of one request. When a request is still
+unanswered after `request_timeout`, Rift ends the process only if the engine sent nothing for
+that long and holds no work it announced over `$/progress`. An engine still working keeps
+running: Rift sends `$/cancelRequest` for the request and retries it on the same process. The
+read's own deadline, `[server] readiness_timeout`, bounds every wait; a request still waiting
+there is cancelled the same way and the answer carries `engine_analysis_unavailable`.
+
 `retry` bounds repeated requests while an answer stays unsettled. `attempts` includes the first
 request; waits start at `delay`, double, and stop at `delay_limit`. `restart` bounds replacement
-processes after a process ends or stops answering. A replacement older than `window` stops
-counting. The server starts a process on its first request and keeps it across later requests.
+processes after a process ends or stops answering. A process Rift replaces because a read was
+dropped midway is not counted. A replacement older than `window` stops counting. The server starts a process on its first request and keeps it across later requests.
 Configuration reload reuses unchanged process definitions and ends replaced processes.
 
 `retry.attempts` defaults to `8` and takes `1` to `64`. `retry.delay` defaults to `"250ms"` and

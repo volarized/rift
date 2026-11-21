@@ -316,6 +316,313 @@ async fn test_edge_readiness_budget_reports_a_typed_warning_for_calls_and_struct
     Ok(())
 }
 
+/// A `sh` engine serving call hierarchy that holds each call hierarchy answer for 300 ms
+/// during its first 2 s and answers at once afterwards: every item it prepares calls nothing.
+/// It announces and ends its work at start, and appends `start` to the file its first
+/// argument names at each start.
+#[cfg(unix)]
+const SLOW_BATCH_ENGINE: &str = r#"echo start >> "$1"
+started=$(date +%s)
+frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
+while IFS= read -r header; do
+  IFS= read -r blank
+  length=$(printf '%s' "$header" | tr -dc 0-9)
+  body=$(dd bs=1 count="$length" 2>/dev/null)
+  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
+  uri=$(printf '%s' "$body" | grep -o '"uri":"[^"]*"' | head -1 | cut -d'"' -f4)
+  case "$body" in
+    *'"method":"initialize"'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"callHierarchyProvider\":true}}}"
+      frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"begin","title":"analysis"}}}'
+      frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"end"}}}' ;;
+    *'"method":"$/cancelRequest"'*) ;;
+    *'"method":"textDocument/prepareCallHierarchy"'*)
+      if [ $(( $(date +%s) - started )) -lt 2 ]; then sleep 0.3; fi
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"name\":\"entry\",\"kind\":12,\"uri\":\"$uri\",\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":16}},\"selectionRange\":{\"start\":{\"line\":0,\"character\":7},\"end\":{\"line\":0,\"character\":12}}}]}" ;;
+    *'"method":"callHierarchy/outgoingCalls"'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[]}" ;;
+    *'"method":"exit"'*)
+      exit 0 ;;
+    *'"id":'[0-9]*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":null}" ;;
+  esac
+done
+"#;
+
+/// Inventory reads cut at a 1 s `[server] readiness_timeout` by an engine that answers each
+/// batch late keep the engine: four reads in a row meet one engine process, and once the
+/// engine answers at once a later read carries no `engine_analysis_unavailable`.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_edge_inventory_reads_cut_at_their_deadline_keep_the_engine() -> TestResult {
+    let engine = tempfile::tempdir()?;
+    let script = engine.path().join("engine.sh");
+    let log = engine.path().join("engine.log");
+    std::fs::write(&script, SLOW_BATCH_ENGINE)?;
+    let configuration = format!(
+        "[server]\nreadiness_timeout = \"1s\"\n\n\
+         [languages.rust.lsp]\ncommand = [\"sh\", \"{}\", \"{}\"]\n",
+        script.display(),
+        log.display()
+    );
+    let files = [
+        (
+            "Cargo.toml",
+            "[package]\nname='edge_fixture'\nversion='0.1.0'\nedition='2024'\n[lib]\npath='lib.rs'\n",
+        ),
+        (
+            "lib.rs",
+            "pub fn entry() { one::entry(); }\npub mod one;\npub mod two;\n",
+        ),
+        ("one.rs", "pub fn entry() { crate::two::entry(); }\n"),
+        ("two.rs", "pub fn entry() {}\n"),
+    ];
+    let (_directory, client, task) = served_workspace(&files, Some(configuration)).await?;
+    let params = QueryParams {
+        query: "SELECT ?s ?t { ?s :calls ?t }".to_owned(),
+        language: QueryLanguage::Sparql,
+        page: 1,
+        max_results: 100,
+        revision: None,
+        include: rift_protocol::query::QueryInclude::default(),
+    };
+    for _read in 0..4 {
+        query_after_population(&client, &params).await?;
+    }
+    let mut settled = None;
+    for _read in 0..20 {
+        let answer = query_after_population(&client, &params).await?;
+        let unavailable = answer["warnings"].as_array().is_some_and(|warnings| {
+            warnings
+                .iter()
+                .any(|warning| warning["code"] == "engine_analysis_unavailable")
+        });
+        if !unavailable {
+            settled = Some(answer);
+            break;
+        }
+    }
+    settled.ok_or("a read after the slow answers takes the whole engine inventory")?;
+    client.cancel().await?;
+    task.await?;
+    let recorded = std::fs::read_to_string(&log)?;
+    assert_eq!(
+        recorded.lines().filter(|line| *line == "start").count(),
+        1,
+        "every read meets the one engine process: {recorded}"
+    );
+    Ok(())
+}
+
+/// The `sh` engine of [`SLOW_BATCH_ENGINE`], which also reads no document of 64 KiB or more
+/// for 3 s, during each of its first four starts: a read that opens such a document is
+/// dropped at its deadline with the frame part-written, and the slot discards the session.
+#[cfg(unix)]
+const SLOW_READER_ENGINE: &str = r#"echo start >> "$1"
+starts=$(grep -c start "$1")
+frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
+while IFS= read -r header; do
+  IFS= read -r blank
+  length=$(printf '%s' "$header" | tr -dc 0-9)
+  if [ "$length" -ge 65536 ] && [ "$starts" -le 4 ]; then sleep 3; fi
+  body=$(dd bs=1 count="$length" 2>/dev/null)
+  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
+  uri=$(printf '%s' "$body" | grep -o '"uri":"[^"]*"' | head -1 | cut -d'"' -f4)
+  case "$body" in
+    *'"method":"initialize"'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"callHierarchyProvider\":true}}}"
+      frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"begin","title":"analysis"}}}'
+      frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"end"}}}' ;;
+    *'"method":"$/cancelRequest"'*) ;;
+    *'"method":"textDocument/prepareCallHierarchy"'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"name\":\"entry\",\"kind\":12,\"uri\":\"$uri\",\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":16}},\"selectionRange\":{\"start\":{\"line\":0,\"character\":7},\"end\":{\"line\":0,\"character\":12}}}]}" ;;
+    *'"method":"callHierarchy/outgoingCalls"'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[]}" ;;
+    *'"method":"exit"'*)
+      exit 0 ;;
+    *'"id":'[0-9]*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":null}" ;;
+  esac
+done
+"#;
+
+/// Inventory reads dropped at their deadline while a document's frame is part-written lose
+/// their session, and the slot replaces it without charging the restart budget: after four
+/// such reads a later read still meets an engine and carries no
+/// `engine_analysis_unavailable`.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_edge_inventory_reads_dropped_mid_write_do_not_spend_the_restart_budget() -> TestResult
+{
+    let engine = tempfile::tempdir()?;
+    let script = engine.path().join("engine.sh");
+    let log = engine.path().join("engine.log");
+    std::fs::write(&script, SLOW_READER_ENGINE)?;
+    // A healthy replacement settles well inside the same deadline that cuts the stalled write.
+    let configuration = format!(
+        "[server]\nreadiness_timeout = \"1s\"\n\n\
+         [languages.rust.lsp]\nsettle_delay = \"10ms\"\ncommand = [\"sh\", \"{}\", \"{}\"]\n",
+        script.display(),
+        log.display()
+    );
+    let large = format!("pub fn entry() {{}}\n{}", "// padding\n".repeat(6_200));
+    let files = [
+        (
+            "Cargo.toml",
+            "[package]\nname='edge_fixture'\nversion='0.1.0'\nedition='2024'\n[lib]\npath='lib.rs'\n",
+        ),
+        ("lib.rs", large.as_str()),
+    ];
+    let (_directory, client, task) = served_workspace(&files, Some(configuration)).await?;
+    let params = QueryParams {
+        query: "SELECT ?s ?t { ?s :calls ?t }".to_owned(),
+        language: QueryLanguage::Sparql,
+        page: 1,
+        max_results: 100,
+        revision: None,
+        include: rift_protocol::query::QueryInclude::default(),
+    };
+    for _read in 0..4 {
+        query_after_population(&client, &params).await?;
+    }
+    let mut settled = None;
+    for _read in 0..10 {
+        let answer = query_after_population(&client, &params).await?;
+        let unavailable = answer["warnings"].as_array().is_some_and(|warnings| {
+            warnings
+                .iter()
+                .any(|warning| warning["code"] == "engine_analysis_unavailable")
+        });
+        if !unavailable {
+            settled = Some(answer);
+            break;
+        }
+    }
+    let recorded = std::fs::read_to_string(&log)?;
+    settled.ok_or_else(|| {
+        format!("a read after the dropped ones meets a running engine; starts: {recorded}")
+    })?;
+    client.cancel().await?;
+    task.await?;
+    Ok(())
+}
+
+/// A `sh` engine serving references and definitions over `lib.rs` and `user.rs`, which answers
+/// a definition only for a document it was told is open, as typescript-language-server does.
+/// The references of `beacon` name its declaration and its call in `user.rs`; a definition
+/// asked inside an open document names `beacon` in `lib.rs`. It appends `open <path>` and
+/// `close <path>` to the file its first argument names for each document notification.
+#[cfg(unix)]
+const OPEN_DOCUMENTS_ENGINE: &str = r#"opened=
+frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
+while IFS= read -r header; do
+  IFS= read -r blank
+  length=$(printf '%s' "$header" | tr -dc 0-9)
+  body=$(dd bs=1 count="$length" 2>/dev/null)
+  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
+  uri=$(printf '%s' "$body" | grep -o '"uri":"[^"]*"' | head -1 | cut -d'"' -f4)
+  case "$body" in
+    *'"method":"initialize"'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true,\"definitionProvider\":true}}}"
+      frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"begin","title":"analysis"}}}'
+      frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"end"}}}' ;;
+    *'"method":"textDocument/didOpen"'*)
+      opened="$opened $uri"
+      echo "open ${uri##*/}" >> "$1" ;;
+    *'"method":"textDocument/didClose"'*)
+      opened=$(printf '%s' "$opened" | sed "s| $uri||")
+      echo "close ${uri##*/}" >> "$1" ;;
+    *'"method":"$/cancelRequest"'*) ;;
+    *'"method":"textDocument/references"'*)
+      base=${uri%/*}
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"uri\":\"$base/lib.rs\",\"range\":{\"start\":{\"line\":0,\"character\":7},\"end\":{\"line\":0,\"character\":13}}},{\"uri\":\"$base/user.rs\",\"range\":{\"start\":{\"line\":0,\"character\":23},\"end\":{\"line\":0,\"character\":29}}}]}" ;;
+    *'"method":"textDocument/definition"'*)
+      base=${uri%/*}
+      case "$opened " in
+        *" $uri "*)
+          frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"uri\":\"$base/lib.rs\",\"range\":{\"start\":{\"line\":0,\"character\":7},\"end\":{\"line\":0,\"character\":13}}}]}" ;;
+        *)
+          frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":null}" ;;
+      esac ;;
+    *'"method":"exit"'*)
+      exit 0 ;;
+    *'"id":'[0-9]*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":null}" ;;
+  esac
+done
+"#;
+
+/// A reference the engine names in a document the read did not open is resolved once the
+/// read opens that document with the index's bytes: the fact names the engine among its
+/// providers, no reference location is dropped, and the engine reads the document's
+/// `didOpen` before its `didClose`.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_edge_reference_locations_in_unopened_documents_are_resolved() -> TestResult {
+    let engine = tempfile::tempdir()?;
+    let script = engine.path().join("engine.sh");
+    let log = engine.path().join("engine.log");
+    std::fs::write(&script, OPEN_DOCUMENTS_ENGINE)?;
+    let configuration = format!(
+        "[languages.rust.lsp]\ncommand = [\"sh\", \"{}\", \"{}\"]\n",
+        script.display(),
+        log.display()
+    );
+    let files = [
+        (
+            "Cargo.toml",
+            "[package]\nname='edge_fixture'\nversion='0.1.0'\nedition='2024'\n[lib]\npath='lib.rs'\n",
+        ),
+        ("lib.rs", "pub fn beacon() {}\npub mod user;\n"),
+        ("user.rs", "pub fn user() { crate::beacon(); }\n"),
+    ];
+    let (_directory, client, task) = served_workspace(&files, Some(configuration)).await?;
+    let beacon = captured_seed(&client, "beacon", "lib.rs").await?;
+    let user = captured_seed(&client, "user", "user.rs").await?;
+    let answer = query_after_population(
+        &client,
+        &QueryParams {
+            query: format!(
+                "SELECT ?s ?p {{ ?s :references <{beacon}> . ?e a :Edge; :from ?s; :to <{beacon}>; \
+                 :kinds :references; :provider ?p }}"
+            ),
+            language: QueryLanguage::Sparql,
+            page: 1,
+            max_results: 100,
+            revision: None,
+            include: rift_protocol::query::QueryInclude::default(),
+        },
+    )
+    .await?;
+    let warnings = answer["warnings"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !warnings
+            .iter()
+            .any(|warning| warning["code"] == "engine_analysis_unavailable"),
+        "no reference location is dropped: {answer}"
+    );
+    let providers: Vec<&str> = workspace_client::query::rows(&answer)?
+        .iter()
+        .filter(|row| workspace_client::query::iri(row, "s").is_ok_and(|from| from == user))
+        .filter_map(|row| workspace_client::query::literal(row, "p").ok())
+        .collect();
+    assert!(
+        providers.contains(&"lsp"),
+        "the reference in user.rs names the engine: {answer}"
+    );
+    client.cancel().await?;
+    task.await?;
+    let recorded = std::fs::read_to_string(&log)?;
+    let lines: Vec<&str> = recorded.lines().collect();
+    let opened = lines.iter().position(|line| *line == "open user.rs");
+    let closed = lines.iter().position(|line| *line == "close user.rs");
+    assert!(
+        opened.is_some_and(|opened| closed.is_some_and(|closed| opened < closed)),
+        "the read opens user.rs before it asks there and closes it after: {lines:?}"
+    );
+    Ok(())
+}
+
 #[path = "../../rift-lsp/tests/live_engine_gate.rs"]
 mod live_engine_gate;
 
