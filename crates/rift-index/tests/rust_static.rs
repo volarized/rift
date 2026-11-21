@@ -1817,3 +1817,29 @@ fn test_rust_derived_clones_keep_the_receiver_type() {
             && !edge.to().as_str().ends_with("/Other/step")
     }));
 }
+
+#[test]
+fn test_rust_typed_self_receivers_reach_the_implementation_type() {
+    // `self: Box<Self>` and `self: Pin<&mut Self>` receivers are the implementation type's
+    // values; a receiver typed by another type stays unresolved.
+    let source = "use std::pin::Pin;\npub struct Slice { pub len: usize }\npub struct Other;\nimpl Other { pub fn into_entries(self: Box<Self>) -> usize { 0 } }\nimpl Slice {\n    pub fn into_entries(self: Box<Self>) -> usize { self.len }\n    pub fn into_keys(self: Box<Self>) -> usize { self.into_entries() }\n    pub fn pinned(self: Pin<&mut Self>) -> usize { self.len }\n    pub fn shared(&self) -> usize { self.len }\n}\npub struct Wrapper(pub Slice);\nimpl Slice { pub fn wrapped(self: Wrapper) -> usize { self.len } }\n";
+    let (_directory, index) = fixture_index(PLAIN_MANIFEST, &[("src/lib.rs", source)]);
+    for (kind, from, to) in [
+        (EdgeKind::Calls, "/Slice/into_keys", "/Slice/into_entries"),
+        (EdgeKind::Reads, "/Slice/into_keys", "/Slice/into_entries"),
+        (EdgeKind::Reads, "/Slice/into_entries", "/Slice/len"),
+        (EdgeKind::Reads, "/Slice/pinned", "/Slice/len"),
+        (EdgeKind::Reads, "/Slice/shared", "/Slice/len"),
+    ] {
+        assert!(
+            has_edge(&index, kind, from, to),
+            "missing {kind:?} {from} -> {to}"
+        );
+    }
+    assert!(!index.edges().edges().any(|edge| {
+        matches!(edge.kind(), EdgeKind::Calls | EdgeKind::Reads)
+            && (edge.to().as_str().ends_with("/Other/into_entries")
+                || (edge.from().as_str().ends_with("/Slice/wrapped")
+                    && edge.to().as_str().ends_with("/Slice/len")))
+    }));
+}

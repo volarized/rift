@@ -63,6 +63,7 @@ pub(super) struct Kinds {
     pattern: u16,
     match_pattern: u16,
     condition: u16,
+    type_arguments: u16,
     named_patterns: [u16; 3],
     shorthand_field: u16,
     value_type: u16,
@@ -137,6 +138,7 @@ pub(super) fn kinds() -> &'static Kinds {
             pattern: field("pattern"),
             match_pattern: id("match_pattern"),
             condition: field("condition"),
+            type_arguments: field("type_arguments"),
             named_patterns: [
                 id("struct_pattern"),
                 id("tuple_struct_pattern"),
@@ -189,6 +191,17 @@ impl Kinds {
             self.record_import(visited, facts, budget)?;
         } else if id == self.self_parameter {
             self.record_receiver(visited, facts)?;
+        } else if id == self.parameter
+            && syntax_element
+                .child_by_field_id(self.pattern)
+                .is_some_and(|pattern| pattern.kind_id() == self.self_value)
+        {
+            if syntax_element
+                .child_by_field_id(self.value_type)
+                .is_some_and(|value_type| self.self_receiver_type(value_type, source))
+            {
+                self.record_receiver(visited, facts)?;
+            }
         } else if id == self.let_declaration || id == self.parameter {
             self.record_value(visited, facts)?;
         } else if id == self.identifier
@@ -480,6 +493,49 @@ impl Kinds {
             )?);
         }
         Ok(())
+    }
+
+    /// Whether a typed `self` parameter's type is a receiver of the implementation type:
+    /// `Self`, a reference to a receiver, or one of the standard receiver wrappers `Box`,
+    /// `Rc`, `Arc` and `Pin` around one. Any other type is not the implementation type.
+    fn self_receiver_type(&self, mut element: Node<'_>, source: &str) -> bool {
+        // Each step removes one wrapper from the bounded syntax tree.
+        loop {
+            if element.kind_id() == self.reference_type {
+                let Some(inner) = element.child_by_field_id(self.value_type) else {
+                    return false;
+                };
+                element = inner;
+                continue;
+            }
+            if element.kind_id() == self.type_identifier {
+                return element.utf8_text(source.as_bytes()) == Ok("Self");
+            }
+            if element.kind_id() != self.generic_type {
+                return false;
+            }
+            let Some(name) = element
+                .child_by_field_id(self.value_type)
+                .and_then(|name| name.utf8_text(source.as_bytes()).ok())
+            else {
+                return false;
+            };
+            let name = name.rsplit("::").next().unwrap_or(name).trim();
+            if !["Box", "Rc", "Arc", "Pin"].contains(&name) {
+                return false;
+            }
+            let Some(arguments) = element.child_by_field_id(self.type_arguments) else {
+                return false;
+            };
+            let mut cursor = arguments.walk();
+            let mut types = arguments
+                .named_children(&mut cursor)
+                .filter(|child| !child.is_extra());
+            let (Some(inner), None) = (types.next(), types.next()) else {
+                return false;
+            };
+            element = inner;
+        }
     }
 
     fn record_bounds(
