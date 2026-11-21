@@ -2140,7 +2140,12 @@ fn map_inventory_references_with_mapping(
             return Err(graph_reference_coverage());
         }
         let key = (path, start as u64, end as u64);
-        if excluded.contains(&key) || found.contains_key(&key) {
+        // An engine can name a quoted property key without its quotes: a location inside
+        // the declaration's own name is that declaration, not a reference to it.
+        let declared = excluded
+            .iter()
+            .any(|(path, from, to)| *path == key.0 && *from <= key.1 && key.2 <= *to);
+        if declared || found.contains_key(&key) {
             continue;
         }
         let resolved = mapping.targets(&report.definitions, &location)?;
@@ -3410,6 +3415,41 @@ mod tests {
             Some(symbol(&reads, "caller"))
         );
         assert_eq!(answer.occurrences[0].target, target);
+        Ok(())
+    }
+
+    /// typescript-language-server names a quoted property key without its quotes, among
+    /// the references of that key and as its definition.
+    #[test]
+    fn a_location_inside_the_declared_name_is_not_a_reference_to_it() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("headers.js"),
+            "function value() { return 1; }\nvar headers = {\n  'etag': value()\n};\n",
+        )?;
+        let reads = reads(directory.path())?;
+        let target = symbol(&reads, "'etag'");
+        let key = location(directory.path(), "headers.js", 2, 3, 7);
+        let report = ReferenceReport {
+            definitions: BTreeMap::from([(super::reference_key(&key), vec![key.clone()])]).into(),
+            locations: Ok(vec![key]),
+            encoding: PositionEncoding::Utf16,
+            full: true,
+        };
+        let answer = super::map_inventory_references(
+            &reads,
+            &target,
+            report,
+            directory.path(),
+            false,
+            EdgeProvider::Lsp,
+        )?;
+        assert!(
+            answer.occurrences.is_empty(),
+            "the key's own name is no reference: {:?}",
+            answer.occurrences
+        );
+        assert!(answer.complete);
         Ok(())
     }
 
