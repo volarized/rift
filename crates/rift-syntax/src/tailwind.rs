@@ -672,6 +672,7 @@ pub fn append_framework_symbols(
     )
     .with_source_witness(source.text)
     .with_syntax_limits(limits)
+    .with_static_facts(document.facts().static_facts().cloned())
     .with_left_out_declarations(omitted - document.facts().left_out_symbols().len())
     .with_framework_context();
     if let Some(bindings) = document.facts().export_bindings() {
