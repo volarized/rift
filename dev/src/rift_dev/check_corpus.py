@@ -11,7 +11,7 @@ import tempfile
 import time
 import traceback
 from collections.abc import Callable, Iterator, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from itertools import batched
 from pathlib import Path
 
@@ -1451,13 +1451,14 @@ class Corpus:
                 encoding="utf-8",
             )
             probe.write_text(churn_source(0), encoding="utf-8")
+            started_at = datetime.now(UTC)
             with self.server() as server:
                 async with server.connect() as client:
                     await await_startup_publication(server)
                     await self.churn(
                         client, server, probe.relative_to(self.root).as_posix()
                     )
-                    no_failed_builds(await logged(server, "index"))
+                    await check_churn_builds(server, started_at)
                 self.stop(server)
                 self.record("stop", state="after_churn", process_gone=True)
         finally:
@@ -1986,8 +1987,8 @@ async def await_filesystem_publication(server: Server, after: datetime) -> None:
     """Observe a publication after the last write within the caller's deadline."""
     while True:
         server.check_running()
-        # Churn can fill the server's own stderr budget before the final write.
-        rows = await logged(server, "index")
+        # Earlier rebuild records cannot witness publication of the final write.
+        rows = await logged(server, "index", since=after)
         if any(
             row.time >= after
             and row.operation == "index.publish"
@@ -2040,9 +2041,37 @@ def objects(answer: JsonObject, key: str) -> list[JsonObject]:
     return [object_value(value, key) for value in array_value(answer.get(key), key)]
 
 
-async def logged(server: Server, component: str) -> list[Line]:
+async def check_churn_builds(server: Server, started: datetime) -> None:
+    """Check warnings and errors across the entire run in bounded, adjacent reads."""
+    # The exclusive bound includes the current millisecond in the log store.
+    ended = datetime.now(UTC) + timedelta(milliseconds=1)
+    since = started
+    while since < ended:
+        until = min(since + timedelta(seconds=30), ended)
+        # The CLI level selector matches one severity exactly.
+        for level in ("warn", "error"):
+            no_failed_builds(
+                await logged(server, "index", since=since, until=until, level=level)
+            )
+        since = until
+
+
+async def logged(
+    server: Server,
+    component: str,
+    *,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    level: str | None = None,
+) -> list[Line]:
     """Read persisted records through the bounded CLI command."""
     arguments = ["server", "logs", "--tail", "all", "--component", component]
+    if since is not None:
+        arguments.extend(["--since", since.isoformat(timespec="milliseconds")])
+    if until is not None:
+        arguments.extend(["--until", until.isoformat(timespec="milliseconds")])
+    if level is not None:
+        arguments.extend(["--level", level])
     text = await asyncio.to_thread(server.read_logs, arguments)
     return records(text)
 
