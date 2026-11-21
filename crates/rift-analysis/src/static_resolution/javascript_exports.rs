@@ -481,6 +481,10 @@ impl<'source> File<'source> {
             let Some((receiver, slot)) = self.javascript_export_slot(member) else {
                 continue;
             };
+            // A key bound to a `Symbol(..)` value of this file names no export (D41).
+            if slot == ExportSlot::Unknown && self.javascript_symbol_key(member, work) {
+                continue;
+            }
             if matches!(
                 self.binding(self.text(receiver)?, receiver.start, |_| true, work),
                 super::Binding::Missing
@@ -514,6 +518,55 @@ impl<'source> File<'source> {
             _ => return self.javascript_nested_export_slot(member),
         };
         Some((member.receiver, slot))
+    }
+
+    /// Whether `member` is `exports[key]` or `module.exports[key]` with `key` a `const`
+    /// of this file bound to a `Symbol(..)` value: such a key is no export name. Only a
+    /// `const` declaring that one name counts.
+    fn javascript_symbol_key(&self, member: &rift_syntax::StaticMember, work: &mut Work) -> bool {
+        if member.member.is_some()
+            || !matches!(
+                self.text(member.receiver),
+                Some("exports" | "module.exports")
+            )
+        {
+            return false;
+        }
+        let key = self
+            .text(rift_syntax::ByteRange {
+                start: member.receiver.end,
+                end: member.range.end,
+            })
+            .map(str::trim)
+            .and_then(|key| key.strip_prefix('['))
+            .and_then(|key| key.strip_suffix(']'))
+            .map(str::trim);
+        let Some(key) = key.filter(|key| {
+            !key.is_empty()
+                && key
+                    .chars()
+                    .all(|character| character.is_alphanumeric() || matches!(character, '_' | '$'))
+        }) else {
+            return false;
+        };
+        let super::Binding::Found(binding) = self.binding(key, member.range.start, |_| true, work)
+        else {
+            return false;
+        };
+        self.target_at(binding.name).is_some_and(|target| {
+            target.symbol.kind == "variable"
+                && self
+                    .text(rift_syntax::ByteRange {
+                        start: 0,
+                        end: target.symbol.item_range.start,
+                    })
+                    .is_some_and(|before| before.trim_end().ends_with("const"))
+                && target
+                    .symbol
+                    .body_range
+                    .and_then(|range| self.text(range))
+                    .is_some_and(|value| value.trim_start().starts_with("Symbol("))
+        })
     }
 
     fn javascript_nested_export_slot(

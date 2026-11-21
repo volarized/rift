@@ -2722,3 +2722,49 @@ module.exports = { kept, written, Options }
             && edge.to().as_str().ends_with("/name")
     }));
 }
+
+#[test]
+fn test_commonjs_symbol_keyed_export_writes_name_no_export() {
+    // A computed key on `module.exports` or `exports` names no export when it is a `const`
+    // of the same file bound to a `Symbol(..)` value. Any other computed key still leaves
+    // every export unresolved for calls.
+    let parser = "const kInternals = Symbol('internals')
+function run() { return 1 }
+function Parser() {}
+module.exports = Parser
+module.exports.run = run
+module.exports[kInternals] = { run }
+exports[kInternals] = run
+";
+    let other = "const kName = 'run'
+function run() { return 1 }
+function Other() {}
+module.exports = Other
+module.exports.run = run
+module.exports[kName] = run
+";
+    let main = "const Parser = require('./parser.js')
+const Other = require('./other.js')
+function build() {
+  return [new Parser(), Parser.run(), new Other(), Other.run()]
+}
+module.exports = build
+";
+    let (_directory, index) = workspace(&[
+        ("parser.js", parser),
+        ("other.js", other),
+        ("main.js", main),
+    ]);
+    for to in ["parser.js/Parser", "parser.js/run"] {
+        assert!(
+            has_edge(&index, EdgeKind::Calls, "main.js/build", to),
+            "{to}"
+        );
+    }
+    for to in ["other.js/Other", "other.js/run"] {
+        assert!(
+            !has_edge(&index, EdgeKind::Calls, "main.js/build", to),
+            "{to}"
+        );
+    }
+}
