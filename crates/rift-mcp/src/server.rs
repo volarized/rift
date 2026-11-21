@@ -2387,7 +2387,8 @@ impl RiftMcp {
     /// A query over the captured inventory answers from partly covered facts, and `warnings`
     /// name the files, languages, or engines left out. A query whose answer needs every fact - an empty
     /// result, a false `ASK`, a count, a negation, an `OPTIONAL` - answers `unavailable` with
-    /// `insufficient_coverage` instead.
+    /// `insufficient_coverage` instead. A file a bound left out of the index is outside the
+    /// indexed set: the server logs it, and `warnings` carry nothing for it.
     #[tool(name = "search")]
     async fn search_query(
         &self,
@@ -6059,11 +6060,11 @@ done
     }
 
     /// A file past `[providers.syntax] max_file` extracts no declaration. Under the default
-    /// `[search.text] large_files = "split"` its text stays in the index and every answer
-    /// names it `large_file_unparsed`; under `skip` it leaves the index and answers carry
-    /// its `source_unavailable`.
+    /// `[search.text] large_files = "split"` its text stays in the index, and under `skip` it
+    /// leaves the index; either way a bound left it out, so no answer names it (D37) and the
+    /// build's log record names the file, the bound, and the measured size.
     #[tokio::test]
-    async fn build_serves_the_warning_of_a_file_past_max_file_under_each_strategy() -> TestResult {
+    async fn build_logs_a_file_past_max_file_under_each_strategy() -> TestResult {
         let directory = tempfile::tempdir()?;
         let wide = "pub fn wide() {}\n";
         let max_file_bytes = 1_usize;
@@ -6076,11 +6077,17 @@ done
         wait_for_complete_publication(&server).await?;
         let result = search_symbols(&server, "wide").await?;
         assert!(result.results.is_empty());
-        assert!(result.warnings.iter().any(|warning| matches!(
-            warning,
-            ReadWarning::LargeFileUnparsed { files, .. }
-                if files.iter().any(|file| file.0.ends_with("/wide.rs"))
-        )));
+        let omission = |warning: &ReadWarning| {
+            matches!(
+                warning,
+                ReadWarning::LargeFileUnparsed { .. } | ReadWarning::SourceUnavailable { .. }
+            )
+        };
+        assert!(
+            !result.warnings.iter().any(omission),
+            "{:?}",
+            result.warnings
+        );
         drop(server);
 
         let directory = tempfile::tempdir()?;
@@ -6088,25 +6095,55 @@ done
         let configuration =
             "[providers.syntax]\nmax_file = \"1b\"\n\n[search.text]\nlarge_files = \"skip\"\n";
         super::hermetic_workspace(directory.path(), configuration)?;
-        let server =
-            RiftMcp::build_settled(directory.path(), WorkspaceIndexLimits::default()).await?;
+        let capture = crate::logs::logs_configuration(directory.path()).capture;
+        rift_tracing::validate_log_filter(&capture)?;
+        let (_runtime, drain) = rift_tracing::TracingRuntime::builder()
+            .capture(&capture)
+            .install()?;
+        let drain = drain.ok_or("a capture filter returns a drain")?;
+        let storage = crate::storage::WorkspaceStorage::open(directory.path()).await;
+        let store = storage.logs().ok_or("the log store must open")?;
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let drain_task = tokio::spawn(drain.run(Arc::clone(&store), 10_000, cancellation.clone()));
+        let server = RiftMcp::build_settled_with_storage(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            storage,
+            crate::identity::BuildCheckout::Unversioned,
+        )
+        .await?;
         wait_for_complete_publication(&server).await?;
         let result = search_symbols(&server, "wide").await?;
         assert!(result.results.is_empty());
-        let expected_limit =
-            format!("wide.rs source file exceeds its accepted byte limit of {max_file_bytes}");
-        let expected_observed = format!("observed {}", max_file_bytes + 1);
         assert!(
-            result.warnings.iter().any(|warning| matches!(
-                warning,
-                ReadWarning::SourceUnavailable { unit: Some(unit), detail }
-                    if unit.0 == "rift://source/project/wide.rs"
-                        && detail.contains(expected_limit.as_str())
-                        && detail.contains("field source.file_bytes")
-                        && detail.contains(expected_observed.as_str())
-            )),
+            !result.warnings.iter().any(omission),
             "{:?}",
             result.warnings
+        );
+        let expected_limit =
+            format!("source file exceeds its accepted byte limit of {max_file_bytes}");
+        let expected_observed = format!("observed {}", max_file_bytes + 1);
+        stop_index_work(&server).await?;
+        cancellation.cancel();
+        drain_task.await?;
+        let records = store
+            .reader()
+            .connect()?
+            .recent(&rift_tracing::LogQuery::newest(500).for_component("index"))?;
+        let named: Vec<serde_json::Value> = records
+            .iter()
+            .filter(|stored| stored.record().message() == "file left out of the index")
+            .map(|stored| serde_json::from_str(stored.record().fields()))
+            .collect::<Result<_, _>>()?;
+        assert!(
+            named.iter().any(|fields| {
+                let reason = fields["reason"].as_str().unwrap_or_default();
+                fields["path"] == "wide.rs"
+                    && reason.contains(expected_limit.as_str())
+                    && reason.contains("field source.file_bytes")
+                    && reason.contains(expected_observed.as_str())
+            }),
+            "the log names the file, the bound, and the measured size: {named:?}"
         );
         Ok(())
     }
@@ -6210,22 +6247,38 @@ done
         let oversized = format!("pub fn oversized() {{}}\n{}", " ".repeat(80));
         assert!(oversized.len() > max_file_bytes);
         let expected_limit =
-            format!("lib.rs source file exceeds its accepted byte limit of {max_file_bytes}");
+            format!("source file exceeds its accepted byte limit of {max_file_bytes}");
         let expected_observed = format!("observed {}", max_file_bytes + 1);
         fs::write(&path, oversized)?;
         let skipped = search_symbols(&server, "oversized").await?;
         assert!(skipped.results.is_empty());
+        // D37: the answer carries nothing for a file a bound left out; the publication the
+        // read settled on keeps the omission with its bound and measured size.
         assert!(
-            skipped.warnings.iter().any(|warning| matches!(
-                warning,
-                ReadWarning::SourceUnavailable { unit: Some(unit), detail }
-                    if unit.0 == "rift://source/project/lib.rs"
-                        && detail.contains(expected_limit.as_str())
-                        && detail.contains("field source.file_bytes")
-                        && detail.contains(expected_observed.as_str())
-            )),
+            !skipped
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, ReadWarning::SourceUnavailable { .. })),
             "{:?}",
             skipped.warnings
+        );
+        let (published, _) = crate::validation::read_published(&server.published)
+            .await
+            .snapshot();
+        let retained = published
+            .reads
+            .file_warning(&rift_core::ProjectPath::new("lib.rs")?)
+            .cloned();
+        drop(published);
+        assert!(
+            retained.as_ref().is_some_and(|warning| {
+                let reason = warning.reason();
+                warning.is_left_out_by_bound()
+                    && reason.contains(expected_limit.as_str())
+                    && reason.contains("field source.file_bytes")
+                    && reason.contains(expected_observed.as_str())
+            }),
+            "{retained:?}"
         );
 
         fs::write(&path, "pub fn recovered() {}\n")?;
@@ -10696,7 +10749,8 @@ done
     /// Under `[search.text] large_files = "split"`, the default, a file past `max_chunk`
     /// answers search from its chunk rows and its declaration answers `get_symbol`, and a
     /// file past `[providers.syntax] max_file` is held as text the provider does not parse:
-    /// its text answers a `pattern`, and every answer names it in `large_file_unparsed`.
+    /// its text answers a `pattern`, and no answer names it (D37): the index build records it
+    /// in the log, as a file the source policy excludes is outside every answer.
     /// The store takes every row a `max_chunk` the configuration accepts can derive, so no
     /// row of either file is left out of the lexical index, and the capture agrees with
     /// the index on the held text.
@@ -10716,19 +10770,13 @@ done
             serde_json::from_value(json!({"pattern": "harbor \\w+", "target": "file"}))?;
         let answer = server.answered_search(Parameters(params)).await?.0;
         assert_eq!(answered_paths(&answer), ["src/blob.rs", "src/huge.rs"]);
-        let unparsed = answer
-            .warnings
-            .iter()
-            .find_map(|warning| match warning {
-                ReadWarning::LargeFileUnparsed { files, .. } => Some(files.clone()),
-                _ => None,
-            })
-            .ok_or("the answer names the unparsed file")?;
-        assert_eq!(
-            unparsed,
-            [rift_protocol::read::SourceUnitId(
-                "rift://source/project/src/huge.rs".to_owned()
-            )]
+        assert!(
+            !answer.warnings.iter().any(|warning| matches!(
+                warning,
+                ReadWarning::LargeFileUnparsed { .. } | ReadWarning::SourceUnavailable { .. }
+            )),
+            "a file a bound left unparsed reaches no answer: {:?}",
+            answer.warnings
         );
         assert!(
             !answer
@@ -10745,9 +10793,10 @@ done
             "no declaration of huge.rs was extracted"
         );
         assert!(
-            huge.warnings
-                .iter()
-                .any(|warning| matches!(warning, ReadWarning::LargeFileUnparsed { .. })),
+            !huge.warnings.iter().any(|warning| matches!(
+                warning,
+                ReadWarning::LargeFileUnparsed { .. } | ReadWarning::SourceUnavailable { .. }
+            )),
             "{:?}",
             huge.warnings
         );

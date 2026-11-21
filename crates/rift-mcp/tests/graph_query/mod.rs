@@ -745,3 +745,126 @@ async fn a_left_out_file_makes_the_symbol_inventory_partial_but_answered() -> Te
     client.cancel().await?;
     Ok(())
 }
+
+/// `def <name>() -> int:` padded with a comment to exactly `bytes` bytes.
+fn python_source_of(name: &str, bytes: usize) -> String {
+    let mut source = format!("def {name}() -> int:\n    return 1\n#");
+    assert!(source.len() < bytes, "fixture too small: {bytes}");
+    source.push_str(&"x".repeat(bytes - source.len() - 1));
+    source.push('\n');
+    source
+}
+
+/// One page of `max_results` rows of `text`.
+async fn statement_page(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    text: &str,
+    max_results: u64,
+) -> TestResult<Value> {
+    query_after_population(
+        client,
+        &QueryParams {
+            max_results,
+            query: text.to_owned(),
+            language: QueryLanguage::Sparql,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// D37 (#717): a file past `[providers.syntax] max_file` is left out of the indexed set the
+/// way a file the source policy excludes is. Plain symbol enumeration, `LIMIT`, `COUNT`,
+/// `GROUP BY` and an absence all answer over the symbols the index holds, and no answer
+/// carries a warning for the left-out file. Sources below and at the bound answer.
+#[tokio::test]
+async fn an_oversized_file_leaves_symbol_enumeration_counts_and_groups_answering() -> TestResult {
+    let bound = SOURCE.len() + 64;
+    let configuration = format!("[providers.syntax]\nmax_file = \"{bound}b\"\n");
+    let at = python_source_of("at_bound", bound);
+    let above = python_source_of("above_bound", bound + 1);
+    let (_directory, client, _server_task) = served_workspace(
+        &[
+            ("pyproject.toml", METADATA),
+            ("graph.py", SOURCE),
+            ("at.py", &at),
+            ("above.py", &above),
+        ],
+        Some(configuration),
+    )
+    .await?;
+    let omission = ["source_unavailable", "large_file_unparsed"];
+    let enumeration = statement_page(
+        &client,
+        "SELECT ?name WHERE { ?s a :Symbol; :name ?name } ORDER BY ?name",
+        100,
+    )
+    .await?;
+    let names = query::rows(&enumeration)?
+        .iter()
+        .map(|row| query::literal(row, "name"))
+        .collect::<TestResult<BTreeSet<&str>>>()?;
+    assert!(
+        names.contains("at_bound") && names.contains("graph_leaf"),
+        "{enumeration}"
+    );
+    assert!(!names.contains("above_bound"), "{enumeration}");
+    let total = enumeration["pagination"]["total"]
+        .as_u64()
+        .ok_or("pagination total")?;
+    assert_eq!(total, u64::try_from(names.len())?, "{enumeration}");
+    let mut answers = vec![enumeration.clone()];
+
+    let limited = statement_page(
+        &client,
+        "SELECT ?s ?name WHERE { ?s a :Symbol; :name ?name } LIMIT 3",
+        10,
+    )
+    .await?;
+    assert_eq!(query::rows(&limited)?.len(), 3, "{limited}");
+    answers.push(limited);
+
+    let count = statement_page(
+        &client,
+        "SELECT (COUNT(*) AS ?n) WHERE { ?s a :Symbol }",
+        10,
+    )
+    .await?;
+    let [row] = query::rows(&count)? else {
+        return Err(format!("expected one count: {count}").into());
+    };
+    assert_eq!(query::literal(row, "n")?, total.to_string(), "{count}");
+    answers.push(count);
+
+    let grouped = statement_page(
+        &client,
+        "SELECT ?kind (COUNT(*) AS ?n) WHERE { ?s a :Symbol; :kind ?kind } GROUP BY ?kind",
+        100,
+    )
+    .await?;
+    let grouped_total = query::rows(&grouped)?
+        .iter()
+        .map(|row| query::literal(row, "n").map(|value| value.parse::<u64>().unwrap_or(0)))
+        .sum::<TestResult<u64>>()?;
+    assert_eq!(grouped_total, total, "{grouped}");
+    answers.push(grouped);
+
+    let absent = statement_page(&client, "ASK { ?s a :Symbol; :name 'above_bound' }", 10).await?;
+    assert_eq!(
+        absent["answer"],
+        json!({"result":"boolean", "value":false}),
+        "{absent}"
+    );
+    answers.push(absent);
+
+    for answer in &answers {
+        assert_ne!(answer["outcome"], "unavailable", "{answer}");
+        let codes = warning_codes(answer);
+        assert!(
+            omission.iter().all(|code| !codes.contains(code)),
+            "no answer carries the left-out file: {answer}"
+        );
+    }
+    client.cancel().await?;
+    Ok(())
+}

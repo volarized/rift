@@ -1250,7 +1250,8 @@ excluded_lockfiles = ["Cargo.lock", "uv.lock", "package-lock.json", "bun.lock"]
 - `large_files` is `split`, the default, or `skip`. Under `split` the file is indexed as
   whole-line chunks of at most `max_chunk`, and a file past [`[providers.syntax]`](#providers)
   `max_file` is held as text the syntax provider does not parse, up to [`[source]`](#source)
-  `workspace_size`; every answer names such files in a `large_file_unparsed` warning. Under
+  `workspace_size`; the index build records such files in `rift server logs`, and symbol answers
+  cover the declarations the index holds. Under
   `skip` the file leaves the text index, a file past `max_file` leaves the index entirely, and an
   answer whose `paths` reach one counts it in a `large_file_skipped` warning
 - `excluded_lockfiles` names the lockfiles search leaves out, matched against each visible file's

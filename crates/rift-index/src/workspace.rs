@@ -1235,42 +1235,84 @@ pub struct IndexedFileSyntax {
 }
 
 impl<File> IndexRead<File> {
-    /// Leaves one file out, recording the warning that names it once, at the
-    /// build that read it.
-    fn left_out(warning: WorkspaceIndexWarning) -> Self {
-        log_left_out(&warning);
+    /// Leaves one file out. The contents that hold the warning record it in the log.
+    const fn left_out(warning: WorkspaceIndexWarning) -> Self {
         Self::Skipped(warning)
     }
 
-    /// Holds one file as text its provider did not parse, recording the warning that
-    /// names it once, at the build that read it.
-    fn held_unparsed(warning: WorkspaceIndexWarning) -> Self {
-        log_held_unparsed(&warning);
+    /// Holds one file as text its provider did not parse. The contents that hold the
+    /// warning record it in the log.
+    const fn held_unparsed(warning: WorkspaceIndexWarning) -> Self {
         Self::Skipped(warning)
     }
 }
 
-/// Records one file left out of the index, once, at the build that left it out.
-fn log_left_out(warning: &WorkspaceIndexWarning) {
-    rift_tracing::warn!(
-        component = "index",
-        operation = "index.build",
-        path = warning.path().as_str(),
-        reason = %warning.reason(),
-        "file left out of the index"
-    );
+/// Files one build names in the log, one record each, before it counts the rest.
+///
+/// A tree whose every file breaches a bound would otherwise write one record per file and
+/// evict everything else the build recorded from the bounded log store.
+const OMITTED_FILE_RECORDS_MAX: u32 = 64;
+
+/// The log records one build writes for the files it leaves out or holds unparsed.
+///
+/// The first [`OMITTED_FILE_RECORDS_MAX`] files read get one record each, naming the path and
+/// the reason with its bound and measured value; each publication of the contents then writes
+/// one record counting the files past them, so a build writes at most
+/// `OMITTED_FILE_RECORDS_MAX` named records and one count per publication, whatever the number
+/// of files a bound left out. Answers carry
+/// nothing for these files: a file a bound left out is outside the indexed set, as a file
+/// the source policy excludes is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct OmittedFileRecords {
+    named: u32,
+    counted: u64,
 }
 
-/// Records one file the index holds as text its provider did not parse, once, at the
-/// build that read it, with the fields a left-out file's record carries.
-fn log_held_unparsed(warning: &WorkspaceIndexWarning) {
-    rift_tracing::warn!(
-        component = "index",
-        operation = "index.build",
-        path = warning.path().as_str(),
-        reason = %warning.reason(),
-        "file held unparsed in the index"
-    );
+impl OmittedFileRecords {
+    /// Names one file this build read and did not parse, or counts it past the bound.
+    fn record(&mut self, warning: &WorkspaceIndexWarning) {
+        if self.named >= OMITTED_FILE_RECORDS_MAX {
+            self.counted = self.counted.saturating_add(1);
+            return;
+        }
+        self.named += 1;
+        let path = warning.path().as_str();
+        let reason = warning.reason();
+        if warning.holds_text() {
+            rift_tracing::warn!(
+                component = "index",
+                operation = "index.build",
+                path = path,
+                reason = %reason,
+                "file held unparsed in the index"
+            );
+        } else {
+            rift_tracing::warn!(
+                component = "index",
+                operation = "index.build",
+                path = path,
+                reason = %reason,
+                "file left out of the index"
+            );
+        }
+    }
+
+    /// Writes the one record counting the files past the named ones since these contents
+    /// last wrote it, or none when every file was named.
+    fn publish(&mut self) {
+        if self.counted == 0 {
+            return;
+        }
+        let counted = self.counted;
+        rift_tracing::warn!(
+            component = "index",
+            operation = "index.build",
+            counted = counted,
+            named_max = OMITTED_FILE_RECORDS_MAX,
+            "more files left out of the index or held unparsed than one build names"
+        );
+        self.counted = 0;
+    }
 }
 
 /// What the index keeps of a file it read and left out: the two digests a capture of
@@ -1316,6 +1358,7 @@ pub(crate) struct IndexContents {
     raw_syntax: BTreeMap<ProjectPath, Arc<rift_syntax::SyntaxFacts>>,
     left_out: BTreeMap<ProjectPath, LeftOutFileState>,
     warnings: Vec<WorkspaceIndexWarning>,
+    omitted: OmittedFileRecords,
     /// Whether these contents are a part of the sources a preparation is still reading.
     /// Their publication leaves the static pass to the one that holds every source.
     partial: bool,
@@ -2142,6 +2185,7 @@ impl IndexContents {
             raw_syntax: index.raw_syntax.clone(),
             left_out: index.left_out.clone(),
             warnings: index.warnings.clone(),
+            omitted: OmittedFileRecords::default(),
             partial: false,
         }
     }
@@ -2170,6 +2214,7 @@ impl IndexContents {
                 })
                 .cloned()
                 .collect(),
+            omitted: OmittedFileRecords::default(),
             partial: false,
         };
         for path in changes.paths() {
@@ -2305,11 +2350,13 @@ impl IndexContents {
             }
             IndexRead::Skipped(warning) if warning.holds_text() => {
                 self.hold_text_file(text_file);
+                self.omitted.record(&warning);
                 self.warnings.push(warning);
             }
             IndexRead::Skipped(warning) => {
                 self.left_out
                     .insert(text_file.path().clone(), LeftOutFileState::of(&text_file));
+                self.omitted.record(&warning);
                 self.warnings.push(warning);
             }
         }
@@ -2527,6 +2574,7 @@ impl IndexContents {
 
     /// Records one file the catalog read left out.
     pub(crate) fn leave_out(&mut self, warning: WorkspaceIndexWarning) {
+        self.omitted.record(&warning);
         self.warnings.push(warning);
     }
 
@@ -2540,7 +2588,7 @@ impl IndexContents {
         self.text_files.remove(path);
         self.left_out
             .insert(path.clone(), LeftOutFileState::of_indexed(&file));
-        log_left_out(&warning);
+        self.omitted.record(&warning);
         self.warnings.push(warning);
         self.sort_warnings();
         true
@@ -2549,6 +2597,7 @@ impl IndexContents {
     /// The same contents with the warnings in project-path order.
     fn sorted(mut self) -> Self {
         self.sort_warnings();
+        self.omitted.publish();
         self
     }
 
@@ -2566,6 +2615,27 @@ impl WorkspaceIndexWarning {
     #[must_use]
     pub const fn leaves_declarations_out(&self) -> bool {
         !matches!(self, Self::FrameworkContextUnresolved { .. })
+    }
+
+    /// Whether a bound left the file's declarations out: the file's byte size, a syntax
+    /// provider bound, or the workspace's declaration bound. Such a file is outside the
+    /// indexed set, as a file the source policy excludes is, so it neither makes an
+    /// inventory partial nor reaches an answer; the build names it in the log instead.
+    #[must_use]
+    pub const fn is_left_out_by_bound(&self) -> bool {
+        matches!(
+            self,
+            Self::FileTooLarge { .. }
+                | Self::SyntaxTooLarge { .. }
+                | Self::DeclarationsBeyondBound(_)
+        )
+    }
+
+    /// Whether the file leaves the captured inventory short of the indexed set: its
+    /// declarations are missing although no bound excluded it.
+    #[must_use]
+    pub const fn leaves_inventory_partial(&self) -> bool {
+        self.leaves_declarations_out() && !self.is_left_out_by_bound()
     }
 
     /// Whether the file keeps its text in the index: the provider refused its source for
@@ -4170,7 +4240,7 @@ impl WorkspaceIndex {
         Ok(!self
             .warnings
             .iter()
-            .any(WorkspaceIndexWarning::leaves_declarations_out)
+            .any(WorkspaceIndexWarning::leaves_inventory_partial)
             && !declarations
                 .incomplete_languages
                 .contains(&language.identity_segment()))
@@ -5166,8 +5236,12 @@ fn built_contents_with_owner(
                             raw_syntax,
                             left_out,
                             warnings,
+                            mut omitted,
                             partial: _,
                         } = contents;
+                        // The admission passes above can leave declarations out after the
+                        // contents were sorted; their count belongs to this publication.
+                        omitted.publish();
                         return Ok(BuiltContents {
                             files,
                             text_files,

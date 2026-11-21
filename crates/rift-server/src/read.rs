@@ -974,11 +974,20 @@ impl ReadService {
 
     /// Returns the warnings every answer from this service carries: one
     /// `stale_index` when the published index lags the captured tree, one
-    /// `source_unavailable` for each file the index left out, bounded by
-    /// [`SOURCE_WARNINGS_MAX`], and none of either when nothing applies.
+    /// `source_unavailable` for each file the index left out although no bound
+    /// excluded it, bounded by [`SOURCE_WARNINGS_MAX`], and none of either when
+    /// nothing applies.
+    ///
+    /// A file a bound left out is outside the indexed set, as a file the source
+    /// policy excludes is: the build names it in the log, and no answer carries it.
     pub(crate) fn warnings(&self) -> Vec<ReadWarning> {
         let mut warnings = self.revisions.warnings();
-        warnings.extend(source_warnings(self.index.warnings()));
+        warnings.extend(selected_source_warnings(
+            self.index
+                .warnings()
+                .iter()
+                .filter(|warning| !warning.is_left_out_by_bound()),
+        ));
         warnings
     }
 
@@ -1634,8 +1643,15 @@ pub(crate) fn wire_index_warning(warning: &WorkspaceIndexWarning) -> ReadWarning
 /// when more were left out - one more counting the rest, which `rift server logs` names one by
 /// one; and one `large_file_unparsed` naming the files held as text alone.
 pub(crate) fn source_warnings(warnings: &[WorkspaceIndexWarning]) -> Vec<ReadWarning> {
+    selected_source_warnings(warnings.iter())
+}
+
+/// [`source_warnings`] for the files `warnings` selects.
+fn selected_source_warnings<'warning>(
+    warnings: impl Iterator<Item = &'warning WorkspaceIndexWarning> + Clone,
+) -> Vec<ReadWarning> {
     let framework = warnings
-        .iter()
+        .clone()
         .filter(|warning| {
             matches!(
                 warning,
@@ -1644,7 +1660,6 @@ pub(crate) fn source_warnings(warnings: &[WorkspaceIndexWarning]) -> Vec<ReadWar
         })
         .collect::<Vec<_>>();
     let (unparsed, left_out): (Vec<&WorkspaceIndexWarning>, Vec<&WorkspaceIndexWarning>) = warnings
-        .iter()
         .filter(|warning| {
             !matches!(
                 warning,
@@ -1662,7 +1677,7 @@ pub(crate) fn source_warnings(warnings: &[WorkspaceIndexWarning]) -> Vec<ReadWar
         warnings.push(ReadWarning::SourceUnavailable {
             unit: None,
             detail: format!(
-                "{rest} more files are absent from the index; rift server logs names each"
+                "{rest} more files are absent from the index; rift server logs records them"
             ),
         });
     }
@@ -2925,7 +2940,7 @@ pub(crate) mod tests {
             result.warnings.last(),
             Some(&ReadWarning::SourceUnavailable {
                 unit: None,
-                detail: "1 more files are absent from the index; rift server logs names each"
+                detail: "1 more files are absent from the index; rift server logs records them"
                     .to_owned(),
             })
         );
@@ -3992,7 +4007,8 @@ pub(crate) mod tests {
 
     /// A committed file the syntax provider refuses under its depth bound is left out of
     /// the revision index the way the workspace scan leaves it out, so `get_symbol` at
-    /// the revision still answers from the file beside it and names the refused one.
+    /// the revision still answers from the file beside it. A bound left the file out, so
+    /// the answer carries nothing for it (D37) while the revision index keeps the omission.
     #[test]
     fn revision_read_leaves_out_a_file_past_a_syntax_bound_and_serves_the_rest() -> TestResult {
         let directory = committed_fixture()?;
@@ -4018,12 +4034,18 @@ pub(crate) mod tests {
         );
         let deep_path = rift_core::ProjectPath::new("src/deep.rs")?;
         assert!(
-            result.warnings.iter().any(|warning| matches!(
+            !result.warnings.iter().any(|warning| matches!(
                 warning,
                 ReadWarning::SourceUnavailable { unit: Some(unit), .. } if *unit == file_id(&deep_path)
             )),
-            "the answer names the refused file: {:?}",
+            "the answer carries nothing for the refused file: {:?}",
             result.warnings
+        );
+        assert!(
+            service.file_warning(&deep_path).is_some_and(
+                |warning| warning.is_left_out_by_bound() && warning.reason().contains("depth")
+            ),
+            "the revision index keeps the omission and its bound"
         );
         Ok(())
     }
