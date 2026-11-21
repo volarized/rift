@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use lsp_types::error_codes::{CONTENT_MODIFIED, SERVER_CANCELLED};
 use lsp_types::notification::{
-    DidChangeWatchedFiles, DidCloseTextDocument, DidOpenTextDocument, Exit, Initialized,
+    Cancel, DidChangeWatchedFiles, DidCloseTextDocument, DidOpenTextDocument, Exit, Initialized,
     Notification, Progress, PublishDiagnostics,
 };
 use lsp_types::request::{
@@ -30,12 +30,12 @@ use lsp_types::request::{
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
-    ConfigurationParams, Diagnostic, DidChangeWatchedFilesParams,
+    CancelParams, ConfigurationParams, Diagnostic, DidChangeWatchedFilesParams,
     DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DocumentDiagnosticParams, DocumentDiagnosticReport,
     DocumentDiagnosticReportResult, FileChangeType, FileEvent, FileSystemWatcher, GlobPattern,
-    InitializeParams, InitializedParams, Location, PartialResultParams, Position, ProgressParams,
-    ProgressParamsValue, ProgressToken, PublishDiagnosticsParams, ReferenceContext,
+    InitializeParams, InitializedParams, Location, NumberOrString, PartialResultParams, Position,
+    ProgressParams, ProgressParamsValue, ProgressToken, PublishDiagnosticsParams, ReferenceContext,
     ReferenceParams, RegistrationParams, TextDocumentIdentifier, TextDocumentItem,
     TextDocumentPositionParams, WatchKind, WorkDoneProgress, WorkDoneProgressCreateParams,
     WorkDoneProgressParams, WorkspaceFolder,
@@ -162,6 +162,17 @@ fn response_result<R: Request>(
     })
 }
 
+/// What a request whose wait ended unanswered does to the session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Unanswered {
+    /// The session ends: the handshake and the shutdown, whose timeouts bound a start and
+    /// a stop whatever the engine reports.
+    EndsSession,
+    /// The session ends only for an engine silent for the whole timeout
+    /// ([`EngineSession::unanswered`]).
+    Silence,
+}
+
 /// Whether an error means session cannot serve another exchange.
 fn ends_session(error: &RiftError) -> bool {
     let slug = error.slug();
@@ -279,6 +290,8 @@ struct WorkProgress {
     last_transition: Option<Instant>,
     last_read: Option<Instant>,
     first_read: Option<Instant>,
+    /// The moment the session last read bytes the engine wrote.
+    last_output: Option<Instant>,
     /// Announcement and last transition over every token but the flycheck ones.
     walk_announced: bool,
     walk_transition: Option<Instant>,
@@ -354,6 +367,21 @@ impl WorkProgress {
     fn read(&mut self, now: Instant) {
         self.first_read.get_or_insert(now);
         self.last_read = Some(now);
+    }
+
+    /// Stamps engine output the session read at `now`.
+    fn output(&mut self, now: Instant) {
+        self.last_output = Some(now);
+        self.read(now);
+    }
+
+    /// Whether the engine is working at `now`: it holds an announced token it has not
+    /// ended, or the session read output from it within the last `window`.
+    fn is_working(&self, now: Instant, window: Duration) -> bool {
+        self.is_outstanding()
+            || self
+                .last_output
+                .is_some_and(|at| now.saturating_duration_since(at) < window)
     }
 
     /// The readiness a call hierarchy walk reads: [`WorkProgress::readiness`]
@@ -501,6 +529,8 @@ pub struct EngineSession {
     open_documents: BTreeSet<lsp_types::Uri>,
     open_documents_unrecorded: bool,
     frame_in_flight: bool,
+    /// The instant the caller's read ends at: no request waits past it.
+    deadline: Option<Instant>,
     ended: bool,
 }
 
@@ -648,6 +678,7 @@ impl EngineSession {
             open_documents: BTreeSet::new(),
             open_documents_unrecorded: false,
             frame_in_flight: false,
+            deadline: None,
             ended: false,
         };
         if let Err(error) = session
@@ -1297,8 +1328,11 @@ impl EngineSession {
     /// Dropping the future drops the child with kill-on-drop armed: the
     /// runtime kills and reaps it in the background.
     pub async fn shutdown(mut self) -> CapturedStream {
+        self.deadline = None;
         if !self.ended {
-            let _shutdown = self.request_within::<Shutdown>((), SHUTDOWN_TIMEOUT).await;
+            let _shutdown = self
+                .request_within::<Shutdown>((), SHUTDOWN_TIMEOUT, Unanswered::EndsSession)
+                .await;
         }
         if !self.ended {
             let _exit = self.notify::<Exit>(&()).await;
@@ -1340,26 +1374,104 @@ impl EngineSession {
         };
         // Boxed: the initialize exchange's future measures 11,056 bytes, and this handshake
         // runs once per session start, so the allocation is paid once.
-        let answer =
-            Box::pin(self.request_within::<edges::EdgeInitialize>(params, startup_timeout)).await?;
+        let answer = Box::pin(self.request_within::<edges::EdgeInitialize>(
+            params,
+            startup_timeout,
+            Unanswered::EndsSession,
+        ))
+        .await?;
         self.capabilities = Capabilities::negotiated_edge_answer(answer)?;
         self.notify::<Initialized>(&InitializedParams {}).await
     }
 
     /// Sends one request and reads until its response, under the timeout.
     async fn request<R: Request>(&mut self, params: R::Params) -> Result<R::Result, RiftError> {
-        self.request_within::<R>(params, self.request_timeout).await
+        self.request_within::<R>(params, self.request_timeout, Unanswered::Silence)
+            .await
+    }
+
+    /// Sets the instant the caller's read ends at, or clears it with `None`.
+    ///
+    /// No request waits for its answer past `deadline`: a request still unanswered there
+    /// is cancelled and fails with [`errors::lsp::engine_analyzing`], and the session
+    /// stays for the next request. A batch checks the deadline before each frame it
+    /// writes, so the deadline never cuts a frame part-written.
+    pub fn set_deadline(&mut self, deadline: Option<Instant>) {
+        self.deadline = deadline;
+    }
+
+    /// The instant one request sent at `sent` stops waiting under `timeout`, and whether
+    /// the caller's deadline, not the timeout, sets it.
+    fn wait_end(&self, sent: Instant, timeout: Duration) -> (Instant, bool) {
+        let timed = sent + timeout;
+        match self.deadline {
+            Some(deadline) if deadline < timed => (deadline, true),
+            _ => (timed, false),
+        }
+    }
+
+    /// Whether the caller's deadline has passed.
+    fn deadline_passed(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    /// Settles a request whose wait ended before its answer arrived.
+    ///
+    /// `request_timeout` measures engine silence, not the age of one request. An engine
+    /// that holds an announced token it has not ended, or that sent output within the
+    /// last `timeout`, is working; so is any engine when the caller's deadline ended the
+    /// wait. Then every pending request is cancelled with `$/cancelRequest`, the session
+    /// stays, and the request fails with [`errors::lsp::engine_analyzing`]. An engine
+    /// silent for the whole `timeout`, or one left holding part of a frame, ends the
+    /// session with [`errors::lsp::engine_timed_out`].
+    async fn unanswered(
+        &mut self,
+        method: &'static str,
+        timeout: Duration,
+        deadline_cut: bool,
+    ) -> RiftError {
+        let working = deadline_cut || self.progress.is_working(Instant::now(), timeout);
+        if working && !self.frame_in_flight && !self.ended {
+            if let Err(error) = self.cancel_pending().await {
+                return error;
+            }
+            return errors::lsp::engine_analyzing().attempts(1_u64).error();
+        }
+        self.end().await;
+        errors::lsp::engine_timed_out()
+            .method(method)
+            .timeout_ms(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX))
+            .error()
+    }
+
+    /// Tells the engine with `$/cancelRequest` that the session no longer waits for any
+    /// request still pending. Their answers arrive later and the next exchange discards
+    /// them.
+    async fn cancel_pending(&mut self) -> Result<(), RiftError> {
+        for id in self.correlation.cancel_pending() {
+            let id = i32::try_from(id.value()).map_or_else(
+                |_| NumberOrString::String(id.value().to_string()),
+                NumberOrString::Number,
+            );
+            self.notify::<Cancel>(&CancelParams { id }).await?;
+        }
+        Ok(())
     }
 
     /// Sends one request under an explicit timeout.
     ///
-    /// A timeout or a broken exchange ends the session. The previous
-    /// answer's emptiness verdict is forgotten here, so the one the
-    /// holder reads always belongs to the request it just made.
+    /// A broken exchange ends the session. Under [`Unanswered::Silence`] so does an engine
+    /// silent for the whole timeout, and a wait that ends while the engine works keeps it
+    /// ([`EngineSession::unanswered`]); under [`Unanswered::EndsSession`] every timeout
+    /// ends it. The previous answer's emptiness verdict is
+    /// forgotten here, so the one the holder reads always belongs to the request it just
+    /// made.
     async fn request_within<R: Request>(
         &mut self,
         params: R::Params,
         timeout: Duration,
+        rule: Unanswered,
     ) -> Result<R::Result, RiftError> {
         self.refuse_ended()?;
         self.empty_answers.forget();
@@ -1369,7 +1481,11 @@ impl EngineSession {
                 .source(source)
                 .error()
         })?;
-        match tokio::time::timeout(timeout, self.exchange::<R>(value)).await {
+        if self.deadline_passed() {
+            return errors::lsp::engine_analyzing().attempts(1_u64).fail();
+        }
+        let (end, deadline_cut) = self.wait_end(Instant::now(), timeout);
+        match tokio::time::timeout_at(end, self.exchange::<R>(value)).await {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(error)) => {
                 if ends_session(&error) {
@@ -1377,13 +1493,14 @@ impl EngineSession {
                 }
                 error.fail()
             }
-            Err(_elapsed) => {
+            Err(_elapsed) if rule == Unanswered::EndsSession => {
                 self.end().await;
                 errors::lsp::engine_timed_out()
                     .method(R::METHOD)
                     .timeout_ms(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX))
                     .fail()
             }
+            Err(_elapsed) => Err(self.unanswered(R::METHOD, timeout, deadline_cut).await),
         }
     }
 
@@ -1469,7 +1586,7 @@ impl EngineSession {
                     .method(method)
                     .fail();
             }
-            self.progress.read(Instant::now());
+            self.progress.output(Instant::now());
             let messages = self.framing.feed(&chunk[..read])?;
             self.queue.extend(messages);
         }

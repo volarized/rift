@@ -448,13 +448,16 @@ impl RiftMcp {
             let confirmations = Arc::clone(&reads);
             let roots = roots.clone();
             async move {
-                let answer = tokio::time::timeout_at(end, file.read(engines, selection, end))
-                    .await
-                    .map_err(|_| {
-                        rift_error::errors::lsp::engine_analyzing()
-                            .attempts(0_u64)
-                            .error()
-                    })??;
+                let answer = tokio::time::timeout_at(
+                    end + crate::server::ENGINE_READ_GRACE,
+                    file.read(engines, selection, end),
+                )
+                .await
+                .map_err(|_| {
+                    rift_error::errors::lsp::engine_analyzing()
+                        .attempts(0_u64)
+                        .error()
+                })??;
                 let Some(answer) = answer else {
                     return Ok(None);
                 };

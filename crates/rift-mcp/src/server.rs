@@ -1541,6 +1541,16 @@ fn ranking_of(
 /// whose check takes longer.
 const WALK_BUDGET_RESERVE_DIVISOR: u32 = 10;
 
+/// How long past its own deadline one engine read of an inventory file may run before the
+/// read is dropped.
+///
+/// The read ends itself at its deadline: the session cancels the requests it still waits
+/// for and the read reports the file unsettled, so no frame is cut part-written and the
+/// engine keeps running. Dropping the read is the last bound, for a write the engine does
+/// not read. The grace is a share of the least reserve a walk keeps before the request's
+/// deadline ([`WALK_BUDGET_RESERVE_DIVISOR`]), so the answer still fits after a drop.
+const ENGINE_READ_GRACE: Duration = Duration::from_millis(50);
+
 /// How many request-time captures of the same tree a walk reserves time for after it
 /// ends: the one check that decides whether its answer stands, twice over.
 ///

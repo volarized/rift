@@ -1614,11 +1614,12 @@ while IFS= read -r header; do
 done
 "#;
 
-/// A walk whose engine answers only after the request deadline is refused with
-/// `temporarily_unavailable` and `retry: same_request`, and keeps its engine session:
-/// the next walk is served by the same engine process, which reads `didClose` for the
-/// document the refused walk left open before it reads that document's next `didOpen`,
-/// and the refused walk's late answer is discarded on the way.
+/// A walk whose engine answers only after the request deadline ends its wait at the walk's
+/// deadline: the session cancels the request, the walk answers its static edge with
+/// `engine_analysis_unavailable`, and it keeps its engine session. The next walk is served
+/// by the same engine process, which reads `didClose` for the document the first walk opened
+/// before it reads that document's next `didOpen`, and the first walk's late answer is
+/// discarded on the way.
 #[cfg(unix)]
 #[tokio::test]
 async fn search_traversal_refused_at_the_request_deadline_keeps_the_engine() -> TestResult {
@@ -1653,17 +1654,16 @@ async fn search_traversal_refused_at_the_request_deadline_keeps_the_engine() -> 
         &json!({"traversal": {"seed": captured_seed(&client, "beacon", "lib.rs").await?}}),
     );
 
-    let refused = failed_call(client.call_tool(walk.clone()).await)?;
+    let first = client.call_tool(walk.clone()).await?;
+    assert_ne!(first.is_error, Some(true), "{first:?}");
+    let first = first
+        .structured_content
+        .ok_or("the cut walk answers with structured content")?;
+    assert_eq!(symbol_names(&first), ["caller"], "{first}");
     assert_eq!(
-        refused.code,
-        ErrorCode::TemporarilyUnavailable,
-        "{refused:?}"
-    );
-    assert_eq!(refused.retry, RetryDirective::SameRequest, "{refused:?}");
-    assert!(
-        refused.message.contains("request deadline exceeded"),
-        "{}",
-        refused.message
+        first["warnings"][0]["code"],
+        json!("engine_analysis_unavailable"),
+        "{first}"
     );
 
     let structured = call_retrying_acceptance(&client, walk).await?;
@@ -1684,6 +1684,107 @@ async fn search_traversal_refused_at_the_request_deadline_keeps_the_engine() -> 
         lines.get(1..5),
         Some(&["open", "late", "close", "open"][..]),
         "the next walk closes the refused walk's document before it opens it again"
+    );
+    Ok(())
+}
+
+/// A `sh` engine serving call hierarchy over `lib.rs` that announces work at start and holds
+/// its answer to the first call hierarchy request for 2 s, past a 1 s
+/// `[languages.rust.lsp] request_timeout`, before it ends that work. Every later request is
+/// answered at once: `caller` is prepared at any position and calls `beacon`. Each start
+/// appends `start` to the file its first argument names.
+#[cfg(unix)]
+const LOADING_ENGINE: &str = r#"echo start >> "$1"
+prepared=0
+frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
+while IFS= read -r header; do
+  IFS= read -r blank
+  length=$(printf '%s' "$header" | tr -dc 0-9)
+  body=$(dd bs=1 count="$length" 2>/dev/null)
+  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
+  uri=$(printf '%s' "$body" | grep -o '"uri":"[^"]*"' | head -1 | cut -d'"' -f4)
+  case "$body" in
+    *'"method":"initialize"'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true,\"callHierarchyProvider\":true}}}"
+      frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"begin","title":"analysis"}}}' ;;
+    *'"method":"$/cancelRequest"'*) ;;
+    *'"method":"textDocument/prepareCallHierarchy"'*)
+      prepared=$((prepared + 1))
+      if [ "$prepared" -eq 1 ]; then
+        sleep 2
+        frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":null}"
+        frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"end"}}}'
+      else
+        frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"name\":\"caller\",\"kind\":12,\"uri\":\"$uri\",\"range\":{\"start\":{\"line\":2,\"character\":0},\"end\":{\"line\":4,\"character\":1}},\"selectionRange\":{\"start\":{\"line\":2,\"character\":7},\"end\":{\"line\":2,\"character\":13}}}]}"
+      fi ;;
+    *'"method":"callHierarchy/outgoingCalls"'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"to\":{\"name\":\"beacon\",\"kind\":12,\"uri\":\"$uri\",\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":18}},\"selectionRange\":{\"start\":{\"line\":0,\"character\":7},\"end\":{\"line\":0,\"character\":13}}},\"fromRanges\":[]}]}" ;;
+    *'"method":"exit"'*)
+      exit 0 ;;
+    *'"id":'[0-9]*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":null}" ;;
+  esac
+done
+"#;
+
+/// A walk whose request waits past `request_timeout` on an engine that announced work keeps
+/// that engine: the first walk carries `engine_analysis_unavailable`, a later walk takes the
+/// engine's answer, and one engine process serves every walk.
+#[cfg(unix)]
+#[tokio::test]
+async fn search_traversal_waiting_on_announced_work_keeps_the_engine() -> TestResult {
+    let engine = tempfile::tempdir()?;
+    let script = engine.path().join("engine.sh");
+    let log = engine.path().join("engine.log");
+    std::fs::write(&script, LOADING_ENGINE)?;
+    let configuration = format!(
+        "[server]\nreadiness_timeout = \"1500ms\"\n\n\
+         [languages.rust.lsp]\ncommand = [\"sh\", \"{}\", \"{}\"]\nrequest_timeout = \"1s\"\n",
+        script.display(),
+        log.display()
+    );
+    let (_directory, client, _server_task) = served_workspace(
+        &[
+            ("Cargo.toml", RUST_LIBRARY),
+            (
+                "lib.rs",
+                "pub fn beacon() {}\n\npub fn caller() {\n    beacon();\n}\n",
+            ),
+        ],
+        Some(configuration),
+    )
+    .await?;
+    call_retrying_acceptance(
+        &client,
+        tool_request("search_retrieval", &json!({"query": "caller"})),
+    )
+    .await?;
+    let walk = tool_request(
+        "search_retrieval",
+        &json!({"traversal": {"seed": captured_seed(&client, "caller", "lib.rs").await?, "direction": "outgoing"}}),
+    );
+    let first = call_retrying_acceptance(&client, walk.clone()).await?;
+    assert_eq!(
+        first["warnings"][0]["code"],
+        json!("engine_analysis_unavailable"),
+        "{first}"
+    );
+    let mut answered = None;
+    for _walk in 0..20 {
+        let structured = call_retrying_acceptance(&client, walk.clone()).await?;
+        if structured["warnings"].as_array().is_none_or(Vec::is_empty) {
+            answered = Some(structured);
+            break;
+        }
+    }
+    let answered = answered.ok_or("a later walk takes the engine's answer")?;
+    assert_eq!(symbol_names(&answered), ["beacon"], "{answered}");
+    client.cancel().await?;
+    let recorded = std::fs::read_to_string(&log)?;
+    assert_eq!(
+        recorded.lines().filter(|line| *line == "start").count(),
+        1,
+        "every walk meets the one engine process: {recorded}"
     );
     Ok(())
 }

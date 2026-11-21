@@ -1273,6 +1273,166 @@ async fn progress_that_never_ends_keeps_the_engine_analyzing() {
     join(engine_task).await;
 }
 
+/// Capabilities of an engine that serves call hierarchy, for the request-timeout tests.
+fn call_hierarchy_capabilities() -> Value {
+    json!({"positionEncoding": "utf-8", "callHierarchyProvider": true})
+}
+
+/// A transport launch whose request timeout is `request_timeout`.
+fn launch_with_request_timeout(request_timeout: Duration) -> EngineLaunch {
+    EngineLaunch {
+        request_timeout,
+        ..transport_launch()
+    }
+}
+
+/// One call hierarchy item the scripted engine prepares.
+fn prepared_item() -> Value {
+    json!([{
+        "name": "a",
+        "kind": 12,
+        "uri": "file:///lib.rs",
+        "range": zero_range(),
+        "selectionRange": zero_range(),
+    }])
+}
+
+/// An engine that announced work and keeps reporting it is working: a request it has not
+/// answered within `request_timeout` is cancelled and reported as analyzing, and the session
+/// stays for the next request, which the same engine answers.
+#[tokio::test]
+async fn a_request_waiting_on_announced_work_keeps_the_session() {
+    let (_workspace, started, engine_task) = begin(
+        launch_with_request_timeout(Duration::from_millis(200)),
+        |mut engine| async move {
+            engine.handshake(call_hierarchy_capabilities()).await;
+            let (first, _params) = engine
+                .expect_request("textDocument/prepareCallHierarchy")
+                .await;
+            engine.begin_progress().await;
+            for _report in 0..6 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                engine.report_progress().await;
+            }
+            engine.respond(&first, prepared_item()).await;
+            let cancel = engine.next_message().await;
+            assert_eq!(cancel["method"], "$/cancelRequest", "{cancel:#}");
+            assert_eq!(cancel["params"]["id"], first, "{cancel:#}");
+            let (second, _params) = engine
+                .expect_request("textDocument/prepareCallHierarchy")
+                .await;
+            engine.end_progress().await;
+            engine.respond(&second, prepared_item()).await;
+            let (id, _params) = engine.expect_request("shutdown").await;
+            engine.respond(&id, Value::Null).await;
+            engine.next_message().await;
+        },
+    )
+    .await;
+    let mut session = started.expect("the scripted engine completes the handshake");
+    let document = path("src/lib.rs");
+    let sent = Instant::now();
+    let error = session
+        .prepare_call_hierarchy(&document, Position::new(0, 3))
+        .await
+        .expect_err("the working engine answers after the request timeout");
+    let waited = sent.elapsed();
+    assert_eq!(error.slug(), errors::lsp::engine_analyzing::SLUG, "{error}");
+    assert!(
+        waited >= Duration::from_millis(200) && waited < Duration::from_millis(600),
+        "the request ends at its timeout, not at the engine's answer: {waited:?}"
+    );
+    assert!(
+        !session.is_ended() && session.is_intact(),
+        "a working engine keeps its session"
+    );
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let items = session
+        .prepare_call_hierarchy(&document, Position::new(0, 3))
+        .await
+        .expect("the same engine answers the next request");
+    assert_eq!(items.len(), 1);
+    session.shutdown().await;
+    join(engine_task).await;
+}
+
+/// An engine that announced nothing and sent nothing for the whole request timeout is
+/// silent: the request ends the session.
+#[tokio::test]
+async fn a_request_to_a_silent_engine_ends_the_session_at_its_timeout() {
+    let (_workspace, started, engine_task) = begin(
+        launch_with_request_timeout(Duration::from_millis(200)),
+        |mut engine| async move {
+            engine.handshake(call_hierarchy_capabilities()).await;
+            engine
+                .expect_request("textDocument/prepareCallHierarchy")
+                .await;
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        },
+    )
+    .await;
+    let mut session = started.expect("the scripted engine completes the handshake");
+    let error = session
+        .prepare_call_hierarchy(&path("src/lib.rs"), Position::new(0, 3))
+        .await
+        .expect_err("the silent engine never answers");
+    assert_eq!(error.slug(), errors::lsp::engine_timed_out::SLUG, "{error}");
+    assert!(session.is_ended(), "a silent engine ends its session");
+    join(engine_task).await;
+}
+
+/// A deadline shorter than the request timeout ends the wait at the deadline: the request is
+/// cancelled and reported as analyzing, and the session stays intact for the next request.
+#[tokio::test]
+async fn a_request_deadline_cuts_the_wait_and_keeps_the_session() {
+    let (_workspace, started, engine_task) = begin(
+        launch_with_request_timeout(Duration::from_secs(5)),
+        |mut engine| async move {
+            engine.handshake(call_hierarchy_capabilities()).await;
+            let (first, _params) = engine
+                .expect_request("textDocument/prepareCallHierarchy")
+                .await;
+            let cancel = engine.next_message().await;
+            assert_eq!(cancel["method"], "$/cancelRequest", "{cancel:#}");
+            assert_eq!(cancel["params"]["id"], first, "{cancel:#}");
+            engine.respond(&first, Value::Null).await;
+            let (second, _params) = engine
+                .expect_request("textDocument/prepareCallHierarchy")
+                .await;
+            engine.respond(&second, prepared_item()).await;
+            let (id, _params) = engine.expect_request("shutdown").await;
+            engine.respond(&id, Value::Null).await;
+            engine.next_message().await;
+        },
+    )
+    .await;
+    let mut session = started.expect("the scripted engine completes the handshake");
+    let document = path("src/lib.rs");
+    let sent = Instant::now();
+    session.set_deadline(Some(
+        tokio::time::Instant::now() + Duration::from_millis(300),
+    ));
+    let error = session
+        .prepare_call_hierarchy(&document, Position::new(0, 3))
+        .await
+        .expect_err("the engine does not answer before the deadline");
+    let waited = sent.elapsed();
+    assert_eq!(error.slug(), errors::lsp::engine_analyzing::SLUG, "{error}");
+    assert!(
+        waited >= Duration::from_millis(300) && waited < Duration::from_secs(5),
+        "the wait ends at the deadline: {waited:?}"
+    );
+    assert!(!session.is_ended() && session.is_intact());
+    session.set_deadline(None);
+    let items = session
+        .prepare_call_hierarchy(&document, Position::new(0, 3))
+        .await
+        .expect("the next request is answered on the same session");
+    assert_eq!(items.len(), 1);
+    session.shutdown().await;
+    join(engine_task).await;
+}
+
 /// Diagnostic reports use their own settlement record. They do not set
 /// the semantic empty-answer state.
 #[tokio::test]
