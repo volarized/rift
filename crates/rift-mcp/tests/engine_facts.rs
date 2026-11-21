@@ -430,7 +430,7 @@ async fn rust_recorded_server_adds_facts_to_the_static_answer() -> TestResult {
     assert_eq!(
         counts,
         [
-            ("calls", 6, 8),
+            ("calls", 6, 9),
             ("references", 15, 19),
             ("hasType", 9, 9),
             ("extends", 0, 0),
@@ -438,18 +438,14 @@ async fn rust_recorded_server_adds_facts_to_the_static_answer() -> TestResult {
         ]
     );
     assert_more(&counts, &["calls", "references"]);
-    for (from, to) in [("each", "Circle/area"), ("first", "Circle/area")] {
+    for (from, to) in [
+        ("each", "Circle/area"),
+        ("first", "Circle/area"),
+        ("inferred", "Square/default"),
+    ] {
         assert_eq!(engine.providers("calls", from, to), ["lsp"]);
         assert_eq!(engine.providers("references", from, to), ["lsp"]);
     }
-    // At `Default::default()` the recorded definition answer names the trait method in a
-    // standard-library file outside the root, which no admitted source holds, and static
-    // analysis names that trait method; the engine states the selected implementation as
-    // a reference.
-    assert_eq!(
-        engine.providers("references", "inferred", "Square/default"),
-        ["lsp"]
-    );
     assert_eq!(
         engine.providers("calls", "total", "Square/area"),
         ["lsp", "static"],
