@@ -2744,7 +2744,9 @@ mod tests {
         )?;
         fs::write(
             directory.path().join("index.ts"),
-            "export interface Broken<out T> { value: T; }\n\
+            // A declaration whose own value is unreadable keeps no identity; a variance
+            // annotation no longer serves, since its declaration keeps one (D26).
+            "export const Broken = { value: (globalThis as any)?.value ?? }\n\
              export function target() {}\nexport function caller() { target(); }\n",
         )?;
         let reads = ReadService::build(
