@@ -1344,7 +1344,9 @@ max_tokens = 256
   64; the rest of the file's declarations are dropped, so one file whose declarations all rank
   well can't fill the list on its own and leave every other file unreachable
 - `max_vectors` bounds how many vectors the workspace holds, 1000 to 1000000; each vector
-  costs the model's dimension in single-precision floats
+  costs the model's dimension in single-precision floats. Declarations past it rank by their
+  text alone: the vector ranking is ready once the declarations it admits hold vectors, and
+  each population records in `rift server logs` how many declarations it left out
 - `kind` selects which embedding runs, and each kind carries only the keys its execution
   reads: `hf` downloads the weights from a Hugging Face repository and caches them where
   every other Hugging Face client on the machine caches them, `directory` reads a directory

@@ -1066,11 +1066,12 @@ impl SearchIndex {
         tree_revision: &str,
     ) -> Result<(), RiftError> {
         let total = as_count(described.len());
+        let admission = VectorAdmission::of(total, self.limits.max_vectors);
         let documents = rift_tracing::traced!(
             component = "search",
             operation = "search.populate.documents",
             total = total,
-            { documents(described, as_usize(total.min(self.limits.max_vectors))) }
+            { documents(described, as_usize(admission.admitted())) }
         );
         let vectors = self.vector_store().await?;
         let wanted = rift_tracing::traced!(
@@ -1087,7 +1088,11 @@ impl SearchIndex {
         let _pruned = vectors.prune_absent(&model.space.identity(), &live).await?;
         let corpus = self.read_corpus(&vectors, model).await?;
         self.publish(&documents, corpus, tree_revision);
-        self.set_pass(reached(as_count(documents.len()), total), total);
+        admission.record();
+        self.set_pass(
+            reached(as_count(documents.len()), admission.admitted()),
+            total,
+        );
         Ok(())
     }
 
@@ -1420,6 +1425,62 @@ fn resolved(
         .take(keep_max)
         .filter_map(|one| addresses.get(one.matched().digest()).cloned())
         .collect()
+}
+
+/// How many of one pass's described declarations `max_vectors` admits to the vector ranking.
+///
+/// The bound is a steady state, not a wait: a pass that embedded every admitted declaration
+/// is ready, and the declarations past the bound rank by their text alone, as if the workspace
+/// held no vector for them. The pass records the cut in the log, never in an answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VectorAdmission {
+    described: u64,
+    max_vectors: u64,
+}
+
+impl VectorAdmission {
+    const fn of(described: u64, max_vectors: u64) -> Self {
+        Self {
+            described,
+            max_vectors,
+        }
+    }
+
+    /// The declarations the pass embeds: every described one, up to `max_vectors`.
+    const fn admitted(self) -> u64 {
+        if self.described < self.max_vectors {
+            self.described
+        } else {
+            self.max_vectors
+        }
+    }
+
+    /// The declarations past `max_vectors`, which no vector ranks.
+    const fn left_out(self) -> u64 {
+        self.described - self.admitted()
+    }
+
+    /// Writes one warning record for a pass that left declarations out, and none otherwise.
+    ///
+    /// One pass runs per publication, so the log carries at most one such record per
+    /// publication, whatever the number of declarations left out.
+    fn record(self) {
+        let left_out = self.left_out();
+        if left_out == 0 {
+            return;
+        }
+        let admitted = self.admitted();
+        rift_tracing::warn!(
+            component = "search",
+            operation = "search.populate",
+            bound = "search.vector.max_vectors",
+            max_vectors = self.max_vectors,
+            described = self.described,
+            admitted = admitted,
+            left_out = left_out,
+            "declarations past max_vectors rank by text alone"
+        );
+    }
 }
 
 /// The readiness a pass that embedded `prepared` of `total` reaches.
