@@ -999,6 +999,13 @@ impl<'source> Namespaces<'source> {
         {
             return self.inherent_method(file, position, owner, member, work);
         }
+        if let [parameter, member] = parts.as_slice()
+            && let Binding::Found(binding) =
+                file.binding(parameter, position, is_type_binding, work)
+            && binding.kind == StaticBindingKind::RustTypeParameter
+        {
+            return self.bound_member(file, position, binding, member, work);
+        }
         let path = self.resolved_path(file, position, &parts, work)?;
         if let Some(target) = self.lookup(file, position, &path, Namespace::Value, work) {
             return Some(target);

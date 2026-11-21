@@ -1866,3 +1866,24 @@ fn test_rust_paths_through_private_imports_of_a_parent_module() {
             && matches!(edge.kind(), EdgeKind::Calls | EdgeKind::Reads)
     }));
 }
+
+#[test]
+fn test_rust_type_parameter_paths_follow_their_bounds() {
+    // `A::size()` names the associated function of the trait bounding `A`, inline or in a
+    // where clause, never a same-name function of another trait.
+    let source = "pub trait Array { fn size() -> usize; }\npub trait Other { fn size() -> usize; }\npub struct Holder<A: Array> { pub value: Option<A> }\nimpl<A: Array> Holder<A> {\n    pub fn capacity() -> usize { A::size() }\n}\npub fn generic<T: Array>() -> usize { T::size() }\npub fn bounded<T>() -> usize where T: Array { T::size() }\n";
+    let (_directory, index) = fixture_index(PLAIN_MANIFEST, &[("src/lib.rs", source)]);
+    for from in ["/Holder/capacity", "/fixture/generic", "/fixture/bounded"] {
+        assert!(
+            has_edge(&index, EdgeKind::Calls, from, "/Array/size"),
+            "missing {from} -> Array.size"
+        );
+    }
+    assert!(
+        !index
+            .edges()
+            .edges()
+            .any(|edge| edge.kind() == EdgeKind::Calls
+                && edge.to().as_str().ends_with("/Other/size"))
+    );
+}

@@ -213,6 +213,19 @@ impl<'source> Namespaces<'source> {
         if parameter.kind != StaticBindingKind::RustTypeParameter {
             return None;
         }
+        self.bound_member(file, receiver.start, parameter, member, work)
+    }
+
+    /// The one member named `member` that the trait bounds of a type parameter declare;
+    /// a bound that is not a known trait, or two bounds that declare it, give none.
+    pub(super) fn bound_member(
+        &self,
+        file: &File<'source>,
+        position: u64,
+        parameter: &rift_syntax::StaticBinding,
+        member: &str,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
         let mut selected: Option<Target<'source>> = None;
         let bounds = self
             .bounds
@@ -224,8 +237,7 @@ impl<'source> Namespaces<'source> {
             let owner = self
                 .edge_type_target(file, bound, work)
                 .filter(|owner| owner.symbol.kind == "trait")?;
-            let Some(target) = self.inherent_method(file, receiver.start, owner, member, work)
-            else {
+            let Some(target) = self.inherent_method(file, position, owner, member, work) else {
                 continue;
             };
             if selected.is_some_and(|previous| previous.symbol != target.symbol) {
