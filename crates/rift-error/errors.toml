@@ -570,7 +570,7 @@ action = "retry workspace indexing"
 fields = { path = { type = "path", format = "display", optional = true } }
 
 [error.index.workspace_syntax]
-message = "Rust syntax analysis failed"
+message = "syntax analysis failed"
 action = "correct the source syntax and retry"
 fields = { path = { type = "path", format = "display", optional = true }, source = { type = "error", role = "source", optional = true }, cause = { type = "rift_error", role = "cause", optional = true } }
 
