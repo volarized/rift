@@ -2273,6 +2273,49 @@ module.exports = Axios;
 }
 
 #[test]
+fn test_bindings_from_calls_take_members_every_returned_literal_writes() {
+    // A callee without a declared return type that returns an object literal from every
+    // `return` gives a binding of its call result the members every literal writes.
+    let source = "function split(flags) {
+  let shortFlag;
+  let longFlag;
+  if (!flags) throw new Error('none');
+  return { shortFlag, longFlag };
+}
+function pick(value) {
+  if (value) return { left: 1, both: 2 };
+  return { right: 1, both: 3 };
+}
+function mixed(value) {
+  if (value) return { kept: 1 };
+  return value;
+}
+function use(flags) {
+  const parts = split(flags);
+  const picked = pick(flags);
+  const other = mixed(flags);
+  return [parts.shortFlag, parts.longFlag, picked.both, picked.left, other.kept];
+}
+exports.use = use;
+";
+    let (_directory, index) = workspace(&[("main.js", source)]);
+    for to in [
+        "main.js/split/shortFlag",
+        "main.js/split/longFlag",
+        "main.js/pick/both",
+    ] {
+        assert!(has_edge(&index, EdgeKind::Reads, "main.js/use", to), "{to}");
+    }
+    // A member missing in one return, and a return that is no object literal.
+    for to in ["main.js/pick/left", "main.js/mixed/kept"] {
+        assert!(
+            !has_edge(&index, EdgeKind::Reads, "main.js/use", to),
+            "{to}"
+        );
+    }
+}
+
+#[test]
 fn test_typescript_types_named_like_a_function_take_the_interface() {
     // In TypeScript a function and an interface of one name merge: a type written with that
     // name is the interface, also inside the function itself.

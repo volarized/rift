@@ -36,6 +36,9 @@ pub(super) struct Callbacks<'source> {
     /// Owning declaration name to the element type of the array its function returns;
     /// absent when two functions share the owner.
     element_returns: BTreeMap<ByteRange, Option<ByteRange>>,
+    /// Owning declaration name to what each `return` of its function returns: the object
+    /// literal, or none for any other value.
+    returned_objects: BTreeMap<ByteRange, Vec<Option<ByteRange>>>,
 }
 
 /// What a standard array method gives one of its callback's parameters.
@@ -69,14 +72,14 @@ impl<'source> Callbacks<'source> {
         self.calls.contains_key(&range)
     }
 
-    pub(super) fn index(facts: &'source StaticFacts, work: &mut Work) -> Option<Self> {
-        let mut callbacks = Self::default();
-        let mut owners = BTreeMap::<ByteRange, Option<ByteRange>>::new();
     /// Whether the declaration `name` is written with one function type.
     pub(super) fn has_function_type(&self, name: ByteRange) -> bool {
         self.function_types.get(&name).is_some_and(Option::is_some)
     }
 
+    pub(super) fn index(facts: &'source StaticFacts, work: &mut Work) -> Option<Self> {
+        let mut callbacks = Self::default();
+        let mut owners = BTreeMap::<ByteRange, Option<ByteRange>>::new();
         for parameter in facts.parameters() {
             if !work.charge() {
                 return None;
@@ -142,16 +145,7 @@ impl<'source> Callbacks<'source> {
             }
             callbacks.destructured.insert(name, (key, call));
         }
-        for &(owner, element) in facts.element_returns() {
-            if !work.charge() {
-                return None;
-            }
-            callbacks
-                .element_returns
-                .entry(owner)
-                .and_modify(|entry| *entry = None)
-                .or_insert(Some(element));
-        }
+        callbacks.index_returns(facts, work)?;
         let mut writers = BTreeMap::<ByteRange, ByteRange>::new();
         for declared in facts.declared_returns() {
             if !work.charge() {
@@ -171,6 +165,27 @@ impl<'source> Callbacks<'source> {
             }
         }
         Some(callbacks)
+    }
+
+    /// Indexes what each function returns: the object literals of its `return`s and the
+    /// element type of a written array return type.
+    fn index_returns(&mut self, facts: &'source StaticFacts, work: &mut Work) -> Option<()> {
+        for &(owner, object) in facts.returned_objects() {
+            if !work.charge() {
+                return None;
+            }
+            self.returned_objects.entry(owner).or_default().push(object);
+        }
+        for &(owner, element) in facts.element_returns() {
+            if !work.charge() {
+                return None;
+            }
+            self.element_returns
+                .entry(owner)
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(element));
+        }
+        Some(())
     }
 }
 
@@ -537,6 +552,44 @@ impl<'source> Index<'source> {
             }
         }
         Some((file, found?))
+    }
+
+    /// The member `member` of the value a name bound to a call holds, read from the object
+    /// literals the callee returns (D38): the callee declares no return type, every one of
+    /// its `return`s returns an object literal, and each of them writes the member. The
+    /// member of the first literal is the target. One level only: a returned call is no
+    /// object literal.
+    pub(super) fn javascript_returned_member<'index>(
+        &'index self,
+        file: &'index File<'source>,
+        binding: &StaticBinding,
+        member: &str,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let &(None, call) = file.callbacks.destructured.get(&binding.name)? else {
+            return None;
+        };
+        if file.javascript_binding_reassigned(binding) {
+            return None;
+        }
+        let call = file.callbacks.calls.get(&call).copied()?;
+        work.javascript_lookup(|work| {
+            let callee = self.javascript_call(file, call, work)?;
+            let declared = self.files.get(callee.file.path.as_str())?;
+            let owner = callee.symbol.name_range?;
+            if declared.callbacks.returns.contains_key(&owner)
+                || declared.callbacks.element_returns.contains_key(&owner)
+            {
+                return None;
+            }
+            let objects = declared.callbacks.returned_objects.get(&owner)?;
+            let mut first = None;
+            for object in objects {
+                let target = Self::javascript_literal_member(declared, (*object)?, member, work)?;
+                first.get_or_insert(target);
+            }
+            first
+        })
     }
 
     /// The class or interface the result of the call at `range` is declared as: the named

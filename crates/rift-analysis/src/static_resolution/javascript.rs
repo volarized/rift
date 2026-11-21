@@ -604,8 +604,17 @@ impl<'source> Index<'source> {
                     if role == rift_core::ReferenceRole::Type {
                         return None;
                     }
-                    let owner = self.javascript_destructured_name(file, binding, work)?;
-                    self.javascript_class_member(owner, member, MemberMode::Instance, role, work)
+                    self.javascript_destructured_name(file, binding, work)
+                        .and_then(|owner| {
+                            self.javascript_class_member(
+                                owner,
+                                member,
+                                MemberMode::Instance,
+                                role,
+                                work,
+                            )
+                        })
+                        .or_else(|| self.javascript_returned_member(file, binding, member, work))
                 }),
             StaticBindingKind::JavaScriptRequire {
                 module,
@@ -887,6 +896,7 @@ pub(super) fn js_binding<'source>(
         },
         |binding, first| {
             ambiguous = !first;
+                let javascript = javascript_source(file.document.path.as_str());
             if first {
                 best = Some(binding);
             }
@@ -896,7 +906,6 @@ pub(super) fn js_binding<'source>(
         return None;
     }
     let binding = best?;
-                let javascript = javascript_source(file.document.path.as_str());
     let deferred = modes
         .scopes
         .get(file.document.path.as_str())

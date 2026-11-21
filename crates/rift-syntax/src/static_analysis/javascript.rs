@@ -57,6 +57,7 @@ pub(super) struct Kinds {
     parameters: u16,
     argument_list: u16,
     arrow: u16,
+    return_statement: u16,
     import: u16,
     import_clause: u16,
     import_specifier: u16,
@@ -319,6 +320,7 @@ impl Kinds {
             argument_list: id("arguments"),
             arrow,
             import: id("import_statement"),
+            return_statement: id("return_statement"),
             import_clause: id("import_clause"),
             import_specifier: id("import_specifier"),
             namespace_import: id("namespace_import"),
@@ -360,6 +362,7 @@ impl Kinds {
         self.record_object_member(visited, facts)?;
         self.record_module_syntax(visited, source, facts);
         self.record_reference(visited, facts)?;
+        self.record_returned_object(visited, facts)?;
         self.record_member(syntax_element, facts)?;
         self.record_declared_type(syntax_element, source, facts)?;
         self.record_type_signature(syntax_element, facts)?;
@@ -393,6 +396,78 @@ impl Kinds {
 
     /// Records a function written as a member of an object literal: a method, or a
     /// `function` expression given as a `key: value` member. Arrow functions take `this`
+    /// Records what a `return` returns, or what an arrow function's expression body is:
+    /// the object literal, or none for any other value. Keyed by the name of the
+    /// declaration the function belongs to.
+    fn record_returned_object(
+        &self,
+        visited: Visited<'_, '_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        let element = visited.syntax_element();
+        let (function, value) = if element.kind_id() == self.return_statement {
+            // The syntax walk has admitted every enclosing statement's depth.
+            let mut enclosing = visited.parent();
+            while let Some(candidate) = enclosing {
+                let id = candidate.syntax_element().kind_id();
+                if id == self.arrow
+                    || id == self.function_scopes[6]
+                    || self.function.contains(&id)
+                    || self.named_expression[..2].contains(&id)
+                {
+                    break;
+                }
+                enclosing = candidate.parent();
+            }
+            let Some(function) = enclosing else {
+                return Ok(());
+            };
+            let mut cursor = element.walk();
+            let value = element
+                .named_children(&mut cursor)
+                .find(|child| !child.is_extra());
+            (function, value)
+        } else if element.kind_id() == self.arrow {
+            let body = self.type_shapes.as_ref().map_or_else(
+                || element.child_by_field_name("body"),
+                |shapes| element.child_by_field_id(shapes.body),
+            );
+            match body {
+                Some(body) if body.kind() != "statement_block" => (visited, Some(body)),
+                _ => return Ok(()),
+            }
+        } else {
+            return Ok(());
+        };
+        let function_element = function.syntax_element();
+        let owner = if function_element.kind_id() == self.arrow
+            || self.named_expression[..2].contains(&function_element.kind_id())
+        {
+            // A function value belongs to the declaration it initializes.
+            function
+                .parent()
+                .map(Visited::syntax_element)
+                .filter(|parent| parent.child_by_field_id(self.value) == Some(function_element))
+                .and_then(|parent| parent.child_by_field_id(self.name))
+        } else {
+            function_element.child_by_field_id(self.name)
+        };
+        let Some(owner) = owner else {
+            return Ok(());
+        };
+        let mut value = value;
+        // Each step descends within the admitted syntax depth.
+        while let Some(inner) = value.filter(|node| node.kind_id() == self.parenthesized) {
+            value = inner.named_child(0);
+        }
+        let object = value
+            .filter(|node| node.kind_id() == self.object_literal[0])
+            .map(byte_range)
+            .transpose()?;
+        facts.returned_objects.push((byte_range(owner)?, object));
+        Ok(())
+    }
+
     /// from their surroundings and are not recorded.
     fn record_object_member(
         &self,

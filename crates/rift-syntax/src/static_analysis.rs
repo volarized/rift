@@ -319,6 +319,9 @@ pub struct StaticFactsParts {
     /// Functions written as members of an object literal, with that literal: `this` inside
     /// them is the literal.
     pub object_members: Vec<(ByteRange, ByteRange)>,
+    /// What each `return` of a function returns, by the name of the declaration the
+    /// function belongs to: the object literal it returns, or none for any other value.
+    pub returned_objects: Vec<(ByteRange, Option<ByteRange>)>,
     /// Scopes with unsupported binding shapes.
     pub unsupported_bindings: Vec<ByteRange>,
     /// Rust use paths.
@@ -487,6 +490,12 @@ impl StaticFacts {
         &self.0.object_members
     }
 
+    /// What each `return` of a function returns: the object literal, or none.
+    #[must_use]
+    pub fn returned_objects(&self) -> &[(ByteRange, Option<ByteRange>)] {
+        &self.0.returned_objects
+    }
+
     /// Scopes where an unsupported binding can affect lookup.
     #[must_use]
     pub fn unsupported_bindings(&self) -> &[ByteRange] {
@@ -535,6 +544,7 @@ impl StaticFacts {
             vector_capacity(&self.0.element_types),
             vector_capacity(&self.0.element_returns),
             vector_capacity(&self.0.object_members),
+            vector_capacity(&self.0.returned_objects),
             vector_capacity(&self.0.unsupported_bindings),
             vector_capacity(&self.0.inherent_impls),
             vector_capacity(&self.0.rust_uses),
@@ -575,6 +585,7 @@ impl StaticFacts {
             self.element_types().len(),
             self.element_returns().len(),
             self.object_members().len(),
+            self.returned_objects().len(),
             self.unsupported_bindings().len(),
             self.inherent_impls().len(),
             self.rust_uses().len(),
@@ -643,6 +654,10 @@ impl StaticFacts {
                 .object_members()
                 .iter()
                 .all(|(function, object)| valid(*function) && contains(*object, *function))
+            && self
+                .returned_objects()
+                .iter()
+                .all(|(owner, object)| valid(*owner) && object.is_none_or(valid))
     }
 
     pub(crate) fn validate(&self, source: &str, limits: SyntaxLimits) -> Result<(), RiftError> {

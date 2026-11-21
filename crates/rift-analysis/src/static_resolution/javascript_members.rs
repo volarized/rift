@@ -286,8 +286,27 @@ impl<'source> Index<'source> {
         {
             return None;
         }
+        Self::javascript_literal_member(file, object, member, work)
+    }
+
+    /// The direct member `member` of the object literal at `object`, written once.
+    pub(super) fn javascript_literal_member(
+        file: &File<'source>,
+        object: rift_syntax::ByteRange,
+        member: &str,
+        work: &mut Work,
+    ) -> Option<Target<'source>> {
+        let entries = file.facts.object_members();
         let mut found: Option<&rift_syntax::SyntaxSymbol> = None;
-        for symbol in file.document.facts.symbols() {
+        // Declarations whose name lies inside the literal, in source order.
+        let names = rift_syntax::ByteRange {
+            start: object.start,
+            end: object.start,
+        }..rift_syntax::ByteRange {
+            start: object.end,
+            end: object.end,
+        };
+        for symbol in file.by_range.range(names).filter_map(|(_, symbol)| *symbol) {
             if !work.charge() {
                 return None;
             }
@@ -425,6 +444,15 @@ impl<'source> Index<'source> {
         work: &mut Work,
     ) -> bool {
         let same = |target: Target<'source>| {
+            // A function or an object literal written in place through `this` declares
+            // another facet of the member (D38): the call still targets the member. Writes
+            // through other receivers keep the refusal.
+            if property == member
+                && receiver.trim() == "this"
+                && file.function_writes.contains(&start)
+            {
+                continue;
+            }
             target.file.path == class.file.path && std::ptr::eq(target.symbol, class.symbol)
         };
         let mut receiver = receiver.trim();
@@ -444,15 +472,6 @@ impl<'source> Index<'source> {
             return self
                 .javascript_class_receiver(file, position, work)
                 .is_some_and(|(owner, _)| same(owner));
-            // A function or an object literal written in place through `this` declares
-            // another facet of the member (D38): the call still targets the member. Writes
-            // through other receivers keep the refusal.
-            if property == member
-                && receiver.trim() == "this"
-                && file.function_writes.contains(&start)
-            {
-                continue;
-            }
         }
         let name = receiver
             .strip_suffix(".prototype")
@@ -622,6 +641,9 @@ impl<'source> File<'source> {
                 // Overload signatures share a member, but two bodies are ambiguous.
                 if role != ReferenceRole::Type {
                     if symbol.kind != "method"
+        // A member assigned through `this` is another facet of a declared member (D38); it
+        // stands for the member only when nothing declares it.
+        let mut assigned: Option<Target<'source>> = None;
                         || (symbol.body_range.is_some() && previous.symbol.body_range.is_some())
                     {
                         return None;
@@ -631,6 +653,13 @@ impl<'source> File<'source> {
                             file: self.document,
                             symbol,
                         });
+            if symbol.syntax_element_kind == Some("assignment_expression") {
+                assigned.get_or_insert(Target {
+                    file: self.document,
+                    symbol,
+                });
+                continue;
+            }
                     }
                 }
             } else {
@@ -641,9 +670,6 @@ impl<'source> File<'source> {
             }
         }
         found.or(assigned)
-        // A member assigned through `this` is another facet of a declared member (D38); it
-        // stands for the member only when nothing declares it.
-        let mut assigned: Option<Target<'source>> = None;
     }
 
     fn javascript_member_mode(
@@ -653,13 +679,6 @@ impl<'source> File<'source> {
         definitions: &crate::EnclosingDefinitions<&'source rift_syntax::SyntaxSymbol>,
         work: &mut Work,
     ) -> Option<MemberMode> {
-            if symbol.syntax_element_kind == Some("assignment_expression") {
-                assigned.get_or_insert(Target {
-                    file: self.document,
-                    symbol,
-                });
-                continue;
-            }
         let mut symbol = *definitions.resolve(position, position.checked_add(1)?)?;
         while let Some(container) = symbol.container.as_deref() {
             if !work.charge()
