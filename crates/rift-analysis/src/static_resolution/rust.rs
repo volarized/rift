@@ -217,7 +217,13 @@ impl<'source> Namespaces<'source> {
                 let Some(binding) = file.facts.bindings().iter().find(|binding| work.charge() && matches!(binding.kind, StaticBindingKind::RustUse { path } if path == imported.range)) else { continue; };
                 let mut path = module.clone();
                 path.push(file.text(binding.name)?.to_owned());
-                let parts = file.use_parts(imported.range, work)?;
+                let Some(parts) = file.use_parts(imported.range, work) else {
+                    if work.exhausted {
+                        return None;
+                    }
+                    // A use path outside the resolver stays unresolved for this site.
+                    continue;
+                };
                 let parts = parts.iter().map(String::as_str).collect::<Vec<_>>();
                 // A first segment naming no item of the module starts at a dependency
                 // crate, as `std`, `core` and `alloc` do (the extern prelude).
