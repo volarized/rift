@@ -9,7 +9,7 @@ pub use heritage_edges::HeritageEdge;
 use rift_error::{RiftError, errors};
 use tree_sitter::{Language, Node};
 
-use crate::extract::byte_range;
+use crate::extract::{Visited, byte_range};
 use crate::{ByteRange, SyntaxLimits};
 
 /// One authored call expression and its supported callee shape.
@@ -105,6 +105,45 @@ pub enum StaticBindingKind {
         /// Imported name, absent for a module binding.
         export: Option<ByteRange>,
     },
+    /// First receiver parameter of a Python method.
+    PythonReceiver {
+        /// Name of the enclosing class.
+        class_name: ByteRange,
+    },
+    /// A Python binding with an authored type annotation.
+    PythonAnnotation {
+        /// Authored annotation expression.
+        annotation: ByteRange,
+    },
+    /// A Python binding initialized by a named constructor call.
+    PythonInstance {
+        /// Authored constructor path, requiring static resolution.
+        constructor: ByteRange,
+    },
+    /// A Python binding initialized by a named value.
+    PythonAlias {
+        /// Authored value path.
+        value: ByteRange,
+    },
+    /// A Python name checked by an `isinstance` condition.
+    PythonGuard {
+        /// Authored class argument.
+        annotation: ByteRange,
+    },
+    /// A Python function with an authored return annotation.
+    PythonFunction {
+        /// Authored return annotation.
+        annotation: ByteRange,
+    },
+    /// Dotted Python module import without a local alias.
+    PythonModule {
+        /// Complete imported module path.
+        module: ByteRange,
+    },
+    /// A Python name declared in the module scope.
+    PythonGlobal,
+    /// A Python name declared in an enclosing function scope.
+    PythonNonlocal,
     /// Explicit Rust use path.
     RustUse {
         /// Imported path before a local alias.
@@ -492,13 +531,22 @@ impl StaticBinding {
                 export,
                 require,
             } => valid(module) && export.is_none_or(&valid) && valid(require),
-            StaticBindingKind::JavaScriptEdgeNamespace { module } => valid(module),
-            StaticBindingKind::JavaScriptInstance { constructor } => valid(constructor),
+            StaticBindingKind::JavaScriptEdgeNamespace { module }
+            | StaticBindingKind::PythonModule { module } => valid(module),
+            StaticBindingKind::JavaScriptInstance { constructor }
+            | StaticBindingKind::PythonInstance { constructor } => valid(constructor),
+            StaticBindingKind::PythonReceiver { class_name } => valid(class_name),
+            StaticBindingKind::PythonAnnotation { annotation }
+            | StaticBindingKind::PythonFunction { annotation }
+            | StaticBindingKind::PythonGuard { annotation } => valid(annotation),
+            StaticBindingKind::PythonAlias { value } => valid(value),
             StaticBindingKind::RustUse { path } => valid(path),
             StaticBindingKind::RustReceiver { type_path } => valid(type_path),
             StaticBindingKind::RustValue { initializer } => valid(initializer),
             StaticBindingKind::Local
             | StaticBindingKind::Shadow
+            | StaticBindingKind::PythonGlobal
+            | StaticBindingKind::PythonNonlocal
             | StaticBindingKind::RustTypeParameter => true,
         };
         valid(self.name)
@@ -589,10 +637,8 @@ impl<'source> Capture<'source> {
         }
         self.edge_heritage.record_edge(visited, &mut self.facts.0)?;
         match &mut self.grammar {
-            Grammar::Python(kinds) => kinds.record_edge(visited, &mut self.facts.0),
-            Grammar::JavaScript(kinds) => {
-                kinds.record(syntax_element, self.source, &mut self.facts.0)
-            }
+            Grammar::Python(kinds) => kinds.record_edge(visited, self.source, &mut self.facts.0),
+            Grammar::JavaScript(kinds) => kinds.record(visited, self.source, &mut self.facts.0),
             Grammar::Rust(kinds, budget) => {
                 kinds.record(visited, self.source, &mut self.facts.0, budget)
             }
@@ -624,11 +670,18 @@ fn identifier(syntax_element: Node<'_>, id: u16) -> Option<Node<'_>> {
     (syntax_element.kind_id() == id && !syntax_element.is_missing()).then_some(syntax_element)
 }
 
-fn enclosing<'tree>(syntax_element: Node<'tree>, kinds: &[u16]) -> Option<Node<'tree>> {
-    let mut parent = syntax_element.parent();
+/// The nearest ancestor of one of `kinds`, read from the parents the walk recorded.
+///
+/// `Node::parent` searches again from the root on every call, so a capture rule that
+/// asks it for every syntax element costs the tree's width and depth each time.
+fn enclosing<'walk, 'tree>(
+    visited: Visited<'walk, 'tree>,
+    kinds: &[u16],
+) -> Option<Visited<'walk, 'tree>> {
+    let mut parent = visited.parent();
     // Capture runs after the shared syntax walk has admitted each syntax element's depth.
     while let Some(candidate) = parent {
-        if kinds.contains(&candidate.kind_id()) {
+        if kinds.contains(&candidate.syntax_element().kind_id()) {
             return Some(candidate);
         }
         parent = candidate.parent();

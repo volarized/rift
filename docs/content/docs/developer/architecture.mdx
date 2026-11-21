@@ -471,10 +471,12 @@ declarations and syntax elements from the files the workspace's source policy in
 
 <VersionBadge version="v0.0.47" />
 
-The server starts with an empty publication, then publishes discovered paths and prepared files
-as indexing advances. Reads answer from prepared source and carry
+The server starts with an empty publication, then publishes discovered paths, the first bounded
+batch of prepared files, and the complete index. Reads answer from prepared source and carry
 [`local_index_preparing`](/docs/developer/protocol/mcp#reads) while their selected local scope is
-incomplete. A `facets` request refuses while source preparation is incomplete.
+incomplete. A `facets` request refuses while source preparation is incomplete. Static edges are
+resolved by the publication that completes preparation: an earlier publication holds none and
+reports its static call coverage as unavailable.
 
 Every publication owns its preparation counts and map together, so progress describes the
 answer the caller received. A tree change can reduce those counts; completion applies to the

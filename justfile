@@ -77,9 +77,10 @@ integration-cli:
     {{ rift_dev }} build --locked --profile corpus -p rift
     tar --zstd -cf target/integration-cli.tar.zst -C target/corpus rift
 
-# The archive carries the three corpus suites; the live suites use the fast archive.
+# The archive carries the three corpus suites and the rift-server unit binary
+# for retained material accounting; the live suites use the fast archive.
 integration-archive:
-    {{ rift_dev }} test archive --workspace --all-features --locked --cargo-profile corpus --profile corpus --archive-file target/integration.tar.zst --test corpus_bun --test corpus_fastapi --test corpus_nextjs
+    {{ rift_dev }} test archive -p rift -p rift-server --all-features --locked --cargo-profile corpus --profile corpus --archive-file target/integration.tar.zst --lib --test corpus_bun --test corpus_fastapi --test corpus_nextjs -E 'binary(/^corpus_/) or package(=rift-server)'
 
 corpus-test *args:
     {{ rift_dev }} test corpus {{ args }}

@@ -58,7 +58,7 @@ pub struct PathMatcher {
     include: Option<Override>,
     include_prefixes: Vec<PathBuf>,
     exclude: Option<Override>,
-    excluded_subtree_prefixes: Vec<PathBuf>,
+    excluded_subtrees: Option<Override>,
     force_include: Option<Override>,
     force_include_reach: ForceIncludeReach,
 }
@@ -87,18 +87,19 @@ impl PathMatcher {
         exclude: &[String],
         force_include: &[String],
     ) -> Result<Self, RiftError> {
+        let compiled_include = compiled_override(root, include)?;
+        let compiled_exclude = compiled_override(root, exclude)?;
+        let excluded_subtrees =
+            compiled_excluded_subtrees(root, exclude, compiled_exclude.as_ref());
         Ok(Self {
             root: root.to_path_buf(),
-            include: compiled_override(root, include)?,
+            include: compiled_include,
             include_prefixes: include
                 .iter()
                 .map(|pattern| literal_prefix(pattern))
                 .collect(),
-            exclude: compiled_override(root, exclude)?,
-            excluded_subtree_prefixes: exclude
-                .iter()
-                .filter_map(|pattern| excluded_subtree_prefix(pattern))
-                .collect(),
+            exclude: compiled_exclude,
+            excluded_subtrees,
             force_include: compiled_override(root, force_include)?,
             force_include_reach: ForceIncludeReach {
                 root: root.to_path_buf(),
@@ -156,6 +157,22 @@ impl PathMatcher {
         )
     }
 
+    /// Whether `exclude` proves every file below `path` excluded.
+    ///
+    /// The root stays reachable. Recursive directory patterns use the same glob backend
+    /// as file matching. Negated excludes and ambiguous directory patterns keep the full walk.
+    #[must_use]
+    pub fn excludes_descendants(&self, path: &Path) -> bool {
+        let Some(overrides) = &self.excluded_subtrees else {
+            return false;
+        };
+        path.ancestors()
+            .take_while(|ancestor| {
+                *ancestor != self.root.as_path() && ancestor.starts_with(&self.root)
+            })
+            .any(|ancestor| matches!(overrides.matched(ancestor, true), Match::Whitelist(_)))
+    }
+
     /// Whether one directory can contain a path this matcher includes.
     #[must_use]
     pub fn may_include_descendant(&self, path: &Path) -> bool {
@@ -172,31 +189,66 @@ impl PathMatcher {
         let included = self.include_prefixes.is_empty()
             || reaches(&self.include_prefixes)
             || self.force_include_reach.reaches(path);
-        let dropped = self
-            .excluded_subtree_prefixes
-            .iter()
-            .any(|prefix| relative.starts_with(prefix));
-        included && !dropped
+        included && !self.excludes_descendants(path)
     }
 }
 
-/// Literal directory prefix before one glob's first metacharacter.
+/// A literal path, or complete directory components before a glob's first metacharacter.
 fn literal_prefix(pattern: &str) -> PathBuf {
+    // An unanchored pattern without a separator matches a file name at any depth.
+    if !pattern.starts_with('/') && !pattern.contains('/') {
+        return PathBuf::new();
+    }
     let Some(pattern) = plain_root_relative_pattern(pattern) else {
         return PathBuf::new();
     };
-    let end = pattern
+    let Some(end) = pattern
         .char_indices()
-        .find_map(|(index, character)| "*?[".contains(character).then_some(index))
-        .unwrap_or(pattern.len());
-    PathBuf::from(pattern[..end].trim_end_matches('/'))
+        .find_map(|(index, character)| "*?[{".contains(character).then_some(index))
+    else {
+        return PathBuf::from(pattern.trim_end_matches('/'));
+    };
+    pattern[..end]
+        .rsplit_once('/')
+        .map_or_else(PathBuf::new, |(directory, _)| PathBuf::from(directory))
 }
 
-/// Prefix of one pattern that proves every descendant excluded.
-fn excluded_subtree_prefix(pattern: &str) -> Option<PathBuf> {
-    let pattern = plain_root_relative_pattern(pattern)?;
-    let prefix = pattern.strip_suffix("/**")?.trim_end_matches('/');
-    (!prefix.chars().any(|character| "*?[".contains(character))).then(|| PathBuf::from(prefix))
+/// Compiles directory patterns that prove every descendant excluded.
+fn compiled_excluded_subtrees(
+    root: &Path,
+    patterns: &[String],
+    exclude: Option<&Override>,
+) -> Option<Override> {
+    if exclude.is_some_and(|overrides| overrides.num_ignores() > 0) {
+        return None;
+    }
+    let parents: Vec<_> = patterns
+        .iter()
+        .filter_map(|pattern| {
+            if matches!(pattern.as_str(), "**" | "/**") {
+                return Some("/**".to_owned());
+            }
+            let parent = pattern.strip_suffix("/**")?;
+            if parent.is_empty()
+                || pattern.starts_with(['!', '#'])
+                || parent.ends_with(['/', '\\'])
+                || parent.contains("//")
+                || parent.split('/').any(|part| matches!(part, "." | ".."))
+            {
+                return None;
+            }
+            // The original separator anchors a single-segment parent too. Escapes remain
+            // unchanged for the same backend to compile.
+            Some(if parent.starts_with('/') {
+                parent.to_owned()
+            } else {
+                format!("/{parent}")
+            })
+        })
+        .collect();
+    // Original patterns have already passed admission. An unproved derived pattern
+    // keeps the full walk without changing which files the original matcher includes.
+    compiled_override(root, &parents).ok().flatten()
 }
 
 /// Normalizes simple anchored patterns; complex escaping stays conservative.
@@ -255,6 +307,135 @@ mod tests {
         let root = Path::new("/workspace");
         let matcher = PathMatcher::build(root, &["src/**".to_owned()], &[]).expect("valid glob");
         assert!(!matcher.may_include_descendant(Path::new("/elsewhere/src")));
+    }
+
+    #[test]
+    fn test_recursive_excludes_keep_compiled_anchors_and_escapes() {
+        let root = Path::new("/workspace");
+        for (pattern, directory, excluded) in [
+            ("build/*", "build/nested", false),
+            ("build/*.rs", "build/nested", false),
+            ("build/**", "build", true),
+            ("build/**", "build/nested", true),
+            ("build/**", "other/build", false),
+            ("/build/**", "build", true),
+            ("/build/**", "other/build", false),
+            ("**/build/**", "other/build", true),
+            (r"build/\[cache\]/**", "build/[cache]", true),
+            (r"build/\[cache\]/**", "build/c", false),
+            (r"\!build/**", "!build", true),
+            ("#build/**", "build", false),
+            ("build//**", "build", false),
+            ("**", "other", true),
+        ] {
+            let matcher = PathMatcher::build_with_force_include(
+                root,
+                &[],
+                &[pattern.to_owned()],
+                &["**".to_owned()],
+            )
+            .expect("valid glob");
+            let directory = root.join(directory);
+            assert_eq!(
+                matcher.excludes_descendants(&directory),
+                excluded,
+                "{pattern}: {directory:?}"
+            );
+            assert_eq!(
+                matcher.may_include_descendant(&directory),
+                !excluded,
+                "{pattern}: {directory:?}"
+            );
+            if excluded {
+                for file in ["direct.rs", "nested/deep.rs"] {
+                    assert!(
+                        !matcher.includes(&directory.join(file)),
+                        "{pattern}: {file}"
+                    );
+                }
+            }
+            assert!(!matcher.excludes_descendants(Path::new("/workspace-other/build")));
+        }
+    }
+
+    #[test]
+    fn test_negated_excludes_keep_directories_reachable() {
+        let root = Path::new("/workspace");
+        let matcher = PathMatcher::build_with_force_include(
+            root,
+            &[],
+            &["build/**".to_owned(), "!build/kept.rs".to_owned()],
+            &["build/**".to_owned()],
+        )
+        .expect("valid globs");
+        assert!(!matcher.excludes_descendants(&root.join("build")));
+        assert!(matcher.may_include_descendant(&root.join("build")));
+        assert!(matcher.includes(&root.join("build/kept.rs")));
+        assert!(!matcher.includes(&root.join("build/hidden.rs")));
+    }
+
+    #[test]
+    fn test_child_directory_excludes_keep_the_root_reachable() {
+        let root = Path::new("/workspace");
+        let matcher = PathMatcher::build(root, &[], &["*/**".to_owned()]).expect("valid glob");
+        assert!(matcher.includes(&root.join("kept.rs")));
+        assert!(!matcher.excludes_descendants(root));
+        assert!(matcher.may_include_descendant(root));
+        assert!(matcher.excludes_descendants(&root.join("build")));
+    }
+
+    #[test]
+    fn test_unanchored_file_names_reach_nested_directories() {
+        let root = Path::new("/workspace");
+        for (pattern, reaches) in [("kept.rs", true), ("/kept.rs", false)] {
+            let matcher = PathMatcher::build(root, &[pattern.to_owned()], &[]).expect("valid glob");
+            assert_eq!(
+                matcher.may_include_descendant(&root.join("nested")),
+                reaches,
+                "{pattern}"
+            );
+            assert_eq!(
+                matcher.includes(&root.join("nested/kept.rs")),
+                reaches,
+                "{pattern}"
+            );
+            let forced =
+                PathMatcher::build_with_force_include(root, &[], &[], &[pattern.to_owned()])
+                    .expect("valid force_include glob");
+            assert_eq!(
+                forced.force_include_reaches(&root.join("nested")),
+                reaches,
+                "{pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_partial_glob_components_keep_matching_directories_reachable() {
+        let root = Path::new("/workspace");
+        for pattern in [
+            "src/g*/**",
+            "/src/g*/**",
+            "src/{generated,other}/**",
+            "src/[g]*/**",
+        ] {
+            let matcher = PathMatcher::build(root, &[pattern.to_owned()], &[]).expect("valid glob");
+            assert!(
+                matcher.includes(&root.join("src/generated/kept.rs")),
+                "{pattern}"
+            );
+            assert!(
+                matcher.may_include_descendant(&root.join("src/generated")),
+                "{pattern}"
+            );
+            let forced =
+                PathMatcher::build_with_force_include(root, &[], &[], &[pattern.to_owned()])
+                    .expect("valid force_include glob");
+            assert!(
+                forced.force_include_reaches(&root.join("src/generated")),
+                "{pattern}"
+            );
+        }
     }
 
     #[test]

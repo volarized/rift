@@ -33,7 +33,9 @@ use crate::history::{StoredHistory, SymbolTimelines};
 mod canonical;
 mod facets;
 mod symbol;
-pub use canonical::{LocalSymbolViewInput, LocalSymbolViews};
+pub use canonical::{
+    InventoryCoverage, LocalSymbolViewInput, LocalSymbolViews, RetainedViewLimits,
+};
 
 /// Inputs for one cancellable current-tree read-service build.
 pub struct ReadServiceBuild<'a> {
@@ -350,8 +352,8 @@ impl ReadService {
             .items
             .into_iter()
             .filter_map(|recommendation| {
-                let crate::LspRecommendationStatus::Available { command, .. } =
-                    recommendation.status
+                let (crate::LspRecommendationStatus::Available { command, .. }
+                | crate::LspRecommendationStatus::Embedded { command, .. }) = recommendation.status
                 else {
                     return None;
                 };
@@ -380,27 +382,43 @@ impl ReadService {
         crate::map::build_preparation_map(source, text, self.revisions.wire_index_tree_revision())
     }
 
-    /// Whether static edge producers have complete captured identities and bounds.
+    /// Whether static edge producers completed captured sources within their bounds.
     ///
     /// # Errors
     /// Returns the captured identity directory failure.
     pub fn static_edges_complete(&self) -> Result<bool, RiftError> {
-        if !self.index.edges().is_complete() {
-            return Ok(false);
-        }
-        for file in self
-            .index
-            .files()
-            .filter(|file| file.syntax().static_facts().is_some())
-        {
-            if !self
-                .index
-                .identity_coverage_complete(file.syntax().language())?
-            {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        Ok(self.index.edges().is_complete() && self.index.symbol_view()?.objects_complete())
+    }
+
+    /// Captured objects whose identities are unestablished, which edge inventories omit.
+    fn edge_identity_omissions(&self) -> usize {
+        self.index
+            .normalized_graph()
+            .records()
+            .iter()
+            .filter(|object| object.identity().is_none())
+            .count()
+    }
+
+    /// Whether edge inventories omit no captured object for an unestablished identity.
+    ///
+    /// An inventory that omits one still answers its edges between identified endpoints, but
+    /// cannot establish an absence or an aggregate.
+    #[must_use]
+    pub fn edge_identities_complete(&self) -> bool {
+        self.edge_identity_omissions() == 0
+    }
+
+    /// Reports captured objects omitted from edges because their identities are unestablished.
+    #[must_use]
+    pub fn edge_identity_warning(&self) -> Option<ReadWarning> {
+        let omitted = self.edge_identity_omissions();
+        (omitted > 0).then(|| ReadWarning::EdgeCoverageMissing {
+            kinds: Vec::new(),
+            detail: format!(
+                "captured objects without established identities: {omitted}; edge inventories omit these objects and retain edges between identified endpoints"
+            ),
+        })
     }
 
     /// Whether a configured engine serves a captured source language.
@@ -819,6 +837,21 @@ impl ReadService {
     /// Returns the immutable workspace index this snapshot serves.
     pub(crate) const fn index(&self) -> &WorkspaceIndex {
         &self.index
+    }
+
+    /// Builds what the first read of this snapshot builds: the declaration inventory,
+    /// the symbol view, and the documentation layer of its index.
+    ///
+    /// The publication that completes preparation calls this before it is published.
+    pub fn prepare_reads(&self) {
+        self.index.prepare_reads();
+    }
+
+    /// Whether the declaration inventory, the symbol view, and the documentation layer of
+    /// this snapshot's index are built.
+    #[must_use]
+    pub fn reads_prepared(&self) -> bool {
+        self.index.reads_prepared()
     }
 
     pub(crate) fn engine_revision(&self) -> &str {
@@ -3044,7 +3077,7 @@ pub(crate) mod tests {
             "to": symbol.id,
             "kind": symbol.kind,
             "kinds": ["calls"],
-            "derivation": "syntax"
+            "provider": "static", "derivation": "syntax"
         });
         assert!(serde_json::from_value::<rift_protocol::read::Edge>(edge.clone()).is_ok());
         edge["to"] = json!(raw_address);

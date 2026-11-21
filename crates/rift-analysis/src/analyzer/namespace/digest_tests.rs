@@ -107,10 +107,15 @@ fn python_repeated_declarations_share_one_identity() {
 }
 
 #[test]
-fn python_captured_digest_refuses_malformed_source_facts() {
+fn python_captured_digest_keeps_module_for_malformed_source_facts() {
     let malformed = "def beacon(\n";
-    assert!(anchors(malformed, malformed, true).is_empty());
-    assert!(anchors(malformed, malformed, false).is_empty());
+    let ordinary = anchors(malformed, malformed, false);
+    assert_eq!(anchors(malformed, malformed, true), ordinary);
+    assert_eq!(
+        ordinary.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["."]
+    );
+    assert_eq!(ordinary["."].as_str(), "rift://symbol/local/python/main");
 }
 use rift_protocol::identity::SymbolOwner;
 use rift_syntax::SyntaxLimits;

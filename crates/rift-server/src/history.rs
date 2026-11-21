@@ -1252,6 +1252,9 @@ mod tests {
                 HistoryEdge::CoChanges { symbol, commits } => {
                     format!("co_changes {} {commits}", symbol.as_str())
                 }
+                HistoryEdge::IntroducedInRelease { revision }
+                | HistoryEdge::ChangedInRelease { revision, .. }
+                | HistoryEdge::RemovedInRelease { revision } => format!("release {revision}"),
             })
             .collect()
     }

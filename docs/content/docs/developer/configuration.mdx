@@ -730,8 +730,10 @@ starts no language server or package installation.
 Cargo selects `rust-analyzer`, using the project's pinned Rust toolchain when available.
 Bun and npm select the installed native TypeScript language server, then
 `typescript-language-server` from `node_modules/.bin` before `PATH`. uv selects `ty`, then
-`pyright-langserver`, from the project's `.venv` before `PATH`. A missing executable leaves
-the recommendation unavailable.
+`pyright-langserver`, from the project's `.venv` before `PATH`. Without either executable,
+Python selects the [embedded engine](#language-engines) the build carries, with
+`--lsp-embedded=ty`. For any other language, a missing executable leaves the recommendation
+unavailable.
 
 The recommendation command reads each directly registered project's own configuration and
 visible files. Registered names must resolve to distinct directories, each different from the
@@ -757,6 +759,13 @@ rift config set --language=typescript --profile=docs --profile-root=docs --lsp-p
 A profile accepts repeated `--include` and `--exclude` patterns relative to its root. Omitted
 patterns preserve the profile's existing language filters. The command writes the profile in
 the root `rift.toml`. Each repository uses one configuration file.
+
+`--lsp-embedded=ty` writes `embedded` instead and selects the engine the build carries for
+Python:
+
+```sh
+rift config set --language=python --lsp-embedded=ty
+```
 
 A custom process remains available through `--lsp-program`. Repeat `--lsp-argument` for each
 literal argument:
@@ -1132,6 +1141,27 @@ of the two on its own, and writes to one wait for that database's turn alone.
 `[search.query] page_limit` accepts 1 KiB to 4 MiB of encoded response and defaults to
 4 MiB. The request selects rows with `page` and `max_results`. A page above the byte bound
 returns a typed error; the caller can reduce `max_results`.
+
+<VersionBadge version="v0.0.84" />
+
+The server retains each answer in a view for 15 minutes, so a later `page` with the same
+`revision` reads it without evaluating the query again. Two `[search.query]` keys bound the
+retained views. The same bounds apply separately to proxy candidate and combined query
+answer stores; the 16 MiB candidate response bound still applies:
+
+```toml
+[search.query]
+retained_views = 256
+retained_size = "8gb"
+```
+
+- `retained_views` caps the views one server retains, 1 to 4096, default `256`
+- `retained_size` caps the bytes those views hold together, 1mb to 64gb, default `8gb`. Views
+  that read one index share it and count it once
+
+A new view past either bound releases the least recently used views first; an answer and each
+later page read from its view count as a use. A later page of a released view evaluates the query
+again. Only a view whose own bytes pass `retained_size` is refused, with `read_unavailable`.
 
 
 <VersionBadge version="v0.0.25" />

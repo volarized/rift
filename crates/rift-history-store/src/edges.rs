@@ -42,7 +42,7 @@ pub fn commit_edge(
     Some(HistoryEdge::ChangedIn { commit, change })
 }
 
-/// The commit a commit edge names; `None` for a `co_changes` edge.
+/// The commit a commit edge names; `None` for a `co_changes` or release edge.
 #[must_use]
 pub const fn edge_commit(edge: &HistoryEdge) -> Option<&HistoryCommit> {
     match edge {
@@ -50,7 +50,10 @@ pub const fn edge_commit(edge: &HistoryEdge) -> Option<&HistoryCommit> {
         | HistoryEdge::ChangedIn { commit, .. }
         | HistoryEdge::RemovedIn { commit }
         | HistoryEdge::RenamedFrom { commit, .. } => Some(commit),
-        HistoryEdge::CoChanges { .. } => None,
+        HistoryEdge::CoChanges { .. }
+        | HistoryEdge::IntroducedInRelease { .. }
+        | HistoryEdge::ChangedInRelease { .. }
+        | HistoryEdge::RemovedInRelease { .. } => None,
     }
 }
 

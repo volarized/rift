@@ -269,3 +269,65 @@ fn captured_symbol_material_refuses_unmeasured_portable_facts_without_overflow()
     );
     assert!(!view.normalized_graph().records().is_empty());
 }
+
+/// A framework whose context is unresolved keeps every declaration its files hold, so it
+/// leaves the captured object inventory complete; a file left out of the index does not
+/// (#759).
+#[test]
+fn captured_object_inventory_stays_complete_beside_an_unresolved_framework() {
+    let root = tempfile::tempdir().expect("workspace");
+    fs::create_dir_all(root.path().join("docs")).expect("docs package");
+    fs::write(
+        root.path().join("core.ts"),
+        "export function construct_core(): number {\n  return 1;\n}\n",
+    )
+    .expect("plain source");
+    fs::write(
+        root.path().join("docs/package.json"),
+        "{\"name\":\"docs\",\"devDependencies\":{\"tailwindcss\":\"^4.0.0\"}}",
+    )
+    .expect("framework manifest");
+    fs::write(
+        root.path().join("docs/layout.tsx"),
+        "export function DocsLayout() {\n  return <div className=\"flex\" />;\n}\n",
+    )
+    .expect("framework source");
+    let build = || {
+        WorkspaceIndex::build(
+            root.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("index")
+    };
+    let index = build();
+    assert!(
+        index.warnings().iter().any(|warning| matches!(
+            warning,
+            super::super::WorkspaceIndexWarning::FrameworkContextUnresolved { .. }
+        )),
+        "{:?}",
+        index.warnings()
+    );
+    let language = index
+        .file(&rift_core::ProjectPath::new("docs/layout.tsx").expect("path"))
+        .expect("framework source stays indexed")
+        .syntax()
+        .language()
+        .clone();
+    assert!(index.symbol_view().expect("view").objects_complete());
+    assert!(
+        index
+            .identity_coverage_complete(&language)
+            .expect("coverage")
+    );
+    fs::write(root.path().join("blob.ts"), "export const held = 1;\0\n").expect("binary source");
+    let left_out = build();
+    assert!(!left_out.symbol_view().expect("view").objects_complete());
+    assert!(
+        !left_out
+            .identity_coverage_complete(&language)
+            .expect("coverage")
+    );
+}

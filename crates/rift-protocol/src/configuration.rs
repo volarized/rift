@@ -6285,6 +6285,79 @@ mod tests {
     }
 
     #[test]
+    fn test_query_retained_views_default_bound_and_advertise_their_ranges() {
+        use crate::query::{
+            QUERY_RETAINED_BYTES_DEFAULT, QUERY_RETAINED_BYTES_MAX, QUERY_RETAINED_BYTES_MIN,
+            QUERY_RETAINED_VIEWS_DEFAULT, QUERY_RETAINED_VIEWS_MAX, QueryConfiguration,
+        };
+        let defaults = QueryConfiguration::default();
+        assert_eq!(defaults.retained_views, QUERY_RETAINED_VIEWS_DEFAULT);
+        assert_eq!(
+            defaults.retained_size,
+            ByteSize::from_bytes(QUERY_RETAINED_BYTES_DEFAULT)
+        );
+        let schema =
+            serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
+        let table = &schema["$defs"]["QueryConfiguration"]["properties"];
+        assert_eq!(table["retained_views"]["minimum"], json!(1));
+        assert_eq!(
+            table["retained_views"]["maximum"],
+            json!(QUERY_RETAINED_VIEWS_MAX)
+        );
+        assert_eq!(
+            table["retained_views"]["default"],
+            json!(QUERY_RETAINED_VIEWS_DEFAULT)
+        );
+        assert_eq!(
+            table["retained_size"]["rift:range"],
+            json!({
+                "min": ByteSize::from_bytes(QUERY_RETAINED_BYTES_MIN),
+                "max": ByteSize::from_bytes(QUERY_RETAINED_BYTES_MAX),
+            })
+        );
+        let cases: [(&str, PatternSetter, [u64; 2]); 2] = [
+            (
+                "search.query.retained_views",
+                |search, value| search.query.retained_views = value,
+                [1, QUERY_RETAINED_VIEWS_MAX],
+            ),
+            (
+                "search.query.retained_size",
+                |search, value| search.query.retained_size = ByteSize::from_bytes(value),
+                [QUERY_RETAINED_BYTES_MIN, QUERY_RETAINED_BYTES_MAX],
+            ),
+        ];
+        for (field, set, [min, max]) in cases {
+            for accepted in [min, max] {
+                let mut configuration = WorkspaceConfiguration::default();
+                set(&mut configuration.search, accepted);
+                assert_eq!(configuration.validate(), Ok(()), "{field} {accepted}");
+            }
+            for refused in [min - 1, max + 1] {
+                let mut configuration = WorkspaceConfiguration::default();
+                set(&mut configuration.search, refused);
+                assert!(
+                    matches!(
+                        configuration.validate(),
+                        Err(ConfigurationViolation::LimitOutOfRange { field: named, .. })
+                            if named == field
+                    ),
+                    "{field} {refused} must be refused naming the key"
+                );
+            }
+        }
+        let accepted: WorkspaceConfiguration = serde_json::from_value(json!({
+            "search": { "query": { "retained_views": 8, "retained_size": "64mb" } }
+        }))
+        .expect("retained view keys");
+        assert_eq!(accepted.search.query.retained_views, 8);
+        assert_eq!(
+            accepted.search.query.retained_size,
+            ByteSize::from_bytes(64 << 20)
+        );
+    }
+
+    #[test]
     fn test_search_journal_size_limit_defaults_bounds_and_advertises_its_range() {
         assert_eq!(
             SearchConfiguration::default().journal_size_limit,

@@ -973,17 +973,17 @@ pub(super) fn children<'a>(
         &mut std::collections::BTreeSet<ByteRange>,
         &mut Vec<Export>,
     ),
-    depth_max: usize,
+    limits: rift_syntax::SyntaxLimits,
     library: bool,
 ) -> Vec<Child> {
     let (mut scope, admitted, exports) = scope;
     let context = Context {
         inventory,
         originals,
-        depth_max,
+        depth_max: limits.syntax_depth_max(),
         library,
     };
-    let ordinary = super::module_children(file, directory, inventory);
+    let ordinary = super::module_children(file, directory, inventory, limits);
     // Keyed by the declaring item: alternative `mod` items of one name each keep their file.
     let direct = ordinary
         .iter()

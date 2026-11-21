@@ -105,10 +105,11 @@ failure-output = "immediate-final"
 slow-timeout = { period = "60s", terminate-after = 1, grace-period = "30s" }
 
 # This ignored measurement builds the verified Bun index before measuring
-# shared accounting. Keep its bound separate from the ordinary unit cases.
+# shared accounting. It runs as a Bun corpus case with that suite's 540 s
+# deadline, leaving 248 s beyond the 292 s test time measured on #734.
 [[profile.corpus.overrides]]
 filter = 'test(=read::canonical::tests::captured_preparation_views_measure_shared_accounting_cost)'
-slow-timeout = { period = "300s", terminate-after = 1, grace-period = "30s" }
+slow-timeout = { period = "540s", terminate-after = 1, grace-period = "30s" }
 success-output = "immediate"
 junit.store-success-output = true
 

@@ -5,7 +5,7 @@ use rift_error::{RiftError, errors};
 use tree_sitter::Node;
 
 use super::Kinds;
-use crate::extract::byte_range;
+use crate::extract::{Visited, byte_range};
 use crate::static_analysis::{
     StaticBindingKind, StaticFactsParts, StaticRustUse, binding, enclosing,
 };
@@ -13,11 +13,12 @@ use crate::static_analysis::{
 impl Kinds {
     pub(super) fn record_import(
         &self,
-        element: Node<'_>,
+        visited: Visited<'_, '_>,
         facts: &mut StaticFactsParts,
         budget: &mut LoopBudget,
     ) -> Result<(), RiftError> {
-        let Some(scope) = enclosing(element, &self.scopes) else {
+        let element = visited.syntax_element();
+        let Some(scope) = enclosing(visited, &self.scopes).map(Visited::syntax_element) else {
             return Ok(());
         };
         let Some(argument) = element.child_by_field_id(self.argument) else {

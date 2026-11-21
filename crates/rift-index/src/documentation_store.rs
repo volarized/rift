@@ -22,6 +22,10 @@ use toasty::Executor;
 
 use rift_error::{RiftError, errors};
 
+use crate::lexical::{
+    LEXICAL_DELETE_PATHS_MAX, STORE_INSERT_ROWS_MAX, naming, numbered_placeholders,
+};
+
 /// Encoded documentation metadata one workspace publication stores, at most.
 ///
 /// The fastapi corpus tree, whose documentation is translated into a dozen languages,
@@ -306,19 +310,25 @@ pub(crate) async fn replace(
         .collect();
     let stored: BTreeMap<&String, &Vec<u8>> = recorded.iter().collect();
     let changes = keyed_changes(&current, &stored);
-    for identity in changes.removed.iter().chain(&changes.replaced) {
-        delete_source(executor, identity).await?;
-    }
+    let deleted: Vec<&str> = changes
+        .removed
+        .iter()
+        .chain(&changes.replaced)
+        .map(String::as_str)
+        .collect();
+    delete_sources(executor, &deleted).await?;
     let by_identity: BTreeMap<&String, &EncodedSource> = encoded
         .sources
         .iter()
         .map(|source| (&source.identity, source))
         .collect();
-    for identity in changes.added.iter().chain(&changes.replaced) {
-        if let Some(source) = by_identity.get(identity) {
-            insert_source(executor, source).await?;
-        }
-    }
+    let inserted: Vec<&EncodedSource> = changes
+        .added
+        .iter()
+        .chain(&changes.replaced)
+        .filter_map(|identity| by_identity.get(identity).copied())
+        .collect();
+    insert_sources(executor, &inserted).await?;
     DocumentationManifestRecord::all()
         .delete()
         .exec(executor)
@@ -391,44 +401,64 @@ fn validate_stored_source_count(count: usize) -> Result<(), RiftError> {
     Ok(())
 }
 
-/// Deletes one source's row and every reverse reference it filed.
-async fn delete_source(executor: &mut dyn Executor, identity: &str) -> Result<(), RiftError> {
-    DocumentationReferenceRecord::filter_by_source(identity)
-        .delete()
-        .exec(&mut *executor)
-        .await
-        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
-    DocumentationSourceRecord::filter_by_identity(identity)
-        .delete()
-        .exec(executor)
-        .await
-        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
+/// Deletes the rows of `identities` and every reverse reference they filed.
+///
+/// A statement names [`LEXICAL_DELETE_PATHS_MAX`] sources, so the statement count follows
+/// the batches and never the sources.
+async fn delete_sources(executor: &mut dyn Executor, identities: &[&str]) -> Result<(), RiftError> {
+    for identities in identities.chunks(LEXICAL_DELETE_PATHS_MAX) {
+        let named = numbered_placeholders(identities.len());
+        for statement in [
+            format!("DELETE FROM documentation_references WHERE source IN ({named})"),
+            format!("DELETE FROM documentation_sources WHERE identity IN ({named})"),
+        ] {
+            naming(statement, identities.iter().copied())
+                .exec(&mut *executor)
+                .await
+                .map_err(|source| errors::index::lexical_storage().source(source).error())?;
+        }
+    }
     Ok(())
 }
 
-/// Inserts one source's row and the reverse references it files.
-async fn insert_source(
+/// Inserts each source's row, then the reverse references the sources file, in batches of
+/// [`STORE_INSERT_ROWS_MAX`] rows.
+async fn insert_sources(
     executor: &mut dyn Executor,
-    source: &EncodedSource,
+    sources: &[&EncodedSource],
 ) -> Result<(), RiftError> {
-    toasty::create!(DocumentationSourceRecord {
-        identity: source.identity.clone(),
-        digest: source.digest.clone(),
-        payload: source.payload.clone(),
-    })
-    .exec(&mut *executor)
-    .await
-    .map_err(|source| errors::index::lexical_storage().source(source).error())?;
-    for (identity, target, block) in &source.references {
-        toasty::create!(DocumentationReferenceRecord {
-            identity: identity.clone(),
-            source: source.identity.clone(),
-            target: target.clone(),
-            block: block.clone(),
-        })
-        .exec(&mut *executor)
-        .await
-        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
+    for sources in sources.chunks(STORE_INSERT_ROWS_MAX) {
+        let mut insert = DocumentationSourceRecord::create_many();
+        for source in sources {
+            insert = insert.item(toasty::create!(DocumentationSourceRecord {
+                identity: source.identity.clone(),
+                digest: source.digest.clone(),
+                payload: source.payload.clone(),
+            }));
+        }
+        insert
+            .exec(&mut *executor)
+            .await
+            .map_err(|source| errors::index::lexical_storage().source(source).error())?;
+    }
+    let references: Vec<(&EncodedSource, &(String, String, String))> = sources
+        .iter()
+        .flat_map(|source| source.references.iter().map(move |filed| (*source, filed)))
+        .collect();
+    for references in references.chunks(STORE_INSERT_ROWS_MAX) {
+        let mut insert = DocumentationReferenceRecord::create_many();
+        for (source, (identity, target, block)) in references {
+            insert = insert.item(toasty::create!(DocumentationReferenceRecord {
+                identity: identity.clone(),
+                source: source.identity.clone(),
+                target: target.clone(),
+                block: block.clone(),
+            }));
+        }
+        insert
+            .exec(&mut *executor)
+            .await
+            .map_err(|source| errors::index::lexical_storage().source(source).error())?;
     }
     Ok(())
 }
@@ -643,6 +673,13 @@ mod tests {
     }
 
     fn collection(text: &str) -> rift_analysis::documentation::DocumentationCollection {
+        collection_of(&[("README.md".to_owned(), text.to_owned())])
+    }
+
+    /// One collection holding one Markdown source per `(path, text)` of `files`.
+    fn collection_of(
+        files: &[(String, String)],
+    ) -> rift_analysis::documentation::DocumentationCollection {
         use rift_analysis::documentation::{
             DocumentationInput, DocumentationSourceSet, collect_documentation, content_digest,
         };
@@ -653,45 +690,202 @@ mod tests {
         use rift_protocol::read::{
             ProjectPath, SourceKind, SourceLocationKind, SymbolOrigin, TextRange,
         };
-        let source = DocumentationSource {
-            identity: DocumentationContentIdentity {
-                source: DocumentationSourceIdentity::Project {
-                    path: ProjectPath("README.md".into()),
-                },
-                cell: None,
-            },
-            revision: content_digest(b"tree"),
-            content_digest: content_digest(text.as_bytes()),
-            origin: SymbolOrigin {
-                location: Some(SourceLocationKind::Project),
-                package: None,
-                runtime: None,
-                source_kind: SourceKind::Authored,
-            },
-            format: DocumentationSourceFormat::Markdown,
-            media_type: "text/markdown".into(),
-            selection: DocumentationSelectionReason::Workspace,
-            byte_length: text.len() as u64,
-            language: None,
-            physical_ranges: Vec::new(),
-            license: None,
+        let inputs = files
+            .iter()
+            .map(|(path, text)| {
+                let source = DocumentationSource {
+                    identity: DocumentationContentIdentity {
+                        source: DocumentationSourceIdentity::Project {
+                            path: ProjectPath(path.clone()),
+                        },
+                        cell: None,
+                    },
+                    revision: content_digest(b"tree"),
+                    content_digest: content_digest(text.as_bytes()),
+                    origin: SymbolOrigin {
+                        location: Some(SourceLocationKind::Project),
+                        package: None,
+                        runtime: None,
+                        source_kind: SourceKind::Authored,
+                    },
+                    format: DocumentationSourceFormat::Markdown,
+                    media_type: "text/markdown".into(),
+                    selection: DocumentationSelectionReason::Workspace,
+                    byte_length: text.len() as u64,
+                    language: None,
+                    physical_ranges: Vec::new(),
+                    license: None,
+                };
+                let chunks = vec![DocumentationChunk {
+                    identity: path.clone(),
+                    range: TextRange {
+                        start: 0,
+                        end: text.len() as u64,
+                    },
+                }];
+                DocumentationInput::new(source, text)
+                    .expect("source")
+                    .with_chunks(chunks)
+                    .expect("chunks")
+            })
+            .collect();
+        collect_documentation(&DocumentationSourceSet::new(inputs).expect("sources"), &[])
+            .expect("metadata")
+    }
+
+    /// The statements the index database's transactions ran so far, read from
+    /// `sqlite.transaction.statement.count`.
+    fn statements_run(recorder: &rift_tracing::ScopedRecorder) -> u64 {
+        let metrics = recorder.metrics();
+        match metrics
+            .find(
+                "sqlite.transaction.statement.count",
+                &[("db.namespace", "index")],
+            )
+            .map(rift_tracing::MetricSeries::value)
+        {
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a statement count is a small whole number"
+            )]
+            Some(rift_tracing::SeriesValue::Buckets { sum, .. }) => sum.round() as u64,
+            _ => 0,
+        }
+    }
+
+    /// `count` one-line Markdown notes of one `generation`, as `(path, text)`.
+    fn note_files(count: usize, generation: usize) -> Vec<(String, String)> {
+        (0..count)
+            .map(|index| {
+                (
+                    format!("docs/note-{index:04}.md"),
+                    format!("Note {index} of generation {generation}.\n"),
+                )
+            })
+            .collect()
+    }
+
+    /// The change that replaces every file of `files` with one unit and its digest.
+    fn note_change(
+        files: &[(String, String)],
+    ) -> Result<crate::LexicalChange, Box<dyn std::error::Error>> {
+        use rift_ranking::{
+            DocumentFields, DocumentIdentity, DocumentKind, DocumentLocation, IndexDocument,
+            SearchableField,
         };
-        let chunks = vec![DocumentationChunk {
-            identity: "README.md".into(),
-            range: TextRange {
-                start: 0,
-                end: text.len() as u64,
-            },
-        }];
-        let input = DocumentationInput::new(source, text)
-            .expect("source")
-            .with_chunks(chunks)
-            .expect("chunks");
-        collect_documentation(
-            &DocumentationSourceSet::new(vec![input]).expect("sources"),
-            &[],
+        let mut paths = Vec::with_capacity(files.len());
+        let mut documents = Vec::with_capacity(files.len());
+        let mut recorded = Vec::with_capacity(files.len());
+        for (path, text) in files {
+            let project = rift_core::ProjectPath::new(path.as_str())?;
+            let fields = DocumentFields::empty().with(SearchableField::FileContent, text);
+            documents.push(IndexDocument::new(
+                DocumentIdentity::new(path.as_str())?,
+                DocumentLocation::Project(project.clone()),
+                DocumentKind::TextFile,
+                fields.digest(),
+                fields,
+            )?);
+            recorded.push((project.clone(), crate::FileDigest::of(text.as_bytes())));
+            paths.push(project);
+        }
+        Ok(crate::LexicalChange::new(paths, documents).with_recorded(recorded))
+    }
+
+    /// A write names its files in batches, so the statements its transaction runs follow
+    /// the batches and never the files.
+    ///
+    /// Every statement is one exchange between the writer's task and the database thread.
+    /// A write that ran six statements for each file spent a thousand files on six
+    /// thousand exchanges, and a search answered `lexical_ranking_unavailable` for as long
+    /// as they took: past the two seconds a caller polls for on a slow machine.
+    #[tokio::test]
+    async fn a_write_runs_statements_for_each_batch_of_files_never_for_each_file()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::lexical::{LEXICAL_DELETE_PATHS_MAX, STORE_INSERT_ROWS_MAX};
+        use crate::{LexicalIndexLimits, LexicalSearchIndex, RevisionScoped};
+        use rift_ranking::DocumentIdentity;
+
+        /// Files one write names: three delete batches and ten insert batches.
+        const FILES: usize = 600;
+        /// Statements one delete batch runs: the word index, the trigram index, its pending
+        /// set, the typed rows, the recorded digests, and the documentation references and
+        /// sources.
+        const DELETE_BATCH_STATEMENTS: usize = 7;
+        /// Statements one insert batch runs: the typed rows, the recorded digests, and the
+        /// documentation sources.
+        const INSERT_BATCH_STATEMENTS: usize = 3;
+        /// Statements one write runs whatever it names: the unit count, the last row id,
+        /// the word index fill, the trigram pending fill, the stored sources read, the
+        /// manifest's delete and insert, and the stamp.
+        const WRITE_STATEMENTS: usize = 8;
+
+        let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let temp = tempfile::tempdir()?;
+        let database = crate::WorkspaceDatabase::open(
+            &temp.path().join("index.db"),
+            crate::DatabaseName::Index,
+            crate::DatabasePool::new(2, 1000),
         )
-        .expect("metadata")
+        .await?;
+        let store = LexicalSearchIndex::attached(database, LexicalIndexLimits::default());
+        let bound = u64::try_from(
+            DELETE_BATCH_STATEMENTS * FILES.div_ceil(LEXICAL_DELETE_PATHS_MAX)
+                + INSERT_BATCH_STATEMENTS * FILES.div_ceil(STORE_INSERT_ROWS_MAX)
+                + WRITE_STATEMENTS,
+        )?;
+
+        let first = note_files(FILES, 1);
+        store
+            .apply_with_documentation(
+                &note_change(&first)?,
+                &LexicalStamp::published("tree1", "derivation"),
+                &collection_of(&first),
+            )
+            .await?;
+        let written = statements_run(&recorder);
+        assert!(
+            (1..=bound).contains(&written),
+            "a write of {FILES} files into an empty store ran {written} statements, past its \
+             bound of {bound}"
+        );
+
+        // The second write replaces every stored row of every file.
+        let second = note_files(FILES, 2);
+        let metadata = collection_of(&second);
+        store
+            .apply_with_documentation(
+                &note_change(&second)?,
+                &LexicalStamp::published("tree2", "derivation"),
+                &metadata,
+            )
+            .await?;
+        let replaced = statements_run(&recorder) - written;
+        assert!(
+            (1..=bound).contains(&replaced),
+            "a write replacing {FILES} stored files ran {replaced} statements, past its bound \
+             of {bound}"
+        );
+
+        let digests = store
+            .recorded_files("derivation")
+            .await?
+            .ok_or("the store records the files it wrote")?;
+        assert_eq!(digests.len(), FILES);
+        let RevisionScoped::Matched(Some(loaded)) = store.documentation("tree2").await? else {
+            panic!("the replacing write stores its metadata");
+        };
+        assert_eq!(loaded.index(), metadata.index());
+        assert_eq!(
+            store
+                .content(&DocumentIdentity::new("docs/note-0599.md")?)
+                .await?
+                .as_deref(),
+            Some("Note 599 of generation 2.\n"),
+            "the replacing write leaves the second generation alone"
+        );
+        Ok(())
     }
 
     #[tokio::test]

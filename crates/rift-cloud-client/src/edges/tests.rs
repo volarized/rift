@@ -63,7 +63,7 @@ async fn missing_edge_coverage_keeps_its_typed_reason() {
 }
 
 fn page(start: u64, complete: bool, _next: Option<&str>) -> Value {
-    json!({"groups":[{"seed":SEED,"complete":complete,"edges":[{"id":format!("{start:064x}"),"edge":{"from":SEED,"to":TARGET,"kind":"call","kinds":["calls"],"derivation":"resolution","occurrence":{"unit":"rift://source/cargo/crates.io/demo/src/lib.rs","range":{"start":start,"end":start+1}}}}]}],
+    json!({"groups":[{"seed":SEED,"complete":complete,"edges":[{"id":format!("{start:064x}"),"edge":{"from":SEED,"to":TARGET,"kind":"call","kinds":["calls"],"provider": "static", "derivation":"resolution","occurrence":{"unit":"rift://source/cargo/crates.io/demo/src/lib.rs","range":{"start":start,"end":start+1}}}}]}],
         "symbols":[symbol(SEED,"entry"),symbol(TARGET,"helper")],
         "sources":[{"unit":"rift://source/cargo/crates.io/demo/src/lib.rs","digest":full_digest("...")}],
         "analyzer_revision":"analyzer-v1","corpus_revision":"corpus-v1","view":{"id":"a".repeat(64),"expires_at":"2099-01-01T00:00:00Z"}})

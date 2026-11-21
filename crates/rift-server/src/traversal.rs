@@ -1047,6 +1047,7 @@ pub(crate) mod tests {
                 kinds: vec![EdgeKind::References],
                 to: rift_protocol::read::SymbolId(to.to_owned()),
                 occurrence: None,
+                provider: rift_protocol::read::EdgeProvider::Static,
                 derivation: EdgeDerivation::Resolution,
                 confidence: None,
                 extensions: Extensions::default(),

@@ -36,6 +36,7 @@ pub async fn graph_type_uses(
     }
     let mut answer = GraphReferences {
         occurrences: Vec::new(),
+        edges: Vec::new(),
         complete: view.objects_complete() && reads.edges().is_complete(),
         edge_warnings: Vec::new(),
     };
@@ -50,6 +51,7 @@ impl GraphReferences {
     fn admit_type_uses(&mut self, reads: &ReadService, incoming: Self) -> Result<(), RiftError> {
         self.complete &= incoming.complete;
         self.edge_warnings.extend(incoming.edge_warnings);
+        let mut admitted = std::collections::BTreeSet::new();
         for mut occurrence in incoming.occurrences {
             if !reads.is_type_position(&occurrence)? {
                 continue;
@@ -58,7 +60,31 @@ impl GraphReferences {
                 return Err(graph_reference_coverage());
             }
             occurrence.kind = EdgeKind::HasType;
+            admitted.insert((
+                occurrence.target.clone(),
+                occurrence.source.unit.as_str().to_owned(),
+                occurrence.source.range.start,
+                occurrence.source.range.end,
+            ));
             self.occurrences.push(occurrence);
+        }
+        for mut edge in incoming.edges {
+            let Some(span) = &edge.occurrence else {
+                continue;
+            };
+            if admitted.contains(&(
+                edge.to.clone(),
+                span.unit.as_str().to_owned(),
+                span.range.start,
+                span.range.end,
+            )) {
+                if self.edges.len() == TRAVERSAL_SYMBOLS_MAX {
+                    return Err(graph_reference_coverage());
+                }
+                edge.kind = rift_protocol::read::ExactKind(EdgeKind::HasType.as_ref().to_owned());
+                edge.kinds = vec![EdgeKind::HasType];
+                self.edges.push(edge);
+            }
         }
         Ok(())
     }

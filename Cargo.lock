@@ -789,6 +789,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "cpu-time"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9e393a7668fe1fad3075085b86c781883000b4ede868f43627b34a87c8b7ded"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4716,7 +4726,7 @@ dependencies = [
 
 [[package]]
 name = "rift"
-version = "0.0.82"
+version = "0.0.84"
 dependencies = [
  "axum",
  "clap",
@@ -4765,7 +4775,7 @@ dependencies = [
 
 [[package]]
 name = "rift-analysis"
-version = "0.0.82"
+version = "0.0.84"
 dependencies = [
  "data-encoding",
  "flate2",
@@ -4801,7 +4811,7 @@ dependencies = [
 
 [[package]]
 name = "rift-cloud-client"
-version = "0.0.82"
+version = "0.0.84"
 dependencies = [
  "anyhow",
  "axum",
@@ -4832,7 +4842,7 @@ dependencies = [
 
 [[package]]
 name = "rift-collect"
-version = "0.0.82"
+version = "0.0.84"
 dependencies = [
  "rift-core",
  "rift-lsp",
@@ -4848,7 +4858,7 @@ dependencies = [
 
 [[package]]
 name = "rift-core"
-version = "0.0.82"
+version = "0.0.84"
 dependencies = [
  "get-size2",
  "percent-encoding",
@@ -4866,7 +4876,7 @@ dependencies = [
 
 [[package]]
 name = "rift-dependency"
-version = "0.0.82"
+version = "0.0.84"
 dependencies = [
  "ignore",
  "rift-core",
@@ -4880,14 +4890,14 @@ dependencies = [
 
 [[package]]
 name = "rift-error"
-version = "0.0.82"
+version = "0.0.84"
 dependencies = [
  "rift-error-macros",
 ]
 
 [[package]]
 name = "rift-error-codegen"
-version = "0.0.82"
+version = "0.0.84"
 dependencies = [
  "rift-error",
  "serde",
@@ -4898,11 +4908,11 @@ dependencies = [
 
 [[package]]
 name = "rift-error-macros"
-version = "0.0.82"
+version = "0.0.84"
 
 [[package]]
 name = "rift-history"
-version = "0.0.82"
+version = "0.0.84"
 dependencies = [
  "data-encoding",
  "digest-io",
@@ -4917,7 +4927,7 @@ dependencies = [
 
 [[package]]
 name = "rift-history-store"
-version = "0.0.82"
+version = "0.0.84"
 dependencies = [
  "rift-core",
  "rift-error",
@@ -4932,7 +4942,7 @@ dependencies = [
 
 [[package]]
 name = "rift-index"
-version = "0.0.82"
+version = "0.0.84"
 dependencies = [
  "async-trait",
  "data-encoding",
@@ -4966,7 +4976,7 @@ dependencies = [
 
 [[package]]
 name = "rift-lsp"
-version = "0.0.82"
+version = "0.0.84"
 dependencies = [
  "globset",
  "lsp-types",
@@ -4983,7 +4993,7 @@ dependencies = [
 
 [[package]]
 name = "rift-mcp"
-version = "0.0.82"
+version = "0.0.84"
 dependencies = [
  "axum",
  "data-encoding",
@@ -5030,7 +5040,7 @@ dependencies = [
 
 [[package]]
 name = "rift-protocol"
-version = "0.0.82"
+version = "0.0.84"
 dependencies = [
  "get-size2",
  "jsonschema",
@@ -5050,7 +5060,7 @@ dependencies = [
 
 [[package]]
 name = "rift-provider"
-version = "0.0.82"
+version = "0.0.84"
 dependencies = [
  "get-size2",
  "rift-core",
@@ -5062,7 +5072,7 @@ dependencies = [
 
 [[package]]
 name = "rift-ranking"
-version = "0.0.82"
+version = "0.0.84"
 dependencies = [
  "data-encoding",
  "get-size2",
@@ -5077,7 +5087,7 @@ dependencies = [
 
 [[package]]
 name = "rift-schema-export"
-version = "0.0.82"
+version = "0.0.84"
 dependencies = [
  "jsonschema",
  "rift-analysis",
@@ -5091,7 +5101,7 @@ dependencies = [
 
 [[package]]
 name = "rift-search"
-version = "0.0.82"
+version = "0.0.84"
 dependencies = [
  "axum",
  "candle-core",
@@ -5126,7 +5136,7 @@ dependencies = [
 
 [[package]]
 name = "rift-server"
-version = "0.0.82"
+version = "0.0.84"
 dependencies = [
  "chrono",
  "data-encoding",
@@ -5174,8 +5184,9 @@ dependencies = [
 
 [[package]]
 name = "rift-syntax"
-version = "0.0.82"
+version = "0.0.84"
 dependencies = [
+ "cpu-time",
  "get-size2",
  "rift-core",
  "rift-error",
@@ -5206,7 +5217,7 @@ dependencies = [
 
 [[package]]
 name = "rift-tracing"
-version = "0.0.82"
+version = "0.0.84"
 dependencies = [
  "getrandom 0.4.3",
  "jiff",
@@ -5245,7 +5256,7 @@ dependencies = [
 
 [[package]]
 name = "rift-tracing-macros"
-version = "0.0.82"
+version = "0.0.84"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -7987,7 +7998,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.0.82"
+version = "0.0.84"
 dependencies = [
  "rift-error-codegen",
  "tempfile",
