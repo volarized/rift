@@ -975,6 +975,13 @@ impl<'source> Namespaces<'source> {
                 let StaticBindingKind::RustUse { path } = binding.kind else {
                     return None;
                 };
+                // A `use` of an enclosing module does not name anything inside an inline
+                // child module; only a binding of the same module spells the path.
+                if self.module(file, binding.name.start, work)?
+                    != self.module(file, position, work)?
+                {
+                    return None;
+                }
                 let mut imported = file.use_parts(path, work)?;
                 imported.extend(tail.iter().map(|part| (*part).to_owned()));
                 imported
