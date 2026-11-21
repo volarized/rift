@@ -377,7 +377,7 @@ async fn typescript_recorded_server_adds_facts_to_the_static_answer() -> TestRes
         counts,
         [
             ("calls", 6, 13),
-            ("references", 18, 19),
+            ("references", 18, 23),
             ("hasType", 2, 7),
             ("extends", 0, 0),
             ("implements", 2, 2),
@@ -391,6 +391,11 @@ async fn typescript_recorded_server_adds_facts_to_the_static_answer() -> TestRes
         ("main.ts/mapped", "shapes.ts/Circle/area"),
     ] {
         assert_eq!(engine.providers("calls", from, to), ["lsp"]);
+        assert_eq!(
+            engine.providers("references", from, to),
+            ["lsp"],
+            "a reference from another file is resolved in its opened document"
+        );
     }
     for (from, to) in [
         ("main.ts/fallback", "shapes.ts/Square"),
@@ -534,7 +539,7 @@ async fn live_typescript_language_server_adds_facts_to_the_static_answer() -> Te
     client.cancel().await?;
     server_task.await?;
     let counts = assert_engine_rule(&static_facts, &engine, "lsp");
-    assert_more(&counts, &["calls", "hasType"]);
+    assert_more(&counts, &["calls", "references", "hasType"]);
     for (from, to) in [
         ("main.ts/total", "shapes.ts/Square/area"),
         ("main.ts/lookup", "shapes.ts/Circle/area"),
