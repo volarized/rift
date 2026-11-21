@@ -548,10 +548,41 @@ impl<'source> File<'source> {
             },
             SyntaxExportKind::All | SyntaxExportKind::Namespace => return true,
         };
-        [ExportSlot::Unknown, ExportSlot::Default, slot]
+        let replaced = |slot: &ExportSlot<'_>| {
+            self.export_writes
+                .get(slot)
+                .is_some_and(|start| *start != Some(binding.range.start))
+        };
+        if replaced(&ExportSlot::Unknown) || replaced(&slot) {
+            return false;
+        }
+        // `module.exports = value` followed by `module.exports.name = ...` at the top
+        // level adds `name` to that value: the earlier write does not replace the later.
+        !replaced(&ExportSlot::Default)
+            || (slot != ExportSlot::Default
+                && binding.container.is_none()
+                && self
+                    .export_writes
+                    .get(&ExportSlot::Default)
+                    .is_some_and(|start| {
+                        start.is_some_and(|start| {
+                            start < binding.range.start && self.top_level_default_export(start)
+                        })
+                    }))
+    }
+
+    /// Whether a default export binding outside every declaration starts at `start`.
+    fn top_level_default_export(&self, start: u64) -> bool {
+        self.document
+            .facts
+            .export_bindings()
+            .unwrap_or_default()
             .iter()
-            .filter_map(|slot| self.export_writes.get(slot))
-            .all(|start| *start == Some(binding.range.start))
+            .any(|binding| {
+                binding.kind == SyntaxExportKind::Default
+                    && binding.container.is_none()
+                    && binding.range.start == start
+            })
     }
 
     fn javascript_export_role(

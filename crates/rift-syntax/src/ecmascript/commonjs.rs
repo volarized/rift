@@ -13,7 +13,8 @@ pub(super) fn record<'tree>(
 ) -> Result<Vec<Node<'tree>>, RiftError> {
     let mut pending = vec![(root, 0_usize)];
     let mut blocked = BTreeSet::new();
-    let mut replaced = BTreeSet::new();
+    // Scope of each `module.exports = value`, with the end of its last write there.
+    let mut replaced: BTreeMap<usize, usize> = BTreeMap::new();
     let mut assignments = Vec::new();
     let mut visited = 0_usize;
     let mut cursor = root.walk();
@@ -44,7 +45,8 @@ pub(super) fn record<'tree>(
                 == Some("module.exports")
                 && let Some(scope) = lexical_scope(syntax_element)
             {
-                replaced.insert(scope.id());
+                let end = replaced.entry(scope.id()).or_default();
+                *end = (*end).max(syntax_element.end_byte());
             }
         }
         if visited
@@ -68,12 +70,43 @@ pub(super) fn record<'tree>(
         let Some(binding) = assignment(syntax_element, source.text, kinds)? else {
             continue;
         };
-        if binding.kind == SyntaxExportKind::Named && !module_execution(syntax_element, &replaced) {
+        if binding.kind == SyntaxExportKind::Named
+            && !kept_after_replacement(syntax_element, source.text, &replaced)
+        {
             continue;
         }
         bindings.insert(syntax_element.id(), binding);
     }
     Ok(assignments)
+}
+
+/// Whether a named export survives every `module.exports = value` of the scopes around it.
+///
+/// A replacement written later replaces the object the name was added to. One written
+/// earlier is the object `module.exports.name = ...` adds to; `exports` no longer names
+/// it, so `exports.name = ...` after it exports nothing. `module.exports.default` keeps
+/// colliding with the default slot the replacement writes.
+fn kept_after_replacement(
+    syntax_element: Node<'_>,
+    source: &str,
+    replaced: &BTreeMap<usize, usize>,
+) -> bool {
+    let through_module = syntax_element
+        .child_by_field_name("left")
+        .and_then(|left| source.get(left.byte_range()))
+        .is_some_and(|left| {
+            left.starts_with("module.exports.") && left != "module.exports.default"
+        });
+    let mut scope = syntax_element;
+    while let Some(parent) = scope.parent() {
+        if let Some(&end) = replaced.get(&parent.id())
+            && (!through_module || end > syntax_element.start_byte())
+        {
+            return false;
+        }
+        scope = parent;
+    }
+    true
 }
 
 fn receiver(text: &str) -> bool {

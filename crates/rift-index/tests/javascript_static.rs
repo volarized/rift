@@ -2479,6 +2479,41 @@ module.exports = use
 }
 
 #[test]
+fn test_commonjs_members_added_after_the_export_value() {
+    // `module.exports = value` followed by `module.exports.name = ...` adds `name` to
+    // that value. A replacement written later drops the name, and so does `exports.name`
+    // after the replacement, since `exports` no longer names the exported object.
+    let reply = "function Reply() {}
+function buildReply(R) { return R }
+function early() { return 1 }
+function extra() { return 2 }
+exports.early = early
+module.exports = Reply
+module.exports.buildReply = buildReply
+exports.extra = extra
+";
+    let main = "const Reply = require('./reply.js')
+function build() {
+  return [new Reply(), Reply.buildReply(Reply), Reply.early(), Reply.extra()]
+}
+module.exports = build
+";
+    let (_directory, index) = workspace(&[("reply.js", reply), ("main.js", main)]);
+    for to in ["reply.js/Reply", "reply.js/buildReply"] {
+        assert!(
+            has_edge(&index, EdgeKind::Calls, "main.js/build", to),
+            "{to}"
+        );
+    }
+    for to in ["reply.js/early", "reply.js/extra"] {
+        assert!(
+            !has_edge(&index, EdgeKind::Calls, "main.js/build", to),
+            "{to}"
+        );
+    }
+}
+
+#[test]
 fn test_typescript_types_named_like_a_function_take_the_interface() {
     // In TypeScript a function and an interface of one name merge: a type written with that
     // name is the interface, also inside the function itself.
