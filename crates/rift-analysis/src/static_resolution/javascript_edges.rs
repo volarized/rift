@@ -4,7 +4,7 @@ use rift_core::{ReferenceRole, SourceRange, SymbolId};
 use rift_protocol::identity::SymbolIdentity;
 use rift_protocol::read::{EdgeKind, SymbolKind};
 use rift_provider::NormalizedTarget;
-use rift_syntax::{ByteRange, StaticBindingKind, SyntaxSymbol};
+use rift_syntax::{ByteRange, StaticBinding, StaticBindingKind, SyntaxSymbol};
 
 use super::javascript::MemberMode;
 use super::{File, Index, StaticOccurrence, StaticResolution, Target, Work};
@@ -18,11 +18,39 @@ impl<'source> Index<'source> {
     ) -> Option<SymbolId> {
         let scopes = self.javascript.scopes.get(file.document.path.as_str())?;
         let callable = scopes.callables.resolve(range.start, range.end).copied();
-        if let Some(symbol) = callable {
-            return self.javascript_identity(Target {
+        let value = scopes.function_values.resolve(range.start, range.end);
+        let holder = match (value, callable) {
+            // A callable declared inside the function value is the nearer caller.
+            (Some(value), Some(symbol))
+                if value.encloses(symbol.range) && *value != symbol.range =>
+            {
+                None
+            }
+            // The call runs when the function value does. The innermost declaration
+            // holding that value is the caller: the callable it defines, or the
+            // variable, field or object member whose initializer builds it.
+            (Some(value), _) => scopes.definitions.resolve(value.start, value.end).copied(),
+            // Outside every function, an instance field initializer runs with its field.
+            (None, None) => scopes
+                .definitions
+                .resolve(range.start, range.end)
+                .copied()
+                .filter(|symbol| {
+                    matches!(
+                        symbol.syntax_element_kind,
+                        Some("field_definition" | "public_field_definition")
+                    )
+                }),
+            (None, Some(_)) => None,
+        };
+        for symbol in [holder, callable].into_iter().flatten() {
+            let identity = self.javascript_identity(Target {
                 file: file.document,
                 symbol,
             });
+            if identity.is_some() {
+                return identity;
+            }
         }
         self.javascript_module_identity(file, work)
     }
@@ -44,7 +72,7 @@ impl<'source> Index<'source> {
                         || target.symbol.kinds.contains(&SymbolKind::Type)
                         || target.symbol.kinds.contains(&SymbolKind::Variant)
                 });
-            let occurrence = target
+            let mut occurrence = target
                 .and_then(|target| {
                     self.occurrence(
                         file,
@@ -57,6 +85,16 @@ impl<'source> Index<'source> {
                 .or_else(|| {
                     self.javascript_module_reference(file, reference.target, reference.role, work)
                 });
+            if let Some(occurrence) = &mut occurrence {
+                occurrence.edge_from = self
+                    .javascript_assignment_reference_from(
+                        file,
+                        reference.target,
+                        reference.role,
+                        work,
+                    )
+                    .or_else(|| self.javascript_module_from(file, reference.target, work));
+            }
             result.record(occurrence);
         }
         for binding in file.facts.bindings() {
@@ -64,6 +102,21 @@ impl<'source> Index<'source> {
                 return;
             }
             if let StaticBindingKind::JavaScriptEdgeNamespace { module } = binding.kind {
+                result.record(self.javascript_namespace_import(file, binding.name, module, work));
+            }
+            if let StaticBindingKind::JavaScriptImport { module, .. } = binding.kind
+                && let Some(written) = self.javascript_written_import(file, binding, module, work)
+            {
+                // An import without a separate written module is no unresolved site.
+                result.record(Some(written));
+            }
+            if let StaticBindingKind::JavaScriptRequire {
+                module,
+                export: None,
+                require,
+            } = binding.kind
+                && self.builtin_require(file, require.start, work)
+            {
                 result.record(self.javascript_namespace_import(file, binding.name, module, work));
             }
         }
@@ -84,6 +137,43 @@ impl<'source> Index<'source> {
             }
         }
         self.javascript_contains(file, work, result);
+    }
+
+    fn javascript_assignment_reference_from(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        role: ReferenceRole,
+        work: &mut Work,
+    ) -> Option<SymbolId> {
+        if !matches!(role, ReferenceRole::Read | ReferenceRole::Write) {
+            return None;
+        }
+        let scopes = self.javascript.scopes.get(file.document.path.as_str())?;
+        let symbol = scopes.definitions.resolve(range.start, range.end)?;
+        let assignment = symbol.syntax_element_kind == Some("assignment_expression");
+        let callable = matches!(symbol.kind, "function" | "method");
+        if assignment && callable {
+            self.javascript_call_from(file, range, work)
+        } else {
+            None
+        }
+    }
+
+    /// The source of an occurrence written outside every declaration of its file: the
+    /// file's own module. A file can declare into another module (an ambient module
+    /// declaration), so its declarations alone do not always name one module.
+    pub(super) fn javascript_module_from(
+        &self,
+        file: &File<'source>,
+        range: ByteRange,
+        work: &mut Work,
+    ) -> Option<SymbolId> {
+        let scopes = self.javascript.scopes.get(file.document.path.as_str())?;
+        if scopes.definitions.resolve(range.start, range.end).is_some() {
+            return None;
+        }
+        self.javascript_module_identity(file, work)
     }
 
     fn javascript_contains(
@@ -290,6 +380,34 @@ impl<'source> Index<'source> {
         Some(occurrence)
     }
 
+    /// The written module of an import whose name is declared in another file.
+    ///
+    /// The terminal declaration is stored by the import itself. A name reached through a
+    /// reexport also keeps the module the import is written against. A name declared in
+    /// that module, an unresolved name and an unresolved module add nothing.
+    fn javascript_written_import(
+        &self,
+        file: &File<'source>,
+        binding: &StaticBinding,
+        module: ByteRange,
+        work: &mut Work,
+    ) -> Option<StaticOccurrence> {
+        if file.inactive(binding.name, work) {
+            return None;
+        }
+        let terminal = self.javascript_import(file, binding, work)?;
+        let path = super::javascript_exports::relative_path(
+            file.document.path.as_str(),
+            file.text(module)?,
+            work,
+        )?;
+        let written = self.edge_javascript_module(&path)?;
+        if written.document.path == terminal.file.path {
+            return None;
+        }
+        self.javascript_namespace_import(file, binding.name, module, work)
+    }
+
     fn javascript_module_occurrence(
         &self,
         file: &File<'source>,
@@ -352,6 +470,10 @@ impl<'source> Index<'source> {
             let parsed = SymbolIdentity::parse(identity.as_str()).ok()?;
             let mut path = parsed.qualified_path().to_vec();
             path.pop()?;
+            if path.is_empty() {
+                // An ambient module declaration is named outside the file's module.
+                continue;
+            }
             let module =
                 SymbolIdentity::new(parsed.owner().clone(), parsed.language().clone(), path)
                     .ok()?;
@@ -384,6 +506,13 @@ impl<'source> Index<'source> {
         {
             return;
         }
+        // A constructor is invoked through `super`, never inherited and replaced. A member
+        // assigned through `this` writes the inherited member; it declares no override.
+        if symbol.name == "constructor"
+            || symbol.syntax_element_kind == Some("assignment_expression")
+        {
+            return;
+        }
         let Some(from) = self.javascript_identity(Target {
             file: file.document,
             symbol,
@@ -399,7 +528,9 @@ impl<'source> Index<'source> {
             if !work.charge() {
                 return;
             }
-            if Some(edge.from) != class.symbol.name_range {
+            // An implemented interface is fulfilled, not inherited: only `extends` passes
+            // a member down for the declaration to replace.
+            if Some(edge.from) != class.symbol.name_range || edge.kind != EdgeKind::Extends {
                 continue;
             }
             let base = self.edge_javascript_target(file, edge.target, work);

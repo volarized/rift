@@ -1,6 +1,7 @@
 //! Resolves captured call and import sites against admitted source declarations.
 
 mod javascript;
+mod javascript_callbacks;
 mod javascript_edges;
 mod javascript_exports;
 mod javascript_members;
@@ -244,6 +245,7 @@ struct Work {
     budget: LoopBudget,
     exhausted: bool,
     python_depth: u8,
+    javascript_depth: u8,
 }
 
 impl Work {
@@ -252,7 +254,20 @@ impl Work {
             budget: LoopBudget::new(maximum),
             exhausted: false,
             python_depth: 0,
+            javascript_depth: 0,
         }
+    }
+
+    /// Runs one nested callback parameter lookup, refusing past a fixed nesting depth.
+    fn javascript_lookup<T>(&mut self, lookup: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
+        const DEPTH_MAX: u8 = 16;
+        if self.javascript_depth >= DEPTH_MAX {
+            return None;
+        }
+        self.javascript_depth += 1;
+        let result = lookup(self);
+        self.javascript_depth -= 1;
+        result
     }
 
     fn python_lookup<T>(&mut self, lookup: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
@@ -340,6 +355,27 @@ impl Conditions {
     }
 }
 
+/// The facet that stands for a member declared several times (D38): one declaration
+/// beside members assigned to its class (`on: Handler` and `this.on = ...`), or members
+/// assigned only. Any other repetition, such as overloads, stays ambiguous.
+fn member_facet<'source>(candidates: &[&'source SyntaxSymbol]) -> Option<&'source SyntaxSymbol> {
+    let assigned =
+        |symbol: &&SyntaxSymbol| symbol.syntax_element_kind == Some("assignment_expression");
+    if !candidates.iter().any(assigned)
+        || !candidates
+            .iter()
+            .all(|symbol| matches!(symbol.kind, "method" | "property"))
+    {
+        return None;
+    }
+    let mut declared = candidates.iter().filter(|symbol| !assigned(symbol));
+    match (declared.next(), declared.next()) {
+        (Some(symbol), None) => Some(*symbol),
+        (None, _) => candidates.first().copied(),
+        (Some(_), Some(_)) => None,
+    }
+}
+
 struct File<'source> {
     document: &'source StaticSource<'source>,
     facts: &'source StaticFacts,
@@ -355,6 +391,16 @@ struct File<'source> {
     python_values: BTreeMap<u64, StaticBindingKind>,
     python_calls: BTreeMap<u64, Vec<&'source StaticCall>>,
     declared_types: BTreeMap<ByteRange, Option<ByteRange>>,
+    /// Declaration name to the named element type its written array type states.
+    element_types: BTreeMap<ByteRange, Option<ByteRange>>,
+    /// Start offsets of plain name writes whose value is a function written in place.
+    function_writes: BTreeSet<u64>,
+    type_signatures: BTreeSet<(ByteRange, bool)>,
+    callbacks: javascript_callbacks::Callbacks<'source>,
+    members: BTreeMap<ByteRange, Option<&'source rift_syntax::StaticMember>>,
+    export_writes: BTreeMap<javascript_exports::ExportSlot<'source>, Option<u64>>,
+    member_writes: BTreeMap<(ByteRange, Option<&'source str>), Option<u64>>,
+    unknown_member_writes: BTreeSet<Option<&'source str>>,
     conditions: Conditions,
     /// Rust modules this file's conditional item chains declare, with their admission.
     chain_modules: BTreeMap<&'source str, Option<bool>>,
@@ -363,41 +409,95 @@ struct File<'source> {
 #[derive(Default)]
 struct AssignmentTargets<'source> {
     names: BTreeSet<&'source str>,
+    /// Start offsets of the writes to each plain name.
+    name_writes: BTreeMap<&'source str, Vec<u64>>,
     members: BTreeSet<(&'source str, &'source str)>,
-    properties: BTreeSet<&'source str>,
+    /// Every member or subscript target, with its start offset.
+    member_writes: Vec<(u64, &'source str)>,
     unknown: bool,
 }
 
 impl<'source> AssignmentTargets<'source> {
-    fn add(&mut self, target: &'source str, work: &mut Work) -> Option<()> {
+    fn add(&mut self, target: &'source str, start: u64) {
         let target = target.trim();
         if target.starts_with('(') || target.contains(['[', ']', '\\', '/']) {
             self.unknown = true;
         }
+        if target.contains(['.', '[']) {
+            self.member_writes.push((start, target));
+        }
         let Some((receiver, path)) = target.split_once('.') else {
             self.names.insert(target);
-            return Some(());
+            self.name_writes.entry(target).or_default().push(start);
+            return;
         };
-        let mut properties = path.split('.').map(str::trim);
-        if let Some(first) = properties.next() {
+        if let Some(first) = path.split('.').map(str::trim).next() {
             self.members.insert((receiver.trim(), first));
-            self.properties.insert(first);
         }
-        for property in properties {
-            if !work.charge() {
-                return None;
-            }
-            self.properties.insert(property);
-        }
-        Some(())
     }
+}
 
-    fn may_replace_method(&self, method: &str) -> bool {
-        self.unknown
-            || [method, "constructor", "prototype"]
-                .iter()
-                .any(|property| self.properties.contains(property))
+/// The object expression and the property one assignment target writes.
+///
+/// Syntax capture splits a destructuring pattern into its member and name targets, so a
+/// target is a name, a member expression or a subscript. `None` is a target without a
+/// member. `Some((receiver, None))` writes a computed property whose name source does not
+/// state; a quoted literal key names its property like a dotted one.
+fn written_member(target: &str) -> Option<(&str, Option<&str>)> {
+    let target = target.trim();
+    if let Some(inner) = target.strip_suffix(']') {
+        let mut depth = 0_usize;
+        let mut open = None;
+        for (index, character) in inner.char_indices().rev() {
+            match character {
+                ']' => depth += 1,
+                '[' if depth == 0 => {
+                    open = Some(index);
+                    break;
+                }
+                '[' => depth -= 1,
+                _ => {}
+            }
+        }
+        let open = open?;
+        let receiver = inner[..open].trim().trim_end_matches("?.").trim();
+        if receiver.is_empty() {
+            return None;
+        }
+        let key = inner[open + 1..].trim();
+        let literal = ['\'', '"', '`'].into_iter().find_map(|quote| {
+            key.strip_prefix(quote)?
+                .strip_suffix(quote)
+                .filter(|name| !name.contains([quote, '\\', '$']))
+        });
+        return Some((receiver, literal));
     }
+    let (receiver, property) = target.rsplit_once('.')?;
+    let receiver = receiver.trim().trim_end_matches('?').trim();
+    let property = property.trim();
+    let named = !property.is_empty()
+        && property
+            .chars()
+            .all(|character| character.is_alphanumeric() || matches!(character, '_' | '$' | '#'));
+    named.then_some((receiver, Some(property)))
+}
+
+/// Whether the assignment after `target` stores the member itself, bound to its receiver.
+///
+/// `this.run = this.run.bind(this)` keeps the declared member: the value is that member
+/// with a fixed receiver, not another function.
+fn rebinds_itself(source: &str, target: &str, receiver: &str, end: u64) -> bool {
+    let rebound = || {
+        let rest = source.get(usize::try_from(end).ok()?..)?.trim_start();
+        let rest = rest.strip_prefix('=')?.trim_start();
+        let rest = rest.strip_prefix(target)?.strip_prefix(".bind(")?;
+        let rest = rest.strip_prefix(receiver)?.strip_prefix(')')?;
+        Some(
+            rest.trim_start_matches([' ', '\t'])
+                .starts_with([';', '\n', '\r', '}', ',', ')']),
+        )
+    };
+    rebound().unwrap_or(false)
 }
 
 impl<'source> File<'source> {
@@ -421,6 +521,14 @@ impl<'source> File<'source> {
             python_values: BTreeMap::new(),
             python_calls: BTreeMap::new(),
             declared_types: BTreeMap::new(),
+            element_types: BTreeMap::new(),
+            function_writes: BTreeSet::new(),
+            type_signatures: BTreeSet::new(),
+            callbacks: javascript_callbacks::Callbacks::default(),
+            members: BTreeMap::new(),
+            export_writes: BTreeMap::new(),
+            member_writes: BTreeMap::new(),
+            unknown_member_writes: BTreeSet::new(),
             conditions: Conditions::default(),
             chain_modules: BTreeMap::new(),
         };
@@ -445,6 +553,8 @@ impl<'source> File<'source> {
         file.conditions = Conditions::new(conditions);
         file.index_bindings(work)?;
         file.index_symbols(work)?;
+        file.index_javascript_members(work)?;
+        file.callbacks = javascript_callbacks::Callbacks::index(facts, work)?;
         Some(file)
     }
 
@@ -515,11 +625,32 @@ impl<'source> File<'source> {
                 .and_modify(|entry| *entry = None)
                 .or_insert(Some(annotation));
         }
+        for &(name, element) in self.facts.element_types() {
+            if !work.charge() {
+                return None;
+            }
+            self.element_types
+                .entry(name)
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(element));
+        }
+        for range in self.facts.function_writes() {
+            if !work.charge() {
+                return None;
+            }
+            self.function_writes.insert(range.start);
+        }
+        for &signature in self.facts.type_signatures() {
+            if !work.charge() {
+                return None;
+            }
+            self.type_signatures.insert(signature);
+        }
         for range in self.facts.assignments() {
             if !work.charge() {
                 return None;
             }
-            self.assignments.add(self.text(*range)?, work)?;
+            self.assignments.add(self.text(*range)?, range.start);
         }
         Some(())
     }
@@ -627,10 +758,9 @@ impl<'source> File<'source> {
                 return None;
             }
             *selected
+        } else if language != "python" && candidates.len() != 1 {
+            member_facet(candidates)?
         } else {
-            if language != "python" && candidates.len() != 1 {
-                return None;
-            }
             *candidates.first()?
         };
         Some(Target {
@@ -1007,6 +1137,11 @@ impl<'source> Index<'source> {
                     if file.document.facts.language().name == "python" {
                         occurrence.edge_from =
                             Some(self.python_identity(file, range, file.qualified_target(".")?)?);
+                    } else if matches!(
+                        file.document.facts.language().name.as_str(),
+                        "javascript" | "typescript"
+                    ) {
+                        occurrence.edge_from = self.javascript_module_from(file, range, work);
                     }
                     Some(occurrence)
                 });
@@ -1136,9 +1271,9 @@ impl<'source> Index<'source> {
     ) -> Option<(ByteRange, Option<Target<'source>>)> {
         match binding.kind {
             StaticBindingKind::JavaScriptImport { .. }
-            | StaticBindingKind::JavaScriptRequire { .. } => {
-                Some((binding.name, self.javascript_import(file, binding, work)))
-            }
+            | StaticBindingKind::JavaScriptRequire {
+                export: Some(_), ..
+            } => Some((binding.name, self.javascript_import(file, binding, work))),
             StaticBindingKind::RustUse { path } => Some((path, self.rust.import(file, path, work))),
             StaticBindingKind::PythonImport { .. } | StaticBindingKind::PythonModule { .. } => {
                 Some((
