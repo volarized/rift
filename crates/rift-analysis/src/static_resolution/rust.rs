@@ -1194,7 +1194,17 @@ impl<'source> Namespaces<'source> {
         namespace: Namespace,
         work: &mut Work,
     ) -> Option<Target<'source>> {
-        if let Some(export) = self.exports.get(path) {
+        let index = match namespace {
+            Namespace::Type => &self.types,
+            Namespace::Value => &self.values,
+        };
+        // A `use` binding of a module names its target there. Without a declaration or an
+        // alias at the path, a visible binding (a private import of an ancestor module, too)
+        // is followed to its target; a cycle of bindings resolves nothing.
+        let mut path = std::borrow::Cow::Borrowed(path);
+        let mut followed = BTreeSet::new();
+        let mut binding_module = None;
+        while let Some(export) = self.exports.get(path.as_ref()) {
             let export = export.as_ref()?;
             if !namespace_visible(
                 self.module(file, position, work)?,
@@ -1203,18 +1213,34 @@ impl<'source> Namespaces<'source> {
             ) {
                 return None;
             }
+            if index.contains_key(path.as_ref()) {
+                break;
+            }
+            if !work.charge() || !followed.insert(path.to_vec()) {
+                return None;
+            }
+            binding_module = Some(&export.module);
+            path = std::borrow::Cow::Owned(export.target.clone());
         }
-        let index = match namespace {
-            Namespace::Type => &self.types,
-            Namespace::Value => &self.values,
-        };
         let target = index
-            .get(path)
+            .get(path.as_ref())
             .copied()
             .flatten()
             .filter(|target| self.available(*target))?;
-        self.accessible(file, position, path, target, work)
-            .then_some(target)
+        // Through a binding, the item needs to be visible where the last binding names it;
+        // the modules on its own path need not be visible from the source, but each must be
+        // admitted.
+        match binding_module {
+            Some(module) => {
+                let (_, declared) = path.split_last()?;
+                ((1..=declared.len()).all(|length| !self.module_unavailable(&declared[..length]))
+                    && namespace_visible(module, declared, target.symbol.visibility.as_deref()))
+                .then_some(target)
+            }
+            None => self
+                .accessible(file, position, &path, target, work)
+                .then_some(target),
+        }
     }
 
     fn available(&self, target: Target<'source>) -> bool {

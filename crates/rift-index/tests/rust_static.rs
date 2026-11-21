@@ -1843,3 +1843,26 @@ fn test_rust_typed_self_receivers_reach_the_implementation_type() {
                     && edge.to().as_str().ends_with("/Slice/len")))
     }));
 }
+
+#[test]
+fn test_rust_paths_through_private_imports_of_a_parent_module() {
+    // `use super::Bucket` names what the parent module imported as `Bucket`; the import is
+    // private to the parent and its descendants, so a path from elsewhere stays unresolved.
+    // A cycle of private imports resolves nothing.
+    let source = "mod inner { pub struct Bucket { pub value: u8 } }\npub mod map {\n    use crate::inner::Bucket;\n    pub mod iter {\n        use super::Bucket;\n        pub fn new() -> u8 { Bucket { value: 1 }.value }\n    }\n}\npub mod other {\n    pub fn outside() -> u8 { crate::map::Bucket { value: 2 }.value }\n}\npub mod first { use crate::second::Loop; pub fn run() -> u8 { Loop { value: 3 }.value } }\npub mod second { use crate::first::Loop; }\n";
+    let (_directory, index) = fixture_index(PLAIN_MANIFEST, &[("src/lib.rs", source)]);
+    for (kind, from, to) in [
+        (EdgeKind::Calls, "/map/iter/new", "/inner/Bucket"),
+        (EdgeKind::Reads, "/map/iter/new", "/inner/Bucket/value"),
+    ] {
+        assert!(
+            has_edge(&index, kind, from, to),
+            "missing {kind:?} {from} -> {to}"
+        );
+    }
+    assert!(!index.edges().edges().any(|edge| {
+        (edge.from().as_str().ends_with("/other/outside")
+            || edge.from().as_str().ends_with("/first/run"))
+            && matches!(edge.kind(), EdgeKind::Calls | EdgeKind::Reads)
+    }));
+}
