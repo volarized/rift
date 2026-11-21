@@ -1400,7 +1400,7 @@ impl EngineSession {
     /// Sets the instant the caller's read ends at, or clears it with `None`.
     ///
     /// No request waits for its answer past `deadline`: a request still unanswered there
-    /// is cancelled and fails with [`errors::lsp::engine_analyzing`], and the session
+    /// is cancelled and fails with [`errors::lsp::engine_analyzing`](fn@errors::lsp::engine_analyzing), and the session
     /// stays for the next request. A batch checks the deadline before each frame it
     /// writes, so the deadline never cuts a frame part-written.
     pub fn set_deadline(&mut self, deadline: Option<Instant>) {
