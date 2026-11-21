@@ -2514,6 +2514,66 @@ module.exports = build
 }
 
 #[test]
+fn test_members_typed_by_the_global_function_type_are_callable() {
+    // A member written with the global `Function` type is callable through a field or a
+    // parameter of its owner; it constructs nothing, and a workspace `Function`
+    // declaration without a call signature decides instead.
+    let source = "export interface Shim {
+  cliui: Function
+  readdirSync: (path: string) => string[]
+}
+export class Command {
+  #shim: Shim
+  constructor(shim: Shim) { this.#shim = shim }
+  add(dir: string) {
+    this.#shim.readdirSync(dir)
+    return this.#shim.cliui()
+  }
+}
+export function viaParameter(shim: Shim) { return shim.cliui() }
+export function constructs(shim: Shim) { return new shim.cliui() }
+";
+    let shadowed = "interface Function { name: string }
+export interface Local { run: Function }
+export function local(item: Local) { return item.run() }
+";
+    let (_directory, index) = workspace_with_manifest(
+        &[("main.ts", source), ("shadowed.ts", shadowed)],
+        module_manifest(),
+    );
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "main.ts/Command/add",
+        "main.ts/Shim/cliui"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "main.ts/Command/add",
+        "main.ts/Shim/readdirSync"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "main.ts/viaParameter",
+        "main.ts/Shim/cliui"
+    ));
+    assert!(!has_edge(
+        &index,
+        EdgeKind::Calls,
+        "main.ts/constructs",
+        "main.ts/Shim/cliui"
+    ));
+    assert!(!has_edge(
+        &index,
+        EdgeKind::Calls,
+        "shadowed.ts/local",
+        "shadowed.ts/Local/run"
+    ));
+}
+
+#[test]
 fn test_typescript_types_named_like_a_function_take_the_interface() {
     // In TypeScript a function and an interface of one name merge: a type written with that
     // name is the interface, also inside the function itself.

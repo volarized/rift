@@ -390,7 +390,7 @@ impl<'source> Index<'source> {
 
     /// Whether the written type `annotation` names, through at most
     /// `DECLARED_TYPE_DEPTH_MAX` aliases, a type whose own shape is a call or construct
-    /// signature.
+    /// signature, or the global `Function` type.
     pub(super) fn javascript_written_signature<'index>(
         &'index self,
         mut file: &'index File<'source>,
@@ -408,7 +408,9 @@ impl<'source> Index<'source> {
             let Some(named) =
                 self.javascript_target(file, annotation, rift_core::ReferenceRole::Type, work)
             else {
-                return false;
+                // The global `Function` type, which no declaration of the workspace takes,
+                // is callable and constructs nothing.
+                return !constructs && file.text(annotation) == Some("Function");
             };
             let Some((owner, name)) = self
                 .files
@@ -629,8 +631,6 @@ impl<'source> Index<'source> {
         }
     }
 
-    fn javascript_imported_member(
-        &self,
     /// A member of a required module's value: `module.exports = name` with `name` an object
     /// declared in that module, or `module.exports = { ... }`.
     fn javascript_module_value_member(
@@ -650,6 +650,8 @@ impl<'source> Index<'source> {
         self.javascript_object_member(target, member, role, work)
     }
 
+    fn javascript_imported_member(
+        &self,
         file: &File<'source>,
         binding: &StaticBinding,
         member: &'source str,
@@ -890,9 +892,9 @@ pub(super) fn js_binding<'source>(
             }
             let symbol = file.target_at(binding.name).map(|target| target.symbol);
             if role == rift_core::ReferenceRole::Type {
+                let javascript = javascript_source(file.document.path.as_str());
                 // A JavaScript type names a class value; a name bound by `require` can hold one.
                 let required_value =
-                let javascript = javascript_source(file.document.path.as_str());
                     matches!(binding.kind, StaticBindingKind::JavaScriptRequire { .. })
                         && javascript;
                 // A TypeScript function names no type: an interface of the same name does.
