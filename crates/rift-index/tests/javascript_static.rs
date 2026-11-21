@@ -2316,6 +2316,58 @@ exports.use = use;
 }
 
 #[test]
+fn test_calls_through_typed_fields_written_again_keep_the_field_type() {
+    // A field with a written type holds a value of that type whatever writes it, so a call
+    // through it keeps the type's member. An untyped field written twice gives no target.
+    let source = "export interface Usage {
+  fail(msg: string): void
+  help(): string
+}
+export function usage(): Usage {
+  return { fail(msg: string) {}, help() { return '' } }
+}
+export class Instance {
+  #usage: Usage
+  helper: Usage
+  constructor() {
+    this.#usage = this!.#usage
+    this.helper = usage()
+  }
+  reset() {
+    this.#usage = usage()
+    this.helper = usage()
+  }
+  check(): string {
+    this.#usage.fail('x')
+    return this.helper.help()
+  }
+}
+class Right { run() { return 2 } }
+export class Untyped {
+  constructor() { this.side = { run: () => 3 } }
+  swap() { this.side = new Right() }
+  use() { return this.side.run() }
+}
+";
+    let (_directory, index) = workspace_with_manifest(&[("main.ts", source)], module_manifest());
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "main.ts/Instance/check",
+        "main.ts/Usage/fail"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "main.ts/Instance/check",
+        "main.ts/Usage/help"
+    ));
+    assert!(!index.edges().edges().any(|edge| {
+        edge.kind() == EdgeKind::Calls && edge.from().as_str().ends_with("main.ts/Untyped/use")
+    }));
+}
+
+#[test]
 fn test_typescript_types_named_like_a_function_take_the_interface() {
     // In TypeScript a function and an interface of one name merge: a type written with that
     // name is the interface, also inside the function itself.

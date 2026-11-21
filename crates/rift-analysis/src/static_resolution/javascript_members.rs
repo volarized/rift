@@ -352,6 +352,7 @@ impl<'source> Index<'source> {
         let mut pending = vec![class];
         let mut visited = BTreeSet::new();
         let mut found: Option<Target<'source>> = None;
+        let mut replaced = false;
         while let Some(class) = pending.pop() {
             if !work.charge() {
                 return None;
@@ -364,7 +365,9 @@ impl<'source> Index<'source> {
                 && class.symbol.kind != "interface"
                 && self.javascript_member_replaced(file, class, member, work)
             {
-                return None;
+                // A call to the written member itself has no target.
+                tail?;
+                replaced = true;
             }
             let target = file.javascript_declared_member(
                 &format!("{}.{}", class.symbol.qualified_name, member),
@@ -386,10 +389,23 @@ impl<'source> Index<'source> {
             }
         }
         let found = found?;
-        match tail {
-            Some(tail) => self.javascript_object_member(found, tail, role, work),
-            None => Some(found),
+        let Some(tail) = tail else {
+            return Some(found);
+        };
+        // A member written with a type holds a value of that type whatever writes it, so
+        // a call through it keeps the members of that type. A written member without a
+        // type gives the call no target.
+        if replaced
+            && !found.symbol.name_range.is_some_and(|name| {
+                self.files
+                    .get(found.file.path.as_str())
+                    .and_then(|file| file.declared_types.get(&name).copied().flatten())
+                    .is_some()
+            })
+        {
+            return None;
         }
+        self.javascript_object_member(found, tail, role, work)
     }
 
     /// Whether a write in the class's file gives `member` of `class` another value.
@@ -428,6 +444,15 @@ impl<'source> Index<'source> {
             {
                 continue;
             }
+            // A function or an object literal written in place through `this` declares
+            // another facet of the member (D38): the call still targets the member. Writes
+            // through other receivers keep the refusal.
+            if property == member
+                && receiver.trim() == "this"
+                && file.function_writes.contains(&start)
+            {
+                continue;
+            }
             if self.javascript_receiver_denotes(file, class, receiver, start, work) {
                 return true;
             }
@@ -444,15 +469,6 @@ impl<'source> Index<'source> {
         work: &mut Work,
     ) -> bool {
         let same = |target: Target<'source>| {
-            // A function or an object literal written in place through `this` declares
-            // another facet of the member (D38): the call still targets the member. Writes
-            // through other receivers keep the refusal.
-            if property == member
-                && receiver.trim() == "this"
-                && file.function_writes.contains(&start)
-            {
-                continue;
-            }
             target.file.path == class.file.path && std::ptr::eq(target.symbol, class.symbol)
         };
         let mut receiver = receiver.trim();
@@ -625,6 +641,9 @@ impl<'source> File<'source> {
         work: &mut Work,
     ) -> Option<Target<'source>> {
         let mut found: Option<Target<'source>> = None;
+        // A member assigned through `this` is another facet of a declared member (D38); it
+        // stands for the member only when nothing declares it.
+        let mut assigned: Option<Target<'source>> = None;
         for &symbol in self.by_qualified_name.get(name)? {
             if !work.charge() {
                 return None;
@@ -634,6 +653,13 @@ impl<'source> File<'source> {
             {
                 continue;
             }
+            if symbol.syntax_element_kind == Some("assignment_expression") {
+                assigned.get_or_insert(Target {
+                    file: self.document,
+                    symbol,
+                });
+                continue;
+            }
             if let Some(previous) = found {
                 if symbol.kind != previous.symbol.kind {
                     return None;
@@ -641,9 +667,6 @@ impl<'source> File<'source> {
                 // Overload signatures share a member, but two bodies are ambiguous.
                 if role != ReferenceRole::Type {
                     if symbol.kind != "method"
-        // A member assigned through `this` is another facet of a declared member (D38); it
-        // stands for the member only when nothing declares it.
-        let mut assigned: Option<Target<'source>> = None;
                         || (symbol.body_range.is_some() && previous.symbol.body_range.is_some())
                     {
                         return None;
@@ -653,13 +676,6 @@ impl<'source> File<'source> {
                             file: self.document,
                             symbol,
                         });
-            if symbol.syntax_element_kind == Some("assignment_expression") {
-                assigned.get_or_insert(Target {
-                    file: self.document,
-                    symbol,
-                });
-                continue;
-            }
                     }
                 }
             } else {
