@@ -2368,6 +2368,84 @@ export class Untyped {
 }
 
 #[test]
+fn test_type_assertions_on_initializers_type_their_locals() {
+    // `const name = value as T` types `name` as `T`, as `const name: T = value` does; the
+    // last assertion of a chain decides. A union or an assertion to no named type types
+    // nothing.
+    let source = "export interface Handle { setBlocking(on: boolean): void }
+export interface Stream { handle: Handle; isTTY: boolean }
+export function single(value: unknown) {
+  const stream = value as Stream
+  stream.handle.setBlocking(true)
+  return stream.isTTY
+}
+export function double(value: unknown) {
+  const stream = value as any as Stream
+  return stream.isTTY
+}
+export function inCallback(values: unknown[]) {
+  return values.map(function each(item) {
+    const stream = item as Stream
+    return stream.isTTY
+  })
+}
+export function wide(value: unknown) {
+  const either = value as Stream | Handle
+  const last = value as Stream as unknown
+  return [either.isTTY, last.isTTY]
+}
+export interface Usage { fail(msg: string): void; help(): string }
+export function asserted(): Usage {
+  const self = {} as Usage
+  self.fail('x')
+  return self
+}
+export function annotated(): Usage {
+  const self: Usage = {} as Usage
+  self.fail('x')
+  return self
+}
+";
+    let (_directory, index) = workspace_with_manifest(&[("main.ts", source)], module_manifest());
+    let edges = index
+        .edges()
+        .edges()
+        .map(|edge| {
+            format!(
+                "{:?} {} {}",
+                edge.kind(),
+                edge.from().as_str(),
+                edge.to().as_str()
+            )
+        })
+        .collect::<Vec<_>>();
+    for (kind, from, to) in [
+        (EdgeKind::Reads, "main.ts/single", "main.ts/Stream/isTTY"),
+        (
+            EdgeKind::Calls,
+            "main.ts/single",
+            "main.ts/Handle/setBlocking",
+        ),
+        (EdgeKind::Reads, "main.ts/double", "main.ts/Stream/isTTY"),
+        (
+            EdgeKind::Reads,
+            "main.ts/inCallback",
+            "main.ts/Stream/isTTY",
+        ),
+        (EdgeKind::Calls, "main.ts/asserted", "main.ts/Usage/fail"),
+        (EdgeKind::Calls, "main.ts/annotated", "main.ts/Usage/fail"),
+    ] {
+        assert!(has_edge(&index, kind, from, to), "{from} {to}: {edges:#?}");
+    }
+    assert!(
+        !edges
+            .iter()
+            .any(|edge| edge.contains("main.ts/wide ") && edge.ends_with("/isTTY")),
+        "{edges:#?}"
+    );
+}
+
+#[test]
 fn test_typescript_types_named_like_a_function_take_the_interface() {
     // In TypeScript a function and an interface of one name merge: a type written with that
     // name is the interface, also inside the function itself.

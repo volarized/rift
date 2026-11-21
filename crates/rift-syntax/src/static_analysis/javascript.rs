@@ -27,6 +27,7 @@ pub(super) struct Kinds {
     type_parameter: Option<u16>,
     type_shapes: Option<TypeShapeKinds>,
     annotation: Option<u16>,
+    asserted: Option<u16>,
     generic: Option<u16>,
     type_alias: Option<u16>,
     type_field: Option<u16>,
@@ -56,8 +57,8 @@ pub(super) struct Kinds {
     edge_types: Vec<u16>,
     parameters: u16,
     argument_list: u16,
-    arrow: u16,
     return_statement: u16,
+    arrow: u16,
     import: u16,
     import_clause: u16,
     import_specifier: u16,
@@ -279,6 +280,7 @@ impl Kinds {
             type_parameter: typescript.then(|| id("type_parameter")),
             type_shapes: typescript.then(|| TypeShapeKinds::resolve(grammar)),
             annotation: typescript.then(|| id("type_annotation")),
+            asserted: typescript.then(|| id("as_expression")),
             generic: typescript.then(|| id("generic_type")),
             type_alias: typescript.then(|| id("type_alias_declaration")),
             type_field: typescript.then(|| field("type")),
@@ -318,9 +320,9 @@ impl Kinds {
             edge_types: edge_type_kinds(grammar),
             parameters: id("formal_parameters"),
             argument_list: id("arguments"),
+            return_statement: id("return_statement"),
             arrow,
             import: id("import_statement"),
-            return_statement: id("return_statement"),
             import_clause: id("import_clause"),
             import_specifier: id("import_specifier"),
             namespace_import: id("namespace_import"),
@@ -360,9 +362,9 @@ impl Kinds {
         let id = syntax_element.kind_id();
         self.record_documented_function(syntax_element, source, documentation, facts)?;
         self.record_object_member(visited, facts)?;
+        self.record_returned_object(visited, facts)?;
         self.record_module_syntax(visited, source, facts);
         self.record_reference(visited, facts)?;
-        self.record_returned_object(visited, facts)?;
         self.record_member(syntax_element, facts)?;
         self.record_declared_type(syntax_element, source, facts)?;
         self.record_type_signature(syntax_element, facts)?;
@@ -394,8 +396,6 @@ impl Kinds {
         Ok(())
     }
 
-    /// Records a function written as a member of an object literal: a method, or a
-    /// `function` expression given as a `key: value` member. Arrow functions take `this`
     /// Records what a `return` returns, or what an arrow function's expression body is:
     /// the object literal, or none for any other value. Keyed by the name of the
     /// declaration the function belongs to.
@@ -468,6 +468,8 @@ impl Kinds {
         Ok(())
     }
 
+    /// Records a function written as a member of an object literal: a method, or a
+    /// `function` expression given as a `key: value` member. Arrow functions take `this`
     /// from their surroundings and are not recorded.
     fn record_object_member(
         &self,
@@ -1273,6 +1275,7 @@ impl Kinds {
             self.type_field
                 .and_then(|field| element.child_by_field_id(field))
                 .or_else(|| self.getter_return_type(element))
+                .or_else(|| self.asserted_type(element))
         };
         let Some((name, mut annotation)) = name.zip(annotation) else {
             return Ok(());
@@ -1334,6 +1337,24 @@ impl Kinds {
                 .push((byte_range(name)?, byte_range(annotation)?));
         }
         Ok(())
+    }
+
+    /// The type the initializer of a variable without its own annotation asserts:
+    /// `const name = value as T` declares `name` as `T`. In `value as any as T` the outer
+    /// assertion decides.
+    fn asserted_type<'tree>(&self, element: Node<'tree>) -> Option<Node<'tree>> {
+        if element.kind_id() != self.variable {
+            return None;
+        }
+        let mut value = element.child_by_field_id(self.value)?;
+        // Each step descends within the admitted syntax depth.
+        while value.kind_id() == self.parenthesized {
+            value = value.named_child(0)?;
+        }
+        if Some(value.kind_id()) != self.asserted {
+            return None;
+        }
+        value.named_child(1)
     }
 
     /// The declared return type of a `get` accessor: the type its property reads as.
