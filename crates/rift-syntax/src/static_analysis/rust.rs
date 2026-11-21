@@ -360,6 +360,7 @@ impl Kinds {
                         self.self_value,
                         self.field_expression,
                         self.call,
+                        self.struct_expression,
                     ]
                     .contains(&syntax_element.kind_id()))
                 .then_some(syntax_element)

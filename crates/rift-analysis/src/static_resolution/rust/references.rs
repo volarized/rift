@@ -323,6 +323,9 @@ impl<'source> Namespaces<'source> {
             .get(&(file.document.path.as_str(), initializer))
         {
             let call = (*call)?;
+            if let Some(owner) = self.cloned_owner(file, call, work, depth - 1) {
+                return Some(ReceiverOwner::Target(owner));
+            }
             let callable = self
                 .call_at_depth(file, call, work, depth - 1)
                 .or_else(|| {
@@ -331,6 +334,10 @@ impl<'source> Namespaces<'source> {
                     }
                     self.function_field(file, call.callee_range, work, depth - 1)
                 })?;
+            // A struct expression or tuple struct constructor makes a value of that struct.
+            if callable.symbol.kind == "struct" {
+                return Some(ReceiverOwner::Target(callable));
+            }
             return self
                 .return_owners
                 .get(&(callable.file.path.as_str(), callable.symbol.name_range?))
@@ -338,6 +345,39 @@ impl<'source> Namespaces<'source> {
                 .map(ReceiverOwner::Target);
         }
         self.receiver_owner_at_depth(file, initializer, work, depth - 1)
+    }
+
+    /// `value.clone()` without a local `clone` for the receiver's type: the standard
+    /// `Clone::clone` returns the receiver's type (`T` for a `T: Clone` receiver, else the
+    /// reference itself), whose members are the same.
+    fn cloned_owner(
+        &self,
+        file: &File<'source>,
+        call: &rift_syntax::StaticCall,
+        work: &mut Work,
+        depth: usize,
+    ) -> Option<Target<'source>> {
+        let rift_syntax::StaticCallee::Member { receiver, member } = call.callee else {
+            return None;
+        };
+        let written = file.text(call.range)?;
+        if file.text(member)? != "clone"
+            || !written
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect::<String>()
+                .ends_with(".clone()")
+        {
+            return None;
+        }
+        let ReceiverOwner::Target(owner) =
+            self.receiver_owner_at_depth(file, receiver, work, depth)?
+        else {
+            return None;
+        };
+        let mut path = self.field_owner(owner).admitted_path()?;
+        path.push("clone".to_owned());
+        (!self.methods.contains_key(&path) && !self.members.contains_key(&path)).then_some(owner)
     }
 
     fn function_field(

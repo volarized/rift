@@ -1787,3 +1787,33 @@ fn test_rust_paths_with_generic_arguments_name_the_plain_path() {
         "/fixture/Holder/new/inner"
     ));
 }
+
+#[test]
+fn test_rust_derived_clones_keep_the_receiver_type() {
+    // `value.clone()` returns the receiver's type (`T` when it implements `Clone`, else the
+    // reference `&T`), so a local it initializes keeps the type's members. A local `clone`
+    // method takes precedence with its declared return. A struct expression is a value of
+    // its struct.
+    let source = "#[derive(Clone, Debug)]\npub struct Input { pub pos: usize }\nimpl Input {\n    pub fn step(&mut self) -> Option<char> { self.pos += 1; None }\n    pub fn cloned(&self) -> Option<char> { let mut copy = self.clone(); copy.step() }\n    pub fn argument(input: &Input) -> Option<char> { let mut copy = input.clone(); copy.step() }\n}\npub struct Plain { pub pos: usize }\nimpl Plain {\n    pub fn step(&self) -> usize { self.pos }\n    pub fn cloned(&self) -> usize { let mut copy = self.clone(); copy.step() }\n}\npub struct Other;\npub struct Custom;\nimpl Custom { pub fn clone(&self) -> Other { Other } }\nimpl Other { pub fn step(&self) -> usize { 0 } }\npub fn custom(value: &Custom) -> usize { let copy = value.clone(); copy.step() }\npub fn built() -> usize { Input { pos: 1 }.pos + Plain { pos: 2 }.step() }\n";
+    let (_directory, index) = fixture_index(PLAIN_MANIFEST, &[("src/lib.rs", source)]);
+    for (kind, from, to) in [
+        (EdgeKind::Calls, "/Input/cloned", "/Input/step"),
+        (EdgeKind::Reads, "/Input/cloned", "/Input/step"),
+        (EdgeKind::Calls, "/Input/argument", "/Input/step"),
+        (EdgeKind::Calls, "/Plain/cloned", "/Plain/step"),
+        (EdgeKind::Calls, "/fixture/custom", "/Other/step"),
+        (EdgeKind::Reads, "/fixture/built", "/Input/pos"),
+        (EdgeKind::Calls, "/fixture/built", "/Plain/step"),
+    ] {
+        assert!(
+            has_edge(&index, kind, from, to),
+            "missing {kind:?} {from} -> {to}"
+        );
+    }
+    assert!(!index.edges().edges().any(|edge| {
+        edge.from().as_str().ends_with("/fixture/custom")
+            && edge.kind() == EdgeKind::Calls
+            && edge.to().as_str().ends_with("/step")
+            && !edge.to().as_str().ends_with("/Other/step")
+    }));
+}
