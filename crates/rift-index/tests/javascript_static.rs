@@ -392,6 +392,36 @@ fn module_manifest() -> &'static str {
 }
 
 #[test]
+fn test_typescript_contextual_global_names_store_symbols_and_method_edges() {
+    let source = "export interface Arguments { value: number }\nexport class Instance {\n    boolean(keys: string | string[]): Instance { return this }\n    global(globals: string | string[], global?: boolean): Instance { return this.boolean(globals) }\n    check(f: (argv: Arguments) => number, global = true): Instance { return this.boolean(global ? 'x' : 'y') }\n    middleware(callback: () => void): Instance { return this.global('y') }\n}\n";
+    for (path, language) in [("main.ts", "typescript"), ("main.tsx", "typescript:tsx")] {
+        let (_directory, index) = workspace_with_manifest(&[(path, source)], module_manifest());
+        let language = rift_protocol::read::Language::from_identity_segment(language)
+            .expect("fixture language");
+        assert!(
+            index
+                .identity_coverage_complete(&language)
+                .expect("identity coverage"),
+            "{path}"
+        );
+        assert!(index.edges().is_complete());
+        for (kind, from, to) in [
+            (EdgeKind::Contains, "/Instance", "/Instance/global"),
+            (EdgeKind::Contains, "/Instance", "/Instance/check"),
+            (EdgeKind::Calls, "/Instance/global", "/Instance/boolean"),
+            (EdgeKind::Calls, "/Instance/check", "/Instance/boolean"),
+            (EdgeKind::Calls, "/Instance/middleware", "/Instance/global"),
+            (EdgeKind::HasType, "/Instance/check", "/Arguments"),
+        ] {
+            assert!(
+                has_edge(&index, kind, from, to),
+                "{path}: {kind:?} {from} to {to}"
+            );
+        }
+    }
+}
+
+#[test]
 fn test_typescript_variance_annotations_keep_identity_heritage_and_members() {
     let source = "export interface Base<T> { base: T }
 export interface Mid<out T = unknown, in U = string> extends Base<T> { value: T; run(input: U): T }

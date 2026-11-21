@@ -139,5 +139,4 @@ allow-git = [
   "https://github.com/oxigraph/oxigraph",
   "https://github.com/astral-sh/ruff",
   "https://github.com/b0o/tree-sitter-cython",
-  "https://github.com/tree-sitter/tree-sitter-typescript",
 ]
