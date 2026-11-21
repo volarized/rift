@@ -892,11 +892,15 @@ fn local_exports(
             let Some(declarations) = declarations else {
                 break 'passes;
             };
+            let visibility = request
+                .1
+                .4
+                .and_then(|range| macros::text_range(file.source, range));
             let target = export_target(
                 input,
                 declarations,
                 (prepared, &mut export_paths),
-                &modules,
+                (&modules, visibility),
                 request,
                 &mut work,
                 work_max,
@@ -1036,7 +1040,7 @@ fn export_target(
     input: &NamespaceInput<'_>,
     declarations: &LocalDeclarations<'_>,
     (prepared, export_paths): (&super::PreparedNamespace, &mut ExportPaths),
-    modules: &Modules<'_, '_>,
+    (modules, visibility): (&Modules<'_, '_>, Option<&str>),
     request: &(Vec<String>, macros::Export),
     work: &mut usize,
     work_max: usize,
@@ -1060,15 +1064,21 @@ fn export_target(
         if export_paths.unparsed.is_some() {
             return None;
         }
-        local_target(input, declarations, modules, &target_path, work, work_max).map(
-            |(file, symbol, target)| {
-                (
-                    target.clone(),
-                    file.path.as_str().to_owned(),
-                    symbol.qualified_name.clone(),
-                )
-            },
+        local_target(
+            input,
+            declarations,
+            modules,
+            (&target_path, namespace, visibility),
+            work,
+            work_max,
         )
+        .map(|(file, symbol, target)| {
+            (
+                target.clone(),
+                file.path.as_str().to_owned(),
+                symbol.qualified_name.clone(),
+            )
+        })
     });
     match local {
         Some(local) => Some(local),
@@ -1262,12 +1272,13 @@ fn local_declarations<'input>(
     Some(declarations)
 }
 
-/// The one public, active declaration `path` names with a source range in its file.
+/// The one active declaration `path` names with a source range in its file, when the
+/// re-export written in `namespace` at `visibility` (`None` for `pub`) may name it.
 fn local_target<'input>(
     input: &NamespaceInput<'_>,
     declarations: &LocalDeclarations<'input>,
     modules: &Modules<'_, '_>,
-    path: &[String],
+    (path, namespace, visibility): (&[String], &[String], Option<&str>),
     work: &mut usize,
     work_max: usize,
 ) -> Option<LocalDeclaration<'input>> {
@@ -1291,8 +1302,57 @@ fn local_target<'input>(
         .source
         .get(usize::try_from(symbol.range.start).ok()?..usize::try_from(symbol.range.end).ok()?)
         .is_some();
-    (admitted == Some(true) && symbol.visibility.as_deref() == Some("pub") && spelled)
+    let (_, module) = path.split_last()?;
+    (admitted == Some(true)
+        && reexport_allowed(symbol.visibility.as_deref(), module, namespace, visibility)
+        && spelled)
         .then_some((*file, *symbol, *identity))
+}
+
+/// Whether a re-export written in `namespace` at `reexport` (`None` for `pub`) may name an
+/// item of `module` declared at `declared`: the re-exporting module sees the item, and the
+/// re-export is visible nowhere the item is not. A public item allows every re-export.
+fn reexport_allowed(
+    declared: Option<&str>,
+    module: &[String],
+    namespace: &[String],
+    reexport: Option<&str>,
+) -> bool {
+    if declared == Some("pub") {
+        return true;
+    }
+    let Some(reexport) = reexport else {
+        return false;
+    };
+    let (Some(item), Some(written)) = (
+        visible_within(declared, module),
+        visible_within(Some(reexport), namespace),
+    ) else {
+        return false;
+    };
+    namespace.starts_with(&item) && written.starts_with(&item)
+}
+
+/// The module whose descendants see an item of `module` declared at `visibility`.
+fn visible_within(visibility: Option<&str>, module: &[String]) -> Option<Vec<String>> {
+    let spelled = visibility.map(|visibility| {
+        visibility
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>()
+    });
+    match spelled.as_deref() {
+        None | Some("pub(self)") => Some(module.to_vec()),
+        Some("pub(crate)") => Some(vec![module.first()?.clone()]),
+        Some("pub(super)") => Some(module.split_last()?.1.to_vec()),
+        Some(spelled) => {
+            let path = spelled.strip_prefix("pub(in")?.strip_suffix(')')?;
+            let segments = path.split("::").map(str::to_owned).collect::<Vec<_>>();
+            let resolved = requested_path(module, &segments)?;
+            // The path names an ancestor of the item's module, or the module itself.
+            module.starts_with(&resolved).then_some(resolved)
+        }
+    }
 }
 
 #[cfg(test)]

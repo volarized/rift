@@ -1632,3 +1632,98 @@ fn test_rust_modules_declared_by_a_conditional_chain_keep_identities() {
         );
     }
 }
+
+#[test]
+fn test_rust_reexports_of_crate_visible_items_keep_their_scope() {
+    // A re-export of a `pub(crate)` or `pub(super)` item, at a visibility the item allows,
+    // is followed wherever the re-exported name is visible, through nested use trees too.
+    // A path from outside the re-export's own visibility stays unresolved.
+    let control = "mod inner;\nmod tag;\npub(crate) use self::{inner::Helper, tag::{Open, Tag}};\npub(super) use self::inner::Shared;\npub(in crate::control) use self::inner::Local;\npub(crate) mod user;\n";
+    let tag = "pub(crate) struct Tag(pub(super) u8);\nimpl Tag {\n    pub(crate) fn full(hash: u64) -> Tag { Tag(hash as u8) }\n    pub(crate) fn special(self) -> bool { self.0 == 0 }\n}\npub struct Open(pub u8);\nimpl Open {\n    pub fn full(hash: u64) -> Open { Open(hash as u8) }\n    pub fn special(self) -> bool { self.0 == 0 }\n}\n";
+    let inner = "pub(crate) struct Helper;\nimpl Helper { pub(crate) fn make() -> u8 { 1 } }\npub(crate) struct Shared;\nimpl Shared { pub(crate) fn make() -> u8 { 2 } }\npub(super) struct Local;\nimpl Local { pub(super) fn make() -> u8 { 3 } }\n";
+    let user = "use super::Local;\npub(crate) fn local() -> u8 { Local::make() }\n";
+    let consumer = "use crate::control::{Helper, Open, Shared, Tag};\npub(crate) fn crate_visible(hash: u64, old: Tag) -> bool { Tag::full(hash); old.special() }\npub fn public(hash: u64, old: Open) -> bool { Open::full(hash); old.special() }\npub(crate) fn nested() -> u8 { Helper::make() + Shared::make() + crate::control::user::local() }\npub(crate) fn refused() -> u8 { crate::control::Local::make() }\n";
+    let (_directory, index) = fixture_index(
+        PLAIN_MANIFEST,
+        &[
+            ("src/lib.rs", "mod consumer;\nmod control;\n"),
+            ("src/control/mod.rs", control),
+            ("src/control/tag.rs", tag),
+            ("src/control/inner.rs", inner),
+            ("src/control/user.rs", user),
+            ("src/consumer.rs", consumer),
+        ],
+    );
+    for (kind, from, to) in [
+        (
+            EdgeKind::Aliases,
+            "/fixture/control/Tag",
+            "/control/tag/Tag",
+        ),
+        (
+            EdgeKind::Aliases,
+            "/fixture/control/Helper",
+            "/control/inner/Helper",
+        ),
+        (
+            EdgeKind::Aliases,
+            "/fixture/control/Shared",
+            "/control/inner/Shared",
+        ),
+        (
+            EdgeKind::Calls,
+            "/consumer/crate_visible",
+            "/control/tag/Tag/full",
+        ),
+        (
+            EdgeKind::Calls,
+            "/consumer/crate_visible",
+            "/control/tag/Tag/special",
+        ),
+        (
+            EdgeKind::Reads,
+            "/consumer/crate_visible",
+            "/control/tag/Tag/special",
+        ),
+        (
+            EdgeKind::Calls,
+            "/consumer/public",
+            "/control/tag/Open/full",
+        ),
+        (
+            EdgeKind::Calls,
+            "/consumer/nested",
+            "/control/inner/Helper/make",
+        ),
+        (
+            EdgeKind::Calls,
+            "/consumer/nested",
+            "/control/inner/Shared/make",
+        ),
+        (
+            EdgeKind::Calls,
+            "/control/user/local",
+            "/control/inner/Local/make",
+        ),
+    ] {
+        assert!(
+            has_edge(&index, kind, from, to),
+            "missing {kind:?} {from} -> {to}"
+        );
+    }
+    assert!(
+        index
+            .edges()
+            .edges()
+            .any(|edge| edge.kind() == EdgeKind::Imports
+                && edge.from().as_str().contains("consumer")
+                && edge.to().as_str().ends_with("/control/tag/Tag")),
+        "missing import of the re-exported Tag"
+    );
+    assert!(!has_edge(
+        &index,
+        EdgeKind::Calls,
+        "/consumer/refused",
+        "/control/inner/Local/make"
+    ));
+}
