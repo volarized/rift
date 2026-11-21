@@ -44,6 +44,22 @@ impl AdjacencyWalk<'_> {
         kind: EdgeKind,
         lookup_details: bool,
     ) -> Result<Vec<Option<SymbolId>>, RiftError> {
+        let named = self
+            .name_package_targets_unreported(callees, kind, lookup_details)
+            .await?;
+        let dropped = named.iter().filter(|identity| identity.is_none()).count();
+        self.report_missing_targets(kind, dropped);
+        Ok(named)
+    }
+
+    /// Names package targets like [`Self::name_package_targets`]; the caller reports the
+    /// targets that stay unnamed with [`Self::report_missing_targets`].
+    pub(super) async fn name_package_targets_unreported(
+        &mut self,
+        callees: &[PackageCallee],
+        kind: EdgeKind,
+        lookup_details: bool,
+    ) -> Result<Vec<Option<SymbolId>>, RiftError> {
         if callees.is_empty() {
             return Ok(Vec::new());
         }
@@ -52,7 +68,6 @@ impl AdjacencyWalk<'_> {
         } else {
             let installed = if self.configuration.enabled {
                 if self.remaining.requests_max == 0 {
-                    self.report_missing_targets(kind, callees.len());
                     return Ok(vec![None; callees.len()]);
                 }
                 claim_request(&mut self.remaining)?;
@@ -68,15 +83,12 @@ impl AdjacencyWalk<'_> {
             self.use_installed = Some(installed);
             installed
         };
-        let named = if installed {
-            self.capture_installed_targets(callees, kind).await?
+        if installed {
+            self.capture_installed_targets(callees, kind).await
         } else {
             self.name_published_targets(callees, kind, lookup_details)
-                .await?
-        };
-        let dropped = named.iter().filter(|identity| identity.is_none()).count();
-        self.report_missing_targets(kind, dropped);
-        Ok(named)
+                .await
+        }
     }
 
     async fn name_published_targets(
@@ -244,7 +256,7 @@ impl AdjacencyWalk<'_> {
         Ok(named)
     }
 
-    fn report_missing_targets(&mut self, kind: EdgeKind, dropped: usize) {
+    pub(super) fn report_missing_targets(&mut self, kind: EdgeKind, dropped: usize) {
         if dropped == 0 {
             return;
         }

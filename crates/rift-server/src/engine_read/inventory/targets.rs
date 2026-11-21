@@ -7,6 +7,7 @@ use lsp_types::{Location, Position};
 use rift_core::{ProjectPath, SymbolId as CoreSymbolId};
 use rift_error::RiftError;
 use rift_lsp::{EngineSession, LineIndex, PositionEncoding};
+use rift_protocol::identity::SymbolIdentity;
 use rift_protocol::read::{
     Edge, EdgeKind, EdgeProvider, ReadWarning, SourceUnitSpan, SymbolId, TextRange,
     TraversalDirection,
@@ -26,6 +27,9 @@ pub struct PackageEdge {
     pub direction: TraversalDirection,
     /// Authored occurrence when this read addressed a source token.
     pub source: Option<SourceUnitSpan>,
+    /// The dependency or standard-library target the static pass stored at the same source
+    /// site under the same owner, when exactly one such target exists there.
+    pub static_target: Option<SymbolId>,
 }
 
 impl PackageEdge {
@@ -369,6 +373,7 @@ impl Mapping<'_> {
                 }
             }
         }
+        self.static_targets(&mut edges);
         let warnings = if missing.is_empty() {
             Vec::new()
         } else {
@@ -383,6 +388,63 @@ impl Mapping<'_> {
             heritage: local_heritage,
             warnings,
         })
+    }
+
+    /// Names each external engine target after the dependency or standard-library target
+    /// the static pass stored at the same source site, when exactly one stored target there
+    /// has the engine target's owner: the static admission rule named that site, and the
+    /// engine placed it in that owner's sources. A call site matches by its callee range.
+    /// Each declaration's stored edges are read once.
+    fn static_targets(&self, edges: &mut [PackageEdge]) {
+        let mut sites = BTreeMap::<CoreSymbolId, BTreeMap<(u64, u64), Vec<usize>>>::new();
+        for (index, edge) in edges.iter().enumerate() {
+            if let Some(source) = &edge.source {
+                sites
+                    .entry(edge.target.caller().clone())
+                    .or_default()
+                    .entry((source.range.start, source.range.end))
+                    .or_default()
+                    .push(index);
+            }
+        }
+        for (seed, ranges) in sites {
+            let mut named = BTreeMap::<usize, StaticName<'_>>::new();
+            for stored in self.reads.edges().outgoing(&seed) {
+                let Ok(identity) = SymbolIdentity::parse(stored.to().as_str()) else {
+                    continue;
+                };
+                let occurrence = stored.occurrence();
+                let callee = stored
+                    .static_callee()
+                    .map(|callee| (callee.start, callee.end));
+                let mut unit = None;
+                for key in std::iter::once((occurrence.range().start(), occurrence.range().end()))
+                    .chain(callee)
+                {
+                    for &index in ranges.get(&key).into_iter().flatten() {
+                        let edge = &edges[index];
+                        let unit = unit.get_or_insert_with(|| occurrence.unit().to_string());
+                        if edge
+                            .source
+                            .as_ref()
+                            .is_none_or(|source| source.unit.0 != *unit)
+                            || edge.target.package().owner().as_ref() != Some(identity.owner())
+                        {
+                            continue;
+                        }
+                        named
+                            .entry(index)
+                            .and_modify(|name| name.add(stored.to()))
+                            .or_insert(StaticName::One(stored.to()));
+                    }
+                }
+            }
+            for (index, name) in named {
+                if let StaticName::One(target) = name {
+                    edges[index].static_target = Some(SymbolId(target.as_str().to_owned()));
+                }
+            }
+        }
     }
 
     fn target(
@@ -418,6 +480,7 @@ impl Mapping<'_> {
                         kind,
                         direction,
                         source: source.cloned(),
+                        static_target: None,
                     });
                 }
             }
@@ -427,6 +490,22 @@ impl Mapping<'_> {
             }
         }
         Ok(false)
+    }
+}
+
+/// The stored static targets at one engine site under the engine target's owner.
+enum StaticName<'store> {
+    One(&'store CoreSymbolId),
+    /// More than one stored target: the site names none of them.
+    Ambiguous,
+}
+
+impl<'store> StaticName<'store> {
+    fn add(&mut self, target: &'store CoreSymbolId) {
+        match self {
+            Self::One(held) if *held == target => {}
+            _ => *self = Self::Ambiguous,
+        }
     }
 }
 
