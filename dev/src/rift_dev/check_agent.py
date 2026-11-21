@@ -52,6 +52,7 @@ build-backend='setuptools.build_meta'
 [tool.setuptools]
 py-modules=['service']
 """
+STANDARD_INT = "rift://symbol/stdlib/cpython/python/builtins/int"
 PYTHON_CONFIGURATION = """
 [languages.python.lsp]
 embedded = "ty"
@@ -85,7 +86,11 @@ async def check_embedded_references(client: Client, root: Path) -> None:
 
 
 async def check_mixed_references(client: Client) -> None:
-    """Require a complete mixed edge answer to carry the edges of every language."""
+    """Require a complete mixed edge answer to carry the edges of every language.
+
+    The Python annotations also name the standard-library `int` the static pass and the
+    engine both establish.
+    """
     expected = {
         (
             symbol_id(await symbol_hit(client, caller, language)),
@@ -95,6 +100,9 @@ async def check_mixed_references(client: Client) -> None:
             ("caller", "serve", "python"),
             ("beacon_two", "beacon_one", "rust"),
         )
+    } | {
+        (symbol_id(await symbol_hit(client, caller, "python")), STANDARD_INT)
+        for caller in ("caller", "serve")
     }
     answer = await client.call(
         "search", {"query": "SELECT ?caller ?target { ?caller :references ?target }"}

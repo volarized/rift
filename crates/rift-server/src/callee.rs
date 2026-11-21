@@ -541,6 +541,18 @@ impl CalleePackage {
             Self::StandardLibrary(library) => library.name(),
         }
     }
+
+    /// The identity owner of the callee's declarations; `None` for invalid coordinates.
+    #[must_use]
+    pub fn owner(&self) -> Option<rift_protocol::identity::SymbolOwner> {
+        match self {
+            Self::Installed(package) => package.owner().ok(),
+            Self::Runtime(runtime) => runtime.owner().ok(),
+            Self::StandardLibrary(library) => Some(rift_protocol::identity::SymbolOwner::Runtime {
+                runtime: library.runtime().to_owned(),
+            }),
+        }
+    }
 }
 
 /// One callee a walk found in a package file, waiting for the global API to name the
