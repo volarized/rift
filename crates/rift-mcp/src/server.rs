@@ -6064,7 +6064,7 @@ done
     /// A file past `[providers.syntax] max_file` extracts no declaration. Under the default
     /// `[search.text] large_files = "split"` its text stays in the index, and under `skip` it
     /// leaves the index; either way a bound left it out, so no answer names it (D37) and the
-    /// build's log record names the file, the bound, and the measured size.
+    /// omission the build logs names the file, the bound, and the measured size.
     #[tokio::test]
     async fn build_logs_a_file_past_max_file_under_each_strategy() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -6097,23 +6097,8 @@ done
         let configuration =
             "[providers.syntax]\nmax_file = \"1b\"\n\n[search.text]\nlarge_files = \"skip\"\n";
         super::hermetic_workspace(directory.path(), configuration)?;
-        let capture = crate::logs::logs_configuration(directory.path()).capture;
-        rift_tracing::validate_log_filter(&capture)?;
-        let (_runtime, drain) = rift_tracing::TracingRuntime::builder()
-            .capture(&capture)
-            .install()?;
-        let drain = drain.ok_or("a capture filter returns a drain")?;
-        let storage = crate::storage::WorkspaceStorage::open(directory.path()).await;
-        let store = storage.logs().ok_or("the log store must open")?;
-        let cancellation = tokio_util::sync::CancellationToken::new();
-        let drain_task = tokio::spawn(drain.run(Arc::clone(&store), 10_000, cancellation.clone()));
-        let server = RiftMcp::build_settled_with_storage(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            storage,
-            crate::identity::BuildCheckout::Unversioned,
-        )
-        .await?;
+        let server =
+            RiftMcp::build_settled(directory.path(), WorkspaceIndexLimits::default()).await?;
         wait_for_complete_publication(&server).await?;
         let result = search_symbols(&server, "wide").await?;
         assert!(result.results.is_empty());
@@ -6122,30 +6107,30 @@ done
             "{:?}",
             result.warnings
         );
+        // The build's record carries `path` and `reason` from the omission the publication
+        // keeps; the record itself is asserted where the build runs on the test's thread
+        // (`a_build_names_the_files_a_bound_left_out_up_to_a_bound_and_counts_the_rest`), so
+        // this test needs no process-wide log capture.
         let expected_limit =
             format!("source file exceeds its accepted byte limit of {max_file_bytes}");
         let expected_observed = format!("observed {}", max_file_bytes + 1);
-        stop_index_work(&server).await?;
-        cancellation.cancel();
-        drain_task.await?;
-        let records = store
-            .reader()
-            .connect()?
-            .recent(&rift_tracing::LogQuery::newest(500).for_component("index"))?;
-        let named: Vec<serde_json::Value> = records
-            .iter()
-            .filter(|stored| stored.record().message() == "file left out of the index")
-            .map(|stored| serde_json::from_str(stored.record().fields()))
-            .collect::<Result<_, _>>()?;
+        let (published, _) = crate::validation::read_published(&server.published)
+            .await
+            .snapshot();
+        let retained = published
+            .reads
+            .file_warning(&rift_core::ProjectPath::new("wide.rs")?)
+            .cloned();
+        drop(published);
         assert!(
-            named.iter().any(|fields| {
-                let reason = fields["reason"].as_str().unwrap_or_default();
-                fields["path"] == "wide.rs"
+            retained.as_ref().is_some_and(|warning| {
+                let reason = warning.reason();
+                warning.is_left_out_by_bound()
                     && reason.contains(expected_limit.as_str())
                     && reason.contains("field source.file_bytes")
                     && reason.contains(expected_observed.as_str())
             }),
-            "the log names the file, the bound, and the measured size: {named:?}"
+            "the omission names the file, the bound, and the measured size: {retained:?}"
         );
         Ok(())
     }
