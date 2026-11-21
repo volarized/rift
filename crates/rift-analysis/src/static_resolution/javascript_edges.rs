@@ -152,6 +152,29 @@ impl<'source> Index<'source> {
         let scopes = self.javascript.scopes.get(file.document.path.as_str())?;
         let symbol = scopes.definitions.resolve(range.start, range.end)?;
         let assignment = symbol.syntax_element_kind == Some("assignment_expression");
+        // The write of `this.name = value` belongs to the code that runs it, also when the
+        // assignment declares the member (D46); so do the reads of a value that is no
+        // function and no object literal.
+        let written = role == ReferenceRole::Write
+            && symbol.name_range.is_some_and(|name| range.encloses(name));
+        let read =
+            role == ReferenceRole::Read && symbol.kind == "property" && symbol.body_range.is_none();
+        if assignment
+            && (written || read)
+            && matches!(symbol.kind, "method" | "property")
+            && symbol.container.is_some()
+            && file
+                .text(symbol.range)
+                .is_some_and(|text| text.starts_with("this"))
+        {
+            let outside = ByteRange {
+                start: symbol.range.start.checked_sub(1)?,
+                end: symbol.range.end,
+            };
+            return self
+                .javascript_call_from(file, outside, work)
+                .or_else(|| self.javascript_module_from(file, outside, work));
+        }
         let callable = matches!(symbol.kind, "function" | "method");
         if assignment && callable {
             self.javascript_call_from(file, range, work)
