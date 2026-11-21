@@ -1,7 +1,6 @@
 //! Reparses a source whose document root is one error, leaving out the bodies that hold it.
 //!
-//! The grammar cannot read some valid member lists, such as generic call signatures
-//! separated by line ends only. The parser then never resynchronizes: the root becomes an
+//! A malformed member list can keep the parser from resynchronizing. The root becomes an
 //! error and every declaration in the file is inside it. The source before the first error
 //! is read correctly, so its tokens name the braced body that holds the error. Parsing
 //! again without that body's interior keeps every byte offset and loses only what the body

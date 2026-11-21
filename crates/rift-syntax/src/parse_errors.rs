@@ -376,10 +376,10 @@ mod tests {
                 &[][..],
             ),
             ("ts", "class Item { run = () => { return ) } }\n", &[][..]),
-            // A type alias takes its member list as its body.
+            // A type alias takes its member list as its body, even if a return tuple is unclosed.
             (
                 "ts",
-                "type Shape = {\n  <T>(value: T): [T, Box<T>]\n  <T = undefined>(): [T | undefined, Box<T>]\n}\nexport const after = 1\n",
+                "type Shape = {\n  <T>(value: T): [T, Box<T>]\n  <T = undefined>(): [T | undefined, Box<T>\n}\nexport const after = 1\n",
                 &[][..],
             ),
             // The function's parameters and a value that is no body still refuse.
@@ -524,9 +524,9 @@ mod tests {
 
     #[test]
     fn a_root_error_keeps_declarations_outside_the_body_that_holds_it() {
-        // Three generic call signatures without separators make the document root an
-        // error. Leaving out that interface body's interior parses the rest whole.
-        let signatures = "  <T extends Before, U extends number>(\n    data: T,\n    status?: U\n  ): Wrapped<T, U, 'body'>\n  <T extends Before, U extends number>(\n    data: T,\n    init?: Init<U>\n  ): Wrapped<T, U, 'body'>\n  <T extends null, U extends number>(\n    data: T,\n    status?: U\n  ): Wrapped<null, U, 'body'>\n";
+        // A generic return type missing its closing angle bracket makes the document
+        // root an error. Leaving out the interface body's interior parses the rest whole.
+        let signatures = "  <T extends Before, U extends number>(\n    data: T,\n    status?: U\n  ): Wrapped<T, U, 'body'\n  <T extends Before, U extends number>(\n    data: T,\n    init?: Init<U>\n  ): Wrapped<T, U, 'body'>\n  <T extends null, U extends number>(\n    data: T,\n    status?: U\n  ): Wrapped<null, U, 'body'>\n";
         let tail = "export class Item {\n  value = 1\n  read() { return this.value }\n}\nexport function later(item: Item) { return item.read() }\n";
         let recovered = format!(
             "export type Before = string\nexport interface Respond {{\n{signatures}}}\n{tail}"
