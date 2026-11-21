@@ -960,7 +960,44 @@ impl Kinds {
 
     /// The one type a union writes besides `null` and `undefined`, or the written type
     /// itself: `T | undefined` and `(T | null)` are written as `T`.
-    fn nullable_type<'tree>(&self, mut written: Node<'tree>, source: &str) -> Node<'tree> {
+    ///
+    /// `Partial<T>`, `Readonly<T>` and `Required<T>` keep every member name of `T`, so
+    /// they are written as `T` too. No other utility type is.
+    fn nullable_type<'tree>(&self, written: Node<'tree>, source: &str) -> Node<'tree> {
+        let mut written = self.nullable_member(written, source);
+        // Each argument lies inside the written type the syntax walk has admitted.
+        while let Some(inner) = self.projected_argument(written, source) {
+            written = self.nullable_member(inner, source);
+        }
+        written
+    }
+
+    /// The single type argument of `Partial<T>`, `Readonly<T>` or `Required<T>`.
+    fn projected_argument<'tree>(&self, written: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+        let shapes = self.type_shapes.as_ref()?;
+        if self.generic != Some(written.kind_id())
+            || !matches!(
+                written
+                    .child_by_field_id(self.name)
+                    .and_then(|name| text(name, source)),
+                Some("Partial" | "Readonly" | "Required")
+            )
+        {
+            return None;
+        }
+        let mut cursor = written.walk();
+        let arguments = written
+            .named_children(&mut cursor)
+            .find(|child| child.kind_id() == shapes.array[2])?;
+        let mut cursor = arguments.walk();
+        let mut named = arguments
+            .named_children(&mut cursor)
+            .filter(|child| !child.is_extra());
+        let first = named.next()?;
+        named.next().is_none().then_some(first)
+    }
+
+    fn nullable_member<'tree>(&self, mut written: Node<'tree>, source: &str) -> Node<'tree> {
         let Some(shapes) = &self.type_shapes else {
             return written;
         };

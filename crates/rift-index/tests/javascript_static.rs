@@ -2594,3 +2594,36 @@ export function make(): Box<number> { return Box(1) }
             && edge.to().as_str().ends_with("main.ts/Box")
     }));
 }
+
+#[test]
+fn test_typescript_utility_projections_read_as_their_type() {
+    // `Partial<T>`, `Readonly<T>` and `Required<T>` keep every member name of `T`, so
+    // members read through them are the members of `T`. No other utility type does.
+    let source = "export interface Options { name: string; run(): number }
+export function projected(p: Partial<Options>, r: Readonly<Options>, q: Required<Options> | undefined) {
+  return [p.name, r.run(), q?.name]
+}
+export function picked(k: Pick<Options, 'name'>, n: NonNullable<Options>) {
+  return [k.name, n.name]
+}
+";
+    let (_directory, index) = workspace_with_manifest(&[("main.ts", source)], module_manifest());
+    assert!(has_edge(
+        &index,
+        EdgeKind::Reads,
+        "main.ts/projected",
+        "main.ts/Options/name"
+    ));
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "main.ts/projected",
+        "main.ts/Options/run"
+    ));
+    assert!(!has_edge(
+        &index,
+        EdgeKind::Reads,
+        "main.ts/picked",
+        "main.ts/Options/name"
+    ));
+}
