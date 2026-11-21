@@ -183,6 +183,11 @@ impl Configuration<'_> {
         self.value(value, self.depth)
     }
 
+    /// The value of one `cfg` predicate under this configuration, unknown when unsure.
+    pub(crate) fn condition(&self, predicate: &[&str]) -> Option<bool> {
+        self.predicate(predicate, self.depth)
+    }
+
     fn predicate(&self, input: &[&str], depth: usize) -> Option<bool> {
         // Static collection uses the normal Cargo build, with test code disabled.
         // Complete captured flags decide only the build they were supplied for.

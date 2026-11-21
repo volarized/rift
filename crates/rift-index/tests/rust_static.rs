@@ -1552,3 +1552,83 @@ fn test_rust_tuple_struct_constructors_are_calls() {
         edge.kind() == EdgeKind::Calls && edge.from().as_str().ends_with("/fixture/value")
     }));
 }
+
+/// The conditional item chain macro as the cfg-if crate defines it, copied into a crate.
+const CONDITIONAL_CHAIN_MACRO: &str = "// Copied from the cfg-if crate.\n#[allow(unused_macro_rules)]\nmacro_rules! cfg_if {\n    ($(\n        if #[cfg($($meta:meta),*)] { $($it:item)* }\n    ) else * else {\n        $($it2:item)*\n    }) => {\n        cfg_if! {\n            @__items\n            () ;\n            $( ( ($($meta),*) ($($it)*) ), )*\n            ( () ($($it2)*) ),\n        }\n    };\n    (\n        if #[cfg($($i_met:meta),*)] { $($i_it:item)* }\n        $(\n            else if #[cfg($($e_met:meta),*)] { $($e_it:item)* }\n        )*\n    ) => {\n        cfg_if! {\n            @__items\n            () ;\n            ( ($($i_met),*) ($($i_it)*) ),\n            $( ( ($($e_met),*) ($($e_it)*) ), )*\n            ( () () ),\n        }\n    };\n    (@__items ($($not:meta,)*) ; ) => {};\n    (@__items ($($not:meta,)*) ; ( ($($m:meta),*) ($($it:item)*) ), $($rest:tt)*) => {\n        cfg_if! { @__apply cfg(all($($m,)* not(any($($not),*)))), $($it)* }\n        cfg_if! { @__items ($($not,)* $($m,)*) ; $($rest)* }\n    };\n    (@__apply $m:meta, $($it:item)*) => {\n        $(#[$m] $it)*\n    };\n}\n";
+
+#[test]
+fn test_rust_modules_declared_by_a_conditional_chain_keep_identities() {
+    // `mod` items in the branches of a local conditional item chain declare modules: every
+    // file keeps its identities, and only the branch the configuration selects contributes
+    // resolved facts. An unknown condition admits no branch after it; an invocation of a
+    // macro that is not defined locally declares nothing.
+    let manifest = "[package]\nname='fixture'\nversion='0.1.0'\n[features]\nalt=[]\n";
+    let library =
+        "#[macro_use]\nmod macros;\nmod group;\nmod chain;\nmod other;\npub fn run() -> u8 { 0 }\n";
+    let group = "cfg_if! {\n    if #[cfg(feature = \"alt\")] {\n        mod alt;\n        use alt as imp;\n    } else {\n        mod base;\n        use base as imp;\n    }\n}\n";
+    let chain = "cfg_if! {\n    if #[cfg(custom)] {\n        mod first;\n    } else if #[cfg(feature = \"alt\")] {\n        mod second;\n    } else {\n        mod third;\n    }\n}\n";
+    let other = "undefined! {\n    if #[cfg(feature = \"alt\")] {\n        mod absent;\n    }\n}\npub fn plain() -> u8 { 1 }\n";
+    let module =
+        "pub struct Item { pub value: u8 }\npub fn read() -> u8 { Item { value: 1 }.value }\n";
+    let files = [
+        ("src/lib.rs", library),
+        ("src/macros.rs", CONDITIONAL_CHAIN_MACRO),
+        ("src/group/mod.rs", group),
+        ("src/group/alt.rs", module),
+        ("src/group/base.rs", module),
+        ("src/chain/mod.rs", chain),
+        ("src/chain/first.rs", module),
+        ("src/chain/second.rs", module),
+        ("src/chain/third.rs", module),
+        ("src/other.rs", other),
+    ];
+    let (_directory, index) = fixture_index(manifest, &files);
+    let view = index.symbol_view().expect("symbols");
+    for record in view.normalized_graph().records() {
+        assert!(record.identity().is_some(), "missing identity: {record:?}");
+    }
+    let language = view
+        .files()
+        .next()
+        .expect("file")
+        .syntax()
+        .language()
+        .clone();
+    assert!(
+        index
+            .identity_coverage_complete(&language)
+            .expect("coverage")
+    );
+    for (file, _) in files
+        .iter()
+        .filter(|(path, _)| path.contains("/group/") || path.contains("/chain/"))
+    {
+        let declared = view
+            .files()
+            .find(|candidate| candidate.path().as_str() == *file)
+            .expect("module file");
+        let symbols = declared.syntax().symbols();
+        assert!(
+            (0..symbols.len())
+                .all(|position| view.symbol_identity_at(declared.path(), position).is_some()),
+            "{file} declarations lack identities"
+        );
+    }
+    assert!(has_edge(
+        &index,
+        EdgeKind::Calls,
+        "/fixture/group/base/read",
+        "/fixture/group/base/Item"
+    ));
+    for edge in index.edges().edges() {
+        let unit = edge.occurrence().unit().to_string();
+        assert!(
+            !unit.ends_with("group/alt.rs") && !unit.contains("src/chain/"),
+            "fact from a branch the configuration does not select: {edge:?}"
+        );
+        assert!(
+            !edge.to().as_str().contains("/group/alt/") && !edge.to().as_str().contains("/chain/"),
+            "endpoint in a branch the configuration does not select: {edge:?}"
+        );
+    }
+}

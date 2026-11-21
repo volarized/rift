@@ -150,7 +150,8 @@ impl<'source> Namespaces<'source> {
         work: &mut Work,
     ) -> Option<Self> {
         let mut namespaces = Self::default();
-        let alternatives = unadmitted_alternatives(files, work)?;
+        let mut alternatives = unadmitted_alternatives(files, work)?;
+        alternatives.extend(unadmitted_chain_modules(files, work)?);
         for file in files
             .values()
             .filter(|file| file.document.facts.language().name == "rust")
@@ -1677,6 +1678,91 @@ fn unadmitted_alternatives<'source>(
             unadmitted.extend(paths.iter().copied().filter(|path| path != admitted));
         } else {
             unadmitted.extend(paths);
+        }
+    }
+    Some(unadmitted)
+}
+
+/// Files of modules a conditional item chain declares whose branch the configuration does
+/// not admit or leaves unknown. They keep their declarations and contribute no resolved
+/// facts or endpoints, as an unadmitted `#[path]` alternative does. A module an ordinary
+/// `mod` item also declares keeps that item's admission.
+fn unadmitted_chain_modules<'source>(
+    files: &BTreeMap<&'source str, File<'source>>,
+    work: &mut Work,
+) -> Option<BTreeSet<&'source str>> {
+    let mut unadmitted = BTreeSet::new();
+    if files.values().all(|file| file.chain_modules.is_empty()) {
+        return Some(unadmitted);
+    }
+    let mut bases = BTreeMap::<&'source str, Vec<String>>::new();
+    let mut declared = BTreeSet::<Vec<String>>::new();
+    for (&path, file) in files
+        .iter()
+        .filter(|(_, file)| file.document.facts.language().name == "rust")
+    {
+        for symbol in file.document.facts.symbols() {
+            if !work.charge() {
+                return None;
+            }
+            let target = Target {
+                file: file.document,
+                symbol,
+            };
+            let Some(qualified) = target.admitted_path() else {
+                continue;
+            };
+            if !bases.contains_key(path)
+                && let Some(base) = declaring_module(target, &qualified)
+            {
+                bases.insert(path, base);
+            }
+            if symbol.kind == "module" && symbol.body_range.is_none() {
+                declared.insert(qualified);
+            }
+        }
+    }
+    for (&parent, file) in files {
+        for (&name, &admitted) in &file.chain_modules {
+            if admitted == Some(true) {
+                continue;
+            }
+            let directories = [
+                parent.strip_suffix("/mod.rs"),
+                parent.strip_suffix(".rs"),
+                Some(
+                    parent
+                        .rsplit_once('/')
+                        .map_or("", |(directory, _)| directory),
+                ),
+            ];
+            for directory in directories.into_iter().flatten() {
+                let stem = if directory.is_empty() {
+                    name.to_owned()
+                } else {
+                    format!("{directory}/{name}")
+                };
+                for candidate in [format!("{stem}.rs"), format!("{stem}/mod.rs")] {
+                    if !work.charge() {
+                        return None;
+                    }
+                    let Some((&path, base)) = bases.get_key_value(candidate.as_str()) else {
+                        continue;
+                    };
+                    let Some((last, module)) = base.split_last() else {
+                        continue;
+                    };
+                    if last != name
+                        || declared.contains(base)
+                        || bases
+                            .get(parent)
+                            .is_some_and(|parent| parent.as_slice() != module)
+                    {
+                        continue;
+                    }
+                    unadmitted.insert(path);
+                }
+            }
         }
     }
     Some(unadmitted)

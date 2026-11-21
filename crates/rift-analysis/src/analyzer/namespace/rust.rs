@@ -14,6 +14,43 @@ use crate::NamespaceInput;
 pub(super) mod configuration;
 mod macros;
 
+/// The modules the conditional item chains of one file declare, each with whether the
+/// configuration admits its branch: admitted when one declaring branch is, inactive when
+/// every one is not, unknown otherwise.
+pub(crate) fn chain_modules<'a>(
+    source: &'a str,
+    syntax: &SyntaxFacts,
+    configuration: Option<&configuration::Configuration<'_>>,
+) -> BTreeMap<&'a str, Option<bool>> {
+    let mut modules = BTreeMap::new();
+    let Some(limits) = syntax.syntax_limits() else {
+        return modules;
+    };
+    for (range, _, _) in syntax.macro_invocations().unwrap_or_default() {
+        let Some(tokens) = macros::chain::token_texts(source, *range, limits) else {
+            continue;
+        };
+        let Some(chain) = macros::chain::modules(&tokens, limits.syntax_depth_max()) else {
+            continue;
+        };
+        for (name, condition) in chain {
+            let admitted =
+                configuration.and_then(|configuration| configuration.condition(&condition));
+            modules
+                .entry(name)
+                .and_modify(|status| {
+                    *status = match (*status, admitted) {
+                        (Some(true), _) | (_, Some(true)) => Some(true),
+                        (Some(false), Some(false)) => Some(false),
+                        _ => None,
+                    }
+                })
+                .or_insert(admitted);
+        }
+    }
+    modules
+}
+
 /// Establishes the selected library root from captured metadata once per inventory.
 pub(super) fn prepare(
     input: &NamespaceInput<'_>,
@@ -32,7 +69,8 @@ pub(super) fn prepare(
     };
     let mut anchors = BTreeMap::new();
     let mut requested = Vec::new();
-    let mut declaring = BTreeMap::<String, Vec<(String, rift_syntax::ByteRange)>>::new();
+    let configurations = configuration::Configurations::new(input);
+    let mut declaring = BTreeMap::<String, Vec<(String, Declaring)>>::new();
     while let Some((path, namespace, directory, scope, library)) = pending.pop_front() {
         let Some(file) = inventory.get(path.as_str()) else {
             continue;
@@ -44,12 +82,13 @@ pub(super) fn prepare(
         }
         let mut admitted = std::collections::BTreeSet::new();
         let mut exports = Vec::new();
+        let mut conditioned = Vec::new();
         let children = macros::children(
             file,
             &directory,
             &inventory,
             &originals,
-            (scope, &mut admitted, &mut exports),
+            (scope, &mut admitted, &mut exports, &mut conditioned),
             input.syntax(),
             library,
         );
@@ -62,7 +101,14 @@ pub(super) fn prepare(
             declaring
                 .entry(child)
                 .or_default()
-                .push((path.clone(), item));
+                .push((path.clone(), Declaring::Item(item)));
+        }
+        let configuration = configurations.file(path.as_str());
+        for (child, condition) in conditioned {
+            declaring.entry(child).or_default().push((
+                path.clone(),
+                Declaring::Known(configuration.condition(&condition)),
+            ));
         }
         let declared = file_anchors(input, file.syntax, &namespace, &admitted);
         anchors.insert(
@@ -107,7 +153,7 @@ pub(super) fn prepare(
         outside_namespaces: target_paths(input, &inventory, &originals, &assigned),
         ..Default::default()
     };
-    let admitted = module_admission(input, &inventory, &declaring, assigned.len());
+    let admitted = module_admission(&configurations, &inventory, &declaring, assigned.len());
     local_exports(input, selected, &requested, &admitted, &mut prepared);
     prepared
 }
@@ -115,15 +161,14 @@ pub(super) fn prepare(
 /// Whether the configuration admits each module file: its declaring `mod` items and every
 /// ancestor's. A file several alternative items declare is admitted when one of them is;
 /// a file reached only through inactive items is not; anything else unknown stays unknown.
-/// Files no ordinary `mod` item declares (crate roots, macro-produced modules) keep the
-/// admission of their own items.
+/// Files no ordinary `mod` item or conditional item chain declares (crate roots, other
+/// macro-produced modules) keep the admission of their own items.
 fn module_admission(
-    input: &NamespaceInput<'_>,
+    configurations: &configuration::Configurations<'_>,
     inventory: &BTreeMap<&str, &super::SelectedFile<'_>>,
-    declaring: &BTreeMap<String, Vec<(String, rift_syntax::ByteRange)>>,
+    declaring: &BTreeMap<String, Vec<(String, Declaring)>>,
     depth_max: usize,
 ) -> BTreeMap<String, Option<bool>> {
-    let configurations = configuration::Configurations::new(input);
     let mut admitted = BTreeMap::<String, Option<bool>>::new();
     // Each pass settles at least one more module depth; module files bound the passes.
     for _ in 0..=depth_max {
@@ -140,11 +185,14 @@ fn module_admission(
                 } else {
                     Some(true)
                 };
-                let item_status = inventory.get(parent.as_str()).and_then(|file| {
-                    configurations
-                        .file(parent)
-                        .admitted(file.syntax, file.source, *item)
-                });
+                let item_status = match item {
+                    Declaring::Item(item) => inventory.get(parent.as_str()).and_then(|file| {
+                        configurations
+                            .file(parent)
+                            .admitted(file.syntax, file.source, *item)
+                    }),
+                    Declaring::Known(status) => *status,
+                };
                 status = match (status, and(parent_status, item_status)) {
                     (_, Some(true)) | (Some(true), _) => Some(true),
                     (Some(false), Some(false)) => Some(false),
@@ -161,6 +209,13 @@ fn module_admission(
         }
     }
     admitted
+}
+
+/// What declares a module file in its parent: an ordinary `mod` item, whose attributes the
+/// configuration evaluates, or a conditional item chain branch with its evaluated condition.
+enum Declaring {
+    Item(rift_syntax::ByteRange),
+    Known(Option<bool>),
 }
 
 fn and(left: Option<bool>, right: Option<bool>) -> Option<bool> {
