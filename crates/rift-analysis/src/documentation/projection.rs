@@ -231,26 +231,9 @@ impl<'collection> DocumentationLayer<'collection> {
         identity: DocumentIdentity,
         block_identity: &DocumentationDigest,
     ) -> Result<(), RiftError> {
-        let address = self.block_address(block_identity).ok_or_else(|| {
-            errors::analysis::documentation_target_missing()
-                .field("block.identity")
-                .error()
-        })?;
-        if self.block_at(address).symbol.is_none() {
-            return errors::analysis::documentation_format_invalid()
-                .field("block.symbol")
-                .fail();
-        }
-        let start = self
-            .mappings
-            .partition_point(|(existing, _)| existing < &identity);
-        let end = self
-            .mappings
-            .partition_point(|(existing, _)| existing <= &identity);
-        if self.mappings[start..end]
-            .iter()
-            .any(|(_, mapping)| mapping.block == address && mapping.owner)
-        {
+        let address = self.owned_block_address(block_identity)?;
+        let (owned, end) = self.owner_mapping(&identity, address);
+        if owned {
             return Ok(());
         }
         if self.mappings.len() >= self.mapping_bound {
@@ -270,6 +253,102 @@ impl<'collection> DocumentationLayer<'collection> {
             ),
         );
         Ok(())
+    }
+
+    /// Associates each package declaration identity with its attached-comment block, in
+    /// the order given, as [`Self::associate_document`] does for one pair.
+    ///
+    /// One association moves every mapping that sorts after it, so associating a whole
+    /// declaration inventory pair by pair moves the mappings once per pair. This reads the
+    /// pairs first and places them in one pass. The mappings it leaves and the first
+    /// refusal it answers are the ones the pair-by-pair calls leave and answer.
+    ///
+    /// # Errors
+    ///
+    /// Refuses unknown blocks, blocks without an owning symbol, or mappings over the bound.
+    pub fn associate_documents<'pair>(
+        &mut self,
+        pairs: impl IntoIterator<Item = (DocumentIdentity, &'pair DocumentationDigest)>,
+    ) -> Result<(), RiftError> {
+        let held = self.mappings.len();
+        let mut placed = BTreeSet::new();
+        let mut pending = Vec::new();
+        let mut refusal = None;
+        for (identity, block_identity) in pairs {
+            let address = match self.owned_block_address(block_identity) {
+                Ok(address) => address,
+                Err(error) => {
+                    refusal = Some(error);
+                    break;
+                }
+            };
+            // The mappings held before this call stay in place until the pass ends, so
+            // the search of one pair reads them as the pair-by-pair calls would.
+            if self.owner_mapping(&identity, address).0 {
+                continue;
+            }
+            let pair = (identity, address.collection, address.block);
+            if placed.contains(&pair) {
+                continue;
+            }
+            if held + pending.len() >= self.mapping_bound {
+                refusal = Some(
+                    errors::analysis::documentation_limit_exceeded()
+                        .field("projection.mappings")
+                        .error(),
+                );
+                break;
+            }
+            pending.push((
+                pair.0.clone(),
+                Mapping {
+                    block: address,
+                    document_range: None,
+                    owner: true,
+                },
+            ));
+            placed.insert(pair);
+        }
+        if !pending.is_empty() {
+            self.mappings.extend(pending);
+            // Stable: a pair follows every held mapping of its identity and every pair
+            // of that identity given before it, where an insertion would have placed it.
+            self.mappings.sort_by(|left, right| left.0.cmp(&right.0));
+        }
+        refusal.map_or(Ok(()), Err)
+    }
+
+    /// The address of an attached-comment block a declaration may own.
+    fn owned_block_address(
+        &self,
+        block_identity: &DocumentationDigest,
+    ) -> Result<BlockAddress, RiftError> {
+        let address = self.block_address(block_identity).ok_or_else(|| {
+            errors::analysis::documentation_target_missing()
+                .field("block.identity")
+                .error()
+        })?;
+        if self.block_at(address).symbol.is_none() {
+            return errors::analysis::documentation_format_invalid()
+                .field("block.symbol")
+                .fail();
+        }
+        Ok(address)
+    }
+
+    /// Whether `identity` already owns the block at `address`, and the position after
+    /// the mappings of `identity`.
+    fn owner_mapping(&self, identity: &DocumentIdentity, address: BlockAddress) -> (bool, usize) {
+        let start = self
+            .mappings
+            .partition_point(|(existing, _)| existing < identity);
+        let end = self
+            .mappings
+            .partition_point(|(existing, _)| existing <= identity);
+        let owned = self.mappings[start..end]
+            .iter()
+            .any(|(_, mapping)| mapping.block == address && mapping.owner);
+        (owned, end)
     }
 
     /// Blocks this layer holds across its collections.
@@ -974,7 +1053,7 @@ mod tests {
     use rift_error::RiftError;
     use rift_protocol::documentation::{
         DocumentationBlockKind, DocumentationContentIdentity, DocumentationCoverage,
-        DocumentationIndex, DocumentationSelectionReason, DocumentationSource,
+        DocumentationDigest, DocumentationIndex, DocumentationSelectionReason, DocumentationSource,
         DocumentationSourceFormat, DocumentationSourceIdentity,
     };
     use rift_protocol::read::{
@@ -1774,6 +1853,118 @@ mod tests {
             crate::documentation::failure::context_value(&owner, "field").as_deref(),
             Some("block.symbol")
         );
+    }
+
+    /// Three attached-comment blocks with owning symbols and one Markdown block with none:
+    /// the collection, the owned block identities, and the unowned one.
+    fn owned_blocks() -> (
+        DocumentationCollection,
+        Vec<DocumentationDigest>,
+        DocumentationDigest,
+    ) {
+        let source = source(
+            "src/lib.rs",
+            "guide other third",
+            DocumentationSourceFormat::AttachedComment,
+        );
+        let owned = |name: &str, start: u64| {
+            block(
+                &source,
+                name,
+                TextRange {
+                    start,
+                    end: start + 5,
+                },
+                Vec::new(),
+                &[],
+                Some(SymbolId(rift_core::symbol_identity(
+                    "rust",
+                    "src/lib.rs",
+                    name,
+                ))),
+            )
+        };
+        let mut blocks = vec![owned("guide", 0), owned("other", 6), owned("third", 12)];
+        let digests = blocks.iter().map(|block| block.identity.clone()).collect();
+        let guide = source_named("guide.md");
+        let plain = block(
+            &guide,
+            "plain",
+            TextRange { start: 0, end: 5 },
+            vec![("guide#chunk/0", TextRange { start: 0, end: 5 })],
+            &[],
+            None,
+        );
+        let unowned = plain.identity.clone();
+        blocks.push(plain);
+        (collection(vec![source, guide], blocks), digests, unowned)
+    }
+
+    #[test]
+    fn pairs_associated_in_one_pass_equal_pairs_associated_one_at_a_time() {
+        let (collection, digests, unowned) = owned_blocks();
+        let unknown = content_digest(b"absent");
+        let layer = |mappings| {
+            bounded(
+                &[&collection],
+                LayerBounds {
+                    sources: 2,
+                    blocks: 4,
+                    mappings,
+                },
+            )
+        };
+        let package = |name: &str| DocumentIdentity::new(name).expect("package identity");
+        let guide = rift_core::symbol_identity("rust", "src/lib.rs", "guide");
+        // Repeated pairs, identities out of order, one identity over several blocks, and
+        // an identity the layer already maps to its own block.
+        let accepted = vec![
+            (package("m"), &digests[1]),
+            (package("b"), &digests[0]),
+            (package("m"), &digests[0]),
+            (package("m"), &digests[1]),
+            (package("z"), &digests[2]),
+            (package("b"), &digests[2]),
+            (package("a"), &digests[1]),
+            (package("b"), &digests[0]),
+            (package(&guide), &digests[0]),
+            (package("m"), &digests[2]),
+        ];
+        let mut refused_block = accepted.clone();
+        refused_block.insert(4, (package("c"), &unowned));
+        let mut missing_block = accepted.clone();
+        missing_block.insert(7, (package("c"), &unknown));
+        let held = layer(16).expect("layer").mapping_count();
+        let mut refusals = 0;
+        for pairs in [&accepted, &refused_block, &missing_block] {
+            for mappings in held..=held + 9 {
+                let mut one_at_a_time = layer(mappings).expect("layer");
+                let expected = pairs.iter().try_for_each(|(identity, block)| {
+                    one_at_a_time.associate_document(identity.clone(), block)
+                });
+                let mut one_pass = layer(mappings).expect("layer");
+                let actual = one_pass.associate_documents(pairs.iter().cloned());
+                let slug = |result: &Result<(), RiftError>| {
+                    result
+                        .as_ref()
+                        .map_err(|error| error.slug().as_str().to_owned())
+                        .copied()
+                };
+                assert_eq!(slug(&actual), slug(&expected), "mappings={mappings}");
+                assert_eq!(
+                    format!("{:?}", one_pass.mappings),
+                    format!("{:?}", one_at_a_time.mappings),
+                    "mappings={mappings}"
+                );
+                refusals += usize::from(expected.is_err());
+            }
+        }
+        assert!(refusals > 0, "a bound or a block refuses some pass");
+        let mut complete = layer(16).expect("layer");
+        complete
+            .associate_documents(accepted.iter().cloned())
+            .expect("every pair fits");
+        assert!(complete.mapping_count() >= held + 7);
     }
 
     #[test]

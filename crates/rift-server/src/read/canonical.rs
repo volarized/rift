@@ -567,42 +567,113 @@ impl State {
     }
 
     fn material_bytes_with_shared_indexes(&self, shared: bool) -> usize {
-        use get_size2::{GetSize, GetSizeTracker};
-        let mut total = rift_protocol::btree_material_bytes::<String, HeldView>(self.views.len())
-            .saturating_add(rift_protocol::btree_material_bytes::<String, ()>(
-                self.expired.len(),
-            ));
         let mut charged = get_size2::StandardTracker::default();
+        let mut total = self.store_bytes(self.views.len());
         for (key, held) in &self.views {
-            total = total
-                .saturating_add(key.capacity())
-                .saturating_add(std::mem::size_of::<HeldView>())
-                .saturating_add(held.view.id.get_heap_size())
-                .saturating_add(held.view.expires_at.capacity());
-            if let Some(query) = &held.query {
-                total = total
-                    .saturating_add(query.bytes.len())
-                    .saturating_add(2 * std::mem::size_of::<usize>());
-            }
-            if charged.track(Arc::as_ptr(&held.material.index)) {
-                let bytes = if shared {
-                    let (bytes, next) = held.material.index.as_ref().get_size_with_tracker(charged);
-                    charged = next;
-                    bytes
-                } else {
-                    held.material.index.retained_material_bytes()
-                };
-                total = total
-                    .saturating_add(bytes)
-                    .saturating_add(2 * std::mem::size_of::<usize>());
-            }
-            if charged.track(Arc::as_ptr(&held.material)) {
-                total = total.saturating_add(held.retained_bytes);
-            }
+            let (bytes, next) = Self::view_bytes(key.capacity(), held, shared, charged);
+            charged = next;
+            total = total.saturating_add(bytes);
         }
+        total
+    }
+
+    /// Material the store itself charges while it holds `views` views: the two maps and
+    /// the released keys.
+    fn store_bytes(&self, views: usize) -> usize {
+        let maps = rift_protocol::btree_material_bytes::<String, HeldView>(views).saturating_add(
+            rift_protocol::btree_material_bytes::<String, ()>(self.expired.len()),
+        );
         self.expired
             .iter()
-            .fold(total, |bytes, key| bytes.saturating_add(key.capacity()))
+            .fold(maps, |bytes, key| bytes.saturating_add(key.capacity()))
+    }
+
+    /// Material one view adds to the views `charged` has seen. With `shared`, an index
+    /// is measured against every allocation already charged; without, by its own cached
+    /// charge.
+    fn view_bytes(
+        key_bytes: usize,
+        held: &HeldView,
+        shared: bool,
+        mut charged: get_size2::StandardTracker,
+    ) -> (usize, get_size2::StandardTracker) {
+        use get_size2::{GetSize, GetSizeTracker};
+        let mut total = key_bytes
+            .saturating_add(std::mem::size_of::<HeldView>())
+            .saturating_add(held.view.id.get_heap_size())
+            .saturating_add(held.view.expires_at.capacity());
+        if let Some(query) = &held.query {
+            total = total
+                .saturating_add(query.bytes.len())
+                .saturating_add(2 * std::mem::size_of::<usize>());
+        }
+        if charged.track(Arc::as_ptr(&held.material.index)) {
+            let bytes = if shared {
+                let (bytes, next) = held.material.index.as_ref().get_size_with_tracker(charged);
+                charged = next;
+                bytes
+            } else {
+                held.material.index.retained_material_bytes()
+            };
+            total = total
+                .saturating_add(bytes)
+                .saturating_add(2 * std::mem::size_of::<usize>());
+        }
+        if charged.track(Arc::as_ptr(&held.material)) {
+            total = total.saturating_add(held.retained_bytes);
+        }
+        (total, charged)
+    }
+
+    /// Releases the least recently used views other than `kept` that the shared measure
+    /// shows cannot stay under `bytes_max`, answering how many it released and whether
+    /// the measure it took settles that the views left fit.
+    ///
+    /// It acts only when the cached charges pass the bound. The shared material is then
+    /// measured once, the most recently used view first: each view adds what the views
+    /// before it do not already hold, so the views that fit are a prefix of that order
+    /// and the rest are the least recently used. Measuring stops at the first view that
+    /// passes the bound. Measuring every remaining view again after each release answered
+    /// the same and walked each retained index once per release.
+    ///
+    /// The views left after the releases are the ones measured to fit, so their material
+    /// is known; the releases changed only the released keys the store charges. The
+    /// measure settles when that sum fits, with no second walk.
+    fn release_measured(&mut self, kept: &str, bytes_max: usize) -> (usize, bool) {
+        let cached = self.material_bytes();
+        if cached == usize::MAX || cached <= bytes_max {
+            return (0, false);
+        }
+        let mut order = self.views.iter().collect::<Vec<_>>();
+        order.sort_by_key(|(key, held)| (key.as_str() != kept, std::cmp::Reverse(held.used)));
+        let mut charged = get_size2::StandardTracker::default();
+        let mut views_bytes = 0_usize;
+        let mut fits = 0_usize;
+        let mut fit_bytes = 0_usize;
+        for (position, (key, held)) in order.iter().enumerate() {
+            let (bytes, next) = Self::view_bytes(key.capacity(), held, true, charged);
+            charged = next;
+            views_bytes = views_bytes.saturating_add(bytes);
+            let total = self.store_bytes(position + 1).saturating_add(views_bytes);
+            if position > 0 && (total == usize::MAX || total > bytes_max) {
+                break;
+            }
+            fits = position + 1;
+            fit_bytes = views_bytes;
+        }
+        let released = self.views.len() - fits.max(1);
+        for _ in 0..released {
+            self.release_least_recent(Some(kept));
+        }
+        // With nothing released the measure is the one `exceeds` takes. A release grows
+        // the released keys by a few bytes: the views left are charged what the walk
+        // measured for them, and the store is charged again with the keys it now holds.
+        // Only when those few bytes pass the bound does the caller measure once more.
+        let left = self.store_bytes(self.views.len()).saturating_add(fit_bytes);
+        (
+            released,
+            released == 0 || (left != usize::MAX && left <= bytes_max),
+        )
     }
 }
 
@@ -781,6 +852,11 @@ impl LocalSymbolViews {
             released += 1;
         }
         state.views.insert(id.to_owned(), held);
+        let (measured, settled) = state.release_measured(id, limits.bytes_max);
+        released += measured;
+        if settled {
+            return released;
+        }
         while state.exceeds(limits.bytes_max) && state.release_least_recent(Some(id)) {
             released += 1;
         }

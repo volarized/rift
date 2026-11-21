@@ -524,6 +524,166 @@ fn distinct_generation_admission_counts_shared_allocations_and_keeps_original_so
     println!("cached_material_bytes={cached} shared_material_bytes={shared}");
 }
 
+/// Releases by measuring every remaining view again after each release: the rule the one
+/// measure in use order must equal.
+fn released_one_at_a_time(state: &mut State, kept: &str, bytes_max: usize) -> usize {
+    let mut released = 0;
+    while state.exceeds(bytes_max) && state.release_least_recent(Some(kept)) {
+        released += 1;
+    }
+    released
+}
+
+#[test]
+fn one_shared_measure_releases_what_measuring_after_each_release_does() {
+    let (_directory, indexes, _) = distinct_text_generations();
+    let now = SystemTime::now();
+    let held = |service_key| {
+        let store = BoundedViews::new(usize::MAX, service_key);
+        let views = indexes
+            .iter()
+            .map(|index| {
+                store
+                    .capture_at(text_generation_input(index), now)
+                    .expect("capture")
+                    .expect("view")
+            })
+            .collect::<Vec<_>>();
+        (store, views)
+    };
+    let (measured, views) = held([51; 32]);
+    let kept = views.last().expect("newest view").id.as_str().to_owned();
+    // The shared charge of the newest view alone, of the two newest, and of all three.
+    let mut bounds = Vec::new();
+    {
+        let mut state = measured.state.lock().expect("state");
+        bounds.push(state.material_bytes());
+        loop {
+            bounds.push(state.material_bytes_with_shared_indexes(true));
+            if !state.release_least_recent(Some(&kept)) {
+                break;
+            }
+        }
+    }
+    assert_eq!(bounds.len(), 4);
+    let mut released_some = false;
+    let mut kept_shared = false;
+    let mut settled_after_release = false;
+    for bound in bounds {
+        // Bounds on both sides of each charge, closer than one released key's bytes.
+        for bytes_max in (bound.saturating_sub(96)..=bound.saturating_add(96)).step_by(8) {
+            let (expected, expected_views) = held([52; 32]);
+            let (actual, actual_views) = held([52; 32]);
+            assert_eq!(expected_views, actual_views);
+            let kept = actual_views.last().expect("newest view").id.as_str();
+            let mut expected = expected.state.lock().expect("state");
+            let mut actual = actual.state.lock().expect("state");
+            let expected_released = released_one_at_a_time(&mut expected, kept, bytes_max);
+            let (mut released, settled) = actual.release_measured(kept, bytes_max);
+            if settled {
+                assert!(!actual.exceeds(bytes_max), "bytes_max={bytes_max}");
+                settled_after_release |= released > 0;
+            } else {
+                released += released_one_at_a_time(&mut actual, kept, bytes_max);
+            }
+            assert_eq!(released, expected_released, "bytes_max={bytes_max}");
+            assert_eq!(
+                actual.views.keys().collect::<Vec<_>>(),
+                expected.views.keys().collect::<Vec<_>>(),
+                "bytes_max={bytes_max}"
+            );
+            assert_eq!(actual.expired, expected.expired, "bytes_max={bytes_max}");
+            released_some |= released > 0;
+            kept_shared |= released == 0 && actual.material_bytes() > bytes_max;
+        }
+    }
+    assert!(
+        released_some,
+        "a bound below the shared charge releases views"
+    );
+    assert!(
+        kept_shared,
+        "a bound the shared charge fits keeps every view"
+    );
+    assert!(
+        settled_after_release,
+        "a release that leaves fitting views settles in the one measure"
+    );
+}
+
+#[test]
+fn admissions_release_only_what_the_byte_bound_requires_and_keep_held_sources() {
+    let (directory, indexes, original) = distinct_text_generations();
+    let now = SystemTime::now();
+    let reads = ReadService::from_prepared_index(
+        rift_index::WorkspaceIndex::build_with_languages(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+            &rift_core::LanguageFileSelections::default(),
+        )
+        .expect("workspace index"),
+        None,
+        Arc::new(rift_dependency::DependencyContext::default()),
+        HistoryConfiguration::default(),
+        rift_protocol::dependencies::DependenciesConfiguration::default(),
+    );
+    let path = rift_core::ProjectPath::new("a.txt").expect("text path");
+    // The cached charge of the three generations, then the shared charge of all three,
+    // of the two newest, and of the newest alone.
+    let mut bounds = Vec::new();
+    {
+        let measured = BoundedViews::new(usize::MAX, [53; 32]);
+        let mut kept = String::new();
+        for index in &indexes {
+            let view = measured
+                .capture_at(text_generation_input(index), now)
+                .expect("capture")
+                .expect("view");
+            kept = view.id.as_str().to_owned();
+        }
+        let mut state = measured.state.lock().expect("state");
+        bounds.push(state.material_bytes());
+        loop {
+            bounds.push(state.material_bytes_with_shared_indexes(true));
+            if !state.release_least_recent(Some(&kept)) {
+                break;
+            }
+        }
+    }
+    assert_eq!(bounds.len(), 4);
+    let mut released_some = false;
+    let mut kept_shared = false;
+    for bound in bounds {
+        for budget in (bound.saturating_sub(96)..=bound.saturating_add(96)).step_by(8) {
+            let store = BoundedViews::new(budget, [54; 32]);
+            let mut held_sources = Vec::new();
+            for index in &indexes {
+                let input = text_generation_input(index);
+                let material = Arc::clone(&input.material);
+                let before = HeldBefore::of(&store);
+                let Some(admitted) = store.capture_at(input, now).expect("capture") else {
+                    break;
+                };
+                released_some |= before.assert_releases_required(&store, &admitted, budget) > 0;
+                held_sources.push((path.clone(), original.clone(), material, admitted));
+                assert_retained_held_sources(&store, &reads, &held_sources);
+            }
+            let state = store.state.lock().expect("state");
+            kept_shared |= state.views.len() == indexes.len() && state.material_bytes() > budget;
+        }
+    }
+    assert!(
+        released_some,
+        "a bound below the shared charge releases views"
+    );
+    assert!(
+        kept_shared,
+        "a bound the shared charge fits keeps every view"
+    );
+}
+
 #[test]
 #[ignore = "retained material measurement"]
 fn captured_preparation_views_measure_shared_accounting_cost() {
@@ -551,7 +711,7 @@ fn captured_preparation_views_measure_shared_accounting_cost() {
     let budget = usize::try_from(8_u64 << 30).expect("existing byte bound");
     let store = BoundedViews::new(budget, [23; 32]);
     let now = SystemTime::now();
-    let mut held_source = None;
+    let mut held_sources = Vec::new();
     let mut prepared = 0;
     let mut target = 0;
     for _ in 0..64 {
@@ -571,47 +731,36 @@ fn captured_preparation_views_measure_shared_accounting_cost() {
         let input = reads
             .local_search_view_input(prepared == total)
             .expect("captured preparation material");
-        if held_source.is_none()
-            && let Some(file) = reads
-                .index
-                .files()
-                .find(|file| !file.source().is_empty() && file.source().len() <= 65_536)
-        {
-            let original = input
-                .material
-                .index
-                .source(file.path())
-                .expect("original captured source")
-                .to_owned();
-            held_source = Some((
-                file.path().clone(),
-                original,
-                Arc::clone(&input.material),
-                None,
-            ));
-        }
+        let held_source = reads
+            .index
+            .files()
+            .find(|file| !file.source().is_empty() && file.source().len() <= 65_536)
+            .map(|file| {
+                let original = input
+                    .material
+                    .index
+                    .source(file.path())
+                    .expect("original captured source")
+                    .to_owned();
+                (file.path().clone(), original, Arc::clone(&input.material))
+            });
+        let before = HeldBefore::of(&store);
         let started = std::time::Instant::now();
         let admitted = store
             .capture_at(input, now)
             .expect("material admission")
             .expect("original byte bound admits shared material");
         let capture_elapsed = started.elapsed();
-        if let Some((path, original, material, view)) = &mut held_source
-            && view.is_none()
-        {
-            assert_measured_held_source(&store, &reads, path, original, material, &admitted);
-            *view = Some(admitted);
+        let released = before.assert_releases_required(&store, &admitted, budget);
+        if released > 0 {
+            println!("released_views={released} prepared={prepared}");
         }
+        if let Some((path, original, material)) = held_source {
+            held_sources.push((path, original, material, admitted));
+        }
+        assert_retained_held_sources(&store, &reads, &held_sources);
         if measured_shared_accounting(&store, budget, prepared, total, capture_elapsed) {
-            let (path, original, material, view) = held_source.expect("observed held source");
-            assert_measured_held_source(
-                &store,
-                &reads,
-                &path,
-                &original,
-                &material,
-                &view.expect("advertised view"),
-            );
+            assert!(!held_sources.is_empty(), "observed held source");
             return;
         }
         assert!(
@@ -649,6 +798,89 @@ fn measured_shared_accounting(
     );
     true
 }
+
+/// The views and released keys a store held before one admission.
+struct HeldBefore(State);
+
+impl HeldBefore {
+    fn of(store: &BoundedViews) -> Self {
+        let state = store.state.lock().expect("retained material state");
+        let mut before = State::default();
+        before.views.clone_from(&state.views);
+        before.expired.clone_from(&state.expired);
+        Self(before)
+    }
+
+    /// Checks the views the admission of `admitted` released, answering their count.
+    ///
+    /// The admitted view stays. Every released view was used before every view left.
+    /// The byte bound required the last release: the views left, the released view used
+    /// last, and the keys of the views released before it pass `budget` under the
+    /// measure admission takes.
+    fn assert_releases_required(
+        self,
+        store: &BoundedViews,
+        admitted: &CapturedView,
+        budget: usize,
+    ) -> usize {
+        let state = store.state.lock().expect("retained material state");
+        assert!(state.views.contains_key(admitted.id.as_str()));
+        let (kept, released): (Vec<_>, Vec<_>) = self
+            .0
+            .views
+            .iter()
+            .partition(|(key, _)| state.views.contains_key(key.as_str()));
+        let Some((last_key, last)) = released.iter().max_by_key(|(_, held)| held.used) else {
+            return 0;
+        };
+        assert!(
+            kept.iter().all(|(_, held)| held.used > last.used),
+            "a released view was used after a view left"
+        );
+        let mut wider = State::default();
+        wider.views.clone_from(&state.views);
+        wider.views.insert((*last_key).clone(), (*last).clone());
+        wider.expired.clone_from(&self.0.expired);
+        wider.expired.extend(
+            released
+                .iter()
+                .filter(|(key, _)| key != last_key)
+                .map(|(key, _)| (*key).clone()),
+        );
+        assert!(
+            wider.exceeds(budget),
+            "a released view fits the byte bound with the views left"
+        );
+        released.len()
+    }
+}
+
+/// Every admitted view the store still holds keeps its original material.
+fn assert_retained_held_sources(
+    store: &BoundedViews,
+    reads: &ReadService,
+    admitted: &[HeldSourceView],
+) {
+    for (path, original, material, view) in admitted {
+        let retained = store
+            .state
+            .lock()
+            .expect("retained material state")
+            .views
+            .contains_key(view.id.as_str());
+        if retained {
+            assert_measured_held_source(store, reads, path, original, material, view);
+        }
+    }
+}
+
+/// One admitted view with a source it captured.
+type HeldSourceView = (
+    rift_core::ProjectPath,
+    String,
+    Arc<LocalSymbolMaterial>,
+    CapturedView,
+);
 
 fn assert_measured_held_source(
     store: &BoundedViews,

@@ -961,15 +961,13 @@ impl File<'_> {
     }
 
     pub(super) fn conditional(&self, range: ByteRange, work: &mut Work) -> bool {
-        self.conditions.iter().any(|(item, admitted)| {
-            !work.charge() || item.contains(range.start) && *admitted != Some(true)
-        })
+        self.conditions
+            .any(range.start, work, |admitted| admitted != Some(true))
     }
 
     pub(super) fn inactive(&self, range: ByteRange, work: &mut Work) -> bool {
-        self.conditions.iter().any(|(item, admitted)| {
-            !work.charge() || item.contains(range.start) && *admitted == Some(false)
-        })
+        self.conditions
+            .any(range.start, work, |admitted| admitted == Some(false))
     }
 
     fn in_impl_or_trait(&self, symbol: &SyntaxSymbol, work: &mut Work) -> bool {

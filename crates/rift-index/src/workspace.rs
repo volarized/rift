@@ -1316,6 +1316,9 @@ pub(crate) struct IndexContents {
     raw_syntax: BTreeMap<ProjectPath, Arc<rift_syntax::SyntaxFacts>>,
     left_out: BTreeMap<ProjectPath, LeftOutFileState>,
     warnings: Vec<WorkspaceIndexWarning>,
+    /// Whether these contents are a part of the sources a preparation is still reading.
+    /// Their publication leaves the static pass to the one that holds every source.
+    partial: bool,
 }
 
 impl IndexContents {
@@ -1711,21 +1714,16 @@ impl WorkspaceIndexPreparation {
         Ok(self.total().expect("discovery has completed"))
     }
 
-    /// Next bounded publication count: the first completed batch, then doubled counts,
-    /// ending exactly at the selected file total.
+    /// Next bounded publication count: the first completed batch, then the selected file
+    /// total.
+    ///
+    /// Every publication builds semantic facts, documentation, and the declaration
+    /// inventory over all of its prepared files. A publication of a growing part of the
+    /// files builds them again for the files the one before it held, so preparation
+    /// publishes the first batch for early reads and then the complete index.
     #[must_use]
     pub fn next_checkpoint(&self) -> Option<usize> {
-        let total = self.total()?;
-        let prepared = self.prepared();
-        if prepared == total {
-            return None;
-        }
-        let next = if prepared == 0 {
-            SOURCE_BATCH_FILES
-        } else {
-            prepared.saturating_mul(2)
-        };
-        Some(next.min(total))
+        checkpoint_after(self.prepared(), self.total()?)
     }
 
     /// Number of selected visible files, once discovery has completed.
@@ -2025,7 +2023,7 @@ impl WorkspaceIndexPreparation {
                     self.advance_lockfiles(&paths, target, cancelled)?;
                 }
             }
-            self.snapshot(previous)
+            self.snapshot(previous, target == total)
         })();
         self.discovered = Some(paths);
         advanced
@@ -2094,8 +2092,15 @@ impl WorkspaceIndexPreparation {
             .min(cursor.saturating_add(target.saturating_sub(self.prepared())))
     }
 
-    fn snapshot(&self, previous: Option<&WorkspaceIndex>) -> Result<WorkspaceIndex, RiftError> {
+    /// Publishes what is prepared. Before `complete`, the publication holds a part of
+    /// the sources and leaves the static pass to the publication that holds them all.
+    fn snapshot(
+        &self,
+        previous: Option<&WorkspaceIndex>,
+        complete: bool,
+    ) -> Result<WorkspaceIndex, RiftError> {
         let mut contents = self.contents.clone();
+        contents.partial = !complete;
         contents.capture_build_paths(&self.root, self.limits, &|| false)?;
         WorkspaceIndex::from_parts_with_owner(
             (self.root.clone(), self.owner.clone()),
@@ -2137,6 +2142,7 @@ impl IndexContents {
             raw_syntax: index.raw_syntax.clone(),
             left_out: index.left_out.clone(),
             warnings: index.warnings.clone(),
+            partial: false,
         }
     }
 
@@ -2164,6 +2170,7 @@ impl IndexContents {
                 })
                 .cloned()
                 .collect(),
+            partial: false,
         };
         for path in changes.paths() {
             contents.files.remove(path);
@@ -3334,6 +3341,37 @@ impl WorkspaceIndex {
         &self.documentation
     }
 
+    /// Builds what the first read of this index builds: the declaration inventory, the
+    /// symbol view, and the documentation layer.
+    ///
+    /// Each is built once and kept, and a refusal one of them meets is kept for the read
+    /// that asks for it. The publication that completes preparation calls this before it
+    /// is published, so its first `search` or `get_symbol` finds them built. The symbol
+    /// view and the documentation layer both read the declaration inventory, so it is
+    /// built first and the two then build side by side on the calling pool.
+    pub fn prepare_reads(&self) {
+        let _ = self
+            .symbol_declarations
+            .get_or_init(|| self.build_symbol_declarations().map(Arc::new));
+        rayon::join(
+            || {
+                let _ = self.symbol_view();
+            },
+            || {
+                let _ = self.documentation_layer();
+            },
+        );
+    }
+
+    /// Whether the declaration inventory, the symbol view, and the documentation layer of
+    /// this index are built.
+    #[must_use]
+    pub fn reads_prepared(&self) -> bool {
+        self.symbol_declarations.get().is_some()
+            && self.symbol_view.get().is_some()
+            && self.documentation_layer.get().is_some()
+    }
+
     /// The documentation layer over this snapshot's collection.
     ///
     /// The first call builds the layer and every later call answers it, so the reads one
@@ -3385,6 +3423,7 @@ impl WorkspaceIndex {
             .get_or_init(|| self.build_symbol_declarations().map(Arc::new))
             .as_ref()
             .map_err(Clone::clone)?;
+        let mut owners = Vec::new();
         for block in &self.documentation.index().blocks {
             let Some(owner) = &block.symbol else {
                 continue;
@@ -3394,10 +3433,10 @@ impl WorkspaceIndex {
                 let Some(matched) = self.declaration_match(path, *index) else {
                     continue;
                 };
-                layer.associate_document(declaration_identity(matched), &block.identity)?;
+                owners.push((declaration_identity(matched), &block.identity));
             }
         }
-        Ok(())
+        layer.associate_documents(owners)
     }
 
     /// Keeps this snapshot's documentation collection alive for one publication.
@@ -4169,6 +4208,33 @@ impl WorkspaceIndex {
                 .contains(&language.identity_segment()))
     }
 
+    /// The readable object of every identified record, each record assembled once. The
+    /// graph's references and edges are read once for all of them.
+    fn assembled_objects(
+        &self,
+        objects: &BTreeMap<SymbolId, usize>,
+    ) -> BTreeMap<SymbolId, Result<ReadableSymbol, RiftError>> {
+        let sources = self.semantics.assembly_sources();
+        objects
+            .iter()
+            .map(|(identity, position)| {
+                let record = &self.semantics.graph().records()[*position];
+                let object = self
+                    .semantics
+                    .assembled_record_from(&sources, record)
+                    .and_then(ReadableSymbol::new)
+                    .ok_or_else(|| {
+                        errors::index::workspace_provider()
+                            .source(ReadableSymbolMissing {
+                                identity: identity.as_str().to_owned(),
+                            })
+                            .error()
+                    });
+                (identity.clone(), object)
+            })
+            .collect()
+    }
+
     fn build_symbol_declarations(&self) -> Result<SymbolDeclarations, RiftError> {
         let mut declarations = SymbolDeclarations {
             objects: SymbolDeclarations::object_positions(self.semantics.graph().records()),
@@ -4196,21 +4262,7 @@ impl WorkspaceIndex {
                 }
             }
         }
-        for (identity, position) in &declarations.objects {
-            let record = &self.semantics.graph().records()[*position];
-            let object = self
-                .semantics
-                .assembled_record(record)
-                .and_then(ReadableSymbol::new)
-                .ok_or_else(|| {
-                    errors::index::workspace_provider()
-                        .source(ReadableSymbolMissing {
-                            identity: identity.as_str().to_owned(),
-                        })
-                        .error()
-                });
-            declarations.assembled.insert(identity.clone(), object);
-        }
+        declarations.assembled = self.assembled_objects(&declarations.objects);
         for file in self.files() {
             if !file.syntax().left_out_symbols().is_empty() {
                 declarations
@@ -4971,7 +5023,13 @@ fn captured_project_semantics(
         operation = "WorkspaceSemantics::build_project_facts",
         phase = "WorkspaceSemantics::build_project_facts",
         files = documents.len(),
-        { prepared.build(limits.edges_max(), previous) }
+        {
+            if contents.partial {
+                prepared.build_deferring_static(limits.edges_max(), previous)
+            } else {
+                prepared.build(limits.edges_max(), previous)
+            }
+        }
     )
     .map(|built| ProjectSemanticsAdmission::Built(Box::new(built)))
 }
@@ -5153,6 +5211,7 @@ fn built_contents_with_owner(
                             raw_syntax,
                             left_out,
                             warnings,
+                            partial: _,
                         } = contents;
                         return Ok(BuiltContents {
                             files,
@@ -6791,6 +6850,17 @@ fn read_text_file(
 /// the reads run past a `workspace_bytes_max` refusal.
 const SOURCE_BATCH_FILES: usize = 512;
 
+/// The publication count that follows `prepared` of `total` selected files.
+fn checkpoint_after(prepared: usize, total: usize) -> Option<usize> {
+    if prepared == total {
+        None
+    } else if prepared == 0 {
+        Some(SOURCE_BATCH_FILES.min(total))
+    } else {
+        Some(total)
+    }
+}
+
 /// Counts one kept file's bytes against `workspace_bytes_max`.
 fn count_workspace_bytes(
     workspace_bytes: &mut usize,
@@ -8127,6 +8197,148 @@ mod tests {
                 .discovered_paths_unchanged(&visibility, &|| false)
                 .expect("discovery has not run")
         );
+    }
+
+    #[test]
+    fn prepared_reads_are_the_ones_the_first_read_gets() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let root = directory.path();
+        fs::write(
+            root.join("a.ts"),
+            "/** Leaf. */\nexport function leaf() {}\n",
+        )
+        .expect("leaf");
+        fs::write(
+            root.join("b.ts"),
+            "import { leaf } from './a.js';\nexport function root() { leaf(); }\n",
+        )
+        .expect("root");
+        let build = || {
+            WorkspaceIndex::build_with_languages(
+                root,
+                WorkspaceIndexLimits::default(),
+                &SourceVisibility::default(),
+                &TextFileInclusion::default(),
+                &LanguageFileSelections::default(),
+            )
+            .expect("index")
+        };
+        let lazy = build();
+        assert!(!lazy.reads_prepared());
+        let lazy_view = lazy.symbol_view().expect("symbol view");
+        assert!(!lazy.reads_prepared(), "one read builds what it asks for");
+
+        let prepared = build();
+        prepared.prepare_reads();
+        assert!(prepared.reads_prepared());
+        let view = prepared.symbol_view().expect("prepared symbol view");
+        assert!(Arc::ptr_eq(
+            &view,
+            &prepared.symbol_view().expect("the same view")
+        ));
+        assert_eq!(
+            view.retained_material_bytes(),
+            lazy_view.retained_material_bytes()
+        );
+        assert!(prepared.documentation_layer().is_ok());
+        let leaf = "rift://symbol/local/typescript/.%2Fa.ts/leaf";
+        assert_eq!(
+            prepared
+                .symbols_by_provider_identity(leaf, 2)
+                .expect("prepared declarations")
+                .len(),
+            lazy.symbols_by_provider_identity(leaf, 2)
+                .expect("lazy declarations")
+                .len()
+        );
+        // Preparing again builds nothing more.
+        prepared.prepare_reads();
+        assert!(Arc::ptr_eq(
+            &view,
+            &prepared.symbol_view().expect("the same view")
+        ));
+    }
+
+    #[test]
+    fn preparation_publishes_the_first_batch_and_then_the_complete_index() {
+        let checkpoints = |total: usize| {
+            let mut counts = Vec::new();
+            let mut prepared = 0;
+            while let Some(next) = checkpoint_after(prepared, total) {
+                assert!(prepared < next && next <= total, "total={total}");
+                counts.push(next);
+                prepared = next;
+            }
+            counts
+        };
+        assert_eq!(checkpoints(0), Vec::<usize>::new());
+        assert_eq!(checkpoints(300), [300]);
+        assert_eq!(checkpoints(SOURCE_BATCH_FILES), [SOURCE_BATCH_FILES]);
+        assert_eq!(checkpoints(514), [SOURCE_BATCH_FILES, 514]);
+        assert_eq!(checkpoints(19_466), [SOURCE_BATCH_FILES, 19_466]);
+        assert_eq!(checkpoints(1_000_000), [SOURCE_BATCH_FILES, 1_000_000]);
+    }
+
+    #[test]
+    fn a_partial_publication_reports_static_coverage_unavailable_until_preparation_completes() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let root = directory.path();
+        fs::write(root.join("a.ts"), "export function leaf() {}\n").expect("leaf");
+        fs::write(
+            root.join("b.ts"),
+            "import { leaf } from './a.js';\nexport function root() { leaf(); }\n",
+        )
+        .expect("root");
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let text_inclusion = TextFileInclusion::default();
+        let languages = LanguageFileSelections::default();
+        let mut preparation =
+            WorkspaceIndexPreparation::new(root, limits, &text_inclusion, &languages)
+                .expect("preparation configuration");
+        assert_eq!(
+            preparation
+                .discover(&visibility, &|| false)
+                .expect("selected paths"),
+            2
+        );
+        let leaf = ProjectPath::new("a.ts").expect("leaf path");
+        let caller = ProjectPath::new("b.ts").expect("caller path");
+        let target =
+            SymbolId::new("rift://symbol/local/typescript/.%2Fa.ts/leaf").expect("leaf identity");
+
+        // The file a partial publication holds has no call at all. A static pass over it
+        // alone would answer complete coverage; the publication answers unavailable.
+        let partial = preparation
+            .advance_to(1, &|| false)
+            .expect("partial publication");
+        assert!(partial.file(&leaf).is_some());
+        assert!(!partial.static_edge_calls_complete(&leaf, None));
+        assert_eq!(partial.static_usages(&target).count(), 0);
+
+        let complete = preparation
+            .advance_to_with_previous(2, Some(&partial), &|| false)
+            .expect("complete publication");
+        let cold = WorkspaceIndex::build_with_languages(
+            root,
+            limits,
+            &visibility,
+            &text_inclusion,
+            &languages,
+        )
+        .expect("cold index");
+        for path in [&leaf, &caller] {
+            assert!(cold.static_edge_calls_complete(path, None));
+            assert!(complete.static_edge_calls_complete(path, None));
+        }
+        let usages = |index: &WorkspaceIndex| {
+            index
+                .static_usages(&target)
+                .map(|(binding, range, _, role)| (binding.clone(), range, role))
+                .collect::<Vec<_>>()
+        };
+        assert!(!usages(&cold).is_empty());
+        assert_eq!(usages(&complete), usages(&cold));
     }
 
     #[test]

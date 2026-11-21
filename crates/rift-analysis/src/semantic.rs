@@ -528,6 +528,9 @@ impl WorkspaceSemantics {
                 )
             )
         });
+        // Containment and override occurrences live on as edges alone; the publication
+        // keeps the remaining occurrences without the room the others took.
+        resolution.occurrences.shrink_to_fit();
         self.static_occurrence_order = (0..resolution.occurrences.len()).collect();
         self.static_occurrence_order.sort_unstable_by_key(|index| {
             (
@@ -536,6 +539,13 @@ impl WorkspaceSemantics {
             )
         });
         self.static_resolution = resolution;
+    }
+
+    /// Leaves the static pass to a later publication of the same sources: this one holds
+    /// no static occurrence and reports unavailable call coverage for every unit.
+    pub(crate) fn defer_static_resolution(&mut self, sources: &[StaticSource<'_>]) {
+        self.static_resolution = crate::static_resolution::deferred(sources);
+        self.static_occurrence_order = Vec::new();
     }
 
     pub(crate) fn static_occurrences(&self) -> &[StaticOccurrence] {
@@ -658,6 +668,29 @@ impl WorkspaceSemantics {
     pub fn assembled_record(&self, record: &rift_core::SymbolRecord) -> Option<AssembledSymbol> {
         SymbolAssembler::assemble(
             &self.graph,
+            record,
+            std::slice::from_ref(&self.syntax_provider),
+        )
+    }
+
+    /// The references and edges of the captured graph by the Contribution that supplies
+    /// them, for a caller that assembles every record.
+    #[must_use]
+    pub fn assembly_sources(&self) -> rift_provider::AssemblySources<'_> {
+        rift_provider::AssemblySources::new(&self.graph)
+    }
+
+    /// Assembles one captured record as [`Self::assembled_record`] does, reading its
+    /// references and edges from `sources`.
+    #[must_use]
+    pub fn assembled_record_from(
+        &self,
+        sources: &rift_provider::AssemblySources<'_>,
+        record: &rift_core::SymbolRecord,
+    ) -> Option<AssembledSymbol> {
+        SymbolAssembler::assemble_from(
+            &self.graph,
+            sources,
             record,
             std::slice::from_ref(&self.syntax_provider),
         )
