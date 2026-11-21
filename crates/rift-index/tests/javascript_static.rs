@@ -2627,3 +2627,98 @@ export function picked(k: Pick<Options, 'name'>, n: NonNullable<Options>) {
         "main.ts/Options/name"
     ));
 }
+
+#[test]
+fn test_object_literals_ending_in_a_typed_spread_take_its_members() {
+    // An object literal whose last element spreads a name of type `T` has the members `T`
+    // declares from `T`. In TypeScript a `let` keeps the type of its initializer through
+    // later writes; in JavaScript a binding written again keeps nothing.
+    let source = "export interface Options { name: string; version?: number; run?: () => number }
+export function spreadLast(base: Options) {
+  const o = { version: 0, run: () => 1, ...base }
+  return [o.name, o.version, o.run?.()]
+}
+export function writtenAgain(base: Options, next: Partial<Options>) {
+  let o = { version: 0, ...base }
+  o = { ...o, ...next }
+  return o.name
+}
+export function spreadFirst(base: Options) {
+  const o = { ...base, version: 1 }
+  return o.name
+}
+type Impl = <T>(init: () => T, options: Options) => () => void
+export const impl: Impl = (init, baseOptions) => () => {
+  let options = { version: 0, run: () => 2, ...baseOptions }
+  const setItem = () => [options.name, options.version, options.run?.()]
+  options = { ...options, name: 'x' }
+  return setItem
+}
+";
+    let script = "class Options { constructor() { this.name = 'a' } }
+/** @param {Options} base */
+function kept(base) {
+  const o = { ...base }
+  return o.name
+}
+/** @param {Options} base */
+function written(base, other) {
+  let o = { ...base }
+  o = other
+  return o.name
+}
+module.exports = { kept, written, Options }
+";
+    let (_directory, index) = workspace_with_manifest(
+        &[("main.ts", source), ("script.cjs", script)],
+        module_manifest(),
+    );
+    for (kind, from, to) in [
+        (
+            EdgeKind::Reads,
+            "main.ts/spreadLast",
+            "main.ts/Options/name",
+        ),
+        (
+            EdgeKind::Reads,
+            "main.ts/spreadLast",
+            "main.ts/Options/version",
+        ),
+        (EdgeKind::Calls, "main.ts/spreadLast", "main.ts/Options/run"),
+        (
+            EdgeKind::Reads,
+            "main.ts/writtenAgain",
+            "main.ts/Options/name",
+        ),
+        (
+            EdgeKind::Reads,
+            "main.ts/impl/setItem",
+            "main.ts/Options/name",
+        ),
+        (
+            EdgeKind::Calls,
+            "main.ts/impl/setItem",
+            "main.ts/Options/run",
+        ),
+    ] {
+        assert!(has_edge(&index, kind, from, to), "{from} {to}");
+    }
+    assert!(has_edge(
+        &index,
+        EdgeKind::Reads,
+        "script.cjs/kept",
+        "script.cjs/Options/name"
+    ));
+    // A spread followed by other members, and a JavaScript binding written again.
+    assert!(!has_edge(
+        &index,
+        EdgeKind::Reads,
+        "main.ts/spreadFirst",
+        "main.ts/Options/name"
+    ));
+    assert!(!index.edges().edges().any(|edge| {
+        edge.kind() == EdgeKind::Reads
+            && edge.from().as_str().ends_with("script.cjs/written")
+            && edge.to().as_str().ends_with("/name")
+    }));
+}

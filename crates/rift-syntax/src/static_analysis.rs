@@ -322,6 +322,9 @@ pub struct StaticFactsParts {
     /// What each `return` of a function returns, by the name of the declaration the
     /// function belongs to: the object literal it returns, or none for any other value.
     pub returned_objects: Vec<(ByteRange, Option<ByteRange>)>,
+    /// Declared names whose initializer is an object literal that ends in a spread of a
+    /// name, with that spread name: `const o = { a: 1, ...base }` gives `(o, base)`.
+    pub spread_values: Vec<(ByteRange, ByteRange)>,
     /// Scopes with unsupported binding shapes.
     pub unsupported_bindings: Vec<ByteRange>,
     /// Rust use paths.
@@ -496,6 +499,12 @@ impl StaticFacts {
         &self.0.returned_objects
     }
 
+    /// Names initialized by an object literal ending in a spread of a name, with that name.
+    #[must_use]
+    pub fn spread_values(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.spread_values
+    }
+
     /// Scopes where an unsupported binding can affect lookup.
     #[must_use]
     pub fn unsupported_bindings(&self) -> &[ByteRange] {
@@ -545,6 +554,7 @@ impl StaticFacts {
             vector_capacity(&self.0.element_returns),
             vector_capacity(&self.0.object_members),
             vector_capacity(&self.0.returned_objects),
+            vector_capacity(&self.0.spread_values),
             vector_capacity(&self.0.unsupported_bindings),
             vector_capacity(&self.0.inherent_impls),
             vector_capacity(&self.0.rust_uses),
@@ -586,6 +596,7 @@ impl StaticFacts {
             self.element_returns().len(),
             self.object_members().len(),
             self.returned_objects().len(),
+            self.spread_values().len(),
             self.unsupported_bindings().len(),
             self.inherent_impls().len(),
             self.rust_uses().len(),
@@ -658,6 +669,10 @@ impl StaticFacts {
                 .returned_objects()
                 .iter()
                 .all(|(owner, object)| valid(*owner) && object.is_none_or(valid))
+            && self
+                .spread_values()
+                .iter()
+                .all(|(name, spread)| valid(*name) && valid(*spread))
     }
 
     pub(crate) fn validate(&self, source: &str, limits: SyntaxLimits) -> Result<(), RiftError> {

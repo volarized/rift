@@ -393,6 +393,8 @@ struct File<'source> {
     declared_types: BTreeMap<ByteRange, Option<ByteRange>>,
     /// Declaration name to the named element type its written array type states.
     element_types: BTreeMap<ByteRange, Option<ByteRange>>,
+    /// Declaration name to the name its object literal initializer spreads last.
+    spread_values: BTreeMap<ByteRange, ByteRange>,
     /// Start offsets of plain name writes whose value is a function written in place.
     function_writes: BTreeSet<u64>,
     type_signatures: BTreeSet<(ByteRange, bool)>,
@@ -520,6 +522,7 @@ impl<'source> File<'source> {
             python_calls: BTreeMap::new(),
             declared_types: BTreeMap::new(),
             element_types: BTreeMap::new(),
+            spread_values: BTreeMap::new(),
             function_writes: BTreeSet::new(),
             type_signatures: BTreeSet::new(),
             callbacks: javascript_callbacks::Callbacks::default(),
@@ -622,6 +625,12 @@ impl<'source> File<'source> {
                 return None;
             }
             self.function_writes.insert(range.start);
+        }
+        for &(name, spread) in self.facts.spread_values() {
+            if !work.charge() {
+                return None;
+            }
+            self.spread_values.insert(name, spread);
         }
         for &signature in self.facts.type_signatures() {
             if !work.charge() {

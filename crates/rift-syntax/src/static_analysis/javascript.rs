@@ -363,6 +363,7 @@ impl Kinds {
         self.record_documented_function(syntax_element, source, documentation, facts)?;
         self.record_object_member(visited, facts)?;
         self.record_returned_object(visited, facts)?;
+        self.record_spread_value(syntax_element, facts)?;
         self.record_module_syntax(visited, source, facts);
         self.record_reference(visited, facts)?;
         self.record_member(syntax_element, facts)?;
@@ -392,6 +393,48 @@ impl Kinds {
             self.record_reexport(visited, source, facts)?;
         } else {
             self.record_shadow_or_mutation(visited, facts)?;
+        }
+        Ok(())
+    }
+
+    /// Records a declared name whose initializer is an object literal that ends in a spread
+    /// of a name: `const o = { a: 1, ...base }`. The members the spread value has are the
+    /// last ones written, so they are the members of `o` that value declares.
+    fn record_spread_value(
+        &self,
+        element: Node<'_>,
+        facts: &mut StaticFactsParts,
+    ) -> Result<(), RiftError> {
+        if element.kind_id() != self.variable {
+            return Ok(());
+        }
+        let Some(name) = element
+            .child_by_field_id(self.name)
+            .filter(|name| name.kind_id() == self.identifier)
+        else {
+            return Ok(());
+        };
+        let mut value = element.child_by_field_id(self.value);
+        // Each step descends within the admitted syntax depth.
+        while let Some(inner) = value.filter(|node| node.kind_id() == self.parenthesized) {
+            value = inner.named_child(0);
+        }
+        let Some(object) = value.filter(|node| node.kind_id() == self.object_literal[0]) else {
+            return Ok(());
+        };
+        let mut cursor = object.walk();
+        let last = object
+            .named_children(&mut cursor)
+            .filter(|child| !child.is_extra())
+            .last();
+        let spread = last
+            .filter(|child| child.kind() == "spread_element")
+            .and_then(|child| child.named_child(0))
+            .filter(|argument| argument.kind_id() == self.identifier && !argument.is_missing());
+        if let Some(spread) = spread {
+            facts
+                .spread_values
+                .push((byte_range(name)?, byte_range(spread)?));
         }
         Ok(())
     }
