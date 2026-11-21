@@ -44,7 +44,13 @@
           "type_indices": [],
           "documentation_indices": [0]
         }
-      ]
+      ],
+      "pagination": {
+        "page": 1,
+        "pages": 1,
+        "max_results": 10,
+        "total": 1
+      }
     }
   },
   "named-symbol": {
@@ -92,7 +98,13 @@
           "type_indices": [],
           "documentation_indices": [0]
         }
-      ]
+      ],
+      "pagination": {
+        "page": 1,
+        "pages": 1,
+        "max_results": 10,
+        "total": 1
+      }
     }
   },
   "missing-symbol": {
@@ -179,6 +191,12 @@
         "documentation_revision": "8f3371e3",
         "references": [],
         "truncated": false
+      },
+      "pagination": {
+        "page": 1,
+        "pages": 1,
+        "max_results": 10,
+        "total": 1
       }
     }
   },
@@ -312,7 +330,13 @@
           "type_indices": [],
           "documentation_indices": [0]
         }
-      ]
+      ],
+      "pagination": {
+        "page": 1,
+        "pages": 1,
+        "max_results": 10,
+        "total": 1
+      }
     }
   },
   "multi-declaration-full": {
@@ -375,7 +399,13 @@
           "type_indices": [],
           "documentation_indices": [0]
         }
-      ]
+      ],
+      "pagination": {
+        "page": 1,
+        "pages": 1,
+        "max_results": 10,
+        "total": 2
+      }
     }
   },
   "multi-declaration-first": {
@@ -998,7 +1028,13 @@
           ]
         }
       ],
-      "revision": "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11"
+      "revision": "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11",
+      "pagination": {
+        "page": 1,
+        "pages": 1,
+        "max_results": 10,
+        "total": 1
+      }
     }
   }
 }
