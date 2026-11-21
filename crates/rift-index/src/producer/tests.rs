@@ -645,3 +645,25 @@ fn producer_edge_provider_survives_package_publication_storage() {
         assert!(imported.iter().all(|edge| edge.provider == provider));
     }
 }
+
+#[test]
+fn producer_rows_keep_their_static_engine_lsp_order() {
+    let mut publication = click();
+    let mut selected = call_facts(&publication);
+    let mut rows = Vec::new();
+    for provider in ["lsp", "engine", "static"] {
+        let mut edge = selected.edges[0].clone();
+        edge.provider = serde_json::from_value(json!(provider)).expect("stored provider");
+        rows.push(edge);
+    }
+    selected.edges = rows;
+    publication = accept_producer_facts(publication, selected, SyntaxLimits::default())
+        .expect("producer rows");
+    let providers = publication
+        .edges
+        .iter()
+        .filter(|edge| edge.producer.is_some())
+        .map(|edge| edge.provider.as_ref())
+        .collect::<Vec<_>>();
+    assert_eq!(providers, ["static", "engine", "lsp"]);
+}

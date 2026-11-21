@@ -40,7 +40,7 @@ pub(super) struct AcquiredAdjacency {
     pages: Vec<(EdgeSearchPage, SymbolRelation)>,
     local: Vec<QueryOccurrence>,
     local_edges: Vec<(SymbolId, SymbolRelation, SymbolId)>,
-    edge_facts: Vec<rift_protocol::read::Edge>,
+    edge_facts: Vec<rift_protocol::index::StoredEdge>,
     captured_inventory: Option<rift_search::sparql::SemanticInventory>,
     named_package_symbols: BTreeMap<SymbolId, (Symbol, RevisionIri)>,
     installed: BTreeMap<SymbolId, Arc<InstalledTarget>>,
@@ -158,7 +158,7 @@ impl AcquiredAdjacency {
                 return Err(super::deadline_failure(deadline.budget()));
             }
             if required.edges.metadata {
-                dataset.insert_edge(&edge.to_protocol(), None)?;
+                dataset.insert_edge(&edge.to_protocol().into(), None)?;
             }
             let source = SymbolId(edge.from().as_str().to_owned());
             let target = SymbolId(edge.to().as_str().to_owned());
@@ -283,7 +283,7 @@ impl AcquiredAdjacency {
     ) -> Result<(), RiftError> {
         if edges.metadata {
             for edge in &self.edge_facts {
-                dataset.insert_edge(edge, None)?;
+                dataset.insert_edge(&edge.clone().into(), None)?;
             }
         }
         if edges.relations {
@@ -507,12 +507,9 @@ impl AcquiredAdjacency {
                 .chain(group.occurrences.iter().map(|record| &record.id))
                 .collect();
             charge_records(remaining, records.len())?;
-            frontier.extend(
-                group
-                    .edges
-                    .iter()
-                    .map(|record| endpoint(&record.edge, step.direction).clone()),
-            );
+            frontier.extend(group.edges.iter().map(|record| {
+                endpoint((&record.edge.from, &record.edge.to), step.direction).clone()
+            }));
         }
         self.view.get_or_insert_with(|| page.view.clone());
         for warning in page.warnings.drain(..) {
@@ -770,7 +767,7 @@ impl<'request> AdjacencyWalk<'request> {
                 .iter()
                 .filter(|edge| {
                     edge.kinds.contains(&EdgeKind::HasType)
-                        && endpoint(edge, direction) != seed
+                        && endpoint((&edge.from, &edge.to), direction) != seed
                         && match direction {
                             TraversalDirection::Outgoing => &edge.from == seed,
                             TraversalDirection::Incoming => &edge.to == seed,
@@ -1173,7 +1170,7 @@ impl<'request> AdjacencyWalk<'request> {
             let reached = group
                 .edges
                 .iter()
-                .map(|record| endpoint(&record.edge, step.direction))
+                .map(|record| endpoint((&record.edge.from, &record.edge.to), step.direction))
                 .chain(local)
                 .cloned()
                 .collect();
@@ -1211,6 +1208,7 @@ impl<'request> AdjacencyWalk<'request> {
             || selected.occurrences.is_some_and(|usage| usage.source);
         let include = EdgeInclude {
             source: needs_source,
+            providers: true,
         };
         let seeds_max = usize::try_from(bounds.max_seeds).unwrap_or(usize::MAX);
         for seeds in remote_seeds.chunks(seeds_max) {
@@ -1307,10 +1305,13 @@ fn relation(kind: EdgeKind) -> Result<SymbolRelation, RiftError> {
     }
 }
 
-fn endpoint(edge: &rift_protocol::read::Edge, direction: TraversalDirection) -> &SymbolId {
+fn endpoint<'edge>(
+    (from, to): (&'edge SymbolId, &'edge SymbolId),
+    direction: TraversalDirection,
+) -> &'edge SymbolId {
     match direction {
-        TraversalDirection::Outgoing => &edge.to,
-        TraversalDirection::Incoming => &edge.from,
+        TraversalDirection::Outgoing => to,
+        TraversalDirection::Incoming => from,
     }
 }
 

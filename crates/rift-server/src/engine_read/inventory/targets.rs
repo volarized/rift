@@ -8,8 +8,7 @@ use rift_core::{ProjectPath, SymbolId as CoreSymbolId};
 use rift_error::RiftError;
 use rift_lsp::{EngineSession, LineIndex, PositionEncoding};
 use rift_protocol::read::{
-    Edge, EdgeKind, EdgeProvider, ReadWarning, SourceUnitSpan, SymbolId, TextRange,
-    TraversalDirection,
+    EdgeKind, EdgeProvider, ReadWarning, SourceUnitSpan, SymbolId, TextRange, TraversalDirection,
 };
 
 use super::{EngineInventorySelection, InventoryHeritage, InventoryReport, graph_call_coverage};
@@ -31,7 +30,7 @@ pub struct PackageEdge {
 impl PackageEdge {
     /// Names this target without changing its analysis, direction or source occurrence.
     #[must_use]
-    pub fn named(&self, identity: SymbolId) -> Edge {
+    pub fn named(&self, identity: SymbolId) -> rift_protocol::index::StoredEdge {
         let seed = SymbolId(self.target.caller().as_str().to_owned());
         let (from, to) = match self.direction {
             TraversalDirection::Outgoing => (seed, identity),

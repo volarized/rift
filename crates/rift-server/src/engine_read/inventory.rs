@@ -13,7 +13,7 @@ use rift_core::{ProjectPath, SymbolId as CoreSymbolId};
 use rift_error::RiftError;
 use rift_lsp::{EngineSession, LineIndex, PositionEncoding};
 use rift_protocol::read::{
-    Edge, EdgeKind, EdgeProvider, ReadWarning, SymbolId, SymbolKind, TraversalDirection,
+    EdgeKind, EdgeProvider, ReadWarning, SymbolId, SymbolKind, TraversalDirection,
 };
 use tokio::time::Instant;
 
@@ -254,9 +254,9 @@ pub struct EngineInventory {
     /// Incoming references for each declaration the engine read.
     pub references: Vec<(SymbolId, GraphReferences)>,
     /// Inferred type edges between canonical declarations.
-    pub types: Vec<Edge>,
+    pub types: Vec<rift_protocol::index::StoredEdge>,
     /// Inheritance and implementation edges between canonical declarations.
-    pub heritage: Vec<Edge>,
+    pub heritage: Vec<rift_protocol::index::StoredEdge>,
     /// Readiness warnings carried by this file's engine answer.
     pub warnings: Vec<ReadWarning>,
     /// External reference, type and inheritance targets awaiting package placement.
@@ -750,7 +750,7 @@ impl ReadService {
         encoding: PositionEncoding,
         reported: Vec<(SymbolId, Vec<Location>)>,
         provider: EdgeProvider,
-    ) -> Result<Vec<Edge>, RiftError> {
+    ) -> Result<Vec<rift_protocol::index::StoredEdge>, RiftError> {
         let roots = [
             rift_lsp::TreeRoot::new(root)?,
             rift_lsp::TreeRoot::new(self.index().root())?,
@@ -917,7 +917,7 @@ fn resolve_heritage(
     encoding: PositionEncoding,
     heritage: Vec<InventoryHeritage>,
     provider: EdgeProvider,
-) -> Result<Vec<Edge>, RiftError> {
+) -> Result<Vec<rift_protocol::index::StoredEdge>, RiftError> {
     let roots = [
         rift_lsp::TreeRoot::new(workspace_root)?,
         rift_lsp::TreeRoot::new(reads.index().root())?,

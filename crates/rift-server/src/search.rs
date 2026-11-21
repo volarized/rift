@@ -270,7 +270,7 @@ impl ReadService {
                 .fail();
         }
         self.accept_revision(params.revision.as_ref())?;
-        let ((results, pagination), warnings) = self.ordered_search_hits(
+        let ((mut results, pagination), warnings) = self.ordered_search_hits(
             params,
             store,
             references,
@@ -280,6 +280,15 @@ impl ReadService {
                 Ok(((results, pagination), warnings))
             },
         )?;
+        if !params.include.providers {
+            for hop in results
+                .iter_mut()
+                .filter_map(|hit| hit.traversal_path.as_mut())
+                .flatten()
+            {
+                hop.edge.providers.clear();
+            }
+        }
         Ok(SearchResult {
             view: None,
             revision: Some(self.served_revision()?),

@@ -1420,7 +1420,7 @@ struct Records {
     units: Vec<PackageSourceUnit>,
     objects: Vec<Symbol>,
     declarations: Vec<PackageSymbol>,
-    edges: Vec<rift_protocol::read::Edge>,
+    edges: Vec<rift_protocol::index::StoredEdge>,
     occurrences: Vec<PackageOccurrence>,
     occurrence_languages: BTreeSet<String>,
     documents: Vec<PackageDocument>,
@@ -1723,7 +1723,7 @@ impl Records {
                 }
             }
             let kind = edge_kind(edge.kind());
-            self.edges.push(rift_protocol::read::Edge {
+            self.edges.push(rift_protocol::index::StoredEdge {
                 producer: None,
                 from: SymbolId::parse(from.as_str()).map_err(|_| {
                     errors::analysis::package_provider_failed()

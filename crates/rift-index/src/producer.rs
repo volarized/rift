@@ -10,12 +10,14 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use rift_error::{RiftError, errors};
-use rift_protocol::index::{PACKAGE_SYMBOLS_CEILING, PackageOccurrence, PackagePublication};
+use rift_protocol::index::{
+    PACKAGE_SYMBOLS_CEILING, PackageOccurrence, PackagePublication, StoredEdge,
+};
 use rift_protocol::producer::{
     FactCoverage, FactKind, FactProducer, PRODUCER_FACTS_FORMAT_REVISION, ProducerEdge,
     ProducerFacts, ProducerOccurrence,
 };
-use rift_protocol::read::{Edge, SourceUnitId, SourceUnitSpan, SymbolId};
+use rift_protocol::read::{SourceUnitId, SourceUnitSpan, SymbolId};
 use rift_syntax::{ByteRange, SyntaxDocument, SyntaxLimits, SyntaxMatch, SyntaxSource};
 
 use crate::located_syntax_element::{LocatedSyntax, SyntaxAddress};
@@ -305,7 +307,7 @@ fn resolve_edge(
     syntax_elements: &mut PublicationSyntax<'_>,
     edge: ProducerEdge,
     producer: &FactProducer,
-) -> Result<Edge, RiftError> {
+) -> Result<StoredEdge, RiftError> {
     let ProducerEdge {
         from,
         kind,
@@ -335,7 +337,7 @@ fn resolve_edge(
         (None, Some(_)) => return Err(invalid("edges.occurrence", "outside_declaration")),
         (None, None) => return Err(invalid("edges.from", "missing")),
     };
-    Ok(Edge {
+    Ok(StoredEdge {
         from,
         kind,
         kinds,
@@ -371,8 +373,8 @@ fn resolve_occurrence(
 
 /// The order of one producer's imported edges. Two edges equal under it differ only
 /// in their extensions and keep the order the producer wrote them.
-fn canonical_order(left: &Edge, right: &Edge) -> Ordering {
-    fn span(edge: &Edge) -> Option<(&SourceUnitId, u64, u64)> {
+fn canonical_order(left: &StoredEdge, right: &StoredEdge) -> Ordering {
+    fn span(edge: &StoredEdge) -> Option<(&SourceUnitId, u64, u64)> {
         edge.occurrence
             .as_ref()
             .map(|span| (&span.unit, span.range.start, span.range.end))
@@ -380,13 +382,23 @@ fn canonical_order(left: &Edge, right: &Edge) -> Ordering {
     (&left.from, &left.to, &left.kind)
         .cmp(&(&right.from, &right.to, &right.kind))
         .then_with(|| span(left).cmp(&span(right)))
-        .then_with(|| left.provider.cmp(&right.provider))
+        .then_with(|| provider_order(left.provider).cmp(&provider_order(right.provider)))
         .then_with(|| left.derivation.cmp(&right.derivation))
         .then_with(|| left.kinds.cmp(&right.kinds))
         .then_with(|| match (left.confidence, right.confidence) {
             (Some(left), Some(right)) => left.total_cmp(&right),
             (left, right) => left.is_some().cmp(&right.is_some()),
         })
+}
+
+// Publication rows place static analysis before embedded engines and language servers.
+fn provider_order(provider: rift_protocol::read::EdgeProvider) -> u8 {
+    use rift_protocol::read::EdgeProvider;
+    match provider {
+        EdgeProvider::Static => 0,
+        EdgeProvider::Engine => 1,
+        EdgeProvider::Lsp => 2,
+    }
 }
 
 fn byte_range(span: &SourceUnitSpan) -> ByteRange {

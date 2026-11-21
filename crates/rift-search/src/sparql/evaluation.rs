@@ -130,7 +130,10 @@ impl From<GraphTerm> for rift_protocol::query::RdfTerm {
     fn from(term: GraphTerm) -> Self {
         match term {
             GraphTerm::Iri(value) => Self::Iri { value },
-            GraphTerm::BlankNode(value) => Self::BlankNode { value },
+            GraphTerm::BlankNode(value) => Self::BlankNode {
+                value,
+                providers: std::collections::BTreeSet::default(),
+            },
             GraphTerm::Literal {
                 value,
                 datatype,

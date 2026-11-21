@@ -273,7 +273,7 @@ impl RiftProxy {
             let key = answer_key(&query, params.language, requested)?;
             if let Some((view, bytes)) = self.query_routes.retained(&key, SystemTime::now()) {
                 return self
-                    .retained_page(view, bytes, paging, requested.clone())
+                    .retained_page(view, bytes, (paging, params.include), requested.clone())
                     .await;
             }
         }
@@ -282,18 +282,7 @@ impl RiftProxy {
             Err(response) => return Ok(*response),
         };
         let revision = combined_revision(selected.iter().map(|result| result.revision.as_ref()))?;
-        if let Some(requested) = &params.revision
-            && revision.as_ref() != Some(requested)
-        {
-            return errors::server::read_revision_unserved()
-                .revision(requested.to_string())
-                .served(
-                    revision
-                        .as_ref()
-                        .map_or_else(|| "no revision".to_owned(), ToString::to_string),
-                )
-                .fail();
-        }
+        served_revision(params.revision.as_ref(), revision.as_ref())?;
         let key = revision
             .as_ref()
             .map(|revision| answer_key(&query, params.language, revision))
@@ -317,7 +306,9 @@ impl RiftProxy {
                         }
                     }
                 }
-                let answer: QueryAnswer = dataset.build().evaluate(&query, &cancellation)?.into();
+                let dataset = dataset.build();
+                let mut answer: QueryAnswer = dataset.evaluate(&query, &cancellation)?.into();
+                dataset.annotate_providers(&mut answer)?;
                 let view = proxy_view(selected.iter().filter_map(|result| result.view.as_ref()))?;
                 if cancellation.is_cancelled() {
                     return errors::search::query_cancelled().fail();
@@ -339,6 +330,7 @@ impl RiftProxy {
                     &view,
                     &answer,
                     QueryPageOptions {
+                        include: params.include,
                         configuration: &configuration,
                         page: params.page,
                         max_results: params.max_results,
@@ -399,7 +391,7 @@ impl RiftProxy {
         &self,
         view: CapturedView,
         bytes: Arc<[u8]>,
-        paging: (u64, u64),
+        (paging, include): ((u64, u64), rift_protocol::query::QueryInclude),
         revision: Revision,
     ) -> Result<Response, RiftError> {
         let root = Arc::clone(&self.root);
@@ -415,6 +407,7 @@ impl RiftProxy {
                     &view,
                     &answer,
                     QueryPageOptions {
+                        include,
                         configuration: &configuration,
                         page: paging.0,
                         max_results: paging.1,
@@ -719,6 +712,22 @@ impl Drop for CancelQuery {
     fn drop(&mut self) {
         self.0.cancel();
     }
+}
+
+/// Refuses a later page whose requested revision is not the one the producers serve.
+fn served_revision(
+    requested: Option<&Revision>,
+    revision: Option<&Revision>,
+) -> Result<(), RiftError> {
+    if let Some(requested) = requested
+        && revision != Some(requested)
+    {
+        return errors::server::read_revision_unserved()
+            .revision(requested.to_string())
+            .served(revision.map_or_else(|| "no revision".to_owned(), ToString::to_string))
+            .fail();
+    }
+    Ok(())
 }
 
 #[cfg(test)]

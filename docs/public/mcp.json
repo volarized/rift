@@ -6276,6 +6276,22 @@
       "description": "Performs search across the index using a query language. `language` names the query\nlanguage and defaults to `sparql`.\nA query over the captured inventory answers from partly covered facts, and `warnings`\nname the files, languages, or engines left out. A query whose answer needs every fact - an empty\nresult, a false `ASK`, a count, a negation, an `OPTIONAL` - answers `unavailable` with\n`insufficient_coverage` instead.",
       "input_schema": {
         "$defs": {
+          "QueryInclude": {
+            "additionalProperties": false,
+            "description": "Optional projections of a query answer. An omitted member is `false`.",
+            "examples": [
+              {
+                "providers": true
+              }
+            ],
+            "properties": {
+              "providers": {
+                "description": "Attaches `providers` to merged edge terms and call steps. Explicit SPARQL\nselections and filters on `:provider` retain the stored producer facts.",
+                "type": "boolean"
+              }
+            },
+            "type": "object"
+          },
           "QueryLanguage": {
             "description": "The query language the server evaluates.",
             "oneOf": [
@@ -6311,9 +6327,19 @@
           {
             "language": "sparql",
             "query": "ASK { ?symbol a :Symbol; :name 'ReadService' }"
+          },
+          {
+            "include": {
+              "providers": true
+            },
+            "query": "SELECT ?edge { ?caller :calls ?callee . ?edge a :Edge; :from ?caller; :to ?callee }"
           }
         ],
         "properties": {
+          "include": {
+            "$ref": "#/$defs/QueryInclude",
+            "description": "Attaches the sorted analyses that produced each returned edge."
+          },
           "language": {
             "$ref": "#/$defs/QueryLanguage",
             "default": "sparql",
@@ -6690,6 +6716,26 @@
               {
                 "const": "binds",
                 "description": "The source binds a name or value to the target.",
+                "type": "string"
+              }
+            ]
+          },
+          "EdgeProvider": {
+            "description": "Which analysis produced an edge.",
+            "oneOf": [
+              {
+                "const": "engine",
+                "description": "A language engine embedded in Rift, such as ty.",
+                "type": "string"
+              },
+              {
+                "const": "lsp",
+                "description": "A language server reached through LSP.",
+                "type": "string"
+              },
+              {
+                "const": "static",
+                "description": "Static analysis captured into the index.",
                 "type": "string"
               }
             ]
@@ -7188,6 +7234,14 @@
                 "additionalProperties": false,
                 "description": "A blank node identity within the retained answer.",
                 "properties": {
+                  "providers": {
+                    "description": "Sorted analyses for an edge or call step, present when `include.providers` is `true`.",
+                    "items": {
+                      "$ref": "#/$defs/EdgeProvider"
+                    },
+                    "type": "array",
+                    "uniqueItems": true
+                  },
                   "type": {
                     "const": "blank_node",
                     "type": "string"

@@ -656,3 +656,86 @@ fn exact_symbol_contract_requires_typed_miss_and_unavailability() -> TestResult 
     assert_invalid(&document, "shared schema `GetSymbolResult` differs")?;
     Ok(())
 }
+
+#[test]
+fn merged_edges_validate_with_optional_provider_sets() -> TestResult {
+    use rift_protocol::edge_read::EdgeInclude;
+    use rift_protocol::index::StoredEdge;
+    let document = contract()?;
+    let schema = json!({"$ref":"#/components/schemas/Edge", "components": document["components"]});
+    let validator = jsonschema::validator_for(&schema)?;
+    let mut rows = Vec::new();
+    for provider in ["static", "engine", "lsp"] {
+        rows.push(serde_json::from_value::<StoredEdge>(json!({
+            "from":"rift://symbol/cargo/crates.io/demo/rust/caller",
+            "to":"rift://symbol/cargo/crates.io/demo/rust/callee",
+            "kind":"calls", "kinds":["calls"], "provider":provider, "derivation":"resolution"
+        }))?);
+    }
+    for included in [false, true] {
+        let edges = StoredEdge::project(
+            rows.clone(),
+            EdgeInclude {
+                providers: included,
+                ..Default::default()
+            },
+        );
+        assert_eq!(edges.len(), 1);
+        let mut edge = serde_json::to_value(&edges[0])?;
+        assert!(validator.is_valid(&edge), "{edge}");
+        let decoded: rift_cloud_client::Search200Response = serde_json::from_value(json!({
+            "groups": [{"seed":edge["from"], "complete":true, "edges":[{"id":"a".repeat(64), "edge":edge}]}],
+            "analyzer_revision":"fixture", "corpus_revision":"fixture",
+            "view":{"id":"fixture.view", "expires_at":"2099-01-01T00:00:00Z"}
+        }))?;
+        let rift_cloud_client::Search200Response::Edge(page) = decoded else {
+            panic!("edge page")
+        };
+        assert_eq!(
+            serde_json::to_value(&page.groups[0].edges[0].edge)?.get("providers"),
+            included
+                .then(|| json!(["engine", "lsp", "static"]))
+                .as_ref()
+        );
+        edge["provider"] = json!("static");
+        assert!(
+            !validator.is_valid(&edge),
+            "singular provider leaves the wire"
+        );
+        edge.as_object_mut()
+            .ok_or("edge object")?
+            .remove("provider");
+        edge["providers"] = json!(["static", "static"]);
+        assert!(!validator.is_valid(&edge), "provider set is unique");
+        edge["providers"] = json!(["unknown"]);
+        assert!(
+            !validator.is_valid(&edge),
+            "provider set uses the declared analyses"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn traversal_search_accepts_typed_provider_projection() -> TestResult {
+    let document = contract()?;
+    let schema = json!({"$ref":"#/components/schemas/PackageSearchRequest", "components":document["components"]});
+    let validator = jsonschema::validator_for(&schema)?;
+    let mut request = rift_cloud_client::PackageSearchRequest {
+        include: Some(rift_cloud_client::PackageSearchRequestInclude {
+            providers: Some(true),
+            source: None,
+        }),
+        ..Default::default()
+    };
+    request.traversal.get_or_insert_default().seed =
+        Some("rift://symbol/cargo/crates.io/demo/rust/caller".to_owned());
+    let mut value = serde_json::to_value(request)?;
+    assert!(validator.is_valid(&value), "{value}");
+    assert_eq!(value["include"], json!({"providers":true}));
+    value["include"] = json!(["providers"]);
+    assert!(!validator.is_valid(&value));
+    value["include"] = json!({"providers":"true"});
+    assert!(!validator.is_valid(&value));
+    Ok(())
+}

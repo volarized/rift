@@ -973,8 +973,12 @@ fn search_request(
                 .map(|candidate| candidate.text().to_owned())
                 .collect(),
         ),
-        include: includes_source(params)
-            .then_some(PackageSearchRequestInclude { source: Some(true) }),
+        include: (includes_source(params) || params.include.providers).then_some(
+            PackageSearchRequestInclude {
+                source: includes_source(params).then_some(true),
+                providers: params.include.providers.then_some(true),
+            },
+        ),
         packages: Some(packages.to_vec()),
         phase: Some(match phase {
             QueryPhase::Precise => PackageSearchRequestPhase::Precise,
@@ -1823,7 +1827,7 @@ mod tests {
     fn search_request_preserves_query_members_and_phase() {
         let params: rift_protocol::read::SearchParams = serde_json::from_value(serde_json::json!({
             "query": "load config",
-            "include": {"source": true}
+            "include": {"source": true, "providers": true}
         }))
         .expect("search fixture is valid");
         let query = ParsedQuery::parse("load config").expect("query fixture is valid");
@@ -1843,7 +1847,10 @@ mod tests {
         );
         assert_eq!(
             broad.include,
-            Some(rift_cloud_client::PackageSearchRequestInclude { source: Some(true) })
+            Some(rift_cloud_client::PackageSearchRequestInclude {
+                source: Some(true),
+                providers: Some(true)
+            })
         );
     }
 
