@@ -9,7 +9,7 @@ use rift_protocol::configuration::{
     SyntaxFrameworkConfiguration, TailwindVersion, WorkspaceConfiguration,
 };
 use rift_protocol::read::{PathPattern, SyntaxFramework};
-use rift_syntax::{ShippedLanguage, SyntaxLimits, SyntaxSource};
+use rift_syntax::{ShippedLanguage, SyntaxLimits, SyntaxOrigin, SyntaxSource};
 
 #[test]
 fn inline_template_aggregate_bound_refuses_partial_workspace_publication() {
@@ -309,13 +309,16 @@ fn tailwind_workspace_publishes_assigned_members_and_ordinary_syntax_for_refused
         "page.jsx",
         "export default function Page() {\n  return <p className=\"flex\" />;\n}\n\nPage.getInitialProps = () => ({ prop: true });\n",
     );
-    // An export inside a `declare global` block names `global` as its container, which
-    // the file declares as no symbol, so the Tailwind interpretation of this file fails
-    // validation.
     write(
         root,
         "types.d.ts",
         "declare global {\n  export namespace JSX {\n    interface Intrinsic {}\n  }\n}\nexport {};\n",
+    );
+    // A nested ordinary block cannot directly export a declaration into the global scope.
+    write(
+        root,
+        "refused.d.ts",
+        "declare global {\n  { export namespace Hidden {} }\n}\nexport {};\n",
     );
     write(root, "other.js", "export function other() {}\n");
     let index = build(root, &WorkspaceConfiguration::default());
@@ -334,15 +337,33 @@ fn tailwind_workspace_publishes_assigned_members_and_ordinary_syntax_for_refused
     );
 
     let types = ProjectPath::new("types.d.ts").expect("source path");
-    let refused = index
+    let augmented = index
         .file(&types)
+        .expect("syntax of the global augmentation");
+    assert_eq!(augmented.syntax().origin(), SyntaxOrigin::Framework);
+    assert!(
+        augmented
+            .syntax()
+            .symbols()
+            .iter()
+            .any(|symbol| symbol.qualified_name == "global.JSX.Intrinsic")
+    );
+    assert!(index.warnings().iter().all(|warning| !matches!(
+        warning,
+        WorkspaceIndexWarning::FrameworkContextUnresolved { path, .. } if path == &types
+    )));
+
+    let refused_path = ProjectPath::new("refused.d.ts").expect("refused source path");
+    let refused = index
+        .file(&refused_path)
         .expect("ordinary syntax of the refused file");
+    assert_eq!(refused.syntax().origin(), SyntaxOrigin::Provider);
     assert!(
         refused
             .syntax()
             .symbols()
             .iter()
-            .any(|symbol| symbol.qualified_name == "global.JSX")
+            .any(|symbol| symbol.qualified_name == "global.Hidden")
     );
     assert!(index.warnings().iter().any(|warning| matches!(
         warning,
@@ -350,7 +371,7 @@ fn tailwind_workspace_publishes_assigned_members_and_ordinary_syntax_for_refused
             path,
             framework: SyntaxFramework::Tailwind,
             detail,
-        } if path == &types && detail.contains("failed validation")
+        } if path == &refused_path && detail.contains("failed validation")
     )));
     assert!(
         index
