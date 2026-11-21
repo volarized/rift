@@ -34,7 +34,10 @@ async fn test_collection_documentation_source_uses_smaller_configured_and_advert
     let page: PackageSearchPage = serde_json::from_value(value).expect("documentation page");
     let mut request = search_request();
     request.target = Some(PackageSearchRequestTarget::Documentation);
-    request.include = Some(crate::PackageSearchRequestInclude { source: Some(true) });
+    request.include = Some(crate::PackageSearchRequestInclude {
+        source: Some(true),
+        providers: None,
+    });
     let document = "[global]\nmax_source = \"1b\"\n";
     let config = accepted_config(
         document,
@@ -168,7 +171,10 @@ async fn test_collection_config_and_environment_deliver_source_past_default_boun
     .await
     .expect("fixture server");
     let mut search = search_request();
-    search.include = Some(crate::PackageSearchRequestInclude { source: Some(true) });
+    search.include = Some(crate::PackageSearchRequestInclude {
+        source: Some(true),
+        providers: None,
+    });
     let default = GlobalClient::new(server.config()).expect("default client");
     assert_registered_field(
         &default
@@ -257,7 +263,10 @@ async fn test_collection_operations_use_smaller_advertised_and_configured_bounds
     .await
     .expect("fixture server");
     let mut search = search_request();
-    search.include = Some(crate::PackageSearchRequestInclude { source: Some(true) });
+    search.include = Some(crate::PackageSearchRequestInclude {
+        source: Some(true),
+        providers: None,
+    });
     let mut config = server.config();
     config.max_source = 2 << 20;
     let client = GlobalClient::new(config).expect("configured client");

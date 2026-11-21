@@ -6,8 +6,9 @@ use rift_error::{RiftError, errors};
 
 use super::{PackageCoverage, PackageOccurrence, PackagePublication, PackageSourceUnit};
 use crate::identity::SymbolIdentity;
+use crate::index::StoredEdge;
 use crate::producer::{FactKind, FactProducer};
-use crate::read::{Edge, Language};
+use crate::read::Language;
 
 /// Reason a publication's facts disagree with its coverage.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -109,7 +110,7 @@ fn validate_coverage(coverage: &[PackageCoverage]) -> Result<(), RiftError> {
     Ok(())
 }
 
-fn edge_language(edge: &Edge) -> Result<Language, RiftError> {
+fn edge_language(edge: &StoredEdge) -> Result<Language, RiftError> {
     SymbolIdentity::parse(edge.from.as_str())
         .map(|identity| identity.language().clone())
         .map_err(|_| FactViolation::Symbol.error("edges.from"))

@@ -403,6 +403,8 @@ impl<'source> PackageSource<'source> {
 pub struct ExactPackageInput<'input> {
     owner: &'input SymbolOwner,
     release_version: &'input str,
+    #[cfg(feature = "collector")]
+    rust_configuration: Option<(&'input ProjectPath, &'input [&'input str])>,
     language: &'input Language,
     origin: &'input ContributionOrigin,
     files: &'input [PackageSource<'input>],
@@ -449,6 +451,8 @@ impl<'input> ExactPackageInput<'input> {
         Ok(Self {
             owner,
             release_version,
+            #[cfg(feature = "collector")]
+            rust_configuration: None,
             language,
             origin,
             files,
@@ -490,6 +494,27 @@ impl<'input> ExactPackageInput<'input> {
     #[must_use]
     pub fn namespace_input(self) -> NamespaceInput<'input> {
         NamespaceInput::from_package(&self)
+    }
+
+    /// Supplies the complete configuration flags captured with this package's selected build.
+    ///
+    /// The manifest must belong to this admitted source or metadata inventory. An empty
+    /// list establishes absent flags; an omitted configuration keeps custom flags unknown.
+    /// Metadata must be attached first so the observation retains its captured build.
+    ///
+    /// # Errors
+    /// Returns the input refusal for a missing manifest, malformed flags, or exceeded bounds.
+    #[cfg(feature = "collector")]
+    pub fn with_rust_configuration(
+        mut self,
+        manifest: &'input ProjectPath,
+        flags: &'input [&'input str],
+    ) -> Result<Self, RiftError> {
+        let input = self
+            .namespace_input()
+            .with_rust_configuration(manifest, flags)?;
+        self.rust_configuration = input.rust_configuration();
+        Ok(self)
     }
 
     /// Adds admitted dependency publications and their original selected sources.
@@ -626,6 +651,10 @@ impl<'input> ExactPackageInput<'input> {
         sources: &'input [PackageSource<'input>],
         frameworks: &'input [rift_protocol::configuration::SyntaxFrameworkConfiguration],
     ) -> Result<Self, RiftError> {
+        #[cfg(feature = "collector")]
+        if self.rust_configuration.is_some() && !std::ptr::eq(sources, self.context_sources) {
+            return errors::analysis::package_input_identity_invalid().fail();
+        }
         let observed = self.files.len().saturating_add(sources.len());
         let bound = self.limits.files_max.min(self.limits.publication().units);
         if observed > bound as usize {

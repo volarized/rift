@@ -13,7 +13,8 @@ use rift_protocol::read::{Pagination, ReadWarning, SearchResult};
 use rift_protocol::search_read::SearchUnavailable;
 use rift_protocol::symbol_read::{CapturedView, SymbolUnavailableReason};
 use rift_search::sparql::{
-    AdjacencySelection, GraphDataset, GraphLimits, GraphQuery, QueryCancellation, SemanticInventory,
+    AdjacencySelection, GraphDataset, GraphLimits, GraphQuery, QueryAnswerProjection,
+    QueryCancellation, SemanticInventory,
 };
 use rift_server::InventoryCoverage;
 
@@ -33,6 +34,7 @@ pub(crate) use edges::EngineInventoryCache;
 
 /// Settings and presentation retained with one query execution.
 pub(crate) struct QueryPageOptions<'a> {
+    pub(crate) include: rift_protocol::query::QueryInclude,
     pub(crate) configuration: &'a QueryConfiguration,
     pub(crate) page: u64,
     pub(crate) max_results: u64,
@@ -59,7 +61,7 @@ impl RiftMcp {
             rift_protocol::query::QUERY_MAX_RESULTS,
         )
         .map_err(read_failure)?;
-        let paging = (params.page, params.max_results);
+        let paging = (params.page, params.max_results, params.include);
         let deadline = self.request_deadline().await;
         let limits = GraphLimits::default();
         let query = tokio::time::timeout_at(
@@ -134,7 +136,7 @@ impl RiftMcp {
     async fn retained_query_page(
         &self,
         key: [u8; 32],
-        paging: (u64, u64),
+        paging: (u64, u64, rift_protocol::query::QueryInclude),
         revision: rift_protocol::revision::Revision,
         configuration: QueryConfiguration,
         deadline: RequestDeadline,
@@ -152,6 +154,7 @@ impl RiftMcp {
                     &view,
                     &answer,
                     QueryPageOptions {
+                        include: paging.2,
                         configuration: &configuration,
                         page: paging.0,
                         max_results: paging.1,
@@ -588,7 +591,7 @@ impl AcquiredGraph {
         deadline: RequestDeadline,
         cancellation: &QueryCancellation,
         views: &std::sync::OnceLock<rift_server::LocalSymbolViews>,
-        paging: (u64, u64),
+        paging: (u64, u64, rift_protocol::query::QueryInclude),
         key: [u8; 32],
     ) -> Result<QueryOutput, RiftError> {
         let Self {
@@ -700,7 +703,7 @@ struct QueryRetention<'answer> {
     key: [u8; 32],
     answer: &'answer QueryAnswer,
     configuration: &'answer QueryConfiguration,
-    paging: (u64, u64),
+    paging: (u64, u64, rift_protocol::query::QueryInclude),
     warnings: Vec<ReadWarning>,
     display: QueryDisplay,
     acquired: &'answer AcquiredAdjacency,
@@ -738,6 +741,7 @@ impl QueryRetention<'_> {
                 &view,
                 self.answer,
                 QueryPageOptions {
+                    include: self.paging.2,
                     configuration: self.configuration,
                     page: self.paging.0,
                     max_results: self.paging.1,
@@ -783,7 +787,8 @@ fn evaluate_acquired_query(
     cancellation: &QueryCancellation,
     acquired: &AcquiredAdjacency,
 ) -> Result<Option<QueryAnswer>, RiftError> {
-    let answer: QueryAnswer = dataset.evaluate(query, cancellation)?.into();
+    let mut answer: QueryAnswer = dataset.evaluate(query, cancellation)?.into();
+    dataset.annotate_providers(&mut answer)?;
     Ok((!acquired.is_incomplete()
         || matches!(answer, QueryAnswer::Boolean { value: true })
         || (query.admits_partial_rows() && !claims_absence(&answer)))
@@ -796,9 +801,14 @@ pub(crate) fn query_page(
     answer: &QueryAnswer,
     options: QueryPageOptions<'_>,
 ) -> Result<QueryOutput, RiftError> {
+    let provider = rift_search::sparql::VocabularyProperty::Provider.iri();
+    let visible = |triple: &&rift_protocol::query::RdfTriple| {
+        !matches!(&triple.predicate,
+        rift_protocol::query::RdfTerm::Iri { value } if value == provider.as_str())
+    };
     let total = match answer {
         QueryAnswer::Bindings { bindings, .. } => bindings.len(),
-        QueryAnswer::Graph { triples } => triples.len(),
+        QueryAnswer::Graph { triples } => triples.iter().filter(visible).count(),
         QueryAnswer::Boolean { .. } => 1,
     };
     let pagination = Pagination::new(options.page, options.max_results, total as u64);
@@ -816,10 +826,17 @@ pub(crate) fn query_page(
             bindings: bindings[start..end].to_vec(),
         },
         QueryAnswer::Graph { triples } => QueryAnswer::Graph {
-            triples: triples[start..end].to_vec(),
+            triples: triples
+                .iter()
+                .filter(visible)
+                .skip(start)
+                .take(end - start)
+                .cloned()
+                .collect(),
         },
         QueryAnswer::Boolean { value } => QueryAnswer::Boolean { value: *value },
     };
+    let answer = answer.project(options.include);
     let output = QueryOutput::new(
         QueryReadResult::Results(Box::new(QueryResult {
             answer,
@@ -891,6 +908,93 @@ mod tests {
     use serde_json::{Value, json};
 
     type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    pub(super) mod dependency_inventory;
+
+    #[test]
+    fn query_pages_project_requested_providers_before_counting_graph_rows() -> TestResult {
+        use rift_protocol::query::{QueryInclude, RdfTerm, RdfTriple};
+        use rift_protocol::read::EdgeProvider;
+        let providers = [
+            EdgeProvider::Engine,
+            EdgeProvider::Lsp,
+            EdgeProvider::Static,
+        ]
+        .into_iter()
+        .collect();
+        let edge = RdfTerm::BlankNode {
+            value: "edge".to_owned(),
+            providers,
+        };
+        let triple = |predicate: &str, object| RdfTriple {
+            subject: edge.clone(),
+            predicate: RdfTerm::Iri {
+                value: format!("urn:rift:vocabulary:{predicate}"),
+            },
+            object,
+        };
+        let mut triples = vec![triple(
+            "to",
+            RdfTerm::Iri {
+                value: "rift://symbol/local/rust/app/callee".to_owned(),
+            },
+        )];
+        triples.extend(["engine", "lsp", "static"].map(|provider| {
+            triple(
+                "provider",
+                RdfTerm::Literal {
+                    value: provider.to_owned(),
+                    datatype: "http://www.w3.org/2001/XMLSchema#string".to_owned(),
+                },
+            )
+        }));
+        let answer = QueryAnswer::Graph { triples };
+        let view = CapturedView {
+            id: rift_protocol::symbol_read::CapturedViewId::parse(&"a".repeat(64))?,
+            expires_at: "2099-01-01T00:00:00Z".to_owned(),
+        };
+        for included in [false, true] {
+            for page in [1, 2] {
+                let output = query_page(
+                    &view,
+                    &answer,
+                    QueryPageOptions {
+                        include: QueryInclude {
+                            providers: included,
+                        },
+                        configuration: &QueryConfiguration::default(),
+                        page,
+                        max_results: 1,
+                        warnings: Vec::new(),
+                        display: QueryDisplay::default(),
+                    },
+                )?;
+                let QueryReadResult::Results(result) = output.result else {
+                    panic!("paged graph")
+                };
+                assert_eq!(result.pagination, Some(Pagination::new(page, 1, 1)));
+                let QueryAnswer::Graph { triples } = &result.answer else {
+                    panic!("graph answer")
+                };
+                assert_eq!(triples.len(), usize::from(page == 1));
+                if page == 1 {
+                    let value = serde_json::to_value(&triples[0])?;
+                    assert!(
+                        value["predicate"]["value"]
+                            .as_str()
+                            .is_some_and(|value| !value.ends_with(":provider"))
+                    );
+                    assert_eq!(
+                        value["subject"].get("providers"),
+                        included
+                            .then(|| json!(["engine", "lsp", "static"]))
+                            .as_ref()
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn query_key_names_normalized_text_revision_and_selection() -> TestResult {
@@ -970,7 +1074,7 @@ mod tests {
             deadline,
             &QueryCancellation::new(),
             &server.local_views,
-            (1, 10),
+            (1, 10, rift_protocol::query::QueryInclude::default()),
             key,
         )?;
         assert!(
@@ -1186,7 +1290,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         crate::server::hermetic_workspace(
             directory.path(),
-            "[languages.toml]\nenabled = false\n[languages.python]\nstdlib = false\n[languages.python.lsp]\nembedded = 'ty'\n",
+            "[global]\nenabled = false\n[languages.toml]\nenabled = false\n[languages.python]\nstdlib = false\n[languages.python.lsp]\nembedded = 'ty'\n",
         )?;
         std::fs::write(
             directory.path().join("pyproject.toml"),
@@ -1201,6 +1305,7 @@ mod tests {
             "from helper import beacon\n\nbeacon()\n\ndef caller() -> int:\n    return beacon() + beacon()\n\ncaller()\n",
         )?;
         let root = directory.path().canonicalize()?;
+        dependency_inventory::observed_python_environment(&root)?;
         let server =
             RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
         let count = server
@@ -1469,14 +1574,14 @@ mod tests {
                         B => (C, 3),
                         _ => return json_response(&json!({"outcome":"unavailable","reason":"insufficient_coverage"})),
                     };
-                    let source = request["include"] == json!({"source": true});
+                    let source = request["include"]["source"] == json!(true);
                     let (seed_symbol, seed_source) = graph_fixture_symbol(seed, source);
                     let (next_symbol, next_source) = graph_fixture_symbol(next, source);
                     let sources = seed_source.into_iter().chain(next_source).collect::<Vec<_>>();
                     let result = json!({
                         "groups": [{"seed":seed,"complete":true,"edges":[{
                             "id": format!("{number:064x}"),
-                            "edge":{"from":seed,"to":next,"kind":facet,"kinds":[facet],"provider": "static", "derivation":"resolution"}
+                            "edge":{"from":seed,"to":next,"kind":facet,"kinds":[facet],"providers": ["static"], "derivation":"resolution"}
                         }]}],
                         "symbols":[seed_symbol,next_symbol],
                         "sources":sources,
@@ -1527,7 +1632,7 @@ mod tests {
                     "groups": [{"seed":seed,"complete":true,"edges":[{
                         "id": format!("{id:064x}"),
                         "edge":{"from":caller,"to":seed,"kind":"calls",
-                            "kinds":["calls"],"provider": "static", "derivation":"resolution"}
+                            "kinds":["calls"],"providers": ["static"], "derivation":"resolution"}
                     }]}],
                     "symbols":[symbol(seed),symbol(caller)],
                     "analyzer_revision":"analyzer-v1","corpus_revision":"corpus-v1",
@@ -1865,7 +1970,10 @@ mod tests {
         );
         let requests = requests.lock().await;
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0]["include"], json!({"source": true}));
+        assert_eq!(
+            requests[0]["include"],
+            json!({"source": true, "providers": true})
+        );
         service.abort();
         Ok(())
     }
@@ -2209,6 +2317,149 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    /// Asserts that whole-inventory and seeded reads of one workspace answer static edges to
+    /// `expected` dependency and standard-library symbols, and that the inventory names
+    /// the edge kinds whose sites static analysis left without a target.
+    async fn assert_external_edges(
+        files: &[(&str, &str)],
+        heritage: &str,
+        expected: &[&str],
+    ) -> TestResult {
+        let directory = tempfile::tempdir()?;
+        crate::server::hermetic_workspace(directory.path(), "")?;
+        for (path, text) in files {
+            let path = directory.path().join(path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, text)?;
+        }
+        let root = directory.path().canonicalize()?;
+        let server =
+            RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
+        let caller = static_endpoint(&server, "encode").await?;
+        let mut answers = String::new();
+        for query in [
+            "SELECT ?a ?b { ?a :calls ?b }".to_owned(),
+            format!("SELECT ?a ?b {{ ?a {heritage} ?b }}"),
+        ] {
+            let output = server
+                .graph_query(QueryParams {
+                    query: query.clone(),
+                    language: QueryLanguage::Sparql,
+                    max_results: 100,
+                    ..Default::default()
+                })
+                .await
+                .map_err(|failure| format!("{failure:?}"))?
+                .0
+                .result;
+            assert!(
+                matches!(&output, QueryReadResult::Results(_)),
+                "{query}: {output:?}"
+            );
+            let rendered = format!("{output:?}");
+            assert!(
+                rendered.contains("EdgeCoverageMissing") && rendered.contains("Calls"),
+                "{query}: {rendered}"
+            );
+            answers.push_str(&rendered);
+        }
+        for target in expected {
+            assert!(answers.contains(target), "{target} not in {answers}");
+        }
+        let target = expected.first().ok_or("an expected target")?;
+        let seeded = server
+            .graph_query(QueryParams {
+                query: format!("ASK {{ <{caller}> :calls <{target}> }}"),
+                language: QueryLanguage::Sparql,
+                ..Default::default()
+            })
+            .await
+            .map_err(|failure| format!("{failure:?}"))?
+            .0
+            .result;
+        assert!(
+            matches!(&seeded, QueryReadResult::Results(result)
+                if matches!(&result.answer, QueryAnswer::Boolean { value: true })),
+            "{caller}: {seeded:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graph_query_serves_rust_edges_to_dependency_and_standard_library_symbols() -> TestResult
+    {
+        let files = [
+            (
+                "Cargo.toml",
+                "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nserde_json = \"1\"\n",
+            ),
+            (
+                "src/lib.rs",
+                "use std::fmt;\npub struct Task;\nimpl fmt::Display for Task {\n    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { Ok(()) }\n}\npub fn encode(task: &Task) -> String { task.label(); serde_json::to_string(&1).unwrap_or_default() }\n",
+            ),
+        ];
+        assert_external_edges(
+            &files,
+            ":implements",
+            &[
+                "rift://symbol/cargo/crates.io/serde_json/rust/serde_json/to_string",
+                "rift://symbol/stdlib/rust/rust/std/fmt/Display",
+            ],
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn graph_query_serves_python_edges_to_dependency_and_standard_library_symbols()
+    -> TestResult {
+        let files = [
+            (
+                "pyproject.toml",
+                "[project]\nname = 'app'\nversion = '0.1.0'\ndependencies = ['greeting==1.0.0']\n[build-system]\nrequires=['setuptools==80.9.0']\nbuild-backend='setuptools.build_meta'\n[tool.setuptools]\npy-modules=['app']\n",
+            ),
+            (
+                "app.py",
+                "import os\nfrom greeting.core import greet, Base\n\nclass Child(Base):\n    pass\n\ndef encode(items):\n    greet()\n    items.sort()\n    return len(os.path.join('a', 'b'))\n",
+            ),
+        ];
+        assert_external_edges(
+            &files,
+            ":extends",
+            &[
+                "rift://symbol/pypi/pypi.org/greeting/python/greeting/core/greet",
+                "rift://symbol/stdlib/cpython/python/builtins/len",
+                "rift://symbol/pypi/pypi.org/greeting/python/greeting/core/Base",
+            ],
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn graph_query_serves_typescript_edges_to_dependency_and_standard_library_symbols()
+    -> TestResult {
+        let files = [
+            (
+                "package.json",
+                "{\"name\":\"app\",\"version\":\"1.0.0\",\"dependencies\":{\"zod\":\"4.6.7\"}}",
+            ),
+            (
+                "src/app.ts",
+                "import { parse, ZodType } from \"zod\";\nexport class Shape implements ZodType {}\nexport function encode() { undeclared(); return parse(1); }\n",
+            ),
+        ];
+        assert_external_edges(
+            &files,
+            ":implements",
+            &[
+                "rift://symbol/npm/npmjs.org/zod/typescript/zod/parse",
+                "rift://symbol/npm/npmjs.org/zod/typescript/zod/ZodType",
+            ],
+        )
+        .await
     }
 
     pub(super) async fn static_endpoint(

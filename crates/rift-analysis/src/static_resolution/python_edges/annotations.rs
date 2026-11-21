@@ -22,8 +22,9 @@ impl<'source> Index<'source> {
         if alternatives.next().is_some() {
             return None;
         }
+        let name = name.split('[').next()?.trim();
         let mut names = name.split('.').map(str::trim);
-        let binding = edge_python_binding(file, names.next()?, annotation.start, work)?;
+        let binding = edge_python_binding(self, file, names.next()?, annotation.start, work)?;
         // Annotation lookup follows declarations and imports only, so cyclic annotations cannot recurse.
         let mut value = self.declaration_value(file, binding, work)?;
         for member in names {
@@ -35,7 +36,7 @@ impl<'source> Index<'source> {
                     let file = self.files.get(self.edge_python.path(&name)?)?;
                     self.export_value(file, member, work)?
                 }
-                Value::Symbol(class) => Value::Symbol(self.python_own_member(class, member)?),
+                Value::Symbol(class) => Value::Symbol(self.python_own_member(class, member, work)?),
                 Value::Instance(_) | Value::Member { .. } => return None,
             };
         }

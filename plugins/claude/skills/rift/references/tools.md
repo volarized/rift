@@ -60,6 +60,7 @@ nothing for it.
 
 Parameters:
 
+- `include` - Attaches the sorted analyses that produced each returned edge.
 - `query` (required) - Query text in `language`.
 - `language` - The language of `query`.
 - `page` - The 1-based page to read.

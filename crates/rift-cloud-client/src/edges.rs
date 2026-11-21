@@ -478,7 +478,7 @@ fn validate_page(
         {
             return Err(invalid("edge projections exceed their page bound"));
         }
-        validate_group(group, &request.edges)?;
+        validate_group(group, &request.edges, request.include)?;
     }
     if i64::try_from(count).map_or(true, |count| count > limit)
         || page.groups.iter().any(|group| !group.complete)
@@ -502,7 +502,11 @@ fn validate_page(
     Ok(())
 }
 
-fn validate_group(group: &EdgeGroup, selection: &EdgeSelection) -> Result<(), RiftError> {
+fn validate_group(
+    group: &EdgeGroup,
+    selection: &EdgeSelection,
+    include: rift_protocol::edge_read::EdgeInclude,
+) -> Result<(), RiftError> {
     let seed = &group.seed;
     for record in &group.occurrences {
         let occurrence = &record.occurrence;
@@ -527,8 +531,17 @@ fn validate_group(group: &EdgeGroup, selection: &EdgeSelection) -> Result<(), Ri
             ));
         }
     }
+    let mut identities = std::collections::BTreeSet::new();
     for record in &group.edges {
         let edge = &record.edge;
+        if !identities.insert(edge.identity()) {
+            return Err(invalid("edge page repeats a merged edge"));
+        }
+        if include.providers == edge.providers.is_empty() {
+            return Err(invalid(
+                "edge providers differ from the requested projection",
+            ));
+        }
         SymbolIdentity::parse(edge.from.as_str())
             .map_err(|_| invalid("edge endpoint is not canonical"))?;
         SymbolIdentity::parse(edge.to.as_str())

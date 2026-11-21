@@ -341,8 +341,8 @@ pub(crate) fn walk_traversal_with_references(
 
 enum TraversalEdge<'edge> {
     Indexed(&'edge IndexedEdge, HopDirection),
-    Confirmed(&'edge IndexedEdge, &'edge GraphHop),
-    Resolved(&'edge GraphHop),
+    Confirmed(&'edge IndexedEdge, Vec<&'edge GraphHop>),
+    Resolved(Vec<&'edge GraphHop>),
 }
 
 impl TraversalEdge<'_> {
@@ -352,7 +352,7 @@ impl TraversalEdge<'_> {
         }
         match self {
             Self::Indexed(edge, _) | Self::Confirmed(edge, _) => kinds.contains(&edge.kind()),
-            Self::Resolved(hop) => hop.edge.kinds.iter().any(|kind| kinds.contains(kind)),
+            Self::Resolved(hops) => hops[0].edge.kinds.iter().any(|kind| kinds.contains(kind)),
         }
     }
 
@@ -360,11 +360,12 @@ impl TraversalEdge<'_> {
         match self {
             Self::Indexed(edge, HopDirection::Outgoing) => Some(edge.to().clone()),
             Self::Indexed(edge, HopDirection::Incoming) => Some(edge.from().clone()),
-            Self::Confirmed(edge, resolved) => match resolved.direction {
+            Self::Confirmed(edge, resolved) => match resolved[0].direction {
                 HopDirection::Outgoing => Some(edge.to().clone()),
                 HopDirection::Incoming => Some(edge.from().clone()),
             },
-            Self::Resolved(hop) => {
+            Self::Resolved(hops) => {
+                let hop = hops[0];
                 let next = match hop.direction {
                     HopDirection::Outgoing => &hop.edge.to,
                     HopDirection::Incoming => &hop.edge.from,
@@ -375,15 +376,21 @@ impl TraversalEdge<'_> {
     }
 
     fn hop(&self) -> GraphHop {
-        match self {
-            Self::Indexed(edge, direction) => graph_hop(edge, *direction),
-            Self::Confirmed(edge, resolved) => {
-                let mut hop = graph_hop(edge, resolved.direction);
-                hop.edge.derivation = resolved.edge.derivation;
-                hop
+        let (mut hop, analyses) = match self {
+            Self::Indexed(edge, direction) => return graph_hop(edge, *direction),
+            Self::Confirmed(edge, analyses) => {
+                let mut hop = graph_hop(edge, analyses[0].direction);
+                hop.edge.derivation = analyses[0].edge.derivation;
+                (hop, analyses)
             }
-            Self::Resolved(hop) => (*hop).clone(),
+            Self::Resolved(analyses) => ((*analyses[0]).clone(), analyses),
+        };
+        for analysis in analyses {
+            if hop.edge.identity() == analysis.edge.identity() {
+                hop.edge.providers.extend(&analysis.edge.providers);
+            }
         }
+        hop
     }
 }
 
@@ -414,10 +421,10 @@ fn combined_edges<'edge>(
         HopDirection::Incoming => edge.from.0.as_str(),
         HopDirection::Outgoing => edge.to.0.as_str(),
     };
-    let mut resolved: BTreeMap<_, _> = engine_hops
-        .iter()
-        .map(|hop| (neighbor(&hop.edge), hop))
-        .collect();
+    let mut resolved = BTreeMap::<_, Vec<_>>::new();
+    for hop in engine_hops {
+        resolved.entry(neighbor(&hop.edge)).or_default().push(hop);
+    }
     let kind = engine_kind(direction);
     let mut edges = Vec::new();
     for edge in stored {
@@ -433,7 +440,11 @@ fn combined_edges<'edge>(
             None => TraversalEdge::Indexed(edge, hop_direction),
         });
     }
-    edges.extend(resolved.into_values().map(TraversalEdge::Resolved));
+    let mut grouped = BTreeMap::<_, Vec<_>>::new();
+    for hop in resolved.into_values().flatten() {
+        grouped.entry(hop.edge.identity()).or_default().push(hop);
+    }
+    edges.extend(grouped.into_values().map(TraversalEdge::Resolved));
     edges
 }
 
@@ -443,7 +454,7 @@ fn combined_edges<'edge>(
 /// kind spelling, the least invented value this lane can honestly report.
 fn graph_hop(edge: &IndexedEdge, direction: HopDirection) -> GraphHop {
     GraphHop {
-        edge: edge.to_protocol(),
+        edge: edge.to_protocol().into(),
         direction,
     }
 }
@@ -1047,7 +1058,9 @@ pub(crate) mod tests {
                 kinds: vec![EdgeKind::References],
                 to: rift_protocol::read::SymbolId(to.to_owned()),
                 occurrence: None,
-                provider: rift_protocol::read::EdgeProvider::Static,
+                providers: std::collections::BTreeSet::from([
+                    rift_protocol::read::EdgeProvider::Static,
+                ]),
                 derivation: EdgeDerivation::Resolution,
                 confidence: None,
                 extensions: Extensions::default(),

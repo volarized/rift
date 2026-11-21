@@ -302,7 +302,7 @@ fn lead_of(hop: &GraphHop) -> Result<Lead, TextError> {
         kinds,
         to: _,
         occurrence: _,
-        provider,
+        providers,
         derivation,
         confidence: _,
         producer,
@@ -334,8 +334,20 @@ fn lead_of(hop: &GraphHop) -> Result<Lead, TextError> {
             producer.name, producer.revision
         )
     });
+    let analyses = if providers.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " (providers: {})",
+            providers
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
     Ok(Lead {
-        text: format!("{BRANCH} {guess}{words} [{}]{produced}", provider.as_ref())
+        text: format!("{BRANCH} {guess}{words}{analyses}{produced}")
             .trim_end()
             .to_owned(),
         by,

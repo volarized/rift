@@ -31,8 +31,17 @@ pub(super) struct InventoryRead {
     pub(super) local: Vec<QueryOccurrence>,
     pub(super) outgoing_references: BTreeMap<SymbolId, Vec<usize>>,
     pub(super) calls: BTreeMap<SymbolId, rift_server::GraphCalls>,
+    packages: Vec<rift_server::PackageEdge>,
+    pub(super) installed: BTreeMap<SymbolId, Arc<super::InstalledTarget>>,
+    pub(super) named_package_symbols: BTreeMap<
+        SymbolId,
+        (
+            rift_protocol::read::Symbol,
+            rift_search::sparql::RevisionIri,
+        ),
+    >,
     pub(super) local_edges: Vec<(SymbolId, SymbolRelation, SymbolId)>,
-    pub(super) edge_facts: Vec<rift_protocol::read::Edge>,
+    pub(super) edge_facts: Vec<rift_protocol::index::StoredEdge>,
     outgoing_edges: BTreeMap<SymbolId, Vec<usize>>,
     incoming_edges: BTreeMap<SymbolId, Vec<usize>>,
     pub(super) warnings: Vec<ReadWarning>,
@@ -378,7 +387,7 @@ impl RiftMcp {
     async fn engine_inventory(
         &self,
         resolved: &ResolvedWorkspace,
-        engines: &rift_server::EnginePool,
+        engines: &Arc<rift_server::EnginePool>,
         inventory: &InventorySelection<'_>,
         end: tokio::time::Instant,
     ) -> Result<Arc<InventoryRead>, RiftError> {
@@ -404,7 +413,7 @@ impl RiftMcp {
     async fn read_engine_inventory(
         &self,
         resolved: &ResolvedWorkspace,
-        engines: &rift_server::EnginePool,
+        engines: &Arc<rift_server::EnginePool>,
         inventory: &InventorySelection<'_>,
         end: tokio::time::Instant,
     ) -> Result<InventoryRead, RiftError> {
@@ -425,10 +434,19 @@ impl RiftMcp {
                 ))
             })
             .await?;
+        let capture = Arc::clone(&reads);
+        let engine_capture = Arc::clone(engines);
+        let roots = self
+            .blocking
+            .run("engine inventory package roots", move || {
+                Ok(rift_server::CalleeRoots::read(&capture, &engine_capture))
+            })
+            .await?;
         let workers = selection.batch_inputs.max(1);
         let requests = stream::iter(files.into_iter().map(|file| {
             let capture = Arc::clone(&reads);
             let confirmations = Arc::clone(&reads);
+            let roots = roots.clone();
             async move {
                 let answer = tokio::time::timeout_at(end, file.read(engines, selection, end))
                     .await
@@ -443,7 +461,7 @@ impl RiftMcp {
                 let inventory = self
                     .blocking
                     .run("engine inventory locations", move || {
-                        answer.resolve(&capture, &rift_server::CalleeRoots::default())
+                        answer.resolve(&capture, &roots)
                     })
                     .await?;
                 Ok(Some(
@@ -464,8 +482,98 @@ impl RiftMcp {
             coverage.admit(&mut read, answer)?;
         }
         coverage.finish(&mut read);
+        self.name_inventory_targets(
+            resolved,
+            engines,
+            roots.clone(),
+            &mut read,
+            end,
+            selection.occurrences.is_some(),
+        )
+        .await?;
         read.report_missing();
         Ok(read)
+    }
+
+    async fn name_inventory_targets(
+        &self,
+        resolved: &ResolvedWorkspace,
+        engines: &Arc<rift_server::EnginePool>,
+        roots: rift_server::CalleeRoots,
+        read: &mut InventoryRead,
+        end: tokio::time::Instant,
+        physical: bool,
+    ) -> Result<(), RiftError> {
+        let mut walk = super::AdjacencyWalk::new(
+            self,
+            resolved,
+            None,
+            rift_search::sparql::AdjacencyStep {
+                kind: EdgeKind::Calls,
+                direction: TraversalDirection::Outgoing,
+            },
+            GraphLimits::default(),
+            RequestDeadline {
+                at: end,
+                budget: end.saturating_duration_since(tokio::time::Instant::now()),
+            },
+        );
+        walk.local = Some((Arc::clone(engines), roots));
+        let mut added = 0usize;
+        for (seed, calls) in &mut read.calls {
+            let before = calls.record_count();
+            walk.name_package_calls(calls, true).await?;
+            let after = calls.record_count();
+            added = added
+                .checked_add(after.saturating_sub(before))
+                .ok_or_else(coverage_failure)?;
+            if !calls.complete {
+                read.missing.calls.insert(seed.clone());
+            }
+        }
+        read.charge(added)?;
+        let packages = std::mem::take(&mut read.packages);
+        let mut grouped = BTreeMap::<EdgeKind, Vec<rift_server::PackageEdge>>::new();
+        for package in packages {
+            grouped.entry(package.kind).or_default().push(package);
+        }
+        for (kind, targets) in grouped {
+            let callees = targets
+                .iter()
+                .map(|target| target.target.clone())
+                .collect::<Vec<_>>();
+            let named = walk.name_package_targets(&callees, kind, true).await?;
+            for (target, identity) in targets.into_iter().zip(named) {
+                let Some(identity) = identity else {
+                    continue;
+                };
+                let edge = target.named(identity);
+                if kind == EdgeKind::References
+                    && let Some(source) = edge.occurrence.clone()
+                {
+                    let occurrence = QueryOccurrence {
+                        target: edge.to.clone(),
+                        enclosing: Some(edge.from.clone()),
+                        source,
+                        kind,
+                    };
+                    if physical {
+                        read.admit_occurrences(&edge.to, vec![occurrence])?;
+                    } else {
+                        read.admit_references(&edge.to, vec![occurrence])?;
+                    }
+                } else {
+                    read.admit_edge(edge.from.clone(), relation(kind)?, edge.to.clone());
+                }
+                read.edge_facts.push(edge);
+            }
+        }
+        walk.verify_installed().await?;
+        read.partial |= walk.acquired.partial;
+        read.extend_warnings(walk.acquired.warnings);
+        read.installed = walk.acquired.installed;
+        read.named_package_symbols = walk.acquired.named_package_symbols;
+        Ok(())
     }
 
     pub(super) async fn inventory_for_kind(
@@ -553,6 +661,15 @@ impl EngineCoverage {
     ) -> Result<(), RiftError> {
         match answer {
             Ok(Some(answer)) => {
+                read.partial |= answer.warnings.iter().any(|warning| {
+                    matches!(
+                        warning,
+                        ReadWarning::EdgeCoverageMissing { .. }
+                            | ReadWarning::EngineAnalysisUnavailable { .. }
+                    )
+                });
+                read.charge(answer.packages.len())?;
+                read.packages.extend(answer.packages);
                 read.extend_warnings(answer.warnings);
                 for (seed, calls) in answer.calls {
                     self.calls
@@ -613,107 +730,4 @@ impl EngineCoverage {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use rift_protocol::read::{SourceUnitId, SourceUnitSpan, TextRange};
-
-    fn references() -> (SymbolId, Vec<QueryOccurrence>) {
-        let target = SymbolId("rift://symbol/local/rust/test/target".to_owned());
-        let caller = SymbolId("rift://symbol/local/rust/test/caller".to_owned());
-        let occurrences = [10, 30]
-            .into_iter()
-            .map(|start| QueryOccurrence {
-                target: target.clone(),
-                enclosing: Some(caller.clone()),
-                source: SourceUnitSpan {
-                    unit: SourceUnitId("rift://source/project/lib.rs".to_owned()),
-                    range: TextRange {
-                        start,
-                        end: start + 6,
-                    },
-                },
-                kind: EdgeKind::References,
-            })
-            .collect();
-        (target, occurrences)
-    }
-
-    #[test]
-    fn reference_pairs_charge_each_caller_once() {
-        let (target, occurrences) = references();
-        let mut read = InventoryRead {
-            records: GraphLimits::default().triples_max() - 1,
-            ..InventoryRead::default()
-        };
-        read.admit_references(&target, occurrences)
-            .expect("two occurrences of one pair fit one remaining record");
-        assert_eq!(read.local_edges.len(), 1);
-        assert_eq!(read.local.len(), 1);
-        assert_eq!(read.records, GraphLimits::default().triples_max());
-    }
-
-    #[test]
-    fn occurrence_reads_keep_each_reference_range() {
-        let (target, occurrences) = references();
-        let mut read = InventoryRead::default();
-        read.admit_occurrences(&target, occurrences)
-            .expect("physical references");
-        let starts: Vec<_> = read
-            .local
-            .iter()
-            .map(|occurrence| occurrence.source.range.start)
-            .collect();
-        assert_eq!(starts, vec![10, 30]);
-        assert_eq!(read.local_edges.len(), 1);
-        assert_eq!(read.records, 2);
-    }
-
-    #[test]
-    fn repeated_reference_provider_records_cannot_exceed_the_inventory_bound() {
-        use rift_protocol::read::{Edge, EdgeDerivation, EdgeProvider, ExactKind, Extensions};
-        let (target, occurrences) = references();
-        let edges = occurrences
-            .iter()
-            .map(|occurrence| Edge {
-                from: occurrence.enclosing.clone().expect("caller"),
-                to: target.clone(),
-                kind: ExactKind("references".to_owned()),
-                kinds: vec![EdgeKind::References],
-                occurrence: Some(occurrence.source.clone()),
-                provider: EdgeProvider::Lsp,
-                derivation: EdgeDerivation::Resolution,
-                confidence: None,
-                producer: None,
-                extensions: Extensions::default(),
-            })
-            .collect();
-        let mut read = InventoryRead {
-            records: GraphLimits::default().triples_max() - 1,
-            ..InventoryRead::default()
-        };
-        let answer = rift_server::EngineInventory {
-            calls: Vec::new(),
-            references: vec![(
-                target,
-                rift_server::GraphReferences {
-                    occurrences,
-                    edges,
-                    complete: true,
-                    edge_warnings: Vec::new(),
-                },
-            )],
-            types: Vec::new(),
-            heritage: Vec::new(),
-            warnings: Vec::new(),
-        };
-        let result = EngineCoverage::default().admit(&mut read, Ok(Some(answer)));
-        assert!(
-            result.is_err(),
-            "two retained provider records cannot fit one remaining record"
-        );
-        assert!(
-            read.edge_facts.is_empty(),
-            "reject before retaining the over-budget records"
-        );
-    }
-}
+mod tests;

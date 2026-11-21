@@ -4,16 +4,39 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 
-use super::macros::{Condition, configured, tokens};
+use super::macros::{Condition, configured_with_flags, tokens};
 use crate::NamespaceInput;
+
+pub(crate) fn valid_flags(flags: &[&str]) -> bool {
+    flags.iter().all(|flag| {
+        let Some(tokens) = tokens(flag) else {
+            return false;
+        };
+        if tokens.concat() != *flag {
+            return false;
+        }
+        match tokens.as_slice() {
+            [name] => super::crate_name_is_valid(name),
+            [name, "=", value] => {
+                super::crate_name_is_valid(name)
+                    && value.starts_with('"')
+                    && value.ends_with('"')
+                    && !value.contains('\\')
+            }
+            _ => false,
+        }
+    })
+}
 
 pub(crate) struct Configurations<'input> {
     manifests: BTreeMap<&'input str, Option<Features>>,
+    captured: Option<(&'input str, BTreeSet<&'input str>)>,
     depth: usize,
 }
 
 pub(crate) struct Configuration<'input> {
     features: Option<&'input Features>,
+    flags: Option<&'input BTreeSet<&'input str>>,
     depth: usize,
 }
 
@@ -22,6 +45,41 @@ struct Manifest {
     package: Option<toml::Table>,
     #[serde(default)]
     features: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    dependencies: toml::Table,
+    #[serde(default)]
+    target: toml::Table,
+}
+
+impl Manifest {
+    /// Declared features plus the implicit feature of each optional dependency that no
+    /// feature names with `dep:`, as Cargo defines them.
+    fn declared_features(self) -> BTreeMap<String, Vec<String>> {
+        let mut features = self.features;
+        let targets = self
+            .target
+            .values()
+            .filter_map(|target| target.get("dependencies")?.as_table());
+        let optional = std::iter::once(&self.dependencies)
+            .chain(targets)
+            .flat_map(|dependencies| dependencies.iter())
+            .filter(|(_, dependency)| {
+                dependency
+                    .get("optional")
+                    .and_then(toml::Value::as_bool)
+                    .unwrap_or(false)
+            })
+            .map(|(name, _)| name.clone())
+            .collect::<BTreeSet<_>>();
+        for name in optional {
+            let explicit = format!("dep:{name}");
+            if features.values().flatten().any(|value| *value == explicit) {
+                continue;
+            }
+            features.entry(name).or_insert_with(|| vec![explicit]);
+        }
+        features
+    }
 }
 
 struct Features {
@@ -78,14 +136,22 @@ impl<'input> Configurations<'input> {
             {
                 continue;
             }
-            let features = metadata.map(|metadata| Features::new(metadata.features));
+            let features = metadata.map(|metadata| Features::new(metadata.declared_features()));
             manifests
                 .entry(parent)
                 .and_modify(|features| *features = None)
                 .or_insert(features);
         }
+        let captured = input.rust_configuration().map(|(manifest, flags)| {
+            let parent = manifest
+                .as_str()
+                .rsplit_once('/')
+                .map_or("", |(parent, _)| parent);
+            (parent, flags.iter().copied().collect())
+        });
         Self {
             manifests,
+            captured,
             depth: input.syntax().syntax_depth_max(),
         }
     }
@@ -97,12 +163,18 @@ impl<'input> Configurations<'input> {
             if let Some(features) = self.manifests.get(directory) {
                 return Configuration {
                     features: features.as_ref(),
+                    flags: self
+                        .captured
+                        .as_ref()
+                        .filter(|(parent, _)| *parent == directory)
+                        .map(|(_, flags)| flags),
                     depth: self.depth,
                 };
             }
             if directory.is_empty() {
                 return Configuration {
                     features: None,
+                    flags: None,
                     depth: self.depth,
                 };
             }
@@ -146,12 +218,28 @@ impl Configuration<'_> {
         self.value(value, self.depth)
     }
 
+    /// The value of one `cfg` predicate under this configuration, unknown when unsure.
+    pub(crate) fn condition(&self, predicate: &[&str]) -> Option<bool> {
+        self.predicate(predicate, self.depth)
+    }
+
     fn predicate(&self, input: &[&str], depth: usize) -> Option<bool> {
         // Static collection uses the normal Cargo build, with test code disabled.
-        // Platform and custom flags remain unknown; only declared defaults are known.
-        match configured(input, true, depth, &|literal| {
-            self.features.as_ref()?.contains(literal)
-        })? {
+        // Complete captured flags decide only the build they were supplied for.
+        // Otherwise platform and custom flags remain unknown.
+        match configured_with_flags(
+            input,
+            true,
+            depth,
+            &|literal| self.features.as_ref()?.contains(literal),
+            &|atom| {
+                if atom.iter().any(|token| token.contains('\\')) {
+                    return None;
+                }
+                self.flags
+                    .map(|flags| flags.contains(atom.concat().as_str()))
+            },
+        )? {
             Condition::Known(value) => Some(value),
             Condition::Unknown => None,
         }
@@ -229,6 +317,50 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
+    fn test_rust_captured_configuration_stays_with_its_manifest() {
+        let manifest = rift_core::ProjectPath::new("Cargo.toml").expect("manifest");
+        let nested = rift_core::ProjectPath::new("nested/Cargo.toml").expect("nested manifest");
+        let source = rift_core::ProjectPath::new("src/lib.rs").expect("source");
+        let files = [crate::PackageSource::new(&source, "pub struct Item;")];
+        let context = [
+            crate::PackageSource::new(
+                &manifest,
+                "[package]\nname='fixture'\nversion='0.1.0'\n[features]\nstd=[]\n",
+            ),
+            crate::PackageSource::new(&nested, "[package]\nname='nested'\nversion='0.1.0'\n"),
+        ];
+        let language = rift_syntax::ShippedLanguage::Rust.language();
+        let flags = ["custom", "feature=\"std\""];
+        let input = crate::NamespaceInput::project(
+            &rift_protocol::identity::SymbolOwner::Local,
+            &language,
+            &files,
+            &context,
+            &[],
+            crate::ExactPackageLimits::new(10, 65_536),
+        )
+        .expect("input")
+        .with_rust_configuration(&manifest, &flags)
+        .expect("flags");
+        let configurations = super::Configurations::new(&input);
+        for (path, attribute, expected) in [
+            ("src/lib.rs", "#[cfg(custom)]", Some(true)),
+            ("src/lib.rs", "#[cfg(feature=\"std\")]", Some(true)),
+            ("src/lib.rs", "#[cfg(absent)]", Some(false)),
+            ("nested/src/lib.rs", "#[cfg(custom)]", None),
+            ("nested/src/lib.rs", "#[cfg(feature=\"std\")]", None),
+            ("src/lib.rs", "#[cfg(key=\"a\\nb\")]", None),
+            ("src/lib.rs", "#[cfg(not(custom = invalid))]", None),
+        ] {
+            assert_eq!(
+                configurations.file(path).attribute(attribute),
+                expected,
+                "{path}: {attribute}"
+            );
+        }
+    }
+
+    #[test]
     fn test_rust_configuration_combines_known_defaults_and_unknown_flags() {
         let declared = BTreeMap::from([
             ("default".to_owned(), vec!["std".to_owned()]),
@@ -238,6 +370,7 @@ mod tests {
         let features = Features::new(declared);
         let configuration = Configuration {
             features: Some(&features),
+            flags: None,
             depth: 32,
         };
         for (attribute, expected) in [

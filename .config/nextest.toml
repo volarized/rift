@@ -117,6 +117,12 @@ junit.store-success-output = true
 filter = 'binary(=corpus_fastapi) & test(=test_fastapi_corpus)'
 slow-timeout = { period = "240s", terminate-after = 1, grace-period = "30s" }
 
+# The Zod floor case indexes 125 TypeScript files in an unoptimized build: 55 to 80 s
+# measured on a loaded host.
+[[profile.corpus.overrides]]
+filter = 'binary(=corpus_zod) & test(=test_zod_static_collection_floors)'
+slow-timeout = { period = "300s", terminate-after = 1, grace-period = "30s" }
+
 [[profile.corpus.overrides]]
 filter = 'binary(=corpus_bun) & test(=test_bun_workspace)'
 slow-timeout = { period = "600s", terminate-after = 1, grace-period = "30s" }

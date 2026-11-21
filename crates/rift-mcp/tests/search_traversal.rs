@@ -723,7 +723,10 @@ async fn live_walk(
             client,
             tool_request(
                 "search_retrieval",
-                &json!({"traversal": {"seed": seed, "direction": direction, "kinds": kinds}}),
+                &json!({
+                    "traversal": {"seed": seed, "direction": direction, "kinds": kinds},
+                    "include": {"providers": true},
+                }),
             ),
         )
         .await?;
@@ -758,12 +761,20 @@ fn direct_incoming(hit: &Value, seed: &str) -> TestResult<Value> {
     Ok(hop["edge"].clone())
 }
 
+/// Whether a merged edge, read with `include.providers`, names `provider` among its
+/// producers (D29: the singular `provider` field left the wire).
+fn provided_by(edge: &Value, provider: &str) -> bool {
+    edge["providers"]
+        .as_array()
+        .is_some_and(|providers| providers.iter().any(|name| name == provider))
+}
+
 /// Each incoming neighbor is a reference the language server resolved.
 fn assert_direct_incoming(answer: &Value, seed: &str) -> TestResult {
     for hit in results(answer) {
         let edge = direct_incoming(&hit, seed)?;
         assert_eq!(edge["kinds"], json!(["references"]), "{hit}");
-        assert_eq!(edge["provider"], json!("lsp"), "{hit}");
+        assert!(provided_by(&edge, "lsp"), "{hit}");
         eprintln!("live incoming edge: {edge}");
     }
     Ok(())
@@ -780,14 +791,17 @@ async fn assert_static_incoming(
         client,
         tool_request(
             "search_retrieval",
-            &json!({"traversal": {"seed": seed, "direction": "incoming"}}),
+            &json!({
+                "traversal": {"seed": seed, "direction": "incoming"},
+                "include": {"providers": true},
+            }),
         ),
     )
     .await?;
     let mut reached = Vec::new();
     for hit in results(&answer) {
         let edge = direct_incoming(&hit, seed)?;
-        assert_eq!(edge["provider"], json!("static"), "{hit}");
+        assert!(provided_by(&edge, "static"), "{hit}");
         let name = hit["hit"]["symbol"]["name"].as_str().unwrap_or_default();
         let kind = edge["kind"].as_str().unwrap_or_default();
         assert_eq!(edge["kinds"], json!([kind]), "{hit}");
@@ -2274,10 +2288,11 @@ async fn search_traversal_outgoing_over_an_unavailable_global_api_drops_package_
     Ok(())
 }
 
-/// An unnamed runtime target does not invalidate a separately established local call.
-/// Partial rows name missing provider coverage; negative answers still require it.
+/// Captured runtime sources name targets without a global collection, beside local calls.
+/// Known calls support negative answers; uncaptured continuations remain incomplete.
 #[tokio::test]
-async fn search_calls_prove_local_witness_when_a_runtime_target_has_no_collection() -> TestResult {
+async fn search_calls_keep_local_and_captured_runtime_targets_without_a_global_collection()
+-> TestResult {
     let configuration = format!("[global]\nenabled = false\n{OUTGOING_ENGINE}");
     let (_directory, client, _server_task) = workspace_client::served_prepared_workspace(
         OUTGOING_FILES,
@@ -2300,7 +2315,7 @@ async fn search_calls_prove_local_witness_when_a_runtime_target_has_no_collectio
             "{answer}"
         );
     }
-    let rows = call_retrying_acceptance(
+    let answer = call_retrying_acceptance(
         &client,
         tool_request(
             "search",
@@ -2308,26 +2323,37 @@ async fn search_calls_prove_local_witness_when_a_runtime_target_has_no_collectio
         ),
     )
     .await?;
+    let targets = workspace_client::query::rows(&answer)?
+        .iter()
+        .map(|row| workspace_client::query::iri(row, "t"))
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
     assert_eq!(
-        rows["answer"]["bindings"],
-        json!([{"t":{"type":"iri","value":leaf}}]),
-        "{rows}"
+        targets,
+        std::collections::BTreeSet::from([
+            leaf.as_str(),
+            "rift://symbol/stdlib/cpython/python/builtins/len"
+        ]),
+        "{answer}"
     );
-    assert!(
-        rows["warnings"].as_array().is_some_and(|warnings| warnings
-            .iter()
-            .any(|warning| warning["code"] == "edge_coverage_missing")),
-        "{rows}"
+    let absent = call_retrying_acceptance(
+        &client,
+        tool_request("search", &json!({"query":format!("ASK {{ <{caller}> :calls <rift://symbol/local/python/absent> }}")})),
+    )
+    .await?;
+    assert_eq!(
+        absent["answer"],
+        json!({"result":"boolean","value":false}),
+        "{absent}"
     );
-    for query in [
-        format!("ASK {{ <{caller}> :calls <rift://symbol/local/python/absent> }}"),
-        format!("ASK {{ <{caller}> :calls ?t FILTER NOT EXISTS {{ ?t :calls ?other }} }}"),
-    ] {
-        let answer =
-            call_retrying_acceptance(&client, tool_request("search", &json!({"query":query})))
-                .await?;
-        assert_eq!(answer["reason"], "insufficient_coverage", "{answer}");
-    }
+    let continuation = call_retrying_acceptance(
+        &client,
+        tool_request("search", &json!({"query":format!("ASK {{ <{caller}> :calls ?t FILTER NOT EXISTS {{ ?t :calls ?other }} }}")})),
+    )
+    .await?;
+    assert_eq!(
+        continuation["reason"], "insufficient_coverage",
+        "{continuation}"
+    );
     client.cancel().await?;
     Ok(())
 }

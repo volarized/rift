@@ -115,6 +115,7 @@ fn search() -> TestResult<Value> {
         )
     };
     Ok(serde_json::to_value(QueryParams {
+        include: rift_protocol::query::QueryInclude::default(),
         query: format!(
             "PREFIX : <{}> PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> SELECT ?symbol ?source ?path ?name WHERE {{ {} UNION {} }} ORDER BY ?path ?symbol",
             rift_search::sparql::VOCABULARY_NAMESPACE,
@@ -295,6 +296,7 @@ async fn require_profile_source_scope(
     client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
 ) -> TestResult {
     let arguments = serde_json::to_value(QueryParams {
+        include: rift_protocol::query::QueryInclude::default(),
         query:
             "PREFIX : <urn:rift:vocabulary:> SELECT ?symbol { ?symbol a :Symbol; :language 'toml' }"
                 .to_owned(),

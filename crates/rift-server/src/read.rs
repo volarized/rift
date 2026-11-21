@@ -421,6 +421,13 @@ impl ReadService {
         })
     }
 
+    /// Sites static analysis left without a target, counted per edge kind. A whole-inventory
+    /// edge read reports them, since its rows cannot name those targets.
+    #[must_use]
+    pub fn static_targets_omitted(&self) -> &BTreeMap<rift_protocol::read::EdgeKind, u64> {
+        self.index.static_targets_omitted()
+    }
+
     /// Whether a configured engine serves a captured source language.
     #[must_use]
     pub fn uses_edge_engines(&self, engines: &crate::EnginePool) -> bool {
@@ -837,6 +844,21 @@ impl ReadService {
     /// Returns the immutable workspace index this snapshot serves.
     pub(crate) const fn index(&self) -> &WorkspaceIndex {
         &self.index
+    }
+
+    /// Builds what the first read of this snapshot builds: the declaration inventory,
+    /// the symbol view, and the documentation layer of its index.
+    ///
+    /// The publication that completes preparation calls this before it is published.
+    pub fn prepare_reads(&self) {
+        self.index.prepare_reads();
+    }
+
+    /// Whether the declaration inventory, the symbol view, and the documentation layer of
+    /// this snapshot's index are built.
+    #[must_use]
+    pub fn reads_prepared(&self) -> bool {
+        self.index.reads_prepared()
     }
 
     pub(crate) fn engine_revision(&self) -> &str {
@@ -3077,7 +3099,7 @@ pub(crate) mod tests {
             "to": symbol.id,
             "kind": symbol.kind,
             "kinds": ["calls"],
-            "provider": "static", "derivation": "syntax"
+            "providers": ["static"], "derivation": "syntax"
         });
         assert!(serde_json::from_value::<rift_protocol::read::Edge>(edge.clone()).is_ok());
         edge["to"] = json!(raw_address);

@@ -7613,7 +7613,7 @@ done
             failing_call(&json!({"query": "ASK {}", "path": "src/lib.rs"}), "search").await?;
         let text = assert_error_result(&result, "invalid_request")?;
         assert!(
-            text.contains("accepted language, max_results, page, query, revision"),
+            text.contains("accepted include, language, max_results, page, query, revision"),
             "{text}"
         );
         assert!(text.contains("tool search"), "{text}");
@@ -12068,6 +12068,7 @@ done
 
         let query = |terms: &str, selector: &str| {
             server.search_query(Parameters(QueryParams {
+                include: rift_protocol::query::QueryInclude::default(),
                 language: QueryLanguage::Sparql,
                 page: 1, max_results: 10, revision: None,
                 query: format!(

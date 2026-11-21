@@ -1530,7 +1530,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "No lane populates part of the edge coverage the traversal asked for, so the\nwalk had nothing to follow there whatever the graph holds. The warning states that a\nlane is absent; it never states that the seed has no such neighbor. An empty answer\ncarrying it means the walk could not run; an empty answer without it means the walk\nran and the seed has no neighbor under the request.",
+                "description": "Part of the edge coverage the read asked for is missing: no lane populates it, so\nthe walk had nothing to follow there whatever the graph holds, or static analysis\nleft sites whose targets it could not name, such as a dependency or standard-library\nowner it did not find. The warning states that coverage is absent; it never states\nthat the seed has no such neighbor. An empty answer carrying it means the read could\nnot see those edges; an empty answer without it means the read ran and the seed has\nno neighbor under the request.",
                 "properties": {
                   "code": {
                     "const": "edge_coverage_missing",
@@ -4850,7 +4850,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "No lane populates part of the edge coverage the traversal asked for, so the\nwalk had nothing to follow there whatever the graph holds. The warning states that a\nlane is absent; it never states that the seed has no such neighbor. An empty answer\ncarrying it means the walk could not run; an empty answer without it means the walk\nran and the seed has no neighbor under the request.",
+                "description": "Part of the edge coverage the read asked for is missing: no lane populates it, so\nthe walk had nothing to follow there whatever the graph holds, or static analysis\nleft sites whose targets it could not name, such as a dependency or standard-library\nowner it did not find. The warning states that coverage is absent; it never states\nthat the seed has no such neighbor. An empty answer carrying it means the read could\nnot see those edges; an empty answer without it means the read ran and the seed has\nno neighbor under the request.",
                 "properties": {
                   "code": {
                     "const": "edge_coverage_missing",
@@ -6276,6 +6276,22 @@
       "description": "Performs search across the index using a query language. `language` names the query\nlanguage and defaults to `sparql`.\nA query over the captured inventory answers from partly covered facts, and `warnings`\nname the files, languages, or engines left out. A query whose answer needs every fact - an empty\nresult, a false `ASK`, a count, a negation, an `OPTIONAL` - answers `unavailable` with\n`insufficient_coverage` instead. A bound never makes an answer unavailable: a file a bound\nleft out of the index is outside the indexed set, and a producer or acquisition bound ends\nthe answer with the rows it reached; the server logs the bound, and `warnings` carry\nnothing for it.",
       "input_schema": {
         "$defs": {
+          "QueryInclude": {
+            "additionalProperties": false,
+            "description": "Optional projections of a query answer. An omitted member is `false`.",
+            "examples": [
+              {
+                "providers": true
+              }
+            ],
+            "properties": {
+              "providers": {
+                "description": "Attaches `providers` to merged edge terms and call steps. Explicit SPARQL\nselections and filters on `:provider` retain the stored producer facts.",
+                "type": "boolean"
+              }
+            },
+            "type": "object"
+          },
           "QueryLanguage": {
             "description": "The query language the server evaluates.",
             "oneOf": [
@@ -6311,9 +6327,19 @@
           {
             "language": "sparql",
             "query": "ASK { ?symbol a :Symbol; :name 'ReadService' }"
+          },
+          {
+            "include": {
+              "providers": true
+            },
+            "query": "SELECT ?edge { ?caller :calls ?callee . ?edge a :Edge; :from ?caller; :to ?callee }"
           }
         ],
         "properties": {
+          "include": {
+            "$ref": "#/$defs/QueryInclude",
+            "description": "Attaches the sorted analyses that produced each returned edge."
+          },
           "language": {
             "$ref": "#/$defs/QueryLanguage",
             "default": "sparql",
@@ -6690,6 +6716,26 @@
               {
                 "const": "binds",
                 "description": "The source binds a name or value to the target.",
+                "type": "string"
+              }
+            ]
+          },
+          "EdgeProvider": {
+            "description": "Which analysis produced an edge.",
+            "oneOf": [
+              {
+                "const": "engine",
+                "description": "A language engine embedded in Rift, such as ty.",
+                "type": "string"
+              },
+              {
+                "const": "lsp",
+                "description": "A language server reached through LSP.",
+                "type": "string"
+              },
+              {
+                "const": "static",
+                "description": "Static analysis captured into the index.",
                 "type": "string"
               }
             ]
@@ -7188,6 +7234,14 @@
                 "additionalProperties": false,
                 "description": "A blank node identity within the retained answer.",
                 "properties": {
+                  "providers": {
+                    "description": "Sorted analyses for an edge or call step, present when `include.providers` is `true`.",
+                    "items": {
+                      "$ref": "#/$defs/EdgeProvider"
+                    },
+                    "type": "array",
+                    "uniqueItems": true
+                  },
                   "type": {
                     "const": "blank_node",
                     "type": "string"
@@ -7956,7 +8010,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "No lane populates part of the edge coverage the traversal asked for, so the\nwalk had nothing to follow there whatever the graph holds. The warning states that a\nlane is absent; it never states that the seed has no such neighbor. An empty answer\ncarrying it means the walk could not run; an empty answer without it means the walk\nran and the seed has no neighbor under the request.",
+                "description": "Part of the edge coverage the read asked for is missing: no lane populates it, so\nthe walk had nothing to follow there whatever the graph holds, or static analysis\nleft sites whose targets it could not name, such as a dependency or standard-library\nowner it did not find. The warning states that coverage is absent; it never states\nthat the seed has no such neighbor. An empty answer carrying it means the read could\nnot see those edges; an empty answer without it means the read ran and the seed has\nno neighbor under the request.",
                 "properties": {
                   "code": {
                     "const": "edge_coverage_missing",

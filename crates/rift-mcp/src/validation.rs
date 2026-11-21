@@ -4541,6 +4541,16 @@ fn prepare_initial_batch(
         epoch,
         &cancelled,
     )?;
+    if batch.complete {
+        // The complete publication is read as soon as it is published. What its first
+        // read builds is built here, on this worker, and not under that read's deadline.
+        if cancelled() {
+            return errors::server::read_cancelled().fail();
+        }
+        rift_tracing::traced!(component = "index", operation = "index.prepare_reads", {
+            candidate.reads.prepare_reads();
+        });
+    }
     if batch.complete
         && !complete_preparation_matches(
             &batch.root,
@@ -9955,6 +9965,31 @@ pub(crate) mod tests {
         let fields: serde_json::Value = serde_json::from_str(last.fields())?;
         assert_eq!(fields["prepared"], total.to_string(), "{fields}");
         assert_eq!(fields["total"], total.to_string(), "{fields}");
+        Ok(())
+    }
+
+    /// The complete publication holds what its first read builds; the builds run during
+    /// preparation, before the publication.
+    #[tokio::test]
+    async fn the_complete_publication_holds_what_its_first_read_builds() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        fs::write(root.join("lib.rs"), "/// Beacon.\npub fn beacon() {}\n")?;
+        fs::write(root.join("other.rs"), "pub fn lantern() {}\n")?;
+        let (context, _invalidations) = initial_preparation_context(root)?;
+        let empty = Arc::clone(&context.published.read().await.current);
+        assert!(
+            !empty.reads.reads_prepared(),
+            "a publication before the complete one builds on its first read, as before"
+        );
+        let initial = super::discover_initial_workspace(&context)
+            .await?
+            .ok_or("initial discovery was cancelled")?;
+        super::prepare_initial_workspace_from(&context, initial).await?;
+        let complete = Arc::clone(&context.published.read().await.current);
+        assert!(complete.preparation.is_none());
+        assert!(complete.reads.reads_prepared());
+        assert_eq!(declarations_named(&complete, "beacon")?, 1);
         Ok(())
     }
 

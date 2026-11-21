@@ -859,69 +859,6 @@
         }
       ]
     },
-    "Edge": {
-      "additionalProperties": false,
-      "description": "One directed edge between two symbols. Its occurrence is where it was read from, and its\nderivation is how much the provider knew when it was read.",
-      "properties": {
-        "confidence": {
-          "description": "How likely a `heuristic` edge is to hold, from 0 to 1. Absent for any other\nderivation.",
-          "format": "double",
-          "maximum": 1,
-          "minimum": 0,
-          "type": "number"
-        },
-        "derivation": {
-          "$ref": "#/$defs/EdgeDerivation",
-          "description": "How this edge was established."
-        },
-        "extensions": {
-          "$ref": "#/$defs/Extensions",
-          "default": {},
-          "description": "Edge facts the model has no field for, namespaced by the provider that emitted them.\nAbsent when empty."
-        },
-        "from": {
-          "$ref": "#/$defs/SymbolId",
-          "description": "The symbol the edge starts at."
-        },
-        "kind": {
-          "$ref": "#/$defs/ExactKind",
-          "description": "What the edge is in this provider's vocabulary, such as `import`, `use`, or\n`implements`."
-        },
-        "kinds": {
-          "description": "Portable classification, so a query for `imports` finds local kinds such as `import`\nand `use` alike.",
-          "items": {
-            "$ref": "#/$defs/EdgeKind"
-          },
-          "minItems": 1,
-          "type": "array"
-        },
-        "occurrence": {
-          "$ref": "#/$defs/SourceUnitSpan",
-          "description": "Exact physical occurrence when this edge was read from source, independent of\nwhether the provider supplied a source syntax element."
-        },
-        "producer": {
-          "$ref": "#/$defs/FactProducer",
-          "description": "The external producer that emitted the edge, named by a package publication that\ncarries its facts. Absent for an edge Rift's own analysis produced."
-        },
-        "provider": {
-          "$ref": "#/$defs/EdgeProvider",
-          "description": "Which analysis produced this edge."
-        },
-        "to": {
-          "$ref": "#/$defs/SymbolId",
-          "description": "The symbol the edge points at. One Rift cannot read carries the `external` origin;\nthe edge is the same either way."
-        }
-      },
-      "required": [
-        "from",
-        "kind",
-        "kinds",
-        "to",
-        "provider",
-        "derivation"
-      ],
-      "type": "object"
-    },
     "EdgeCoverage": {
       "additionalProperties": false,
       "description": "Coverage of one edge kind within a selected language.",
@@ -1115,11 +1052,6 @@
       "description": "Which analysis produced an edge.",
       "oneOf": [
         {
-          "const": "static",
-          "description": "Static analysis captured into the index.",
-          "type": "string"
-        },
-        {
           "const": "engine",
           "description": "A language engine embedded in Rift, such as ty.",
           "type": "string"
@@ -1127,6 +1059,11 @@
         {
           "const": "lsp",
           "description": "A language server reached through LSP.",
+          "type": "string"
+        },
+        {
+          "const": "static",
+          "description": "Static analysis captured into the index.",
           "type": "string"
         }
       ]
@@ -2213,6 +2150,69 @@
       ],
       "type": "object"
     },
+    "StoredEdge": {
+      "additionalProperties": false,
+      "description": "One producer row retained in a package publication.",
+      "properties": {
+        "confidence": {
+          "description": "How likely a `heuristic` edge is to hold, from 0 to 1. Absent for any other\nderivation.",
+          "format": "double",
+          "maximum": 1,
+          "minimum": 0,
+          "type": "number"
+        },
+        "derivation": {
+          "$ref": "#/$defs/EdgeDerivation",
+          "description": "How this edge was established."
+        },
+        "extensions": {
+          "$ref": "#/$defs/Extensions",
+          "default": {},
+          "description": "Edge facts the model has no field for, namespaced by the provider that emitted them.\nAbsent when empty."
+        },
+        "from": {
+          "$ref": "#/$defs/SymbolId",
+          "description": "The symbol the edge starts at."
+        },
+        "kind": {
+          "$ref": "#/$defs/ExactKind",
+          "description": "What the edge is in this provider's vocabulary, such as `import`, `use`, or\n`implements`."
+        },
+        "kinds": {
+          "description": "Portable classification, so a query for `imports` finds local kinds such as `import`\nand `use` alike.",
+          "items": {
+            "$ref": "#/$defs/EdgeKind"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "occurrence": {
+          "$ref": "#/$defs/SourceUnitSpan",
+          "description": "Exact physical occurrence when this edge was read from source, independent of\nwhether the provider supplied a source syntax element."
+        },
+        "producer": {
+          "$ref": "#/$defs/FactProducer",
+          "description": "The external producer that emitted the edge, named by a package publication that\ncarries its facts. Absent for an edge Rift's own analysis produced."
+        },
+        "provider": {
+          "$ref": "#/$defs/EdgeProvider",
+          "description": "Which analysis produced this edge."
+        },
+        "to": {
+          "$ref": "#/$defs/SymbolId",
+          "description": "The symbol the edge points at. One Rift cannot read carries the `external` origin;\nthe edge is the same either way."
+        }
+      },
+      "required": [
+        "from",
+        "kind",
+        "kinds",
+        "to",
+        "provider",
+        "derivation"
+      ],
+      "type": "object"
+    },
     "SymbolId": {
       "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.",
       "examples": [
@@ -2772,7 +2772,7 @@
     "edges": {
       "description": "Normalized edges, preserving their source occurrences and derivation. An\nedge an external producer wrote names it in `producer`.",
       "items": {
-        "$ref": "#/$defs/Edge"
+        "$ref": "#/$defs/StoredEdge"
       },
       "type": "array"
     },
