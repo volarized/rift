@@ -47,6 +47,9 @@ pub(super) struct EdgePythonKinds {
     guards: guards::TypeGuards,
     return_type: u16,
     loops: [u16; 2],
+    /// Compound statements and clauses a class body may define methods under.
+    conditional: [u16; 6],
+    block: u16,
 }
 
 pub(super) fn edge_python_kinds() -> &'static EdgePythonKinds {
@@ -112,6 +115,15 @@ pub(super) fn edge_python_kinds() -> &'static EdgePythonKinds {
             guards: guards::TypeGuards::new(&grammar),
             return_type: field("return_type"),
             loops: [id("for_statement"), id("while_statement")],
+            conditional: [
+                id("if_statement"),
+                id("elif_clause"),
+                id("else_clause"),
+                id("try_statement"),
+                id("except_clause"),
+                id("finally_clause"),
+            ],
+            block: id("block"),
         }
     })
 }
@@ -389,7 +401,15 @@ impl EdgePythonKinds {
             }
             parent = parent.parent()?;
         }
-        let class = parent.parent()?.syntax_element();
+        // A method defined under `if`, `try` and their clauses still belongs to the class body.
+        let mut owner = parent.parent()?;
+        while self.conditional.contains(&owner.syntax_element().kind_id()) {
+            owner = owner.parent()?;
+            if owner.syntax_element().kind_id() == self.block {
+                owner = owner.parent()?;
+            }
+        }
+        let class = owner.syntax_element();
         (class.kind_id() == self.definitions[1])
             .then(|| class.child_by_field_id(self.name.get()))
             .flatten()
