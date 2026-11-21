@@ -13,10 +13,10 @@
 //! The smaller file grows until one analysis takes [`SMALL_RUN_MIN`] of CPU time or reaches
 //! the same source, syntax element or calibration bound as before.
 //!
-//! One aggregate case walks every registered provider under the single test deadline it has
-//! on main; wide-syntax-element cases also measure one provider each, and a registry coverage
-//! test requires a case for every shipped language and dialect.
-//! Attached-document cases walk [`registry::providers`] and select supported shapes.
+//! The wide-syntax-element case and the attached-document case walk [`registry::providers`], so
+//! every shipped language and dialect joins them once [`wide_line`] and [`attached_run`] name
+//! it, and a failure names the provider's language. `.config/nextest.toml` runs this suite
+//! alone, so a per-provider copy of the wide case would add its whole time to the run.
 
 use std::time::Duration;
 
@@ -24,8 +24,7 @@ use cpu_time::ProcessTime;
 use rift_core::ProjectPath;
 use rift_protocol::read::Language;
 use rift_syntax::{
-    MarkdownSyntaxProvider, SyntaxDocument, SyntaxLimits, SyntaxProvider, SyntaxSource,
-    language::ShippedLanguage, registry,
+    MarkdownSyntaxProvider, SyntaxDocument, SyntaxLimits, SyntaxProvider, SyntaxSource, registry,
 };
 
 /// How many times larger the larger file of each shape is.
@@ -249,24 +248,9 @@ fn analyze_linearly(
     (document.expect("at least one measured run"), lines)
 }
 
-fn assert_wide_provider(language: ShippedLanguage) {
-    let language = language.language();
-    let provider = registry::provider_for_language(&language).expect("registered provider");
-    let line = wide_line(&language);
-    let build = |count| line.repeat(count);
-    let (document, lines) = analyze_linearly(provider, build, WIDE_SYNTAX_ELEMENT_LINES_MIN);
-    assert!(
-        document.syntax_elements().len() > lines,
-        "every generated line must reach the walk as a syntax_element: language={language:?}, \
-         syntax_elements={}, lines={lines}",
-        document.syntax_elements().len(),
-    );
-}
-
 /// The aggregate case from main: every registered provider inside one test deadline and one
 /// [`AGGREGATE_CPU_MAX`] of process CPU, so the whole wide-syntax-element proof keeps the bound
-/// it always had. The per-provider cases in
-/// [`wide_providers`] name the provider that fails.
+/// it always had. Its assertions name the provider's language that fails.
 #[test]
 fn every_provider_reads_a_syntax_element_with_many_children_in_linear_time() {
     let start = ProcessTime::try_now().expect("the process CPU clock must be available");
@@ -290,61 +274,6 @@ fn every_provider_reads_a_syntax_element_with_many_children_in_linear_time() {
         "every provider's wide syntax element proof must fit the aggregate bound in process CPU \
          time: spent={spent:?}, bound={AGGREGATE_CPU_MAX:?}"
     );
-}
-
-mod wide_providers {
-    use std::collections::BTreeSet;
-
-    use super::{ShippedLanguage, assert_wide_provider, registry};
-
-    macro_rules! cases {
-        ($($case:ident => $language:ident),+ $(,)?) => {
-            const LANGUAGES: &[ShippedLanguage] = &[$(ShippedLanguage::$language),+];
-
-            $(#[test]
-            fn $case() {
-                assert_wide_provider(ShippedLanguage::$language);
-            })+
-        };
-    }
-
-    cases! {
-        rust => Rust,
-        javascript => JavaScript,
-        typescript => TypeScript,
-        typescript_tsx => TypeScriptTsx,
-        markdown => Markdown,
-        json => Json,
-        yaml => Yaml,
-        toml => Toml,
-        python => Python,
-        html => Html,
-        html_angular => HtmlAngular,
-        css => Css,
-        vue => Vue,
-        svelte => Svelte,
-        c => C,
-        cpp => Cpp,
-        cython => Cython,
-        jsonc => Jsonc,
-    }
-
-    #[test]
-    fn cases_cover_every_registered_provider() {
-        let registered = registry::shipped_languages()
-            .map(|(definition, _)| definition.shipped())
-            .collect::<BTreeSet<_>>();
-        let cases = LANGUAGES.iter().copied().collect::<BTreeSet<_>>();
-        assert_eq!(
-            LANGUAGES.len(),
-            registered.len(),
-            "cases must not repeat a provider"
-        );
-        assert_eq!(
-            cases, registered,
-            "every registered provider needs a complexity case"
-        );
-    }
 }
 
 #[test]
