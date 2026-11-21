@@ -4,16 +4,17 @@ use rift_error::{RiftError, errors};
 use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::Node;
 
-pub(super) fn record(
-    root: Node<'_>,
+pub(super) fn record<'tree>(
+    root: Node<'tree>,
     source: SyntaxSource<'_>,
     limits: SyntaxLimits,
     kinds: &EcmaScriptKinds,
     bindings: &mut BTreeMap<usize, SyntaxExportBinding>,
-) -> Result<(), RiftError> {
+) -> Result<Vec<Node<'tree>>, RiftError> {
     let mut pending = vec![(root, 0_usize)];
     let mut blocked = BTreeSet::new();
-    let mut replaced = BTreeSet::new();
+    // Scope of each `module.exports = value`, with the end of its last write there.
+    let mut replaced: BTreeMap<usize, usize> = BTreeMap::new();
     let mut assignments = Vec::new();
     let mut visited = 0_usize;
     let mut cursor = root.walk();
@@ -44,7 +45,8 @@ pub(super) fn record(
                 == Some("module.exports")
                 && let Some(scope) = lexical_scope(syntax_element)
             {
-                replaced.insert(scope.id());
+                let end = replaced.entry(scope.id()).or_default();
+                *end = (*end).max(syntax_element.end_byte());
             }
         }
         if visited
@@ -61,19 +63,50 @@ pub(super) fn record(
             (child, depth + 1)
         });
     }
-    for syntax_element in assignments {
+    for &syntax_element in &assignments {
         if !module_execution(syntax_element, &blocked) {
             continue;
         }
         let Some(binding) = assignment(syntax_element, source.text, kinds)? else {
             continue;
         };
-        if binding.kind == SyntaxExportKind::Named && !module_execution(syntax_element, &replaced) {
+        if binding.kind == SyntaxExportKind::Named
+            && !kept_after_replacement(syntax_element, source.text, &replaced)
+        {
             continue;
         }
         bindings.insert(syntax_element.id(), binding);
     }
-    Ok(())
+    Ok(assignments)
+}
+
+/// Whether a named export survives every `module.exports = value` of the scopes around it.
+///
+/// A replacement written later replaces the object the name was added to. One written
+/// earlier is the object `module.exports.name = ...` adds to; `exports` no longer names
+/// it, so `exports.name = ...` after it exports nothing. `module.exports.default` keeps
+/// colliding with the default slot the replacement writes.
+fn kept_after_replacement(
+    syntax_element: Node<'_>,
+    source: &str,
+    replaced: &BTreeMap<usize, usize>,
+) -> bool {
+    let through_module = syntax_element
+        .child_by_field_name("left")
+        .and_then(|left| source.get(left.byte_range()))
+        .is_some_and(|left| {
+            left.starts_with("module.exports.") && left != "module.exports.default"
+        });
+    let mut scope = syntax_element;
+    while let Some(parent) = scope.parent() {
+        if let Some(&end) = replaced.get(&parent.id())
+            && (!through_module || end > syntax_element.start_byte())
+        {
+            return false;
+        }
+        scope = parent;
+    }
+    true
 }
 
 fn receiver(text: &str) -> bool {
@@ -208,16 +241,41 @@ fn assignment(
         return Ok(None);
     };
     let range = extract::byte_range(syntax_element)?;
+    if let Some((property, function)) = kinds.export_function(syntax_element, source) {
+        // A named function assigned to `module.exports` is declared under its own name.
+        let written = (target == ExportTarget::Module)
+            .then(|| kinds.child(function, EcmaScriptGrammarField::Name))
+            .flatten();
+        let name = extract::byte_range(written.unwrap_or(property))?;
+        return Ok(Some(SyntaxExportBinding {
+            kind: if target == ExportTarget::Property {
+                SyntaxExportKind::Named
+            } else {
+                SyntaxExportKind::Default
+            },
+            range,
+            local: Some(name),
+            exported: (target == ExportTarget::Property).then_some(name),
+            source: None,
+            container: None,
+            type_only: false,
+        }));
+    }
     if target == ExportTarget::Property {
-        let Some((property, _)) = kinds.export_function(syntax_element, source) else {
+        // `exports.name = local` exports the declaration the local name binds.
+        let property = kinds.child(left, EcmaScriptGrammarField::Property);
+        let value = kinds.child(syntax_element, EcmaScriptGrammarField::Right);
+        let Some((property, value)) = property
+            .filter(|property| property.kind_id() == kinds.property_identifier)
+            .zip(value.filter(|value| value.kind_id() == kinds.identifier))
+        else {
             return Ok(None);
         };
-        let name = extract::byte_range(property)?;
         return Ok(Some(SyntaxExportBinding {
             kind: SyntaxExportKind::Named,
             range,
-            local: Some(name),
-            exported: Some(name),
+            local: Some(extract::byte_range(value)?),
+            exported: Some(extract::byte_range(property)?),
             source: None,
             container: None,
             type_only: false,
@@ -226,6 +284,19 @@ fn assignment(
     let Some(value) = kinds.child(syntax_element, EcmaScriptGrammarField::Right) else {
         return Ok(None);
     };
+    if value.kind_id() == kinds.identifier {
+        // `module.exports = name` exports the declaration the name binds, as
+        // `export default name` does.
+        return Ok(Some(SyntaxExportBinding {
+            kind: SyntaxExportKind::Default,
+            range,
+            local: Some(extract::byte_range(value)?),
+            exported: None,
+            source: None,
+            container: None,
+            type_only: false,
+        }));
+    }
     if value.kind() != "call_expression"
         || value
             .child_by_field_name("function")

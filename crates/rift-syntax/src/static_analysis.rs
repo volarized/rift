@@ -32,6 +32,17 @@ pub struct StaticReference {
     pub role: rift_core::ReferenceRole,
 }
 
+/// One member expression with its original receiver and property spans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticMember {
+    /// Complete member expression.
+    pub range: ByteRange,
+    /// Receiver expression.
+    pub receiver: ByteRange,
+    /// Literal property name; computed properties remain unknown.
+    pub member: Option<ByteRange>,
+}
+
 /// Syntactic form of the callee in a captured call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaticCallee {
@@ -92,6 +103,14 @@ pub enum StaticBindingKind {
         module: ByteRange,
         /// Named property, or absent for the module value.
         export: Option<ByteRange>,
+    },
+    /// A type a JavaScript documentation comment imports from another module; it names
+    /// that module's export where a type is written and is no value.
+    JavaScriptTypeImport {
+        /// Unquoted module specifier.
+        module: ByteRange,
+        /// Imported name.
+        export: ByteRange,
     },
     /// A local variable initialized directly by a constructor.
     JavaScriptInstance {
@@ -214,13 +233,75 @@ pub struct StaticConditionalItem {
     pub attribute: ByteRange,
 }
 
+/// One simple parameter of function-like syntax, by position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticParameter {
+    /// The function, method, signature or function type that declares the parameter.
+    pub function: ByteRange,
+    /// Name of the declaration that function belongs to, when it has one.
+    pub owner: Option<ByteRange>,
+    /// Zero-based position in the parameter list.
+    pub index: u32,
+    /// The parameter's name.
+    pub name: ByteRange,
+}
+
+/// One named type a function's declared return type writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticDeclaredReturn {
+    /// Name of the declaration the function belongs to.
+    pub owner: ByteRange,
+    /// The function or signature that writes the return type.
+    pub function: ByteRange,
+    /// The member of an inline object type this entry types; absent for the whole type.
+    pub member: Option<ByteRange>,
+    /// The named type written for the return value or for that member.
+    pub annotation: ByteRange,
+}
+
+/// The written place that types a function value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaticFunctionContext {
+    /// The function initializes the declaration with this name.
+    Initializer(ByteRange),
+    /// The function is an argument of a call.
+    Argument {
+        /// Complete invocation range.
+        call: ByteRange,
+        /// Zero-based argument position.
+        index: u32,
+    },
+    /// The function is returned by this enclosing function.
+    Returned(ByteRange),
+}
+
 /// Collections retained by static syntax capture.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StaticFactsParts {
+    /// Whether ECMAScript syntax requires module interpretation without an explicit mode.
+    pub javascript_module_syntax: bool,
     /// Value accesses and type references.
     pub references: Vec<StaticReference>,
+    /// Receiver and property spans for member expressions.
+    pub members: Vec<StaticMember>,
     /// Declaration names and their explicit named type annotations.
     pub declared_types: Vec<(ByteRange, ByteRange)>,
+    /// Type declaration names whose own shape is a signature: a call signature or
+    /// function type (`false`), or a construct signature or constructor type (`true`).
+    pub type_signatures: Vec<(ByteRange, bool)>,
+    /// Simple parameters of functions, signatures and function types.
+    pub parameters: Vec<StaticParameter>,
+    /// Declaration names whose written type is a function type, with that type.
+    pub function_types: Vec<(ByteRange, ByteRange)>,
+    /// Function-like syntax and the named type its return annotation writes.
+    pub return_types: Vec<(ByteRange, ByteRange)>,
+    /// Function values and the written place that types them.
+    pub function_contexts: Vec<(ByteRange, StaticFunctionContext)>,
+    /// Declared return types by the name of the declaration the function belongs to.
+    pub declared_returns: Vec<StaticDeclaredReturn>,
+    /// Names bound from a call: the bound name, the key it is destructured by (absent when
+    /// the name takes the whole result) and the call.
+    pub destructured: Vec<(ByteRange, Option<ByteRange>, ByteRange)>,
     /// Runtime function expressions and their enclosing value ranges.
     pub function_values: Vec<(ByteRange, ByteRange)>,
     /// Function expressions that establish their own receiver.
@@ -237,6 +318,19 @@ pub struct StaticFactsParts {
     pub reexports: Vec<StaticReexport>,
     /// Assignment targets.
     pub assignments: Vec<ByteRange>,
+    /// Name and member targets of assignments whose value is a function written in place.
+    pub function_writes: Vec<ByteRange>,
+    /// Declaration names whose written type is an array, with the named element type.
+    pub element_types: Vec<(ByteRange, ByteRange)>,
+    /// Declarations whose function writes an array return type, with the named element
+    /// type: the owning declaration's name and the element type.
+    pub element_returns: Vec<(ByteRange, ByteRange)>,
+    /// Functions written as members of an object literal, with that literal: `this` inside
+    /// them is the literal.
+    pub object_members: Vec<(ByteRange, ByteRange)>,
+    /// What each `return` of a function returns, by the name of the declaration the
+    /// function belongs to: the object literal it returns, or none for any other value.
+    pub returned_objects: Vec<(ByteRange, Option<ByteRange>)>,
     /// Scopes with unsupported binding shapes.
     pub unsupported_bindings: Vec<ByteRange>,
     /// Rust use paths.
@@ -263,15 +357,70 @@ pub struct StaticFactsParts {
 pub struct StaticFacts(StaticFactsParts);
 
 impl StaticFacts {
+    /// Whether captured ECMAScript syntax requires module interpretation without an explicit mode.
+    #[must_use]
+    pub fn has_javascript_module_syntax(&self) -> bool {
+        self.0.javascript_module_syntax
+    }
+
     /// Captured value accesses and type references.
     #[must_use]
     pub fn references(&self) -> &[StaticReference] {
         &self.0.references
     }
+
+    /// Captured member expressions with their original receiver and property spans.
+    #[must_use]
+    pub fn members(&self) -> &[StaticMember] {
+        &self.0.members
+    }
     /// Declaration names and their explicit named type annotations.
     #[must_use]
     pub fn declared_types(&self) -> &[(ByteRange, ByteRange)] {
         &self.0.declared_types
+    }
+
+    /// Type declarations whose own shape is a call (`false`) or construct (`true`) signature.
+    #[must_use]
+    pub fn type_signatures(&self) -> &[(ByteRange, bool)] {
+        &self.0.type_signatures
+    }
+
+    /// Simple parameters of functions, signatures and function types, by position.
+    #[must_use]
+    pub fn parameters(&self) -> &[StaticParameter] {
+        &self.0.parameters
+    }
+
+    /// Declaration names whose written type is a function type, with that type.
+    #[must_use]
+    pub fn function_types(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.function_types
+    }
+
+    /// Function-like syntax and the named type its return annotation writes.
+    #[must_use]
+    pub fn return_types(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.return_types
+    }
+
+    /// Function values and the written place that types them.
+    #[must_use]
+    pub fn function_contexts(&self) -> &[(ByteRange, StaticFunctionContext)] {
+        &self.0.function_contexts
+    }
+
+    /// Declared return types by the name of the declaration the function belongs to.
+    #[must_use]
+    pub fn declared_returns(&self) -> &[StaticDeclaredReturn] {
+        &self.0.declared_returns
+    }
+
+    /// Names bound from a call: the bound name, the key it is destructured by (absent when
+    /// the name takes the whole result) and the call.
+    #[must_use]
+    pub fn destructured(&self) -> &[(ByteRange, Option<ByteRange>, ByteRange)] {
+        &self.0.destructured
     }
 
     /// Runtime function expressions and their enclosing value ranges.
@@ -337,6 +486,36 @@ impl StaticFacts {
         &self.0.assignments
     }
 
+    /// Name and member targets of assignments whose value is a function written in place.
+    #[must_use]
+    pub fn function_writes(&self) -> &[ByteRange] {
+        &self.0.function_writes
+    }
+
+    /// Declaration names written with an array type, and the named element type.
+    #[must_use]
+    pub fn element_types(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.element_types
+    }
+
+    /// Declarations whose function returns a written array type, and its element type.
+    #[must_use]
+    pub fn element_returns(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.element_returns
+    }
+
+    /// Functions written as members of an object literal, and the literal.
+    #[must_use]
+    pub fn object_members(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.object_members
+    }
+
+    /// What each `return` of a function returns: the object literal, or none.
+    #[must_use]
+    pub fn returned_objects(&self) -> &[(ByteRange, Option<ByteRange>)] {
+        &self.0.returned_objects
+    }
+
     /// Scopes where an unsupported binding can affect lookup.
     #[must_use]
     pub fn unsupported_bindings(&self) -> &[ByteRange] {
@@ -388,7 +567,15 @@ impl StaticFacts {
     pub(crate) fn retained_bytes(&self) -> usize {
         [
             vector_capacity(&self.0.references),
+            vector_capacity(&self.0.members),
             vector_capacity(&self.0.declared_types),
+            vector_capacity(&self.0.type_signatures),
+            vector_capacity(&self.0.parameters),
+            vector_capacity(&self.0.function_types),
+            vector_capacity(&self.0.return_types),
+            vector_capacity(&self.0.function_contexts),
+            vector_capacity(&self.0.declared_returns),
+            vector_capacity(&self.0.destructured),
             vector_capacity(&self.0.function_values),
             vector_capacity(&self.0.function_scopes),
             vector_capacity(&self.0.static_blocks),
@@ -397,6 +584,11 @@ impl StaticFacts {
             vector_capacity(&self.0.bindings),
             vector_capacity(&self.0.reexports),
             vector_capacity(&self.0.assignments),
+            vector_capacity(&self.0.function_writes),
+            vector_capacity(&self.0.element_types),
+            vector_capacity(&self.0.element_returns),
+            vector_capacity(&self.0.object_members),
+            vector_capacity(&self.0.returned_objects),
             vector_capacity(&self.0.unsupported_bindings),
             vector_capacity(&self.0.inherent_impls),
             vector_capacity(&self.0.rust_uses),
@@ -427,7 +619,15 @@ impl StaticFacts {
     fn validate_counts(&self, limits: &SyntaxLimits) -> Result<(), RiftError> {
         let lengths = [
             self.references().len(),
+            self.members().len(),
             self.declared_types().len(),
+            self.type_signatures().len(),
+            self.parameters().len(),
+            self.function_types().len(),
+            self.return_types().len(),
+            self.function_contexts().len(),
+            self.declared_returns().len(),
+            self.destructured().len(),
             self.function_values().len(),
             self.function_scopes().len(),
             self.static_blocks().len(),
@@ -436,6 +636,11 @@ impl StaticFacts {
             self.bindings().len(),
             self.reexports().len(),
             self.assignments().len(),
+            self.function_writes().len(),
+            self.element_types().len(),
+            self.element_returns().len(),
+            self.object_members().len(),
+            self.returned_objects().len(),
             self.unsupported_bindings().len(),
             self.inherent_impls().len(),
             self.rust_uses().len(),
@@ -493,6 +698,59 @@ impl StaticFacts {
         imports && conditional
     }
 
+    /// Whether the facts that connect function values and bound names to written types
+    /// hold source ranges.
+    fn typed_values_valid(&self, valid: impl Fn(ByteRange) -> bool + Copy) -> bool {
+        self.parameters().iter().all(|parameter| {
+            valid(parameter.function) && valid(parameter.name) && parameter.owner.is_none_or(valid)
+        }) && self
+            .function_types()
+            .iter()
+            .chain(self.return_types())
+            .all(|(name, written)| valid(*name) && valid(*written))
+            && self.declared_returns().iter().all(|declared| {
+                valid(declared.owner)
+                    && valid(declared.function)
+                    && valid(declared.annotation)
+                    && declared.member.is_none_or(valid)
+            })
+            && self
+                .destructured()
+                .iter()
+                .all(|(name, key, call)| valid(*name) && key.is_none_or(valid) && valid(*call))
+            && self.function_contexts().iter().all(|(function, context)| {
+                valid(*function)
+                    && match context {
+                        StaticFunctionContext::Initializer(range)
+                        | StaticFunctionContext::Returned(range)
+                        | StaticFunctionContext::Argument { call: range, .. } => valid(*range),
+                    }
+            })
+    }
+
+    /// Whether assignment targets, array element types and object literal members hold
+    /// source ranges.
+    fn written_values_valid(&self, valid: impl Fn(ByteRange) -> bool + Copy) -> bool {
+        self.assignments()
+            .iter()
+            .chain(self.function_writes())
+            .copied()
+            .all(valid)
+            && self
+                .element_types()
+                .iter()
+                .chain(self.element_returns())
+                .all(|(name, element)| valid(*name) && valid(*element))
+            && self
+                .object_members()
+                .iter()
+                .all(|(function, object)| valid(*function) && contains(*object, *function))
+            && self
+                .returned_objects()
+                .iter()
+                .all(|(owner, object)| valid(*owner) && object.is_none_or(valid))
+    }
+
     pub(crate) fn validate(&self, source: &str, limits: SyntaxLimits) -> Result<(), RiftError> {
         self.validate_counts(&limits)?;
         let valid = |range: ByteRange| {
@@ -535,8 +793,18 @@ impl StaticFacts {
         let declared_types = self
             .declared_types()
             .iter()
-            .all(|(name, annotation)| valid(*name) && valid(*annotation));
-        let assignments = self.assignments().iter().copied().all(valid);
+            .all(|(name, annotation)| valid(*name) && valid(*annotation))
+            && self.type_signatures().iter().all(|(name, _)| valid(*name))
+            && self.typed_values_valid(valid);
+        let assignments = self.written_values_valid(valid);
+        let members = self.members().iter().all(|member| {
+            valid(member.range)
+                && valid(member.receiver)
+                && member.range.encloses(member.receiver)
+                && member.member.is_none_or(|name| {
+                    valid(name) && member.range.encloses(name) && member.receiver.end <= name.start
+                })
+        });
         let unsupported = self.unsupported_bindings().iter().copied().all(valid);
         let implementations = self.inherent_impls().iter().all(|row| {
             valid(row.range) && valid(row.type_path) && contains(row.range, row.type_path)
@@ -556,6 +824,7 @@ impl StaticFacts {
             && bindings
             && reexports
             && assignments
+            && members
             && unsupported
             && implementations
             && rust
@@ -598,6 +867,9 @@ impl StaticBinding {
             } => valid(module) && export.is_none_or(&valid) && valid(require),
             StaticBindingKind::JavaScriptEdgeNamespace { module }
             | StaticBindingKind::PythonModule { module } => valid(module),
+            StaticBindingKind::JavaScriptTypeImport { module, export } => {
+                valid(module) && valid(export)
+            }
             StaticBindingKind::JavaScriptInstance { constructor }
             | StaticBindingKind::PythonInstance { constructor } => valid(constructor),
             StaticBindingKind::PythonReceiver { class_name } => valid(class_name),
@@ -637,7 +909,7 @@ fn vector_capacity<T>(items: &Vec<T>) -> usize {
 
 enum Grammar {
     Python(&'static python_edges::EdgePythonKinds),
-    JavaScript(&'static javascript::Kinds),
+    JavaScript(&'static javascript::Kinds, javascript::Documentation),
     Rust(&'static rust::Kinds, rift_core::LoopBudget),
 }
 
@@ -651,7 +923,7 @@ pub(crate) struct Capture<'source> {
 impl<'source> Capture<'source> {
     pub(crate) fn for_javascript(source: &'source str) -> Self {
         Self {
-            grammar: Grammar::JavaScript(javascript::kinds()),
+            grammar: Grammar::JavaScript(javascript::kinds(), javascript::Documentation::default()),
             edge_heritage: heritage_edges::edge_javascript_kinds(),
             source,
             facts: StaticFacts::default(),
@@ -663,7 +935,10 @@ impl<'source> Capture<'source> {
         dialect: crate::typescript::TypeScriptDialect,
     ) -> Self {
         Self {
-            grammar: Grammar::JavaScript(javascript::edge_typescript_kinds(dialect)),
+            grammar: Grammar::JavaScript(
+                javascript::edge_typescript_kinds(dialect),
+                javascript::Documentation::default(),
+            ),
             edge_heritage: heritage_edges::edge_typescript_kinds(dialect),
             source,
             facts: StaticFacts::default(),
@@ -701,13 +976,21 @@ impl<'source> Capture<'source> {
         {
             kinds.record_error(visited, &mut self.facts.0)?;
         }
-        if syntax_element.is_missing() || syntax_element.is_extra() {
+        if syntax_element.is_missing() {
+            return Ok(());
+        }
+        if syntax_element.is_extra() {
+            if let Grammar::JavaScript(kinds, documentation) = &mut self.grammar {
+                kinds.record_comment(visited, self.source, documentation, &mut self.facts.0)?;
+            }
             return Ok(());
         }
         self.edge_heritage.record_edge(visited, &mut self.facts.0)?;
         match &mut self.grammar {
             Grammar::Python(kinds) => kinds.record_edge(visited, self.source, &mut self.facts.0),
-            Grammar::JavaScript(kinds) => kinds.record(visited, self.source, &mut self.facts.0),
+            Grammar::JavaScript(kinds, documentation) => {
+                kinds.record(visited, self.source, documentation, &mut self.facts.0)
+            }
             Grammar::Rust(kinds, budget) => {
                 kinds.record(visited, self.source, &mut self.facts.0, budget)
             }
@@ -782,4 +1065,47 @@ fn call(
         callee_range: byte_range(callee)?,
         callee: shape,
     })
+}
+
+#[cfg(test)]
+mod javascript_member_tests {
+    use super::{StaticFacts, StaticFactsParts, StaticMember};
+    use crate::{ByteRange, SyntaxLimits};
+
+    #[test]
+    fn test_javascript_member_restore_checks_original_spans() {
+        let source = "value /* note */ . field";
+        let range = ByteRange { start: 0, end: 24 };
+        let receiver = ByteRange { start: 0, end: 5 };
+        let member = ByteRange { start: 19, end: 24 };
+        let parts = |receiver, member| StaticFactsParts {
+            members: vec![StaticMember {
+                range,
+                receiver,
+                member,
+            }],
+            ..StaticFactsParts::default()
+        };
+        let checked = StaticFacts::from_parts(
+            source,
+            SyntaxLimits::default(),
+            parts(receiver, Some(member)),
+        )
+        .expect("original spans");
+        assert_eq!(checked.members()[0].receiver, receiver);
+        for invalid in [range, ByteRange { start: 24, end: 25 }] {
+            assert!(
+                StaticFacts::from_parts(
+                    source,
+                    SyntaxLimits::default(),
+                    parts(invalid, Some(member))
+                )
+                .is_err()
+            );
+        }
+        let limits = SyntaxLimits::new(100, 1, 10).expect("limits");
+        let mut oversized = parts(receiver, None);
+        oversized.members.push(oversized.members[0]);
+        assert!(StaticFacts::from_parts(source, limits, oversized).is_err());
+    }
 }
