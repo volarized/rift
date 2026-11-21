@@ -312,8 +312,17 @@ fn test_python_bare_decorators_store_calls() {
         index
             .edges()
             .edges()
-            .filter(|edge| edge.kind().as_ref() == "calls")
+            .filter(|edge| edge.kind().as_ref() == "calls"
+                && edge.to().as_str().starts_with("rift://symbol/local/"))
             .all(|edge| edge.to().as_str() == "rift://symbol/local/python/main/decorate")
+    );
+    // `@property` calls the standard-library builtin, never a local declaration (D23).
+    assert!(
+        index
+            .edges()
+            .edges()
+            .any(|edge| edge.kind().as_ref() == "calls"
+                && edge.to().as_str() == "rift://symbol/stdlib/cpython/python/builtins/property")
     );
     assert!(index.edges().is_complete());
 }

@@ -1424,14 +1424,25 @@ fn test_rust_trait_path_calls_select_the_argument_implementation() {
         "/Reader/debug",
         "/Inner/fmt"
     ));
-    for from in ["/Reader/pointer", "/Reader/unknown"] {
-        assert!(
-            !index
-                .edges()
-                .edges()
-                .any(|edge| edge.kind() == EdgeKind::Calls && edge.from().as_str().ends_with(from)),
-            "{from}"
-        );
+    // No local implementation answers them; the trait method itself is a standard-library
+    // target (D23), spelled through `use std::fmt`.
+    for (from, spelled) in [
+        (
+            "/Reader/pointer",
+            "rift://symbol/stdlib/rust/rust/std/fmt/Pointer/fmt",
+        ),
+        (
+            "/Reader/unknown",
+            "rift://symbol/stdlib/rust/rust/std/fmt/Display/fmt",
+        ),
+    ] {
+        let calls = index
+            .edges()
+            .edges()
+            .filter(|edge| edge.kind() == EdgeKind::Calls && edge.from().as_str().ends_with(from))
+            .map(|edge| edge.to().as_str().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(calls, [spelled], "{from}");
     }
 }
 
