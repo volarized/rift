@@ -5,13 +5,64 @@ use std::collections::{BTreeMap, BTreeSet};
 use rift_core::SymbolId as CoreSymbolId;
 use rift_protocol::identity::SymbolIdentity;
 use rift_protocol::read::{
-    EdgeKind, SourceUnitId, SourceUnitSpan, SymbolId, TextRange, TraversalDirection,
+    EdgeKind, ReadWarning, SourceUnitId, SourceUnitSpan, SymbolId, TextRange, TraversalDirection,
 };
 
 use crate::ReadService;
 use crate::traversal::TRAVERSAL_SYMBOLS_MAX;
 
 use super::{CallCorroboration, CallDestination, CallProvider, GraphCalls};
+
+/// The engine references one confirmation read for each callee, kept for the other callers
+/// of the same read.
+///
+/// A callee's references answer the same for every caller, so callers that share a callee
+/// read its references once instead of once each: the read is linear in callers and callees,
+/// not in their product. A failed read is not kept, so the next caller asks again.
+#[derive(Default)]
+pub(super) struct TargetReferences {
+    reports: BTreeMap<SymbolId, TargetReport>,
+}
+
+/// The parts of one callee's engine references that a confirmation reads.
+struct TargetReport {
+    positions: BTreeMap<CallKey, SourceUnitSpan>,
+    edge_warnings: Vec<ReadWarning>,
+}
+
+impl TargetReferences {
+    /// The callee's references, read from the engine only the first time a caller asks.
+    async fn read(
+        &mut self,
+        reads: &ReadService,
+        engines: &crate::EnginePool,
+        target: &SymbolId,
+        deadline: tokio::time::Instant,
+    ) -> Option<&TargetReport> {
+        if !self.reports.contains_key(target) {
+            // This read contains only engine observations, never captured references.
+            let report = Box::pin(super::engine_graph_references(
+                reads, engines, target, false, deadline,
+            ))
+            .await
+            .ok()?;
+            let positions = report
+                .occurrences
+                .into_iter()
+                .filter(|occurrence| occurrence.target == *target)
+                .map(|occurrence| (call_key(&occurrence.source), occurrence.source))
+                .collect();
+            self.reports.insert(
+                target.clone(),
+                TargetReport {
+                    positions,
+                    edge_warnings: report.edge_warnings,
+                },
+            );
+        }
+        self.reports.get(target)
+    }
+}
 
 /// Retains a concrete call when a separate engine operation confirms its callee token.
 /// Original disagreements and incomplete provider coverage remain in the answer.
@@ -20,6 +71,7 @@ pub(super) async fn confirm_reference_sites(
     engines: &crate::EnginePool,
     seed: &SymbolId,
     mut calls: GraphCalls,
+    targets: &mut TargetReferences,
     deadline: tokio::time::Instant,
 ) -> GraphCalls {
     let mut pending = BTreeMap::<SymbolId, Vec<usize>>::new();
@@ -45,31 +97,21 @@ pub(super) async fn confirm_reference_sites(
             continue;
         };
         let provider = slot.edge_provider();
-        // This read contains only engine observations, never captured references.
-        let Ok(report) = Box::pin(super::engine_graph_references(
-            reads, engines, &target, false, deadline,
-        ))
-        .await
-        else {
+        let Some(report) = targets.read(reads, engines, &target, deadline).await else {
             continue;
         };
-        for warning in report.edge_warnings {
-            if !calls.edge_warnings.contains(&warning) {
-                calls.edge_warnings.push(warning);
+        for warning in &report.edge_warnings {
+            if !calls.edge_warnings.contains(warning) {
+                calls.edge_warnings.push(warning.clone());
             }
         }
-        let positions = report
-            .occurrences
-            .into_iter()
-            .filter(|occurrence| occurrence.target == target)
-            .map(|occurrence| (call_key(&occurrence.source), occurrence.source))
-            .collect::<BTreeMap<_, _>>();
+        let positions = &report.positions;
         for position in records {
             if calls.corroboration.len() == TRAVERSAL_SYMBOLS_MAX {
                 break 'targets;
             }
             let record = &calls.corroboration[position];
-            let Some(observed) = reference_witness(&positions, record) else {
+            let Some(observed) = reference_witness(positions, record) else {
                 continue;
             };
             let confirmed = CallCorroboration {

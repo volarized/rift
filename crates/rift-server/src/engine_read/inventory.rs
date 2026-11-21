@@ -263,12 +263,14 @@ impl EngineInventory {
         engines: &EnginePool,
         deadline: Instant,
     ) -> Self {
+        let mut targets = super::call_evidence::TargetReferences::default();
         for (seed, calls) in &mut self.calls {
             *calls = super::call_evidence::confirm_reference_sites(
                 reads,
                 engines,
                 seed,
                 std::mem::take(calls),
+                &mut targets,
                 deadline,
             )
             .await;
