@@ -421,16 +421,22 @@ impl RiftMcp {
         let seeds = inventory.seeds.to_vec();
         let capture = Arc::clone(&reads);
         let selection = inventory.facts;
-        let (files, mut read) = self
+        let (files, mut read, sources) = self
             .blocking
             .run("engine inventory files", move || {
                 let inventory = InventorySelection {
                     seeds: &seeds,
                     facts: selection,
                 };
+                let sources = if selection.references {
+                    rift_server::DocumentSources::of(&capture)
+                } else {
+                    rift_server::DocumentSources::default()
+                };
                 Ok((
                     capture.engine_inventory_files(&seeds, selection)?,
                     captured_inventory(&capture, &inventory)?,
+                    sources,
                 ))
             })
             .await?;
@@ -447,14 +453,18 @@ impl RiftMcp {
             let capture = Arc::clone(&reads);
             let confirmations = Arc::clone(&reads);
             let roots = roots.clone();
+            let sources = sources.clone();
             async move {
-                let answer = tokio::time::timeout_at(end, file.read(engines, selection, end))
-                    .await
-                    .map_err(|_| {
-                        rift_error::errors::lsp::engine_analyzing()
-                            .attempts(0_u64)
-                            .error()
-                    })??;
+                let answer = tokio::time::timeout_at(
+                    end + crate::server::ENGINE_READ_GRACE,
+                    file.read(engines, (selection, &sources), end),
+                )
+                .await
+                .map_err(|_| {
+                    rift_error::errors::lsp::engine_analyzing()
+                        .attempts(0_u64)
+                        .error()
+                })??;
                 let Some(answer) = answer else {
                     return Ok(None);
                 };

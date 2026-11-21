@@ -145,3 +145,7 @@ path = "tests/workspace_resource.rs"
 [[test]]
 name = "embedded_python"
 path = "tests/embedded_python.rs"
+
+[[test]]
+name = "engine_facts"
+path = "tests/engine_facts.rs"

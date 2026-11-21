@@ -11,6 +11,7 @@ use lsp_types::{
 use rift_core::ProjectPath;
 use rift_error::{RiftError, errors};
 use serde_json::Value;
+use tokio::time::Instant;
 
 use super::{EngineSession, correlation, ends_session, require};
 
@@ -274,13 +275,19 @@ impl EngineSession {
                 .fail();
         }
         self.empty_answers.forget();
+        if self.deadline_passed() {
+            return errors::lsp::engine_analyzing().attempts(1_u64).fail();
+        }
         let timeout = self.request_timeout;
-        let answer = match tokio::time::timeout(timeout, self.exchange_batch::<R>(params)).await {
+        let (end, deadline_cut) = self.wait_end(Instant::now(), timeout);
+        let answer = match tokio::time::timeout_at(end, self.exchange_batch::<R>(params)).await {
+            Ok(Err(error)) if error.slug() == errors::lsp::engine_analyzing::SLUG => {
+                // The deadline passed between two frames: nothing waits for the frames
+                // already written.
+                Err(self.unanswered(R::METHOD, timeout, true).await)
+            }
             Ok(answer) => answer,
-            Err(_) => errors::lsp::engine_timed_out()
-                .method(R::METHOD)
-                .timeout_ms(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX))
-                .fail(),
+            Err(_elapsed) => Err(self.unanswered(R::METHOD, timeout, deadline_cut).await),
         };
         if answer.as_ref().is_err_and(ends_session) {
             self.end().await;
@@ -318,6 +325,9 @@ impl EngineSession {
         self.make_room(params.len(), R::METHOD).await?;
         let mut pending = BTreeMap::new();
         for (position, params) in params.into_iter().enumerate() {
+            if position > 0 && self.deadline_passed() {
+                return errors::lsp::engine_analyzing().attempts(1_u64).fail();
+            }
             let value = serde_json::to_value(params).map_err(|source| {
                 errors::lsp::engine_result_invalid()
                     .method(R::METHOD)

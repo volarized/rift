@@ -3,7 +3,9 @@
 use std::collections::BTreeMap;
 
 use rift_core::ReferenceRole;
-use rift_syntax::{ByteRange, StaticBinding, StaticCall, StaticFacts, StaticFunctionContext};
+use rift_syntax::{
+    ByteRange, StaticBinding, StaticCall, StaticFacts, StaticFunctionContext, StaticMemberCallback,
+};
 
 use super::javascript_members::DECLARED_TYPE_DEPTH_MAX;
 use super::{File, Index, Target, Work};
@@ -23,6 +25,8 @@ pub(super) struct Callbacks<'source> {
     /// functions share the owner, as overloads do.
     owned: BTreeMap<(ByteRange, u32), Option<ByteRange>>,
     contexts: BTreeMap<ByteRange, StaticFunctionContext>,
+    member_initializers: BTreeMap<ByteRange, &'source StaticMemberCallback>,
+    member_type_shapes: BTreeMap<ByteRange, ByteRange>,
     return_types: BTreeMap<ByteRange, ByteRange>,
     /// Declaration name to its written function type; absent when it writes several.
     function_types: BTreeMap<ByteRange, Option<ByteRange>>,
@@ -77,6 +81,10 @@ impl<'source> Callbacks<'source> {
         self.function_types.get(&name).is_some_and(Option::is_some)
     }
 
+    pub(super) fn member_type_shape(&self, name: ByteRange) -> Option<ByteRange> {
+        self.member_type_shapes.get(&name).copied()
+    }
+
     pub(super) fn index(facts: &'source StaticFacts, work: &mut Work) -> Option<Self> {
         let mut callbacks = Self::default();
         let mut owners = BTreeMap::<ByteRange, Option<ByteRange>>::new();
@@ -116,6 +124,20 @@ impl<'source> Callbacks<'source> {
                 return None;
             }
             callbacks.contexts.insert(function, context);
+        }
+        for context in facts.member_callbacks() {
+            if !work.charge() {
+                return None;
+            }
+            callbacks
+                .member_initializers
+                .insert(context.parameter, context);
+        }
+        for &(name, body) in facts.member_type_shapes() {
+            if !work.charge() {
+                return None;
+            }
+            callbacks.member_type_shapes.insert(name, body);
         }
         for &(function, annotation) in facts.return_types() {
             if !work.charge() {
@@ -206,16 +228,16 @@ impl<'source> Index<'source> {
         work: &mut Work,
     ) -> Option<Target<'source>> {
         let &(function, index) = file.callbacks.positions.get(&binding.name)?;
-        let context = *file.callbacks.contexts.get(&function)?;
+        let context = file.callbacks.contexts.get(&function).copied();
         work.javascript_lookup(|work| {
             let (owner, written) = match context {
-                StaticFunctionContext::Initializer(name) => {
+                Some(StaticFunctionContext::Initializer(name)) => {
                     self.javascript_function_type(file, name, work)?
                 }
-                StaticFunctionContext::Argument {
+                Some(StaticFunctionContext::Argument {
                     call,
                     index: argument,
-                } => {
+                }) => {
                     let call = file.callbacks.calls.get(&call).copied()?;
                     if let ArrayCallback::Element(element) =
                         self.javascript_array_callback(file, call, argument, index, work)
@@ -233,10 +255,15 @@ impl<'source> Index<'source> {
                         .flatten()?;
                     self.javascript_function_type(declared, parameter, work)?
                 }
-                StaticFunctionContext::Returned(enclosing) => {
+                Some(StaticFunctionContext::Returned(enclosing)) => {
                     let annotation = *file.callbacks.return_types.get(&enclosing)?;
                     self.javascript_named_function_type(file, annotation, work)?
                 }
+                None => self.javascript_member_callback(
+                    file,
+                    file.callbacks.member_initializers.get(&binding.name)?,
+                    work,
+                )?,
             };
             let parameter = owner.callbacks.names.get(&(written, index))?;
             let annotation = owner.declared_types.get(parameter).copied().flatten()?;
@@ -367,7 +394,7 @@ impl<'source> Index<'source> {
 
     /// The function type written for the declaration `name`, inline or through its named
     /// type.
-    fn javascript_function_type<'index>(
+    pub(super) fn javascript_function_type<'index>(
         &'index self,
         file: &'index File<'source>,
         name: ByteRange,

@@ -260,16 +260,19 @@ impl<'read> CapturedCalls<'read> {
             };
             // A static edge to a dependency or standard-library symbol names the spelled
             // public path. An engine that names a dependency declaration at the same call
-            // supplies the defining identity. Keep both facts without treating their
-            // different names as a disagreement.
+            // supplies the defining identity. A Rust trait call can name the interface
+            // at the site while the engine names the method in a local implementation.
             let external = rift_protocol::identity::SymbolIdentity::parse(neighbor.as_str())
                 .is_ok_and(|identity| !identity.owner().is_local());
             if external
-                && comparison.at(&span, callee).any(|(_, destinations)| {
+                && (comparison.at(&span, callee).any(|(_, destinations)| {
                     destinations.iter().any(|(_, destination)| {
                         matches!(destination, CallDestination::Dependency(_))
                     })
-                })
+                }) || self.direction == TraversalDirection::Outgoing
+                    && comparison.local_at(&span, callee).is_some_and(|method| {
+                        rust_trait_method(self.reads, &neighbor, method) == Some(true)
+                    }))
             {
                 engine.edges.push(edge.to_protocol());
                 engine.local.push((neighbor, vec![span]));
@@ -314,6 +317,55 @@ impl<'read> CapturedCalls<'read> {
         merge_call_neighbors(&mut engine.local);
         engine
     }
+}
+
+/// Whether a local Rust method implements the trait member named at a call site.
+fn rust_trait_method(reads: &ReadService, target: &SymbolId, method: &SymbolId) -> Option<bool> {
+    let identity = SymbolIdentity::parse(method.as_str()).ok()?;
+    if !identity.owner().is_local() || identity.language().name != "rust" {
+        return None;
+    }
+    let (trait_id, trait_method) = target.as_str().rsplit_once('/')?;
+    let (owner, method_name) = method.as_str().rsplit_once('/')?;
+    if trait_method != method_name {
+        return None;
+    }
+    let owner = CoreSymbolId::new(owner).ok()?;
+    let method = CoreSymbolId::new(method.as_str()).ok()?;
+    let (declarations, total) = reads.index().symbols_by_identity_page(&method, 0, 1).ok()?;
+    let [declaration] = declarations.as_slice() else {
+        return None;
+    };
+    if total != 1 {
+        return None;
+    }
+    let implementation = declaration
+        .file
+        .syntax()
+        .static_facts()?
+        .inherent_impls()
+        .iter()
+        .filter(|item| item.range.encloses(declaration.symbol.item_range))
+        .min_by_key(|item| item.range.end - item.range.start)?;
+    let unit = rift_core::SourceUnitId::parse(
+        crate::read::source_unit_id(declaration.file.path()).as_str(),
+    )
+    .ok()?;
+    Some(
+        reads
+            .edges()
+            .outgoing(&owner)
+            .iter()
+            .take(TRAVERSAL_SYMBOLS_MAX)
+            .any(|edge| {
+                let location = edge.occurrence();
+                edge.kind() == EdgeKind::Implements
+                    && edge.to().as_str() == trait_id
+                    && location.unit() == &unit
+                    && implementation.range.start <= location.range().start()
+                    && location.range().end() <= implementation.type_path.start
+            }),
+    )
 }
 
 fn caller_contains(
@@ -400,6 +452,19 @@ impl CallEvidence {
             .get_key_value(&key)
             .filter(move |((_, start, end), _)| *start < callee.start || *end > callee.end);
         name.chain(full)
+    }
+
+    fn local_at(&self, span: &SourceUnitSpan, callee: rift_syntax::ByteRange) -> Option<&SymbolId> {
+        let mut observed = self.at(span, callee).flat_map(|(_, destinations)| {
+            destinations
+                .iter()
+                .filter_map(|(_, destination)| match destination {
+                    CallDestination::Local(id) => Some(id),
+                    CallDestination::Dependency(_) => None,
+                })
+        });
+        let first = observed.next()?;
+        observed.all(|id| id == first).then_some(first)
     }
 
     fn corroborate(
@@ -727,6 +792,78 @@ mod tests {
             matching,
             [super::call_key(&identifier), super::call_key(&call)]
         );
+    }
+
+    #[test]
+    fn rust_trait_call_keeps_its_external_path_and_the_confirmed_implementation() {
+        use rift_protocol::read::{EdgeProvider, TraversalDirection};
+
+        let directory = tempfile::tempdir().expect("workspace");
+        std::fs::write(
+            directory.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("manifest");
+        std::fs::create_dir(directory.path().join("src")).expect("sources");
+        std::fs::write(
+            directory.path().join("src/lib.rs"),
+            "pub struct Shape;\nimpl Default for Shape { fn default() -> Self { Shape } }\n\
+             pub struct Other;\nimpl Other { pub fn default() -> Self { Other } }\n\
+             pub fn make() -> Shape { Default::default() }\n",
+        )
+        .expect("source");
+        let reads = super::ReadService::build(
+            directory.path(),
+            rift_index::WorkspaceIndexLimits::default(),
+            &rift_core::SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            rift_protocol::configuration::HistoryConfiguration::default(),
+        )
+        .expect("captured workspace");
+        let caller = SymbolId("rift://symbol/local/rust/fixture/make".to_owned());
+        let caller_id = super::CoreSymbolId::new(caller.as_str()).expect("caller identity");
+        let capture =
+            || super::CapturedCalls::read(&reads, &caller_id, TraversalDirection::Outgoing);
+        let captured = capture();
+        let [authored] = captured.edges.as_slice() else {
+            panic!("expected one authored trait call");
+        };
+        let authored = authored.to_protocol();
+        let occurrence = authored.occurrence.clone().expect("call site");
+        let shape = SymbolId("rift://symbol/local/rust/fixture/Shape/default".to_owned());
+        let other = SymbolId("rift://symbol/local/rust/fixture/Other/default".to_owned());
+        for (targets, complete) in [
+            (vec![shape.clone()], true),
+            (vec![other.clone()], false),
+            (vec![shape.clone(), other], false),
+        ] {
+            let mut definitions = super::GraphCalls {
+                complete: true,
+                ..super::GraphCalls::default()
+            };
+            for target in targets {
+                definitions.push_local(
+                    &caller,
+                    target,
+                    vec![occurrence.clone()],
+                    TraversalDirection::Outgoing,
+                    EdgeProvider::Lsp,
+                );
+            }
+            let calls = capture().combine_external(definitions);
+            assert_eq!(calls.complete, complete);
+            if complete {
+                assert_eq!(calls.edges.len(), 2);
+                assert!(calls.edges.contains(&authored));
+                assert!(calls.edges.iter().any(|edge| {
+                    edge.to == shape
+                        && edge.provider == EdgeProvider::Lsp
+                        && edge.occurrence.as_ref() == Some(&occurrence)
+                }));
+            } else {
+                assert!(calls.edges.is_empty());
+            }
+        }
     }
 
     #[test]

@@ -2128,6 +2128,54 @@ fn test_this_inside_object_literal_methods_names_the_literal_members() {
 }
 
 #[test]
+fn test_typescript_callbacks_take_the_written_type_of_an_assigned_member() {
+    let source = r"
+export interface Options { storage: string }
+export interface Input<T> { get: () => T }
+type AddSettings<T> = T extends { get: () => infer U }
+    ? { settings: { apply: (options: Partial<Options>) => string | undefined } }
+    : never;
+type Other = { settings: { apply: (options: { storage: number }) => number } };
+type Alternatives<T> = T extends { get: () => infer U }
+    ? { settings: { apply: (options: Options) => string } }
+    : Other;
+
+export function install(api: unknown) {
+    (api as Input<string> & AddSettings<Input<string>>).settings = {
+        apply: (options) => options.storage,
+    };
+}
+export function conflicting(api: unknown) {
+    (api as Other & AddSettings<Input<string>>).settings = {
+        apply: (options) => options.storage,
+    };
+}
+export function alternatives(api: unknown) {
+    (api as Input<string> & Alternatives<Input<string>>).settings = {
+        apply: (options) => options.storage,
+    };
+}
+export function explicitly_typed(api: unknown) {
+    (api as AddSettings<Input<string>>).settings = {
+        apply: (options: { storage: string }) => options.storage,
+    };
+}
+";
+    let (_directory, index) = workspace_with_manifest(&[("main.ts", source)], module_manifest());
+    let reads = index
+        .edges()
+        .edges()
+        .filter(|edge| {
+            edge.kind() == EdgeKind::Reads
+                && edge.to().as_str().ends_with("main.ts/Options/storage")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(reads.len(), 1, "{reads:?}");
+    let from = reads[0].from().as_str();
+    assert!(from.ends_with("main.ts/install/apply"), "{from}");
+}
+
+#[test]
 fn test_typescript_callbacks_of_asserted_inline_object_types() {
     // A callback passed to a member of a value asserted to an inline object type takes
     // the parameter types the asserted member's function type writes.

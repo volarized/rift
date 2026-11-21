@@ -5,7 +5,7 @@
 //! classification live here so the byte layer in `framing` never inspects
 //! JSON.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use rift_error::{RiftError, errors};
 use serde::{Deserialize, Serialize};
@@ -38,7 +38,17 @@ impl RequestId {
 #[derive(Debug, Default)]
 pub struct Correlation {
     next_id: u64,
-    pending: BTreeMap<u64, &'static str>,
+    pending: BTreeMap<u64, Pending>,
+    /// Cancelled requests already settled, newest last, at most [`PENDING_REQUESTS_MAX`].
+    settled_cancelled: VecDeque<(u64, &'static str)>,
+}
+
+/// One request that awaits its response.
+#[derive(Debug)]
+struct Pending {
+    method: &'static str,
+    /// The session told the engine it no longer waits for this answer.
+    cancelled: bool,
 }
 
 impl Correlation {
@@ -69,8 +79,29 @@ impl Correlation {
         }
         let id = self.next_id;
         self.next_id += 1;
-        self.pending.insert(id, method);
+        self.pending.insert(
+            id,
+            Pending {
+                method,
+                cancelled: false,
+            },
+        );
         Ok(RequestId(id))
+    }
+
+    /// Marks every pending request not cancelled yet as cancelled, and returns their ids.
+    ///
+    /// A cancelled request stays pending: its response, or the engine's refusal of the
+    /// cancelled call, still arrives, and the next exchange settles and discards it.
+    pub(crate) fn cancel_pending(&mut self) -> Vec<RequestId> {
+        self.pending
+            .iter_mut()
+            .filter(|(_id, pending)| !pending.cancelled)
+            .map(|(id, pending)| {
+                pending.cancelled = true;
+                RequestId(*id)
+            })
+            .collect()
     }
 
     /// Settles one response id, returning the method it answered.
@@ -86,7 +117,22 @@ impl Correlation {
                 .error()
         };
         let id = id.as_u64().ok_or_else(unknown)?;
-        self.pending.remove(&id).ok_or_else(unknown)
+        if let Some(pending) = self.pending.remove(&id) {
+            if pending.cancelled {
+                if self.settled_cancelled.len() >= PENDING_REQUESTS_MAX {
+                    self.settled_cancelled.pop_front();
+                }
+                self.settled_cancelled.push_back((id, pending.method));
+            }
+            return Ok(pending.method);
+        }
+        // An engine may answer a cancelled request and its `$/cancelRequest` both; the
+        // second answer settles nothing and the caller discards it like the first.
+        self.settled_cancelled
+            .iter()
+            .find(|(settled, _method)| *settled == id)
+            .map(|(_id, method)| *method)
+            .ok_or_else(unknown)
     }
 }
 
@@ -194,6 +240,44 @@ mod tests {
         assert_eq!(
             correlation.conclude(&serde_json::json!(0)).expect("method"),
             "initialize"
+        );
+    }
+
+    #[test]
+    fn cancelled_requests_stay_pending_once_and_settle_a_repeated_answer() {
+        let mut correlation = Correlation::new();
+        let first = correlation.begin("textDocument/references").expect("id");
+        assert_eq!(correlation.cancel_pending(), [first]);
+        assert!(
+            correlation.cancel_pending().is_empty(),
+            "a request is cancelled once"
+        );
+        assert_eq!(
+            correlation.pending_count(),
+            1,
+            "a cancelled request awaits its answer"
+        );
+        let second = correlation.begin("textDocument/references").expect("id");
+        assert_eq!(correlation.cancel_pending(), [second]);
+        for answer in [first, first, second] {
+            assert_eq!(
+                correlation
+                    .conclude(&serde_json::json!(answer.value()))
+                    .expect("the answer to a cancelled request settles"),
+                "textDocument/references"
+            );
+        }
+        assert_eq!(correlation.pending_count(), 0);
+        let live = correlation.begin("shutdown").expect("id");
+        correlation
+            .conclude(&serde_json::json!(live.value()))
+            .expect("settles");
+        let repeated = correlation
+            .conclude(&serde_json::json!(live.value()))
+            .expect_err("a repeated answer to a request never cancelled is refused");
+        assert_eq!(
+            repeated.slug(),
+            errors::lsp::correlation_response_unknown::SLUG
         );
     }
 

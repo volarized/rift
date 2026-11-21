@@ -280,6 +280,21 @@ pub enum StaticFunctionContext {
     Returned(ByteRange),
 }
 
+/// An unannotated function parameter in an object literal assigned to a typed member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticMemberCallback {
+    /// The parameter that takes its type from the assignment.
+    pub parameter: ByteRange,
+    /// The assigned property of the asserted receiver.
+    pub property: ByteRange,
+    /// The function-valued member of the assigned object literal.
+    pub callback: ByteRange,
+    /// The named type asserted on the receiver.
+    pub asserted: ByteRange,
+    /// The second named type when the receiver is asserted to an intersection.
+    pub intersection: Option<ByteRange>,
+}
+
 /// Collections retained by static syntax capture.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StaticFactsParts {
@@ -302,6 +317,10 @@ pub struct StaticFactsParts {
     pub return_types: Vec<(ByteRange, ByteRange)>,
     /// Function values and the written place that types them.
     pub function_contexts: Vec<(ByteRange, StaticFunctionContext)>,
+    /// Parameters typed by an object literal's assignment to a member.
+    pub member_callbacks: Vec<StaticMemberCallback>,
+    /// Names of type and property declarations with their explicit object type bodies.
+    pub member_type_shapes: Vec<(ByteRange, ByteRange)>,
     /// Declared return types by the name of the declaration the function belongs to.
     pub declared_returns: Vec<StaticDeclaredReturn>,
     /// Names bound from a call: the bound name, the key it is destructured by (absent when
@@ -416,6 +435,18 @@ impl StaticFacts {
     #[must_use]
     pub fn function_contexts(&self) -> &[(ByteRange, StaticFunctionContext)] {
         &self.0.function_contexts
+    }
+
+    /// Parameters typed by an object literal's assignment to a member.
+    #[must_use]
+    pub fn member_callbacks(&self) -> &[StaticMemberCallback] {
+        &self.0.member_callbacks
+    }
+
+    /// Names of type and property declarations with their explicit object type bodies.
+    #[must_use]
+    pub fn member_type_shapes(&self) -> &[(ByteRange, ByteRange)] {
+        &self.0.member_type_shapes
     }
 
     /// Declared return types by the name of the declaration the function belongs to.
@@ -588,6 +619,8 @@ impl StaticFacts {
             vector_capacity(&self.0.function_types),
             vector_capacity(&self.0.return_types),
             vector_capacity(&self.0.function_contexts),
+            vector_capacity(&self.0.member_callbacks),
+            vector_capacity(&self.0.member_type_shapes),
             vector_capacity(&self.0.declared_returns),
             vector_capacity(&self.0.destructured),
             vector_capacity(&self.0.function_values),
@@ -641,6 +674,8 @@ impl StaticFacts {
             self.function_types().len(),
             self.return_types().len(),
             self.function_contexts().len(),
+            self.member_callbacks().len(),
+            self.member_type_shapes().len(),
             self.declared_returns().len(),
             self.destructured().len(),
             self.function_values().len(),
@@ -723,7 +758,15 @@ impl StaticFacts {
             .function_types()
             .iter()
             .chain(self.return_types())
+            .chain(self.member_type_shapes())
             .all(|(name, written)| valid(*name) && valid(*written))
+            && self.member_callbacks().iter().all(|context| {
+                valid(context.parameter)
+                    && valid(context.property)
+                    && valid(context.callback)
+                    && valid(context.asserted)
+                    && context.intersection.is_none_or(valid)
+            })
             && self.declared_returns().iter().all(|declared| {
                 valid(declared.owner)
                     && valid(declared.function)

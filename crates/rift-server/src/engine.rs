@@ -372,6 +372,9 @@ struct SlotState {
     /// `initialize` or `startup_timeout` passes, whatever happens to the requests.
     starting: Option<tokio::task::JoinHandle<Result<EngineSession, RiftError>>>,
     restarts: RestartBudget,
+    /// The slot discarded a live session because an exchange was dropped midway
+    /// ([`RequestSessionGuard`]); the start that replaces it is not charged.
+    discarded: bool,
 }
 
 /// Decides, under the slot lock, whether a session outlives an exchange dropped midway.
@@ -402,6 +405,14 @@ impl Drop for RequestSessionGuard<'_> {
                     .as_ref()
                     .is_some_and(EngineSession::is_intact));
         if !survives {
+            // A session Rift discards here still ran: its replacement is not charged to
+            // the restart budget, which counts engines that exit, break framing or stay
+            // silent.
+            self.state.discarded |= self
+                .state
+                .session
+                .as_ref()
+                .is_some_and(|session| !session.is_ended());
             drop(self.state.session.take());
             if self.state.starting.is_none() {
                 self.reported_state.send_replace(LspState::Failed);
@@ -721,6 +732,25 @@ async fn attempt_within<T>(
             AttemptEnd::Completed(outcome)
         }
         Err(_elapsed) => AttemptEnd::Spent(retried),
+    }
+}
+
+/// The condition one failed attempt on a live session leaves for the retry loop, or the
+/// failure itself when no retry can change it.
+///
+/// An analyzing failure means the engine is working and the session cancelled the request
+/// at its timeout or at the caller's deadline: the same session retries inside the
+/// deadline. A refusal gets the retry schedule.
+fn absorbed_failure<T>(error: RiftError) -> Result<Transient<T>, RiftError> {
+    let slug = error.slug();
+    if slug == errors::lsp::engine_analyzing::SLUG {
+        Ok(Transient::Analyzing)
+    } else if slug == errors::lsp::engine_refused_retryable::SLUG
+        || slug == errors::lsp::engine_refused_terminal::SLUG
+    {
+        Ok(Transient::Refused(error))
+    } else {
+        Err(error)
     }
 }
 
@@ -1203,6 +1233,7 @@ impl EngineSlot {
                     Box::pin(self.start_replacement(state, dead, reported.take())).await?
                 }
             };
+            session.set_deadline(deadline);
             if !exchange_started {
                 match begin(session).await {
                     Ok(()) => {
@@ -1244,17 +1275,14 @@ impl EngineSlot {
                     reported = Some(error);
                     continue;
                 }
-                AttemptEnd::Completed(Err(error))
-                    if error.slug() == errors::lsp::engine_refused_retryable::SLUG
-                        || error.slug() == errors::lsp::engine_refused_terminal::SLUG =>
-                {
-                    Transient::Refused(error)
-                }
-                AttemptEnd::Completed(Err(error)) => {
-                    finish(session).await;
-                    guarded.finished = true;
-                    return error.fail();
-                }
+                AttemptEnd::Completed(Err(error)) => match absorbed_failure(error) {
+                    Ok(absorbed) => absorbed,
+                    Err(error) => {
+                        finish(session).await;
+                        guarded.finished = true;
+                        return error.fail();
+                    }
+                },
             };
             // One clock read decides the wait and schedules its end, so the end
             // checked against the deadline is the end the wait keeps.
@@ -1362,9 +1390,11 @@ impl EngineSlot {
                     ControlFlow::Continue(failure) => reported = Some(failure),
                 }
             }
-            if !state
-                .restarts
-                .claim(&self.configuration.restart, Instant::now())
+            let discarded = std::mem::take(&mut state.discarded);
+            if !discarded
+                && !state
+                    .restarts
+                    .claim(&self.configuration.restart, Instant::now())
             {
                 self.report_state(LspState::Failed);
                 let engine = self.name();
@@ -2145,7 +2175,7 @@ done
 
     /// An exchange dropped while its `didOpen` frame is part-written to an engine that
     /// stopped reading discards the session, and the next request starts a replacement
-    /// within the restart budget.
+    /// that spends no restart: Rift discarded a session whose engine still ran.
     #[cfg(unix)]
     #[tokio::test]
     async fn an_exchange_dropped_mid_frame_discards_its_session() {
@@ -2194,8 +2224,8 @@ done
         assert_eq!(reopened, 0, "the replacement opened nothing");
         assert_eq!(
             slot.state.lock().await.restarts.spent.len(),
-            1,
-            "the replacement spent one restart"
+            0,
+            "the replacement of a session Rift discarded spends no restart"
         );
         assert_eq!(
             engine_log(directory.path()),

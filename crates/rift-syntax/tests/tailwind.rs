@@ -2,10 +2,37 @@
 
 use rift_core::ProjectPath;
 use rift_syntax::{
-    CssSyntaxProvider, HtmlSyntaxProvider, SvelteSyntaxProvider, SyntaxFacts, SyntaxFactsParts,
-    SyntaxLimits, SyntaxProvider, SyntaxSource, TypeScriptDialect, VueSyntaxProvider,
-    append_framework_symbols, tailwind_symbols,
+    CssSyntaxProvider, HtmlSyntaxProvider, JavaScriptSyntaxProvider, SvelteSyntaxProvider,
+    SyntaxFacts, SyntaxFactsParts, SyntaxLimits, SyntaxProvider, SyntaxSource, TypeScriptDialect,
+    VueSyntaxProvider, append_framework_symbols, tailwind_symbols,
 };
+
+#[test]
+fn tailwind_keeps_static_calls_and_references_in_jsx_and_tsx() {
+    let javascript = JavaScriptSyntaxProvider::default();
+    let tsx = TypeScriptDialect::Tsx.provider();
+    let text = "function label() { return 'Beacon'; } export function Panel() { return <main className=\"flex\">{label()}</main>; }";
+    let limits = SyntaxLimits::default();
+    for (extension, provider) in [("jsx", &javascript as &dyn SyntaxProvider), ("tsx", &tsx)] {
+        let path = ProjectPath::new(format!("src/panel.{extension}")).expect("fixture path");
+        let source = SyntaxSource { path: &path, text };
+        let document = provider.analyze(source, limits).expect("source document");
+        let original = document.facts().static_facts().expect("static facts");
+        assert_eq!(original.calls().len(), 1);
+        assert!(!original.references().is_empty());
+
+        let framework = tailwind_symbols(source, &document, 4, limits).expect("Tailwind facts");
+        let interpreted = append_framework_symbols(source, limits, &document, framework.symbols)
+            .expect("Tailwind document");
+        assert!(
+            interpreted
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.name == "flex")
+        );
+        assert_eq!(interpreted.facts().static_facts(), Some(original));
+    }
+}
 
 #[test]
 fn tailwind_static_classes_variants_and_dynamic_expressions_across_templates() {
