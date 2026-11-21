@@ -458,9 +458,10 @@ async fn test_edge_inventory_reads_dropped_mid_write_do_not_spend_the_restart_bu
     let script = engine.path().join("engine.sh");
     let log = engine.path().join("engine.log");
     std::fs::write(&script, SLOW_READER_ENGINE)?;
+    // A healthy replacement settles well inside the same deadline that cuts the stalled write.
     let configuration = format!(
         "[server]\nreadiness_timeout = \"1s\"\n\n\
-         [languages.rust.lsp]\ncommand = [\"sh\", \"{}\", \"{}\"]\n",
+         [languages.rust.lsp]\nsettle_delay = \"10ms\"\ncommand = [\"sh\", \"{}\", \"{}\"]\n",
         script.display(),
         log.display()
     );
